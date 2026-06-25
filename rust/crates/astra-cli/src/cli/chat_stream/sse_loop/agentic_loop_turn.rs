@@ -2483,7 +2483,7 @@ mod tests {
             payload["edge_profile"]
                 .get(EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
                 .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("<deferred_tools>")),
+                .is_some_and(|text| text.contains("<deferred-tools>")),
             "tool_search visibility must be paired with a deferred manifest"
         );
     }

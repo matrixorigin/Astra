@@ -1,7 +1,7 @@
 //! End-to-end contract: the deferred activation flow composes correctly
 //! across two model requests.
 //!
-//! Turn N : LLM sees `<deferred_tools>` listing `github`. Calls
+//! Turn N : LLM sees `<deferred-tools>` listing `github`. Calls
 //!          `tool_search(query="select:github")`. Runtime returns compact
 //!          callable shape and records the selected name.
 //! Turn N+1: Surface assembly reads the pending selection and injects the full

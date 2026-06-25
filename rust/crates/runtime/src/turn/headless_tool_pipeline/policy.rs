@@ -21,7 +21,7 @@ use astra_turn_core::headless_tool_stderr_lines::{
 };
 use astra_turn_core::tool::deferred_activation::{
     DirectDeferredCallAdmission, classify_direct_deferred_call,
-    deferred_tool_not_activatable_message, direct_deferred_call_activated_message,
+    deferred_tool_not_activatable_message, direct_deferred_call_activation_message,
     tool_not_admitted_message,
 };
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
@@ -71,7 +71,7 @@ fn emit_blocked_tool_result(
 /// Decide which denial body to emit for a name the validator rejected.
 ///
 /// First-principle: the model can only act on what we have already told it
-/// about. If `name` appears in this turn's `<deferred_tools>` manifest, it
+/// about. If `name` appears in this turn's `<deferred-tools>` manifest, it
 /// has been advertised — denying with the bare "Unknown tool" copy contradicts
 /// the prompt. Surface the activation hint instead. Otherwise the name is
 /// truly hallucinated; return the unknown-tool body so the model can
@@ -588,7 +588,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         exec.record_direct_deferred_call_activation(&name);
                     }
                     (
-                        direct_deferred_call_activated_message(&name),
+                        direct_deferred_call_activation_message(&name),
                         "direct_deferred_call_activated",
                     )
                 }
@@ -656,7 +656,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 );
             }
             let (tool_msg, err_tr) =
-                openai_tool_roundtrip_values(&execution.id, &execution.name, err_msg.as_str());
+                openai_tool_roundtrip_values(&execution.id, &execution.name, &err_msg);
             trace_short_circuit_tool_skip(
                 self.ctx.step_recorder,
                 &execution.id,
@@ -1045,7 +1045,7 @@ mod tests {
         let body = validator_denial_body("grep", &valid, &deferred);
 
         assert!(body.contains("not available in this turn yet"));
-        assert!(body.contains("`<deferred_tools>`"));
+        assert!(body.contains("`<deferred-tools>`"));
         assert!(body.contains("tool_search"));
         assert!(body.contains("query=\"select:grep\""));
         assert!(!body.contains("Unknown tool"));

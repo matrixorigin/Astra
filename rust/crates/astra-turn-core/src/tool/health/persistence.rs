@@ -1,6 +1,6 @@
 //! Cross-session persistence for per-tool health.
 //!
-//! Stored at `~/.astra/learning/<profile>.json` as a tool-health snapshot.
+//! Stored at `~/.astra/tool-health/<profile>.json` as a tool-health snapshot.
 //!
 //! Local sync metadata (last-synced baseline for delta push) lives in a
 //! separate file `<profile>.sync.json` so the user-facing learning state is
@@ -45,39 +45,39 @@ pub struct LearningSyncMetadata {
 
 // ─── File I/O ────────────────────────────────────────────────────────────────
 
-pub fn learning_dir() -> PathBuf {
+pub fn tool_health_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".astra")
-        .join("learning")
+        .join("tool-health")
 }
 
-pub fn learning_path(profile: &str) -> PathBuf {
-    learning_dir().join(format!("{profile}.json"))
+pub fn tool_health_path(profile: &str) -> PathBuf {
+    tool_health_dir().join(format!("{profile}.json"))
 }
 
-pub fn learning_sync_metadata_path(profile: &str) -> PathBuf {
-    learning_dir().join(format!("{profile}.sync.json"))
+pub fn tool_health_sync_metadata_path(profile: &str) -> PathBuf {
+    tool_health_dir().join(format!("{profile}.sync.json"))
 }
 
 pub fn load_snapshot(profile: &str) -> Option<LearningSnapshot> {
-    let path = learning_path(profile);
+    let path = tool_health_path(profile);
     let data = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
 pub fn load_sync_metadata(profile: &str) -> Option<LearningSyncMetadata> {
-    let path = learning_sync_metadata_path(profile);
+    let path = tool_health_sync_metadata_path(profile);
     let data = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
 pub fn save_snapshot(profile: &str, snapshot: &LearningSnapshot) -> Result<(), String> {
-    save_snapshot_to(&learning_path(profile), snapshot)
+    save_snapshot_to(&tool_health_path(profile), snapshot)
 }
 
 pub fn save_sync_metadata(profile: &str, metadata: &LearningSyncMetadata) -> Result<(), String> {
-    save_sync_metadata_to(&learning_sync_metadata_path(profile), metadata)
+    save_sync_metadata_to(&tool_health_sync_metadata_path(profile), metadata)
 }
 
 pub fn load_snapshot_from(path: &Path) -> Option<LearningSnapshot> {
@@ -389,7 +389,7 @@ mod tests {
         assert!(res.is_ok());
         assert!(
             !tmp.path()
-                .join(".astra/learning/profile-empty.json")
+                .join(".astra/tool-health/profile-empty.json")
                 .exists()
         );
     }

@@ -192,68 +192,7 @@ struct CliCapabilityView {
 }
 
 pub fn local_tool_schemas() -> Vec<Value> {
-    let mut schemas = full_tool_schemas();
-    if schemas
-        .iter()
-        .filter_map(astra_turn_core::tool::schema::tool_schema_name)
-        .all(|name| name != "reflect")
-    {
-        schemas.push(cli_local_reflect_schema());
-    }
-    local_runtime_tool_schemas(schemas)
-}
-
-fn cli_local_reflect_schema() -> Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "reflect",
-            "description": "Inspect persisted session observations through the normalized observation-plane surface. Use topic/facet/depth/horizon rather than removed focus-style parameters. CLI/Edge mode can use local session artifacts; without an active session the tool returns reflect_requires_session.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "topic": {
-                        "type": "string",
-                        "enum": ["overview", "runtime", "execution", "knowledge", "adaptation"],
-                        "description": "Top-level observation topic. Use execution/errors or execution/trace via topic+facet."
-                    },
-                    "facet": {
-                        "type": "string",
-                        "enum": ["overview", "question", "performance", "errors", "tools", "trace", "context", "memory", "signals", "measurements"],
-                        "description": "Observation facet under the selected topic. Examples: execution/errors, execution/trace, runtime/performance, knowledge/context."
-                    },
-                    "depth": {
-                        "type": "string",
-                        "enum": ["hint", "summary", "diagnostic", "forensic"],
-                        "description": "Requested analysis depth. Local CLI surface is bounded and may summarize forensic requests."
-                    },
-                    "horizon": {
-                        "type": "string",
-                        "enum": ["now", "current_turn", "recent", "turn", "session", "cross_session"],
-                        "description": "Time range. Trace is selected by facet, not by horizon."
-                    },
-                    "source_policy": {
-                        "type": "string",
-                        "enum": ["auto", "live_only", "live_first", "durable_first", "local_only", "cloud_only"],
-                        "description": "Preferred data source policy. Coverage is reported when a provider is missing or unavailable."
-                    },
-                    "include_context": {
-                        "type": "boolean",
-                        "description": "Request visible prompt/context facts when a provider is available."
-                    },
-                    "question": {
-                        "type": "string",
-                        "description": "Optional concrete question to orient the reflection."
-                    },
-                    "last_n": {
-                        "type": "integer",
-                        "description": "Bounded evidence limit for recent events or decisions. This is not a horizon alias."
-                    }
-                },
-                "additionalProperties": false
-            }
-        }
-    })
+    local_runtime_tool_schemas(full_tool_schemas())
 }
 
 /// Plan-mode write guard tool list (CLI parity with
@@ -1480,7 +1419,7 @@ impl ToolExecutor {
         .clear();
     }
 
-    /// Snapshot of the names that the model's `<deferred_tools>` manifest
+    /// Snapshot of the names that the model's `<deferred-tools>` manifest
     /// currently advertises. Used by the host to keep its validator-side
     /// `deferred_tool_names` set in lockstep with what the prompt rendered.
     pub fn current_activatable_tool_names_snapshot(&self) -> HashSet<String> {
@@ -1657,7 +1596,7 @@ impl ToolExecutor {
         let can_select = surface.activatable_contains(name);
         use astra_turn_core::tool::deferred_activation::{
             DirectDeferredCallAdmission, classify_direct_deferred_call,
-            direct_deferred_call_activated_message, tool_not_admitted_message,
+            direct_deferred_call_activation_message, tool_not_admitted_message,
         };
 
         match classify_direct_deferred_call(name, can_select, |tool_name| {
@@ -1667,7 +1606,7 @@ impl ToolExecutor {
                 name: activated_name,
             } => {
                 // Direct deferred call: the model called a tool advertised in
-                // `<deferred_tools>` without first selecting it via
+                // `<deferred-tools>` without first selecting it via
                 // `tool_search(select:NAME)`. Treat as activation intent —
                 // record the name so the next turn's `tools[]` includes the
                 // full schema, then ask the model to retry. Do NOT execute:
@@ -1680,7 +1619,7 @@ impl ToolExecutor {
                     &mut guard,
                     [activated_name.clone()],
                 );
-                return Some(EdgeToolRun::error(direct_deferred_call_activated_message(
+                return Some(EdgeToolRun::error(direct_deferred_call_activation_message(
                     &activated_name,
                 )));
             }
@@ -4527,28 +4466,70 @@ impl ToolExecutor {
                     let topic = args
                         .get("topic")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("overview");
-                    let facet = args.get("facet").and_then(|v| v.as_str());
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let facet = args
+                        .get("facet")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let depth = args
+                        .get("depth")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let horizon = args
+                        .get("horizon")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let source_policy = args
+                        .get("source_policy")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let include_context = args
+                        .get("include_context")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
-                    let last_n = args.get("last_n").and_then(|v| v.as_i64()).unwrap_or(20);
+                    let last_n = args
+                        .get("last_n")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(20)
+                        .clamp(1, i64::from(i32::MAX)) as i32;
+                    let request =
+                        astra_services::reflect::ReflectRequest::from_observation_params_with_source(
+                            topic,
+                            facet,
+                            depth,
+                            horizon,
+                            source_policy,
+                            include_context,
+                            last_n,
+                            question,
+                        );
                     if let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty()) {
-                        let limit = usize::try_from(last_n.max(1)).unwrap_or(20);
-                        match crate::cli::self_command::render_reflect_surface_for_session(
+                        let limit = usize::try_from(last_n).unwrap_or(20);
+                        match crate::cli::self_command::render_reflect_surface_for_session_with_profile(
                             &session_id,
                             limit,
-                            Some(topic),
-                            facet,
-                            Some(question),
+                            request.clone(),
+                            None,
                         )
                         .await
                         {
                             Ok(surface) => surface,
                             Err(error) => serde_json::json!({
                                 "status": "reflect_unavailable",
-                                "topic": topic,
-                                "facet": facet,
-                                "question": question,
-                                "last_n": last_n,
+                                "topic": request.topic,
+                                "facet": request.facet,
+                                "depth": request.depth,
+                                "horizon": request.horizon,
+                                "source_policy": request.source_policy,
+                                "include_context": request.include_context,
+                                "question": request.question,
+                                "last_n": request.last_n,
                                 "error": error,
                             })
                             .to_string(),
@@ -4556,10 +4537,14 @@ impl ToolExecutor {
                     } else {
                         serde_json::json!({
                         "status": "reflect_requires_session",
-                        "topic": topic,
-                        "facet": facet,
-                        "question": question,
-                        "last_n": last_n,
+                        "topic": request.topic,
+                        "facet": request.facet,
+                        "depth": request.depth,
+                        "horizon": request.horizon,
+                        "source_policy": request.source_policy,
+                        "include_context": request.include_context,
+                        "question": request.question,
+                        "last_n": request.last_n,
                         "note": "Reflect data comes from the server API. Use /reflect command for direct access."
                     }).to_string()
                     }

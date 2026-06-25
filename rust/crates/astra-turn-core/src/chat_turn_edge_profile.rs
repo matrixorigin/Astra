@@ -23,7 +23,7 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: &str = "deferred_tools_text";
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: &str = "deferred_tools_context_window";
 
 /// Protocol key carrying the JSON array of names listed in this turn's
-/// `<deferred_tools>` manifest. Pairs with
+/// `<deferred-tools>` manifest. Pairs with
 /// [`EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT`] (which is the rendered XML used
 /// for prompt assembly). The runtime reads the names from here so it can
 /// branch the validator denial copy and let `tool_search(select:NAME)`
@@ -31,7 +31,7 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: &str = "deferred_tools
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: &str = "deferred_tool_names";
 
 /// Protocol key carrying deferred tool names omitted from the rendered
-/// `<deferred_tools>` block because the session-stable manifest hit its model
+/// `<deferred-tools>` block because the session-stable manifest hit its model
 /// budget. This is observability metadata only: omitted names are not
 /// activatable through `tool_search(select:NAME)` until they are rendered in a
 /// later manifest or found by keyword search.

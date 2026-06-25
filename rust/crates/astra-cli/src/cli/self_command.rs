@@ -9,6 +9,7 @@ use crate::cli::session::session_continuation::extract_text_content;
 use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
+use astra_services::reflect::ReflectRequest;
 use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, WorkspaceMetadata};
@@ -29,15 +30,27 @@ struct ReflectResponse {
     session_id: String,
     topic: String,
     facet: String,
+    depth: String,
+    horizon: String,
+    source_policy: String,
+    include_context: bool,
     analysis_view: String,
     question: Option<String>,
     persistence_warning: Option<String>,
+    data_coverage: LocalReflectDataCoverage,
     /// Placeholder: the old reflection subsystem was removed. The CLI now
     /// returns a minimal reflection surface so callers can still inspect the
     /// recent journal turns under the chosen topic/facet.
     reflection_context: serde_json::Value,
     prompt_preview: String,
     recent_turns: Vec<EventPreview>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LocalReflectDataCoverage {
+    overall: &'static str,
+    source: &'static str,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,12 +105,18 @@ pub(crate) async fn execute_self_command(
             question,
             last_n,
         }) => {
+            let request = ReflectRequest::from_observation_params(
+                Some(topic.as_str()),
+                facet.as_deref(),
+                None,
+                None,
+                i32::try_from(*last_n).unwrap_or(i32::MAX),
+                question.as_deref().unwrap_or(""),
+            );
             render_reflect_surface_for_session_with_profile(
                 &resolve_target_session_id(session_id.as_deref(), profile).await?,
                 *last_n,
-                Some(topic.as_str()),
-                facet.as_deref(),
-                question.as_deref(),
+                request,
                 profile,
             )
             .await
@@ -217,15 +236,15 @@ pub(crate) async fn render_reflect_surface_for_session(
     facet: Option<&str>,
     question: Option<&str>,
 ) -> Result<String, String> {
-    render_reflect_surface_for_session_with_profile(
-        session_id,
-        journal_limit,
+    let request = ReflectRequest::from_observation_params(
         topic,
         facet,
-        question,
         None,
-    )
-    .await
+        None,
+        i32::try_from(journal_limit).unwrap_or(i32::MAX),
+        question.unwrap_or(""),
+    );
+    render_reflect_surface_for_session_with_profile(session_id, journal_limit, request, None).await
 }
 
 pub(crate) async fn try_render_reflect_surface_for_session_with_profile(
@@ -236,12 +255,18 @@ pub(crate) async fn try_render_reflect_surface_for_session_with_profile(
     question: Option<&str>,
     profile: Option<&str>,
 ) -> Result<Option<String>, String> {
+    let request = ReflectRequest::from_observation_params(
+        topic,
+        facet,
+        None,
+        None,
+        i32::try_from(journal_limit).unwrap_or(i32::MAX),
+        question.unwrap_or(""),
+    );
     match render_reflect_surface_for_session_with_profile(
         session_id,
         journal_limit,
-        topic,
-        facet,
-        question,
+        request,
         profile,
     )
     .await
@@ -260,26 +285,11 @@ fn reflect_surface_missing_state(error: &str) -> bool {
 pub(crate) async fn render_reflect_surface_for_session_with_profile(
     session_id: &str,
     journal_limit: usize,
-    topic: Option<&str>,
-    facet: Option<&str>,
-    question: Option<&str>,
+    request: ReflectRequest,
     profile: Option<&str>,
 ) -> Result<String, String> {
     let artifacts = self_surface::load_artifacts(session_id, profile).await?;
-    let topic = normalize_reflect_topic(topic);
-    let facet = normalize_reflect_facet(facet, topic);
-    to_json(
-        &build_reflect_response(
-            &artifacts,
-            journal_limit.max(1),
-            topic,
-            facet,
-            question
-                .map(str::trim)
-                .filter(|question| !question.is_empty()),
-        )
-        .await,
-    )
+    to_json(&build_reflect_response(&artifacts, journal_limit.max(1), request).await)
 }
 
 pub(crate) fn agent_info_surface_alias(dimension: &str) -> Option<&'static str> {
@@ -386,15 +396,14 @@ async fn resolve_default_session_id(profile: Option<&str>) -> Result<String, Str
 async fn build_reflect_response(
     artifacts: &SessionArtifacts,
     journal_limit: usize,
-    topic: &str,
-    facet: &str,
-    question: Option<&str>,
+    request: ReflectRequest,
 ) -> ReflectResponse {
     // The old reflection subsystem has been removed. Callers now get a
     // trimmed surface: the session id, the requested topic/facet/question, and
     // a journal preview filtered by the derived analysis view. Downstream UIs should read
     // `recent_turns` directly; `reflection_context` is intentionally minimal.
-    let analysis_view = analysis_view_for_topic_facet(topic, facet);
+    let analysis_view = request.analysis_view.clone();
+    let question = (!request.question.is_empty()).then(|| request.question.clone());
     let turns_completed = artifacts
         .journal_events
         .iter()
@@ -414,29 +423,56 @@ async fn build_reflect_response(
         .map(str::trim)
         .filter(|error| !error.is_empty())
         .map(|error| format!("session persistence degraded: {error}"));
+    let data_coverage = local_reflect_data_coverage(&request);
     let reflection_context = serde_json::json!({
         "session_id": artifacts.session_id,
         "turns_completed": turns_completed,
-        "topic": topic,
-        "facet": facet,
-        "analysis_view": analysis_view,
-        "question": question,
+        "topic": request.topic.clone(),
+        "facet": request.facet.clone(),
+        "depth": request.depth.clone(),
+        "horizon": request.horizon.clone(),
+        "source_policy": request.source_policy.clone(),
+        "include_context": request.include_context,
+        "analysis_view": analysis_view.clone(),
+        "question": question.clone(),
+        "data_coverage": data_coverage.clone(),
         "persistence_warning": persistence_warning.clone(),
         "note": "old reflection subsystem removed; see recent_turns for journal signals",
     });
-    let prompt_preview = match question {
+    let prompt_preview = match question.as_deref() {
         Some(q) => {
-            format!("Topic: {topic}\nFacet: {facet}\nAnalysis view: {analysis_view}\nQuestion: {q}")
+            format!(
+                "Topic: {}\nFacet: {}\nDepth: {}\nHorizon: {}\nSource policy: {}\nInclude context: {}\nAnalysis view: {analysis_view}\nQuestion: {q}",
+                request.topic,
+                request.facet,
+                request.depth,
+                request.horizon,
+                request.source_policy,
+                request.include_context
+            )
         }
-        None => format!("Topic: {topic}\nFacet: {facet}\nAnalysis view: {analysis_view}"),
+        None => format!(
+            "Topic: {}\nFacet: {}\nDepth: {}\nHorizon: {}\nSource policy: {}\nInclude context: {}\nAnalysis view: {analysis_view}",
+            request.topic,
+            request.facet,
+            request.depth,
+            request.horizon,
+            request.source_policy,
+            request.include_context
+        ),
     };
     ReflectResponse {
         session_id: artifacts.session_id.clone(),
-        topic: topic.to_string(),
-        facet: facet.to_string(),
+        topic: request.topic,
+        facet: request.facet,
+        depth: request.depth,
+        horizon: request.horizon,
+        source_policy: request.source_policy,
+        include_context: request.include_context,
         analysis_view: analysis_view.to_string(),
-        question: question.map(str::to_string),
+        question,
         persistence_warning,
+        data_coverage,
         reflection_context,
         prompt_preview,
         recent_turns: if artifacts.journal_events.is_empty() {
@@ -445,9 +481,45 @@ async fn build_reflect_response(
             analysis_view_recent_event_previews(
                 &artifacts.journal_events,
                 journal_limit,
-                analysis_view,
+                &analysis_view,
             )
         },
+    }
+}
+
+fn local_reflect_data_coverage(request: &ReflectRequest) -> LocalReflectDataCoverage {
+    let mut warnings = Vec::new();
+    if matches!(request.horizon.as_str(), "cross_session") {
+        warnings.push(
+            "cross_session horizon is not available from a single local session surface"
+                .to_string(),
+        );
+    }
+    if matches!(request.source_policy.as_str(), "cloud_only") {
+        warnings
+            .push("cloud_only source policy is not available from local CLI artifacts".to_string());
+    }
+    if matches!(request.source_policy.as_str(), "live_only") {
+        warnings.push(
+            "live_only source policy is bounded to persisted local turn artifacts in CLI mode"
+                .to_string(),
+        );
+    }
+    if request.include_context {
+        warnings.push(
+            "include_context requested, but local reflect only exposes persisted context summaries"
+                .to_string(),
+        );
+    }
+
+    LocalReflectDataCoverage {
+        overall: if warnings.is_empty() {
+            "fresh"
+        } else {
+            "partial"
+        },
+        source: "local_session_artifacts",
+        warnings,
     }
 }
 
@@ -599,64 +671,6 @@ fn event_preview(event: &JournalEvent) -> EventPreview {
         metadata: event.metadata.clone(),
         user_input_preview: event.user_input.as_deref().map(|s| truncate(s, 160)),
         assistant_output_preview: event.assistant_output.as_deref().map(|s| truncate(s, 160)),
-    }
-}
-
-fn normalize_reflect_topic(topic: Option<&str>) -> &'static str {
-    match topic
-        .unwrap_or("overview")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "runtime" => "runtime",
-        "execution" => "execution",
-        "knowledge" => "knowledge",
-        "adaptation" => "adaptation",
-        _ => "overview",
-    }
-}
-
-fn normalize_reflect_facet(facet: Option<&str>, topic: &str) -> &'static str {
-    match facet
-        .unwrap_or_else(|| default_reflect_facet_for_topic(topic))
-        .trim()
-        .to_ascii_lowercase()
-        .replace('-', "_")
-        .as_str()
-    {
-        "errors" | "failures" if topic == "execution" => "errors",
-        "trace" if topic == "execution" => "trace",
-        "tools" if topic == "execution" => "tools",
-        "performance" | "latency" | "cost" if topic == "runtime" => "performance",
-        "context" if topic == "knowledge" => "context",
-        "memory" if topic == "knowledge" => "memory",
-        "signals" if topic == "adaptation" => "signals",
-        "question" if topic == "overview" => "question",
-        "overview" if topic == "overview" => "overview",
-        _ => default_reflect_facet_for_topic(topic),
-    }
-}
-
-fn default_reflect_facet_for_topic(topic: &str) -> &'static str {
-    match topic {
-        "runtime" => "performance",
-        "execution" => "tools",
-        "knowledge" => "context",
-        "adaptation" => "signals",
-        _ => "overview",
-    }
-}
-
-fn analysis_view_for_topic_facet(topic: &str, facet: &str) -> &'static str {
-    match (topic, facet) {
-        ("execution", "errors" | "failures") => "execution_errors",
-        ("execution", "trace") => "execution_trace",
-        ("execution", _) => "execution_tools",
-        ("knowledge", _) => "knowledge_context",
-        ("runtime", _) => "runtime_performance",
-        ("adaptation", _) => "adaptation_signals",
-        _ => "overview",
     }
 }
 
@@ -989,6 +1003,7 @@ mod tests {
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
     };
+    use astra_services::reflect::ReflectRequest;
     use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
     use astra_services::session_journal::{
         self, JournalDirGuard, JournalEvent, JournalEventType, ToolCallRecord,
@@ -1593,7 +1608,15 @@ mod tests {
             latest_full_context_trace: None,
         };
 
-        let response = build_reflect_response(&artifacts, 4, "execution", "trace", None).await;
+        let request = ReflectRequest::from_observation_params(
+            Some("execution"),
+            Some("trace"),
+            None,
+            None,
+            4,
+            "",
+        );
+        let response = build_reflect_response(&artifacts, 4, request).await;
 
         assert_eq!(
             response.persistence_warning.as_deref(),

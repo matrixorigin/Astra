@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn reflect_hydration_rel_path_ignores_removed_focus() {
+    fn reflect_hydration_rel_path_ignores_legacy_query_params() {
         let p = reflect_hydration_rel_path("s", &json!({"focus": "bugs"}));
         assert!(p.starts_with("chat/session/s/reflect?"));
         assert!(!p.contains("focus="));

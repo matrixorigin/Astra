@@ -1206,8 +1206,31 @@ fn agent_schema_enum_does_not_advertise_delegate_action() {
 #[tokio::test]
 async fn execute_reflect_returns_placeholder() {
     let executor = test_executor();
-    let result = executor.execute("reflect", &json!({})).await;
-    assert!(result.contains("reflect_requires_session"), "got: {result}");
+    let result = executor
+        .execute(
+            "reflect",
+            &json!({
+                "topic": "execution",
+                "facet": "errors",
+                "depth": "forensic",
+                "horizon": "cross_session",
+                "source_policy": "cloud_only",
+                "include_context": true,
+                "question": "why did the command fail?",
+                "last_n": -10
+            }),
+        )
+        .await;
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["status"], "reflect_requires_session");
+    assert_eq!(value["topic"], "execution");
+    assert_eq!(value["facet"], "errors");
+    assert_eq!(value["depth"], "forensic");
+    assert_eq!(value["horizon"], "cross_session");
+    assert_eq!(value["source_policy"], "cloud_only");
+    assert_eq!(value["include_context"], true);
+    assert_eq!(value["question"], "why did the command fail?");
+    assert_eq!(value["last_n"], 1);
     assert!(
         !result.contains("focus"),
         "removed focus parameter should not appear in placeholder: {result}"
@@ -1309,14 +1332,41 @@ async fn execute_reflect_uses_local_surface_with_session() {
     let result = executor
         .execute(
             "reflect",
-            &json!({"topic": "runtime", "facet": "performance"}),
+            &json!({
+                "topic": "execution",
+                "facet": "trace",
+                "depth": "forensic",
+                "horizon": "cross_session",
+                "source_policy": "cloud_only",
+                "include_context": true
+            }),
         )
         .await;
     let value: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(value["session_id"], session_id);
-    assert_eq!(value["topic"], "runtime");
-    assert_eq!(value["facet"], "performance");
-    assert_eq!(value["analysis_view"], "runtime_performance");
+    assert_eq!(value["topic"], "execution");
+    assert_eq!(value["facet"], "trace");
+    assert_eq!(value["depth"], "forensic");
+    assert_eq!(value["horizon"], "cross_session");
+    assert_eq!(value["source_policy"], "cloud_only");
+    assert_eq!(value["include_context"], true);
+    assert_eq!(value["analysis_view"], "execution_trace");
+    assert_eq!(value["data_coverage"]["overall"], "partial");
+    let warnings = value["data_coverage"]["warnings"]
+        .as_array()
+        .expect("coverage warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("cross_session"))),
+        "cross-session local reflect requests must report partial coverage: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("cloud_only"))),
+        "cloud-only local reflect requests must report partial coverage: {warnings:?}"
+    );
     // Old reflection subsystem removed. `recent_turns` surfaces the
     // topic-scoped journal preview that downstream UIs read directly.
     let recent = value["recent_turns"].as_array().expect("recent_turns");

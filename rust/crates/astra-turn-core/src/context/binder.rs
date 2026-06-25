@@ -527,22 +527,28 @@ mod tests {
         let mut fixture = test_sources();
         fixture.session.project_context = "prior-session-summary-stub".to_string();
         fixture.session.deferred_tools_block =
-            "<deferred_tools>\n  <tool>\n    <name>web_fetch</name>\n    <description>fetch web content</description>\n  </tool>\n</deferred_tools>".to_string();
+            "<deferred-tools>\nweb_fetch\n</deferred-tools>".to_string();
         let sources = fixture.context();
         let project_context = bind_project_context(&sources);
         let content = bind_deferred_tools(&sources);
 
         assert!(
-            !project_context.contains("<deferred_tools>"),
+            !project_context.contains("<deferred-tools>"),
             "ProjectContext must not mix tool discovery into the same cache section"
         );
         assert!(
-            content.contains("<deferred_tools>"),
+            content.contains("<deferred-tools>"),
             "deferred_tools section must preserve the manifest block; got:\n{content}"
         );
         assert!(
-            content.contains("<name>web_fetch</name>"),
+            content.contains("\nweb_fetch\n"),
             "entries from the block must be preserved verbatim"
+        );
+        assert!(
+            !content.contains("<tool>")
+                && !content.contains("<name>")
+                && !content.contains("<description>"),
+            "deferred tools must stay as a plain name list: {content}"
         );
     }
 
@@ -570,7 +576,7 @@ mod tests {
     fn bind_all_keeps_project_deferred_and_skill_catalog_as_ordered_session_sections() {
         let mut fixture = test_sources();
         fixture.session.project_context = "prior-session-summary-stub".to_string();
-        fixture.session.deferred_tools_block = "<deferred_tools>x</deferred_tools>".to_string();
+        fixture.session.deferred_tools_block = "<deferred-tools>x</deferred-tools>".to_string();
         fixture.session.skill_listing_block = "<available_skills>y</available_skills>".to_string();
         let sources = fixture.context();
         let plan_input = crate::context_planner::PlanInput {
@@ -615,7 +621,7 @@ mod tests {
         );
         assert_eq!(
             bound.sections[1].artifact.text().unwrap(),
-            "<deferred_tools>x</deferred_tools>"
+            "<deferred-tools>x</deferred-tools>"
         );
         assert_eq!(
             bound.sections[2].artifact.text().unwrap(),

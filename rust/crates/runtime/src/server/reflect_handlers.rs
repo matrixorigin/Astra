@@ -70,22 +70,22 @@ fn non_empty(value: &str) -> Option<&str> {
 }
 
 #[derive(Deserialize)]
-pub(super) struct LearningFeedbackRequest {
+pub(super) struct FeedbackSignalRequest {
     pub event_id: String,
     pub satisfaction_score: Option<i64>,
 }
 
 #[derive(Serialize)]
-pub(super) struct LearningFeedbackResponse {
+pub(super) struct FeedbackSignalResponse {
     pub status: String,
     pub message: String,
 }
 
-pub(super) async fn learning_feedback_handler(
+pub(super) async fn feedback_signal_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<LearningFeedbackRequest>,
-) -> Result<Json<LearningFeedbackResponse>, (StatusCode, Json<ErrorResponse>)> {
+    Json(request): Json<FeedbackSignalRequest>,
+) -> Result<Json<FeedbackSignalResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let record = state
         .learning_feedback_service
@@ -95,7 +95,7 @@ pub(super) async fn learning_feedback_handler(
             satisfaction_score: request.satisfaction_score,
         })
         .await?;
-    Ok(Json(LearningFeedbackResponse {
+    Ok(Json(FeedbackSignalResponse {
         status: record.status,
         message: record.message,
     }))

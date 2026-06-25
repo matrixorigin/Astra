@@ -5,6 +5,7 @@
 //! plane instead of running an implicit in-process rule engine.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::SystemTime;
 
@@ -152,7 +153,7 @@ impl StreamingSpeculationStats {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FeedbackBuffer {
     signals: VecDeque<FeedbackSignal>,
 }
@@ -162,6 +163,7 @@ pub struct FeedbackSignalStore {
     buffer: RwLock<FeedbackBuffer>,
     max_signals: usize,
     streaming_spec: RwLock<StreamingSpeculationStats>,
+    storage_path: Option<PathBuf>,
 }
 
 impl Default for FeedbackSignalStore {
@@ -177,16 +179,40 @@ impl FeedbackSignalStore {
             buffer: RwLock::new(FeedbackBuffer::default()),
             max_signals: DEFAULT_MAX_SIGNALS,
             streaming_spec: RwLock::new(StreamingSpeculationStats::default()),
+            storage_path: None,
+        }
+    }
+
+    /// Create a feedback signal store backed by a JSON file.
+    ///
+    /// Corrupt or unreadable storage starts empty; the next successful record
+    /// rewrites the file with a valid bounded snapshot.
+    pub fn with_storage(path: PathBuf) -> Self {
+        let mut buffer = if path.exists() {
+            match std::fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+                Err(_) => FeedbackBuffer::default(),
+            }
+        } else {
+            FeedbackBuffer::default()
+        };
+        trim_buffer(&mut buffer, DEFAULT_MAX_SIGNALS);
+        Self {
+            buffer: RwLock::new(buffer),
+            max_signals: DEFAULT_MAX_SIGNALS,
+            streaming_spec: RwLock::new(StreamingSpeculationStats::default()),
+            storage_path: Some(path),
         }
     }
 
     /// Record a new feedback signal.
     pub fn record(&self, signal: FeedbackSignal) {
-        let mut buffer = self.buffer.write().unwrap_or_else(|e| e.into_inner());
-        buffer.signals.push_back(signal);
-        while buffer.signals.len() > self.max_signals {
-            buffer.signals.pop_front();
+        {
+            let mut buffer = self.buffer.write().unwrap_or_else(|e| e.into_inner());
+            buffer.signals.push_back(signal);
+            trim_buffer(&mut buffer, self.max_signals);
         }
+        self.persist();
     }
 
     /// Return retained signals from oldest to newest.
@@ -221,6 +247,41 @@ impl FeedbackSignalStore {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+
+    /// Persist retained feedback signals using an atomic rename.
+    pub fn persist(&self) {
+        let Some(path) = &self.storage_path else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("[feedback-signals] failed to create storage directory: {err}");
+            return;
+        }
+        let data = {
+            let buffer = self.buffer.read().unwrap_or_else(|e| e.into_inner());
+            let Ok(data) = serde_json::to_vec_pretty(&*buffer) else {
+                return;
+            };
+            data
+        };
+        let tmp = path.with_extension("tmp");
+        if let Err(err) = std::fs::write(&tmp, data) {
+            eprintln!("[feedback-signals] failed to write temp file: {err}");
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!("[feedback-signals] failed to rename temp file: {err}");
+        }
+    }
+}
+
+fn trim_buffer(buffer: &mut FeedbackBuffer, max_signals: usize) {
+    while buffer.signals.len() > max_signals {
+        buffer.signals.pop_front();
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +300,46 @@ mod tests {
         assert_eq!(signals[0].turn_id.as_deref(), Some("t1"));
         assert_eq!(signals[1].turn_id.as_deref(), Some("t2"));
         assert_eq!(signals[1].signal_type.type_name(), "correction");
+    }
+
+    #[test]
+    fn persists_and_reloads_feedback_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("feedback-signals.json");
+
+        let store = FeedbackSignalStore::with_storage(path.clone());
+        store.record(FeedbackSignal::new(SignalType::TaskSuccess).with_turn("t1"));
+        store.record(FeedbackSignal::new(SignalType::Correction).with_turn("t2"));
+
+        let reloaded = FeedbackSignalStore::with_storage(path);
+        let signals = reloaded.recent_signals();
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].turn_id.as_deref(), Some("t1"));
+        assert_eq!(signals[1].turn_id.as_deref(), Some("t2"));
+        assert_eq!(signals[1].signal_type, SignalType::Correction);
+    }
+
+    #[test]
+    fn storage_recovers_from_corrupt_file_on_next_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("feedback-signals.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not-json").unwrap();
+
+        let store = FeedbackSignalStore::with_storage(path.clone());
+        assert!(store.recent_signals().is_empty());
+
+        store.record(FeedbackSignal::new(SignalType::TaskFailure {
+            reason: "bad output".to_string(),
+        }));
+
+        let reloaded = FeedbackSignalStore::with_storage(path);
+        let signals = reloaded.recent_signals();
+        assert_eq!(signals.len(), 1);
+        assert!(matches!(
+            signals[0].signal_type,
+            SignalType::TaskFailure { ref reason } if reason == "bad output"
+        ));
     }
 
     #[test]

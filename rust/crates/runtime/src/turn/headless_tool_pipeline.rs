@@ -200,7 +200,7 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub messages: &'a mut Vec<Value>,
     pub tool_results: &'a mut Vec<Value>,
     pub valid_tool_names: &'a HashSet<String>,
-    /// Names listed in this turn's rendered `<deferred_tools>` manifest.
+    /// Names listed in this turn's rendered `<deferred-tools>` manifest.
     /// Used by the validator to differentiate "unknown" denials (truly
     /// hallucinated) from prompt-advertised names whose activation may still
     /// be blocked by runtime binding or fail-closed surface policy. When

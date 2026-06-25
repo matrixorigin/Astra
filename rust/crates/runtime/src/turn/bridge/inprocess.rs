@@ -2296,7 +2296,7 @@ impl InProcessChatTurnBridge {
                 &dynamic_sections,
             );
             // Compute session-stable skill context. Selector-based
-            // `<deferred_tools>` was removed; skills are surfaced through the
+            // `<deferred-tools>` was removed; skills are surfaced through the
             // full `<available_skills>` catalog in `CacheScope::Session`, so a
             // catalog change flips the cache once then stabilizes.
             //
@@ -7891,9 +7891,7 @@ mod tests {
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
                 .to_string(),
-            Value::String(
-                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
-            ),
+            Value::String("<deferred-tools>\ngithub\n</deferred-tools>".to_string()),
         );
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
@@ -7912,7 +7910,7 @@ mod tests {
 
         let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o-2024-08-06");
         assert!(
-            block.contains("<deferred_tools>"),
+            block.contains("<deferred-tools>"),
             "same effective context budget should preserve the CLI-rendered deferred block"
         );
     }
@@ -7923,9 +7921,7 @@ mod tests {
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
                 .to_string(),
-            Value::String(
-                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
-            ),
+            Value::String("<deferred-tools>\ngithub\n</deferred-tools>".to_string()),
         );
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
@@ -7950,9 +7946,7 @@ mod tests {
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
                 .to_string(),
-            Value::String(
-                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
-            ),
+            Value::String("<deferred-tools>\ngithub\n</deferred-tools>".to_string()),
         );
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
@@ -7977,9 +7971,7 @@ mod tests {
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
                 .to_string(),
-            Value::String(
-                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
-            ),
+            Value::String("<deferred-tools>\ngithub\n</deferred-tools>".to_string()),
         );
 
         let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o");
@@ -7995,9 +7987,7 @@ mod tests {
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
                 .to_string(),
-            Value::String(
-                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
-            ),
+            Value::String("<deferred-tools>\ngithub\n</deferred-tools>".to_string()),
         );
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW

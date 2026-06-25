@@ -47,7 +47,7 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub messages: &'a mut Vec<Value>,
     pub tool_results: &'a mut Vec<Value>,
     pub valid_tool_names: &'a HashSet<String>,
-    /// Names listed in this turn's `<deferred_tools>` manifest. Empty when
+    /// Names listed in this turn's `<deferred-tools>` manifest. Empty when
     /// the surface produced no deferred listing for this turn. Threaded into
     /// [`HeadlessToolExecutionCtx::deferred_tool_names`] so the validator can
     /// emit the activation hint instead of "Unknown tool" for these names.

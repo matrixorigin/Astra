@@ -62,11 +62,12 @@ impl ObservabilityHub {
         }
 
         let profile_path = observability_storage_file(&storage_root, "profiles.json");
+        let feedback_path = observability_storage_file(&storage_root, "feedback-signals.json");
         let outcomes_path = observability_storage_file(&storage_root, "delegation-outcomes.json");
         let profile_store = Arc::new(UserProfileStore::with_storage(profile_path));
         Self {
             profile_manager: UserProfileManager::new(profile_store),
-            feedback_signals: FeedbackSignalStore::new(),
+            feedback_signals: FeedbackSignalStore::with_storage(feedback_path),
             delegation_outcomes: DelegationOutcomeTracker::with_storage(outcomes_path),
             sessions: RwLock::new(HashMap::new()),
             low_confidence_tools: Mutex::new(Vec::new()),
@@ -278,9 +279,6 @@ impl ObservabilityHub {
 }
 
 fn observability_storage_file(root: &std::path::Path, filename: &str) -> std::path::PathBuf {
-    if root.extension().is_some() {
-        return root.to_path_buf();
-    }
     root.join(filename)
 }
 
@@ -534,3 +532,42 @@ pub fn on_turn_end(hub: &ObservabilityHub, session: &mut ObservabilitySession, t
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_storage_persists_feedback_signals_across_hub_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let hub = ObservabilityHub::with_storage(dir.path().to_path_buf());
+        hub.record_feedback(FeedbackSignal::new(SignalType::Correction).with_turn("turn-1"));
+        drop(hub);
+
+        let reloaded = ObservabilityHub::with_storage(dir.path().to_path_buf());
+        let signals = reloaded.recent_feedback_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(signals[0].signal_type, SignalType::Correction);
+        assert!(
+            dir.path().join("feedback-signals.json").exists(),
+            "feedback signals must be stored beside the other observation-plane files"
+        );
+    }
+
+    #[test]
+    fn observability_storage_files_are_isolated_under_root_directory() {
+        let root = std::path::PathBuf::from("/tmp/observability.json");
+
+        assert_eq!(
+            observability_storage_file(&root, "profiles.json"),
+            root.join("profiles.json")
+        );
+        assert_ne!(
+            observability_storage_file(&root, "profiles.json"),
+            observability_storage_file(&root, "feedback-signals.json"),
+            "profile and feedback stores must never share the same JSON file"
+        );
+    }
+}

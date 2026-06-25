@@ -139,7 +139,7 @@ pub struct SessionContext {
     pub project_context: String,
     pub edge_profile: EdgeProfile,
     pub self_model: Option<String>,
-    /// Pre-rendered `<deferred_tools>` system block. Session-scoped so it
+    /// Pre-rendered `<deferred-tools>` system block. Session-scoped so it
     /// joins the cached prefix. Empty when no tools are deferred.
     pub deferred_tools_block: String,
     /// Pre-rendered `<available_skills>` system block. Session-scoped.

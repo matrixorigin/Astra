@@ -298,7 +298,7 @@ pub trait AgenticLoopHost: Send {
     /// Valid tool names from the host's tool schemas.
     fn valid_tool_names(&self) -> &HashSet<String>;
 
-    /// Names listed in the current turn's `<deferred_tools>` manifest.
+    /// Names listed in the current turn's `<deferred-tools>` manifest.
     ///
     /// The validator uses this to differentiate "unknown tool" denials
     /// (truly hallucinated names) from "not yet activated" denials

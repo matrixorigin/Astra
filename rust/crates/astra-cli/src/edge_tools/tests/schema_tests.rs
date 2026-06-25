@@ -615,6 +615,21 @@ fn local_cli_catalog_includes_plan_mode_wrappers() {
 fn local_cli_catalog_includes_normalized_reflect_schema() {
     let schemas = crate::edge_tools::local_tool_schemas();
     let reflect = tool_schema(&schemas, "reflect");
+    let shared_schemas = astra_tools::schemas::all_tool_schemas();
+    let shared_reflect = tool_schema(&shared_schemas, "reflect");
+    assert_eq!(
+        reflect, shared_reflect,
+        "local CLI reflect schema must come from astra-tools, not a second hard-coded copy"
+    );
+    assert_eq!(
+        schemas
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .filter(|name| *name == "reflect")
+            .count(),
+        1,
+        "local CLI catalog must not append a duplicate reflect fallback"
+    );
     let properties = reflect["function"]["parameters"]["properties"]
         .as_object()
         .expect("reflect parameters must expose properties");

@@ -820,7 +820,7 @@ pub struct ServerAgenticLoopHost {
     capabilities: astra_turn_core::capability::CapabilitySet,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
-    /// Names from this turn's rendered `<deferred_tools>` manifest after
+    /// Names from this turn's rendered `<deferred-tools>` manifest after
     /// removing tools that are already visible in the final wire `tools[]`.
     /// This mirrors what the model was told, even if a runtime binding later
     /// makes some names non-activatable.
@@ -2303,7 +2303,7 @@ impl ServerAgenticLoopHost {
                     if let Some(executor) = self.current_server_tool_executor.as_ref() {
                         executor.record_direct_deferred_call_activation(&name);
                     }
-                    astra_turn_core::tool::deferred_activation::direct_deferred_call_activated_message(
+                    astra_turn_core::tool::deferred_activation::direct_deferred_call_activation_message(
                         &name,
                     )
                 }
@@ -4993,16 +4993,16 @@ mod tests {
 
     fn deferred_manifest_edge_profile(names: &[&str], model: &str) -> Map<String, Value> {
         let mut edge_profile = Map::new();
-        let tools_xml = names
+        let tools_list = names
             .iter()
             .filter(|name| !name.trim().is_empty())
-            .map(|name| format!("<tool><name>{}</name></tool>", name.trim()))
+            .map(|name| name.trim())
             .collect::<Vec<_>>()
-            .join("");
+            .join("\n");
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
                 .to_string(),
-            Value::String(format!("<deferred_tools>{tools_xml}</deferred_tools>")),
+            Value::String(format!("<deferred-tools>\n{tools_list}\n</deferred-tools>")),
         );
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
@@ -5536,7 +5536,7 @@ mod tests {
             .expect("server context pipeline should assemble without deferred metadata");
         let text = pipeline_outcome_text(&outcome);
         assert!(
-            !text.contains("<deferred_tools>"),
+            !text.contains("<deferred-tools>"),
             "prompt must not advertise deferred tools that activation/search will reject: {text}"
         );
     }
@@ -5667,7 +5667,7 @@ mod tests {
         let text = pipeline_outcome_text(&outcome);
 
         assert!(
-            text.contains("<deferred_tools>") && text.contains("github"),
+            text.contains("<deferred-tools>") && text.contains("github"),
             "server prompt must include the same deferred manifest that validator/tool_search consume: {text}"
         );
     }
@@ -5807,11 +5807,11 @@ mod tests {
             .expect("server context pipeline should assemble without a partial deferred manifest");
         let text = pipeline_outcome_text(&outcome);
         assert!(
-            text.contains("<deferred_tools>") && text.contains("<name>github</name>"),
+            text.contains("<deferred-tools>") && text.contains("github"),
             "prompt must keep the still-activatable deferred tool: {text}"
         );
         assert!(
-            !text.contains("<name>bash</name>"),
+            !text.contains("bash"),
             "prompt must filter names that are already visible in tools[]: {text}"
         );
     }
@@ -5861,7 +5861,7 @@ mod tests {
             .expect("server context pipeline should assemble without unavailable deferred tools");
         let text = pipeline_outcome_text(&outcome);
         assert!(
-            !text.contains("<deferred_tools>"),
+            !text.contains("<deferred-tools>"),
             "prompt must not advertise a deferred tool whose runtime binding is absent: {text}"
         );
 
@@ -5992,11 +5992,11 @@ mod tests {
             .expect("server context pipeline should assemble with runtime-bound deferred subset");
         let text = pipeline_outcome_text(&outcome);
         assert!(
-            text.contains("<deferred_tools>") && text.contains("<name>github</name>"),
+            text.contains("<deferred-tools>") && text.contains("github"),
             "prompt must keep the still-bound deferred tool: {text}"
         );
         assert!(
-            !text.contains("<name>agent_fanout</name>"),
+            !text.contains("agent_fanout"),
             "prompt must filter deferred tools without a runtime binding: {text}"
         );
 

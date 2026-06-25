@@ -151,7 +151,7 @@ fn manifest_for_model(
             target: LOG_TARGET,
             model = resolved_model_name,
             declared_count = declared_names.len(),
-            "deferred tool manifest omitted because rendered text contains no <name> entries"
+            "deferred tool manifest omitted because rendered text contains no name lines"
         );
         return None;
     }
@@ -192,63 +192,60 @@ fn manifest_for_model(
 }
 
 fn rendered_name_keys_from_block(block: &str) -> HashSet<String> {
-    const OPEN: &str = "<name>";
-    const CLOSE: &str = "</name>";
-
-    let mut names = HashSet::new();
-    let mut rest = block;
-    while let Some(open_idx) = rest.find(OPEN) {
-        let after_open = &rest[open_idx + OPEN.len()..];
-        let Some(close_idx) = after_open.find(CLOSE) else {
-            break;
-        };
-        let name = after_open[..close_idx].trim();
-        if !name.is_empty() {
-            names.insert(name.to_string());
-        }
-        rest = &after_open[close_idx + CLOSE.len()..];
-    }
-    names
+    deferred_tools_body(block)
+        .into_iter()
+        .flat_map(str::lines)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn filter_block_to_names(block: &str, names: &HashSet<String>) -> Option<String> {
-    const OPEN_TOOL: &str = "<tool>";
-    const CLOSE_TOOL: &str = "</tool>";
-
     let allowed_name_keys: HashSet<String> = names
         .iter()
         .map(|name| xml_escape_text(name).into_owned())
         .collect();
-    let mut rendered = String::with_capacity(block.len());
-    let mut rest = block;
-    let mut kept = 0usize;
+    let (prefix, body, suffix) = split_deferred_tools_block(block)?;
+    let retained: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| allowed_name_keys.contains(*line))
+        .collect();
 
-    while let Some(open_idx) = rest.find(OPEN_TOOL) {
-        rendered.push_str(&rest[..open_idx]);
-        let from_tool = &rest[open_idx..];
-        let Some(close_idx) = from_tool.find(CLOSE_TOOL) else {
-            tracing::warn!(
-                target: LOG_TARGET,
-                "deferred tool manifest XML parse failed: unclosed <tool> tag at offset {}",
-                open_idx
-            );
-            break;
-        };
-        let close_end = close_idx + CLOSE_TOOL.len();
-        let tool_block = &from_tool[..close_end];
-        let block_names = rendered_name_keys_from_block(tool_block);
-        if block_names
-            .iter()
-            .any(|name| allowed_name_keys.contains(name))
-        {
-            rendered.push_str(tool_block);
-            kept += 1;
-        }
-        rest = &from_tool[close_end..];
+    if retained.is_empty() {
+        return None;
     }
-    rendered.push_str(rest);
 
-    if kept == 0 { None } else { Some(rendered) }
+    let mut rendered = String::with_capacity(block.len());
+    rendered.push_str(prefix.trim_end_matches('\n'));
+    rendered.push('\n');
+    for name in retained {
+        rendered.push_str(name);
+        rendered.push('\n');
+    }
+    rendered.push_str(suffix.trim_start_matches('\n'));
+    Some(rendered)
+}
+
+fn deferred_tools_body(block: &str) -> Option<&str> {
+    let (_, body, _) = split_deferred_tools_block(block)?;
+    Some(body)
+}
+
+fn split_deferred_tools_block(block: &str) -> Option<(&str, &str, &str)> {
+    const OPEN: &str = "<deferred-tools>";
+    const CLOSE: &str = "</deferred-tools>";
+
+    let open_idx = block.find(OPEN)?;
+    let body_start = open_idx + OPEN.len();
+    let close_rel = block[body_start..].find(CLOSE)?;
+    let close_idx = body_start + close_rel;
+    Some((
+        &block[..body_start],
+        &block[body_start..close_idx],
+        &block[close_idx..],
+    ))
 }
 
 #[cfg(test)]
@@ -262,20 +259,15 @@ mod tests {
         model: &str,
     ) -> Map<String, Value> {
         let mut edge_profile = Map::new();
-        let tools_xml = rendered_names
+        let tools_list = rendered_names
             .iter()
-            .map(|name| {
-                format!(
-                    "  <tool>\n    <name>{}</name>\n    <description>{} tool</description>\n  </tool>\n",
-                    name.trim(),
-                    name.trim()
-                )
-            })
-            .collect::<String>();
+            .map(|name| name.trim())
+            .collect::<Vec<_>>()
+            .join("\n");
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
                 .to_string(),
-            Value::String(format!("<deferred_tools>\n{tools_xml}</deferred_tools>")),
+            Value::String(format!("<deferred-tools>\n{tools_list}\n</deferred-tools>")),
         );
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
@@ -303,7 +295,10 @@ mod tests {
         assert_eq!(names, HashSet::from(["agent_fanout".to_string()]));
         let block = block_for_model(&edge_profile, "gpt-4o")
             .expect("consistent deferred manifest should render");
-        assert!(block.contains("<name>agent_fanout</name>"));
+        assert!(block.contains("\nagent_fanout\n"));
+        assert!(!block.contains("<tool>"));
+        assert!(!block.contains("<name>"));
+        assert!(!block.contains("<description>"));
     }
 
     #[test]
@@ -338,8 +333,10 @@ mod tests {
         )
         .expect("filtered manifest should keep allowed names");
 
-        assert!(block.contains("<name>github</name>"));
-        assert!(!block.contains("<name>agent_fanout</name>"));
+        assert!(block.contains("\ngithub\n"));
+        assert!(!block.contains("\nagent_fanout\n"));
+        assert!(!block.contains("<tool>"));
+        assert!(!block.contains("<name>"));
     }
 
     #[test]
@@ -369,6 +366,28 @@ mod tests {
         assert!(
             block_for_model(&edge_profile, "gpt-4o").is_none(),
             "the model must not see deferred tools that activation/search will not honor"
+        );
+    }
+
+    #[test]
+    fn names_and_block_for_model_reject_legacy_schema_like_xml_manifest() {
+        let mut edge_profile = deferred_profile(&["github"], &["github"], "gpt-4o");
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            Value::String(
+                "<deferred-tools><tool><name>github</name><description>GitHub</description></tool></deferred-tools>"
+                    .to_string(),
+            ),
+        );
+
+        assert!(
+            names_for_model(&edge_profile, Some("gpt-4o")).is_empty(),
+            "legacy schema-like deferred manifests must not be activatable"
+        );
+        assert!(
+            block_for_model(&edge_profile, "gpt-4o").is_none(),
+            "legacy schema-like deferred manifests must not be shown to the model"
         );
     }
 }

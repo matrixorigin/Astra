@@ -242,7 +242,7 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/api/v1/learning/feedback",
-            post(reflect_handlers::learning_feedback_handler),
+            post(reflect_handlers::feedback_signal_handler),
         )
         .route(
             "/agents/edge/heartbeat",

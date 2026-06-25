@@ -1035,7 +1035,7 @@ mod tests {
                 ErrorKind::ToolInvalidArgs,
             ),
             (
-                "Error: Tool 'agent_fanout' is not available in this turn yet. It appears in `<deferred_tools>`, so first call `tool_search`.",
+                "Error: Tool 'agent_fanout' is not available in this turn yet. It appears in `<deferred-tools>`, so first call `tool_search`.",
                 ErrorKind::ToolInvalidArgs,
             ),
             // ToolUnavailable

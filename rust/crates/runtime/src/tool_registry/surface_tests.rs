@@ -411,7 +411,7 @@ fn deferred_manifest_is_atomic_text_budget_and_names() {
         .deferred_manifest(Some("gpt-4o"))
         .expect("default surface should have deferred tools");
 
-    assert!(manifest.text.contains("<deferred_tools>"));
+    assert!(manifest.text.contains("<deferred-tools>"));
     assert_eq!(
         manifest.context_window,
         crate::prompts::budget_for_model(Some("gpt-4o")).model_limit
@@ -465,7 +465,7 @@ fn deferred_manifest_names_follow_rendered_budget_subset() {
     );
     for name in &manifest.names {
         assert!(
-            manifest.text.contains(&format!("<name>{name}</name>")),
+            manifest.text.contains(&format!("\n{name}\n")),
             "manifest exposed {name}, but the prompt block did not render that name: {}",
             manifest.text
         );
@@ -484,8 +484,15 @@ fn deferred_manifest_names_follow_rendered_budget_subset() {
         "manifest must expose every deferred tool omitted by the rendered budget"
     );
     assert!(
-        !manifest.text.contains(&format!("<name>{omitted}</name>")),
+        !manifest.text.contains(&format!("\n{omitted}\n")),
         "test setup expected {omitted} to be omitted from rendered prompt"
+    );
+    assert!(
+        !manifest.text.contains("<tool>")
+            && !manifest.text.contains("<name>")
+            && !manifest.text.contains("<description>"),
+        "deferred manifest must be a pure name list, not schema-like XML: {}",
+        manifest.text
     );
 }
 
