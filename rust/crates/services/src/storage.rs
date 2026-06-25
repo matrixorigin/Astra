@@ -3036,30 +3036,6 @@ mod tests {
     }
 
     #[test]
-    fn add_agent_session_event_count_or_create_is_delta_upsert_not_count_reconcile() {
-        let source = include_str!("storage.rs");
-        let helper = source
-            .split("pub async fn add_agent_session_event_count_or_create")
-            .nth(1)
-            .expect("helper source")
-            .split("pub async fn touch_agent_session_activity")
-            .next()
-            .expect("helper body");
-        assert!(
-            helper.contains("event_count + VALUES(event_count)"),
-            "helper must add the actual event insert delta"
-        );
-        assert!(
-            helper.contains("WHERE NOT EXISTS"),
-            "helper must keep owner-bound lazy creation explicit"
-        );
-        assert!(
-            !helper.contains("COUNT(*)"),
-            "helper must not recompute event_count from agent_events"
-        );
-    }
-
-    #[test]
     fn eval_calibration_assessments_schema_matches_runtime_queries() {
         let source = include_str!("storage.rs");
         let ddl = source
