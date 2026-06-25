@@ -323,9 +323,7 @@ pub(crate) async fn list_sessions_handler(
     Query(query): Query<SessionListQuery>,
 ) -> Result<Json<SessionListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let cursor = query
-        .cursor()
-        .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+    let cursor = query.cursor()?;
     let sessions = state
         .session_service
         .list_sessions(SessionListFilter {
@@ -1354,14 +1352,7 @@ pub(crate) async fn session_activity_handler(
 
     let activities = state
         .session_service
-        .get_session_activity(
-            session_id,
-            user.user_id,
-            query.limit,
-            query
-                .cursor()
-                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?,
-        )
+        .get_session_activity(session_id, user.user_id, query.limit, query.cursor()?)
         .await?;
     Ok(Json(SessionActivityResponse::from(activities)))
 }

@@ -999,7 +999,7 @@ pub struct SkillListQuery {
 }
 
 impl SkillListQuery {
-    pub fn cursor(&self) -> Result<Option<SkillListCursor>, &'static str> {
+    pub fn cursor(&self) -> Result<Option<SkillListCursor>, (StatusCode, Json<ErrorResponse>)> {
         match (
             &self.after_skill_name,
             &self.after_version,
@@ -1011,9 +1011,10 @@ impl SkillListQuery {
                 version: version.clone(),
                 skill_id: skill_id.clone(),
             })),
-            _ => Err(
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
                 "skill list cursor requires after_skill_name, after_version, and after_skill_id",
-            ),
+            )),
         }
     }
 }
@@ -1143,8 +1144,10 @@ mod tests {
     fn skill_list_query_requires_complete_cursor() {
         let q: SkillListQuery =
             serde_json::from_str(r#"{"after_skill_name":"alpha","after_version":"1.0"}"#).unwrap();
+        let (status, body) = q.cursor().unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
-            q.cursor().unwrap_err(),
+            body.detail,
             "skill list cursor requires after_skill_name, after_version, and after_skill_id"
         );
     }

@@ -98,7 +98,8 @@ describe("AstraClient — Auth", () => {
       display_name: null,
     });
     await client.getMe().catch(() => {});
-    const headers = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers;
+    const headers = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0][1].headers;
     expect(headers["Authorization"]).toBeUndefined();
   });
 
@@ -184,9 +185,9 @@ describe("AstraClient — Sessions", () => {
 
     const result = await createClient().getSession("s2");
     expect(result.sessionId).toBe("s2");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/sessions/s2",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/sessions/s2");
   });
 
   test("getRuntimeSession returns raw metadata", async () => {
@@ -237,7 +238,8 @@ describe("AstraClient — Sessions", () => {
     });
     expect(result.total).toBe(3);
     expect(result.next_cursor?.session_id).toBe("s1");
-    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
     expect(url).toContain("limit=2");
     expect(url).toContain("after_updated_at=2026-04-01T10%3A00%3A00.123456");
     expect(url).toContain("after_session_id=s1");
@@ -379,28 +381,28 @@ describe("AstraClient — Runs", () => {
   test("cancelRun", async () => {
     globalThis.fetch = mockFetch(200);
     await createClient().cancelRun("r1");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/chat/runs/r1",
-    );
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].method).toBe(
-      "DELETE",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/chat/runs/r1");
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].method,
+    ).toBe("DELETE");
   });
 
   test("pauseRun", async () => {
     globalThis.fetch = mockFetch(200);
     await createClient().pauseRun("r1");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/chat/runs/r1/pause",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/chat/runs/r1/pause");
   });
 
   test("resumeRun", async () => {
     globalThis.fetch = mockFetch(200);
     await createClient().resumeRun("r1");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/chat/runs/r1/resume",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/chat/runs/r1/resume");
   });
 
   test("getRunEvents with startIndex", async () => {
@@ -411,9 +413,9 @@ describe("AstraClient — Runs", () => {
 
     const events = await createClient().getRunEvents("r1", 5);
     expect(events).toHaveLength(2);
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "last_index=5",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("last_index=5");
   });
 
   test("getRunProjection uses bounded projection endpoint", async () => {
@@ -549,26 +551,26 @@ describe("AstraClient — Runs", () => {
     });
     const r = await createClient().listDelegations("r0");
     expect(r.sub_run_ids).toEqual(["sr1"]);
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/delegations",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/delegations");
   });
 
   test("pauseDelegations", async () => {
     globalThis.fetch = mockFetch(200, { parent_run_id: "r0", affected: 2 });
     const r = await createClient().pauseDelegations("r0");
     expect(r.affected).toBe(2);
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/delegations/pause",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/delegations/pause");
   });
 
   test("resumeDelegations", async () => {
     globalThis.fetch = mockFetch(200, { parent_run_id: "r0", affected: 1 });
     await createClient().resumeDelegations("r0");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/delegations/resume",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/delegations/resume");
   });
 });
 
@@ -627,7 +629,8 @@ describe("AstraClient — Session lifecycle and reflect", () => {
       limit: 5,
     });
     expect(result.items).toEqual([]);
-    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
     expect(url).toContain("/sessions/sx/transcript");
     expect(url).toContain("before_seq=10");
     expect(url).toContain("limit=5");
@@ -640,7 +643,8 @@ describe("AstraClient — Session lifecycle and reflect", () => {
       offset: 5,
     });
     expect(result.artifacts).toEqual([]);
-    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
     expect(url).toContain("/sessions/sx/artifacts");
     expect(url).toContain("limit=50");
     expect(url).toContain("offset=5");
@@ -649,25 +653,25 @@ describe("AstraClient — Session lifecycle and reflect", () => {
   test("closeSession", async () => {
     globalThis.fetch = mockFetch(200, sessWire);
     await createClient().closeSession("sx");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/sessions/sx/close",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/sessions/sx/close");
   });
 
   test("resumeSession", async () => {
     globalThis.fetch = mockFetch(200, sessWire);
     await createClient().resumeSession("sx");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/sessions/sx/resume",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/sessions/sx/resume");
   });
 
   test("cancelSession", async () => {
     globalThis.fetch = mockFetch(200, sessWire);
     await createClient().cancelSession("sx");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/sessions/sx/cancel",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/sessions/sx/cancel");
   });
 
   test("getSessionActivity", async () => {
@@ -675,12 +679,34 @@ describe("AstraClient — Session lifecycle and reflect", () => {
       session_id: "sx",
       activities: [],
       total: 0,
+      limit: 5,
+      next_cursor: null,
     });
     const r = await createClient().getSessionActivity("sx", { limit: 5 });
     expect(r.total).toBe(0);
+    expect(r.limit).toBe(5);
+    expect(r.next_cursor).toBeNull();
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/activity");
     expect(url).toContain("limit=5");
+  });
+
+  test("getSessionActivity with cursor", async () => {
+    globalThis.fetch = mockFetch(200, {
+      session_id: "sx",
+      activities: [],
+      total: 0,
+      limit: 10,
+      next_cursor: null,
+    });
+    const r = await createClient().getSessionActivity("sx", {
+      limit: 10,
+      cursor: { created_at: "2024-01-01T00:00:00.000000", log_id: "log-42" },
+    });
+    expect(r.total).toBe(0);
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(url).toContain("after_created_at=2024-01-01T00%3A00%3A00.000000");
+    expect(url).toContain("after_log_id=log-42");
   });
 
   test("getSessionReflect", async () => {
@@ -709,9 +735,9 @@ describe("AstraClient — Session lifecycle and reflect", () => {
       recommendations: [],
     });
     await createClient().getSessionDecisionTrace("sx");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "decision-trace",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("decision-trace");
   });
 });
 
@@ -768,18 +794,18 @@ describe("AstraClient — Events and edges", () => {
     globalThis.fetch = mockFetch(200, []);
     const r = await createClient().getCausalChain("cc1");
     expect(r).toEqual([]);
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/events/causal-chain/cc1",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/events/causal-chain/cc1");
   });
 
   test("getEdgesStatus", async () => {
     globalThis.fetch = mockFetch(200, { edges: [] });
     const r = await createClient().getEdgesStatus();
     expect(r.edges).toEqual([]);
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/edges/status",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/edges/status");
   });
 });
 
@@ -840,9 +866,9 @@ describe("AstraClient — Models", () => {
     const result = await createClient().listModels();
     expect(result).toHaveLength(1);
     expect(result[0].name).toBe("m1");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/models",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/models");
   });
 
   test("listModels accepts envelope payloads", async () => {
@@ -875,9 +901,9 @@ describe("AstraClient — Skills", () => {
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("id1");
     expect(result[0].name).toBe("bash");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "/skills",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toContain("/skills");
   });
 
   test("listRuntimeSkills preserves pagination envelope", async () => {
@@ -913,7 +939,8 @@ describe("AstraClient — Skills", () => {
     expect(result.total).toBe(11);
     expect(result.skills?.[0]?.source).toBe("database");
     expect(result.next_cursor?.skill_id).toBe("id2");
-    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
     expect(url).toContain("/skills");
     expect(url).toContain("limit=1");
     expect(url).toContain("after_skill_name=web-search");
@@ -937,9 +964,9 @@ describe("AstraClient — pathPrefix", () => {
       pathPrefix: "/api",
     });
     await client.login("u", "p");
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe(
-      "http://localhost:8000/api/auth/login",
-    );
+    expect(
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toBe("http://localhost:8000/api/auth/login");
   });
 });
 
@@ -1018,7 +1045,9 @@ describe("AstraClient — Errors", () => {
       ok: true,
       status: 200,
       text: () =>
-        Promise.resolve('{"sessions":[], "total":0, "limit":20, "next_cursor":null}'),
+        Promise.resolve(
+          '{"sessions":[], "total":0, "limit":20, "next_cursor":null}',
+        ),
       headers: new Headers(),
     } as unknown as Response);
 
@@ -1028,8 +1057,8 @@ describe("AstraClient — Errors", () => {
       headers: { "X-Plain": "from-record" },
     });
 
-    const headersArg = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1]
-      .headers as Record<string, string>;
+    const headersArg = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0][1].headers as Record<string, string>;
     expect(headersArg["X-Plain"]).toBe("from-record");
   });
 
@@ -1038,7 +1067,9 @@ describe("AstraClient — Errors", () => {
       ok: true,
       status: 200,
       text: () =>
-        Promise.resolve('{"sessions":[], "total":0, "limit":20, "next_cursor":null}'),
+        Promise.resolve(
+          '{"sessions":[], "total":0, "limit":20, "next_cursor":null}',
+        ),
       headers: new Headers(),
     } as unknown as Response);
 
@@ -1047,8 +1078,8 @@ describe("AstraClient — Errors", () => {
     h.set("X-Custom", "from-headers-object");
     await client.fetch(PATH_SESSIONS, { method: "GET", headers: h });
 
-    const headersArg = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1]
-      .headers as Record<string, string>;
+    const headersArg = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0][1].headers as Record<string, string>;
     // Undici/Node may normalize names; value must be present.
     expect(Object.values(headersArg)).toContain("from-headers-object");
     expect(
@@ -1162,7 +1193,10 @@ describe("chatRequestToWire", () => {
   });
 
   test("default request omits execution_budget", () => {
-    const body = chatRequestToWire({ message: "m", selectedModel: { model: "test-model" } });
+    const body = chatRequestToWire({
+      message: "m",
+      selectedModel: { model: "test-model" },
+    });
     expect(body.execution_budget).toBeUndefined();
   });
 
@@ -1269,7 +1303,9 @@ describe("chatRequestToWire", () => {
       message: "x",
       selectedModel: { model: "test-model" },
     });
-    expect(Object.keys(body).sort()).toEqual(["message", "selected_model"].sort());
+    expect(Object.keys(body).sort()).toEqual(
+      ["message", "selected_model"].sort(),
+    );
   });
 });
 
@@ -1434,7 +1470,9 @@ describe("AstraClient — Model Gateway registry", () => {
 
     expect(out).toEqual(record);
     const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(call[0]).toBe("http://localhost:8000/model-gateways/gateway-a/disable");
+    expect(call[0]).toBe(
+      "http://localhost:8000/model-gateways/gateway-a/disable",
+    );
     expect(call[1].method).toBe("POST");
     expect(JSON.parse(call[1].body)).toEqual({});
   });
@@ -1501,7 +1539,8 @@ describe("AstraClient — Skills lifecycle", () => {
     const client = createClient();
     const out = await client.getSkill("n@1.0.0", { version: "1.0.0" });
     expect(out).toEqual(rec);
-    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
     expect(url).toContain("/skills/");
     expect(url).toContain(encodeURIComponent("n@1.0.0"));
     expect(url).toContain("version=1.0.0");

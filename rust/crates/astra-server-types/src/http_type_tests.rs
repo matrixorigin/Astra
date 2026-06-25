@@ -349,8 +349,10 @@ fn session_list_query_requires_complete_cursor() {
         "after_updated_at": "2026-04-01T10:00:00.123456"
     }))
     .unwrap();
+    let (status, body) = q.cursor().unwrap_err();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
-        q.cursor().unwrap_err(),
+        body.detail,
         "session list cursor requires both after_updated_at and after_session_id"
     );
 }
@@ -604,8 +606,10 @@ fn session_activity_query_requires_complete_cursor() {
         after_created_at: Some("2026-04-01T10:00:00.123456".into()),
         after_log_id: None,
     };
+    let (status, body) = missing_log.cursor().unwrap_err();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
-        missing_log.cursor().unwrap_err(),
+        body.detail,
         "session activity cursor requires both after_created_at and after_log_id"
     );
 

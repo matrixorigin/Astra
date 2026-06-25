@@ -113,6 +113,11 @@ pub struct SessionListRecord {
     pub next_cursor: Option<SessionListCursor>,
 }
 
+/// Cursor for session list pagination.
+///
+/// The `updated_at` field carries the value of `COALESCE(updated_at, created_at)` from the
+/// database — it is the *ordering key*, not strictly the `updated_at` column.  When a session
+/// has never been updated the cursor will contain its `created_at` timestamp.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionListCursor {
     pub updated_at: String,

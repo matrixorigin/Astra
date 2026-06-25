@@ -979,6 +979,13 @@ export type RuntimeSessionListResponse = {
   next_cursor?: RuntimeSessionListCursor | null;
 };
 
+/**
+ * Cursor for session list pagination.
+ *
+ * `updated_at` carries `COALESCE(updated_at, created_at)` — the ordering key,
+ * not strictly the `updated_at` column. Sessions that were never updated will
+ * have their `created_at` timestamp here.
+ */
 export type RuntimeSessionListCursor = {
   updated_at: string;
   session_id: string;
@@ -1221,10 +1228,17 @@ export type SessionActivityEntryResponse = {
   created_at: string;
 };
 
+export type SessionActivityCursor = {
+  created_at: string;
+  log_id: string;
+};
+
 export type SessionActivityResponse = {
   session_id: string;
   activities: SessionActivityEntryResponse[];
   total: number;
+  limit: number;
+  next_cursor?: SessionActivityCursor | null;
 };
 
 // ─── Run list ─────────────────────────────────────────────────────

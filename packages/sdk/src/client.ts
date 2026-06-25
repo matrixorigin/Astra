@@ -45,6 +45,7 @@ import type {
   RuntimeSessionUpdateBody,
   RuntimeTranscriptParams,
   RuntimeTranscriptResponse,
+  SessionActivityCursor,
   SessionActivityResponse,
   SessionAuditSummary,
   SessionInfo,
@@ -576,11 +577,16 @@ export class AstraClient {
   /** `GET /sessions/{id}/activity` */
   async getSessionActivity(
     sessionId: string,
-    opts?: { limit?: number; offset?: number },
+    opts?: { limit?: number; cursor?: SessionActivityCursor },
   ): Promise<SessionActivityResponse> {
     const q = buildQueryString({
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
-      ...(opts?.offset !== undefined ? { offset: opts.offset } : {}),
+      ...(opts?.cursor
+        ? {
+            after_created_at: opts.cursor.created_at,
+            after_log_id: opts.cursor.log_id,
+          }
+        : {}),
     });
     return this.fetch<SessionActivityResponse>(
       `${sessionActivityPath(sessionId)}${q}`,

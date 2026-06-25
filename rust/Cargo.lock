@@ -522,6 +522,7 @@ dependencies = [
  "astra-services",
  "astra-tools",
  "async-trait",
+ "axum 0.8.9",
  "chrono",
  "dashmap",
  "regex",

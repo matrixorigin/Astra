@@ -19,6 +19,8 @@ pub mod worktree_isolation;
 pub mod ws_progress_callback;
 
 #[cfg(feature = "server")]
+use astra_core::{ErrorResponse, error_response};
+#[cfg(feature = "server")]
 use astra_services::auth::{SessionActivityCursor, SessionActivityRecord, SessionListCursor};
 #[cfg(feature = "server")]
 use astra_services::{
@@ -29,6 +31,8 @@ use astra_services::{
 };
 #[cfg(feature = "server")]
 use astra_tools::AskUserPrompt;
+#[cfg(feature = "server")]
+use axum::{Json, http::StatusCode};
 #[cfg(feature = "server")]
 use serde::{Deserialize, Serialize};
 
@@ -166,14 +170,17 @@ pub struct SessionListQuery {
 
 #[cfg(feature = "server")]
 impl SessionListQuery {
-    pub fn cursor(&self) -> Result<Option<SessionListCursor>, &'static str> {
+    pub fn cursor(&self) -> Result<Option<SessionListCursor>, (StatusCode, Json<ErrorResponse>)> {
         match (&self.after_updated_at, &self.after_session_id) {
             (None, None) => Ok(None),
             (Some(updated_at), Some(session_id)) => Ok(Some(SessionListCursor {
                 updated_at: updated_at.clone(),
                 session_id: session_id.clone(),
             })),
-            _ => Err("session list cursor requires both after_updated_at and after_session_id"),
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "session list cursor requires both after_updated_at and after_session_id",
+            )),
         }
     }
 }
@@ -189,14 +196,19 @@ pub struct SessionActivityQuery {
 
 #[cfg(feature = "server")]
 impl SessionActivityQuery {
-    pub fn cursor(&self) -> Result<Option<SessionActivityCursor>, &'static str> {
+    pub fn cursor(
+        &self,
+    ) -> Result<Option<SessionActivityCursor>, (StatusCode, Json<ErrorResponse>)> {
         match (&self.after_created_at, &self.after_log_id) {
             (None, None) => Ok(None),
             (Some(created_at), Some(log_id)) => Ok(Some(SessionActivityCursor {
                 created_at: created_at.clone(),
                 log_id: log_id.clone(),
             })),
-            _ => Err("session activity cursor requires both after_created_at and after_log_id"),
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "session activity cursor requires both after_created_at and after_log_id",
+            )),
         }
     }
 }

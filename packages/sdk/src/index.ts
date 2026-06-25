@@ -121,6 +121,7 @@ export type {
   SkillRecord,
   // Audit types
   SessionActivity,
+  SessionActivityCursor,
   SessionAuditSummary,
   SessionUpdateBody,
   SessionActivityEntryResponse,

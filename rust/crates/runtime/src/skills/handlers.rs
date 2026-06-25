@@ -20,9 +20,7 @@ pub async fn list_skills_handler(
         state.skill_service.clone(),
         &user.user_id,
         query.limit,
-        query
-            .cursor()
-            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?,
+        query.cursor()?,
     )
     .await?;
     Ok(Json(result))
