@@ -2031,6 +2031,20 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         .expect("insert user_query");
     }
 
+    // These fixture rows bypass the event writer, so keep the denormalized
+    // counter faithful before testing context-trace delta updates.
+    for (session_id, event_count) in [(&session_a, 2_i64), (&session_b, 1_i64)] {
+        sqlx::query(
+            "UPDATE agent_sessions SET event_count = ? WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(event_count)
+        .bind(session_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("seed session event_count");
+    }
+
     sqlx::query(
         "INSERT INTO session_checkpoints \
          (checkpoint_id, session_id, user_id, number, turn, title, summary, tools_json, total_tokens, created_at) \

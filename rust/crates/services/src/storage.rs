@@ -2555,6 +2555,23 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS eval_calibration_assessments (
+            calibration_id VARCHAR(64) PRIMARY KEY,
+            user_id        VARCHAR(36) NOT NULL,
+            agent_id       VARCHAR(255),
+            session_id     VARCHAR(64) NOT NULL,
+            confidence     DECIMAL(5,4) NOT NULL,
+            quality_score  DECIMAL(5,4) NOT NULL,
+            created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_eval_calibration_user_created (user_id, created_at),
+            INDEX idx_eval_calibration_agent_created (user_id, agent_id, created_at),
+            INDEX idx_eval_calibration_session (user_id, session_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS eval_training_datasets (
             dataset_id        VARCHAR(36) PRIMARY KEY,
             user_id           VARCHAR(36) NOT NULL,
@@ -3040,5 +3057,35 @@ mod tests {
             !helper.contains("COUNT(*)"),
             "helper must not recompute event_count from agent_events"
         );
+    }
+
+    #[test]
+    fn eval_calibration_assessments_schema_matches_runtime_queries() {
+        let source = include_str!("storage.rs");
+        let ddl = source
+            .split("CREATE TABLE IF NOT EXISTS eval_calibration_assessments")
+            .nth(1)
+            .expect("eval calibration assessment DDL")
+            .split("CREATE TABLE IF NOT EXISTS eval_training_datasets")
+            .next()
+            .expect("eval calibration assessment DDL block");
+        for column in [
+            "calibration_id VARCHAR(64) PRIMARY KEY",
+            "user_id        VARCHAR(36) NOT NULL",
+            "agent_id       VARCHAR(255)",
+            "session_id     VARCHAR(64) NOT NULL",
+            "confidence     DECIMAL(5,4) NOT NULL",
+            "quality_score  DECIMAL(5,4) NOT NULL",
+            "created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+        ] {
+            assert!(ddl.contains(column), "missing calibration column: {column}");
+        }
+        for index in [
+            "INDEX idx_eval_calibration_user_created (user_id, created_at)",
+            "INDEX idx_eval_calibration_agent_created (user_id, agent_id, created_at)",
+            "INDEX idx_eval_calibration_session (user_id, session_id, created_at)",
+        ] {
+            assert!(ddl.contains(index), "missing calibration index: {index}");
+        }
     }
 }

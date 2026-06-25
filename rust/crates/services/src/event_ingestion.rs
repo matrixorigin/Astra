@@ -737,7 +737,7 @@ impl EventIngestionWorker {
                 .await
                 .map_err(|e| format!("edge insert for {}: {e}", event.event_id))?;
             }
-            crate::storage::bump_agent_session_event_count(
+            crate::storage::add_agent_session_event_count_or_create(
                 &mut *tx,
                 session_id,
                 user_id,
@@ -1680,8 +1680,8 @@ mod tests {
             "insert_batch must group inserts by (user_id, session_id) so rows_affected is a per-session delta"
         );
         assert!(
-            source.contains("bump_agent_session_event_count"),
-            "insert_batch must update agent_sessions.event_count with a true insert delta"
+            source.contains("add_agent_session_event_count_or_create"),
+            "insert_batch may lazily create session roots but must use a true insert delta"
         );
         assert!(
             !source.contains(forbidden_load),
