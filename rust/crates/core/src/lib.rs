@@ -379,6 +379,8 @@ pub mod error_kind;
 pub mod log;
 pub mod model_override;
 pub mod net;
+pub mod delegation;
+pub mod feedback;
 pub mod observation;
 pub mod runtime_limits;
 pub mod tool_schema;

@@ -207,17 +207,17 @@ pub fn render_introspect_request(
 
     match &request.facet {
         ObservationFacet::Session => render_introspect(snapshot, request.depth.detail()),
-        ObservationFacet::Recent => render_recent_rounds(snapshot),
+        ObservationFacet::Recent | ObservationFacet::Trace => render_recent_rounds(snapshot),
         ObservationFacet::Volatile => render_volatile_pending(snapshot),
         ObservationFacet::Stall => render_stall_state(snapshot),
         ObservationFacet::Noise => render_injection_freshness(snapshot),
         ObservationFacet::Errors => render_errors(snapshot),
-        ObservationFacet::All => render_all(snapshot),
-        ObservationFacet::Performance | ObservationFacet::Memory => {
-            render_edge_only_unavailable(request)
-        }
-        ObservationFacet::Unknown => render_unknown_facet(snapshot, request),
-        _ => render_unknown_facet(snapshot, request),
+        ObservationFacet::Tools => render_introspect(snapshot, request.depth.detail()),
+        ObservationFacet::Overview => render_all(snapshot),
+        ObservationFacet::Performance
+        | ObservationFacet::Memory
+        | ObservationFacet::Context
+        | ObservationFacet::Signals => render_edge_only_unavailable(request),
     }
 }
 

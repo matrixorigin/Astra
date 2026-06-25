@@ -42,10 +42,6 @@ pub enum ObservationFacet {
     Signals,
     /// Overview: aggregated session summary.
     Overview,
-    /// All facets (introspect only).
-    All,
-    /// Unknown facet (fallback).
-    Unknown,
 }
 
 impl ObservationFacet {
@@ -64,9 +60,8 @@ impl ObservationFacet {
             "context" | "data_quality" => Self::Context,
             "memory" | "session_memory" => Self::Memory,
             "signals" | "adaptation" => Self::Signals,
-            "overview" => Self::Overview,
-            "all" => Self::All,
-            _ => Self::Unknown,
+            "overview" | "all" => Self::Overview,
+            _ => Self::Session,
         }
     }
 
@@ -86,8 +81,6 @@ impl ObservationFacet {
             Self::Memory => "memory",
             Self::Signals => "signals",
             Self::Overview => "overview",
-            Self::All => "all",
-            Self::Unknown => "unknown",
         }
     }
 }
