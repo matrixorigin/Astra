@@ -119,9 +119,9 @@ pub(crate) async fn insert_core_turn_event(
     let result = query(
         "INSERT IGNORE INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-          parent_event_id, causal_chain_id, token_usage, llm_model_used, llm_params, reasoning_content, \
+          parent_event_id, causal_chain_id, turn_seq, token_usage, llm_model_used, llm_params, reasoning_content, \
           token_input, token_output, token_total, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
     )
     .bind(&event.event_id)
     .bind(&event.session_id)
@@ -132,6 +132,7 @@ pub(crate) async fn insert_core_turn_event(
     .bind(&event.content)
     .bind(&event.parent_event_id)
     .bind(&event.causal_chain_id)
+    .bind(event.turn_seq)
     .bind(event.token_usage.as_ref().map(serde_json::Value::to_string))
     .bind(&event.llm_model_used)
     .bind(event.llm_params.as_ref().map(serde_json::Value::to_string))
@@ -224,6 +225,24 @@ pub(crate) async fn insert_turn_decision_audit(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn core_turn_event_insert_persists_turn_seq() {
+        let source = include_str!("storage.rs");
+        assert!(
+            source.contains(
+                "parent_event_id, causal_chain_id, turn_seq, token_usage, llm_model_used"
+            ),
+            "core turn events must persist turn_seq so session_turn inference has a fact source"
+        );
+        assert!(
+            source.contains(".bind(event.turn_seq)"),
+            "core turn event insert must bind TurnCoreEventRecord.turn_seq"
+        );
+    }
 }
 
 pub(crate) async fn insert_turn_skill_selection(

@@ -737,6 +737,7 @@ mod tests {
                     parent_event_id: None,
                     parent_event_ids: vec![],
                     causal_chain_id: "c".into(),
+                    turn_seq: Some(1),
                     llm_model_used: None,
                     token_usage: None,
                     llm_params: None,

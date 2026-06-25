@@ -662,6 +662,7 @@ pub async fn ensure_core_schema(
             INDEX idx_agent_events_session_model_created (session_id, llm_model_used, created_at DESC),
             INDEX idx_agent_events_session_parent (session_id, parent_event_id),
             INDEX idx_agent_events_owner_session_created (user_id, session_id, created_at),
+            INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq),
             INDEX idx_agent_events_user_created (user_id, created_at),
             INDEX idx_agent_events_causal_chain_id (causal_chain_id),
             INDEX idx_agent_events_skill_created (skill_name, created_at),
@@ -2150,11 +2151,18 @@ pub async fn ensure_core_schema(
         }
     }
 
-    for (table, index, ddl) in [(
-        "agent_sessions",
-        "idx_sessions_project",
-        "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
-    )] {
+    for (table, index, ddl) in [
+        (
+            "agent_sessions",
+            "idx_sessions_project",
+            "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
+        ),
+        (
+            "agent_events",
+            "idx_agent_events_owner_session_turn",
+            "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq)",
+        ),
+    ] {
         if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
             tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
         }
@@ -2993,5 +3001,22 @@ mod tests {
         if AGENT_ID_LEN < 32 {
             panic!("AGENT_ID_LEN ({AGENT_ID_LEN}) is too small");
         }
+    }
+
+    #[test]
+    fn agent_events_turn_seq_inference_index_is_declared_and_reconciled() {
+        let source = include_str!("storage.rs");
+        assert!(
+            source.contains(
+                "INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq)"
+            ),
+            "agent_events must index the session-turn inference path in CREATE TABLE"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq)"
+            ),
+            "agent_events must reconcile the session-turn inference index in schema ensure"
+        );
     }
 }
