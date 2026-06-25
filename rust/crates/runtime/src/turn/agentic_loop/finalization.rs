@@ -3,7 +3,7 @@ use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::StepCheckpoint;
 use astra_services::SessionArtifactStore;
 
-use super::super::agentic::adaptive_tuning::record_loop_completion_feedback;
+use super::super::agentic::adaptive_runtime::record_loop_completion_feedback;
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, VolatileKind, run_agentic_loop_impl,
 };
@@ -532,7 +532,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             }
         }
 
-        // Carry `UserCancelled` forward so the adaptive-tuning layer can
+        // Carry `UserCancelled` forward so the adaptive profile layer can
         // skip scenario re-detection on the next turn. Without this gate,
         // the aborted tool history leaks into ScenarioDetector and can
         // falsely trigger an `Exploration` scenario (ratcheting the tool

@@ -1,7 +1,7 @@
 # Introspect and Reflect Observation Plane
 
-**Date**: 2026-06-24  
-**Status**: Design Proposal  
+**Date**: 2026-06-24
+**Status**: Foundation Implemented; Provider and Persistence Phases Pending
 **Audience**: Astra runtime, CLI, server, observability, learning, and SDK maintainers
 
 ## Executive Summary
@@ -29,7 +29,7 @@ Providers
       -> Tuning Control Plane / Feedback Tools
 ```
 
-This proposal keeps two user-facing tool facades:
+This design keeps two user-facing tool facades:
 
 - `introspect`: live observation for the current runtime, current turn, and
   recent rounds.
@@ -45,34 +45,49 @@ write its own `TuningJob` status, reconcile events, evaluations, and
 measurements back as graph evidence. That feedback path is outside the
 `introspect` and `reflect` tool facades.
 
+Current implementation status:
+
+- Shared observation DTOs, evidence refs, confidence dimensions, failure
+  clusters, adaptation signals, graph slices, data coverage, and budget result
+  wire shapes are implemented in `astra_core`.
+- `introspect` and `reflect` expose normalized observation-plane envelopes with
+  `topic`, `facet`, `depth`, `horizon`, `source_policy`, `include_context`,
+  `data_coverage`, observations, evidence, graph slices, failure clusters,
+  causal chains, adaptation signals, action hints, and budget metadata.
+- Legacy `introspect` parameters such as `subtopic` and `detail`, legacy
+  `reflect` focus-style routing, and the public `reflect.evidence_graph`
+  response field are removed from the runtime contract.
+- A common `InspectionService` provider-fusion layer and persistent Observation
+  Graph storage are follow-up phases, not current behavior.
+
 ## Design Principles
 
-1. **Read-only by construction**  
+1. **Read-only by construction**
    `introspect` and `reflect` never apply adaptation. They only return
    observations and evidence.
 
-2. **Same semantics across runtime modes**  
+2. **Same semantics across runtime modes**
    CLI/Edge and pure Server modes may have different available data, but the
    same request should return the same conceptual schema. Missing data is
    represented as coverage, not as a different behavior.
 
-3. **Runtime errors are first-class data**  
+3. **Runtime errors are first-class data**
    Errors are not just counters. They are classified observations linked to
    tool calls, decisions, context state, traces, and causal chains.
 
-4. **Evidence beats advice**  
+4. **Evidence beats advice**
    The tools may include read-only action hints, but their primary output is
    evidence and structured signals that another tool can consume.
 
-5. **Depth controls cost and blast radius**  
+5. **Depth controls cost and blast radius**
    Agent-initiated calls default to compact live summaries. User-triggered or
    explicit forensic calls can return deeper evidence.
 
-6. **Data provenance is always visible**  
+6. **Data provenance is always visible**
    Every response declares which providers contributed data, how fresh they
    are, and which expected providers were missing or stale.
 
-7. **Graph first, views second**  
+7. **Graph first, views second**
    Debug UI, Timeline UI, Memory Analysis, Feedback Training, Session Replay,
    and the Tuning Control Plane should consume the same Observation Graph
    instead of each building a private interpretation of events.
@@ -560,44 +575,60 @@ For conflicts:
 
 ## Shared Response Envelope
 
-Both tools return the same envelope. Some fields may be empty depending on
-topic, depth, and coverage.
+Both tools return the same observation envelope at the root. Some fields may be
+empty depending on topic, depth, and coverage. Tool-specific compatibility
+fields may still exist beside this envelope, but consumers should use the
+observation-plane fields for new integrations.
 
 ```json
 {
   "schema_version": 1,
   "tool": "introspect",
-  "mode": "edge",
   "topic": "execution",
   "facet": "errors",
   "depth": "diagnostic",
   "horizon": "current_turn",
   "source_policy": "live_first",
   "include_context": false,
-  "generated_at": "2026-06-24T10:00:00Z",
   "data_coverage": {},
-  "budget_result": {},
-  "summary": {
-    "status": "degraded",
-    "headline": "Repeated shell timeouts are slowing repository inspection."
+  "summary": "Repeated shell timeouts are slowing repository inspection.",
+  "view": {
+    "topic": "execution",
+    "facet": "errors",
+    "depth": "diagnostic",
+    "horizon": "current_turn",
+    "data_coverage": {}
   },
-  "current_state": {},
-  "graph_slice": {},
   "observations": [],
+  "evidence": [],
+  "action_hints": [],
   "failure_clusters": [],
   "causal_chains": [],
-  "evidence": [],
   "adaptation_signals": [],
-  "action_hints": []
+  "graph_slice": {},
+  "budget_result": {}
 }
 ```
+
+Reserved future fields include `mode`, `generated_at`, and `current_state`.
+They should only become part of the public contract when every producer can
+fill them with explicit provenance and tests.
+
+Existing `reflect` compatibility fields such as `session_id`, `analysis_view`,
+`overview`, `diagnoses`, `insights`, `recommendations`, `reflection_context`,
+and `prompt_preview` may continue to exist during migration. New consumers
+should not depend on those fields for observation-plane behavior.
 
 ### Field Semantics
 
 | Field | Meaning |
 | --- | --- |
-| `summary` | Human/agent-readable compact result |
-| `current_state` | State facts relevant to the selected horizon |
+| `schema_version` | Observation-plane response schema version |
+| `tool` | Producing facade, usually `introspect` or `reflect` |
+| `topic`, `facet`, `depth`, `horizon`, `source_policy`, `include_context` | Normalized request scope |
+| `data_coverage` | Root coverage summary; must match `view.data_coverage` |
+| `view` | Normalized view descriptor repeated for consumers that already read nested view metadata |
+| `summary` | Human/agent-readable compact result string |
 | `graph_slice` | Bounded Observation Graph subset used to render the view |
 | `observations` | Classified read-only findings |
 | `failure_clusters` | Optional groups of related failures used for diagnosis and tuning |
@@ -605,6 +636,7 @@ topic, depth, and coverage.
 | `evidence` | Materialized evidence refs and previews |
 | `adaptation_signals` | Read-only inputs for the Tuning Control Plane and write-side feedback/adaptation tools |
 | `action_hints` | Optional read-only hints, not commands |
+| `budget_result` | Truncation and cursor metadata for bounded responses |
 
 ## Confidence Model
 
@@ -637,7 +669,8 @@ remain explainable.
 
 The agent needs to answer "what am I doing?" as well as "what failed?".
 
-`topic=execution, facet=progress` should expose:
+This is a provider-phase target, not part of the current foundation contract.
+Once implemented, `topic=execution, facet=progress` should expose:
 
 ```json
 {
@@ -865,7 +898,7 @@ Example:
 {
   "adaptation_signals": [
     {
-      "signal_id": "sig_tool_policy_01H00000000000000000000001",
+      "signal_id": "urn:astra:signal:graph:sig_tool_policy_01H00000000000000000000001",
       "observation_refs": [
         "urn:astra:observation:graph:obs_err_01H00000000000000000000001"
       ],
@@ -1017,41 +1050,13 @@ Pure Server may use:
 It may not have local user machine artifacts. The schema remains the same, with
 those providers marked `missing` or `unavailable`.
 
-## Compatibility Mapping
+## Removed Legacy Parameters
 
-### Current `introspect`
-
-| Current Parameter | New Meaning |
-| --- | --- |
-| `detail=minimal` | `depth=hint` |
-| `detail=summary` | `depth=summary` |
-| `detail=full` | `depth=diagnostic` |
-| `subtopic=session` | `topic=runtime`, `facet=summary` |
-| `subtopic=recent` | `topic=execution`, `facet=progress`, include recent rounds |
-| `subtopic=volatile` | `topic=knowledge`, `facet=context` |
-| `subtopic=stall` | `topic=execution`, `facet=loop` |
-| `subtopic=noise` | `topic=knowledge`, `facet=context` |
-| `subtopic=errors` | `topic=execution`, `facet=errors` |
-| `subtopic=cache` | `topic=runtime`, `facet=cache` |
-| `subtopic=session_memory` | `topic=knowledge`, `facet=memory` |
-| `dimension=capability` | `topic=runtime`, `facet=capability` |
-
-Server-local and CLI implementations should share one router. The current
-server-local path must not ignore topic/subtopic.
-
-### Current `reflect`
-
-| Current Parameter | New Meaning |
-| --- | --- |
-| `focus=auto` | `topic=overview`, `facet=summary` |
-| `focus=skill_failure` | `topic=execution`, `facet=errors` |
-| `focus=unexpected_result` | `topic=execution`, `facet=trace` or `topic=overview`, `facet=question` |
-| `focus=data_quality` | `topic=knowledge`, `facet=context` |
-| `focus=tool_selection` | `topic=execution`, `facet=tools` |
-| `focus=performance` | `topic=execution`, `facet=performance` |
-| `focus=history` | `topic=execution`, `facet=trace`, `depth=summary` |
-| `question=...` | `topic=overview`, `facet=question` |
-| `last_n=N` | `horizon=recent` with limit N when no explicit horizon is set |
+The runtime contract does not read old `introspect` parameters such as
+`subtopic` or `detail`, and does not read old `reflect` parameters such as
+`focus`. CLI, Edge, and Server paths should share the normalized router:
+`topic`, `facet`, `depth`, `horizon`, `source_policy`, `include_context`, and
+bounded evidence limits.
 
 Local self-surface should become a provider inside the shared reflect service,
 not a separate response shape.
@@ -1100,7 +1105,7 @@ response contract.
 ### User Session Failure Analysis
 
 ```text
-/reflect failure diagnostic
+/reflect execution/errors diagnostic
 ```
 
 Normalized request:
@@ -1137,25 +1142,55 @@ Normalized request:
 }
 ```
 
-## Implementation Plan
+## Implementation Status and Plan
 
-1. Define shared response types:
-   - `ObservationEnvelope`
-   - `GraphLayer`
-   - `UnifiedGraphView`
-   - `GraphSlice`
-   - `DataCoverage`
-   - `ProviderCoverage`
-   - `Observation`
-   - `FailureCluster`
+Implemented foundation:
+
+1. Shared DTOs in `astra_core::observation`:
+   - `ObservationView`
+   - `ObservationDataCoverage`
+   - `ObservationProviderCoverage`
+   - `ObservationBudgetResult`
+   - `ObservationRecord`
+   - `ObservationEvidence`
+   - `ObservationConfidence`
+   - `ObservationFailureCluster`
+   - `ObservationCausalChain`
+   - `ObservationAdaptationSignal`
+   - `ObservationActionHint`
+   - `ObservationGraphSlice`
    - `EvidenceRef`
-   - `EvidenceClass`
-   - `CausalChain`
-   - `AdaptationSignal`
-   - `ActionHint`
-   - `TuningConditionView`
-   - `ReconcileEventView`
-2. Define provider traits:
+2. `introspect` normalized routing:
+   - `topic`
+   - `facet`
+   - `depth`
+   - `horizon`
+   - `source_policy`
+   - `include_context`
+   - JSON observation envelope
+3. `reflect` normalized routing:
+   - `topic`
+   - `facet`
+   - `depth`
+   - `horizon`
+   - `source_policy`
+   - `include_context`
+   - server database coverage warnings
+   - shared graph-slice projection
+4. First-class error and provider-unavailable observations for the current
+   runtime and server database surfaces.
+5. Read-only adaptation signals that reference observations and failure
+   clusters instead of duplicating severity, confidence, or evidence.
+6. Removal of obsolete public contracts:
+   - `introspect.subtopic`
+   - `introspect.detail`
+   - legacy `reflect.focus` routing
+   - public `reflect.evidence_graph`
+   - implicit tuning control-loop runtime code
+
+Next phases:
+
+1. Define provider traits:
    - `LiveRuntimeProvider`
    - `ContextProvider`
    - `LocalSessionProvider`
@@ -1164,19 +1199,16 @@ Normalized request:
    - `TraceProvider`
    - `MemoryObservationProvider`
    - `TuningControlPlaneProvider`
-3. Build an `InspectionService` that normalizes topic, facet, depth, horizon,
-   selector, budget, and source policy.
-4. Make `introspect` and `reflect` facades over `InspectionService`.
-5. Move CLI local reflect self-surface behind `LocalSessionProvider`.
-6. Unify CLI and Server topic routing for `introspect`.
-7. Add first-class runtime error observations.
-8. Add coverage reporting to every response.
-9. Add adaptation signals without write side effects.
-10. Ingest tuning job status, reconcile events, evaluations, and measurements
-    as Observation Graph evidence, not as tool side effects.
-11. Update SDK and slash-command renderers.
-12. Keep backward-compatible aliases for existing `detail`, `subtopic`,
-    `focus`, and `last_n` parameters during migration.
+2. Build an `InspectionService` that normalizes topic, facet, depth, horizon,
+   selector, budget, and source policy before calling providers.
+3. Move CLI local reflect self-surface behind `LocalSessionProvider`.
+4. Add persistent Observation Graph storage with logical runtime, observation,
+   and adaptation layers.
+5. Ingest tuning job status, reconcile events, evaluations, and measurements as
+   Observation Graph evidence once the write-side tuning control plane exists.
+6. Update SDK bindings and richer slash-command renderers to consume the shared
+   envelope directly.
+7. Keep `last_n` only as a bounded evidence limit, not as a horizon alias.
 
 ## Open Questions
 

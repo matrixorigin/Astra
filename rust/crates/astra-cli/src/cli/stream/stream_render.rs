@@ -667,10 +667,9 @@ pub(crate) struct EdgeSseContext<'a> {
     pub turn_rollback_on_failure: bool,
     /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
     pub tool_cache: &'a mut EdgeToolCache,
-    /// Optional ObservabilityHub for recording streaming-speculation metrics
-    /// (see `AutoTuningEngine::should_disable_streaming_speculation`). `None`
-    /// for tests and non-observable contexts; production supplies it from
-    /// `CliAgenticLoopHost`.
+    /// Optional ObservabilityHub for recording streaming-speculation metrics.
+    /// `None` for tests and non-observable contexts; production supplies it
+    /// from `CliAgenticLoopHost`.
     pub observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Incremental turn snapshot mirrored during SSE consumption so forced
     /// cancellation can recover partial text, ids, usage, and tool audit data.
@@ -2469,7 +2468,7 @@ impl CliSseStreamHost<'_> {
         if let Some(hub) = self.observability_hub.as_ref() {
             let snap = exec.snapshot().await;
             hub.record_streaming_speculation_metrics(&snap);
-            // Reset so each batch report is a delta; AutoTuningEngine sums
+            // Reset so each batch report is a delta; ObservabilityHub sums
             // incoming reports additively.
             exec.reset_metrics().await;
         }

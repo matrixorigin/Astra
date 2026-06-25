@@ -1,4 +1,4 @@
-//! Guardrail auto-tuning.
+//! Guardrail adaptive thresholding.
 //!
 //! Rolling-stats-based, bounded-Δ adjustment for the auto-reflection
 //! signal threshold (how many accumulated evolution signals are needed
@@ -6,9 +6,9 @@
 //!
 //! Design principles:
 //! 1. Rolling window of recent per-turn outcomes (failing tool calls).
-//! 2. Bounded Δ: adjust threshold by at most ±1 per tuning tick.
+//! 2. Bounded Δ: adjust threshold by at most ±1 per adjustment tick.
 //! 3. Never fully disable: threshold is clamped to `[MIN, MAX]`.
-//! 4. Hysteresis: only tune after observing at least MIN_SAMPLES turns.
+//! 4. Hysteresis: only adjust after observing at least MIN_SAMPLES turns.
 //!
 //! The tuner is owned by `StallTrackingState::guardrail_tuner`; the auto-
 //! reflection path reads `reflection_threshold()` each turn instead of

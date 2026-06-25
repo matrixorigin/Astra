@@ -103,7 +103,9 @@ fn every_catalog_tool_has_schema() {
     // This list is self-validated below — if a tool listed here gains a static
     // schema or is removed from the catalog, the test will catch it.
     // `skill` embeds the live skill catalog and is generated per session.
-    const DYNAMIC_SCHEMA_TOOLS: &[&str] = &["skill"];
+    // `reflect` is a CLI-local observation facade; the server has HTTP reflect
+    // routes, not a globally executable model-facing reflect tool.
+    const DYNAMIC_SCHEMA_TOOLS: &[&str] = &["skill", "reflect"];
 
     let schemas = all_tool_schemas();
     let schema_names: std::collections::HashSet<&str> = schemas
@@ -606,6 +608,60 @@ fn local_cli_catalog_includes_plan_mode_wrappers() {
     assert!(
         names.iter().any(|n| n == "exit_plan_mode"),
         "local CLI catalog should expose exit_plan_mode via the client-backed wrapper"
+    );
+}
+
+#[test]
+fn local_cli_catalog_includes_normalized_reflect_schema() {
+    let schemas = crate::edge_tools::local_tool_schemas();
+    let reflect = tool_schema(&schemas, "reflect");
+    let properties = reflect["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("reflect parameters must expose properties");
+
+    for key in [
+        "topic",
+        "facet",
+        "depth",
+        "horizon",
+        "source_policy",
+        "include_context",
+        "question",
+        "last_n",
+    ] {
+        assert!(
+            properties.contains_key(key),
+            "reflect schema must expose normalized observation parameter `{key}`"
+        );
+    }
+    assert!(
+        !properties.contains_key("focus"),
+        "reflect schema must not expose removed focus parameter"
+    );
+    assert_eq!(
+        properties["topic"]["enum"],
+        serde_json::json!([
+            "overview",
+            "runtime",
+            "execution",
+            "knowledge",
+            "adaptation"
+        ])
+    );
+    assert_eq!(
+        properties["depth"]["enum"],
+        serde_json::json!(["hint", "summary", "diagnostic", "forensic"])
+    );
+    assert_eq!(
+        properties["source_policy"]["enum"],
+        serde_json::json!([
+            "auto",
+            "live_only",
+            "live_first",
+            "durable_first",
+            "local_only",
+            "cloud_only"
+        ])
     );
 }
 

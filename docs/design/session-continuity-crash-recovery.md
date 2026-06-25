@@ -117,7 +117,7 @@ shared restore helper 的职责：
    - `goal_progress`
    - `active_skills`
    - `discovered_skills`
-   - adaptive tuning state
+   - adaptive runtime state
 6. 恢复：
    - `history`
    - `last_turn_event`

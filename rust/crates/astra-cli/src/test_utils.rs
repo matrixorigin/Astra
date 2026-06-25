@@ -5,6 +5,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 // ── Safe env helpers ───────────────────────────────────────────────────
 //
@@ -204,14 +205,26 @@ pub(crate) fn test_temp_dir() -> tempfile::TempDir {
     );
 }
 
-pub(crate) fn isolated_sessions_dir() -> (
-    tempfile::TempDir,
-    astra_services::session_journal::JournalDirGuard,
-) {
+static ISOLATED_SESSIONS_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+pub(crate) struct IsolatedSessionsGuard {
+    // Drop the journal override before releasing the serial lock.
+    _journal_guard: astra_services::session_journal::JournalDirGuard,
+    _serial_guard: MutexGuard<'static, ()>,
+}
+
+pub(crate) fn isolated_sessions_dir() -> (tempfile::TempDir, IsolatedSessionsGuard) {
+    let serial_guard = ISOLATED_SESSIONS_DIR_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let tmp = test_temp_dir();
     let sessions = tmp.path().join("sessions");
     std::fs::create_dir_all(&sessions).expect("create isolated sessions root");
-    let guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+    let journal_guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+    let guard = IsolatedSessionsGuard {
+        _journal_guard: journal_guard,
+        _serial_guard: serial_guard,
+    };
     (tmp, guard)
 }
 

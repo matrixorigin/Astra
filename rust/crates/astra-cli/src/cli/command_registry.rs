@@ -375,8 +375,6 @@ const COMPACT_SUBCOMMANDS: &[(&str, &str)] = &[
     ("summary-only", "Summarize without trimming"),
 ];
 
-// TUNING_SUBCOMMANDS removed — evolution subsystem deleted
-
 const CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[
     ("diff", "Show differences from defaults"),
     ("export", "Export configuration to file"),
@@ -591,7 +589,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/reflect",
-        "Reflect on session (modes: skill_failure, performance, …)",
+        "Reflect on session observations (topic/facet, e.g. execution/errors)",
         CommandGroup::Observability,
     )
     .with_tui_handler(TuiHandler::Fallback),
@@ -641,12 +639,6 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Observability,
     )
     .with_tui_handler(TuiHandler::Fallback),
-    CommandMeta::new(
-        "/tuning",
-        "(removed — evolution subsystem deleted)",
-        CommandGroup::Observability,
-    )
-    .alias(),
     CommandMeta::new(
         "/config",
         "Runtime config: panel for edit; show|paths|sources|diff|export stay text-first",
@@ -1044,6 +1036,16 @@ mod tests {
         let quit = COMMANDS.iter().find(|m| m.name == "/quit");
         assert!(quit.is_some(), "/quit should exist");
         assert!(quit.unwrap().is_alias, "/quit should be marked as alias");
+    }
+
+    #[test]
+    fn removed_tuning_command_is_not_registered() {
+        assert!(
+            COMMANDS.iter().all(|m| m.name != "/tuning"),
+            "/tuning must not remain as a removed alias or deprecated command"
+        );
+        assert!(resolve_command_meta("/tuning").is_none());
+        assert!(resolve_command("/tuning").is_err());
     }
 
     #[test]

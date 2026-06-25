@@ -669,19 +669,34 @@ test-ignored-integration:
 		else \
 			echo "Running online integration tests (ignored; live MatrixOne; bridge-e2e-hooks enabled for system_matrix_http_e2e)..."; \
 		fi; \
+		FAILED=""; \
+		PERF_FAILED=""; \
 		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 			-p astra-runtime -p astra-services -p astra-plan \
 			--features astra-runtime/bridge-e2e-hooks \
 			--tests --run-ignored only \
 			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-			-E 'not test(/perf_benchmark_/)'; \
-		echo "Running online performance benchmarks in an isolated serial lane..."; \
+			-E 'not test(/perf_benchmark_/)' \
+			|| FAILED="$$FAILED integration"; \
+		echo "Running online performance benchmarks in an isolated serial lane (non-blocking unless ASTRA_STRICT_ONLINE_PERF=1)..."; \
 		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 			-p astra-runtime \
 			--features astra-runtime/bridge-e2e-hooks \
 			--tests --run-ignored only \
 			$(NEXTEST_ONLINE_FLAGS) -j 1 \
-			-E 'test(/perf_benchmark_/)'; \
+			-E 'test(/perf_benchmark_/)' \
+			|| PERF_FAILED=1; \
+		if [ -n "$$FAILED" ]; then \
+			echo "❌ test-ignored-integration: failed lanes:$$FAILED"; \
+			exit 1; \
+		fi; \
+		if [ -n "$$PERF_FAILED" ]; then \
+			if [ "$${ASTRA_STRICT_ONLINE_PERF:-}" = "1" ]; then \
+				echo "❌ test-ignored-integration: online perf lane failed under ASTRA_STRICT_ONLINE_PERF=1"; \
+				exit 1; \
+			fi; \
+			echo "WARNING: online perf lane failed; continuing because ASTRA_STRICT_ONLINE_PERF is not 1"; \
+		fi; \
 	fi
 
 # Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).

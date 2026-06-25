@@ -430,7 +430,7 @@ pub struct SkillExecutionResult {
 
 1. Create `SkillQualityTracker`
 2. Collect metrics from verification results + implicit signals
-3. Feed quality scores into auto-routing and adaptive tuning signals; do not
+3. Feed quality scores into auto-routing and adaptation signals; do not
    mutate the cache-stable skill listing schema
 4. Add `/skill stats [name]` CLI command
 5. Persist metrics (local config file → later DB)

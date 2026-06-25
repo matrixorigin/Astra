@@ -1,3 +1,5 @@
+//! Adaptive runtime profile and per-turn dampening.
+
 use std::collections::{HashMap, HashSet};
 
 use astra_config::user_profile::{Scenario, TurnIntent};
@@ -9,7 +11,6 @@ use astra_services::session_audit::{
 use super::super::agentic_loop::host::{AgenticLoopOutcome, AgenticLoopState};
 
 pub(crate) const MAX_RECENT_TACTICAL_ACTIONS: usize = 8;
-pub(crate) const DEFAULT_TUNING_CYCLE_INTERVAL: u32 = 5;
 
 pub(crate) fn should_emit_adaptive_scenario_event(
     scenario_changed: bool,
@@ -335,7 +336,10 @@ pub(crate) fn apply_adaptive_execution_profile_with_intent(
     // ── Anti-flap: scenario change cooldown ──
     // Suppress scenario changes within cooldown period of the last change
     // to prevent rapid oscillation between scenarios.
-    let scenario_cooldown = session_guard.config.adaptive_tuning.scenario_cooldown_turns;
+    let scenario_cooldown = session_guard
+        .config
+        .adaptive_runtime
+        .scenario_cooldown_turns;
     let scenario_suppressed = if profile_scenario != old_scenario && profile_scenario.is_some() {
         if let Some(last_change) = session_guard.last_scenario_change_turn {
             let turns_since = session_guard.turn_number.saturating_sub(last_change);
@@ -512,14 +516,14 @@ pub(crate) fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_token
     // ── 1. Dynamic token budget ──
     // Anti-flap: detect direction oscillation and suppress rapid reversals.
     //
-    // Gated on BOTH `adaptive` (global adaptive-tuning switch) AND the more
+    // Gated on BOTH `adaptive` (global adaptive runtime switch) AND the more
     // specific `adaptive_budget_reduction` opt-in. Default off: lowering the
     // ceiling at high pressure is a shrink spiral that makes the next turn
     // more likely to trip the same check. Compaction is the correct pressure
     // handler; the budget should stay put unless an operator explicitly
     // wants quota-style protection. See session 0e37eb46 for the regression
     // that motivated this gate.
-    let budget_cooldown = config.adaptive_tuning.budget_cooldown_turns;
+    let budget_cooldown = config.adaptive_runtime.budget_cooldown_turns;
     if config.context_window.adaptive
         && config.context_window.adaptive_budget_reduction
         && turn_tokens_used > 0
@@ -668,6 +672,19 @@ fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
     (tool_calls, unique_tools.len() as u32)
 }
 
+fn write_session_journal_event(
+    state: &AgenticLoopState,
+    event: astra_services::session_journal::JournalEvent,
+) {
+    let Some(session_id) = state.current_session_id.as_deref() else {
+        return;
+    };
+    let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) else {
+        return;
+    };
+    let _ = writer.append(&event);
+}
+
 /// Decide whether the current user message implicitly accepts the previous
 /// assistant turn. Acceptance fires when:
 ///
@@ -676,8 +693,8 @@ fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
 ///   `astra_turn_core::input_classifier::is_correction_signal`.
 ///
 /// Routing through that shared classifier is mandatory: prior to this
-/// extraction adaptive_tuning carried its own inlined keyword list that drifted
-/// from the canonical one (false positives on bare "not " and "wrong",
+/// extraction the adaptive runtime path carried its own inlined keyword list
+/// that drifted from the canonical one (false positives on bare "not " and "wrong",
 /// missing matches for "i meant", "actually i", "wait,", etc.). Two parallel
 /// lists is the anti-pattern this consolidates away.
 #[must_use]
@@ -691,12 +708,13 @@ pub(crate) fn should_emit_acceptance(message: &str) -> bool {
 
 /// Record feedback signals based on the loop's outcome and accumulated state.
 ///
-/// Called once after the loop finishes (or errors) to feed the auto-tuning engine.
+/// Called once after the loop finishes (or errors) to feed observation and
+/// SelfModel inputs.
 pub(crate) fn record_loop_completion_feedback(
     state: &mut AgenticLoopState,
     result: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
 ) {
-    use astra_learning::auto_tuning::{FeedbackSignal, SignalType};
+    use astra_learning::feedback::{FeedbackSignal, SignalType};
 
     let hub = match &state.telemetry.observability_hub {
         Some(h) => h,
@@ -882,7 +900,7 @@ pub(crate) fn record_loop_completion_feedback(
     }
 
     // ── 8. Tool health signals ──
-    // Emit signals for health avoidance tools so tuning rules can react.
+    // Emit signals for health avoidance tools so observation/SelfModel can react.
     {
         let avoidance_advised = state.turn_guard.health.health_avoidance_tools();
         for tool_name in avoidance_advised {
@@ -905,141 +923,6 @@ pub(crate) fn record_loop_completion_feedback(
             }
         }
     }
-}
-
-///
-/// Every N turns (configured via `adaptive_tuning.tuning_cycle_interval`),
-/// evaluates all registered evolution rules and applies any triggered actions
-/// to the session's RuntimeConfig.
-pub(crate) fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
-    // Read the interval from session config if available, else use default.
-    let interval = state
-        .telemetry
-        .observability_session
-        .as_ref()
-        .and_then(|s| s.read().ok())
-        .map(|g| g.config.adaptive_tuning.tuning_cycle_interval)
-        .unwrap_or(DEFAULT_TUNING_CYCLE_INTERVAL);
-
-    if state.telemetry.completed_turns_for_tuning < interval {
-        return;
-    }
-    state.telemetry.completed_turns_for_tuning = 0;
-
-    let hub = match state.telemetry.observability_hub.clone() {
-        Some(h) => h,
-        None => return,
-    };
-
-    let session = match state.telemetry.observability_session.clone() {
-        Some(s) => s,
-        None => return,
-    };
-
-    let mut session_guard = match session.write() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-
-    let actions = hub.run_tuning_cycle(&mut session_guard.config);
-    let turn = state.session_turn;
-
-    // Track token-budget direction changes from tuning rules for anti-flap.
-    let new_budget = session_guard.config.token_budget.max_turn_input_tokens;
-    let old_budget_before_tuning = {
-        // Compare against what it was before this cycle
-        state.max_turn_input_tokens as u32
-    };
-    if new_budget != old_budget_before_tuning {
-        let direction: i8 = if new_budget > old_budget_before_tuning {
-            1
-        } else {
-            -1
-        };
-        session_guard.last_token_budget_direction = direction;
-        session_guard.last_token_budget_change_turn = Some(turn);
-    }
-
-    if !actions.is_empty() {
-        eprintln!(
-            "[auto-tuning] cycle applied {} rule(s): {:?}",
-            actions.len(),
-            actions
-        );
-    }
-
-    // Release lock before writing journal events.
-    let action_ids = actions.clone();
-    drop(session_guard);
-
-    // Emit journal events for triggered rules.
-    for rule_id in &action_ids {
-        let event = astra_services::session_journal::JournalEvent::adaptive_tuning_rule_triggered(
-            state.current_session_id.as_deref(),
-            turn,
-            rule_id,
-            rule_id,
-            "aggregate",
-            Vec::new(),
-        );
-        write_session_journal_event(state, event);
-    }
-
-    // Re-acquire lock for remaining operations.
-    let session = match &state.telemetry.observability_session {
-        Some(s) => s,
-        None => return,
-    };
-    let mut session_guard = match session.write() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-
-    // Check if any previously applied rules should be rolled back
-    let rollbacks = hub.check_rollbacks(&mut session_guard.config);
-    if !rollbacks.is_empty() {
-        tracing::info!(
-            target: "astra_runtime::auto_tuning",
-            count = rollbacks.len(),
-            rules = ?rollbacks,
-            "rolled back tuning rules"
-        );
-    }
-
-    // Persist feedback state after each tuning cycle
-    if let Err(e) = astra_learning::auto_tuning::save_feedback("default", hub.tuning()) {
-        tracing::warn!(
-            target: "astra_runtime::auto_tuning",
-            err = %e,
-            "failed to persist auto-tuning feedback"
-        );
-    }
-    drop(session_guard);
-
-    // Publish high-failure tools to ObservabilityHub for SelfModel reasoning.
-    let high_failure = state.turn_guard.health.high_failure_tools(3, 0.5);
-    if !high_failure.is_empty() {
-        hub.record_low_confidence_tools(high_failure);
-    }
-}
-
-fn write_session_journal_event(
-    state: &AgenticLoopState,
-    event: astra_services::session_journal::JournalEvent,
-) {
-    let Some(session_id) = state.current_session_id.as_deref() else {
-        return;
-    };
-    // `JournalWriter::append` auto-prepends a `SessionStart` under the same
-    // file lock when one is needed (see
-    // `prepend_session_start_if_needed`).  A separate
-    // `ensure_session_start_event` call here would re-acquire the file
-    // lock and re-stat the journal solely to check a condition the
-    // append path will recheck atomically — wasted I/O on every event.
-    let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) else {
-        return;
-    };
-    let _ = writer.append(&event);
 }
 
 #[cfg(test)]

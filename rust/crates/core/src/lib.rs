@@ -379,6 +379,7 @@ pub mod error_kind;
 pub mod log;
 pub mod model_override;
 pub mod net;
+pub mod observation;
 pub mod runtime_limits;
 pub mod tool_schema;
 
@@ -392,6 +393,14 @@ pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{ClassifiedError, ErrorKind, classify_tool_output};
+pub use observation::{
+    EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationAdaptationSignal,
+    ObservationBudgetOmitted, ObservationBudgetResult, ObservationCausalChain,
+    ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
+    ObservationGraphEdge, ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
+    ObservationGraphNodeKind, ObservationGraphSlice, ObservationProviderCoverage,
+    ObservationRecord, ObservationSignalConsumer, ObservationView,
+};
 pub use runtime_limits::RuntimeLimits;
 #[cfg(any(test, feature = "dev-defaults"))]
 pub use runtime_limits::{DEV_MATRIXONE_PASSWORD, warn_default_credentials_once};

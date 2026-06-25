@@ -268,9 +268,18 @@ Summarize and trim conversation history.
 | `no-memoria`   | Compact without Memoria         |
 | `summary-only` | Summarize without trimming      |
 
-### `/reflect [mode]`
+### `/reflect [topic[/facet]] [depth]`
 
-Reflect on session (skill_failure, performance, etc.).
+Reflect on session observations through the observation-plane surface.
+
+Examples:
+
+```
+/reflect
+/reflect execution/errors diagnostic
+/reflect execution/trace forensic
+/reflect adaptation/signals
+```
 
 ### `/turn` _(removed)_
 
@@ -335,10 +344,6 @@ LSP (Language Server Protocol) backend status.
 ### `/telemetry [subcommand]`
 
 Deep observability traces: turns, drift, decisions, profile, and context.
-
-### `/tuning` _(removed)_
-
-Migration: evolution/tuning commands were deleted; use `/stats`, `/inspect`, and `/profile experiments` instead.
 
 ### `/sync [subcommand]`
 

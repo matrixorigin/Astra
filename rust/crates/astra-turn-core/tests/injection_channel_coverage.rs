@@ -4,7 +4,7 @@
 //! rules, recent-arg hints, skill listing, memoria-prefetch, implicit
 //! feedback, and tool-round guidance all flow into the system prompt
 //! every turn but have no freshness / staleness tracking —
-//! `introspect subtopic=injection_freshness` silently omits them.
+//! `introspect facet=noise` silently omits them.
 //!
 //! After wip-4, every live injection path must correspond to a variant
 //! in `InjectionChannel::all()` so the observer, freshness report, and
@@ -41,7 +41,7 @@ fn all_live_channels_are_enumerated() {
         EXPECTED_CHANNELS.len(),
         "InjectionChannel::all() must enumerate every live channel. \
          Expected {} variants, got {}. \
-         Missing coverage creates silent blind spots in introspect subtopic=injection_freshness.",
+         Missing coverage creates silent blind spots in introspect facet=noise.",
         EXPECTED_CHANNELS.len(),
         actual.len()
     );

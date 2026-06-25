@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::super::agentic::adaptive_tuning::apply_adaptive_execution_profile_with_intent;
+use super::super::agentic::adaptive_runtime::apply_adaptive_execution_profile_with_intent;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::{CompactionEngine, TokenBudget};
 use super::host::{

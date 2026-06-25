@@ -2,7 +2,7 @@
 
 Scrubbed copy of 19 `llm_capture_*.json` files from live session
 `d0640d3d-3be0-4ce1-a4b7-e52d49601da6` (2026-05-08). This session
-exposed every cache-regression the introspect `subtopic=cache`
+exposed every cache-regression the introspect `facet=cache`
 diagnostic is designed to catch, so it serves as the single-source
 regression net — one fixture, all rules triggered.
 

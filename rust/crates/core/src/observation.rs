@@ -1,0 +1,627 @@
+//! Shared read-only observation DTOs.
+//!
+//! These are wire-shape types for tool views such as `introspect` and
+//! `reflect`. They deliberately do not imply graph persistence or tuning
+//! actions; write-side systems may consume these records later.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+const ALLOWED_EVIDENCE_KINDS: &[&str] = &[
+    "event",
+    "decision",
+    "trace",
+    "observation",
+    "signal",
+    "memory",
+    "artifact",
+    "evaluation",
+    "intervention",
+    "spec",
+    "job",
+    "failure_cluster",
+    "hypothesis",
+    "candidate",
+    "condition",
+    "reconcile",
+    "measurement",
+    "context",
+];
+
+const ALLOWED_EVIDENCE_NAMESPACES: &[&str] =
+    &["cloud", "edge", "local", "graph", "memory", "external"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRef<'a> {
+    raw: &'a str,
+    kind: &'a str,
+    namespace: &'a str,
+    id: &'a str,
+}
+
+impl<'a> EvidenceRef<'a> {
+    pub fn parse(raw: &'a str) -> Result<Self, EvidenceRefError> {
+        let mut parts = raw.splitn(5, ':');
+        let Some("urn") = parts.next() else {
+            return Err(EvidenceRefError::InvalidPrefix);
+        };
+        let Some("astra") = parts.next() else {
+            return Err(EvidenceRefError::InvalidPrefix);
+        };
+        let kind = parts.next().ok_or(EvidenceRefError::MissingKind)?;
+        let namespace = parts.next().ok_or(EvidenceRefError::MissingNamespace)?;
+        let id = parts.next().ok_or(EvidenceRefError::MissingId)?;
+        if !ALLOWED_EVIDENCE_KINDS.contains(&kind) {
+            return Err(EvidenceRefError::UnknownKind(kind.to_string()));
+        }
+        if !ALLOWED_EVIDENCE_NAMESPACES.contains(&namespace) {
+            return Err(EvidenceRefError::UnknownNamespace(namespace.to_string()));
+        }
+        if id.trim().is_empty()
+            || id.chars().any(char::is_whitespace)
+            || id.split(':').any(str::is_empty)
+        {
+            return Err(EvidenceRefError::InvalidId);
+        }
+        Ok(Self {
+            raw,
+            kind,
+            namespace,
+            id,
+        })
+    }
+
+    pub fn as_str(&self) -> &'a str {
+        self.raw
+    }
+
+    pub fn kind(&self) -> &'a str {
+        self.kind
+    }
+
+    pub fn namespace(&self) -> &'a str {
+        self.namespace
+    }
+
+    pub fn id(&self) -> &'a str {
+        self.id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvidenceRefError {
+    InvalidPrefix,
+    MissingKind,
+    MissingNamespace,
+    MissingId,
+    UnknownKind(String),
+    UnknownNamespace(String),
+    InvalidId,
+}
+
+impl fmt::Display for EvidenceRefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPrefix => write!(f, "evidence ref must start with urn:astra"),
+            Self::MissingKind => write!(f, "evidence ref is missing kind"),
+            Self::MissingNamespace => write!(f, "evidence ref is missing namespace"),
+            Self::MissingId => write!(f, "evidence ref is missing id"),
+            Self::UnknownKind(kind) => write!(f, "unknown evidence ref kind: {kind}"),
+            Self::UnknownNamespace(namespace) => {
+                write!(f, "unknown evidence ref namespace: {namespace}")
+            }
+            Self::InvalidId => write!(f, "evidence ref id must be non-empty and whitespace-free"),
+        }
+    }
+}
+
+impl std::error::Error for EvidenceRefError {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservationView {
+    pub topic: String,
+    pub facet: String,
+    pub depth: String,
+    pub horizon: String,
+    pub data_coverage: ObservationDataCoverage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservationDataCoverage {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub overall: String,
+    pub source: String,
+    pub events: i64,
+    pub decisions: i64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ObservationProviderCoverage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservationProviderCoverage {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ObservationBudgetResult {
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "ObservationBudgetOmitted::is_empty")]
+    pub omitted: ObservationBudgetOmitted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ObservationBudgetOmitted {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub events: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub chains: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub nodes: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub evidence_previews: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub observations: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub action_hints: i64,
+}
+
+impl ObservationBudgetOmitted {
+    pub fn is_empty(&self) -> bool {
+        self.events == 0
+            && self.chains == 0
+            && self.nodes == 0
+            && self.evidence_previews == 0
+            && self.observations == 0
+            && self.action_hints == 0
+    }
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObservationRecord {
+    pub ref_id: String,
+    pub topic: String,
+    pub facet: String,
+    pub kind: String,
+    pub severity: String,
+    pub summary: String,
+    pub confidence: ObservationConfidence,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObservationConfidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal: Option<f64>,
+}
+
+impl ObservationConfidence {
+    pub fn complete(classification: f64, evidence: f64, causal: f64) -> Self {
+        Self {
+            classification: Some(clamp_confidence(classification)),
+            evidence: Some(clamp_confidence(evidence)),
+            causal: Some(clamp_confidence(causal)),
+        }
+    }
+
+    pub fn evidence(evidence: f64) -> Self {
+        Self {
+            classification: None,
+            evidence: Some(clamp_confidence(evidence)),
+            causal: None,
+        }
+    }
+
+    pub fn classification_evidence(classification: f64, evidence: f64) -> Self {
+        Self {
+            classification: Some(clamp_confidence(classification)),
+            evidence: Some(clamp_confidence(evidence)),
+            causal: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObservationEvidence {
+    pub ref_id: String,
+    pub evidence_class: String,
+    pub source: String,
+    pub summary: String,
+    pub confidence: ObservationConfidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObservationActionHint {
+    pub target_type: String,
+    pub summary: String,
+    pub confidence: ObservationConfidence,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observation_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObservationFailureCluster {
+    pub cluster_ref: String,
+    pub label: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observation_refs: Vec<String>,
+    pub evidence_class: String,
+    pub confidence: ObservationConfidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservationAdaptationSignal {
+    pub signal_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observation_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_cluster_refs: Vec<String>,
+    pub consumer: ObservationSignalConsumer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservationSignalConsumer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_tool_family: Option<String>,
+    pub target_type: String,
+    pub payload_kind: String,
+    pub priority: String,
+    pub scope_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObservationCausalChain {
+    pub chain_ref: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    pub confidence: ObservationConfidence,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationGraphLayer {
+    Runtime,
+    Observation,
+    Adaptation,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationGraphNodeKind {
+    Event,
+    Decision,
+    Trace,
+    Outcome,
+    Observation,
+    FailureCluster,
+    AdaptationSignal,
+    CausalChain,
+    Evidence,
+    Candidate,
+    EvaluationRun,
+    Intervention,
+    MeasurementRun,
+    TuningJob,
+    Condition,
+    ReconcileEvent,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationGraphEdgeKind {
+    Precedes,
+    Causes,
+    LikelyCauses,
+    CorrelatesWith,
+    Supports,
+    Contradicts,
+    DerivedFrom,
+    Duplicates,
+    Measures,
+    References,
+    Reconciles,
+    Selects,
+    Applies,
+    Finalizes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObservationGraphNode {
+    pub ref_id: String,
+    pub layer: ObservationGraphLayer,
+    pub kind: ObservationGraphNodeKind,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservationGraphEdge {
+    pub from: String,
+    pub to: String,
+    pub kind: ObservationGraphEdgeKind,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ObservationGraphSlice {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<ObservationGraphNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<ObservationGraphEdge>,
+    #[serde(default)]
+    pub budget_result: ObservationBudgetResult,
+}
+
+fn clamp_confidence(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observation_record_wire_shape_roundtrips() {
+        let record = ObservationRecord {
+            ref_id: "urn:astra:observation:graph:test:1".into(),
+            topic: "execution".into(),
+            facet: "errors".into(),
+            kind: "diagnosis:tool_timeout".into(),
+            severity: "warning".into(),
+            summary: "tool timed out".into(),
+            confidence: ObservationConfidence::complete(0.9, 0.8, 0.7),
+            evidence_refs: vec!["urn:astra:event:local:test:1".into()],
+        };
+
+        let json = serde_json::to_string(&record).expect("serialize observation");
+        let parsed: ObservationRecord =
+            serde_json::from_str(&json).expect("deserialize observation");
+        assert_eq!(record, parsed);
+    }
+
+    #[test]
+    fn confidence_wire_shape_names_available_dimensions() {
+        let evidence = ObservationEvidence {
+            ref_id: "urn:astra:event:local:test:1".into(),
+            evidence_class: "observed_evidence".into(),
+            source: "test".into(),
+            summary: "test evidence".into(),
+            confidence: ObservationConfidence::evidence(1.5),
+        };
+        let json = serde_json::to_value(&evidence).expect("serialize evidence");
+        assert_eq!(json["confidence"]["evidence"], 1.0);
+        assert!(json["confidence"].get("classification").is_none());
+        assert!(json["confidence"].get("causal").is_none());
+
+        let hint = ObservationActionHint {
+            target_type: "user_guidance".into(),
+            summary: "inspect the failure".into(),
+            confidence: ObservationConfidence::classification_evidence(0.8, f64::NAN),
+            observation_refs: vec![],
+        };
+        let json = serde_json::to_value(&hint).expect("serialize action hint");
+        assert_eq!(json["confidence"]["classification"], 0.8);
+        assert_eq!(json["confidence"]["evidence"], 0.0);
+        assert!(json["confidence"].get("causal").is_none());
+    }
+
+    #[test]
+    fn failure_cluster_and_adaptation_signal_wire_shapes_are_ref_based() {
+        let cluster = ObservationFailureCluster {
+            cluster_ref: "urn:astra:failure_cluster:graph:reflect:test:tool_timeout".into(),
+            label: "tool_timeout".into(),
+            summary: "bash timed out repeatedly".into(),
+            observation_refs: vec!["urn:astra:observation:graph:reflect:test:diagnosis:0".into()],
+            evidence_class: "inferred_evidence".into(),
+            confidence: ObservationConfidence::classification_evidence(0.82, 0.76),
+        };
+        let signal = ObservationAdaptationSignal {
+            signal_id: "urn:astra:signal:graph:reflect:test:tool_policy:tool_timeout".into(),
+            observation_refs: cluster.observation_refs.clone(),
+            failure_cluster_refs: vec![cluster.cluster_ref.clone()],
+            consumer: ObservationSignalConsumer {
+                suggested_tool_family: Some("tuning_control_plane".into()),
+                target_type: "tool_policy".into(),
+                payload_kind: "tool_policy_signal".into(),
+                priority: "medium".into(),
+                scope_hint: "session".into(),
+            },
+        };
+
+        EvidenceRef::parse(&cluster.cluster_ref).expect("cluster ref must be canonical");
+        EvidenceRef::parse(&signal.signal_id).expect("signal ref must be canonical");
+        let cluster_json = serde_json::to_value(&cluster).expect("serialize cluster");
+        assert_eq!(cluster_json["confidence"]["classification"], 0.82);
+        assert!(cluster_json["confidence"].get("causal").is_none());
+        let signal_json = serde_json::to_value(&signal).expect("serialize signal");
+        assert!(signal_json.get("confidence").is_none());
+        assert!(signal_json.get("severity").is_none());
+        assert!(signal_json.get("evidence_refs").is_none());
+        assert_eq!(
+            signal_json["consumer"]["suggested_tool_family"],
+            "tuning_control_plane"
+        );
+    }
+
+    #[test]
+    fn graph_slice_wire_shape_keeps_layers_and_edges_explicit() {
+        let slice = ObservationGraphSlice {
+            nodes: vec![
+                ObservationGraphNode {
+                    ref_id: "urn:astra:event:cloud:evt-1".into(),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Event,
+                    label: "tool_error".into(),
+                    summary: Some("bash timed out".into()),
+                    metadata: None,
+                },
+                ObservationGraphNode {
+                    ref_id: "urn:astra:observation:graph:obs-1".into(),
+                    layer: ObservationGraphLayer::Observation,
+                    kind: ObservationGraphNodeKind::Observation,
+                    label: "diagnosis:tool_timeout".into(),
+                    summary: None,
+                    metadata: None,
+                },
+            ],
+            edges: vec![ObservationGraphEdge {
+                from: "urn:astra:observation:graph:obs-1".into(),
+                to: "urn:astra:event:cloud:evt-1".into(),
+                kind: ObservationGraphEdgeKind::DerivedFrom,
+            }],
+            budget_result: ObservationBudgetResult::default(),
+        };
+
+        for node in &slice.nodes {
+            EvidenceRef::parse(&node.ref_id).expect("graph node refs must be canonical");
+        }
+        let json = serde_json::to_value(&slice).expect("serialize graph slice");
+        assert_eq!(json["nodes"][0]["layer"], "runtime");
+        assert_eq!(json["nodes"][1]["kind"], "observation");
+        assert_eq!(json["edges"][0]["kind"], "derived_from");
+    }
+
+    #[test]
+    fn evidence_ref_parser_accepts_canonical_refs() {
+        let parsed = EvidenceRef::parse("urn:astra:event:cloud:event_01H00000000000000000000001")
+            .expect("valid evidence ref");
+        assert_eq!(parsed.kind(), "event");
+        assert_eq!(parsed.namespace(), "cloud");
+        assert_eq!(parsed.id(), "event_01H00000000000000000000001");
+        assert_eq!(
+            parsed.as_str(),
+            "urn:astra:event:cloud:event_01H00000000000000000000001"
+        );
+    }
+
+    #[test]
+    fn evidence_ref_parser_accepts_hierarchical_ids() {
+        let edge_event = EvidenceRef::parse("urn:astra:event:edge:session_abc:seq_42")
+            .expect("edge event evidence ref should allow hierarchical ids");
+        assert_eq!(edge_event.id(), "session_abc:seq_42");
+
+        let reflect_observation =
+            EvidenceRef::parse("urn:astra:observation:graph:reflect:test-sess:diagnosis:0")
+                .expect("reflect observation ref should allow generated hierarchical ids");
+        assert_eq!(reflect_observation.kind(), "observation");
+        assert_eq!(reflect_observation.namespace(), "graph");
+        assert_eq!(reflect_observation.id(), "reflect:test-sess:diagnosis:0");
+    }
+
+    #[test]
+    fn evidence_ref_parser_rejects_private_namespaces() {
+        let err = EvidenceRef::parse("urn:astra:event:server:evt-1").unwrap_err();
+        assert_eq!(err, EvidenceRefError::UnknownNamespace("server".into()));
+    }
+
+    #[test]
+    fn evidence_ref_parser_rejects_malformed_refs() {
+        assert_eq!(
+            EvidenceRef::parse("event:cloud:evt-1").unwrap_err(),
+            EvidenceRefError::InvalidPrefix
+        );
+        assert_eq!(
+            EvidenceRef::parse("urn:astra").unwrap_err(),
+            EvidenceRefError::MissingKind
+        );
+        assert_eq!(
+            EvidenceRef::parse("urn:astra:event").unwrap_err(),
+            EvidenceRefError::MissingNamespace
+        );
+        assert_eq!(
+            EvidenceRef::parse("urn:astra:event:cloud").unwrap_err(),
+            EvidenceRefError::MissingId
+        );
+        assert_eq!(
+            EvidenceRef::parse("urn:astra:unknown:cloud:evt-1").unwrap_err(),
+            EvidenceRefError::UnknownKind("unknown".into())
+        );
+        assert_eq!(
+            EvidenceRef::parse("urn:astra:event:cloud:").unwrap_err(),
+            EvidenceRefError::InvalidId
+        );
+        assert_eq!(
+            EvidenceRef::parse("urn:astra:event:cloud:event 1").unwrap_err(),
+            EvidenceRefError::InvalidId
+        );
+        assert_eq!(
+            EvidenceRef::parse("urn:astra:event:cloud::evt").unwrap_err(),
+            EvidenceRefError::InvalidId
+        );
+        assert_eq!(
+            EvidenceRef::parse("urn:astra:event:cloud:evt:").unwrap_err(),
+            EvidenceRefError::InvalidId
+        );
+        assert_eq!(
+            EvidenceRef::parse("urn:astra:event:cloud:evt::seq").unwrap_err(),
+            EvidenceRefError::InvalidId
+        );
+    }
+
+    #[test]
+    fn observation_view_can_report_provider_coverage_and_budget() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "live_runtime".to_string(),
+            ObservationProviderCoverage {
+                status: "fresh".to_string(),
+                freshness_ms: Some(0),
+                reason: None,
+            },
+        );
+        let coverage = ObservationDataCoverage {
+            overall: "partial".to_string(),
+            source: "live_runtime_snapshot".to_string(),
+            events: 2,
+            decisions: 0,
+            providers,
+            warnings: vec!["memory_backend_unavailable".to_string()],
+        };
+        let budget = ObservationBudgetResult {
+            truncated: true,
+            next_cursor: None,
+            omitted: ObservationBudgetOmitted {
+                nodes: 12,
+                evidence_previews: 12,
+                ..Default::default()
+            },
+        };
+
+        let coverage_json = serde_json::to_value(&coverage).expect("serialize coverage");
+        assert_eq!(
+            coverage_json["providers"]["live_runtime"]["status"],
+            "fresh"
+        );
+        let budget_json = serde_json::to_value(&budget).expect("serialize budget");
+        assert_eq!(budget_json["truncated"], true);
+        assert_eq!(budget_json["omitted"]["nodes"], 12);
+    }
+}

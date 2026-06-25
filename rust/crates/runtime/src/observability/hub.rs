@@ -9,11 +9,9 @@ use astra_services::session_workspace::{
 };
 use serde::{Deserialize, Serialize};
 
-use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
-use astra_learning::auto_tuning::{
-    AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType,
-};
+use astra_learning::delegation::DelegationOutcomeTracker;
+use astra_learning::feedback::{FeedbackSignal, FeedbackSignalStore, SignalType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 
@@ -23,8 +21,8 @@ pub struct ObservabilityHub {
     /// User profile manager.
     profile_manager: UserProfileManager,
 
-    /// Auto-tuning engine.
-    tuning_engine: AutoTuningEngine,
+    /// Feedback signal store for observation and SelfModel inputs.
+    feedback_signals: FeedbackSignalStore,
 
     /// Delegation outcome tracker for coordination auto-select.
     delegation_outcomes: DelegationOutcomeTracker,
@@ -48,7 +46,7 @@ impl ObservabilityHub {
         let profile_store = Arc::new(UserProfileStore::new());
         Self {
             profile_manager: UserProfileManager::new(profile_store),
-            tuning_engine: AutoTuningEngine::new(),
+            feedback_signals: FeedbackSignalStore::new(),
             delegation_outcomes: DelegationOutcomeTracker::new(),
             sessions: RwLock::new(HashMap::new()),
             low_confidence_tools: Mutex::new(Vec::new()),
@@ -64,12 +62,11 @@ impl ObservabilityHub {
         }
 
         let profile_path = observability_storage_file(&storage_root, "profiles.json");
-        let tuning_path = observability_storage_file(&storage_root, "feedback-aggregator.json");
         let outcomes_path = observability_storage_file(&storage_root, "delegation-outcomes.json");
         let profile_store = Arc::new(UserProfileStore::with_storage(profile_path));
         Self {
             profile_manager: UserProfileManager::new(profile_store),
-            tuning_engine: AutoTuningEngine::with_storage(tuning_path),
+            feedback_signals: FeedbackSignalStore::new(),
             delegation_outcomes: DelegationOutcomeTracker::with_storage(outcomes_path),
             sessions: RwLock::new(HashMap::new()),
             low_confidence_tools: Mutex::new(Vec::new()),
@@ -125,18 +122,15 @@ impl ObservabilityHub {
 
     // ─── Feedback Recording ─────────────────────────────────────────────────
 
-    /// Record a feedback signal for auto-tuning.
+    /// Record a feedback signal for observation and SelfModel inputs.
     pub fn record_feedback(&self, signal: FeedbackSignal) {
-        self.tuning_engine.record_feedback(signal);
+        self.feedback_signals.record(signal);
     }
 
     /// Record a batch of streaming speculative tool execution metrics.
     ///
-    /// Forwards the cumulative counters into the
-    /// [`astra_learning::auto_tuning::AutoTuningEngine`] so that speculation
-    /// hit rate can be tracked across a session and used to auto-gate
-    /// `ASTRA_STREAMING_TOOL_EXEC` via
-    /// [`AutoTuningEngine::should_disable_streaming_speculation`].
+    /// Forwards the cumulative counters into the feedback signal store so that
+    /// speculation hit rate can be observed across a session.
     ///
     /// Also emits a structured `tracing::info!` event on target
     /// `astra::streaming_speculation::metrics` for downstream log consumers.
@@ -144,7 +138,7 @@ impl ObservabilityHub {
         &self,
         metrics: &astra_turn_core::streaming_tool_exec::StreamingSpeculationMetrics,
     ) {
-        self.tuning_engine.record_streaming_speculation(
+        self.feedback_signals.record_streaming_speculation(
             metrics.started,
             metrics.hit,
             metrics.discarded,
@@ -234,30 +228,6 @@ impl ObservabilityHub {
             .preferred_pattern(scenario, min_observations)
     }
 
-    // ─── Auto-Tuning Cycle ──────────────────────────────────────────────────
-
-    /// Run one auto-tuning cycle and return executed rules.
-    pub fn run_tuning_cycle(&self, config: &mut RuntimeConfig) -> Vec<String> {
-        let executions = self.tuning_engine.run_cycle(config);
-
-        // Persist aggregator state after tuning cycle.
-        if !executions.is_empty() {
-            self.tuning_engine.persist();
-        }
-
-        executions.into_iter().map(|e| e.rule_id).collect()
-    }
-
-    /// Check and execute rollbacks.
-    pub fn check_rollbacks(&self, config: &mut RuntimeConfig) -> Vec<String> {
-        let rollbacks = self.tuning_engine.check_rollbacks(config);
-        // Persist aggregator after rollbacks too (state may have changed).
-        if !rollbacks.is_empty() {
-            self.tuning_engine.persist();
-        }
-        rollbacks
-    }
-
     // ─── Query Observation ──────────────────────────────────────────────────
 
     /// Observe a user query (updates profile and scenario detection).
@@ -296,9 +266,9 @@ impl ObservabilityHub {
             .unwrap_or_default()
     }
 
-    /// Get the auto-tuning engine.
-    pub fn tuning(&self) -> &AutoTuningEngine {
-        &self.tuning_engine
+    /// Return retained feedback signals from oldest to newest.
+    pub fn recent_feedback_signals(&self) -> Vec<FeedbackSignal> {
+        self.feedback_signals.recent_signals()
     }
 
     /// Get the profile manager.

@@ -27,12 +27,14 @@ pub(crate) struct IdentityView {
 #[derive(Debug, Serialize)]
 struct ReflectResponse {
     session_id: String,
-    focus: String,
+    topic: String,
+    facet: String,
+    analysis_view: String,
     question: Option<String>,
     persistence_warning: Option<String>,
-    /// Placeholder: the old liquid-reflection subsystem was removed. The CLI now
+    /// Placeholder: the old reflection subsystem was removed. The CLI now
     /// returns a minimal reflection surface so callers can still inspect the
-    /// recent journal turns under the chosen focus.
+    /// recent journal turns under the chosen topic/facet.
     reflection_context: serde_json::Value,
     prompt_preview: String,
     recent_turns: Vec<EventPreview>,
@@ -85,14 +87,16 @@ pub(crate) async fn execute_self_command(
         }
         SelfCmd::Reflect(SelfReflectArgs {
             session_id,
-            focus,
+            topic,
+            facet,
             question,
             last_n,
         }) => {
             render_reflect_surface_for_session_with_profile(
                 &resolve_target_session_id(session_id.as_deref(), profile).await?,
                 *last_n,
-                Some(focus.as_str()),
+                Some(topic.as_str()),
+                facet.as_deref(),
                 question.as_deref(),
                 profile,
             )
@@ -209,13 +213,15 @@ pub(crate) async fn render_surface_for_session_with_profile(
 pub(crate) async fn render_reflect_surface_for_session(
     session_id: &str,
     journal_limit: usize,
-    focus: Option<&str>,
+    topic: Option<&str>,
+    facet: Option<&str>,
     question: Option<&str>,
 ) -> Result<String, String> {
     render_reflect_surface_for_session_with_profile(
         session_id,
         journal_limit,
-        focus,
+        topic,
+        facet,
         question,
         None,
     )
@@ -225,14 +231,16 @@ pub(crate) async fn render_reflect_surface_for_session(
 pub(crate) async fn try_render_reflect_surface_for_session_with_profile(
     session_id: &str,
     journal_limit: usize,
-    focus: Option<&str>,
+    topic: Option<&str>,
+    facet: Option<&str>,
     question: Option<&str>,
     profile: Option<&str>,
 ) -> Result<Option<String>, String> {
     match render_reflect_surface_for_session_with_profile(
         session_id,
         journal_limit,
-        focus,
+        topic,
+        facet,
         question,
         profile,
     )
@@ -252,16 +260,20 @@ fn reflect_surface_missing_state(error: &str) -> bool {
 pub(crate) async fn render_reflect_surface_for_session_with_profile(
     session_id: &str,
     journal_limit: usize,
-    focus: Option<&str>,
+    topic: Option<&str>,
+    facet: Option<&str>,
     question: Option<&str>,
     profile: Option<&str>,
 ) -> Result<String, String> {
     let artifacts = self_surface::load_artifacts(session_id, profile).await?;
+    let topic = normalize_reflect_topic(topic);
+    let facet = normalize_reflect_facet(facet, topic);
     to_json(
         &build_reflect_response(
             &artifacts,
             journal_limit.max(1),
-            normalize_reflect_focus(focus),
+            topic,
+            facet,
             question
                 .map(str::trim)
                 .filter(|question| !question.is_empty()),
@@ -374,13 +386,15 @@ async fn resolve_default_session_id(profile: Option<&str>) -> Result<String, Str
 async fn build_reflect_response(
     artifacts: &SessionArtifacts,
     journal_limit: usize,
-    focus: &str,
+    topic: &str,
+    facet: &str,
     question: Option<&str>,
 ) -> ReflectResponse {
-    // The old liquid-reflection subsystem has been removed. Callers now get a
-    // trimmed surface: the session id, the requested focus/question, and a
-    // journal preview filtered by the focus kind. Downstream UIs should read
+    // The old reflection subsystem has been removed. Callers now get a
+    // trimmed surface: the session id, the requested topic/facet/question, and
+    // a journal preview filtered by the derived analysis view. Downstream UIs should read
     // `recent_turns` directly; `reflection_context` is intentionally minimal.
+    let analysis_view = analysis_view_for_topic_facet(topic, facet);
     let turns_completed = artifacts
         .journal_events
         .iter()
@@ -403,18 +417,24 @@ async fn build_reflect_response(
     let reflection_context = serde_json::json!({
         "session_id": artifacts.session_id,
         "turns_completed": turns_completed,
-        "focus": focus,
+        "topic": topic,
+        "facet": facet,
+        "analysis_view": analysis_view,
         "question": question,
         "persistence_warning": persistence_warning.clone(),
-        "note": "liquid-reflection subsystem removed; see recent_turns for journal signals",
+        "note": "old reflection subsystem removed; see recent_turns for journal signals",
     });
     let prompt_preview = match question {
-        Some(q) => format!("Focus: {focus}\nQuestion: {q}"),
-        None => format!("Focus: {focus}"),
+        Some(q) => {
+            format!("Topic: {topic}\nFacet: {facet}\nAnalysis view: {analysis_view}\nQuestion: {q}")
+        }
+        None => format!("Topic: {topic}\nFacet: {facet}\nAnalysis view: {analysis_view}"),
     };
     ReflectResponse {
         session_id: artifacts.session_id.clone(),
-        focus: focus.to_string(),
+        topic: topic.to_string(),
+        facet: facet.to_string(),
+        analysis_view: analysis_view.to_string(),
         question: question.map(str::to_string),
         persistence_warning,
         reflection_context,
@@ -422,7 +442,11 @@ async fn build_reflect_response(
         recent_turns: if artifacts.journal_events.is_empty() {
             restored_recent_turn_previews(artifacts, journal_limit)
         } else {
-            focused_recent_event_previews(&artifacts.journal_events, journal_limit, focus)
+            analysis_view_recent_event_previews(
+                &artifacts.journal_events,
+                journal_limit,
+                analysis_view,
+            )
         },
     }
 }
@@ -578,43 +602,89 @@ fn event_preview(event: &JournalEvent) -> EventPreview {
     }
 }
 
-fn normalize_reflect_focus(focus: Option<&str>) -> &'static str {
-    match focus.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
-        "skill_failure" => "skill_failure",
-        "unexpected_result" => "unexpected_result",
-        "data_quality" => "data_quality",
-        "tool_surface" => "tool_surface",
-        "history" => "history",
-        "performance" => "performance",
-        _ => "auto",
+fn normalize_reflect_topic(topic: Option<&str>) -> &'static str {
+    match topic
+        .unwrap_or("overview")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "runtime" => "runtime",
+        "execution" => "execution",
+        "knowledge" => "knowledge",
+        "adaptation" => "adaptation",
+        _ => "overview",
     }
 }
 
-fn focused_recent_event_previews(
+fn normalize_reflect_facet(facet: Option<&str>, topic: &str) -> &'static str {
+    match facet
+        .unwrap_or_else(|| default_reflect_facet_for_topic(topic))
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "errors" | "failures" if topic == "execution" => "errors",
+        "trace" if topic == "execution" => "trace",
+        "tools" if topic == "execution" => "tools",
+        "performance" | "latency" | "cost" if topic == "runtime" => "performance",
+        "context" if topic == "knowledge" => "context",
+        "memory" if topic == "knowledge" => "memory",
+        "signals" if topic == "adaptation" => "signals",
+        "question" if topic == "overview" => "question",
+        "overview" if topic == "overview" => "overview",
+        _ => default_reflect_facet_for_topic(topic),
+    }
+}
+
+fn default_reflect_facet_for_topic(topic: &str) -> &'static str {
+    match topic {
+        "runtime" => "performance",
+        "execution" => "tools",
+        "knowledge" => "context",
+        "adaptation" => "signals",
+        _ => "overview",
+    }
+}
+
+fn analysis_view_for_topic_facet(topic: &str, facet: &str) -> &'static str {
+    match (topic, facet) {
+        ("execution", "errors" | "failures") => "execution_errors",
+        ("execution", "trace") => "execution_trace",
+        ("execution", _) => "execution_tools",
+        ("knowledge", _) => "knowledge_context",
+        ("runtime", _) => "runtime_performance",
+        ("adaptation", _) => "adaptation_signals",
+        _ => "overview",
+    }
+}
+
+fn analysis_view_recent_event_previews(
     events: &[JournalEvent],
     journal_limit: usize,
-    focus: &str,
+    analysis_view: &str,
 ) -> Vec<EventPreview> {
-    let event_types: &[JournalEventType] = match focus {
-        "skill_failure" => &[
+    let event_types: &[JournalEventType] = match analysis_view {
+        "execution_errors" => &[
             JournalEventType::TurnError,
             JournalEventType::Error,
             JournalEventType::StallDetected,
             JournalEventType::VerificationCompleted,
             JournalEventType::Turn,
         ],
-        "performance" => &[
+        "runtime_performance" => &[
             JournalEventType::Turn,
             JournalEventType::TurnError,
             JournalEventType::StallDetected,
             JournalEventType::AdaptivePerTurnApplied,
         ],
-        "tool_surface" => &[
+        "execution_tools" => &[
             JournalEventType::Turn,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
         ],
-        "history" => &[
+        "execution_trace" => &[
             JournalEventType::Turn,
             JournalEventType::TurnError,
             JournalEventType::Error,
@@ -859,7 +929,6 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::DelegationSubRunCompleted => "delegation_sub_run_completed",
         JournalEventType::DelegationRetry => "delegation_retry",
         JournalEventType::DelegationCompleted => "delegation_completed",
-        JournalEventType::AdaptiveBaselinePromoted => "adaptive_baseline_promoted",
         JournalEventType::AgentSpawned => "agent_spawned",
         JournalEventType::AgentTerminated => "agent_terminated",
         JournalEventType::VerificationCompleted => "verification_completed",
@@ -878,7 +947,6 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::DriftDetected => "drift_detected",
         JournalEventType::AdaptiveScenarioApplied => "adaptive_scenario_applied",
         JournalEventType::AdaptivePerTurnApplied => "adaptive_per_turn_applied",
-        JournalEventType::AdaptiveTuningRuleTriggered => "adaptive_tuning_rule_triggered",
         JournalEventType::InterruptionRecorded => "interruption_recorded",
         JournalEventType::CompactionRetry => "compaction_retry",
         JournalEventType::LlmRound => "llm_round",
@@ -1488,7 +1556,8 @@ mod tests {
         let body = execute_self_command(
             &SelfCmd::Reflect(SelfReflectArgs {
                 session_id: Some(session_id.to_string()),
-                focus: "history".to_string(),
+                topic: "execution".to_string(),
+                facet: Some("trace".to_string()),
                 question: None,
                 last_n: 4,
             }),
@@ -1524,7 +1593,7 @@ mod tests {
             latest_full_context_trace: None,
         };
 
-        let response = build_reflect_response(&artifacts, 4, "history", None).await;
+        let response = build_reflect_response(&artifacts, 4, "execution", "trace", None).await;
 
         assert_eq!(
             response.persistence_warning.as_deref(),

@@ -147,7 +147,6 @@ dependencies = [
  "astra-core",
  "astra-credentials",
  "astra-harness",
- "astra-learning",
  "astra-logging",
  "astra-mcp",
  "astra-messaging",
@@ -314,9 +313,6 @@ dependencies = [
 name = "astra-learning"
 version = "0.1.0"
 dependencies = [
- "astra-config",
- "astra-core",
- "dirs 6.0.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -372,7 +368,6 @@ name = "astra-pipeline"
 version = "0.1.0"
 dependencies = [
  "astra-core",
- "astra-learning",
  "astra-services",
  "astra-text-utils",
  "astra-turn-types",

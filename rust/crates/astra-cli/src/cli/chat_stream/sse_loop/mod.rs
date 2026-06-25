@@ -787,7 +787,6 @@ pub(crate) async fn stream_chat_sse(
             observability_session: p.observability_session.clone(),
             observability_hub: p.observability_hub.clone(),
             turn_trace_collector: None,
-            completed_turns_for_tuning: 0,
             evaluation_persistence: None,
             context_trace_persistence: None,
             promotion_events: Vec::new(),

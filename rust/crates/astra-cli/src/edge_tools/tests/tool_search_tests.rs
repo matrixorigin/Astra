@@ -117,6 +117,32 @@ async fn select_resolves_only_current_visible_tools_with_full_schema() {
 }
 
 #[tokio::test]
+async fn select_reflect_returns_normalized_observation_schema() {
+    let executor = executor();
+    set_visible(&executor, &["reflect", "tool_search"]);
+
+    let parsed = run_search(&executor, json!({"query": "select:reflect"})).await;
+
+    assert_eq!(parsed["mode"].as_str(), Some("select"));
+    assert_eq!(field_strings(&parsed, "requested"), strings(&["reflect"]));
+    assert!(field_strings(&parsed, "missing").is_empty());
+    assert_eq!(match_names(&parsed), strings(&["reflect"]));
+    let properties = parsed["matches"][0]["parameters"]["properties"]
+        .as_object()
+        .expect("reflect select result must include callable properties");
+    for key in ["topic", "facet", "depth", "horizon", "source_policy"] {
+        assert!(
+            properties.contains_key(key),
+            "reflect select result must expose `{key}`: {parsed}"
+        );
+    }
+    assert!(
+        !properties.contains_key("focus"),
+        "reflect select result must not expose removed focus parameter: {parsed}"
+    );
+}
+
+#[tokio::test]
 async fn select_is_case_insensitive_and_deduplicates_requested_names() {
     let executor = executor();
     set_visible(&executor, &["bash", "read_file", "tool_search"]);

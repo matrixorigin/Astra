@@ -541,7 +541,7 @@ pub struct TelemetryState {
     pub first_memoria_ms: Option<u64>,
     /// All skill names selected across all turns.
     pub all_selected_skills: Vec<String>,
-    /// Optional observability session for context tracing, drift detection, and auto-tuning.
+    /// Optional observability session for context tracing, drift detection, and feedback signals.
     /// When set, hooks are called at turn start/end, tool surface, etc.
     pub observability_session:
         Option<std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
@@ -558,8 +558,6 @@ pub struct TelemetryState {
     /// When set, records system prompt, history, memory, and tool surface traces.
     /// Created at turn start, finalized at turn end.
     pub turn_trace_collector: Option<crate::turn::turn_trace_collector::TurnTraceCollector>,
-    /// Number of turns completed in this loop invocation (for tuning cycle trigger).
-    pub completed_turns_for_tuning: u32,
     /// Deferred context assembly trace: written here by `finalize_turn_trace` so
     /// the journal event is only emitted when the turn actually commits (not on
     /// aborts/retries), preventing ghost `context_assembly_recorded` events.
@@ -675,7 +673,7 @@ pub struct StallTrackingState {
     /// Anomaly-based circuit breaker for the agentic loop.
     /// Owns tool-round hard-stop and abort decisions.
     pub circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker,
-    /// Rolling-stats guardrail auto-tuner for the auto-reflection signal
+    /// Rolling-stats guardrail adapter for the auto-reflection signal
     /// threshold. Observes per-turn outcomes and adjusts the threshold by
     /// ±1 (bounded to `[MIN, MAX]`) so Astra reacts faster when failures
     /// cluster and backs off when things are stable.
@@ -1834,10 +1832,9 @@ fn apply_harness_pause_recovery_threshold(
     }
 }
 
-pub(crate) use super::super::agentic::adaptive_tuning::{
-    DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile_with_intent,
-    apply_per_turn_adaptation, apply_tactical_actions, maybe_run_tuning_cycle,
-    record_loop_completion_feedback, should_emit_adaptive_scenario_event,
+pub(crate) use super::super::agentic::adaptive_runtime::{
+    apply_adaptive_execution_profile_with_intent, apply_per_turn_adaptation,
+    apply_tactical_actions, record_loop_completion_feedback, should_emit_adaptive_scenario_event,
 };
 #[cfg(test)]
 pub(crate) use super::tool_support::delegate_tool_schema;
@@ -6975,7 +6972,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // Output should exist but be capped (plain text → context)
     }
 
-    // ── Auto-tuning integration tests ───────────────────────────────────────
+    // ── Feedback signal observation tests ───────────────────────────────────
 
     pub(crate) fn make_hub() -> std::sync::Arc<crate::observability::ObservabilityHub> {
         std::sync::Arc::new(crate::observability::ObservabilityHub::new())
@@ -7015,50 +7012,13 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        // Add a rule that fires on low success rate — it should NOT fire because
-        // we just recorded a success.
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "test-low-success",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.5,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "low success".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            triggered.is_empty(),
-            "rule should not fire with 100% success"
-        );
-
-        // Record failures to bring success rate below threshold.
-        let fail_result: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
-            Ok(AgenticLoopOutcome::Error("test error".into()));
-        record_loop_completion_feedback(&mut state, &fail_result);
-        let fail_result2: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
-            Ok(AgenticLoopOutcome::Error("test error 2".into()));
-        record_loop_completion_feedback(&mut state, &fail_result2);
-
-        let triggered = hub.tuning().evaluate(&config);
-        // success_rate = 1/3 ≈ 0.33 < 0.5 threshold
-        assert!(
-            !triggered.is_empty(),
-            "rule should fire with low success rate"
-        );
-
-        // Full cycle: evaluate + execute.
-        let mut config2 = astra_config::runtime_config::RuntimeConfig::default();
-        let executions = hub.run_tuning_cycle(&mut config2);
-        assert!(
-            !executions.is_empty(),
-            "tuning cycle should execute the triggered rule"
-        );
+        let signals = hub.recent_feedback_signals();
+        assert_eq!(signals.len(), 1);
+        assert!(matches!(
+            signals[0].signal_type,
+            astra_learning::feedback::SignalType::TaskSuccess
+        ));
+        assert_eq!(signals[0].turn_id.as_deref(), Some("run-1"));
     }
 
     #[test]
@@ -7071,26 +7031,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
             Err("something broke".to_string().into());
         record_loop_completion_feedback(&mut state, &result);
 
-        // TaskFailure lowers success rate. With 0 successes and 1 failure, rate = 0.0.
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "low-success",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.5,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "low success".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            !triggered.is_empty(),
-            "low success rate rule should fire after failure"
-        );
+        let signals = hub.recent_feedback_signals();
+        assert!(signals.iter().any(|signal| matches!(
+            &signal.signal_type,
+            astra_learning::feedback::SignalType::TaskFailure { reason }
+                if reason.contains("something broke")
+        )));
     }
 
     #[test]
@@ -7102,26 +7048,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Cancelled);
         record_loop_completion_feedback(&mut state, &result);
 
-        // Interruption is recorded as a signal — verify via accumulation.
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "interrupt-detect",
-                astra_learning::auto_tuning::EvolutionTrigger::SignalAccumulation {
-                    signal_type: "interruption".into(),
-                    count: 1,
-                    window_secs: 3600,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "interrupted".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            !triggered.is_empty(),
-            "interruption signal should fire accumulation rule"
-        );
+        assert!(hub.recent_feedback_signals().iter().any(|signal| matches!(
+            signal.signal_type,
+            astra_learning::feedback::SignalType::Interruption
+        )));
     }
 
     #[test]
@@ -7135,22 +7065,13 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "high-tokens",
-                astra_learning::auto_tuning::EvolutionTrigger::HighTokenUsage {
-                    threshold_tokens: 50_000,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "high tokens".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(!triggered.is_empty(), "high token usage rule should fire");
+        assert!(hub.recent_feedback_signals().iter().any(|signal| matches!(
+            signal.signal_type,
+            astra_learning::feedback::SignalType::HighTokenUsage {
+                tokens: 60_000,
+                threshold: 50_000
+            }
+        )));
     }
 
     #[test]
@@ -7165,25 +7086,13 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "churn-detect",
-                astra_learning::auto_tuning::EvolutionTrigger::SignalAccumulation {
-                    signal_type: "tool_churn".into(),
-                    count: 1,
-                    window_secs: 3600,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "churn".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            !triggered.is_empty(),
-            "tool churn signal should fire accumulation rule"
-        );
+        assert!(hub.recent_feedback_signals().iter().any(|signal| matches!(
+            signal.signal_type,
+            astra_learning::feedback::SignalType::ToolChurn {
+                calls: 30,
+                unique_tools: 1
+            }
+        )));
     }
 
     #[test]
@@ -7220,23 +7129,11 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "churn-detect",
-                astra_learning::auto_tuning::EvolutionTrigger::SignalAccumulation {
-                    signal_type: "tool_churn".into(),
-                    count: 1,
-                    window_secs: 3600,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "churn".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
         assert!(
-            triggered.is_empty(),
+            hub.recent_feedback_signals().iter().all(|signal| !matches!(
+                signal.signal_type,
+                astra_learning::feedback::SignalType::ToolChurn { .. }
+            )),
             "synthetic placeholders should not trigger churn feedback"
         );
     }
@@ -7275,98 +7172,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        // The bad skill failure adds a TaskFailure signal, lowering success rate.
-        // We have TaskSuccess (completed) + TaskSuccess (good-skill) + TaskFailure (bad-skill)
-        // = 2 successes / 3 total = 0.67 success rate.
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "low-success",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.8, // 0.67 < 0.8, so this should trigger
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "skill failure".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            !triggered.is_empty(),
-            "skill failure should lower success rate and trigger rule"
-        );
-    }
-
-    #[test]
-    fn tuning_cycle_runs_at_interval() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-
-        hub.tuning().add_rule(
-            astra_learning::auto_tuning::EvolutionRule::new(
-                "test-alert",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.5,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "low success detected".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            )
-            .with_cooldown(std::time::Duration::from_secs(0)),
-        );
-
-        // Record failures to satisfy the rule trigger.
-        for _ in 0..3 {
-            hub.record_feedback(astra_learning::auto_tuning::FeedbackSignal::new(
-                astra_learning::auto_tuning::SignalType::TaskFailure {
-                    reason: "test".into(),
-                },
-            ));
-        }
-
-        // Below interval — should NOT trigger.
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL - 1;
-        maybe_run_tuning_cycle(&mut state);
-        assert_eq!(
-            state.telemetry.completed_turns_for_tuning,
-            DEFAULT_TUNING_CYCLE_INTERVAL - 1,
-            "counter should not reset below interval"
-        );
-        assert!(
-            hub.tuning().get_executions().is_empty(),
-            "no cycle should run below interval"
-        );
-
-        // At interval — SHOULD trigger.
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-        maybe_run_tuning_cycle(&mut state);
-        assert_eq!(
-            state.telemetry.completed_turns_for_tuning, 0,
-            "counter should reset after cycle"
-        );
-        assert!(
-            !hub.tuning().get_executions().is_empty(),
-            "cycle should execute the triggered rule"
-        );
-    }
-
-    #[test]
-    fn tuning_cycle_skips_without_session() {
-        let hub = make_hub();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-        maybe_run_tuning_cycle(&mut state);
-        // Counter is reset (passes threshold check) but no cycle runs (no session).
-        assert_eq!(state.telemetry.completed_turns_for_tuning, 0);
+        let signals = hub.recent_feedback_signals();
+        assert!(signals.iter().any(|signal| matches!(
+            &signal.signal_type,
+            astra_learning::feedback::SignalType::TaskFailure { reason }
+                if reason.contains("bad-skill")
+        )));
+        assert!(signals.iter().any(|signal| {
+            signal
+                .context
+                .get("skill_name")
+                .and_then(|value| value.as_str())
+                == Some("bad-skill")
+        }));
     }
 
     #[test]
@@ -8006,61 +7824,14 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert_eq!(guard.last_token_budget_change_turn, Some(1));
     }
 
-    #[test]
-    fn tuning_cycle_updates_budget_direction_on_increase() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-
-        // Set a low budget so tuning might increase it
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 50_000;
-            guard.turn_number = 10;
-        }
-        state.max_turn_input_tokens = 50_000;
-
-        // Add a rule that increases token budget
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "test-increase-budget",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 1.0, // always fires
-                    window_secs: 3600,
-                    min_samples: 0,
-                },
-                astra_learning::auto_tuning::EvolutionAction::AdjustConfig {
-                    path: "token_budget.max_turn_input_tokens".into(),
-                    delta: 10_000.0,
-                    min: None,
-                    max: None,
-                },
-            ));
-
-        maybe_run_tuning_cycle(&mut state);
-
-        let guard = session.read().unwrap();
-        if guard.config.token_budget.max_turn_input_tokens > 50_000 {
-            // If the rule fired and increased budget, direction should be +1
-            assert_eq!(guard.last_token_budget_direction, 1);
-            assert_eq!(guard.last_token_budget_change_turn, Some(10));
-        }
-        // (If the rule didn't fire due to min_samples, that's OK — the direction
-        // tracking only activates on actual changes.)
-    }
-
     // ══════════════════════════════════════════════════════════════════════
     // Stress & integration tests
     // ══════════════════════════════════════════════════════════════════════
 
-    /// Simulate a single "turn" through all adaptive phases:
+    /// Simulate a single turn through the retained adaptive phases:
     /// 1. apply_adaptive_execution_profile (scenario routing)
     /// 2. apply_per_turn_adaptation (micro-adaptation based on token usage)
     /// 3. record_loop_completion_feedback (outcome signal)
-    /// 4. maybe_run_tuning_cycle (if interval reached)
     fn simulate_turn(
         state: &mut AgenticLoopState,
         session: &std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>,
@@ -8085,19 +7856,13 @@ print(json.dumps({'context': 'user said: ' + msg}))
         apply_per_turn_adaptation(state, tokens_used);
 
         // Phase 3: feedback
-        state.telemetry.completed_turns_for_tuning += 1;
         record_loop_completion_feedback(state, outcome);
-
-        // Phase 4: tuning cycle (fires at interval)
-        maybe_run_tuning_cycle(state);
     }
 
     #[test]
     fn stress_full_adaptive_loop_20_turns() {
-        // See `stress_multi_turn_state_continuity_50_turns` for why we pin
-        // journal I/O to a tempdir — adaptive-tuning fans out journal writes
-        // for `state.current_session_id` and would otherwise pollute
-        // `~/.astra/sessions/stress-test.jsonl` across local test runs.
+        // See `stress_multi_turn_state_continuity_50_turns` for why tests
+        // that touch journal-backed session ids pin I/O to a tempdir.
         let _journal_dir = tempfile::tempdir().unwrap();
         let _journal_guard =
             astra_services::session_journal::JournalDirGuard::new(_journal_dir.path());
@@ -8179,78 +7944,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
             final_state.1
         );
         // No panic, no corruption — full loop survived 20 turns
-    }
-
-    #[test]
-    fn stress_budget_conflict_tuning_increase_then_per_turn_decrease() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-        state.current_run_id = Some("run-conflict".into());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 50_000;
-            guard.config.context_window.adaptive = true;
-            guard.turn_number = 9;
-        }
-        state.max_turn_input_tokens = 50_000;
-
-        // Add a rule that increases token budget
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "increase-budget",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 1.0,
-                    window_secs: 3600,
-                    min_samples: 0,
-                },
-                astra_learning::auto_tuning::EvolutionAction::AdjustConfig {
-                    path: "token_budget.max_turn_input_tokens".into(),
-                    delta: 20_000.0,
-                    min: None,
-                    max: None,
-                },
-            ));
-
-        // Step 1: Fire tuning cycle — should increase budget
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-        maybe_run_tuning_cycle(&mut state);
-
-        let budget_after_tuning = {
-            let guard = session.read().unwrap();
-            guard.config.token_budget.max_turn_input_tokens
-        };
-
-        // Step 2: Advance turn, then per-turn wants to decrease due to high usage
-        {
-            let mut guard = session.write().unwrap();
-            guard.turn_number = 10;
-        }
-
-        // High token usage relative to new budget
-        let high_usage = (budget_after_tuning as f64 * 0.92) as u64;
-        apply_per_turn_adaptation(&mut state, high_usage);
-
-        let budget_after_per_turn = {
-            let guard = session.read().unwrap();
-            guard.config.token_budget.max_turn_input_tokens
-        };
-
-        // Anti-flap should suppress the decrease because tuning just increased
-        // (direction reversal within cooldown)
-        if budget_after_tuning > 50_000 {
-            // Tuning rule fired, so anti-flap should kick in
-            assert_eq!(
-                budget_after_per_turn, budget_after_tuning,
-                "anti-flap should suppress decrease right after tuning increase: tuning={}, per_turn={}",
-                budget_after_tuning, budget_after_per_turn
-            );
-        }
-        // In all cases, budget should be valid
-        assert!(budget_after_per_turn >= 30_000);
     }
 
     #[test]
@@ -8388,7 +8081,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn stress_multi_turn_state_continuity_50_turns() {
-        // Test isolation: every adaptive-tuning turn fans out a journal write
+        // Test isolation: every adaptive turn can fan out a journal write
         // for the active session id.  Without a `JournalDirGuard`, those writes
         // land in the developer's real `~/.astra/sessions/<sid>.jsonl` file,
         // accumulating across runs (observed at >10 MB / 38k events) until
@@ -8469,98 +8162,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
     }
 
     #[test]
-    fn stress_all_8_default_rules_fire() {
-        use astra_learning::auto_tuning::{FeedbackSignal, SignalType, default_rules};
-
-        let hub = make_hub();
-        // Load default evolution rules so the tuning engine has something to evaluate
-        for rule in default_rules() {
-            hub.tuning().add_rule(rule);
-        }
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-        state.current_run_id = Some("run-all-rules".into());
-
-        // Record diverse feedback to trigger as many rules as possible
-        for _ in 0..15 {
-            // Failures (triggers LowSuccessRate rules)
-            hub.record_feedback(
-                FeedbackSignal::new(SignalType::TaskFailure {
-                    reason: "test error".into(),
-                })
-                .with_turn("turn-1"),
-            );
-
-            // High token usage
-            hub.record_feedback(
-                FeedbackSignal::new(SignalType::HighTokenUsage {
-                    tokens: 90_000,
-                    threshold: 80_000,
-                })
-                .with_turn("turn-1"),
-            );
-
-            // Tool churn
-            hub.record_feedback(
-                FeedbackSignal::new(SignalType::ToolChurn {
-                    calls: 30,
-                    unique_tools: 2,
-                })
-                .with_turn("turn-1"),
-            );
-
-            // Corrections
-            hub.record_feedback(FeedbackSignal::new(SignalType::Correction).with_turn("turn-1"));
-
-            // Interruptions
-            hub.record_feedback(FeedbackSignal::new(SignalType::Interruption).with_turn("turn-1"));
-        }
-
-        // Trigger tuning cycle
-        {
-            let mut guard = session.write().unwrap();
-            guard.turn_number = 10;
-        }
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-
-        let config_before = {
-            let guard = session.read().unwrap();
-            guard.config.clone()
-        };
-
-        maybe_run_tuning_cycle(&mut state);
-
-        let config_after = {
-            let guard = session.read().unwrap();
-            guard.config.clone()
-        };
-
-        // At least some rules should have fired
-        let executions = hub.tuning().get_executions();
-        assert!(
-            !executions.is_empty(),
-            "at least some rules should fire with diverse feedback signals"
-        );
-
-        // Config should still be valid (no corruption from multiple simultaneous adjustments)
-        assert!(config_after.token_budget.max_turn_input_tokens >= 10_000);
-        assert!(config_after.token_budget.max_turn_input_tokens <= 500_000);
-        assert!(config_after.memory.retrieval_top_k >= 1);
-        assert!(config_after.memory.retrieval_top_k <= 50);
-
-        // Verify that config actually changed (at least one rule had an effect)
-        let budget_changed = config_before.token_budget.max_turn_input_tokens
-            != config_after.token_budget.max_turn_input_tokens;
-        let memory_changed =
-            config_before.memory.retrieval_top_k != config_after.memory.retrieval_top_k;
-        let _some_change = budget_changed || memory_changed;
-
-        // No panic, no corruption — all rules composed successfully
-    }
-
-    #[test]
     fn retry_signal_emitted_on_consecutive_identical_tool_calls() {
         let hub = make_hub();
         let mut state = make_state();
@@ -8599,24 +8200,11 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        // Add a rule that triggers on high retry rate.
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "retry-trigger",
-                astra_learning::auto_tuning::EvolutionTrigger::HighRetryRate {
-                    threshold: 0.3,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "retries detected".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let triggered = hub.tuning().evaluate(&config);
         assert!(
-            !triggered.is_empty(),
+            hub.recent_feedback_signals().iter().any(|signal| matches!(
+                signal.signal_type,
+                astra_learning::feedback::SignalType::Retry { count: 2 }
+            )),
             "consecutive identical tool calls should emit Retry signal"
         );
     }
@@ -8633,27 +8221,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        // Verify Acceptance signal was recorded — check success rate.
-        // Acceptance + TaskSuccess = 2 successes, both positive.
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "high-success-check",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.5,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "acceptance".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
-                },
-            ));
-        let triggered = hub.tuning().evaluate(&config);
-        // With Acceptance + TaskSuccess = 100% success rate, LowSuccessRate (0.5) should NOT trigger.
         assert!(
-            triggered.is_empty(),
-            "acceptance + task success should keep success rate high"
+            hub.recent_feedback_signals().iter().any(|signal| matches!(
+                signal.signal_type,
+                astra_learning::feedback::SignalType::Acceptance
+            )),
+            "non-correction follow-up should emit Acceptance"
         );
     }
 
@@ -8669,27 +8242,20 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        // Only TaskSuccess should be recorded (no Acceptance because "wrong" is a correction keyword).
-        // We can verify by checking there's only 1 signal.
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "success-check",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 1.1, // impossible to reach — we're just counting signals
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "check".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
-                },
-            ));
-        // This would trigger if there's any signal below the impossible threshold.
-        let triggered = hub.tuning().evaluate(&config);
+        let signals = hub.recent_feedback_signals();
         assert!(
-            !triggered.is_empty(),
-            "TaskSuccess alone with threshold 1.1 should trigger (success rate < 1.1)"
+            signals.iter().all(|signal| !matches!(
+                signal.signal_type,
+                astra_learning::feedback::SignalType::Acceptance
+            )),
+            "correction text should suppress Acceptance"
+        );
+        assert!(
+            signals.iter().any(|signal| matches!(
+                signal.signal_type,
+                astra_learning::feedback::SignalType::TaskSuccess
+            )),
+            "completed outcome should still emit TaskSuccess"
         );
     }
 

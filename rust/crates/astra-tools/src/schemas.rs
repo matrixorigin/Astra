@@ -853,12 +853,17 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query runtime state. Subtopics: `session` (default: token pressure, cache hit rate, tool health, alerts, working memory, plan/task/session lifecycle context including restore/resume state and last lifecycle event when available), `cache` (cache-regression diagnosis), `recent` (recent LLM-round summaries), `volatile` (runtime nudges/coaching queued for next turn), `stall` (loop-guard state), `all` (session + recent + volatile + stall). Set detail='full' for deep diagnosis (stall forensics, context pressure, performance); use detail='summary' for quick health checks.",
+                "description": "Query read-only runtime observation state. Use topic/facet/depth for the normalized surface: topics are `runtime`, `execution`, `knowledge`, `adaptation`, `overview`; facets include `session` (default: token pressure, cache hit rate, tool health, alerts, working memory, plan/task/session lifecycle context including restore/resume state and last lifecycle event when available), `execution/errors`, `recent`, `volatile`, `stall`, `noise`, and `all`. CLI/Edge mode can also read Edge-local facets `cache` and `session_memory`; pure Server mode returns an explicit data-coverage unavailable message for those facets.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Diagnostic to run. `noise` reports stale runtime-injected prompt channels."},
-                        "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Detail level for session output."}
+                        "topic": {"type": "string", "enum": ["overview","runtime","execution","knowledge","adaptation"], "description": "Top-level observation topic. `execution/errors` may also be passed as a facet."},
+                        "facet": {"type": "string", "enum": ["session","execution/errors","errors","recent","volatile","stall","noise","cache","session_memory","all"], "description": "Observation facet within the topic. `cache` and `session_memory` require CLI/Edge-local data."},
+                        "depth": {"type": "string", "enum": ["hint","summary","diagnostic","forensic"], "description": "Output depth. `hint` is the compact live nudge; `diagnostic` and `forensic` map to the full bounded renderer for current runtime snapshots."},
+                        "horizon": {"type": "string", "enum": ["now","current_turn","recent","turn","session","cross_session"], "description": "Time range. Trace is selected by facet/selector, not by horizon."},
+                        "source_policy": {"type": "string", "enum": ["auto","live_only","live_first","durable_first","local_only","cloud_only"], "description": "Preferred data source policy. Availability is reported in the output when the requested facet is not visible from this runtime."},
+                        "include_context": {"type": "boolean", "description": "Include visible prompt/context facts when a context provider is available. Context facts are reported as observed context, not durable truth."},
+                        "format": {"type": "string", "enum": ["text","json"], "description": "Output format. Defaults to text; json returns a structured read-only observation envelope with summary, view, observations, evidence, and action_hints."}
                     }
                 }
             }
@@ -1773,6 +1778,9 @@ mod tests {
         let desc = introspect["function"]["description"]
             .as_str()
             .expect("introspect description must be a string");
+        let properties = introspect["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("introspect parameters properties must be an object");
         assert!(
             desc.contains("plan/task/session lifecycle context"),
             "introspect should advertise lifecycle visibility: {desc}"
@@ -1785,6 +1793,51 @@ mod tests {
             desc.contains("last lifecycle event"),
             "introspect should advertise causal last-event visibility: {desc}"
         );
+        for key in [
+            "topic",
+            "facet",
+            "depth",
+            "horizon",
+            "source_policy",
+            "include_context",
+            "format",
+        ] {
+            assert!(
+                properties.contains_key(key),
+                "introspect schema should expose normalized observation parameter `{key}`"
+            );
+        }
+        assert!(
+            !properties.contains_key("subtopic") && !properties.contains_key("detail"),
+            "introspect schema must not expose removed legacy aliases"
+        );
+        assert_eq!(
+            enum_values(&properties["depth"]),
+            vec!["hint", "summary", "diagnostic", "forensic"],
+            "introspect depth schema must expose canonical observation depths"
+        );
+        assert_eq!(
+            enum_values(&properties["source_policy"]),
+            vec![
+                "auto",
+                "live_only",
+                "live_first",
+                "durable_first",
+                "local_only",
+                "cloud_only",
+            ],
+            "introspect source_policy schema must not regress to old edge/server/cloud aliases"
+        );
+    }
+
+    fn enum_values(schema: &serde_json::Value) -> Vec<&str> {
+        schema
+            .get("enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("schema must expose enum array")
+            .iter()
+            .map(|value| value.as_str().expect("enum values must be strings"))
+            .collect()
     }
 
     #[test]

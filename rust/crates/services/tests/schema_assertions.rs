@@ -115,6 +115,51 @@ async fn schema_rationalization_runtime_contract() {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn evaluation_schema_supports_calibration_reads() {
+    let pool = common::setup_pool().await;
+    let schema = current_schema(&pool).await;
+
+    let calibration = column_names(&pool, &schema, "eval_calibration_assessments").await;
+    for expected in [
+        "calibration_id",
+        "user_id",
+        "agent_id",
+        "session_id",
+        "confidence",
+        "quality_score",
+        "created_at",
+    ] {
+        assert!(
+            calibration.iter().any(|column| column == expected),
+            "eval_calibration_assessments missing {expected}"
+        );
+    }
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "eval_calibration_assessments",
+            "idx_eval_calibration_user_created"
+        )
+        .await,
+        ["user_id", "created_at"],
+        "calibration reads without agent_id must use user/created ordering"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "eval_calibration_assessments",
+            "idx_eval_calibration_user_agent_created"
+        )
+        .await,
+        ["user_id", "agent_id", "created_at"],
+        "calibration reads with agent_id must use user/agent/created ordering"
+    );
+}
+
 async fn current_schema(pool: &astra_core::SharedPool) -> String {
     let row = sqlx::query("SELECT DATABASE() AS db")
         .fetch_one(pool.get())

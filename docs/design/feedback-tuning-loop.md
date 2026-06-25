@@ -1,7 +1,7 @@
 # Feedback and Tuning Control Plane
 
-**Date**: 2026-06-24  
-**Status**: Design Proposal  
+**Date**: 2026-06-24
+**Status**: Design Proposal
 **Audience**: Astra runtime, CLI, server, learning, memory, policy, skill, and tool maintainers
 
 ## Executive Summary

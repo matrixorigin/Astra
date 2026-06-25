@@ -10,7 +10,6 @@ default = []
 
 [dependencies]
 astra-core.workspace = true
-astra-learning.workspace = true
 astra-services.workspace = true
 astra-text-utils = { path = "../astra-text-utils" }
 astra-turn-types = { path = "../astra-turn-types" }

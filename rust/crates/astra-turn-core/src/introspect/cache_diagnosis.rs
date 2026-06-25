@@ -1,5 +1,5 @@
 //! Cache-performance diagnostic rules surfaced through
-//! `introspect(subtopic="cache")`.
+//! `introspect(facet="cache")`.
 //!
 //! All four rules are **pure functions**: they consume a slice of
 //! [`RoundSnapshot`] entries (a recent-history ring captured by the
@@ -770,7 +770,7 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
 // reproduction.
 
 /// Render findings + round-level aggregates as markdown suitable for
-/// returning to the LLM from `introspect(subtopic="cache")`. Designed
+/// returning to the LLM from `introspect(facet="cache")`. Designed
 /// to be informative but compact (~30-60 lines depending on the
 /// number of findings).
 ///

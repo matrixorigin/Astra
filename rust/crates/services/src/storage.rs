@@ -2564,12 +2564,39 @@ pub async fn ensure_core_schema(
             quality_score  DECIMAL(5,4) NOT NULL,
             created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_eval_calibration_user_created (user_id, created_at),
-            INDEX idx_eval_calibration_agent_created (user_id, agent_id, created_at),
+            INDEX idx_eval_calibration_user_agent_created (user_id, agent_id, created_at),
             INDEX idx_eval_calibration_session (user_id, session_id, created_at)
         )",
     )
     .execute(&pool)
     .await?;
+
+    for (index, ddl) in [
+        (
+            "idx_eval_calibration_user_created",
+            "ALTER TABLE eval_calibration_assessments ADD INDEX idx_eval_calibration_user_created (user_id, created_at)",
+        ),
+        (
+            "idx_eval_calibration_user_agent_created",
+            "ALTER TABLE eval_calibration_assessments ADD INDEX idx_eval_calibration_user_agent_created (user_id, agent_id, created_at)",
+        ),
+        (
+            "idx_eval_calibration_session",
+            "ALTER TABLE eval_calibration_assessments ADD INDEX idx_eval_calibration_session (user_id, session_id, created_at)",
+        ),
+    ] {
+        if let Err(e) = add_index_if_missing(
+            &pool,
+            &settings.database,
+            "eval_calibration_assessments",
+            index,
+            ddl,
+        )
+        .await
+        {
+            tracing::debug!("eval calibration additive index migration skipped: {index}: {e}");
+        }
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS eval_training_datasets (
@@ -3038,6 +3065,15 @@ mod tests {
     #[test]
     fn eval_calibration_assessments_schema_matches_runtime_queries() {
         let source = include_str!("storage.rs");
+        let ddl_marker = concat!(
+            "query(\n        \"CREATE TABLE IF NOT EXISTS ",
+            "eval_calibration_assessments"
+        );
+        assert_eq!(
+            source.matches(ddl_marker).count(),
+            1,
+            "eval calibration schema must have a single authoritative DDL block"
+        );
         let ddl = source
             .split("CREATE TABLE IF NOT EXISTS eval_calibration_assessments")
             .nth(1)
@@ -3058,10 +3094,20 @@ mod tests {
         }
         for index in [
             "INDEX idx_eval_calibration_user_created (user_id, created_at)",
-            "INDEX idx_eval_calibration_agent_created (user_id, agent_id, created_at)",
+            "INDEX idx_eval_calibration_user_agent_created (user_id, agent_id, created_at)",
             "INDEX idx_eval_calibration_session (user_id, session_id, created_at)",
         ] {
             assert!(ddl.contains(index), "missing calibration index: {index}");
+        }
+        for reconcile in [
+            "ALTER TABLE eval_calibration_assessments ADD INDEX idx_eval_calibration_user_created (user_id, created_at)",
+            "ALTER TABLE eval_calibration_assessments ADD INDEX idx_eval_calibration_user_agent_created (user_id, agent_id, created_at)",
+            "ALTER TABLE eval_calibration_assessments ADD INDEX idx_eval_calibration_session (user_id, session_id, created_at)",
+        ] {
+            assert!(
+                source.contains(reconcile),
+                "missing calibration index reconcile: {reconcile}"
+            );
         }
     }
 }

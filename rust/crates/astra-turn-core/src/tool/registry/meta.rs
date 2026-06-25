@@ -324,6 +324,28 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 20,
     },
     ToolMeta {
+        name: "reflect",
+        description: "Inspect persisted session observations through topic/facet reflection views",
+        triggers: &[
+            "reflect",
+            "reflection",
+            "session diagnosis",
+            "root cause",
+            "why failed",
+            "trace analysis",
+            "反思",
+            "诊断",
+            "失败原因",
+            "因果链",
+            "会话分析",
+        ],
+        intents: &[IntentType::Introspect, IntentType::CodeRead],
+        scope: Scope::Local,
+        requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 45,
+    },
+    ToolMeta {
         name: "tool_search",
         description: "Search and activate deferred tools. `select:NAME` queues the tool schema \
              for the next request and returns compact callable shape.",

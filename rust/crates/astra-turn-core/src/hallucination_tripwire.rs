@@ -149,7 +149,7 @@ fn build_nudge(matched: &[String]) -> String {
          this turn actually returned `{{}}` or an empty body. Quote the \
          tool's real error/output verbatim in your next summary — don't \
          coin phantom outcome labels.  If in doubt, run `introspect \
-         subtopic=recent` or re-read the tool-call history before \
+         facet=recent` or re-read the tool-call history before \
          narrating."
     )
 }

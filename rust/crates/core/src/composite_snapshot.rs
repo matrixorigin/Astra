@@ -34,7 +34,7 @@ use std::pin::Pin;
 ///
 /// Each variant carries just enough information to **locate** the state —
 /// never the state itself. This keeps the snapshot index lightweight while
-/// enabling full rollback/fork/tuning across all dimensions.
+/// enabling full rollback, fork, and runtime adaptation across all dimensions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "ref")]
 pub enum SnapshotRef {

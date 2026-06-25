@@ -1206,8 +1206,12 @@ fn agent_schema_enum_does_not_advertise_delegate_action() {
 #[tokio::test]
 async fn execute_reflect_returns_placeholder() {
     let executor = test_executor();
-    let result = executor.execute("reflect", &json!({"focus": "auto"})).await;
+    let result = executor.execute("reflect", &json!({})).await;
     assert!(result.contains("reflect_requires_session"), "got: {result}");
+    assert!(
+        !result.contains("focus"),
+        "removed focus parameter should not appear in placeholder: {result}"
+    );
 }
 
 #[tokio::test]
@@ -1303,13 +1307,18 @@ async fn execute_reflect_uses_local_surface_with_session() {
 
     let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id(session_id);
     let result = executor
-        .execute("reflect", &json!({"focus": "performance"}))
+        .execute(
+            "reflect",
+            &json!({"topic": "runtime", "facet": "performance"}),
+        )
         .await;
     let value: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(value["session_id"], session_id);
-    assert_eq!(value["focus"], "performance");
-    // Liquid-reflection subsystem removed. `recent_turns` surfaces the
-    // focused journal preview that downstream UIs read directly.
+    assert_eq!(value["topic"], "runtime");
+    assert_eq!(value["facet"], "performance");
+    assert_eq!(value["analysis_view"], "runtime_performance");
+    // Old reflection subsystem removed. `recent_turns` surfaces the
+    // topic-scoped journal preview that downstream UIs read directly.
     let recent = value["recent_turns"].as_array().expect("recent_turns");
     assert!(!recent.is_empty(), "turn journal preview should be present");
 }

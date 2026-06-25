@@ -1010,12 +1010,12 @@ pub(crate) async fn handle_state_command(
                     return Ok(());
                 }
             };
-            let (requested_focus, requested_question) = parse_reflect_args(arg);
+            let reflect_args = parse_reflect_args(arg);
             // `/reflect diff` short-circuits: render the local tool-health
             // delta between the most recently synced entries and the live
             // session entries, so the agent can audit its own tuning
             // without needing a server round-trip.
-            if requested_focus.as_deref() == Some("diff") {
+            if reflect_args.diff {
                 let out = render_reflect_diff(state);
                 eprint!("{out}");
                 return Ok(());
@@ -1024,18 +1024,14 @@ pub(crate) async fn handle_state_command(
                 crate::cli::self_command::try_render_reflect_surface_for_session_with_profile(
                     &sid,
                     20,
-                    requested_focus.as_deref(),
-                    requested_question.as_deref(),
+                    Some(reflect_args.topic.as_str()),
+                    reflect_args.facet.as_deref(),
+                    reflect_args.question.as_deref(),
                     profile,
                 )
                 .await?
             {
-                render_reflect_report(
-                    &body,
-                    &sid,
-                    requested_focus.as_deref(),
-                    requested_question.as_deref(),
-                );
+                render_reflect_report(&body, &sid, reflect_args.question.as_deref());
                 return Ok(());
             }
 
@@ -1051,10 +1047,14 @@ pub(crate) async fn handle_state_command(
                 .trim_start_matches('/')
                 .to_string();
             let mut query_parts: Vec<String> = Vec::new();
-            if let Some(focus) = requested_focus.as_deref().filter(|focus| *focus != "auto") {
-                query_parts.push(format!("focus={focus}"));
+            if reflect_args.topic != "overview" {
+                query_parts.push(format!("topic={}", reflect_args.topic));
             }
-            if let Some(question) = requested_question
+            if let Some(facet) = reflect_args.facet.as_deref() {
+                query_parts.push(format!("facet={facet}"));
+            }
+            if let Some(question) = reflect_args
+                .question
                 .as_deref()
                 .filter(|question| !question.is_empty())
             {
@@ -1064,12 +1064,7 @@ pub(crate) async fn handle_state_command(
                 rel = format!("{rel}?{}", query_parts.join("&"));
             }
             match api.get_authed_path_text(tok, &rel).await {
-                Ok(body) => render_reflect_report(
-                    &body,
-                    &sid,
-                    requested_focus.as_deref(),
-                    requested_question.as_deref(),
-                ),
+                Ok(body) => render_reflect_report(&body, &sid, reflect_args.question.as_deref()),
                 Err(astra_thin_client::ThinClientError::Api {
                     status,
                     body: err_body,
@@ -1088,29 +1083,106 @@ pub(crate) async fn handle_state_command(
     Ok(())
 }
 
-fn parse_reflect_args(arg: &str) -> (Option<String>, Option<String>) {
-    let known_focuses = [
-        "auto",
-        "skill_failure",
-        "unexpected_result",
-        "data_quality",
-        "tool_surface",
-        "history",
-        "performance",
-        "diff",
-    ];
-    let mut parts = arg.splitn(2, ' ');
-    let first = parts.next().unwrap_or("").trim();
-    let rest = parts.next().unwrap_or("").trim();
-    if known_focuses.contains(&first) {
-        let focus = (!first.is_empty()).then(|| first.to_string());
-        let question = (!rest.is_empty()).then(|| rest.to_string());
-        (focus, question)
-    } else if arg.trim().is_empty() {
-        (Some("auto".to_string()), None)
-    } else {
-        (Some("auto".to_string()), Some(arg.trim().to_string()))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedReflectArgs {
+    topic: String,
+    facet: Option<String>,
+    question: Option<String>,
+    diff: bool,
+}
+
+fn parse_reflect_args(arg: &str) -> ParsedReflectArgs {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return ParsedReflectArgs {
+            topic: "overview".to_string(),
+            facet: None,
+            question: None,
+            diff: false,
+        };
     }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let first = normalize_reflect_token(tokens[0]);
+    if first == "diff" {
+        return ParsedReflectArgs {
+            topic: "overview".to_string(),
+            facet: None,
+            question: None,
+            diff: true,
+        };
+    }
+
+    let mut topic = "overview".to_string();
+    let mut facet = None;
+    let mut question_start = 0usize;
+    let mut parsed_topic = false;
+
+    if let Some((head, tail)) = first.split_once('/')
+        && is_reflect_topic(head)
+    {
+        topic = head.to_string();
+        parsed_topic = true;
+        if !tail.is_empty() {
+            facet = Some(tail.to_string());
+        }
+        question_start = 1;
+    } else if is_reflect_topic(&first) {
+        topic = first;
+        parsed_topic = true;
+        question_start = 1;
+    }
+
+    if parsed_topic && facet.is_none() && question_start < tokens.len() {
+        let candidate = normalize_reflect_token(tokens[question_start]);
+        if is_reflect_facet(&candidate) {
+            facet = Some(candidate);
+            question_start += 1;
+        }
+    }
+
+    let question = (question_start < tokens.len()).then(|| tokens[question_start..].join(" "));
+
+    ParsedReflectArgs {
+        topic,
+        facet,
+        question,
+        diff: false,
+    }
+}
+
+fn normalize_reflect_token(token: &str) -> String {
+    token.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn is_reflect_topic(token: &str) -> bool {
+    matches!(
+        token,
+        "overview" | "runtime" | "execution" | "knowledge" | "adaptation"
+    )
+}
+
+fn is_reflect_facet(token: &str) -> bool {
+    matches!(
+        token,
+        "overview"
+            | "summary"
+            | "question"
+            | "errors"
+            | "failures"
+            | "tools"
+            | "trace"
+            | "performance"
+            | "latency"
+            | "cost"
+            | "context"
+            | "memory"
+            | "signals"
+            | "measurements"
+            | "progress"
+            | "loop"
+            | "cache"
+    )
 }
 
 fn is_local_reflect_report(report: &serde_json::Value) -> bool {
@@ -1180,21 +1252,16 @@ pub(crate) fn render_reflect_diff(state: &SessionState) -> String {
     out
 }
 
-/// Render either the local liquid reflection surface or a server `ReflectReport`
+/// Render either the local reflect surface or a server `ReflectReport`
 /// as a compact, colored terminal report.
-fn render_reflect_report(
-    body: &str,
-    session_id: &str,
-    requested_focus: Option<&str>,
-    requested_question: Option<&str>,
-) {
+fn render_reflect_report(body: &str, session_id: &str, requested_question: Option<&str>) {
     let Ok(report) = serde_json::from_str::<serde_json::Value>(body) else {
         print_json_or_raw(body);
         return;
     };
 
     if is_local_reflect_report(&report) {
-        render_local_reflect_report(&report, session_id, requested_focus, requested_question);
+        render_local_reflect_report(&report, session_id, requested_question);
         return;
     }
 
@@ -1363,16 +1430,18 @@ fn render_reflect_report(
         eprintln!();
         eprintln!(
             "  {}",
-            "Tip: /reflect skill_failure — focus on tool errors".dim()
+            "Tip: /reflect execution/errors — inspect tool and runtime errors".dim()
         );
-        eprintln!("  {}", "     /reflect performance — focus on latency".dim());
+        eprintln!(
+            "  {}",
+            "     /reflect runtime performance — inspect latency".dim()
+        );
     }
 }
 
 fn render_local_reflect_report(
     report: &serde_json::Value,
     session_id: &str,
-    requested_focus: Option<&str>,
     requested_question: Option<&str>,
 ) {
     let short_sid = prefix_chars(session_id, 8);
@@ -1383,7 +1452,7 @@ fn render_local_reflect_report(
 
     eprintln!(
         "{}",
-        format!("🔍 Liquid Reflection — {short_sid}")
+        format!("🔍 Session Reflection — {short_sid}")
             .magenta()
             .bold()
     );
@@ -1396,8 +1465,17 @@ fn render_local_reflect_report(
         token_utilisation
     );
 
-    if let Some(focus) = requested_focus.filter(|focus| !focus.is_empty()) {
-        eprintln!("  {} {}", "Focus:".bold(), focus);
+    if let Some(topic) = context["topic"].as_str().filter(|topic| !topic.is_empty()) {
+        eprintln!("  {} {}", "Topic:".bold(), topic);
+    }
+    if let Some(facet) = context["facet"].as_str().filter(|facet| !facet.is_empty()) {
+        eprintln!("  {} {}", "Facet:".bold(), facet);
+    }
+    if let Some(analysis_view) = context["analysis_view"]
+        .as_str()
+        .filter(|analysis_view| !analysis_view.is_empty())
+    {
+        eprintln!("  {} {}", "Analysis:".bold(), analysis_view);
     }
     if let Some(question) = requested_question.filter(|question| !question.is_empty()) {
         eprintln!("  {} {}", "Question:".bold(), question);
@@ -1972,10 +2050,12 @@ mod tests {
     use crate::cli::session::session_state::SessionState;
 
     #[test]
-    fn parse_reflect_args_recognises_diff_focus() {
-        let (focus, question) = parse_reflect_args("diff");
-        assert_eq!(focus.as_deref(), Some("diff"));
-        assert_eq!(question, None);
+    fn parse_reflect_args_recognises_diff_branch() {
+        let args = parse_reflect_args("diff");
+        assert!(args.diff);
+        assert_eq!(args.topic, "overview");
+        assert_eq!(args.facet, None);
+        assert_eq!(args.question, None);
     }
 
     #[test]
@@ -2029,17 +2109,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_reflect_args_splits_focus_and_question() {
-        let (focus, question) = parse_reflect_args("performance why was bash slow");
-        assert_eq!(focus.as_deref(), Some("performance"));
-        assert_eq!(question.as_deref(), Some("why was bash slow"));
+    fn parse_reflect_args_splits_topic_facet_and_question() {
+        let args = parse_reflect_args("execution/errors why did bash fail");
+        assert!(!args.diff);
+        assert_eq!(args.topic, "execution");
+        assert_eq!(args.facet.as_deref(), Some("errors"));
+        assert_eq!(args.question.as_deref(), Some("why did bash fail"));
+    }
+
+    #[test]
+    fn parse_reflect_args_accepts_separate_topic_and_facet() {
+        let args = parse_reflect_args("runtime performance why was bash slow");
+        assert_eq!(args.topic, "runtime");
+        assert_eq!(args.facet.as_deref(), Some("performance"));
+        assert_eq!(args.question.as_deref(), Some("why was bash slow"));
     }
 
     #[test]
     fn parse_reflect_args_treats_freeform_as_question() {
-        let (focus, question) = parse_reflect_args("why was bash slow");
-        assert_eq!(focus.as_deref(), Some("auto"));
-        assert_eq!(question.as_deref(), Some("why was bash slow"));
+        let args = parse_reflect_args("performance why was bash slow");
+        assert_eq!(args.topic, "overview");
+        assert_eq!(args.facet, None);
+        assert_eq!(
+            args.question.as_deref(),
+            Some("performance why was bash slow")
+        );
+    }
+
+    #[test]
+    fn parse_reflect_args_does_not_accept_removed_focus_shortcuts() {
+        let args = parse_reflect_args("skill_failure why did bash fail");
+        assert_eq!(args.topic, "overview");
+        assert_eq!(args.facet, None);
+        assert_eq!(
+            args.question.as_deref(),
+            Some("skill_failure why did bash fail")
+        );
+    }
+
+    #[test]
+    fn parse_reflect_args_empty_defaults_to_overview() {
+        let args = parse_reflect_args("");
+        assert_eq!(args.topic, "overview");
+        assert_eq!(args.facet, None);
+        assert_eq!(args.question, None);
     }
 
     #[test]

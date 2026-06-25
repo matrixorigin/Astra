@@ -203,7 +203,7 @@ impl MatrixCloudRuntime {
             // Shared observatory: extraction service writes extraction
             // records; `compact_with_memoria` (reached via `state.
             // memory_extraction_service.observatory()`) writes injection
-            // records. `introspect subtopic=session_memory` reads both.
+            // records. `introspect facet=session_memory` reads both.
             let observatory = Arc::new(crate::session_memory::SessionMemoryObservatory::new());
             let svc = Arc::new(
                 crate::session_memory::MemoryExtractionService::new(

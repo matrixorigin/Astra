@@ -1645,7 +1645,7 @@ mod tests {
         // Some edge tools emit the banner without a leading JSON
         // error envelope — the banner itself is a strong signal.
         assert!(result_body_signals_failure(
-            "⚠ introspect returned an error. Retry with a smaller subtopic."
+            "⚠ introspect returned an error. Retry with a smaller facet."
         ));
     }
 

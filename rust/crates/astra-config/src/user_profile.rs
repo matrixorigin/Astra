@@ -784,7 +784,7 @@ fn scenario_keywords(scenario: Scenario) -> Vec<&'static str> {
             "learn", "tutorial", "example", "teach", "explain", "how does", "what is",
         ],
         // Keyword overlap with Exploration/Learning is intentional — QuickAnswer
-        // wins only when the fallback-routing pre-filter in `agentic_adaptive_tuning`
+        // wins only when the fallback-routing pre-filter in agentic adaptive runtime
         // confirms the query is short AND interrogative AND read-only. Keywords here
         // exist so the scoring path can still identify it if those preconditions match.
         Scenario::QuickAnswer => vec![

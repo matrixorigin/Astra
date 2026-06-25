@@ -100,6 +100,20 @@ pub const COMPACTION_INVARIANT_SQL: &[CompactionInvariant] = &[
     },
 ];
 
+fn compaction_invariant_batch_sql() -> String {
+    COMPACTION_INVARIANT_SQL
+        .iter()
+        .enumerate()
+        .map(|(idx, invariant)| {
+            format!(
+                "SELECT '{}' AS invariant_id, violations FROM ({}) AS invariant_{}",
+                invariant.id, invariant.sql, idx
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
 #[derive(Debug, Error)]
 pub enum StateProjectionError {
     #[error("database operation failed: operation={operation}, entity={entity}, source={source}")]
@@ -314,21 +328,27 @@ impl DatabaseStateProjectionStore {
         session_id: &str,
         compaction_run_id: &str,
     ) -> Result<Vec<(String, i64)>, StateProjectionError> {
-        let mut out = Vec::with_capacity(COMPACTION_INVARIANT_SQL.len());
+        let sql = compaction_invariant_batch_sql();
+        let mut query = sqlx::query(&sql);
         for invariant in COMPACTION_INVARIANT_SQL {
-            let mut query = sqlx::query(invariant.sql).bind(user_id).bind(session_id);
+            query = query.bind(user_id).bind(session_id);
             if invariant.binds_compaction_run_id {
                 query = query.bind(compaction_run_id);
             }
-            let row = query.fetch_one(self.pool.get()).await.map_err(|source| {
-                StateProjectionError::Database {
-                    operation: "run_compaction_invariant",
-                    entity: invariant.id.to_string(),
-                    source,
-                }
-            })?;
+        }
+
+        let rows = query.fetch_all(self.pool.get()).await.map_err(|source| {
+            StateProjectionError::Database {
+                operation: "run_compaction_invariant",
+                entity: "compaction_invariants".to_string(),
+                source,
+            }
+        })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let invariant_id = row.try_get::<String, _>("invariant_id").unwrap_or_default();
             let violations = row.try_get::<i64, _>("violations").unwrap_or(0);
-            out.push((invariant.id.to_string(), violations));
+            out.push((invariant_id, violations));
         }
         Ok(out)
     }
@@ -1474,6 +1494,28 @@ mod tests {
                 invariant.id
             );
         }
+    }
+
+    #[test]
+    fn compaction_invariant_batch_sql_keeps_one_row_per_invariant() {
+        let sql = compaction_invariant_batch_sql();
+        for invariant in COMPACTION_INVARIANT_SQL {
+            assert!(
+                sql.contains(&format!("SELECT '{}' AS invariant_id", invariant.id)),
+                "batch SQL missing invariant id {}",
+                invariant.id
+            );
+        }
+        assert_eq!(
+            sql.matches(" UNION ALL ").count(),
+            COMPACTION_INVARIANT_SQL.len().saturating_sub(1),
+            "batch SQL must combine invariants into one round trip"
+        );
+        assert_eq!(
+            sql.matches(") AS invariant_").count(),
+            COMPACTION_INVARIANT_SQL.len(),
+            "each invariant subquery must have a stable alias"
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
-//! Adaptive learning and auto-tuning engine.
+//! Learning support primitives.
 //!
-//! Provides feedback signal processing, parameter tuning rules,
-//! and evolution triggers — decoupled from runtime infrastructure.
+//! This crate intentionally does not contain an implicit tuning control loop.
+//! Durable tuning jobs should live in a dedicated control plane.
 
-pub mod auto_tuning;
+pub mod delegation;
+pub mod feedback;

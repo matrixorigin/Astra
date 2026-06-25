@@ -16,9 +16,7 @@ use astra_services::evaluation::SessionQualityAssessmentRequest;
 use astra_services::runs::ToolOutputBatchItem;
 use astra_services::session_journal::ToolCallRecord;
 
-use super::super::agentic::adaptive_tuning::{
-    apply_per_turn_adaptation, apply_tactical_actions, maybe_run_tuning_cycle,
-};
+use super::super::agentic::adaptive_runtime::{apply_per_turn_adaptation, apply_tactical_actions};
 use super::super::agentic::delegate_interception::{
     DelegationInterceptionResult, intercept_delegations, tool_call_arguments_value, tool_call_name,
 };
@@ -1427,7 +1425,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     // Populate the in-memory round ring unconditionally (regardless of
     // whether `full_llm_capture` / turn_event_buffer is active). This is
-    // what powers `introspect(subtopic=recent)` — the agent can ask
+    // what powers `introspect(facet=recent)` — the agent can ask
     // "what were my last few rounds doing?" without any disk I/O.
     //
     let round_duration_ms = prep.turn_start_time.elapsed().as_millis() as u64;
@@ -1827,8 +1825,12 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             state.step_recorder.end_turn(false);
             finalize_turn_trace(state).await;
             refresh_runtime_promotion_signals_from_db(state).await;
-            state.telemetry.completed_turns_for_tuning += 1;
-            maybe_run_tuning_cycle(state);
+            if let Some(hub) = state.telemetry.observability_hub.as_ref() {
+                let high_failure = state.turn_guard.health.high_failure_tools(3, 0.5);
+                if !high_failure.is_empty() {
+                    hub.record_low_confidence_tools(high_failure);
+                }
+            }
             let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
             apply_per_turn_adaptation(state, turn_tokens);
 

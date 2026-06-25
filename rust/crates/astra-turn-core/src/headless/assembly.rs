@@ -196,7 +196,7 @@ pub fn unknown_local_tool_error_message(name: &str, valid_tool_names: &HashSet<S
 ///     byte count + head prove the content is real.
 ///
 /// Both forms start with [`CACHED_SENTINEL`] so downstream detectors
-/// (memory writability gates, adaptive tuning signals, compaction
+/// (memory writability gates, adaptive runtime signals, compaction
 /// replay guards in `context_compression::SYNTHETIC_USER_SENTINELS`,
 /// regression test `compaction_survival`) that look for that sentinel
 /// continue to work. Keep this single source of truth — if you change

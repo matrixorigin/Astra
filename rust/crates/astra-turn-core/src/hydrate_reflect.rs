@@ -3,7 +3,7 @@
 use astra_thin_client::{ThinClient, ThinClientError};
 use serde_json::Value;
 
-/// Minimal query-value encoding for reflect URL (matches legacy CLI behavior).
+/// Minimal query-value encoding for reflect URL.
 fn reflect_query_encode(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -19,12 +19,25 @@ fn reflect_query_encode(s: &str) -> String {
 /// Relative path + query for `GET /chat/session/{id}/reflect?...` (no leading slash).
 #[must_use]
 pub fn reflect_hydration_rel_path(session_id: &str, args: &Value) -> String {
-    let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("auto");
     let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
     let last_n = args.get("last_n").and_then(|v| v.as_i64()).unwrap_or(20);
     let mut qp: Vec<String> = Vec::new();
-    if !focus.is_empty() && focus != "auto" {
-        qp.push(format!("focus={focus}"));
+    for key in ["topic", "facet", "depth", "horizon", "source_policy"] {
+        if let Some(value) = args
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            qp.push(format!("{key}={}", reflect_query_encode(value)));
+        }
+    }
+    if args
+        .get("include_context")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        qp.push("include_context=true".to_string());
     }
     if !question.is_empty() {
         qp.push(format!("question={}", reflect_query_encode(question)));
@@ -85,17 +98,36 @@ mod tests {
     fn reflect_hydration_rel_path_with_question() {
         let p = reflect_hydration_rel_path(
             "abc",
-            &json!({"question": "q & x", "focus": "auto", "last_n": 3}),
+            &json!({"question": "q & x", "topic": "execution", "facet": "trace", "last_n": 3}),
         );
+        assert!(p.contains("topic=execution"));
+        assert!(p.contains("facet=trace"));
         assert!(p.contains("question=q%20%26%20x"));
         assert!(p.contains("last_n=3"));
         assert!(!p.contains("focus="));
     }
 
     #[test]
-    fn reflect_hydration_rel_path_includes_non_auto_focus() {
+    fn reflect_hydration_rel_path_ignores_removed_focus() {
         let p = reflect_hydration_rel_path("s", &json!({"focus": "bugs"}));
         assert!(p.starts_with("chat/session/s/reflect?"));
-        assert!(p.contains("focus=bugs"));
+        assert!(!p.contains("focus="));
+    }
+
+    #[test]
+    fn reflect_hydration_rel_path_includes_source_and_context() {
+        let p = reflect_hydration_rel_path(
+            "s",
+            &json!({
+                "topic": "knowledge",
+                "facet": "context",
+                "source_policy": "local_only",
+                "include_context": true
+            }),
+        );
+        assert!(p.contains("topic=knowledge"));
+        assert!(p.contains("facet=context"));
+        assert!(p.contains("source_policy=local_only"));
+        assert!(p.contains("include_context=true"));
     }
 }

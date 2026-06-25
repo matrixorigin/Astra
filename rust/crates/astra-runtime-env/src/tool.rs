@@ -254,6 +254,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         control_plane("exit_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("get_agent_info", ToolLoadPolicy::Deferred),
         control_plane("introspect", ToolLoadPolicy::Deferred),
+        control_plane("reflect", ToolLoadPolicy::Deferred),
         // Non-blocking status updates are still part of the user communication
         // path, so keep notify available with ask_user instead of requiring a
         // discovery round-trip.

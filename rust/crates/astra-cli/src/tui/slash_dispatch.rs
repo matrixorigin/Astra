@@ -694,7 +694,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             ctx.show_info("Use /timeline (Enter to drill into a turn).".into());
             SlashResult::Handled
         }
-        "/verbose" | "/tuning" | "/experiment" => {
+        "/verbose" | "/experiment" => {
             ctx.show_info("Removed. Use /stats for metrics, /timeline for turn traces.".into());
             SlashResult::Handled
         }

@@ -1980,34 +1980,6 @@ pub(crate) async fn handle_session_command(
                                     eprintln!("      {}", ellipsize(preview, 120).magenta());
                                 }
                             }
-                            session_journal::JournalEventType::AdaptiveBaselinePromoted => {
-                                let meta = evt.metadata.as_ref();
-                                let task_type = meta
-                                    .and_then(|m| m.get("task_type"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let domain = meta
-                                    .and_then(|m| m.get("domain"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("any");
-                                let variant = meta
-                                    .and_then(|m| m.get("variant_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let experiment = meta
-                                    .and_then(|m| m.get("experiment_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                eprintln!(
-                                    "  {} {} adaptive baseline {} / {} → {} ({})",
-                                    ts_short.dim(),
-                                    "⚙".magenta(),
-                                    task_type,
-                                    domain,
-                                    variant,
-                                    experiment.dim(),
-                                );
-                            }
                             session_journal::JournalEventType::AgentSpawned => {
                                 let projection = project_agent_spawned(evt.metadata.as_ref());
                                 eprintln!(
@@ -2167,29 +2139,6 @@ pub(crate) async fn handle_session_command(
                                         triggers,
                                     );
                                 }
-                            }
-                            session_journal::JournalEventType::AdaptiveTuningRuleTriggered => {
-                                let rule = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("rule_name"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let n_changes = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("config_changes"))
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| a.len())
-                                    .unwrap_or(0);
-                                eprintln!(
-                                    "  {} {} T{} tuning rule: {} ({} changes)",
-                                    ts_short.dim(),
-                                    "⚡".yellow(),
-                                    evt.turn.unwrap_or(0),
-                                    rule,
-                                    n_changes,
-                                );
                             }
                             session_journal::JournalEventType::InterruptionRecorded => {
                                 let interruption = evt
@@ -3136,28 +3085,6 @@ pub(crate) fn build_export_markdown(
                     evt.user_input.as_deref().unwrap_or(""),
                 ));
             }
-            session_journal::JournalEventType::AdaptiveBaselinePromoted => {
-                let meta = evt.metadata.as_ref();
-                let task_type = meta
-                    .and_then(|m| m.get("task_type"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let domain = meta
-                    .and_then(|m| m.get("domain"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("any");
-                let variant = meta
-                    .and_then(|m| m.get("variant_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let experiment = meta
-                    .and_then(|m| m.get("experiment_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                md.push_str(&format!(
-                    "### Adaptive baseline promoted\n- **Time:** {ts_short}\n- **Scope:** {task_type} / {domain}\n- **Winner:** {variant}\n- **Experiment:** {experiment}\n\n"
-                ));
-            }
             session_journal::JournalEventType::AdaptiveScenarioApplied => {
                 let meta = evt.metadata.as_ref();
                 let scenario = meta
@@ -3557,8 +3484,6 @@ fn handle_session_adaptive(_arg: &str, state: &SessionState) {
                         e.event_type,
                         session_journal::JournalEventType::AdaptiveScenarioApplied
                             | session_journal::JournalEventType::AdaptivePerTurnApplied
-                            | session_journal::JournalEventType::AdaptiveTuningRuleTriggered
-                            | session_journal::JournalEventType::AdaptiveBaselinePromoted
                     )
                 })
                 .collect();
@@ -3639,43 +3564,6 @@ fn handle_session_adaptive(_arg: &str, state: &SessionState) {
                                 "↻".magenta(),
                                 n,
                                 triggers
-                            );
-                        }
-                        session_journal::JournalEventType::AdaptiveTuningRuleTriggered => {
-                            let rule = evt
-                                .metadata
-                                .as_ref()
-                                .and_then(|m| m.get("rule_name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?");
-                            eprintln!(
-                                "    {} T{:>2} {} rule: {}",
-                                ts.dim(),
-                                turn,
-                                "⚡".yellow(),
-                                rule
-                            );
-                        }
-                        session_journal::JournalEventType::AdaptiveBaselinePromoted => {
-                            let scope = evt
-                                .metadata
-                                .as_ref()
-                                .and_then(|m| m.get("task_type"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?");
-                            let var = evt
-                                .metadata
-                                .as_ref()
-                                .and_then(|m| m.get("variant_id"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?");
-                            eprintln!(
-                                "    {} T{:>2} {} baseline promoted: {} → {}",
-                                ts.dim(),
-                                turn,
-                                "🏆".magenta(),
-                                scope,
-                                var
                             );
                         }
                         _ => {}

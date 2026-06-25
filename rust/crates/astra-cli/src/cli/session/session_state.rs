@@ -473,8 +473,8 @@ pub(crate) struct SessionState {
     pub diagnosis_criteria_met: u32,
     pub diagnosis_criteria_failed: u32,
 
-    // ── Observability (M1-M6) ──
-    /// Global observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
+    // ── Observability ──
+    /// Global observability hub for profiles, traces, and feedback signals.
     /// Created at REPL startup, shared across sessions.
     pub observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Per-session observability context for tracing, drift detection, and timing.

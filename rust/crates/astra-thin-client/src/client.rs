@@ -818,7 +818,7 @@ impl ThinClient {
 
     // ── Reflect / decision trace ─────────────────────────────────────────────
 
-    /// `path_with_query` is relative to origin, e.g. `chat/session/sid/reflect?focus=auto`.
+    /// `path_with_query` is relative to origin, e.g. `chat/session/sid/reflect?topic=execution&facet=trace`.
     pub async fn get_authed_path_text(
         &self,
         token: &str,

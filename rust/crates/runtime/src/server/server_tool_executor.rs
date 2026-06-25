@@ -1723,9 +1723,9 @@ mod tests {
 
         assert!(!result.is_error, "{result:?}");
         assert!(
-            result
-                .output
-                .contains("No introspection data available yet"),
+            result.output.contains("## Session Health")
+                && result.output.contains("Pressure: 0%")
+                && result.output.contains("Cache: 0%"),
             "{result:?}"
         );
         assert!(
@@ -1735,6 +1735,30 @@ mod tests {
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
             "ToolEngine introspect results should still receive execution metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn introspect_json_executes_from_tool_engine_without_snapshot() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata(
+                "introspect",
+                &json!({"format": "json", "facet": "execution/errors"}),
+            )
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap_or_else(|error| {
+            panic!("introspect json must parse: {error}; {}", result.output)
+        });
+        assert_eq!(parsed["view"]["topic"], "execution");
+        assert_eq!(parsed["view"]["facet"], "errors");
+        assert!(
+            parsed["summary"]
+                .as_str()
+                .is_some_and(|summary| !summary.is_empty())
+        );
+        assert!(parsed["observations"].as_array().is_some());
     }
 
     #[tokio::test]

@@ -782,13 +782,6 @@ pub(crate) fn initialize_session_state(
         super::session_startup::apply_pending_adaptive_state(&mut state);
     }
 
-    // Restore persisted feedback aggregator state (if any)
-    if let Some(ref hub) = state.observability_hub {
-        if let Err(e) = astra_learning::auto_tuning::load_feedback("default", hub.tuning()) {
-            eprintln!("[auto-tuning] failed to load feedback: {e}");
-        }
-    }
-
     state
 }
 

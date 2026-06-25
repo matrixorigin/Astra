@@ -12,7 +12,7 @@
 //! created before `idx_skill_active_name_ver` existed, this suite runs a **test-only** `CREATE INDEX`
 //! (ignores duplicate-name errors) so the listing path is validated against the intended DDL.
 
-use astra_core::{MatrixOneSettings, SharedPool};
+use astra_core::{EvidenceRef, MatrixOneSettings, SharedPool};
 use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, IngestionEvent};
 use astra_services::replay::ReplaySessionRequestData;
 use astra_services::session_audit::TurnListParams;
@@ -4786,11 +4786,44 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
 
     let reflect = DatabaseReflectService::new(settings.clone()).with_pool(shared.clone());
     let report = reflect
-        .build_evidence(&owner_user_id, &session_id, "auto", 10, "what happened?")
+        .build_evidence(
+            &owner_user_id,
+            &session_id,
+            astra_services::reflect::ReflectRequest::from_observation_params(
+                Some("overview"),
+                Some("overview"),
+                None,
+                None,
+                10,
+                "what happened?",
+            ),
+        )
         .await
         .expect("owner reflect report");
     assert_eq!(report.overview.total_events, 2);
     assert_eq!(report.overview.total_decisions, 1);
+    let view = report.view.as_ref().expect("reflect report includes view");
+    assert_eq!(view.topic, "overview");
+    assert_eq!(view.facet, "overview");
+    assert_eq!(view.data_coverage.events, 2);
+    assert_eq!(view.data_coverage.decisions, 1);
+    assert!(!report.summary.is_empty());
+    assert!(
+        report.observations.iter().any(|observation| {
+            EvidenceRef::parse(&observation.ref_id)
+                .is_ok_and(|ref_id| ref_id.kind() == "observation" && ref_id.namespace() == "graph")
+        }),
+        "reflect report should include normalized observations"
+    );
+    assert!(
+        report.evidence.iter().any(|evidence| {
+            EvidenceRef::parse(&evidence.ref_id).is_ok_and(|ref_id| {
+                matches!(ref_id.kind(), "decision" | "event")
+                    && matches!(ref_id.namespace(), "cloud" | "edge" | "local")
+            })
+        }),
+        "reflect report should include standardized evidence refs"
+    );
     assert!(
         report
             .overview
@@ -4805,13 +4838,11 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             .iter()
             .any(|(skill, _)| skill == "other_skill")
     );
-    let graph = report
-        .evidence_graph
-        .expect("owner decision should build evidence graph");
-    let graph_json = serde_json::to_string(&graph).expect("serialize graph");
-    assert!(graph_json.contains(&owner_decision_id));
-    assert!(!graph_json.contains(&other_decision_id));
-    assert!(!graph_json.contains("other secret"));
+    let graph_slice_json =
+        serde_json::to_string(&report.graph_slice).expect("serialize graph slice");
+    assert!(graph_slice_json.contains(&owner_decision_id));
+    assert!(!graph_slice_json.contains(&other_decision_id));
+    assert!(!graph_slice_json.contains("other secret"));
 
     let introspection =
         DatabaseIntrospectionService::new(settings.clone()).with_pool(shared.clone());

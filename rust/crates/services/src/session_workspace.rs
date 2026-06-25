@@ -100,7 +100,7 @@ pub struct ContextTraceTimingSignal {
     pub total_ms: u64,
 }
 
-/// Canonical per-turn cloud/local trace signal for resume and auto-tuning.
+/// Canonical per-turn cloud/local trace signal for resume and adaptive runtime views.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextTraceSignal {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -370,7 +370,7 @@ pub struct WorkspaceMetadata {
     /// Active A/B experiment variant (if enrolled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_variant: Option<String>,
-    /// Tuned RuntimeConfig (JSON). Persisted so auto-tuning adjustments survive restarts.
+    /// RuntimeConfig override snapshot (JSON) persisted for local resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuned_config_json: Option<String>,
 }

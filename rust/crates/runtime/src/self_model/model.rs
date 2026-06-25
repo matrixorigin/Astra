@@ -1,8 +1,8 @@
 //! Self-Model — Unified introspection view of the agent's state.
 //!
 //! The SelfModel is a read-only snapshot that composes data from existing
-//! components (ObservabilitySession, ToolHealthTracker, RuntimeConfig,
-//! AutoTuningEngine) into a single coherent view.
+//! components (ObservabilitySession, ToolHealthTracker, RuntimeConfig, and
+//! feedback signals) into a single coherent view.
 //!
 //! This enables:
 //! - Dynamic system prompt sections showing the agent its own state
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::Scenario;
-use astra_learning::auto_tuning::{FeedbackSignal, SignalType};
+use astra_learning::feedback::{FeedbackSignal, SignalType};
 use astra_services::LessonHint;
 use astra_text_utils::str_preview::truncate_str;
 use astra_turn_core::context_assembly_trace::TokenBudgetTrace;
@@ -47,7 +47,7 @@ pub struct SelfModel {
     pub state: ExecutionState,
     /// Goal tracking (what we're trying to achieve).
     pub goals: GoalState,
-    /// Recent feedback signals (what auto-tuning noticed).
+    /// Recent feedback signals observed during the session.
     pub recent_signals: Vec<SignalSummary>,
     /// Constraints and safety bounds.
     pub constraints: ConstraintSet,
@@ -719,16 +719,16 @@ impl SelfModel {
             );
         }
         // P3.1: surface the structured before/after diff of the most recent
-        // strategy-delta application so the agent can audit its own tuning.
+        // strategy-delta application so the agent can audit its own adaptation.
         if let Some(diff) = &self.skill_diff {
             let _ = writeln!(s, "Strategy diff: {}", diff.summary_line());
         }
 
-        // ── Guardrail auto-tuning state (rolling stats → bounded Δ) ──
+        // ── Guardrail adaptive state (rolling stats → bounded Δ) ──
         if let Some(g) = &self.guardrail {
             let delta_tag = match g.last_delta.cmp(&0) {
-                std::cmp::Ordering::Less => " (tuned down → reacting faster)",
-                std::cmp::Ordering::Greater => " (tuned up → backing off)",
+                std::cmp::Ordering::Less => " (adjusted down → reacting faster)",
+                std::cmp::Ordering::Greater => " (adjusted up → backing off)",
                 std::cmp::Ordering::Equal => "",
             };
             match g.recent_fail_rate {

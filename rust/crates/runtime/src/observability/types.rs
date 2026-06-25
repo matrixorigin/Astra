@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
-use astra_learning::auto_tuning::{
-    AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType,
-};
+use astra_learning::feedback::FeedbackSignal;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use astra_turn_core::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
 
@@ -81,7 +79,7 @@ pub struct ObservabilitySession {
     pub last_token_budget_change_turn: Option<u32>,
 
     /// Set to `true` when the previous turn ended in a `UserCancelled`
-    /// interruption. The adaptive-tuning layer consumes this flag at the
+    /// interruption. The adaptive profile layer consumes this flag at the
     /// start of the next turn to *skip* scenario re-detection: the tool
     /// history of a cancelled turn is an aborted plan, not evidence of a
     /// deliberate agent behavior pattern (e.g. "exploration"). Without this
@@ -99,7 +97,7 @@ pub struct ObservabilitySession {
     pub last_strategy_application: Option<crate::turn::agentic::stage_bridge::StrategyApplication>,
 
     /// Most recent [`GuardrailView`] snapshot published by the auto-reflection
-    /// path after tuning the reflection threshold. Surfaced into the SelfModel
+    /// path after adjusting the reflection threshold. Surfaced into the SelfModel
     /// so the agent passively "knows" how sensitive it currently is.
     pub last_guardrail_view: Option<crate::self_model::GuardrailView>,
 
@@ -140,7 +138,7 @@ pub struct ObservabilitySession {
         std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
 
     /// High-failure tools surfaced for SelfModel reasoning (name, fail_rate, samples).
-    /// Populated by the adaptive-tuning cycle; consumed by the SelfModel snapshot
+    /// Populated from tool-health observations; consumed by the SelfModel snapshot
     /// builder. Replaced (not appended to) on each publish.
     pub low_confidence_tools: Vec<(String, f64, u32)>,
 
@@ -159,14 +157,14 @@ pub struct ObservabilitySession {
     /// a reference to the live tracker.
     pub last_tool_health_export: Vec<astra_pipeline::ToolHealthEntry>,
 
-    /// Recent `AutoTuningEngine` feedback signals mirrored onto the session so
-    /// SelfModel can render them. Bounded to the most recent 16 entries.
+    /// Recent feedback signals mirrored onto the session so SelfModel can
+    /// render them. Bounded to the most recent 16 entries.
     pub last_feedback_signals: Vec<FeedbackSignal>,
 
     /// Per-channel fingerprint history for runtime-injected prompt signals
     /// (recent_failing_tests, outcome_bias, lessons, volatile_pending).
     /// Observed once per SelfModel snapshot build so the
-    /// `introspect subtopic=noise` renderer can flag channels that have
+    /// `introspect facet=noise` renderer can flag channels that have
     /// been re-rendered unchanged for many turns — session f85a02bb's
     /// 58-round stale-signal case.
     pub injection_history: astra_turn_core::injection_tracking::InjectionHistory,

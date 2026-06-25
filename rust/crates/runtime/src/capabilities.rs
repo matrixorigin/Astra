@@ -733,6 +733,20 @@ mod tests {
     }
 
     #[test]
+    fn server_executed_surfaces_do_not_advertise_cli_local_reflect_facade() {
+        let caps = full_server_capabilities_for_tests();
+        let web = names(server_runtime_tool_schemas(&caps));
+        let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
+
+        for (surface, names) in [("web", web), ("remote", remote)] {
+            assert!(
+                !names.contains(&"reflect".to_string()),
+                "{surface} executes on the server and must use HTTP reflect routes, not the CLI-local reflect tool facade: {names:?}"
+            );
+        }
+    }
+
+    #[test]
     fn server_lifecycle_capabilities() {
         use astra_turn_core::capability::Capability;
 

@@ -65,7 +65,7 @@ New variant `astra_config::user_profile::Scenario::QuickAnswer` with the
 tightest strategy in the set (`max_tools_per_turn=5`,
 `tool_budget_tokens=500`, `memory_top_k=5`).
 
-`runtime::turn::agentic_adaptive_tuning::fallback_scenario_from_routing`
+`runtime::turn::agentic::adaptive_runtime::resolve_scenario_from_routing`
 routes short interrogative read-only queries here BEFORE Exploration.
 Preconditions:
 
@@ -113,7 +113,7 @@ The user's stored preference is unchanged — scaling is per-turn only.
 ## Related tests
 
 - `astra_turn_core::thinking_config::tests::scale_for_turn_*` (8 tests)
-- `astra_runtime::turn::agentic_adaptive_tuning::tests::short_interrogative_routes_to_quick_answer_not_exploration`
+- `astra_runtime::turn::agentic::adaptive_runtime::tests::short_interrogative_routes_to_quick_answer_not_exploration`
 - `..::short_chinese_interrogative_routes_to_quick_answer`
 - `..::debug_keyword_wins_over_quick_answer`
 - `..::long_question_does_not_route_to_quick_answer`

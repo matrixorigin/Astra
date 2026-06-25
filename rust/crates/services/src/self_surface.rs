@@ -1397,8 +1397,6 @@ fn evolution_record_from_event(event: &JournalEvent) -> Option<EvolutionRecord> 
         JournalEventType::DriftDetected => ("drift", "observed"),
         JournalEventType::AdaptiveScenarioApplied => ("scenario", "applied"),
         JournalEventType::AdaptivePerTurnApplied => ("adaptation", "applied"),
-        JournalEventType::AdaptiveTuningRuleTriggered => ("tuning_rule", "applied"),
-        JournalEventType::AdaptiveBaselinePromoted => ("baseline", "promoted"),
         JournalEventType::ConfigChange => ("mutation", "applied"),
         JournalEventType::VerificationCompleted => ("verification", "recorded"),
         _ => return None,
@@ -1757,10 +1755,9 @@ fn step_id(event: &JournalEvent) -> String {
 
 fn actor_for_event(event: &JournalEvent) -> &'static str {
     match event.event_type {
-        JournalEventType::AdaptiveScenarioApplied
-        | JournalEventType::AdaptivePerTurnApplied
-        | JournalEventType::AdaptiveTuningRuleTriggered
-        | JournalEventType::AdaptiveBaselinePromoted => "adaptive_engine",
+        JournalEventType::AdaptiveScenarioApplied | JournalEventType::AdaptivePerTurnApplied => {
+            "adaptive_engine"
+        }
         JournalEventType::VerificationCompleted => "verifier",
         JournalEventType::ConfigChange | JournalEventType::GoalSteered => "self_mutation",
         JournalEventType::Turn | JournalEventType::TurnError if event.tool_calls.is_some() => {
@@ -1783,8 +1780,6 @@ fn phase_for_event_type(event_type: &JournalEventType) -> &'static str {
         JournalEventType::VerificationCompleted | JournalEventType::TurnEvaluation => "evaluate",
         JournalEventType::AdaptiveScenarioApplied
         | JournalEventType::AdaptivePerTurnApplied
-        | JournalEventType::AdaptiveTuningRuleTriggered
-        | JournalEventType::AdaptiveBaselinePromoted
         | JournalEventType::ConfigChange => "adapt",
         _ => "observe",
     }
@@ -1842,10 +1837,6 @@ fn summarize_event(event: &JournalEvent) -> String {
             }
             "adaptive per-turn changes applied".to_string()
         }
-        JournalEventType::AdaptiveTuningRuleTriggered => {
-            "adaptive tuning rule triggered".to_string()
-        }
-        JournalEventType::AdaptiveBaselinePromoted => "adaptive baseline promoted".to_string(),
         JournalEventType::GoalSteered => event
             .metadata
             .as_ref()
@@ -2009,7 +2000,6 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::DelegationSubRunCompleted => "delegation_sub_run_completed",
         JournalEventType::DelegationRetry => "delegation_retry",
         JournalEventType::DelegationCompleted => "delegation_completed",
-        JournalEventType::AdaptiveBaselinePromoted => "adaptive_baseline_promoted",
         JournalEventType::AgentSpawned => "agent_spawned",
         JournalEventType::AgentTerminated => "agent_terminated",
         JournalEventType::VerificationCompleted => "verification_completed",
@@ -2028,7 +2018,6 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::DriftDetected => "drift_detected",
         JournalEventType::AdaptiveScenarioApplied => "adaptive_scenario_applied",
         JournalEventType::AdaptivePerTurnApplied => "adaptive_per_turn_applied",
-        JournalEventType::AdaptiveTuningRuleTriggered => "adaptive_tuning_rule_triggered",
         JournalEventType::InterruptionRecorded => "interruption_recorded",
         JournalEventType::CompactionRetry => "compaction_retry",
         JournalEventType::LlmRound => "llm_round",

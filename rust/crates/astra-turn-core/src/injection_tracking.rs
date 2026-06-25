@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 /// `runtime::turn::bridge_inprocess::build_turn_payload` (or the
 /// equivalent CLI edge_profile write). Keep them in one-to-one
 /// correspondence — if a new section is added to the prompt without a
-/// matching variant here, `introspect subtopic=injection_freshness`
+/// matching variant here, `introspect facet=noise`
 /// goes blind to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum InjectionChannel {
@@ -74,7 +74,7 @@ impl InjectionChannel {
     ///
     /// **Stability contract**: these tags are persisted in
     /// `workspace.yaml::last_context_trace` and surfaced via the
-    /// `introspect subtopic=injection_freshness` table. Renaming them
+    /// `introspect facet=noise` table. Renaming them
     /// breaks cross-process fingerprint history and any external
     /// dashboards that scrape introspect output.
     pub fn tag(&self) -> &'static str {
@@ -275,7 +275,7 @@ impl InjectionHistory {
     /// Invariant: when the newest fingerprint matches a run that would
     /// otherwise be pruned (repeated identical injection beyond the cap),
     /// the earliest-matching run must be retained so `first_seen_round`
-    /// survives for the noise subtopic. See the inline comment in the
+    /// survives for the noise facet. See the inline comment in the
     /// body and the regression test
     /// `observe_single_fingerprint_beyond_cap_preserves_first_seen_round`
     /// which asserts `rounds_alive` still reflects round 0 after pushing

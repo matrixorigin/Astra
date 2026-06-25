@@ -5,7 +5,7 @@
 //! - M2: Decision Explainer
 //! - M3: RuntimeConfig (via session)
 //! - M5: User Profiles
-//! - M6: Auto-Tuning
+//! - M6: Adaptive runtime signals
 //!
 //! This module provides hooks that can be called at strategic points
 //! in the agentic loop lifecycle.

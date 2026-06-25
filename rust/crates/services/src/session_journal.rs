@@ -1265,8 +1265,6 @@ pub enum JournalEventType {
     DelegationRetry,
     /// Delegation completed (all sub-runs done, results aggregated).
     DelegationCompleted,
-    /// Adaptive baseline promoted from a completed experiment winner.
-    AdaptiveBaselinePromoted,
     /// A child agent was spawned (via spawn_agent tool or delegation).
     AgentSpawned,
     /// A spawned agent terminated (completed, failed, or cancelled).
@@ -1303,8 +1301,6 @@ pub enum JournalEventType {
     AdaptiveScenarioApplied,
     /// Per-turn micro-adaptation adjusted config values.
     AdaptivePerTurnApplied,
-    /// Tuning rule evaluated and triggered a config change.
-    AdaptiveTuningRuleTriggered,
     /// A structured interruption was recorded (budget exhaustion, rate limit, cancel, etc.).
     InterruptionRecorded,
     /// Compaction retry completed — records tier, tokens freed, and per-layer breakdown.
@@ -2289,10 +2285,8 @@ fn is_recovery_activity_event(event_type: &JournalEventType) -> bool {
             | JournalEventType::ConfigChange
             | JournalEventType::SyncMarker
             | JournalEventType::ContextAssemblyRecorded
-            | JournalEventType::AdaptiveBaselinePromoted
             | JournalEventType::AdaptiveScenarioApplied
             | JournalEventType::AdaptivePerTurnApplied
-            | JournalEventType::AdaptiveTuningRuleTriggered
             | JournalEventType::CompactionRetry
     )
 }
@@ -3902,29 +3896,6 @@ impl JournalEvent {
         evt
     }
 
-    /// Adaptive baseline promoted event — emitted when a completed experiment winner
-    /// is promoted into a durable baseline.
-    pub fn adaptive_baseline_promoted(
-        session_id: Option<&str>,
-        task_type: &str,
-        domain: Option<&str>,
-        experiment_id: &str,
-        variant_id: &str,
-        replaced_existing: bool,
-        config_keys: &[String],
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::AdaptiveBaselinePromoted, session_id);
-        evt.metadata = Some(serde_json::json!({
-            "task_type": task_type,
-            "domain": domain,
-            "experiment_id": experiment_id,
-            "variant_id": variant_id,
-            "replaced_existing": replaced_existing,
-            "config_keys": config_keys,
-        }));
-        evt
-    }
-
     /// Agent spawned event — marks the exact moment a child agent starts.
     /// Emitted by the spawner after successful registration so the unified
     /// timeline can show when each child was created.
@@ -4115,31 +4086,6 @@ impl JournalEvent {
         evt.metadata = Some(serde_json::json!({
             "changes": change_vals,
             "triggers": triggers,
-        }));
-        evt
-    }
-
-    /// Tuning rule triggered — emitted when an evolution rule fires and
-    /// modifies runtime config.
-    pub fn adaptive_tuning_rule_triggered(
-        session_id: Option<&str>,
-        turn: u32,
-        rule_id: &str,
-        rule_name: &str,
-        signal_type: &str,
-        config_changes: Vec<(String, String, String)>, // (key, from, to)
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::AdaptiveTuningRuleTriggered, session_id);
-        evt.turn = Some(turn);
-        let changes: Vec<serde_json::Value> = config_changes
-            .iter()
-            .map(|(k, from, to)| serde_json::json!({"key": k, "from": from, "to": to}))
-            .collect();
-        evt.metadata = Some(serde_json::json!({
-            "rule_id": rule_id,
-            "rule_name": rule_name,
-            "signal_type": signal_type,
-            "config_changes": changes,
         }));
         evt
     }
@@ -6265,31 +6211,6 @@ mod tests {
         assert_eq!(meta["failed"], 1);
         assert_eq!(meta["aggregated_status"], "partial");
         assert_eq!(meta["aggregated_output_preview"], "merged result preview");
-    }
-
-    #[test]
-    fn adaptive_baseline_promoted_event_builder() {
-        let keys = vec![
-            "memory.retrieval_top_k".to_string(),
-            "compression.max_history_tokens".to_string(),
-        ];
-        let evt = JournalEvent::adaptive_baseline_promoted(
-            Some("s1"),
-            "fetch",
-            None,
-            "exp-1",
-            "winner",
-            true,
-            &keys,
-        );
-        assert_eq!(evt.event_type, JournalEventType::AdaptiveBaselinePromoted);
-        let meta = evt.metadata.as_ref().unwrap();
-        assert_eq!(meta["task_type"], "fetch");
-        assert!(meta["domain"].is_null());
-        assert_eq!(meta["experiment_id"], "exp-1");
-        assert_eq!(meta["variant_id"], "winner");
-        assert_eq!(meta["replaced_existing"], true);
-        assert_eq!(meta["config_keys"][0], "memory.retrieval_top_k");
     }
 
     // ── Session ID Validation Security Tests ──

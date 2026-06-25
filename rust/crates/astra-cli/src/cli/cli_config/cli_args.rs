@@ -955,9 +955,12 @@ pub(crate) struct SelfSessionArgs {
 pub(crate) struct SelfReflectArgs {
     /// Session id or unique prefix (defaults to the most recent resumable session)
     pub session_id: Option<String>,
-    /// Reflection focus to prioritize in the local surface
-    #[arg(long, default_value = "auto", value_parser = ["auto", "skill_failure", "unexpected_result", "data_quality", "tool_surface", "history", "performance"])]
-    pub focus: String,
+    /// Observation topic to prioritize in the local reflection surface
+    #[arg(long, default_value = "overview", value_parser = ["overview", "runtime", "execution", "knowledge", "adaptation"])]
+    pub topic: String,
+    /// Optional observation facet under the selected topic
+    #[arg(long)]
+    pub facet: Option<String>,
     /// Optional concrete question to keep in the reflection prompt preview
     #[arg(long)]
     pub question: Option<String>,

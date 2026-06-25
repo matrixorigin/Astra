@@ -242,7 +242,7 @@ struct PrepareChatTurnRequest<'a> {
     /// SelfModel Gap 3 surface.
     recent_rejections: Vec<(String, String)>,
     /// Optional shared observability hub, forwarded from the SSE fetch request
-    /// so the per-turn SelfModel ingest can read `hub.tuning().recent_signals()`.
+    /// so the per-turn SelfModel ingest can read recent feedback signals.
     observability_hub: Option<&'a Arc<astra_runtime::observability::ObservabilityHub>>,
     append_system_prompt: Option<&'a str>,
     /// Whether the current permission mode is `Plan`. When true the schema-
@@ -858,7 +858,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             let recent_signals = ctx
                 .observability_hub
                 .as_ref()
-                .map(|hub| hub.tuning().recent_signals())
+                .map(|hub| hub.recent_feedback_signals())
                 .unwrap_or_default();
             session.ingest_self_model_inputs(skills, tool_health_entries, scenario, recent_signals);
 
@@ -1119,7 +1119,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub session_turn: u32,
     pub turn_chain_id: Option<&'a str>,
     pub user_query_event_id: Option<&'a str>,
-    /// Optional shared observability hub for reading the auto-tuning feedback
+    /// Optional shared observability hub for reading recent feedback signals
     /// window when publishing SelfModel inputs. Threaded through so the
     /// per-turn ingest can attach `recent_signals` to the session without
     /// needing a global singleton.

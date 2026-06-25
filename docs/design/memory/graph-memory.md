@@ -1547,7 +1547,7 @@ This uses MatrixOne's zero-copy branching — no data duplication, instant creat
 | MAX_ITERATIONS | 3 | 2–5 | High — latency vs recall tradeoff |
 | IMPORTANCE_REFLECT_THRESHOLD | 0.7 | 0.5–0.9 | Medium — controls reflection frequency |
 
-Sensitivity classification (High/Medium/Low) will be confirmed empirically. Parameters classified "High" get per-user adaptive tuning in a future iteration.
+Sensitivity classification (High/Medium/Low) will be confirmed empirically. Parameters classified "High" get per-user adaptive runtime policy in a future iteration.
 
 ---
 

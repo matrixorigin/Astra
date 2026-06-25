@@ -1,7 +1,7 @@
 # Tuning Job MVP Implementation Plan
 
-**Date**: 2026-06-24  
-**Status**: Implementation Design  
+**Date**: 2026-06-24
+**Status**: Implementation Design
 **Audience**: Astra runtime, CLI, server, storage, observability, and SDK maintainers
 
 ## Executive Summary
@@ -1187,33 +1187,33 @@ Every material tuning output should be visible as graph evidence:
 
 ## Suggested PR Slices
 
-1. **Schema and repository**  
+1. **Schema and repository**
    Add structs, repository trait, in-memory repo, SQL migration, SQL repo tests.
 
-2. **API and CLI shell**  
+2. **API and CLI shell**
    Add create/list/get/start/cancel/events/trace routes and `/tuning` rendering.
    `start` can only move `created -> baseline` with a stub event.
 
-3. **TUI mode and dashboard**  
+3. **TUI mode and dashboard**
    Add lightweight tuning mode, dashboard state, polling, snapshot diff, trace
    drill-down, and status chip.
 
-4. **Controller smoke path**  
+4. **Controller smoke path**
    Implement idempotent `created -> baseline -> deciding` with fake harness
    output. This validates durable transitions, checkpointing, trace rendering,
    and restart safety.
 
-5. **Real harness adapter**  
+5. **Real harness adapter**
    Wire one benchmark adapter and persist baseline/candidate evaluation refs.
 
-6. **Failure cluster and hypothesis generation**  
+6. **Failure cluster and hypothesis generation**
    Add failure clustering from observation/evaluation evidence and produce
    auditable hypothesis refs.
 
-7. **Candidate generation and decision**  
+7. **Candidate generation and decision**
    Generate bounded candidates, evaluate, rank, and emit `TuningDecision`.
 
-8. **Observation integration**  
+8. **Observation integration**
    Add provider support so `reflect(topic="adaptation", facet="measurements")`
    can explain job state and decisions.
 

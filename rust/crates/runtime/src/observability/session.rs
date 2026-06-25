@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
-use astra_learning::auto_tuning::{
-    AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType,
-};
+use astra_learning::feedback::FeedbackSignal;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use astra_turn_core::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
 
@@ -309,7 +307,7 @@ impl ObservabilitySession {
     /// Publish the four SelfModel inputs that were previously hard-coded to
     /// empty at the `build_self_model_snapshot` call site. `recent_signals`
     /// is bounded to the most recent 16 entries (tail-preserving) so the
-    /// SelfModel does not balloon when the tuning engine retains a long
+    /// SelfModel does not balloon when the feedback buffer retains a long
     /// window.
     pub fn ingest_self_model_inputs(
         &mut self,
