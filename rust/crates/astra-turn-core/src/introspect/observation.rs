@@ -48,21 +48,14 @@ pub fn build_introspect_report(
     snapshot: &IntrospectSnapshot,
     request: &IntrospectRequest,
 ) -> IntrospectReport {
-    let edge_only_unavailable = is_edge_only_facet(&request.facet);
-    let mut warnings = match request.facet {
-        ObservationFacet::Performance | ObservationFacet::Memory => {
-            vec!["requested facet requires CLI/Edge-local artifacts for full detail".to_string()]
-        }
-        _ => Vec::new(),
-    };
+    let mut warnings = Vec::new();
     if request.include_context {
         warnings.push(
             "include_context requested, but this runtime snapshot renderer has no visible-context provider"
                 .to_string(),
         );
     }
-    let data_coverage =
-        introspect_data_coverage(snapshot, request, edge_only_unavailable, warnings);
+    let data_coverage = introspect_data_coverage(snapshot, request, warnings);
     let view = ObservationView {
         topic: request.topic.as_str().to_string(),
         facet: request.facet.as_str().to_string(),
@@ -74,25 +67,21 @@ pub fn build_introspect_report(
     let summary = introspect_summary(snapshot, request);
     let mut observations = build_introspect_observations(snapshot, request, &summary);
 
-    let mut evidence = if edge_only_unavailable {
-        Vec::new()
-    } else {
-        vec![ObservationEvidence {
-            ref_id: RUNTIME_SNAPSHOT_REF.to_string(),
-            evidence_class: "observed_evidence".to_string(),
-            source: "runtime.introspect_snapshot".to_string(),
-            summary: format!(
-                "pressure={:.0}% cache={:.0}% turns={}/{} alerts={} tool_errors={}",
-                snapshot.token_pressure * 100.0,
-                snapshot.cache_hit_ratio * 100.0,
-                snapshot.turns_completed,
-                snapshot.turns_completed + snapshot.turns_remaining,
-                snapshot.alerts.len(),
-                snapshot.tool_errors.len(),
-            ),
-            confidence: ObservationConfidence::evidence(0.75),
-        }]
-    };
+    let mut evidence = vec![ObservationEvidence {
+        ref_id: RUNTIME_SNAPSHOT_REF.to_string(),
+        evidence_class: "observed_evidence".to_string(),
+        source: "runtime.introspect_snapshot".to_string(),
+        summary: format!(
+            "pressure={:.0}% cache={:.0}% turns={}/{} alerts={} tool_errors={}",
+            snapshot.token_pressure * 100.0,
+            snapshot.cache_hit_ratio * 100.0,
+            snapshot.turns_completed,
+            snapshot.turns_completed + snapshot.turns_remaining,
+            snapshot.alerts.len(),
+            snapshot.tool_errors.len(),
+        ),
+        confidence: ObservationConfidence::evidence(0.75),
+    }];
 
     let mut action_hints = build_introspect_action_hints(snapshot, &observations);
     let budget_result =
@@ -146,25 +135,16 @@ fn runtime_event_count(snapshot: &IntrospectSnapshot) -> i64 {
 fn introspect_data_coverage(
     snapshot: &IntrospectSnapshot,
     request: &IntrospectRequest,
-    edge_only_unavailable: bool,
     warnings: Vec<String>,
 ) -> ObservationDataCoverage {
-    let source = if edge_only_unavailable {
-        "edge_local_artifacts_unavailable".to_string()
-    } else {
-        match request.source_policy {
-            SourcePolicy::Auto | SourcePolicy::LiveFirst => "live_runtime_snapshot".to_string(),
-            SourcePolicy::LiveOnly => "live_only_runtime_snapshot".to_string(),
-            SourcePolicy::DurableFirst => "durable_first_runtime_snapshot".to_string(),
-            SourcePolicy::LocalOnly => "local_runtime_snapshot".to_string(),
-            SourcePolicy::CloudOnly => "cloud_runtime_snapshot".to_string(),
-        }
+    let source = match request.source_policy {
+        SourcePolicy::Auto | SourcePolicy::LiveFirst => "live_runtime_snapshot".to_string(),
+        SourcePolicy::LiveOnly => "live_only_runtime_snapshot".to_string(),
+        SourcePolicy::DurableFirst => "durable_first_runtime_snapshot".to_string(),
+        SourcePolicy::LocalOnly => "local_runtime_snapshot".to_string(),
+        SourcePolicy::CloudOnly => "cloud_runtime_snapshot".to_string(),
     };
-    let events = if edge_only_unavailable {
-        0
-    } else {
-        runtime_event_count(snapshot)
-    };
+    let events = runtime_event_count(snapshot);
 
     let mut providers = BTreeMap::new();
     providers.insert(
@@ -175,24 +155,6 @@ fn introspect_data_coverage(
             reason: None,
         },
     );
-    if edge_only_unavailable {
-        providers.insert(
-            "local_journal".to_string(),
-            ObservationProviderCoverage {
-                status: "missing".to_string(),
-                freshness_ms: None,
-                reason: Some("not_visible_from_shared_runtime_renderer".to_string()),
-            },
-        );
-        providers.insert(
-            "local_workspace_metadata".to_string(),
-            ObservationProviderCoverage {
-                status: "missing".to_string(),
-                freshness_ms: None,
-                reason: Some("not_visible_from_shared_runtime_renderer".to_string()),
-            },
-        );
-    }
     if request.include_context {
         providers.insert(
             "visible_context".to_string(),
@@ -218,7 +180,7 @@ fn introspect_data_coverage(
     }
 
     ObservationDataCoverage {
-        overall: if edge_only_unavailable || !warnings.is_empty() {
+        overall: if !warnings.is_empty() {
             "partial".to_string()
         } else {
             "fresh".to_string()
@@ -278,13 +240,6 @@ fn truncate_count<T>(items: &mut Vec<T>, max: usize) -> i64 {
     omitted
 }
 
-fn is_edge_only_facet(facet: &ObservationFacet) -> bool {
-    matches!(
-        facet,
-        ObservationFacet::Performance | ObservationFacet::Memory
-    )
-}
-
 fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest) -> String {
     match request.facet {
         ObservationFacet::Errors => {
@@ -304,12 +259,6 @@ fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
                     snapshot.stall_state.events.len()
                 )
             }
-        }
-        ObservationFacet::Performance | ObservationFacet::Memory => {
-            format!(
-                "{} requires Edge-local data for full detail",
-                request.facet.as_str()
-            )
         }
         _ if !snapshot.alerts.is_empty() => {
             format!(
@@ -332,25 +281,6 @@ fn build_introspect_observations(
     request: &IntrospectRequest,
     summary: &str,
 ) -> Vec<ObservationRecord> {
-    if matches!(
-        request.facet,
-        ObservationFacet::Performance | ObservationFacet::Memory
-    ) {
-        return vec![ObservationRecord {
-            ref_id: format!(
-                "urn:astra:observation:local:introspect:{}:unavailable",
-                request.facet.as_str()
-            ),
-            topic: request.topic.as_str().to_string(),
-            facet: request.facet.as_str().to_string(),
-            kind: "data_surface_unavailable".to_string(),
-            severity: "info".to_string(),
-            summary: summary.to_string(),
-            confidence: ObservationConfidence::complete(0.95, 0.90, 0.20),
-            evidence_refs: Vec::new(),
-        }];
-    }
-
     let mut observations = Vec::new();
     match request.facet {
         ObservationFacet::Session => {
@@ -407,21 +337,6 @@ fn build_introspect_observations(
                     evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
                 });
             }
-        }
-        ObservationFacet::Performance | ObservationFacet::Memory => {
-            observations.push(ObservationRecord {
-                ref_id: "urn:astra:observation:local:introspect:edge_facet_unavailable".to_string(),
-                topic: request.topic.as_str().to_string(),
-                facet: request.facet.as_str().to_string(),
-                kind: "data_unavailable".to_string(),
-                severity: "info".to_string(),
-                summary: format!(
-                    "facet={} requires CLI/Edge-local session artifacts",
-                    request.facet.as_str()
-                ),
-                confidence: ObservationConfidence::evidence(0.70),
-                evidence_refs: vec![],
-            });
         }
         _ => {}
     }

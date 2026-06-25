@@ -224,9 +224,17 @@ impl IntrospectRequest {
 
         let depth_raw = string_arg(args, "depth").unwrap_or("summary");
 
+        let facet = match ObservationFacet::from_str(facet_raw) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("Invalid facet '{}': {}, using default", facet_raw, e);
+                ObservationFacet::default()
+            }
+        };
+
         Self {
             topic,
-            facet: ObservationFacet::from_str(facet_raw),
+            facet,
             depth: IntrospectDepth::from_arg(depth_raw),
             horizon: ObservationHorizon::from_arg(
                 string_arg(args, "horizon").unwrap_or("current_turn"),

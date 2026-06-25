@@ -205,48 +205,15 @@ pub fn render_introspect_request(
         return observation::render_introspect_report_json(snapshot, request);
     }
 
-    match &request.facet {
+    match request.facet {
         ObservationFacet::Session => render_introspect(snapshot, request.depth.detail()),
         ObservationFacet::Recent | ObservationFacet::Trace => render_recent_rounds(snapshot),
         ObservationFacet::Volatile => render_volatile_pending(snapshot),
         ObservationFacet::Stall => render_stall_state(snapshot),
         ObservationFacet::Noise => render_injection_freshness(snapshot),
         ObservationFacet::Errors => render_errors(snapshot),
-        ObservationFacet::Tools => render_introspect(snapshot, request.depth.detail()),
         ObservationFacet::Overview => render_all(snapshot),
-        ObservationFacet::Performance
-        | ObservationFacet::Memory
-        | ObservationFacet::Context
-        | ObservationFacet::Signals => render_edge_only_unavailable(request),
     }
-}
-
-fn render_edge_only_unavailable(request: &IntrospectRequest) -> String {
-    let reason = if request.source_policy.allows_edge_local_artifacts() {
-        "no CLI/Edge-local artifact provider is attached to this renderer"
-    } else {
-        "requested source_policy does not allow CLI/Edge-local artifacts"
-    };
-    format!(
-        "## Introspect Unavailable\n\
-         facet={} topic={} horizon={} source_policy={}\n\
-         Data coverage: this facet requires CLI/Edge-local session artifacts; {reason}.",
-        request.facet.as_str(),
-        request.topic.as_str(),
-        request.horizon.as_str(),
-        request.source_policy.as_str(),
-    )
-}
-
-fn render_unknown_facet(snapshot: &IntrospectSnapshot, request: &IntrospectRequest) -> String {
-    let mut out = format!(
-        "## Introspect Fallback\n\
-         Unknown facet `{}` for topic `{}`; returning session view.\n\n",
-        request.facet.as_str(),
-        request.topic.as_str(),
-    );
-    out.push_str(&render_introspect(snapshot, request.depth.detail()));
-    out
 }
 
 /// Render the introspect output at the requested text depth.

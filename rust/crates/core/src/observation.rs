@@ -28,40 +28,42 @@ pub enum ObservationFacet {
     Noise,
     /// Recent tool errors and failure previews.
     Errors,
-    /// Runtime performance: latency, cost, cache efficiency.
-    Performance,
     /// Tool execution trace and outcome history.
     Trace,
-    /// Tool usage patterns and health rankings.
-    Tools,
-    /// Knowledge context: memory, data quality, freshness.
-    Context,
-    /// Memory and session state.
-    Memory,
-    /// Adaptation signals and tuning recommendations.
-    Signals,
     /// Overview: aggregated session summary.
     Overview,
 }
 
+/// Error type for facet parsing failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservationFacetError {
+    UnknownFacet(String),
+}
+
+impl fmt::Display for ObservationFacetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownFacet(s) => write!(f, "unknown observation facet: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for ObservationFacetError {}
+
 impl ObservationFacet {
     /// Parse a facet string into canonical form.
-    pub fn from_str(s: &str) -> Self {
+    /// Returns an error for unknown facets instead of falling back to Session.
+    pub fn from_str(s: &str) -> Result<Self, ObservationFacetError> {
         match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-            "" | "session" | "runtime" => Self::Session,
-            "recent" => Self::Recent,
-            "volatile" => Self::Volatile,
-            "stall" => Self::Stall,
-            "noise" | "freshness" => Self::Noise,
-            "errors" => Self::Errors,
-            "performance" | "latency" | "cost" | "cache" => Self::Performance,
-            "trace" | "history" => Self::Trace,
-            "tools" => Self::Tools,
-            "context" | "data_quality" => Self::Context,
-            "memory" | "session_memory" => Self::Memory,
-            "signals" | "adaptation" => Self::Signals,
-            "overview" | "all" => Self::Overview,
-            _ => Self::Session,
+            "" | "session" | "runtime" => Ok(Self::Session),
+            "recent" => Ok(Self::Recent),
+            "volatile" => Ok(Self::Volatile),
+            "stall" => Ok(Self::Stall),
+            "noise" | "freshness" => Ok(Self::Noise),
+            "errors" => Ok(Self::Errors),
+            "trace" | "history" => Ok(Self::Trace),
+            "overview" | "all" => Ok(Self::Overview),
+            unknown => Err(ObservationFacetError::UnknownFacet(unknown.to_string())),
         }
     }
 
@@ -74,12 +76,7 @@ impl ObservationFacet {
             Self::Stall => "stall",
             Self::Noise => "noise",
             Self::Errors => "errors",
-            Self::Performance => "performance",
             Self::Trace => "trace",
-            Self::Tools => "tools",
-            Self::Context => "context",
-            Self::Memory => "memory",
-            Self::Signals => "signals",
             Self::Overview => "overview",
         }
     }
