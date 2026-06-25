@@ -530,7 +530,7 @@ pub async fn run_product_matrix_full_journey(
         "manual event missing from causal chain: {cc_j}"
     );
 
-    let list_ev_path = format!("/events?session_id={session_id}&limit=20&offset=0");
+    let list_ev_path = format!("/events?session_id={session_id}&limit=20");
     let (st_list_ev, list_ev) = get_json(app, &list_ev_path, Some(auth_header.as_str()), &[]).await;
     assert_eq!(st_list_ev, StatusCode::OK, "list events (query): {list_ev}");
     assert!(
@@ -543,7 +543,7 @@ pub async fn run_product_matrix_full_journey(
 
     let (st_ev_sess, ev_sess) = get_json(
         app,
-        &format!("/events/session/{session_id}?limit=50&offset=0"),
+        &format!("/events/session/{session_id}?limit=50"),
         Some(auth_header.as_str()),
         &[],
     )

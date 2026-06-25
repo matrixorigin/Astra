@@ -1308,7 +1308,12 @@ export type EventListResponse = {
   events: EventResponse[];
   total: number;
   limit: number;
-  offset: number;
+  next_cursor?: EventListCursor | null;
+};
+
+export type EventListCursor = {
+  created_at: string;
+  event_id: string;
 };
 
 export type EventListFilters = {
@@ -1317,7 +1322,7 @@ export type EventListFilters = {
   agentId?: string;
   causalChainId?: string;
   limit?: number;
-  offset?: number;
+  cursor?: EventListCursor;
 };
 
 // ─── Edge status ───────────────────────────────────────────────────

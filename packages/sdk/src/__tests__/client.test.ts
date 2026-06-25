@@ -715,12 +715,18 @@ describe("AstraClient — Events and edges", () => {
       events: [],
       total: 0,
       limit: 100,
-      offset: 0,
+      next_cursor: null,
     });
-    await createClient().getSessionEvents("sid", { offset: 1 });
+    await createClient().getSessionEvents("sid", {
+      cursor: {
+        created_at: "2026-04-01T10:00:00.123456",
+        event_id: "evt-1",
+      },
+    });
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/events/session/sid");
-    expect(url).toContain("offset=1");
+    expect(url).toContain("after_created_at=2026-04-01T10%3A00%3A00.123456");
+    expect(url).toContain("after_event_id=evt-1");
   });
 
   test("listEvents", async () => {
@@ -728,13 +734,26 @@ describe("AstraClient — Events and edges", () => {
       events: [],
       total: 0,
       limit: 50,
-      offset: 0,
+      next_cursor: {
+        created_at: "2026-04-01T10:00:00.123456",
+        event_id: "evt-1",
+      },
     });
-    await createClient().listEvents({ sessionId: "s1", limit: 20 });
+    const result = await createClient().listEvents({
+      sessionId: "s1",
+      limit: 20,
+      cursor: {
+        created_at: "2026-04-01T10:00:00.123456",
+        event_id: "evt-1",
+      },
+    });
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/events?");
     expect(url).toContain("session_id=s1");
     expect(url).toContain("limit=20");
+    expect(url).toContain("after_created_at=2026-04-01T10%3A00%3A00.123456");
+    expect(url).toContain("after_event_id=evt-1");
+    expect(result.next_cursor?.event_id).toBe("evt-1");
   });
 
   test("getCausalChain", async () => {

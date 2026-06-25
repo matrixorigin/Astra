@@ -40,6 +40,7 @@ pub async fn list_events_handler(
     Query(q): Query<EventListQuery>,
 ) -> Result<Json<EventListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let cursor = q.cursor()?;
     let list = state
         .event_service
         .list_events(EventListFilter {
@@ -49,7 +50,7 @@ pub async fn list_events_handler(
             agent_id: q.agent_id,
             causal_chain_id: q.causal_chain_id,
             limit: q.limit,
-            offset: q.offset,
+            cursor,
         })
         .await?;
     Ok(Json(EventListResponse::from(list)))
@@ -88,9 +89,10 @@ pub async fn get_session_events_handler(
     Query(q): Query<SessionEventQuery>,
 ) -> Result<Json<EventListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let cursor = q.cursor()?;
     let list = state
         .event_service
-        .get_session_events(session_id, user.user_id, q.limit, q.offset)
+        .get_session_events(session_id, user.user_id, q.limit, cursor)
         .await?;
     Ok(Json(EventListResponse::from(list)))
 }

@@ -354,13 +354,87 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
             agent_id: None,
             causal_chain_id: None,
             limit: u32::MAX,
-            offset: 0,
+            cursor: None,
         })
         .await
         .expect("list_events");
     assert_eq!(listed.limit, MAX_API_LIST_LIMIT);
     assert_eq!(listed.events.len(), 3);
     assert!(listed.events[0].created_at >= listed.events[1].created_at);
+    assert!(listed.next_cursor.is_none());
+
+    let first_event_page = ev
+        .list_events(EventListFilter {
+            user_id: user_id.clone(),
+            session_id: None,
+            event_type: None,
+            agent_id: None,
+            causal_chain_id: None,
+            limit: 2,
+            cursor: None,
+        })
+        .await
+        .expect("list first event page");
+    assert_eq!(
+        first_event_page
+            .events
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![e2.as_str(), e3.as_str()]
+    );
+    let second_event_page = ev
+        .list_events(EventListFilter {
+            user_id: user_id.clone(),
+            session_id: None,
+            event_type: None,
+            agent_id: None,
+            causal_chain_id: None,
+            limit: 2,
+            cursor: first_event_page.next_cursor.clone(),
+        })
+        .await
+        .expect("list second event page");
+    assert_eq!(
+        second_event_page
+            .events
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![e1.as_str()]
+    );
+    assert!(second_event_page.next_cursor.is_none());
+
+    let first_session_page = ev
+        .get_session_events(session_id.clone(), user_id.clone(), 2, None)
+        .await
+        .expect("session events first page");
+    assert_eq!(
+        first_session_page
+            .events
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![e1.as_str(), e3.as_str()]
+    );
+    let second_session_page = ev
+        .get_session_events(
+            session_id.clone(),
+            user_id.clone(),
+            2,
+            first_session_page.next_cursor.clone(),
+        )
+        .await
+        .expect("session events second page");
+    assert_eq!(
+        second_session_page
+            .events
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![e2.as_str()]
+    );
+    assert!(second_session_page.next_cursor.is_none());
 
     sqlx::query(
         "INSERT INTO ctx_decision_audits \
@@ -3578,14 +3652,14 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
     );
 
     let owner_events = event_service
-        .get_session_events(session_id.clone(), owner_user_id.clone(), 100, 0)
+        .get_session_events(session_id.clone(), owner_user_id.clone(), 100, None)
         .await
         .expect("owner can list session events");
     assert_eq!(owner_events.events.len(), 1);
     assert_eq!(owner_events.events[0].event_id, owner_event.event_id);
 
     let other_session_result = event_service
-        .get_session_events(session_id.clone(), other_user_id.clone(), 100, 0)
+        .get_session_events(session_id.clone(), other_user_id.clone(), 100, None)
         .await;
     assert_eq!(
         other_session_result

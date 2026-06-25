@@ -130,6 +130,7 @@ export type {
   ReflectQueryParams,
   ReflectReport,
   EventResponse,
+  EventListCursor,
   EventListResponse,
   EventListFilters,
   EdgeInfo,

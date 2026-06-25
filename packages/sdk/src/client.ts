@@ -13,6 +13,7 @@ import type {
   EdgeHeartbeatRequestBody,
   EdgeRegisterRequestBody,
   EdgeStatusResponse,
+  EventListCursor,
   EventListFilters,
   EventListResponse,
   EventResponse,
@@ -614,11 +615,16 @@ export class AstraClient {
   /** `GET /events/session/{session_id}` */
   async getSessionEvents(
     sessionId: string,
-    opts?: { limit?: number; offset?: number },
+    opts?: { limit?: number; cursor?: EventListCursor },
   ): Promise<EventListResponse> {
     const q = buildQueryString({
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
-      ...(opts?.offset !== undefined ? { offset: opts.offset } : {}),
+      ...(opts?.cursor
+        ? {
+            after_created_at: opts.cursor.created_at,
+            after_event_id: opts.cursor.event_id,
+          }
+        : {}),
     });
     const raw = await this.fetch<EventListResponse>(
       `${eventsSessionPath(sessionId)}${q}`,
@@ -636,7 +642,12 @@ export class AstraClient {
         ? { causal_chain_id: filters.causalChainId }
         : {}),
       ...(filters?.limit !== undefined ? { limit: filters.limit } : {}),
-      ...(filters?.offset !== undefined ? { offset: filters.offset } : {}),
+      ...(filters?.cursor
+        ? {
+            after_created_at: filters.cursor.created_at,
+            after_event_id: filters.cursor.event_id,
+          }
+        : {}),
     });
     const raw = await this.fetch<EventListResponse>(`${PATH_EVENTS}${q}`);
     return normalizeEventList(raw);

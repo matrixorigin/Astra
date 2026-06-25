@@ -40,7 +40,7 @@ pub(super) async fn platform_snapshot_handler(
             agent_id: None,
             causal_chain_id: None,
             limit: 50,
-            offset: 0,
+            cursor: None,
         }),
     );
 

@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
-use crate::pagination::clamp_api_list_pagination;
+use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::storage::{agent_session_exists_for_user, bump_agent_session_event_count};
 
 const MAX_CAUSAL_CHAIN_EVENTS: i64 = 500;
@@ -50,7 +50,7 @@ pub struct EventListFilter {
     pub agent_id: Option<String>,
     pub causal_chain_id: Option<String>,
     pub limit: u32,
-    pub offset: u32,
+    pub cursor: Option<EventListCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,7 +58,13 @@ pub struct EventListRecord {
     pub events: Vec<EventRecord>,
     pub total: i64,
     pub limit: u32,
-    pub offset: u32,
+    pub next_cursor: Option<EventListCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventListCursor {
+    pub created_at: String,
+    pub event_id: String,
 }
 
 fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String> {
@@ -67,6 +73,71 @@ fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.trim_matches('"').to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn validate_event_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_API_LIST_LIMIT)
+}
+
+fn event_list_query_limit(limit: u32) -> i64 {
+    i64::from(limit) + 1
+}
+
+fn event_list_cursor_db_created_at(
+    cursor: &EventListCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let created_at = cursor.created_at.trim();
+    if created_at.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid event list cursor: created_at is required",
+        ));
+    }
+    let db_created_at = created_at.replace('T', " ");
+    if db_created_at.len() != "YYYY-MM-DD HH:MM:SS.ffffff".len()
+        || db_created_at.as_bytes().get(10) != Some(&b' ')
+        || db_created_at.as_bytes().get(19) != Some(&b'.')
+        || chrono::NaiveDateTime::parse_from_str(&db_created_at, "%Y-%m-%d %H:%M:%S%.6f").is_err()
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid event list cursor timestamp: {created_at}"),
+        ));
+    }
+    Ok(db_created_at)
+}
+
+fn event_list_cursor_event_id(
+    cursor: &EventListCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let event_id = cursor.event_id.trim();
+    if event_id.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid event list cursor: event_id is required",
+        ));
+    }
+    Ok(event_id.to_string())
+}
+
+fn event_list_cursor_from_record(
+    event: &EventRecord,
+) -> Result<EventListCursor, (StatusCode, Json<ErrorResponse>)> {
+    if event.created_at.trim().is_empty() {
+        return Err(internal_error(format!(
+            "invalid agent_events cursor: event_id={}, column=created_at, value is empty",
+            event.event_id
+        )));
+    }
+    if event.event_id.trim().is_empty() {
+        return Err(internal_error(
+            "invalid agent_events cursor: column=event_id, value is empty",
+        ));
+    }
+    Ok(EventListCursor {
+        created_at: event.created_at.clone(),
+        event_id: event.event_id.clone(),
+    })
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -101,7 +172,7 @@ pub trait EventService: Send + Sync {
         session_id: String,
         user_id: String,
         limit: u32,
-        offset: u32,
+        cursor: Option<EventListCursor>,
     ) -> Result<EventListRecord, (StatusCode, Json<ErrorResponse>)>;
 
     async fn delete_event(
@@ -204,7 +275,7 @@ pub const EVENT_LIST_SELECT_COLS: &str = "\
     parent_event_id, \
     causal_chain_id, \
     '{}' AS metadata_json, \
-    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
+    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at";
 
 #[async_trait]
 impl EventService for DatabaseEventService {
@@ -326,11 +397,11 @@ impl EventService for DatabaseEventService {
 
     async fn list_events(
         &self,
-        mut filter: EventListFilter,
+        filter: EventListFilter,
     ) -> Result<EventListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        (filter.limit, filter.offset) = clamp_api_list_pagination(filter.limit, filter.offset);
+        let limit = validate_event_list_limit(filter.limit);
 
         let mut count_qb = QueryBuilder::<MySql>::new(
             "SELECT COUNT(event_id) AS total FROM agent_events WHERE user_id = ",
@@ -380,10 +451,19 @@ impl EventService for DatabaseEventService {
             list_qb.push(" AND causal_chain_id = ");
             list_qb.push_bind(ccid);
         }
-        list_qb.push(" ORDER BY created_at DESC LIMIT ");
-        list_qb.push_bind(i64::from(filter.limit));
-        list_qb.push(" OFFSET ");
-        list_qb.push_bind(i64::from(filter.offset));
+        if let Some(cursor) = &filter.cursor {
+            let created_at = event_list_cursor_db_created_at(cursor)?;
+            let event_id = event_list_cursor_event_id(cursor)?;
+            list_qb.push(" AND (created_at < ");
+            list_qb.push_bind(created_at.clone());
+            list_qb.push(" OR (created_at = ");
+            list_qb.push_bind(created_at);
+            list_qb.push(" AND event_id < ");
+            list_qb.push_bind(event_id);
+            list_qb.push("))");
+        }
+        list_qb.push(" ORDER BY created_at DESC, event_id DESC LIMIT ");
+        list_qb.push_bind(event_list_query_limit(limit));
 
         let rows = list_qb
             .build()
@@ -394,13 +474,25 @@ impl EventService for DatabaseEventService {
         for row in rows {
             events.push(Self::event_record_from_row(row)?);
         }
+        let has_more = events.len() > limit as usize;
+        if has_more {
+            events.truncate(limit as usize);
+        }
         Self::hydrate_parent_event_ids(&pool, &mut events).await?;
+        let next_cursor = if has_more {
+            events
+                .last()
+                .map(event_list_cursor_from_record)
+                .transpose()?
+        } else {
+            None
+        };
 
         Ok(EventListRecord {
             events,
             total,
-            limit: filter.limit,
-            offset: filter.offset,
+            limit,
+            next_cursor,
         })
     }
 
@@ -463,10 +555,10 @@ impl EventService for DatabaseEventService {
         session_id: String,
         user_id: String,
         limit: u32,
-        offset: u32,
+        cursor: Option<EventListCursor>,
     ) -> Result<EventListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let (limit, offset) = clamp_api_list_pagination(limit, offset);
+        let limit = validate_event_list_limit(limit);
 
         if !agent_session_exists_for_user(&pool, &session_id, &user_id)
             .await
@@ -488,15 +580,29 @@ impl EventService for DatabaseEventService {
         .map_err(internal_error)?;
         let total = count_row.try_get::<i64, _>("total").unwrap_or(0);
 
-        let select_sql = format!(
-            "SELECT {} FROM agent_events WHERE session_id = ? AND user_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?",
+        let mut list_qb = QueryBuilder::<MySql>::new(format!(
+            "SELECT {} FROM agent_events WHERE session_id = ",
             EVENT_LIST_SELECT_COLS
-        );
-        let rows = query(&select_sql)
-            .bind(&session_id)
-            .bind(&user_id)
-            .bind(i64::from(limit))
-            .bind(i64::from(offset))
+        ));
+        list_qb.push_bind(&session_id);
+        list_qb.push(" AND user_id = ");
+        list_qb.push_bind(&user_id);
+        if let Some(cursor) = &cursor {
+            let created_at = event_list_cursor_db_created_at(cursor)?;
+            let event_id = event_list_cursor_event_id(cursor)?;
+            list_qb.push(" AND (created_at > ");
+            list_qb.push_bind(created_at.clone());
+            list_qb.push(" OR (created_at = ");
+            list_qb.push_bind(created_at);
+            list_qb.push(" AND event_id > ");
+            list_qb.push_bind(event_id);
+            list_qb.push("))");
+        }
+        list_qb.push(" ORDER BY created_at ASC, event_id ASC LIMIT ");
+        list_qb.push_bind(event_list_query_limit(limit));
+
+        let rows = list_qb
+            .build()
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
@@ -505,12 +611,24 @@ impl EventService for DatabaseEventService {
         for row in rows {
             events.push(Self::event_record_from_row(row)?);
         }
+        let has_more = events.len() > limit as usize;
+        if has_more {
+            events.truncate(limit as usize);
+        }
         Self::hydrate_parent_event_ids(&pool, &mut events).await?;
+        let next_cursor = if has_more {
+            events
+                .last()
+                .map(event_list_cursor_from_record)
+                .transpose()?
+        } else {
+            None
+        };
         Ok(EventListRecord {
             events,
             total,
             limit,
-            offset,
+            next_cursor,
         })
     }
 
@@ -601,7 +719,7 @@ impl EventService for UnconfiguredEventService {
         _: String,
         _: String,
         _: u32,
-        _: u32,
+        _: Option<EventListCursor>,
     ) -> Result<EventListRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("event service not configured"))
     }
@@ -638,8 +756,8 @@ pub struct EventListQuery {
     pub causal_chain_id: Option<String>,
     #[serde(default = "default_event_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub offset: u32,
+    pub after_created_at: Option<String>,
+    pub after_event_id: Option<String>,
 }
 
 impl Default for EventListQuery {
@@ -650,7 +768,8 @@ impl Default for EventListQuery {
             agent_id: None,
             causal_chain_id: None,
             limit: default_event_limit(),
-            offset: 0,
+            after_created_at: None,
+            after_event_id: None,
         }
     }
 }
@@ -663,21 +782,51 @@ pub fn default_event_limit() -> u32 {
 pub struct SessionEventQuery {
     #[serde(default = "default_session_event_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub offset: u32,
+    pub after_created_at: Option<String>,
+    pub after_event_id: Option<String>,
 }
 
 impl Default for SessionEventQuery {
     fn default() -> Self {
         Self {
             limit: default_session_event_limit(),
-            offset: 0,
+            after_created_at: None,
+            after_event_id: None,
         }
     }
 }
 
 pub fn default_session_event_limit() -> u32 {
     100
+}
+
+fn event_cursor_from_query_parts(
+    after_created_at: &Option<String>,
+    after_event_id: &Option<String>,
+) -> Result<Option<EventListCursor>, (StatusCode, Json<ErrorResponse>)> {
+    match (after_created_at, after_event_id) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(event_id)) => Ok(Some(EventListCursor {
+            created_at: created_at.clone(),
+            event_id: event_id.clone(),
+        })),
+        _ => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "event list cursor requires both after_created_at and after_event_id",
+        )),
+    }
+}
+
+impl EventListQuery {
+    pub fn cursor(&self) -> Result<Option<EventListCursor>, (StatusCode, Json<ErrorResponse>)> {
+        event_cursor_from_query_parts(&self.after_created_at, &self.after_event_id)
+    }
+}
+
+impl SessionEventQuery {
+    pub fn cursor(&self) -> Result<Option<EventListCursor>, (StatusCode, Json<ErrorResponse>)> {
+        event_cursor_from_query_parts(&self.after_created_at, &self.after_event_id)
+    }
 }
 
 #[derive(Serialize, PartialEq)]
@@ -702,7 +851,7 @@ pub struct EventListResponse {
     pub events: Vec<EventResponse>,
     pub total: i64,
     pub limit: u32,
-    pub offset: u32,
+    pub next_cursor: Option<EventListCursor>,
 }
 
 impl From<EventRecord> for EventResponse {
@@ -730,7 +879,7 @@ impl From<EventListRecord> for EventListResponse {
             events: r.events.into_iter().map(EventResponse::from).collect(),
             total: r.total,
             limit: r.limit,
-            offset: r.offset,
+            next_cursor: r.next_cursor,
         }
     }
 }
@@ -738,7 +887,6 @@ impl From<EventListRecord> for EventListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pagination::{MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, clamp_api_list_pagination};
 
     // --- metadata_tool_name ---
 
@@ -844,11 +992,20 @@ mod tests {
             }],
             total: 42,
             limit: 10,
-            offset: 0,
+            next_cursor: Some(EventListCursor {
+                created_at: "2026-04-01T10:00:00.123456".to_string(),
+                event_id: "e1".to_string(),
+            }),
         };
         let resp = EventListResponse::from(record);
         assert_eq!(resp.events.len(), 1);
         assert_eq!(resp.total, 42);
+        assert_eq!(
+            resp.next_cursor
+                .as_ref()
+                .map(|cursor| cursor.event_id.as_str()),
+            Some("e1")
+        );
     }
 
     // --- query deserialization defaults ---
@@ -857,21 +1014,83 @@ mod tests {
     fn event_list_query_defaults() {
         let q: EventListQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.limit, 50);
-        assert_eq!(q.offset, 0);
+        assert_eq!(q.cursor().unwrap(), None);
     }
 
     #[test]
     fn session_event_query_defaults() {
         let q: SessionEventQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.limit, 100);
-        assert_eq!(q.offset, 0);
+        assert_eq!(q.cursor().unwrap(), None);
     }
 
     #[test]
-    fn list_events_paging_contract_matches_shared_clamp() {
-        let (limit, offset) = clamp_api_list_pagination(u32::MAX, u32::MAX);
-        assert_eq!(limit, MAX_API_LIST_LIMIT);
-        assert_eq!(offset, MAX_API_LIST_OFFSET);
+    fn event_list_query_requires_complete_cursor() {
+        let q: EventListQuery =
+            serde_json::from_str(r#"{"after_created_at":"2026-04-01T10:00:00.000000"}"#).unwrap();
+        assert_eq!(q.cursor().unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn event_list_limit_has_hard_cap_and_minimum() {
+        assert_eq!(validate_event_list_limit(0), 1);
+        assert_eq!(validate_event_list_limit(10), 10);
+        assert_eq!(validate_event_list_limit(u32::MAX), MAX_API_LIST_LIMIT);
+        assert_eq!(event_list_query_limit(MAX_API_LIST_LIMIT), 201);
+    }
+
+    #[test]
+    fn event_list_cursor_rejects_invalid_inputs() {
+        let cursor = EventListCursor {
+            created_at: "2026-04-01T10:00:00.123456".to_string(),
+            event_id: "event-1".to_string(),
+        };
+        assert_eq!(
+            event_list_cursor_db_created_at(&cursor).unwrap(),
+            "2026-04-01 10:00:00.123456"
+        );
+        assert_eq!(
+            event_list_cursor_event_id(&cursor).unwrap(),
+            "event-1".to_string()
+        );
+
+        let invalid_time = EventListCursor {
+            created_at: "2026-04-01T10:00:00".to_string(),
+            event_id: "event-1".to_string(),
+        };
+        assert_eq!(
+            event_list_cursor_db_created_at(&invalid_time)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let missing_event_id = EventListCursor {
+            created_at: "2026-04-01T10:00:00.123456".to_string(),
+            event_id: "  ".to_string(),
+        };
+        assert_eq!(
+            event_list_cursor_event_id(&missing_event_id).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn event_list_sql_contract_uses_seek_cursor_not_offset() {
+        let desc_sql = format!(
+            "SELECT {EVENT_LIST_SELECT_COLS} FROM agent_events WHERE user_id = ? \
+             AND (created_at < ? OR (created_at = ? AND event_id < ?)) \
+             ORDER BY created_at DESC, event_id DESC LIMIT ?"
+        );
+        let asc_sql = format!(
+            "SELECT {EVENT_LIST_SELECT_COLS} FROM agent_events WHERE session_id = ? \
+             AND (created_at > ? OR (created_at = ? AND event_id > ?)) \
+             ORDER BY created_at ASC, event_id ASC LIMIT ?"
+        );
+        assert!(!desc_sql.to_ascii_uppercase().contains(" OFFSET "));
+        assert!(!asc_sql.to_ascii_uppercase().contains(" OFFSET "));
+        assert!(desc_sql.contains("event_id < ?"));
+        assert!(asc_sql.contains("event_id > ?"));
     }
 
     #[test]
