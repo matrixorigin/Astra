@@ -310,7 +310,7 @@ pub async fn run_product_matrix_full_journey(
 
     let (st_mkt, mkt_j) = get_json(
         app,
-        "/marketplace/installed?limit=20&offset=0",
+        "/marketplace/installed?limit=20",
         Some(auth_header.as_str()),
         &[],
     )

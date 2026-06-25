@@ -23,10 +23,84 @@ pub struct InstalledListResponse {
     pub installations: Vec<InstallationResponse>,
     pub total: i64,
     pub limit: i64,
-    pub offset: i64,
+    pub next_cursor: Option<InstalledListCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledListCursor {
+    pub installed_at: String,
+    pub installation_id: String,
 }
 
 const MAX_INSTALLED_LIST_ROWS: i64 = 200;
+const INSTALLED_LIST_SELECT: &str = "\
+    installation_id, skill_name, skill_version, status, \
+    DATE_FORMAT(installed_at, '%Y-%m-%dT%H:%i:%s.%f') AS installed_at";
+
+fn validate_installed_list_limit(limit: i64) -> i64 {
+    limit.clamp(1, MAX_INSTALLED_LIST_ROWS)
+}
+
+fn installed_list_query_limit(limit: i64) -> i64 {
+    limit + 1
+}
+
+fn installed_list_cursor_db_installed_at(
+    cursor: &InstalledListCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let installed_at = cursor.installed_at.trim();
+    if installed_at.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid installed list cursor: installed_at is required",
+        ));
+    }
+    let db_installed_at = installed_at.replace('T', " ");
+    if db_installed_at.len() != "YYYY-MM-DD HH:MM:SS.ffffff".len()
+        || db_installed_at.as_bytes().get(10) != Some(&b' ')
+        || db_installed_at.as_bytes().get(19) != Some(&b'.')
+        || chrono::NaiveDateTime::parse_from_str(&db_installed_at, "%Y-%m-%d %H:%M:%S%.6f").is_err()
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid installed list cursor timestamp: {installed_at}"),
+        ));
+    }
+    Ok(db_installed_at)
+}
+
+fn installed_list_cursor_installation_id(
+    cursor: &InstalledListCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let installation_id = cursor.installation_id.trim();
+    if installation_id.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid installed list cursor: installation_id is required",
+        ));
+    }
+    Ok(installation_id.to_string())
+}
+
+fn installed_list_cursor_from_installation(
+    installation: &InstallationResponse,
+) -> Result<InstalledListCursor, (StatusCode, Json<ErrorResponse>)> {
+    if installation.installed_at.trim().is_empty() {
+        return Err(internal_error(format!(
+            "invalid skill_installations cursor: installation_id={}, column=installed_at, value is empty",
+            installation.installation_id
+        )));
+    }
+    if installation.installation_id.trim().is_empty() {
+        return Err(internal_error(
+            "invalid skill_installations cursor: column=installation_id, value is empty",
+        ));
+    }
+    Ok(InstalledListCursor {
+        installed_at: installation.installed_at.clone(),
+        installation_id: installation.installation_id.clone(),
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StatusResponse {
@@ -79,7 +153,7 @@ pub trait MarketplaceService: Send + Sync {
         &self,
         user_id: String,
         limit: i64,
-        offset: i64,
+        cursor: Option<InstalledListCursor>,
     ) -> Result<InstalledListResponse, (StatusCode, Json<ErrorResponse>)>;
 
     async fn save_credential(
@@ -317,11 +391,10 @@ impl MarketplaceService for DatabaseMarketplaceService {
         &self,
         user_id: String,
         limit: i64,
-        offset: i64,
+        cursor: Option<InstalledListCursor>,
     ) -> Result<InstalledListResponse, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let limit = limit.clamp(0, MAX_INSTALLED_LIST_ROWS);
-        let offset = offset.max(0);
+        let limit = validate_installed_list_limit(limit);
 
         let count_row = query("SELECT COUNT(*) AS cnt FROM skill_installations WHERE user_id = ?")
             .bind(&user_id)
@@ -330,17 +403,32 @@ impl MarketplaceService for DatabaseMarketplaceService {
             .map_err(internal_error)?;
         let total: i64 = count_row.try_get("cnt").unwrap_or(0);
 
-        let rows = query(
-            "SELECT installation_id, skill_name, skill_version, status, \
-             DATE_FORMAT(installed_at, '%Y-%m-%dT%H:%i:%s') AS installed_at \
-             FROM skill_installations WHERE user_id = ? ORDER BY installed_at DESC LIMIT ? OFFSET ?"
-        )
-        .bind(&user_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
+        let list_sql = if cursor.is_some() {
+            format!(
+                "SELECT {INSTALLED_LIST_SELECT} FROM skill_installations WHERE user_id = ? \
+                 AND (installed_at < ? OR (installed_at = ? AND installation_id < ?)) \
+                 ORDER BY installed_at DESC, installation_id DESC LIMIT ?"
+            )
+        } else {
+            format!(
+                "SELECT {INSTALLED_LIST_SELECT} FROM skill_installations WHERE user_id = ? \
+                 ORDER BY installed_at DESC, installation_id DESC LIMIT ?"
+            )
+        };
+        let mut list_query = query(&list_sql).bind(&user_id);
+        if let Some(cursor) = &cursor {
+            let installed_at = installed_list_cursor_db_installed_at(cursor)?;
+            let installation_id = installed_list_cursor_installation_id(cursor)?;
+            list_query = list_query
+                .bind(installed_at.clone())
+                .bind(installed_at)
+                .bind(installation_id);
+        }
+        let rows = list_query
+            .bind(installed_list_query_limit(limit))
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let mut installations = Vec::with_capacity(rows.len());
         for row in rows {
@@ -352,12 +440,24 @@ impl MarketplaceService for DatabaseMarketplaceService {
                 installed_at: row.try_get("installed_at").unwrap_or_default(),
             });
         }
+        let has_more = installations.len() > limit as usize;
+        if has_more {
+            installations.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            installations
+                .last()
+                .map(installed_list_cursor_from_installation)
+                .transpose()?
+        } else {
+            None
+        };
 
         Ok(InstalledListResponse {
             installations,
             total,
             limit,
-            offset,
+            next_cursor,
         })
     }
 
@@ -496,7 +596,7 @@ impl MarketplaceService for UnconfiguredMarketplaceService {
         &self,
         _: String,
         _: i64,
-        _: i64,
+        _: Option<InstalledListCursor>,
     ) -> Result<InstalledListResponse, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("marketplace service not configured"))
     }
@@ -555,13 +655,29 @@ pub struct DeleteCredentialQuery {
 #[derive(Deserialize)]
 pub struct ListInstalledQuery {
     #[serde(default = "default_limit")]
-    pub limit: Option<i64>,
-    #[serde(default)]
-    pub offset: Option<i64>,
+    pub limit: i64,
+    pub after_installed_at: Option<String>,
+    pub after_installation_id: Option<String>,
 }
 
-fn default_limit() -> Option<i64> {
-    Some(50)
+fn default_limit() -> i64 {
+    50
+}
+
+impl ListInstalledQuery {
+    pub fn cursor(&self) -> Result<Option<InstalledListCursor>, (StatusCode, Json<ErrorResponse>)> {
+        match (&self.after_installed_at, &self.after_installation_id) {
+            (None, None) => Ok(None),
+            (Some(installed_at), Some(installation_id)) => Ok(Some(InstalledListCursor {
+                installed_at: installed_at.clone(),
+                installation_id: installation_id.clone(),
+            })),
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "installed list cursor requires both after_installed_at and after_installation_id",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -571,19 +687,86 @@ mod tests {
     #[test]
     fn list_installed_query_default_limit() {
         let q: ListInstalledQuery = serde_json::from_str("{}").unwrap();
-        assert_eq!(q.limit, Some(50));
-        assert_eq!(q.offset, None);
+        assert_eq!(q.limit, 50);
+        assert_eq!(q.cursor().unwrap(), None);
     }
 
     #[test]
     fn list_installed_query_explicit_limit_overrides() {
         let q: ListInstalledQuery = serde_json::from_str(r#"{"limit": 10}"#).unwrap();
-        assert_eq!(q.limit, Some(10));
+        assert_eq!(q.limit, 10);
     }
 
     #[test]
-    fn list_installed_query_null_limit_is_none() {
-        let q: ListInstalledQuery = serde_json::from_str(r#"{"limit": null}"#).unwrap();
-        assert_eq!(q.limit, None);
+    fn list_installed_query_rejects_null_limit() {
+        assert!(serde_json::from_str::<ListInstalledQuery>(r#"{"limit": null}"#).is_err());
+    }
+
+    #[test]
+    fn list_installed_query_requires_complete_cursor() {
+        let q: ListInstalledQuery =
+            serde_json::from_str(r#"{"after_installed_at":"2026-04-01T10:00:00.123456"}"#).unwrap();
+        assert_eq!(q.cursor().unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn installed_list_limit_has_hard_cap_and_minimum() {
+        assert_eq!(validate_installed_list_limit(0), 1);
+        assert_eq!(validate_installed_list_limit(10), 10);
+        assert_eq!(
+            validate_installed_list_limit(i64::MAX),
+            MAX_INSTALLED_LIST_ROWS
+        );
+        assert_eq!(installed_list_query_limit(MAX_INSTALLED_LIST_ROWS), 201);
+    }
+
+    #[test]
+    fn installed_list_cursor_rejects_invalid_inputs() {
+        let cursor = InstalledListCursor {
+            installed_at: "2026-04-01T10:00:00.123456".to_string(),
+            installation_id: "inst-1".to_string(),
+        };
+        assert_eq!(
+            installed_list_cursor_db_installed_at(&cursor).unwrap(),
+            "2026-04-01 10:00:00.123456"
+        );
+        assert_eq!(
+            installed_list_cursor_installation_id(&cursor).unwrap(),
+            "inst-1".to_string()
+        );
+
+        let invalid_time = InstalledListCursor {
+            installed_at: "2026-04-01T10:00:00".to_string(),
+            installation_id: "inst-1".to_string(),
+        };
+        assert_eq!(
+            installed_list_cursor_db_installed_at(&invalid_time)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let missing_id = InstalledListCursor {
+            installed_at: "2026-04-01T10:00:00.123456".to_string(),
+            installation_id: "  ".to_string(),
+        };
+        assert_eq!(
+            installed_list_cursor_installation_id(&missing_id)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn installed_list_sql_contract_uses_seek_cursor_not_offset() {
+        let sql = format!(
+            "SELECT {INSTALLED_LIST_SELECT} FROM skill_installations WHERE user_id = ? \
+             AND (installed_at < ? OR (installed_at = ? AND installation_id < ?)) \
+             ORDER BY installed_at DESC, installation_id DESC LIMIT ?"
+        );
+        assert!(!sql.to_ascii_uppercase().contains(" OFFSET "));
+        assert!(sql.contains("installed_at < ?"));
+        assert!(sql.contains("installation_id < ?"));
     }
 }

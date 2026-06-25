@@ -86,11 +86,10 @@ pub async fn list_installed_handler(
     headers: HeaderMap,
 ) -> Result<Json<InstalledListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let limit = query.limit.unwrap_or(50);
-    let offset = query.offset.unwrap_or(0);
+    let cursor = query.cursor()?;
     let result = state
         .marketplace_service
-        .list_installed(user.user_id, limit, offset)
+        .list_installed(user.user_id, query.limit, cursor)
         .await?;
     Ok(Json(result))
 }

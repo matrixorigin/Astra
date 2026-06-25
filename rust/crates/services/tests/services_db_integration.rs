@@ -32,15 +32,15 @@ use astra_services::session_workspace::{
 use astra_services::{
     AdminAuditFilter, AdminAuditReader, ContextService, DatabaseAdminAuditReader,
     DatabaseContextService, DatabaseDecisionService, DatabaseEventService,
-    DatabaseIntrospectionService, DatabaseMarketplaceStatsService, DatabaseReflectService,
-    DatabaseReplayService, DatabaseSessionArtifactStore, DatabaseSessionService,
-    DatabaseSkillService, DecisionCreateRequestData, DecisionListFilter, DecisionService,
-    DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
+    DatabaseIntrospectionService, DatabaseMarketplaceService, DatabaseMarketplaceStatsService,
+    DatabaseReflectService, DatabaseReplayService, DatabaseSessionArtifactStore,
+    DatabaseSessionService, DatabaseSkillService, DecisionCreateRequestData, DecisionListFilter,
+    DecisionService, DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
     IntrospectionService, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
-    MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService,
-    ReplayService, SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
-    SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
-    SnapshotListFilter,
+    MarketplaceService, MarketplaceStatsService, MatrixOneDurableTaskLifecycle,
+    MatrixOneSyncService, ReflectService, ReplayService, SessionArtifactJsonStore,
+    SessionArtifactStore, SessionArtifactStoreError, SessionListFilter, SessionService,
+    SkillSearchQuery, SkillService, SnapshotCreateRequestData, SnapshotListFilter,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -94,7 +94,7 @@ async fn cleanup_session_bundle(
     pool: &sqlx::Pool<sqlx::MySql>,
     session_id: &str,
     session_id_2: &str,
-    _user_id: &str,
+    user_id: &str,
     event_ids: &[String],
     decision_ids: &[String],
     audit_ids: &[String],
@@ -118,6 +118,10 @@ async fn cleanup_session_bundle(
     let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id IN (?, ?)")
         .bind(session_id)
         .bind(session_id_2)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM skill_installations WHERE user_id = ?")
+        .bind(user_id)
         .execute(pool)
         .await;
     for aid in audit_ids {
@@ -309,6 +313,12 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     let snapshot_id = Uuid::new_v4().to_string();
     let snapshot_id_2 = Uuid::new_v4().to_string();
     let snapshot_id_3 = Uuid::new_v4().to_string();
+    let installation_id = Uuid::new_v4().to_string();
+    let installation_id_2 = Uuid::new_v4().to_string();
+    let installation_id_3 = Uuid::new_v4().to_string();
+    let skill_name = format!("skill-{}", Uuid::new_v4());
+    let skill_name_2 = format!("skill-{}", Uuid::new_v4());
+    let skill_name_3 = format!("skill-{}", Uuid::new_v4());
     let decision_id = Uuid::new_v4().to_string();
     let decision_id_2 = Uuid::new_v4().to_string();
     let decision_id_3 = Uuid::new_v4().to_string();
@@ -628,6 +638,61 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         .await
         .expect("list_audit_logs");
     assert_eq!(logs.len(), 3);
+
+    for (installation_id, skill_name, ts) in [
+        (&installation_id, &skill_name, "2026-05-01 10:00:00.000000"),
+        (
+            &installation_id_2,
+            &skill_name_2,
+            "2026-05-01 12:00:00.000000",
+        ),
+        (
+            &installation_id_3,
+            &skill_name_3,
+            "2026-05-01 11:00:00.000000",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO skill_installations \
+             (installation_id, user_id, skill_name, skill_version, status, installed_at, updated_at) \
+             VALUES (?, ?, ?, '1.0.0', 'installed', ?, ?)",
+        )
+        .bind(installation_id)
+        .bind(&user_id)
+        .bind(skill_name)
+        .bind(ts)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert skill installation");
+    }
+
+    let marketplace = DatabaseMarketplaceService::new(settings.clone()).with_pool(shared.clone());
+    let first_installed_page = marketplace
+        .list_installed(user_id.clone(), 2, None)
+        .await
+        .expect("list first installed page");
+    assert_eq!(
+        first_installed_page
+            .installations
+            .iter()
+            .map(|installation| installation.installation_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![installation_id_2.as_str(), installation_id_3.as_str()]
+    );
+    let second_installed_page = marketplace
+        .list_installed(user_id.clone(), 2, first_installed_page.next_cursor.clone())
+        .await
+        .expect("list second installed page");
+    assert_eq!(
+        second_installed_page
+            .installations
+            .iter()
+            .map(|installation| installation.installation_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![installation_id.as_str()]
+    );
+    assert!(second_installed_page.next_cursor.is_none());
 
     let mstats = DatabaseMarketplaceStatsService::new(settings).with_pool(shared);
     let sr = mstats
