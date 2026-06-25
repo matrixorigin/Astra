@@ -3083,20 +3083,23 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("implementation source");
+        let forbidden_reconcile = concat!("reconcile_session", "_event_count");
+        let forbidden_count = concat!("load_agent_event", "_count_for_user");
+        let forbidden_upsert = concat!("upsert_agent_session", "_event_count");
         assert!(
             implementation.contains("add_agent_session_event_count_or_create("),
             "context trace push must update session event_count from the actual insert delta"
         );
         assert!(
-            !implementation.contains("reconcile_session_event_count"),
+            !implementation.contains(forbidden_reconcile),
             "context trace push must not reconcile event_count with a follow-up COUNT(*)"
         );
         assert!(
-            !implementation.contains("load_agent_event_count_for_user"),
+            !implementation.contains(forbidden_count),
             "context trace push must not COUNT agent_events on the write path"
         );
         assert!(
-            !implementation.contains("upsert_agent_session_event_count"),
+            !implementation.contains(forbidden_upsert),
             "context trace push must not overwrite event_count from a recomputed total"
         );
     }

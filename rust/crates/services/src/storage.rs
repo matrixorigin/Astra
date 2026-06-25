@@ -101,25 +101,6 @@ pub fn normalized_parent_event_ids(
     out
 }
 
-pub async fn load_agent_event_count_for_user<'e, E>(
-    executor: E,
-    session_id: &str,
-    user_id: &str,
-) -> Result<i64, sqlx::Error>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    let row = query(
-        "SELECT COUNT(*) AS event_count FROM agent_events \
-         WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_one(executor)
-    .await?;
-    row.try_get::<i64, _>("event_count")
-}
-
 pub async fn agent_session_exists_for_user<'e, E>(
     executor: E,
     session_id: &str,
@@ -156,35 +137,6 @@ where
     .fetch_optional(executor)
     .await?;
     Ok(row.is_some())
-}
-
-pub async fn upsert_agent_session_event_count<'e, E>(
-    executor: E,
-    session_id: &str,
-    user_id: &str,
-    event_count: i64,
-) -> Result<(), sqlx::Error>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    // MatrixOne rejects updating key columns in ON DUPLICATE KEY UPDATE.
-    // Owner mismatch still fails atomically by assigning NULL to NOT NULL
-    // event_count, rolling back the caller's transaction before side effects persist.
-    query(
-        "INSERT INTO agent_sessions \
-         (session_id, user_id, status, event_count, created_at, updated_at, last_active_at) \
-         VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6)) \
-         ON DUPLICATE KEY UPDATE \
-         event_count = CASE WHEN user_id = VALUES(user_id) THEN VALUES(event_count) ELSE NULL END, \
-         updated_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE updated_at END, \
-         last_active_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE last_active_at END",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .bind(event_count)
-    .execute(executor)
-    .await?;
-    Ok(())
 }
 
 pub async fn bump_agent_session_event_count<'e, E>(
