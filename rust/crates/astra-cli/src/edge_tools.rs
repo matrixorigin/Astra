@@ -3530,6 +3530,16 @@ impl ToolExecutor {
 
         let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
 
+        if !request.format.is_json() && request.source_policy.allows_edge_local_artifacts() {
+            match request.facet {
+                astra_core::ObservationFacet::Cache => return self.handle_introspect_cache(),
+                astra_core::ObservationFacet::SessionMemory => {
+                    return self.render_session_memory_introspect();
+                }
+                _ => {}
+            }
+        }
+
         let snapshot = self
             .introspect_snapshot
             .read()

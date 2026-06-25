@@ -18,6 +18,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 temp-env = "0.3"
+tempfile = "3"
 
 [features]
 dev-defaults = []

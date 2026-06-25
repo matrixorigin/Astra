@@ -1396,7 +1396,7 @@ fn build_reflect_graph_slice(
             &mut node_refs,
             ObservationGraphNode {
                 ref_id: signal.signal_id.clone(),
-                layer: ObservationGraphLayer::Observation,
+                layer: ObservationGraphLayer::Adaptation,
                 kind: ObservationGraphNodeKind::AdaptationSignal,
                 label: signal.consumer.payload_kind.clone(),
                 summary: Some(format!(
@@ -2157,6 +2157,7 @@ mod tests {
         }));
         assert!(graph_slice.nodes.iter().any(|node| {
             node.ref_id == envelope.adaptation_signals[0].signal_id
+                && node.layer == ObservationGraphLayer::Adaptation
                 && node.kind == ObservationGraphNodeKind::AdaptationSignal
         }));
         assert!(

@@ -714,7 +714,7 @@ pub(crate) fn record_loop_completion_feedback(
     state: &mut AgenticLoopState,
     result: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
 ) {
-    use astra_learning::feedback::{FeedbackSignal, SignalType};
+    use astra_core::feedback::{FeedbackSignal, SignalType};
 
     let hub = match &state.telemetry.observability_hub {
         Some(h) => h,

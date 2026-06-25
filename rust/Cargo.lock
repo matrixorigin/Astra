@@ -260,6 +260,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "temp-env",
+ "tempfile",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
@@ -307,15 +308,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
-]
-
-[[package]]
-name = "astra-learning"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -422,7 +414,6 @@ dependencies = [
  "astra-config",
  "astra-core",
  "astra-harness",
- "astra-learning",
  "astra-logging",
  "astra-mcp",
  "astra-messaging",

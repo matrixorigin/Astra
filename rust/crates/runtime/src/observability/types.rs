@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
-use astra_learning::feedback::FeedbackSignal;
+use astra_core::feedback::FeedbackSignal;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use astra_turn_core::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
 

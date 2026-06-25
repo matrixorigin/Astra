@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::injection_tracking::{ChannelFreshness, ChannelStatus, InjectionChannel};
 use astra_core::ObservationFacet;
-pub use observation::{build_introspect_report, IntrospectReport};
+pub use observation::{IntrospectReport, build_introspect_report};
 pub use request::{
     IntrospectDepth, IntrospectFormat, IntrospectRequest, ObservationHorizon, ObservationTopic,
     SourcePolicy,
@@ -213,7 +213,26 @@ pub fn render_introspect_request(
         ObservationFacet::Noise => render_injection_freshness(snapshot),
         ObservationFacet::Errors => render_errors(snapshot),
         ObservationFacet::Overview => render_all(snapshot),
+        ObservationFacet::Cache | ObservationFacet::SessionMemory => {
+            render_edge_local_unavailable(request)
+        }
     }
+}
+
+fn render_edge_local_unavailable(request: &IntrospectRequest) -> String {
+    let reason = if request.source_policy.allows_edge_local_artifacts() {
+        "no CLI/Edge-local artifact provider is attached"
+    } else {
+        "requested source_policy does not allow CLI/Edge-local artifacts"
+    };
+    format!(
+        "## Introspect Unavailable\n\
+         facet={} source_policy={}\n\
+         CLI/Edge-local session artifacts are not visible from this runtime: {}.",
+        request.facet.as_str(),
+        request.source_policy.as_str(),
+        reason,
+    )
 }
 
 /// Render the introspect output at the requested text depth.
@@ -779,21 +798,25 @@ mod tests {
         assert_eq!(report.view.topic, "execution");
         assert_eq!(report.view.facet, "errors");
         assert!(report.summary.contains("recent tool errors"));
-        assert!(report
-            .observations
-            .iter()
-            .any(|observation| observation.ref_id
-                == "urn:astra:observation:local:introspect:execution:error:0"
-                && observation.kind == "tool_error:tool_timeout"));
+        assert!(
+            report
+                .observations
+                .iter()
+                .any(|observation| observation.ref_id
+                    == "urn:astra:observation:local:introspect:execution:error:0"
+                    && observation.kind == "tool_error:tool_timeout")
+        );
         assert!(report.evidence.iter().any(
             |evidence| evidence.ref_id == "urn:astra:context:local:introspect:runtime_snapshot"
         ));
         assert_eq!(report.view.data_coverage.overall, "fresh");
-        assert!(report
-            .view
-            .data_coverage
-            .providers
-            .contains_key("live_runtime"));
+        assert!(
+            report
+                .view
+                .data_coverage
+                .providers
+                .contains_key("live_runtime")
+        );
         assert!(!report.budget_result.truncated);
         assert_report_refs_are_valid(&report);
     }
@@ -801,24 +824,26 @@ mod tests {
     #[test]
     fn render_json_edge_only_facet_reports_unavailable_without_unrelated_runtime_noise() {
         let req = IntrospectRequest::from_args(&serde_json::json!({
-            "facet": "memory",
+            "facet": "session_memory",
             "format": "json"
         }));
         let out = render_introspect_request(&sample_snapshot(), &req);
         let report: IntrospectReport = serde_json::from_str(&out).expect("json report");
 
-        assert_eq!(report.view.facet, "memory");
+        assert_eq!(report.view.facet, "session_memory");
         assert_eq!(
             report.view.data_coverage.source,
             "edge_local_artifacts_unavailable"
         );
         assert_eq!(report.view.data_coverage.events, 0);
-        assert!(report
-            .view
-            .data_coverage
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("Edge-local")));
+        assert!(
+            report
+                .view
+                .data_coverage
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Edge-local"))
+        );
         assert_eq!(report.observations.len(), 1);
         assert_eq!(
             report.observations[0].kind, "data_surface_unavailable",
@@ -912,12 +937,14 @@ mod tests {
             report.view.data_coverage.providers["visible_context"].status,
             "missing"
         );
-        assert!(report
-            .view
-            .data_coverage
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("include_context requested")));
+        assert!(
+            report
+                .view
+                .data_coverage
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("include_context requested"))
+        );
         assert_report_refs_are_valid(&report);
     }
 
@@ -957,11 +984,11 @@ mod tests {
     #[test]
     fn unavailable_message_explains_missing_edge_provider() {
         let req = IntrospectRequest::from_args(&serde_json::json!({
-            "facet": "memory"
+            "facet": "session_memory"
         }));
         let out = render_introspect_request(&IntrospectSnapshot::default(), &req);
         assert!(out.contains("Introspect Unavailable"), "{out}");
-        assert!(out.contains("facet=memory"), "{out}");
+        assert!(out.contains("facet=session_memory"), "{out}");
         assert!(out.contains("CLI/Edge-local session artifacts"), "{out}");
         assert!(
             out.contains("no CLI/Edge-local artifact provider is attached"),
@@ -972,7 +999,7 @@ mod tests {
     #[test]
     fn unavailable_message_explains_source_policy_exclusion() {
         let req = IntrospectRequest::from_args(&serde_json::json!({
-            "facet": "memory",
+            "facet": "session_memory",
             "source_policy": "cloud_only"
         }));
         let out = render_introspect_request(&IntrospectSnapshot::default(), &req);

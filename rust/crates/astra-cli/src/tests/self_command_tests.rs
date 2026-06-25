@@ -16,7 +16,9 @@ fn cli_self_reflect_subcommand() {
         "astra",
         "self",
         "reflect",
-        "--focus",
+        "--topic",
+        "runtime",
+        "--facet",
         "performance",
         "--question",
         "why was bash slow?",
@@ -26,7 +28,8 @@ fn cli_self_reflect_subcommand() {
     .unwrap();
     match cli.command {
         Some(Command::SelfInspect(SelfCmd::Reflect(args))) => {
-            assert_eq!(args.focus, "performance");
+            assert_eq!(args.topic, "runtime");
+            assert_eq!(args.facet.as_deref(), Some("performance"));
             assert_eq!(args.question.as_deref(), Some("why was bash slow?"));
             assert_eq!(args.last_n, 12);
         }

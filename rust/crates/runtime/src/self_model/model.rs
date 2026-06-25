@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::Scenario;
-use astra_learning::feedback::{FeedbackSignal, SignalType};
+use astra_core::feedback::{FeedbackSignal, SignalType};
 use astra_services::LessonHint;
 use astra_text_utils::str_preview::truncate_str;
 use astra_turn_core::context_assembly_trace::TokenBudgetTrace;

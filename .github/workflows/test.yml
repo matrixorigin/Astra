@@ -155,7 +155,7 @@ jobs:
           -p astra-tools -p astra-pipeline -p astra-turn-types
           -p astra-skills -p astra-sandbox -p astra-server-types
           -p astra-messaging -p astra-text-utils
-          -p astra-config -p astra-learning
+          -p astra-config
           --profile ci
       - name: Test bridge-e2e-hooks (selective)
         run: >-

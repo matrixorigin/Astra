@@ -1,7 +1,7 @@
 use super::{
     Diagnosis, EvidenceGraph, Insight, ObservationActionHint, ObservationAdaptationSignal,
     ObservationCausalChain, ObservationConfidence, ObservationEvidence, ObservationFailureCluster,
-    ObservationRecord, ReflectRequest, ObservationSignalConsumer, SessionOverview,
+    ObservationRecord, ObservationSignalConsumer, ReflectRequest, SessionOverview,
 };
 
 pub(super) struct ObservationEnvelope {
@@ -43,7 +43,9 @@ pub(super) fn build_observation_envelope(
                 evidence_class: "observed_evidence".to_string(),
                 source: "agent_events.error_sample".to_string(),
                 summary: truncate_chars(sample, 180),
-                confidence: ObservationConfidence::evidence(diagnosis_evidence_confidence(diagnosis)),
+                confidence: ObservationConfidence::evidence(diagnosis_evidence_confidence(
+                    diagnosis,
+                )),
             });
         }
 

@@ -336,6 +336,23 @@ mod tests {
     }
 
     #[test]
+    fn from_args_maps_knowledge_topic_to_session_memory_surface() {
+        let req = IntrospectRequest::from_args(&serde_json::json!({
+            "topic": "knowledge"
+        }));
+        assert_eq!(req.topic, ObservationTopic::Knowledge);
+        assert_eq!(req.facet, ObservationFacet::SessionMemory);
+    }
+
+    #[test]
+    fn from_args_parses_advertised_cache_facet() {
+        let req = IntrospectRequest::from_args(&serde_json::json!({
+            "facet": "cache"
+        }));
+        assert_eq!(req.facet, ObservationFacet::Cache);
+    }
+
+    #[test]
     fn from_args_parses_json_format() {
         let req = IntrospectRequest::from_args(&serde_json::json!({
             "format": "json"

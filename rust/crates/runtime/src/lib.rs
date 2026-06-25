@@ -361,8 +361,6 @@ pub use turn::{
 
 pub use astra_config::runtime_config;
 pub use astra_config::user_profile;
-pub use astra_learning::delegation;
-pub use astra_learning::feedback;
 pub use astra_text_utils::semantic_dedup;
 pub use astra_text_utils::text_tokenize;
 pub use astra_turn_core::cloud_session_facts::update_from_journal_event;

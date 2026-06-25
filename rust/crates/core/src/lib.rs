@@ -373,14 +373,14 @@ mod connection_quota_tests {
 pub mod composite_snapshot;
 pub mod confidence;
 pub mod config;
+pub mod delegation;
 pub mod drift;
 pub mod durable_task_store;
 pub mod error_kind;
+pub mod feedback;
 pub mod log;
 pub mod model_override;
 pub mod net;
-pub mod delegation;
-pub mod feedback;
 pub mod observation;
 pub mod runtime_limits;
 pub mod tool_schema;

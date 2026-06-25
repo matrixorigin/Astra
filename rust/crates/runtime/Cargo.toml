@@ -42,7 +42,6 @@ unicode-normalization.workspace = true
 astra-logging.workspace = true
 astra-config.workspace = true
 astra-core.workspace = true
-astra-learning.workspace = true
 astra-messaging.workspace = true
 astra-text-utils.workspace = true
 astra-pipeline.workspace = true

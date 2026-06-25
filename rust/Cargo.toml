@@ -20,7 +20,6 @@ members = [
     "crates/astra-messaging",
     "crates/astra-text-utils",
     "crates/astra-config",
-    "crates/astra-learning",
     "crates/astra-runtime-env",
     "crates/astra-test-harness",
     "crates/astra-harness",
@@ -39,7 +38,6 @@ astra-credentials = { path = "crates/astra-credentials" }
 astra-harness = { path = "crates/astra-harness" }
 astra-logging = { path = "crates/astra-logging" }
 astra-config = { path = "crates/astra-config" }
-astra-learning = { path = "crates/astra-learning" }
 astra-messaging = { path = "crates/astra-messaging" }
 astra-text-utils = { path = "crates/astra-text-utils" }
 astra-pipeline = { path = "crates/astra-pipeline" }

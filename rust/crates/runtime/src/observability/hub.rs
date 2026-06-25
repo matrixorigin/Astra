@@ -10,8 +10,8 @@ use astra_services::session_workspace::{
 use serde::{Deserialize, Serialize};
 
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
-use astra_learning::delegation::DelegationOutcomeTracker;
-use astra_learning::feedback::{FeedbackSignal, FeedbackSignalStore, SignalType};
+use astra_core::delegation::DelegationOutcomeTracker;
+use astra_core::feedback::{FeedbackSignal, FeedbackSignalStore, SignalType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 

@@ -9,7 +9,7 @@
 
 pub mod persistence;
 
-use crate::action_compensation::{classify_execution_outcome, FailureCategory};
+use crate::action_compensation::{FailureCategory, classify_execution_outcome};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 

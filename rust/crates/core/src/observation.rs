@@ -32,6 +32,10 @@ pub enum ObservationFacet {
     Trace,
     /// Overview: aggregated session summary.
     Overview,
+    /// CLI/Edge-local prompt-cache captures and cache diagnosis.
+    Cache,
+    /// CLI/Edge-local session-memory extraction and injection artifacts.
+    SessionMemory,
 }
 
 /// Error type for facet parsing failures.
@@ -63,6 +67,8 @@ impl ObservationFacet {
             "errors" => Ok(Self::Errors),
             "trace" | "history" => Ok(Self::Trace),
             "overview" | "all" => Ok(Self::Overview),
+            "cache" => Ok(Self::Cache),
+            "session_memory" => Ok(Self::SessionMemory),
             unknown => Err(ObservationFacetError::UnknownFacet(unknown.to_string())),
         }
     }
@@ -78,6 +84,8 @@ impl ObservationFacet {
             Self::Errors => "errors",
             Self::Trace => "trace",
             Self::Overview => "overview",
+            Self::Cache => "cache",
+            Self::SessionMemory => "session_memory",
         }
     }
 }
@@ -472,6 +480,20 @@ fn clamp_confidence(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_facet_parses_advertised_edge_local_facets() {
+        assert_eq!(
+            ObservationFacet::from_str("cache").unwrap(),
+            ObservationFacet::Cache
+        );
+        assert_eq!(
+            ObservationFacet::from_str("session-memory").unwrap(),
+            ObservationFacet::SessionMemory
+        );
+        assert_eq!(ObservationFacet::Cache.as_str(), "cache");
+        assert_eq!(ObservationFacet::SessionMemory.as_str(), "session_memory");
+    }
 
     #[test]
     fn observation_record_wire_shape_roundtrips() {

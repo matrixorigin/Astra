@@ -48,6 +48,13 @@ pub fn build_introspect_report(
     snapshot: &IntrospectSnapshot,
     request: &IntrospectRequest,
 ) -> IntrospectReport {
+    if matches!(
+        request.facet,
+        ObservationFacet::Cache | ObservationFacet::SessionMemory
+    ) {
+        return build_edge_local_unavailable_report(request);
+    }
+
     let mut warnings = Vec::new();
     if request.include_context {
         warnings.push(
@@ -107,6 +114,96 @@ pub fn build_introspect_report(
         adaptation_signals: Vec::new(),
         graph_slice: ObservationGraphSlice::default(),
         budget_result,
+    }
+}
+
+fn build_edge_local_unavailable_report(request: &IntrospectRequest) -> IntrospectReport {
+    let facet = request.facet.as_str();
+    let (reason, warning) = if request.source_policy.allows_edge_local_artifacts() {
+        (
+            "no CLI/Edge-local artifact provider is attached",
+            format!(
+                "CLI/Edge-local session artifacts for facet={facet} are unavailable in this runtime"
+            ),
+        )
+    } else {
+        (
+            "source_policy_excludes_edge_local_artifacts",
+            format!(
+                "requested source_policy={} does not allow CLI/Edge-local artifacts for facet={facet}",
+                request.source_policy.as_str()
+            ),
+        )
+    };
+    let provider_name = match request.facet {
+        ObservationFacet::Cache => "local_cache_captures",
+        ObservationFacet::SessionMemory => "local_journal",
+        _ => "edge_local_artifacts",
+    };
+
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        provider_name.to_string(),
+        ObservationProviderCoverage {
+            status: "missing".to_string(),
+            freshness_ms: None,
+            reason: Some(reason.to_string()),
+        },
+    );
+    let data_coverage = ObservationDataCoverage {
+        overall: "unavailable".to_string(),
+        source: "edge_local_artifacts_unavailable".to_string(),
+        events: 0,
+        decisions: 0,
+        providers,
+        warnings: vec![warning],
+    };
+    let view = ObservationView {
+        topic: request.topic.as_str().to_string(),
+        facet: facet.to_string(),
+        depth: request.depth.as_str().to_string(),
+        horizon: request.horizon.as_str().to_string(),
+        data_coverage: data_coverage.clone(),
+    };
+    let summary = format!(
+        "Introspect unavailable for facet={facet}: {}",
+        if request.source_policy.allows_edge_local_artifacts() {
+            "no CLI/Edge-local artifact provider is attached"
+        } else {
+            "requested source_policy does not allow CLI/Edge-local artifacts"
+        }
+    );
+    let observations = vec![ObservationRecord {
+        ref_id: format!("urn:astra:observation:local:introspect:data_surface:{facet}"),
+        topic: request.topic.as_str().to_string(),
+        facet: facet.to_string(),
+        kind: "data_surface_unavailable".to_string(),
+        severity: "info".to_string(),
+        summary: summary.clone(),
+        confidence: ObservationConfidence::classification_evidence(1.0, 1.0),
+        evidence_refs: Vec::new(),
+    }];
+
+    IntrospectReport {
+        schema_version: 1,
+        tool: "introspect".to_string(),
+        topic: request.topic.as_str().to_string(),
+        facet: facet.to_string(),
+        depth: request.depth.as_str().to_string(),
+        horizon: request.horizon.as_str().to_string(),
+        source_policy: request.source_policy.as_str().to_string(),
+        include_context: request.include_context,
+        data_coverage,
+        summary,
+        view,
+        observations,
+        evidence: Vec::new(),
+        action_hints: Vec::new(),
+        failure_clusters: Vec::new(),
+        causal_chains: Vec::new(),
+        adaptation_signals: Vec::new(),
+        graph_slice: ObservationGraphSlice::default(),
+        budget_result: ObservationBudgetResult::default(),
     }
 }
 
