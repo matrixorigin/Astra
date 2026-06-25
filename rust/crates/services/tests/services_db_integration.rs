@@ -611,7 +611,7 @@ async fn concurrent_agent_session_event_count_upsert_preserves_single_owner() {
     assert_eq!(
         successes.len(),
         1,
-        "exactly one owner may create or reconcile a session_id; outcomes: {outcomes:?}"
+        "exactly one owner may create or update a session_id; outcomes: {outcomes:?}"
     );
     assert!(
         outcomes.iter().any(|result| result.is_err()),
@@ -2209,11 +2209,11 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
             .expect("session B event_count");
     assert_eq!(
         session_a_event_count, 3,
-        "context-trace push should reconcile event_count to the real cloud event total"
+        "context-trace push should add its inserted event delta to session A"
     );
     assert_eq!(
         session_b_event_count, 2,
-        "context-trace push should reconcile event_count for sessions without checkpoints too"
+        "context-trace push should add its inserted event delta to session B"
     );
 
     let restore = HybridRestoreService::new(pool.clone());
@@ -2995,7 +2995,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
             .try_get::<i64, _>("event_count")
             .expect("session event_count"),
         1,
-        "context trace reconcile should create the missing session row with the correct event count"
+        "context trace delta update should create the missing session row with the correct event count"
     );
 
     let restore = HybridRestoreService::new(pool.clone());
@@ -3468,7 +3468,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
             .expect("decode owner event_count");
     assert_eq!(
         stored_count, 1,
-        "event_count must reconcile only rows owned by the session owner"
+        "event_count delta must apply only to rows owned by the session owner"
     );
 
     let owner_events = event_service
@@ -4701,7 +4701,7 @@ async fn session_delete_removes_owner_scoped_transcript_pages_and_todo_counter_o
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn event_write_paths_reconcile_event_count_on_live_matrixone() {
+async fn event_write_paths_update_event_count_by_insert_delta_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -4766,7 +4766,7 @@ async fn event_write_paths_reconcile_event_count_on_live_matrixone() {
         .expect("decode service event_count");
     assert_eq!(
         service_count, 2,
-        "DatabaseEventService::create_event should reconcile event_count from actual persisted rows"
+        "DatabaseEventService::create_event should add one event_count delta per persisted row"
     );
 
     let config = IngestionConfig {
@@ -4838,7 +4838,7 @@ async fn event_write_paths_reconcile_event_count_on_live_matrixone() {
     };
     assert!(
         last_error.is_none(),
-        "live ingestion should not record MatrixOne errors after reconcile fix: {:?}",
+        "live ingestion should not record MatrixOne errors after event_count delta update: {:?}",
         last_error
     );
 
@@ -4852,7 +4852,7 @@ async fn event_write_paths_reconcile_event_count_on_live_matrixone() {
             .expect("decode ingestion event_count");
     assert_eq!(
         ingestion_count, 2,
-        "ingestion reconcile should count only persisted unique rows after INSERT IGNORE duplicates"
+        "ingestion delta should count only persisted unique rows after INSERT IGNORE duplicates"
     );
     let actual_events = sqlx::query("SELECT COUNT(*) AS c FROM agent_events WHERE session_id = ?")
         .bind(&ingestion_session)
