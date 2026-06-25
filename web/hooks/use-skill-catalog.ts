@@ -3,6 +3,7 @@
 import { useCallback, useState } from 'react';
 import { listSkills } from '@/lib/api/skills';
 import type { SkillSummary } from '@/lib/api/types';
+import type { RuntimeSkillListCursor } from '@astra/sdk';
 
 type UseSkillCatalogOptions = {
   pageSize?: number;
@@ -22,21 +23,21 @@ export function useSkillCatalog({
   maxItems = 5_000,
 }: UseSkillCatalogOptions = {}) {
   const [items, setItems] = useState<SkillSummary[]>([]);
-  const [nextOffset, setNextOffset] = useState<number | null>(0);
+  const [nextCursor, setNextCursor] = useState<RuntimeSkillListCursor | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadedInitial, setLoadedInitial] = useState(false);
   const [loadedAll, setLoadedAll] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const loadPage = useCallback(async (offset: number, replace = false) => {
+  const loadPage = useCallback(async (cursor: RuntimeSkillListCursor | null, replace = false) => {
     setLoading(true);
     setError(null);
     try {
-      const response = await listSkills({ limit: pageSize, offset });
+      const response = await listSkills({ limit: pageSize, cursor });
       setItems((current) => replace ? mergeByName([], response.items) : mergeByName(current, response.items));
-      setNextOffset(response.nextOffset);
+      setNextCursor(response.nextCursor);
       setLoadedInitial(true);
-      if (response.nextOffset === null) {
+      if (response.nextCursor === null) {
         setLoadedAll(true);
       }
     } catch (err) {
@@ -50,15 +51,15 @@ export function useSkillCatalog({
     if (loadedInitial || loading) {
       return;
     }
-    await loadPage(0, true);
+    await loadPage(null, true);
   }, [loadPage, loadedInitial, loading]);
 
   const loadNextPage = useCallback(async () => {
-    if (nextOffset === null || loading) {
+    if (nextCursor === null || loading) {
       return;
     }
-    await loadPage(nextOffset);
-  }, [loadPage, loading, nextOffset]);
+    await loadPage(nextCursor);
+  }, [loadPage, loading, nextCursor]);
 
   const loadAll = useCallback(async () => {
     if (loadedAll || loading) {
@@ -69,34 +70,36 @@ export function useSkillCatalog({
     setError(null);
     try {
       const byName = new Map(items.map((skill) => [skill.name, skill]));
-      let offset = loadedInitial ? nextOffset : 0;
+      let cursor = loadedInitial ? nextCursor : null;
+      let loadedCount = byName.size;
 
-      while (offset !== null && offset < maxItems) {
-        const response = await listSkills({ limit: pageSize, offset });
+      while (loadedCount < maxItems) {
+        const response = await listSkills({ limit: pageSize, cursor });
         for (const skill of response.items) {
           byName.set(skill.name, skill);
         }
-        if (response.nextOffset === null || response.items.length === 0) {
-          offset = null;
+        loadedCount = byName.size;
+        if (response.nextCursor === null || response.items.length === 0) {
+          cursor = null;
           break;
         }
-        offset = response.nextOffset;
+        cursor = response.nextCursor;
       }
 
       setItems([...byName.values()].sort((left, right) => left.name.localeCompare(right.name)));
-      setNextOffset(offset);
+      setNextCursor(cursor);
       setLoadedInitial(true);
-      setLoadedAll(offset === null || offset >= maxItems);
+      setLoadedAll(cursor === null || loadedCount >= maxItems);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load skills.');
     } finally {
       setLoading(false);
     }
-  }, [items, loadedAll, loadedInitial, loading, maxItems, nextOffset, pageSize]);
+  }, [items, loadedAll, loadedInitial, loading, maxItems, nextCursor, pageSize]);
 
   return {
     items,
-    nextOffset,
+    nextCursor,
     loading,
     error,
     loadedInitial,

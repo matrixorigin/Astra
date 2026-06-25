@@ -1,6 +1,6 @@
 import { requestJson, toQuery } from '@/lib/api/request';
 import type { SkillListResponse, SkillSummary } from '@/lib/api/types';
-import type { RuntimeSkillListItem, RuntimeSkillListResponse } from '@astra/sdk';
+import type { RuntimeSkillListCursor, RuntimeSkillListItem, RuntimeSkillListResponse } from '@astra/sdk';
 
 function toSkillSummary(skill: RuntimeSkillListItem): SkillSummary | null {
   const name = skill.skill_name?.trim();
@@ -19,11 +19,17 @@ function toSkillSummary(skill: RuntimeSkillListItem): SkillSummary | null {
   };
 }
 
-export async function listSkills(params: { limit?: number; offset?: number } = {}) {
+export async function listSkills(params: { limit?: number; cursor?: RuntimeSkillListCursor | null } = {}) {
   const payload = await requestJson<RuntimeSkillListResponse>(
     `/api/skills${toQuery({
       limit: params.limit ?? 100,
-      offset: params.offset ?? 0,
+      ...(params.cursor
+        ? {
+            after_skill_name: params.cursor.skill_name,
+            after_version: params.cursor.version,
+            after_skill_id: params.cursor.skill_id,
+          }
+        : {}),
     })}`,
   );
   const items = (payload.skills ?? [])
@@ -31,14 +37,11 @@ export async function listSkills(params: { limit?: number; offset?: number } = {
     .filter((item): item is SkillSummary => item !== null);
   const total = payload.total ?? items.length;
   const limit = payload.limit ?? params.limit ?? items.length;
-  const offset = payload.offset ?? params.offset ?? 0;
-  const nextOffset = offset + limit < total ? offset + limit : null;
 
   return {
     items,
     total,
     limit,
-    offset,
-    nextOffset,
+    nextCursor: payload.next_cursor ?? null,
   } satisfies SkillListResponse;
 }

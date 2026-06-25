@@ -317,7 +317,7 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
+      next_cursor: null,
     });
     const listRuns = vi.fn().mockResolvedValue({
       runs: [
@@ -381,7 +381,7 @@ describe('queueDeferredRunInput', () => {
       },
     });
 
-    expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200, offset: 0 });
+    expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200 });
     expect(listRuns).toHaveBeenCalledWith({ limit: 200, offset: 0 });
     expect(submitRunInput).toHaveBeenCalledWith('run-recovered', {
       idempotencyKey: expect.any(String),
@@ -417,7 +417,7 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
+      next_cursor: null,
     });
     const listRuns = vi.fn().mockResolvedValue({
       runs: [
@@ -449,7 +449,7 @@ describe('queueDeferredRunInput', () => {
 
     const result = await getChatHydrated('user-a', 'chat-open');
 
-    expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200, offset: 0 });
+    expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200 });
     expect(listRuns).toHaveBeenCalledWith({ limit: 200, offset: 0 });
     expect(getSessionTranscript).toHaveBeenCalledWith('chat-open', {
       limit: 200,
@@ -478,7 +478,7 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
+      next_cursor: null,
     });
     const listRuns = vi.fn().mockResolvedValue({
       runs: [
@@ -790,7 +790,7 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
+      next_cursor: null,
     });
     const listRuns = vi.fn().mockResolvedValue({
       runs: [
@@ -872,7 +872,7 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
+      next_cursor: null,
     });
     const listRuns = vi.fn().mockResolvedValue({
       runs: [
@@ -946,7 +946,7 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
+      next_cursor: null,
     });
     const listRuns = vi.fn().mockResolvedValue({
       runs: [

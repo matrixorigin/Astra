@@ -1,3 +1,5 @@
+import type { RuntimeSkillListCursor } from '@astra/sdk';
+
 export type PlanTier = 'free' | 'pro' | 'team';
 export type Visibility = 'private' | 'team' | 'public';
 export type MessageRole = 'user' | 'assistant' | 'system';
@@ -298,8 +300,7 @@ export type SkillListResponse = {
   items: SkillSummary[];
   total: number;
   limit: number;
-  offset: number;
-  nextOffset: number | null;
+  nextCursor: RuntimeSkillListCursor | null;
 };
 
 export type HarnessTemplate = {

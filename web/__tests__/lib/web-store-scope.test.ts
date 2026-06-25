@@ -43,7 +43,7 @@ function runtimeSessionList(sessions: unknown[]) {
     sessions,
     total: sessions.length,
     limit: 200,
-    offset: 0,
+    next_cursor: null,
   };
 }
 

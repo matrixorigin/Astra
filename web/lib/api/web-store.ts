@@ -5,6 +5,7 @@ import {
   parseSseDataEvents,
   type RunListResponse,
   type RunStatus,
+  type RuntimeSessionListCursor,
   type RuntimeSessionListResponse,
   type RuntimeSessionResponse,
   type RuntimeTranscriptItemResponse,
@@ -1899,14 +1900,15 @@ async function listAllBackendSessions(
   ownerUserId: string,
 ): Promise<RuntimeSessionResponse[]> {
   const sessions: RuntimeSessionResponse[] = [];
-  let offset = 0;
+  let cursor: RuntimeSessionListCursor | null = null;
+  const seenCursors = new Set<string>();
 
   for (;;) {
     let parsed: RuntimeSessionListResponse;
     try {
       parsed = await client.sdk.listRuntimeSessions({
         limit: SESSION_SYNC_PAGE_SIZE,
-        offset,
+        ...(cursor ? { cursor } : {}),
       });
     } catch (error) {
       throw runtimeOperationError(
@@ -1918,24 +1920,20 @@ async function listAllBackendSessions(
     const page = Array.isArray(parsed.sessions) ? parsed.sessions : [];
     sessions.push(...page);
 
-    const responseLimit =
-      typeof parsed.limit === "number" && parsed.limit > 0
-        ? parsed.limit
-        : SESSION_SYNC_PAGE_SIZE;
-    const total =
-      typeof parsed.total === "number" && Number.isFinite(parsed.total)
-        ? parsed.total
-        : null;
+    const nextCursor = parsed.next_cursor ?? null;
 
-    if (
-      page.length === 0 ||
-      page.length < responseLimit ||
-      (total !== null && offset + page.length >= total)
-    ) {
+    if (page.length === 0 || nextCursor === null) {
       break;
     }
 
-    offset += page.length;
+    const cursorKey = `${nextCursor.updated_at}\u0000${nextCursor.session_id}`;
+    if (seenCursors.has(cursorKey)) {
+      throw new Error(
+        `Cannot sync persisted sessions for user ${ownerUserId}: repeated session list cursor`,
+      );
+    }
+    seenCursors.add(cursorKey);
+    cursor = nextCursor;
   }
 
   return sessions;

@@ -23,7 +23,7 @@ async function mockChatApis(page: Page, options: {
     });
   });
   await page.route('**/api/skills**', async (route) => {
-    await route.fulfill({ json: { items: [], nextOffset: null } });
+    await route.fulfill({ json: { skills: [], next_cursor: null } });
   });
   await page.route('**/api/edges/status', async (route) => {
     await route.fulfill({ json: { edges: [] } });

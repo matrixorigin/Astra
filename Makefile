@@ -45,7 +45,7 @@ help:
 	@echo "  make test-saas-coverage - SaaS E2E + llvm line coverage report (needs: cargo install cargo-llvm-cov)"
 	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
-	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
+	@echo "  (also: test-sdk-offline, test-web-offline, test-sdk-online — @astra/sdk + web offline; remote E2E opt-in on test-online)"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type)"
@@ -620,7 +620,7 @@ sweep:
 # Testing
 # ============================================================================
 
-.PHONY: test test-offline test-online test-saas test-saas-coverage test-sdk-offline test-sdk-online
+.PHONY: test test-offline test-online test-saas test-saas-coverage test-sdk-offline test-web-offline test-sdk-online
 test: test-offline test-online
 
 .PHONY: test-dashboard
@@ -629,7 +629,7 @@ test-dashboard: ## Build astra-test and launch live dashboard
 	./rust/target/release/astra-test --live-dashboard
 
 .PHONY: test-offline
-test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline
+test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline test-web-offline
 
 .PHONY: test-workspace
 test-workspace: sweep
@@ -875,6 +875,12 @@ test-sdk-offline:
 	@cd packages/sdk && ASTRA_SDK_E2E=1 npm run test:coverage
 	@cd packages/sdk && npm run build
 
+.PHONY: test-web-offline
+test-web-offline: test-sdk-offline
+	@echo "Running astra-web offline (typecheck, Vitest, build)..."
+	@cd web && npm ci
+	@cd web && npm run ci
+
 # @astra/sdk — Jest Mode B (ASTRA_SDK_BASE_URL) + sdk-online-smoke; requires astra-server (e.g. make dev-start)
 .PHONY: test-sdk-online
 test-sdk-online:
@@ -953,7 +959,7 @@ test-harness:
 # ============================================================================
 
 .PHONY: check
-check: lint format-check type-check
+check: lint format-check type-check check-web
 	@echo "✅ All static checks passed!"
 
 .PHONY: ci
@@ -988,6 +994,14 @@ audit:
 type-check: sweep
 	@echo "Running compile checks..."
 	@$(CARGO) check $(CARGO_MANIFEST_FLAG) --all-targets
+
+.PHONY: check-web
+check-web:
+	@echo "Checking astra-web typecheck..."
+	@cd packages/sdk && npm ci --ignore-scripts
+	@cd packages/sdk && npm run build
+	@cd web && npm ci
+	@cd web && npm run typecheck
 
 # ============================================================================
 # Memoria (Memory Service)

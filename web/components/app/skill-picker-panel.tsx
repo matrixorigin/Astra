@@ -32,7 +32,7 @@ export function SkillPickerPanel({ selected, onChange, onBack }: SkillPickerPane
   const [query, setQuery] = useState('');
   const {
     items,
-    nextOffset,
+    nextCursor,
     loading,
     error,
     loadInitial,
@@ -159,7 +159,7 @@ export function SkillPickerPanel({ selected, onChange, onBack }: SkillPickerPane
       </div>
 
       <div className="mt-2 border-t border-border pt-2">
-        {nextOffset !== null ? (
+        {nextCursor !== null ? (
           <button
             type="button"
             disabled={loading}
