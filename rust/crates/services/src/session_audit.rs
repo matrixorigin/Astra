@@ -859,7 +859,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         const MODEL_SEP: char = '\u{001f}';
         let metrics_row = query(&format!(
             "SELECT \
-               COUNT(CASE WHEN event_type = 'user_query' THEN 1 END) AS turn_count, \
+               COALESCE(MAX(turn_seq), 0) AS turn_count, \
                COUNT(CASE WHEN event_type = 'turn_error' THEN 1 END) AS error_count, \
                COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) AS stall_count, \
                COUNT(CASE WHEN event_type = 'checkpoint' THEN 1 END) AS checkpoint_count, \
@@ -1478,7 +1478,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let data_sql = format!(
             "SELECT \
                s.session_id, s.status, s.created_at, s.ended_at, \
-               COUNT(CASE WHEN e.event_type = 'user_query' THEN 1 END) AS turn_count, \
+               COALESCE(MAX(e.turn_seq), 0) AS turn_count, \
                COALESCE(SUM(e.token_input), 0) AS tokens_in, \
                COALESCE(SUM(e.token_output), 0) AS tokens_out, \
                COUNT(CASE WHEN e.event_type IN ('tool_call', 'tool_error') THEN 1 END) AS tool_calls, \
@@ -1532,7 +1532,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let count_sql = format!(
             "SELECT COUNT(*) AS cnt FROM (\
                SELECT s.session_id, \
-                 COUNT(CASE WHEN e.event_type = 'user_query' THEN 1 END) AS turn_count \
+                 COALESCE(MAX(e.turn_seq), 0) AS turn_count \
                FROM agent_sessions s \
                LEFT JOIN agent_events e ON e.session_id = s.session_id AND e.user_id = s.user_id \
                WHERE {where_clause} \

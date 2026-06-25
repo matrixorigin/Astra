@@ -1350,6 +1350,108 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let event_one = Uuid::new_v4().to_string();
+    let event_four = Uuid::new_v4().to_string();
+    let event_ids = vec![event_one.clone(), event_four.clone()];
+
+    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&session_id), &event_ids, &[])
+        .await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count, created_at, updated_at, last_active_at) \
+         VALUES (?, ?, 'turn-high-watermark', 'active', 0, ?, ?, ?)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind("2026-06-16 09:00:00.000000")
+    .bind("2026-06-16 09:00:00.000000")
+    .bind("2026-06-16 09:00:00.000000")
+    .execute(&pool)
+    .await
+    .expect("insert audit session");
+
+    for (event_id, turn_seq, ts) in [
+        (&event_one, 1_i64, "2026-06-16 09:01:00.000000"),
+        (&event_four, 4_i64, "2026-06-16 09:04:00.000000"),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_events \
+             (event_id, session_id, user_id, event_type, content, causal_chain_id, \
+              token_input, token_output, token_total, turn_seq, created_at) \
+             VALUES (?, ?, ?, 'user_query', '{}', '', 1, 1, 2, ?, ?)",
+        )
+        .bind(event_id)
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(turn_seq)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert sparse turn event");
+    }
+
+    let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
+    let summary = audit
+        .get_summary(&user_id, &session_id)
+        .await
+        .expect("get sparse-turn summary");
+    assert_eq!(
+        summary.turn_count, 4,
+        "session audit summary must report turn_seq high watermark, not user_query row count"
+    );
+
+    let matching = audit
+        .list_sessions(
+            &user_id,
+            &AuditSessionListParams {
+                page: 1,
+                per_page: 10,
+                status: None,
+                model: None,
+                since: None,
+                until: None,
+                min_turns: Some(3),
+                sort: "turns".into(),
+                order: "desc".into(),
+            },
+        )
+        .await
+        .expect("list sparse-turn sessions");
+    assert_eq!(matching.total, 1);
+    assert_eq!(matching.sessions[0].session_id, session_id);
+    assert_eq!(matching.sessions[0].turn_count, 4);
+
+    let filtered = audit
+        .list_sessions(
+            &user_id,
+            &AuditSessionListParams {
+                page: 1,
+                per_page: 10,
+                status: None,
+                model: None,
+                since: None,
+                until: None,
+                min_turns: Some(5),
+                sort: "turns".into(),
+                order: "desc".into(),
+            },
+        )
+        .await
+        .expect("filter sparse-turn sessions");
+    assert_eq!(filtered.total, 0);
+    assert!(filtered.sessions.is_empty());
+
+    cleanup_agent_sessions_and_events(&pool, &[session_id], &event_ids, &[]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn cross_session_runtime_promotions_db_roundtrip() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
