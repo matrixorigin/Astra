@@ -1,5 +1,5 @@
 use astra_runtime::skills::UnifiedSkillRegistry;
-use astra_services::skills::{SkillListItem, SkillListRecord, SkillRecord};
+use astra_services::skills::{SkillListCursor, SkillListItem, SkillListRecord, SkillRecord};
 
 const SUPPORTED_SKILL_SOURCE_FILTERS: &[&str] = astra_skills::SkillSourceKind::SUPPORTED_FILTERS;
 
@@ -108,17 +108,28 @@ pub(crate) fn list_skill_record_from_registry(
         .saturating_add(effective_limit as usize)
         .min(manifests.len());
 
+    let skills = manifests[start..end]
+        .iter()
+        .cloned()
+        .map(skill_list_item_from_manifest)
+        .collect::<Vec<_>>();
+    let next_cursor = if end < manifests.len() {
+        skills.last().map(|item| SkillListCursor {
+            skill_name: item.skill_name.clone(),
+            version: item.version.clone(),
+            skill_id: item.skill_id.clone(),
+        })
+    } else {
+        None
+    };
+
     SkillListRecord {
-        skills: manifests[start..end]
-            .iter()
-            .cloned()
-            .map(skill_list_item_from_manifest)
-            .collect(),
+        skills,
         total,
         // Echo the *applied* cap, not the user's request, so callers paginating
         // via `total / limit` don't loop forever expecting an oversized page.
         limit: effective_limit,
-        offset,
+        next_cursor,
     }
 }
 
