@@ -2351,6 +2351,105 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
+    let (shared, _settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let sync = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let first_event_id = Uuid::new_v4().to_string();
+    let fourth_event_id = Uuid::new_v4().to_string();
+
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
+
+    sync.push_session_state(
+        &session_id,
+        &user_id,
+        None,
+        None,
+        None,
+        0,
+        Some("feature/sparse-turns"),
+        Some("gpt-5.4"),
+    )
+    .await
+    .expect("push sparse-turn session state");
+
+    sqlx::query(
+        "UPDATE agent_sessions SET title = 'sparse-turn-restore', event_count = 2 \
+         WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("seed sparse-turn session root");
+
+    for (event_id, turn_seq, content, ts) in [
+        (
+            &first_event_id,
+            1_i64,
+            "first sparse restore turn",
+            "2026-09-06 08:00:00.000000",
+        ),
+        (
+            &fourth_event_id,
+            4_i64,
+            "fourth sparse restore turn",
+            "2026-09-06 08:04:00.000000",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_events \
+             (event_id, session_id, user_id, event_type, content, token_usage, \
+              token_input, token_output, token_total, turn_seq, created_at) \
+             VALUES (?, ?, ?, 'user_query', ?, CAST(? AS JSON), 1, 1, 2, ?, ?)",
+        )
+        .bind(event_id)
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(content)
+        .bind(serde_json::json!({"input": 1, "output": 1, "total": 2}).to_string())
+        .bind(turn_seq)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert sparse-turn restore event");
+    }
+
+    let restore = HybridRestoreService::new(pool.clone());
+    let restored = restore
+        .restore_session(&user_id, &session_id)
+        .await
+        .expect("restore sparse-turn session")
+        .expect("sparse-turn session restored");
+    assert_eq!(
+        restored.turn_count, 4,
+        "restore_session must report turn_seq high watermark, not user_query row count"
+    );
+
+    let listed = restore
+        .list_resumable_sessions(&user_id)
+        .await
+        .expect("list sparse-turn resumable sessions");
+    let listed_session = listed
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .expect("sparse-turn session listed");
+    assert_eq!(
+        listed_session.turn_count, 4,
+        "list_resumable_sessions must use the same turn high watermark as restore_session"
+    );
+
+    flusher.shutdown.cancel();
+    let _ = flusher.join_handle.await;
+    cleanup_restore_fixture(&pool, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();

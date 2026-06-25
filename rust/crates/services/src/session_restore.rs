@@ -3052,31 +3052,6 @@ mod tests {
     }
 
     #[test]
-    fn cloud_restore_turn_count_uses_turn_seq_fact_source() {
-        let source = include_str!("session_restore.rs");
-        let implementation = source
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("implementation source");
-        assert!(
-            implementation.contains("COALESCE(MAX(ae.turn_seq), 0)"),
-            "single-session restore must derive turn_count from turn_seq"
-        );
-        assert!(
-            implementation.contains("COALESCE(MAX(turn_seq), 0)"),
-            "resumable-session listing must derive turn_count from turn_seq"
-        );
-        assert!(
-            !implementation.contains("COUNT(*) FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id AND event_type = 'user_query'"),
-            "cloud restore must not count user_query rows as turn_count"
-        );
-        assert!(
-            !implementation.contains("COUNT(*) FROM agent_events WHERE session_id = s.session_id AND user_id = s.user_id AND event_type = 'user_query'"),
-            "resumable listing must not count user_query rows as turn_count"
-        );
-    }
-
-    #[test]
     fn context_trace_push_updates_event_count_from_insert_delta() {
         let source = include_str!("session_restore.rs");
         let implementation = source
