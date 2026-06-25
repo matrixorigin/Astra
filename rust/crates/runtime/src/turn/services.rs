@@ -626,6 +626,30 @@ impl TurnAuxiliaryEventWriter for NoopTurnAuxiliaryEventWriter {
 mod tests {
     use super::*;
     use serde_json::json;
+    use sqlx::Row;
+    use uuid::Uuid;
+
+    static SHARED_BOOTSTRAP: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+
+    async fn setup_live_pool() -> SharedPool {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+        );
+        SHARED_BOOTSTRAP
+            .get_or_init(|| async {
+                let settings = MatrixOneSettings::from_env();
+                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                    .unwrap_or_else(|_| "mysql".to_string());
+                astra_services::ensure_core_schema(&settings, &catalog)
+                    .await
+                    .expect("ensure_core_schema");
+                SharedPool::new(&settings).await.expect("SharedPool::new")
+            })
+            .await
+            .clone()
+    }
 
     #[test]
     fn metadata_tool_name_none() {
@@ -669,37 +693,290 @@ mod tests {
     }
 
     #[test]
-    fn turn_event_writers_use_delta_updates_not_count_reconcile() {
-        let source = include_str!("services.rs");
-        let forbidden_load = concat!("load_agent_event_count", "_for_user");
-        let forbidden_upsert = concat!("upsert_agent_session", "_event_count");
-        let forbidden_subquery = concat!("event_count = (SELECT ", "COUNT(*)");
-        assert!(
-            source.contains("bump_agent_session_event_count"),
-            "event writers must maintain agent_sessions.event_count with actual insert deltas"
-        );
-        assert!(
-            source.contains("touch_agent_session_activity"),
-            "activity writer should only touch activity metadata"
-        );
-        assert!(
-            !source.contains(forbidden_load),
-            "turn event writer hot path must not COUNT(*) agent_events"
-        );
-        assert!(
-            !source.contains(forbidden_upsert),
-            "turn event writer hot path must not reconcile event_count from COUNT(*)"
-        );
-        assert!(
-            !source.contains(forbidden_subquery),
-            "turn activity update must not embed a COUNT(*) subquery"
-        );
-    }
-
-    #[test]
     fn metadata_tool_name_non_string_value() {
         let v = json!({"tool_name": 42});
         assert!(metadata_tool_name(Some(&v)).is_none());
+    }
+
+    fn core_event(
+        event_id: &str,
+        user_id: &str,
+        session_id: &str,
+        causal_chain_id: &str,
+        event_type: &str,
+        content: &str,
+        parent_event_id: Option<&str>,
+    ) -> TurnCoreEventRecord {
+        TurnCoreEventRecord {
+            event_id: event_id.to_string(),
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            agent_id: None,
+            event_type: event_type.to_string(),
+            content: content.to_string(),
+            parent_event_id: parent_event_id.map(str::to_string),
+            parent_event_ids: parent_event_id
+                .map(|id| vec![id.to_string()])
+                .unwrap_or_default(),
+            causal_chain_id: causal_chain_id.to_string(),
+            turn_seq: Some(1),
+            llm_model_used: None,
+            token_usage: None,
+            llm_params: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn tool_event(
+        event_id: &str,
+        user_id: &str,
+        session_id: &str,
+        causal_chain_id: &str,
+        event_type: &str,
+        content: &str,
+        parent_event_id: Option<&str>,
+    ) -> TurnToolEventRecord {
+        TurnToolEventRecord {
+            event_id: event_id.to_string(),
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            agent_id: None,
+            event_type: event_type.to_string(),
+            content: content.to_string(),
+            parent_event_id: parent_event_id.map(str::to_string),
+            parent_event_ids: parent_event_id
+                .map(|id| vec![id.to_string()])
+                .unwrap_or_default(),
+            causal_chain_id: causal_chain_id.to_string(),
+            metadata: None,
+            skill_name: None,
+            skill_version: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn auxiliary_event(
+        event_id: &str,
+        user_id: &str,
+        session_id: &str,
+        causal_chain_id: &str,
+        event_type: &str,
+        content: &str,
+        parent_event_id: Option<&str>,
+    ) -> TurnAuxiliaryEventRecord {
+        TurnAuxiliaryEventRecord {
+            event_id: event_id.to_string(),
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            agent_id: None,
+            event_type: event_type.to_string(),
+            content: content.to_string(),
+            parent_event_id: parent_event_id.map(str::to_string),
+            parent_event_ids: parent_event_id
+                .map(|id| vec![id.to_string()])
+                .unwrap_or_default(),
+            causal_chain_id: causal_chain_id.to_string(),
+            metadata: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn turn_event_writers_increment_event_count_by_insert_delta_on_live_matrixone() {
+        let shared = setup_live_pool().await;
+        let pool = shared.get().clone();
+        let settings = MatrixOneSettings::from_env();
+        let suffix = Uuid::new_v4().to_string();
+        let session_id = format!("turn-writer-{suffix}");
+        let user_id = format!("user-{suffix}");
+        let causal_chain_id = format!("chain-{suffix}");
+        let core_user_event_id = format!("core-user-{suffix}");
+        let core_response_event_id = format!("core-response-{suffix}");
+        let tool_duplicate_event_id = format!("tool-dup-{suffix}");
+        let tool_unique_event_id = format!("tool-unique-{suffix}");
+        let aux_duplicate_event_id = format!("aux-dup-{suffix}");
+        let aux_unique_event_id = format!("aux-unique-{suffix}");
+
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+             VALUES (?, ?, 'turn-writer-delta-it', 'active', 0)",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("insert session");
+
+        let core_writer =
+            DatabaseTurnCoreEventWriter::new(settings.clone()).with_pool(shared.clone());
+        core_writer
+            .persist(TurnCorePersistPlan {
+                user_query_event: Some(core_event(
+                    &core_user_event_id,
+                    &user_id,
+                    &session_id,
+                    &causal_chain_id,
+                    "user_query",
+                    "hello",
+                    None,
+                )),
+                llm_response_event: Some(core_event(
+                    &core_response_event_id,
+                    &user_id,
+                    &session_id,
+                    &causal_chain_id,
+                    "llm_response",
+                    "world",
+                    Some(&core_user_event_id),
+                )),
+                snapshot_link_plan: None,
+            })
+            .await
+            .expect("persist core events");
+        core_writer
+            .persist(TurnCorePersistPlan {
+                user_query_event: Some(core_event(
+                    &core_user_event_id,
+                    &user_id,
+                    &session_id,
+                    &causal_chain_id,
+                    "user_query",
+                    "duplicate",
+                    None,
+                )),
+                llm_response_event: None,
+                snapshot_link_plan: None,
+            })
+            .await
+            .expect("persist duplicate core event");
+
+        let tool_writer =
+            DatabaseTurnToolEventWriter::new(settings.clone()).with_pool(shared.clone());
+        tool_writer
+            .persist(TurnToolEventPersistPlan {
+                events: vec![
+                    tool_event(
+                        &tool_duplicate_event_id,
+                        &user_id,
+                        &session_id,
+                        &causal_chain_id,
+                        "tool_use",
+                        "first duplicate",
+                        Some(&core_response_event_id),
+                    ),
+                    tool_event(
+                        &tool_duplicate_event_id,
+                        &user_id,
+                        &session_id,
+                        &causal_chain_id,
+                        "tool_use",
+                        "second duplicate",
+                        Some(&core_response_event_id),
+                    ),
+                    tool_event(
+                        &tool_unique_event_id,
+                        &user_id,
+                        &session_id,
+                        &causal_chain_id,
+                        "tool_result",
+                        "unique",
+                        Some(&tool_duplicate_event_id),
+                    ),
+                ],
+            })
+            .await
+            .expect("persist tool events");
+
+        let aux_writer =
+            DatabaseTurnAuxiliaryEventWriter::new(settings.clone()).with_pool(shared.clone());
+        aux_writer
+            .persist_events(vec![
+                auxiliary_event(
+                    &aux_duplicate_event_id,
+                    &user_id,
+                    &session_id,
+                    &causal_chain_id,
+                    "system_note",
+                    "first duplicate",
+                    Some(&tool_unique_event_id),
+                ),
+                auxiliary_event(
+                    &aux_duplicate_event_id,
+                    &user_id,
+                    &session_id,
+                    &causal_chain_id,
+                    "system_note",
+                    "second duplicate",
+                    Some(&tool_unique_event_id),
+                ),
+                auxiliary_event(
+                    &aux_unique_event_id,
+                    &user_id,
+                    &session_id,
+                    &causal_chain_id,
+                    "system_note",
+                    "unique",
+                    Some(&aux_duplicate_event_id),
+                ),
+            ])
+            .await
+            .expect("persist auxiliary events");
+
+        DatabaseTurnSessionActivityWriter::new(settings)
+            .with_pool(shared.clone())
+            .update_session_activity(
+                &session_id,
+                &user_id,
+                SessionActivityUpdatePlan {
+                    last_event_id: Some(aux_unique_event_id.clone()),
+                },
+            )
+            .await
+            .expect("touch session activity");
+
+        let row = sqlx::query(
+            "SELECT event_count, last_event_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load session count");
+        assert_eq!(
+            row.try_get::<i64, _>("event_count")
+                .expect("decode event_count"),
+            6,
+            "writers must add only actual inserted rows; duplicate INSERT IGNORE rows must not bump"
+        );
+        assert_eq!(
+            row.try_get::<String, _>("last_event_id")
+                .expect("decode last_event_id"),
+            aux_unique_event_id
+        );
+
+        let actual_events = sqlx::query(
+            "SELECT COUNT(*) AS c FROM agent_events WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count persisted events")
+        .try_get::<i64, _>("c")
+        .expect("decode event count");
+        assert_eq!(actual_events, 6);
+
+        let _ = sqlx::query("DELETE FROM agent_events WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&user_id)
+            .execute(&pool)
+            .await;
     }
 
     /// Verify that all Database*Writer structs fail instantly when no pool is
