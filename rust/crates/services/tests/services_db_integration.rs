@@ -40,6 +40,7 @@ use astra_services::{
     MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService,
     ReplayService, SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
     SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
+    SnapshotListFilter,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -114,6 +115,11 @@ async fn cleanup_session_bundle(
             .execute(pool)
             .await;
     }
+    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id IN (?, ?)")
+        .bind(session_id)
+        .bind(session_id_2)
+        .execute(pool)
+        .await;
     for aid in audit_ids {
         let _ = sqlx::query("DELETE FROM auth_audit_logs WHERE log_id = ?")
             .bind(aid)
@@ -300,6 +306,9 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     let e1 = Uuid::new_v4().to_string();
     let e2 = Uuid::new_v4().to_string();
     let e3 = Uuid::new_v4().to_string();
+    let snapshot_id = Uuid::new_v4().to_string();
+    let snapshot_id_2 = Uuid::new_v4().to_string();
+    let snapshot_id_3 = Uuid::new_v4().to_string();
     let decision_id = Uuid::new_v4().to_string();
     let decision_id_2 = Uuid::new_v4().to_string();
     let decision_id_3 = Uuid::new_v4().to_string();
@@ -443,6 +452,63 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         vec![e2.as_str()]
     );
     assert!(second_session_page.next_cursor.is_none());
+
+    for (capture_id, event_id, ts) in [
+        (&snapshot_id, &e1, "2026-05-01 10:00:00.000000"),
+        (&snapshot_id_2, &e2, "2026-05-01 12:00:00.000000"),
+        (&snapshot_id_3, &e3, "2026-05-01 11:00:00.000000"),
+    ] {
+        sqlx::query(
+            "INSERT INTO ctx_snapshots \
+             (context_capture_id, user_id, session_id, event_id, context_data, created_at) \
+             VALUES (?, ?, ?, ?, CAST('{\"kind\":\"it\"}' AS JSON), ?)",
+        )
+        .bind(capture_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(event_id)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert snapshot");
+    }
+
+    let ctx_service = DatabaseContextService::new(settings.clone()).with_pool(shared.clone());
+    let first_snapshot_page = ctx_service
+        .list_snapshots(SnapshotListFilter {
+            user_id: user_id.clone(),
+            session_id: None,
+            limit: 2,
+            cursor: None,
+        })
+        .await
+        .expect("list first snapshot page");
+    assert_eq!(
+        first_snapshot_page
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.context_capture_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![snapshot_id_2.as_str(), snapshot_id_3.as_str()]
+    );
+    let second_snapshot_page = ctx_service
+        .list_snapshots(SnapshotListFilter {
+            user_id: user_id.clone(),
+            session_id: None,
+            limit: 2,
+            cursor: first_snapshot_page.next_cursor.clone(),
+        })
+        .await
+        .expect("list second snapshot page");
+    assert_eq!(
+        second_snapshot_page
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.context_capture_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![snapshot_id.as_str()]
+    );
+    assert!(second_snapshot_page.next_cursor.is_none());
 
     for (did, event_id, ts) in [
         (&decision_id, &e1, "2026-05-01 10:00:00.000000"),

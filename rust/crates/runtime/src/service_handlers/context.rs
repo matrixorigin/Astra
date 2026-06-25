@@ -34,13 +34,14 @@ pub async fn list_snapshots_handler(
     Query(q): Query<SnapshotListQuery>,
 ) -> Result<Json<SnapshotListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let cursor = q.cursor()?;
     let list = state
         .context_service
         .list_snapshots(SnapshotListFilter {
             user_id: user.user_id,
             session_id: q.session_id,
             limit: q.limit,
-            offset: q.offset,
+            cursor,
         })
         .await?;
     Ok(Json(SnapshotListResponse::from(list)))

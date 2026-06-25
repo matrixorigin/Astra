@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, query};
+use sqlx::{MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
@@ -39,7 +39,7 @@ pub struct SnapshotListFilter {
     pub user_id: String,
     pub session_id: Option<String>,
     pub limit: u32,
-    pub offset: u32,
+    pub cursor: Option<SnapshotListCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,7 +47,13 @@ pub struct SnapshotListRecord {
     pub snapshots: Vec<SnapshotListItem>,
     pub total: i64,
     pub limit: u32,
-    pub offset: u32,
+    pub next_cursor: Option<SnapshotListCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotListCursor {
+    pub created_at: String,
+    pub context_capture_id: String,
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -124,8 +130,73 @@ const SNAPSHOT_SELECT_COLS: &str = "\
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
 const SNAPSHOT_LIST_SELECT_COLS: &str = "\
     cs.context_capture_id, cs.session_id, cs.event_id, \
-    DATE_FORMAT(cs.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
+    DATE_FORMAT(cs.created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at";
 const MAX_SNAPSHOT_LIST_ROWS: u32 = 200;
+
+fn validate_snapshot_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_SNAPSHOT_LIST_ROWS)
+}
+
+fn snapshot_list_query_limit(limit: u32) -> i64 {
+    i64::from(limit) + 1
+}
+
+fn snapshot_list_cursor_db_created_at(
+    cursor: &SnapshotListCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let created_at = cursor.created_at.trim();
+    if created_at.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid snapshot list cursor: created_at is required",
+        ));
+    }
+    let db_created_at = created_at.replace('T', " ");
+    if db_created_at.len() != "YYYY-MM-DD HH:MM:SS.ffffff".len()
+        || db_created_at.as_bytes().get(10) != Some(&b' ')
+        || db_created_at.as_bytes().get(19) != Some(&b'.')
+        || chrono::NaiveDateTime::parse_from_str(&db_created_at, "%Y-%m-%d %H:%M:%S%.6f").is_err()
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid snapshot list cursor timestamp: {created_at}"),
+        ));
+    }
+    Ok(db_created_at)
+}
+
+fn snapshot_list_cursor_capture_id(
+    cursor: &SnapshotListCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let context_capture_id = cursor.context_capture_id.trim();
+    if context_capture_id.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid snapshot list cursor: context_capture_id is required",
+        ));
+    }
+    Ok(context_capture_id.to_string())
+}
+
+fn snapshot_list_cursor_from_item(
+    snapshot: &SnapshotListItem,
+) -> Result<SnapshotListCursor, (StatusCode, Json<ErrorResponse>)> {
+    if snapshot.created_at.trim().is_empty() {
+        return Err(internal_error(format!(
+            "invalid ctx_snapshots cursor: context_capture_id={}, column=created_at, value is empty",
+            snapshot.context_capture_id
+        )));
+    }
+    if snapshot.context_capture_id.trim().is_empty() {
+        return Err(internal_error(
+            "invalid ctx_snapshots cursor: column=context_capture_id, value is empty",
+        ));
+    }
+    Ok(SnapshotListCursor {
+        created_at: snapshot.created_at.clone(),
+        context_capture_id: snapshot.context_capture_id.clone(),
+    })
+}
 
 #[async_trait]
 impl ContextService for DatabaseContextService {
@@ -209,7 +280,7 @@ impl ContextService for DatabaseContextService {
         filter: SnapshotListFilter,
     ) -> Result<SnapshotListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let limit = filter.limit.min(MAX_SNAPSHOT_LIST_ROWS);
+        let limit = validate_snapshot_list_limit(filter.limit);
 
         let count_sql = if filter.session_id.is_some() {
             "SELECT COUNT(cs.context_capture_id) AS total FROM ctx_snapshots cs \
@@ -234,41 +305,34 @@ impl ContextService for DatabaseContextService {
         .map_err(internal_error)?;
         let total = total_row.try_get::<i64, _>("total").unwrap_or(0);
 
-        let list_sql = if filter.session_id.is_some() {
-            format!(
-                "SELECT {} \
-                 FROM ctx_snapshots cs \
-                 WHERE cs.user_id = ? AND cs.session_id = ? \
-                 ORDER BY cs.created_at DESC LIMIT ? OFFSET ?",
-                SNAPSHOT_LIST_SELECT_COLS
-            )
-        } else {
-            format!(
-                "SELECT {} \
-                 FROM ctx_snapshots cs \
-                 WHERE cs.user_id = ? \
-                 ORDER BY cs.created_at DESC LIMIT ? OFFSET ?",
-                SNAPSHOT_LIST_SELECT_COLS
-            )
-        };
-
-        let rows = if let Some(sid) = &filter.session_id {
-            query(&list_sql)
-                .bind(&filter.user_id)
-                .bind(sid)
-                .bind(i64::from(limit))
-                .bind(i64::from(filter.offset))
-                .fetch_all(&pool)
-                .await
-        } else {
-            query(&list_sql)
-                .bind(&filter.user_id)
-                .bind(i64::from(limit))
-                .bind(i64::from(filter.offset))
-                .fetch_all(&pool)
-                .await
+        let mut list_qb = QueryBuilder::<MySql>::new(format!(
+            "SELECT {} FROM ctx_snapshots cs WHERE cs.user_id = ",
+            SNAPSHOT_LIST_SELECT_COLS
+        ));
+        list_qb.push_bind(&filter.user_id);
+        if let Some(sid) = &filter.session_id {
+            list_qb.push(" AND cs.session_id = ");
+            list_qb.push_bind(sid);
         }
-        .map_err(internal_error)?;
+        if let Some(cursor) = &filter.cursor {
+            let created_at = snapshot_list_cursor_db_created_at(cursor)?;
+            let context_capture_id = snapshot_list_cursor_capture_id(cursor)?;
+            list_qb.push(" AND (cs.created_at < ");
+            list_qb.push_bind(created_at.clone());
+            list_qb.push(" OR (cs.created_at = ");
+            list_qb.push_bind(created_at);
+            list_qb.push(" AND cs.context_capture_id < ");
+            list_qb.push_bind(context_capture_id);
+            list_qb.push("))");
+        }
+        list_qb.push(" ORDER BY cs.created_at DESC, cs.context_capture_id DESC LIMIT ");
+        list_qb.push_bind(snapshot_list_query_limit(limit));
+
+        let rows = list_qb
+            .build()
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let mut snapshots = Vec::with_capacity(rows.len());
         for row in rows {
@@ -279,11 +343,23 @@ impl ContextService for DatabaseContextService {
                 created_at: row.try_get("created_at").unwrap_or_default(),
             });
         }
+        let has_more = snapshots.len() > limit as usize;
+        if has_more {
+            snapshots.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            snapshots
+                .last()
+                .map(snapshot_list_cursor_from_item)
+                .transpose()?
+        } else {
+            None
+        };
         Ok(SnapshotListRecord {
             snapshots,
             total,
             limit,
-            offset: filter.offset,
+            next_cursor,
         })
     }
 
@@ -359,12 +435,28 @@ pub struct SnapshotListQuery {
     pub session_id: Option<String>,
     #[serde(default = "default_snapshot_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub offset: u32,
+    pub after_created_at: Option<String>,
+    pub after_context_capture_id: Option<String>,
 }
 
 pub fn default_snapshot_limit() -> u32 {
     50
+}
+
+impl SnapshotListQuery {
+    pub fn cursor(&self) -> Result<Option<SnapshotListCursor>, (StatusCode, Json<ErrorResponse>)> {
+        match (&self.after_created_at, &self.after_context_capture_id) {
+            (None, None) => Ok(None),
+            (Some(created_at), Some(context_capture_id)) => Ok(Some(SnapshotListCursor {
+                created_at: created_at.clone(),
+                context_capture_id: context_capture_id.clone(),
+            })),
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "snapshot list cursor requires both after_created_at and after_context_capture_id",
+            )),
+        }
+    }
 }
 
 #[derive(Serialize, PartialEq)]
@@ -381,7 +473,7 @@ pub struct SnapshotListResponse {
     pub snapshots: Vec<SnapshotListItemResponse>,
     pub total: i64,
     pub limit: u32,
-    pub offset: u32,
+    pub next_cursor: Option<SnapshotListCursor>,
 }
 
 #[derive(Serialize, PartialEq)]
@@ -419,7 +511,7 @@ impl From<SnapshotListRecord> for SnapshotListResponse {
                 .collect(),
             total: r.total,
             limit: r.limit,
-            offset: r.offset,
+            next_cursor: r.next_cursor,
         }
     }
 }
@@ -432,8 +524,73 @@ mod tests {
     fn snapshot_list_query_defaults() {
         let q: SnapshotListQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.limit, 50);
-        assert_eq!(q.offset, 0);
+        assert_eq!(q.cursor().unwrap(), None);
         assert!(q.session_id.is_none());
+    }
+
+    #[test]
+    fn snapshot_list_query_requires_complete_cursor() {
+        let q: SnapshotListQuery =
+            serde_json::from_str(r#"{"after_created_at":"2026-04-01T10:00:00.000000"}"#).unwrap();
+        assert_eq!(q.cursor().unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn snapshot_list_limit_has_hard_cap_and_minimum() {
+        assert_eq!(validate_snapshot_list_limit(0), 1);
+        assert_eq!(validate_snapshot_list_limit(10), 10);
+        assert_eq!(
+            validate_snapshot_list_limit(u32::MAX),
+            MAX_SNAPSHOT_LIST_ROWS
+        );
+        assert_eq!(snapshot_list_query_limit(MAX_SNAPSHOT_LIST_ROWS), 201);
+    }
+
+    #[test]
+    fn snapshot_list_cursor_rejects_invalid_inputs() {
+        let cursor = SnapshotListCursor {
+            created_at: "2026-04-01T10:00:00.123456".to_string(),
+            context_capture_id: "ctx-1".to_string(),
+        };
+        assert_eq!(
+            snapshot_list_cursor_db_created_at(&cursor).unwrap(),
+            "2026-04-01 10:00:00.123456"
+        );
+        assert_eq!(
+            snapshot_list_cursor_capture_id(&cursor).unwrap(),
+            "ctx-1".to_string()
+        );
+
+        let invalid_time = SnapshotListCursor {
+            created_at: "2026-04-01T10:00:00".to_string(),
+            context_capture_id: "ctx-1".to_string(),
+        };
+        assert_eq!(
+            snapshot_list_cursor_db_created_at(&invalid_time)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let missing_id = SnapshotListCursor {
+            created_at: "2026-04-01T10:00:00.123456".to_string(),
+            context_capture_id: "  ".to_string(),
+        };
+        assert_eq!(
+            snapshot_list_cursor_capture_id(&missing_id).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn snapshot_list_sql_contract_uses_seek_cursor_not_offset() {
+        let sql = format!(
+            "SELECT {SNAPSHOT_LIST_SELECT_COLS} FROM ctx_snapshots cs WHERE cs.user_id = ? \
+             AND (cs.created_at < ? OR (cs.created_at = ? AND cs.context_capture_id < ?)) \
+             ORDER BY cs.created_at DESC, cs.context_capture_id DESC LIMIT ?"
+        );
+        assert!(!sql.to_ascii_uppercase().contains(" OFFSET "));
+        assert!(sql.contains("cs.context_capture_id < ?"));
     }
 
     #[test]
