@@ -253,6 +253,88 @@ async fn event_ingest_batch_partial_duplicate_no_error() {
     cleanup_session(&pool, &session_id).await;
 }
 
+/// Verifies that one mixed batch updates each session from its own inserted
+/// rows, while lazily creating missing session roots.
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy_roots() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+
+    let session_a = Uuid::new_v4().to_string();
+    let session_b = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &session_a).await;
+    cleanup_session(&pool, &session_b).await;
+
+    let duplicate_a = test_event(
+        &format!("evt-lazy-dup-{}", Uuid::new_v4()),
+        &session_a,
+        "test_multi_session",
+    );
+    let unique_a = test_event(
+        &format!("evt-lazy-a-{}", Uuid::new_v4()),
+        &session_a,
+        "test_multi_session",
+    );
+    let unique_b1 = test_event(
+        &format!("evt-lazy-b1-{}", Uuid::new_v4()),
+        &session_b,
+        "test_multi_session",
+    );
+    let unique_b2 = test_event(
+        &format!("evt-lazy-b2-{}", Uuid::new_v4()),
+        &session_b,
+        "test_multi_session",
+    );
+
+    let config = IngestionConfig {
+        batch_size: 50,
+        flush_interval_secs: 300,
+        channel_capacity: 8,
+        ..Default::default()
+    };
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(duplicate_a.clone()).await;
+    shutdown.signal();
+    handle.await.unwrap();
+
+    assert_session_event_count(&pool, &session_a, 1).await;
+
+    let config = IngestionConfig {
+        batch_size: 50,
+        flush_interval_secs: 300,
+        channel_capacity: 8,
+        ..Default::default()
+    };
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    for event in [
+        duplicate_a.clone(),
+        unique_a.clone(),
+        unique_b1.clone(),
+        unique_b2.clone(),
+    ] {
+        sender.enqueue_async(event).await;
+    }
+    shutdown.signal();
+    handle.await.unwrap();
+
+    assert_session_event_count(&pool, &session_a, 2).await;
+    assert_session_event_count(&pool, &session_b, 2).await;
+
+    for (session_id, expected) in [(&session_a, 2_i64), (&session_b, 2_i64)] {
+        let actual: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count session events");
+        assert_eq!(actual, expected, "persisted agent_events for {session_id}");
+    }
+
+    cleanup_session(&pool, &session_a).await;
+    cleanup_session(&pool, &session_b).await;
+}
+
 /// Verifies that a duplicate event in a mixed batch cannot mutate causal
 /// edges just because another event in the same session was inserted.
 #[tokio::test]

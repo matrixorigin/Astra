@@ -1718,33 +1718,6 @@ mod tests {
         assert_eq!(sender.overflow_count(), 2);
     }
 
-    #[test]
-    fn insert_batch_sql_uses_per_session_delta_not_count_reconcile() {
-        let source = include_str!("event_ingestion.rs");
-        let forbidden_load = concat!("load_agent_event_count", "_for_user");
-        let forbidden_upsert = concat!("upsert_agent_session", "_event_count");
-        assert!(
-            source.contains("rows_affected()"),
-            "insert_batch must check rows_affected to detect INSERT IGNORE skips"
-        );
-        assert!(
-            source.contains("BTreeMap::<(&str, &str), Vec<&IngestionEvent>>::new()"),
-            "insert_batch must group inserts by (user_id, session_id) so rows_affected is a per-session delta"
-        );
-        assert!(
-            source.contains("add_agent_session_event_count_or_create"),
-            "insert_batch may lazily create session roots but must use a true insert delta"
-        );
-        assert!(
-            !source.contains(forbidden_load),
-            "insert_batch hot path must not COUNT(*) agent_events"
-        );
-        assert!(
-            !source.contains(forbidden_upsert),
-            "insert_batch hot path must not reconcile agent_sessions.event_count from COUNT(*)"
-        );
-    }
-
     // ── Shutdown handle tests ───────────────────────────────────────────
 
     /// Helper: create a MySql pool that will fail on any actual query.
