@@ -26,7 +26,7 @@ pub struct IntrospectReport {
     pub data_coverage: ObservationDataCoverage,
     pub summary: String,
     pub view: ObservationView,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub observations: Vec<ObservationRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<ObservationEvidence>,

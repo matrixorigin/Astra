@@ -871,6 +871,56 @@ fn all_tool_schemas_core() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "reflect",
+                "description": "Inspect persisted session observations through the normalized observation-plane surface. Use topic/facet/depth/horizon rather than removed focus-style parameters. CLI/Edge mode can use local session artifacts; without an active session the tool returns reflect_requires_session. Server-executed surfaces use HTTP reflect routes instead of this CLI-local facade.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "enum": ["overview", "runtime", "execution", "knowledge", "adaptation"],
+                            "description": "Top-level observation topic. Use execution/errors or execution/trace via topic+facet."
+                        },
+                        "facet": {
+                            "type": "string",
+                            "enum": ["overview", "question", "performance", "errors", "tools", "trace", "context", "memory", "signals", "measurements"],
+                            "description": "Observation facet under the selected topic. Examples: execution/errors, execution/trace, runtime/performance, knowledge/context."
+                        },
+                        "depth": {
+                            "type": "string",
+                            "enum": ["hint", "summary", "diagnostic", "forensic"],
+                            "description": "Requested analysis depth. Local CLI surface is bounded and may summarize forensic requests."
+                        },
+                        "horizon": {
+                            "type": "string",
+                            "enum": ["now", "current_turn", "recent", "turn", "session", "cross_session"],
+                            "description": "Time range. Trace is selected by facet, not by horizon."
+                        },
+                        "source_policy": {
+                            "type": "string",
+                            "enum": ["auto", "live_only", "live_first", "durable_first", "local_only", "cloud_only"],
+                            "description": "Preferred data source policy. Coverage is reported when a provider is missing or unavailable."
+                        },
+                        "include_context": {
+                            "type": "boolean",
+                            "description": "Request visible prompt/context facts when a provider is available."
+                        },
+                        "question": {
+                            "type": "string",
+                            "description": "Optional concrete question to orient the reflection."
+                        },
+                        "last_n": {
+                            "type": "integer",
+                            "description": "Bounded evidence limit for recent events or decisions. This is not a horizon alias."
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "get_agent_info",
                 "description": "Return the current Astra agent identity and capability summary. Use dimension='capability' to inspect which tools are actually available under the current workspace, executor, runtime, and policy binding.",
                 "parameters": {
@@ -1827,6 +1877,47 @@ mod tests {
                 "cloud_only",
             ],
             "introspect source_policy schema must not regress to old edge/server/cloud aliases"
+        );
+    }
+
+    #[test]
+    fn reflect_schema_is_cli_facade_shape_without_legacy_focus() {
+        let schemas = all_tool_schemas();
+        let reflect = find_schema(&schemas, "reflect").expect("reflect schema must exist");
+        let desc = reflect["function"]["description"]
+            .as_str()
+            .expect("reflect description must be a string");
+        let properties = reflect["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("reflect parameters properties must be an object");
+
+        assert!(
+            desc.contains("CLI/Edge mode") && desc.contains("HTTP reflect routes"),
+            "reflect schema should document local facade vs server routes: {desc}"
+        );
+        for key in [
+            "topic",
+            "facet",
+            "depth",
+            "horizon",
+            "source_policy",
+            "include_context",
+            "question",
+            "last_n",
+        ] {
+            assert!(
+                properties.contains_key(key),
+                "reflect schema should expose normalized observation parameter `{key}`"
+            );
+        }
+        assert!(
+            !properties.contains_key("focus"),
+            "reflect schema must not expose removed legacy focus parameter"
+        );
+        assert_eq!(
+            enum_values(&properties["depth"]),
+            vec!["hint", "summary", "diagnostic", "forensic"],
+            "reflect depth schema must expose canonical observation depths"
         );
     }
 

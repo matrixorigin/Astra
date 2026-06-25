@@ -592,18 +592,36 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         "direct_deferred_call_activated",
                     )
                 }
-                DirectDeferredCallAdmission::NotAdmitted => (
-                    astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+                DirectDeferredCallAdmission::NotAdmitted => {
+                    if astra_turn_core::tool::runtime_binding::tool_name_requires_runtime_binding(
                         &execution.name,
-                        action,
-                    ),
-                    "tool_not_admitted",
-                ),
+                    ) {
+                        (
+                            astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+                                &execution.name,
+                                action,
+                            ),
+                            "tool_not_admitted",
+                        )
+                    } else {
+                        (
+                            tool_not_admitted_message(&execution.name, true),
+                            "tool_not_admitted",
+                        )
+                    }
+                }
                 DirectDeferredCallAdmission::Unknown => {
                     if is_prompt_deferred {
                         if has_runtime_binding(&execution.name) {
                             (
                                 deferred_tool_not_activatable_message(&execution.name),
+                                "tool_not_admitted",
+                            )
+                        } else if !astra_turn_core::tool::runtime_binding::tool_name_requires_runtime_binding(
+                            &execution.name,
+                        ) {
+                            (
+                                tool_not_admitted_message(&execution.name, true),
                                 "tool_not_admitted",
                             )
                         } else {

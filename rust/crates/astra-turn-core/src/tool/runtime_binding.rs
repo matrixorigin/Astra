@@ -97,6 +97,7 @@ mod tests {
         assert!(tool_name_requires_runtime_binding("agent"));
         assert!(tool_name_requires_runtime_binding("mcp__weather"));
         assert!(!tool_name_requires_runtime_binding("github"));
+        assert!(!tool_name_requires_runtime_binding("reflect"));
         assert!(!tool_name_requires_runtime_binding("definitely_unknown"));
     }
 
@@ -106,6 +107,7 @@ mod tests {
         assert!(tool_name_requires_executor_binding("agent"));
         assert!(!tool_name_requires_executor_binding("mcp__weather"));
         assert!(!tool_name_requires_executor_binding("github"));
+        assert!(!tool_name_requires_executor_binding("reflect"));
     }
 
     #[test]

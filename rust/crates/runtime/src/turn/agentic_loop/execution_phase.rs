@@ -3,7 +3,8 @@ use std::time::Instant;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, DeferredInputState, HostTurnResult,
-    TaskBoardSnapshot, finalize_and_render, finalize_turn_trace, try_write_heavy_checkpoint,
+    TaskBoardSnapshot, finalize_and_render, finalize_turn_trace, publish_introspect_snapshot,
+    try_write_heavy_checkpoint,
 };
 use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
@@ -1142,6 +1143,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 }
             }
         }
+        let lifecycle_summary = host.turn_start_lifecycle_summary(state);
+        publish_introspect_snapshot(host, state, lifecycle_summary);
         host.on_turn_completed(state);
     }
 
@@ -3059,6 +3062,7 @@ mod tests {
     #[tokio::test]
     async fn turn_completed_hook_fires_once_on_successful_turn() {
         let mut state = make_state();
+        state.max_turn_input_tokens = 10_000;
         let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
 
         let _ = execute_turn_and_ingest_phase(
@@ -3077,6 +3081,19 @@ mod tests {
             host.turn_completed_run_ids.len(),
             1,
             "hook must fire exactly once per successful turn"
+        );
+        assert_eq!(
+            host.introspect_snapshots.len(),
+            1,
+            "successful clean ingest must publish one introspect snapshot"
+        );
+        let snapshot = host.introspect_snapshots.last().unwrap();
+        assert_eq!(snapshot.turns_completed, 1);
+        assert_eq!(snapshot.total_input_tokens, 10);
+        assert_eq!(snapshot.total_output_tokens, 5);
+        assert!(
+            snapshot.token_pressure > 0.0,
+            "bounded context must publish non-zero token pressure: {snapshot:?}"
         );
     }
 
@@ -3149,6 +3166,10 @@ mod tests {
             host.turn_completed_run_ids.is_empty(),
             "hook must not fire when ingest returns Fatal"
         );
+        assert!(
+            host.introspect_snapshots.is_empty(),
+            "fatal ingest must not publish a partial introspect snapshot"
+        );
     }
 
     #[tokio::test]
@@ -3177,6 +3198,10 @@ mod tests {
         assert!(
             host.turn_completed_run_ids.is_empty(),
             "hook must not fire on execute_turn error"
+        );
+        assert!(
+            host.introspect_snapshots.is_empty(),
+            "execute_turn error must not publish an introspect snapshot"
         );
     }
 

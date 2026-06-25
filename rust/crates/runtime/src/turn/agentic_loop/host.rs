@@ -49,8 +49,8 @@
 //! which wraps this loop with consistent outcome mapping.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use astra_services::session_audit::RuntimePromotionEventData;
@@ -140,8 +140,8 @@ pub enum ControlToolRecovery {
 }
 
 pub use astra_turn_core::interaction_types::{
-    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence, TurnInteractionMode,
-    TurnInteractionPolicy, ASK_USER_TOOL_NAME,
+    ASK_USER_TOOL_NAME, TurnInteractionMode, TurnInteractionPolicy,
+    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
 };
 
 // ─── Host trait ──────────────────────────────────────────────────────────────
@@ -250,6 +250,19 @@ pub trait AgenticLoopHost: Send {
     /// context as turn-start state.
     fn turn_start_lifecycle_summary(&self, _state: &AgenticLoopState) -> String {
         String::new()
+    }
+
+    /// Receive the latest normalized runtime snapshot for the `introspect`
+    /// tool.
+    ///
+    /// The runtime owns snapshot construction because the authoritative token,
+    /// round, cache, and stall fields live in [`AgenticLoopState`]. Hosts only
+    /// decide where to publish the snapshot: the CLI stores it on its local
+    /// [`ToolExecutor`], while server mode uses [`ServerToolExecutor`] below.
+    fn on_introspect_snapshot(
+        &mut self,
+        _snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+    ) {
     }
 
     /// Optional LLM summary client for summary-based compaction helpers.
@@ -391,6 +404,140 @@ pub trait AgenticLoopHost: Send {
     ///   exact "writing through multiple layers of references" pain
     ///   the dedicated capture slot was designed to avoid.
     fn on_turn_completed(&mut self, _state: &AgenticLoopState) {}
+}
+
+pub(crate) fn publish_introspect_snapshot<H: AgenticLoopHost + ?Sized>(
+    host: &mut H,
+    state: &AgenticLoopState,
+    lifecycle_summary: String,
+) {
+    let snapshot = build_introspect_snapshot(state, lifecycle_summary);
+    host.on_introspect_snapshot(snapshot.clone());
+    if let Some(executor) = state.server_tool_executor.as_deref() {
+        executor.update_introspect_snapshot(snapshot);
+    }
+}
+
+pub(crate) fn build_introspect_snapshot(
+    state: &AgenticLoopState,
+    lifecycle_summary: String,
+) -> astra_turn_core::introspect::IntrospectSnapshot {
+    let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
+    let cache_ratio = if total_in > 0 {
+        state.total_cache_read as f64 / total_in as f64
+    } else {
+        0.0
+    };
+    let working_mem = state
+        .pipeline_session
+        .as_ref()
+        .map(|s| s.working_memory().render_prompt_section())
+        .unwrap_or_default();
+
+    let recent_rounds = state
+        .recent_rounds
+        .iter()
+        .map(|r| astra_turn_core::introspect::RoundSnapshotEntry {
+            turn: r.turn,
+            round: r.round,
+            provider: r.provider.clone(),
+            model: r.model.clone(),
+            prompt_tokens: r.prompt_tokens,
+            cache_read_tokens: r.cache_read_tokens,
+            cache_creation_tokens: r.cache_creation_tokens,
+            completion_tokens: r.completion_tokens,
+            tool_calls_returned: r.tool_calls_returned,
+            tool_call_names: r.tool_call_names.clone(),
+            duration_ms: r.duration_ms,
+            finish_reason: r.finish_reason.clone(),
+        })
+        .collect();
+    let volatile_pending = state
+        .volatile_pending
+        .iter()
+        .map(|inj| astra_turn_core::introspect::VolatileSnapshotEntry {
+            kind: format!("{:?}", inj.kind),
+            content: inj.content.clone(),
+            round_index: inj.round_index,
+        })
+        .collect();
+    let events: Vec<String> = state
+        .stall
+        .events
+        .iter()
+        .map(|(name, turn)| format!("{name} @ turn {turn}"))
+        .collect();
+    let stall_state = astra_turn_core::introspect::StallSnapshotSummary {
+        nudge_count: state.stall.nudge_count,
+        events,
+        introspection_count: state.stall.introspection_count,
+        forced_execution_escalation: state.stall.forced_execution_escalation,
+        forced_parallel_batching: state.stall.forced_parallel_batching,
+        forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
+        forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
+        forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
+        forced_exploration_family_lockout: state.stall.forced_exploration_family_lockout,
+        forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
+        forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
+    };
+
+    let current_round = state.current_round_index;
+    let bias_map = state.turn_guard.health.outcome_bias_by_tool(3600);
+    let tool_health: Vec<astra_turn_core::introspect::ToolHealthEntry> = state
+        .turn_guard
+        .health
+        .all()
+        .iter()
+        .filter(|(_, h)| h.total_calls > 0)
+        .map(|(name, h)| {
+            let last_fail_cat = bias_map.get(name).and_then(|b| b.last_failure_tag.clone());
+            astra_turn_core::introspect::ToolHealthEntry {
+                name: name.clone(),
+                calls: h.total_calls as u32,
+                errors: h.total_failures as u32,
+                avg_ms: 0,
+                avoidance_advised: h.avoidance_advised,
+                consecutive_failures: h.consecutive_failures as u32,
+                last_failure_category: last_fail_cat,
+            }
+        })
+        .collect();
+
+    astra_turn_core::introspect::IntrospectSnapshot {
+        current_model: state.current_model_identity().map(str::to_string),
+        token_pressure: introspect_token_pressure(state),
+        cache_hit_ratio: cache_ratio,
+        turns_completed: state.llm_rounds_completed,
+        turns_remaining: state.remaining_turns as u32,
+        compaction_tier: format!("{:?}", state.compact_tier_applied),
+        alerts: Vec::new(),
+        tool_health,
+        working_memory_summary: working_mem,
+        lifecycle_summary,
+        total_input_tokens: state.total_prompt + state.total_cache_read,
+        total_output_tokens: state.total_completion,
+        cache_read_tokens: state.total_cache_read,
+        cache_creation_tokens: state.total_cache_creation,
+        recent_rounds,
+        volatile_pending,
+        stall_state,
+        injection_freshness: Vec::new(),
+        current_round,
+        tool_errors: state.turn_guard.health.recent_errors(10),
+        circuit_breaker: None,
+    }
+}
+
+pub(crate) fn introspect_token_pressure(state: &AgenticLoopState) -> f64 {
+    if state.max_turn_input_tokens == 0 {
+        return 0.0;
+    }
+    let fresh_estimate = crate::prompts::estimate_tokens(
+        &state.messages,
+        state.always_load_tool_schema_tokens as usize,
+        0,
+    ) as u64;
+    fresh_estimate as f64 / state.max_turn_input_tokens as f64
 }
 
 // ─── Loop state sub-structs ──────────────────────────────────────────────────
@@ -1864,27 +2011,27 @@ pub const DELEGATE_TOOL_NAME: &str =
     super::super::agentic::delegate_interception::DELEGATE_TOOL_NAME;
 
 pub(crate) use super::super::agentic::delegate_interception::{
-    coordination_pattern_name, delegation_adaptive_context, delegation_final_output_preview,
-    format_delegation_result, format_delegation_terminal_preview, is_delegation_call,
-    merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
+    DelegationAdaptiveContext, DelegationExecutionResult, DelegationFinalOutputSource,
+    DelegationOutcomeMetadata, coordination_pattern_name, delegation_adaptive_context,
+    delegation_final_output_preview, format_delegation_result, format_delegation_terminal_preview,
+    is_delegation_call, merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
     parse_delegate_agents, parse_delegation_request, partition_and_execute_delegations,
     pattern_from_name, select_default_coordination_pattern, task_needs_review,
-    tool_call_arguments_value, tool_call_name, DelegationAdaptiveContext,
-    DelegationExecutionResult, DelegationFinalOutputSource, DelegationOutcomeMetadata,
+    tool_call_arguments_value, tool_call_name,
 };
 
 use super::super::harness_adapter::harness_at;
 pub(crate) use super::execution_phase::{
-    execute_turn_and_ingest_phase, TurnExecutionControl, TurnExecutionPhase,
+    TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
 };
 pub(crate) use super::finalization::{
     finalize_and_render, finalize_turn_trace, run_agentic_loop_with_host,
     try_write_heavy_checkpoint,
 };
 pub(crate) use super::lifecycle::{
-    prepare_turn_iteration, run_loop_preamble, PreparedTurnIteration, TurnIterationPrep,
+    PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
 };
-pub(crate) use super::tool_phase::{execute_tool_phase, TurnToolPhaseControl};
+pub(crate) use super::tool_phase::{TurnToolPhaseControl, execute_tool_phase};
 
 #[cfg(feature = "harness")]
 pub(crate) fn set_harness_interruption(
@@ -2532,6 +2679,7 @@ pub(crate) mod tests {
         /// assert the hook runs AFTER `ingest_agentic_turn_stream`
         /// populated that field.
         pub(crate) turn_completed_run_ids: Vec<Option<String>>,
+        pub(crate) introspect_snapshots: Vec<astra_turn_core::introspect::IntrospectSnapshot>,
         pub(crate) cancelled_agent_ids: Vec<String>,
         pub(crate) cancel_child_agents_delay: Option<std::time::Duration>,
     }
@@ -2552,6 +2700,7 @@ pub(crate) mod tests {
                 recovered_control_results: HashMap::new(),
                 recovered_control_requests: Vec::new(),
                 turn_completed_run_ids: Vec::new(),
+                introspect_snapshots: Vec::new(),
                 cancelled_agent_ids: Vec::new(),
                 cancel_child_agents_delay: None,
             }
@@ -2675,6 +2824,13 @@ pub(crate) mod tests {
 
         fn render_final_text(&mut self, text: &str) {
             self.rendered_final_text.push(text.to_string());
+        }
+
+        fn on_introspect_snapshot(
+            &mut self,
+            snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+        ) {
+            self.introspect_snapshots.push(snapshot);
         }
 
         async fn cancel_child_agents(
@@ -3005,6 +3161,64 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn publish_introspect_snapshot_delivers_live_runtime_metrics_to_host() {
+        let mut state = make_state();
+        state.context_manifest_model_name = Some("deepseek-v4-pro-official".to_string());
+        state.total_prompt = 30_000;
+        state.total_cache_read = 4_000;
+        state.total_cache_creation = 1_000;
+        state.total_completion = 2_500;
+        state.llm_rounds_completed = 7;
+        state.remaining_turns = 13;
+        state.max_turn_input_tokens = 200_000;
+        state.always_load_tool_schema_tokens = 120;
+        state.messages = vec![
+            json!({"role": "system", "content": "runtime state"}),
+            json!({"role": "user", "content": "inspect current progress"}),
+        ];
+        state.push_recent_round(RecentRoundSummary {
+            turn: 3,
+            round: 6,
+            provider: "edge".to_string(),
+            model: "deepseek-v4-pro-official".to_string(),
+            prompt_tokens: 1200,
+            cache_read_tokens: 300,
+            cache_creation_tokens: 10,
+            completion_tokens: 250,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["read_file".to_string()],
+            duration_ms: 42,
+            finish_reason: Some("tool_calls".to_string()),
+        });
+        let mut host = MockHost::new(Vec::new());
+
+        publish_introspect_snapshot(&mut host, &state, "turn-start lifecycle".to_string());
+
+        let snapshot = host
+            .introspect_snapshots
+            .pop()
+            .expect("host must receive introspect snapshot");
+        assert_eq!(
+            snapshot.current_model.as_deref(),
+            Some("deepseek-v4-pro-official")
+        );
+        assert!(
+            snapshot.token_pressure > 0.0,
+            "bounded context must report non-zero token pressure: {snapshot:?}"
+        );
+        assert_eq!(snapshot.cache_hit_ratio, 4_000.0 / 35_000.0);
+        assert_eq!(snapshot.turns_completed, 7);
+        assert_eq!(snapshot.turns_remaining, 13);
+        assert_eq!(snapshot.total_input_tokens, 34_000);
+        assert_eq!(snapshot.total_output_tokens, 2_500);
+        assert_eq!(snapshot.cache_read_tokens, 4_000);
+        assert_eq!(snapshot.cache_creation_tokens, 1_000);
+        assert_eq!(snapshot.lifecycle_summary, "turn-start lifecycle");
+        assert_eq!(snapshot.recent_rounds.len(), 1);
+        assert_eq!(snapshot.recent_rounds[0].tool_call_names, vec!["read_file"]);
+    }
+
+    #[test]
     fn task_board_snapshot_summarizes_active_tasks_stably() {
         let snapshot = TaskBoardSnapshot::from_active_tasks(&[
             SessionTask {
@@ -3329,7 +3543,7 @@ pub(crate) mod tests {
         // Tokens accumulate across turns (+=)
         assert_eq!(state.total_prompt, 35); // 20 + 15
         assert_eq!(state.total_completion, 15); // 10 + 5
-                                                // Edge tool counted
+        // Edge tool counted
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
@@ -3509,7 +3723,7 @@ pub(crate) mod tests {
         assert_eq!(host.current_turn, 0); // No turns executed
         assert!(state.final_text.contains("without a final answer")); // EmptyCompletion message
         assert_eq!(state.remaining_turns, 10); // Unchanged
-                                               // EmptyCompletion interruption recorded
+        // EmptyCompletion interruption recorded
         let interruption = state
             .interruption
             .as_ref()
@@ -3681,11 +3895,13 @@ pub(crate) mod tests {
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         assert!(state.final_text.contains("Turn budget exhausted"));
-        assert!(!state
-            .messages
-            .iter()
-            .filter_map(|message| message.get("content").and_then(Value::as_str))
-            .any(|content| content.contains("Budget review")));
+        assert!(
+            !state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
     }
 
     #[tokio::test]
@@ -3790,14 +4006,18 @@ pub(crate) mod tests {
             !state.final_text.contains("changes look good"),
             "budget exhaustion must overwrite stale success-shaped text"
         );
-        assert!(state
-            .final_text
-            .contains("Turn budget exhausted after 2 agentic turn(s)"));
-        assert!(!state
-            .messages
-            .iter()
-            .filter_map(|message| message.get("content").and_then(Value::as_str))
-            .any(|content| content.contains("Budget review")));
+        assert!(
+            state
+                .final_text
+                .contains("Turn budget exhausted after 2 agentic turn(s)")
+        );
+        assert!(
+            !state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
     }
 
     #[tokio::test]
@@ -4505,14 +4725,14 @@ pub(crate) mod tests {
     // ── E2E delegation round-trip tests ─────────────────────────────────────
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
-    pub(crate) fn make_test_delegation_engine(
-    ) -> Arc<crate::server::delegation::engine::DelegationEngine> {
+    pub(crate) fn make_test_delegation_engine()
+    -> Arc<crate::server::delegation::engine::DelegationEngine> {
         use crate::server::delegation::engine::{
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run::engine::RunEngine;
-        use astra_services::coordination::{AgentProfile, AgentTier};
         use astra_services::AgentProfileRegistry;
+        use astra_services::coordination::{AgentProfile, AgentTier};
 
         let mut registry = AgentProfileRegistry::new();
         let _ = registry.register(AgentProfile::new(
@@ -5516,14 +5736,18 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
         assert_eq!(msg1.len(), 1);
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Follow these instructions carefully."));
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Follow these instructions carefully.")
+        );
 
         // Second call: replay loaded content + dedup note.
         let msg2: Vec<&Value> = state
@@ -5583,20 +5807,24 @@ pub(crate) mod tests {
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
 
         let msg2: Vec<&Value> = state
             .messages
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
             .collect();
-        assert!(msg2[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: other-skill"));
+        assert!(
+            msg2[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: other-skill")
+        );
 
         // Both tracked
         assert_eq!(state.skills.invoked.len(), 2);
@@ -5731,10 +5959,12 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
             .collect();
         assert_eq!(skill_msgs.len(), 1);
-        assert!(skill_msgs[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
+        assert!(
+            skill_msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
 
         // Skill exclusivity drop is now a debug log, not a user-facing headless line.
         // Verify the host did NOT receive any deferred notice (it goes to tracing now).
@@ -6979,8 +7209,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
     }
 
-    pub(crate) fn make_session(
-    ) -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
+    pub(crate) fn make_session()
+    -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
         std::sync::Arc::new(std::sync::RwLock::new(
             crate::observability::ObservabilitySession::new_simple("test-session"),
         ))
@@ -9466,7 +9696,7 @@ mod parallel_execution_tests {
     /// Unit test for partition_tool_batches.
     #[test]
     fn partition_tool_batches_groups_correctly() {
-        use crate::turn::agentic::headless_round::{partition_tool_batches, ToolBatch};
+        use crate::turn::agentic::headless_round::{ToolBatch, partition_tool_batches};
         use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
 
         let tool_calls = vec![

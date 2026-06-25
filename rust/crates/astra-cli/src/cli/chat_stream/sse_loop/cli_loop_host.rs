@@ -714,114 +714,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             }
         }
 
-        // Update introspect snapshot so the `introspect` tool returns fresh
-        // token/tool/round diagnostics if the model calls it on a subsequent
-        // round this turn. The lifecycle block is the turn-start prompt
-        // context that the model already saw; task/plan mutations after
-        // turn start are intentionally not represented as live state here.
-        let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
-        let cache_ratio = if total_in > 0 {
-            state.total_cache_read as f64 / total_in as f64
-        } else {
-            0.0
-        };
-        let working_mem = state
-            .pipeline_session
-            .as_ref()
-            .map(|s| s.working_memory().render_prompt_section())
-            .unwrap_or_default();
-        let lifecycle_summary = self.append_system_prompt.clone().unwrap_or_default();
-        self.executor
-            .update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
-                current_model: state.current_model_identity().map(str::to_string),
-                token_pressure: 0.0,
-                cache_hit_ratio: cache_ratio,
-                turns_completed: state.llm_rounds_completed,
-                turns_remaining: state.remaining_turns as u32,
-                compaction_tier: format!("{:?}", state.compact_tier_applied),
-                alerts: Vec::new(),
-                tool_health: state
-                    .turn_guard
-                    .health
-                    .all()
-                    .iter()
-                    .filter(|(_, h)| h.total_calls > 0)
-                    .map(|(name, h)| astra_turn_core::introspect::ToolHealthEntry {
-                        name: name.clone(),
-                        calls: h.total_calls as u32,
-                        errors: h.total_failures as u32,
-                        avg_ms: 0,
-                        avoidance_advised: h.avoidance_advised,
-                        consecutive_failures: h.consecutive_failures as u32,
-                        last_failure_category: None,
-                    })
-                    .collect(),
-                working_memory_summary: working_mem,
-                lifecycle_summary,
-                total_input_tokens: state.total_prompt + state.total_cache_read,
-                total_output_tokens: state.total_completion,
-                cache_read_tokens: state.total_cache_read,
-                cache_creation_tokens: state.total_cache_creation,
-                // Task #46 fields populated from state on each turn.
-                recent_rounds: state
-                    .recent_rounds
-                    .iter()
-                    .map(|r| astra_turn_core::introspect::RoundSnapshotEntry {
-                        turn: r.turn,
-                        round: r.round,
-                        provider: r.provider.clone(),
-                        model: r.model.clone(),
-                        prompt_tokens: r.prompt_tokens,
-                        cache_read_tokens: r.cache_read_tokens,
-                        cache_creation_tokens: r.cache_creation_tokens,
-                        completion_tokens: r.completion_tokens,
-                        tool_calls_returned: r.tool_calls_returned,
-                        tool_call_names: r.tool_call_names.clone(),
-                        duration_ms: r.duration_ms,
-                        finish_reason: r.finish_reason.clone(),
-                    })
-                    .collect(),
-                volatile_pending: state
-                    .volatile_pending
-                    .iter()
-                    .map(|inj| astra_turn_core::introspect::VolatileSnapshotEntry {
-                        kind: format!("{:?}", inj.kind),
-                        content: inj.content.clone(),
-                        round_index: inj.round_index,
-                    })
-                    .collect(),
-                stall_state: astra_turn_core::introspect::StallSnapshotSummary {
-                    nudge_count: state.stall.nudge_count,
-                    events: state
-                        .stall
-                        .events
-                        .iter()
-                        .map(|(name, turn)| format!("{name} @ turn {turn}"))
-                        .collect(),
-                    introspection_count: state.stall.introspection_count,
-                    forced_execution_escalation: state.stall.forced_execution_escalation,
-                    forced_parallel_batching: state.stall.forced_parallel_batching,
-                    forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
-                    forced_redundant_reads_corrective: state
-                        .stall
-                        .forced_redundant_reads_corrective,
-                    forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
-                    forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
-                    forced_exploration_family_lockout: state
-                        .stall
-                        .forced_exploration_family_lockout,
-                    forced_exploration_family_corrective: state
-                        .stall
-                        .forced_exploration_family_corrective,
-                },
-                // Injection freshness is session-scoped (filled by
-                // `handle_introspect` from `ObservabilitySession.injection_history`).
-                injection_freshness: Vec::new(),
-                current_round: state.current_round_index,
-                tool_errors: state.turn_guard.health.recent_errors(10),
-                circuit_breaker: None,
-            });
-
         let error_kind = turn_result.core.error_kind;
         Ok(HostTurnResult {
             accum: turn_result.core,
@@ -932,6 +824,20 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
         self.capabilities.clone()
+    }
+
+    fn turn_start_lifecycle_summary(
+        &self,
+        _state: &astra_runtime::turn::agentic_loop::host::AgenticLoopState,
+    ) -> String {
+        self.append_system_prompt.clone().unwrap_or_default()
+    }
+
+    fn on_introspect_snapshot(
+        &mut self,
+        snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+    ) {
+        self.executor.update_introspect_snapshot(snapshot);
     }
 
     async fn recover_missing_control_tool_result(

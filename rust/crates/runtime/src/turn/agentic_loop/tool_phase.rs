@@ -28,8 +28,9 @@ use super::super::agentic::tool_interception::{PreparedToolRound, prepare_interc
 use super::execution_phase::{TurnExecutionPhase, observe_turn_end_without_tools};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
-    ControlToolRecovery, MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render,
-    finalize_turn_trace, record_edge_tool_observability,
+    ControlToolRecovery, MAX_TRACKED_FILE_READS, build_introspect_snapshot,
+    extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
+    introspect_token_pressure, publish_introspect_snapshot, record_edge_tool_observability,
 };
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use astra_turn_core::agentic_post_tool_policy::{
@@ -1288,13 +1289,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .map(|r| (tool_dedup_signature(&r.tool, &r.args), r.output.clone()))
         .collect();
 
-    // Update introspect snapshot so the tool can return fresh state.
-    if let Some(executor) = state.server_tool_executor.as_deref() {
-        let lifecycle_summary = host.turn_start_lifecycle_summary(state);
-        let snapshot = build_introspect_snapshot(state, lifecycle_summary);
-        executor.update_introspect_snapshot(snapshot);
-    }
-
     let evo_records_before = state.stall.tool_call_records.len();
     let plan_mode_active = host.plan_mode_active(state);
     let headless_quiet = prep.quiet || state.skill_produced_output;
@@ -1448,6 +1442,12 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         ),
     };
     state.push_recent_round(recent_summary);
+
+    // Publish after the round summary enters the in-memory ring so the next
+    // LLM round sees the same token/cache counters and recent-round view on
+    // CLI and server surfaces.
+    let lifecycle_summary = host.turn_start_lifecycle_summary(state);
+    publish_introspect_snapshot(host, state, lifecycle_summary);
 
     if let Some(ref mut buf) = state.turn_event_buffer {
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
@@ -1865,141 +1865,6 @@ fn observe_gate_cancelled(
         let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
         crate::observability::on_turn_end(hub, &mut session_guard, timing);
     }
-}
-
-fn build_introspect_snapshot(
-    state: &super::host::AgenticLoopState,
-    lifecycle_summary: String,
-) -> astra_turn_core::introspect::IntrospectSnapshot {
-    let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
-    let cache_ratio = if total_in > 0 {
-        state.total_cache_read as f64 / total_in as f64
-    } else {
-        0.0
-    };
-    let working_mem = state
-        .pipeline_session
-        .as_ref()
-        .map(|s| s.working_memory().render_prompt_section())
-        .unwrap_or_default();
-
-    // Task #46: populate the in-memory self-awareness fields from state.
-    let recent_rounds = state
-        .recent_rounds
-        .iter()
-        .map(|r| astra_turn_core::introspect::RoundSnapshotEntry {
-            turn: r.turn,
-            round: r.round,
-            provider: r.provider.clone(),
-            model: r.model.clone(),
-            prompt_tokens: r.prompt_tokens,
-            cache_read_tokens: r.cache_read_tokens,
-            cache_creation_tokens: r.cache_creation_tokens,
-            completion_tokens: r.completion_tokens,
-            tool_calls_returned: r.tool_calls_returned,
-            tool_call_names: r.tool_call_names.clone(),
-            duration_ms: r.duration_ms,
-            finish_reason: r.finish_reason.clone(),
-        })
-        .collect();
-    let volatile_pending = state
-        .volatile_pending
-        .iter()
-        .map(|inj| astra_turn_core::introspect::VolatileSnapshotEntry {
-            kind: format!("{:?}", inj.kind),
-            content: inj.content.clone(),
-            round_index: inj.round_index,
-        })
-        .collect();
-    let events: Vec<String> = state
-        .stall
-        .events
-        .iter()
-        .map(|(name, turn)| format!("{name} @ turn {turn}"))
-        .collect();
-    let stall_state = astra_turn_core::introspect::StallSnapshotSummary {
-        nudge_count: state.stall.nudge_count,
-        events,
-        introspection_count: state.stall.introspection_count,
-        forced_execution_escalation: state.stall.forced_execution_escalation,
-        forced_parallel_batching: state.stall.forced_parallel_batching,
-        forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
-        forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
-        forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
-        forced_exploration_family_lockout: state.stall.forced_exploration_family_lockout,
-        forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
-        forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
-    };
-
-    // Injection-freshness is session-scoped (lives on ObservabilitySession,
-    // not on the per-turn AgenticLoopState). The CLI edge_tools path
-    // overlays it on the snapshot just before rendering — see
-    // `build_self_model_for_agent` companion hook. Server-path builds of
-    // this snapshot (e.g., for server-side introspect API) leave it empty.
-    let current_round = state.current_round_index;
-
-    let bias_map = state.turn_guard.health.outcome_bias_by_tool(3600);
-    let tool_health: Vec<astra_turn_core::introspect::ToolHealthEntry> = state
-        .turn_guard
-        .health
-        .all()
-        .iter()
-        .filter(|(_, h)| h.total_calls > 0)
-        .map(|(name, h)| {
-            let last_fail_cat = bias_map.get(name).and_then(|b| b.last_failure_tag.clone());
-            astra_turn_core::introspect::ToolHealthEntry {
-                name: name.clone(),
-                calls: h.total_calls as u32,
-                errors: h.total_failures as u32,
-                avg_ms: 0,
-                avoidance_advised: h.avoidance_advised,
-                consecutive_failures: h.consecutive_failures as u32,
-                last_failure_category: last_fail_cat,
-            }
-        })
-        .collect();
-
-    let tool_errors = state.turn_guard.health.recent_errors(10);
-
-    let token_pressure = introspect_token_pressure(state);
-
-    astra_turn_core::introspect::IntrospectSnapshot {
-        current_model: state.current_model_identity().map(str::to_string),
-        token_pressure,
-        cache_hit_ratio: cache_ratio,
-        turns_completed: state.llm_rounds_completed,
-        turns_remaining: state.remaining_turns as u32,
-        compaction_tier: format!("{:?}", state.compact_tier_applied),
-        alerts: Vec::new(),
-        tool_health,
-        working_memory_summary: working_mem,
-        lifecycle_summary,
-        total_input_tokens: state.total_prompt + state.total_cache_read,
-        total_output_tokens: state.total_completion,
-        cache_read_tokens: state.total_cache_read,
-        cache_creation_tokens: state.total_cache_creation,
-        recent_rounds,
-        volatile_pending,
-        stall_state,
-        injection_freshness: Vec::new(),
-        current_round,
-        tool_errors,
-        circuit_breaker: None, // populated by bridge when available
-    }
-}
-
-fn introspect_token_pressure(state: &super::host::AgenticLoopState) -> f64 {
-    // Compute token pressure using the same precise estimation as lifecycle.rs.
-    // Falls back to 0.0 when max_turn_input_tokens is 0 (unlimited legacy mode).
-    if state.max_turn_input_tokens == 0 {
-        return 0.0;
-    }
-    let fresh_estimate = crate::prompts::estimate_tokens(
-        &state.messages,
-        state.always_load_tool_schema_tokens as usize,
-        0,
-    ) as u64;
-    fresh_estimate as f64 / state.max_turn_input_tokens as f64
 }
 
 #[cfg(test)]

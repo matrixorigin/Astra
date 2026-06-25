@@ -225,7 +225,12 @@ pub fn cli_remote_tool_schemas(
 }
 
 fn retain_server_executable_schemas(schemas: &mut Vec<Value>) {
-    schemas.retain(|schema| !matches!(tool_schema_name(schema), Some("lsp" | "powershell")));
+    schemas.retain(|schema| {
+        !matches!(
+            tool_schema_name(schema),
+            Some("lsp" | "powershell" | "reflect")
+        )
+    });
 }
 
 /// Return the skill source policy for a surface.
@@ -737,6 +742,11 @@ mod tests {
         let caps = full_server_capabilities_for_tests();
         let web = names(server_runtime_tool_schemas(&caps));
         let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
+        let local = names(cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            Vec::new(),
+            &caps,
+        ));
 
         for (surface, names) in [("web", web), ("remote", remote)] {
             assert!(
@@ -744,6 +754,10 @@ mod tests {
                 "{surface} executes on the server and must use HTTP reflect routes, not the CLI-local reflect tool facade: {names:?}"
             );
         }
+        assert!(
+            local.contains(&"reflect".to_string()),
+            "local CLI must retain the reflect facade so it can use session artifacts: {local:?}"
+        );
     }
 
     #[test]

@@ -729,6 +729,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_reflect_without_edge_row_reports_activation_not_runtime_missing() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "call-reflect",
+            "type": "function",
+            "function": {
+                "name": "reflect",
+                "arguments": "{}",
+            }
+        })];
+        harness.edge_tool_round.clear();
+        harness.valid_tool_names = HashSet::from(["tool_search".to_string()]);
+        harness.deferred_tool_names = HashSet::from(["reflect".to_string()]);
+        begin_recorded_turn(&mut harness, 1);
+
+        {
+            let mut pipeline = harness.pipeline();
+            match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+                HeadlessPipelineStage::ShortCircuit => {}
+                _ => panic!("direct deferred reflect call must be rejected before execution"),
+            }
+        }
+
+        let result = harness
+            .tool_results
+            .last()
+            .expect("rejection must append a tool result")
+            .to_string();
+        assert!(
+            result.contains("not available in this turn yet"),
+            "deferred local reflect should produce an activation/admission hint, got: {result}"
+        );
+        assert!(
+            !result.contains("required runtime capability is not connected"),
+            "reflect is a CLI-local facade, not an executor-gated runtime: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_agent_without_executor_still_reports_runtime_missing() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "call-agent",
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "arguments": r#"{"action":"spawn","prompt":"review"}"#,
+            }
+        })];
+        harness.edge_tool_round.clear();
+        harness.valid_tool_names = HashSet::from(["tool_search".to_string()]);
+        harness.deferred_tool_names = HashSet::from(["agent".to_string()]);
+        begin_recorded_turn(&mut harness, 1);
+
+        {
+            let mut pipeline = harness.pipeline();
+            match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+                HeadlessPipelineStage::ShortCircuit => {}
+                _ => panic!("direct deferred agent call must be rejected without executor"),
+            }
+        }
+
+        let result = harness
+            .tool_results
+            .last()
+            .expect("rejection must append a tool result")
+            .to_string();
+        assert!(
+            result.contains("multi-agent runtime is not connected"),
+            "executor-gated agent must still fail closed, got: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn permit_execution_returns_permitted_execution_for_allowed_tool() {
         let mut harness = PipelineHarness::new();
         let mut pipeline = harness.pipeline();
