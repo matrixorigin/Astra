@@ -3533,7 +3533,7 @@ impl ToolExecutor {
         // Edge-only data providers are available in the CLI runtime because
         // it owns local session artifacts. The shared renderer returns an
         // explicit unavailable surface for these facets in pure server mode.
-        if request.facet == astra_turn_core::introspect::IntrospectFacet::Cache
+        if request.facet == astra_core::ObservationFacet::Performance
             && !request.format.is_json()
             && request.source_policy.allows_edge_local_artifacts()
         {
@@ -3572,7 +3572,7 @@ impl ToolExecutor {
             snap.current_round = s.turn_number;
         }
 
-        if request.facet == astra_turn_core::introspect::IntrospectFacet::SessionMemory
+        if request.facet == astra_core::ObservationFacet::Memory
             && !request.format.is_json()
             && request.source_policy.allows_edge_local_artifacts()
         {

@@ -1,17 +1,17 @@
 use super::{
-    Diagnosis, EvidenceGraph, Insight, ReflectActionHint, ReflectAdaptationSignal,
-    ReflectCausalChain, ReflectConfidence, ReflectEvidence, ReflectFailureCluster,
-    ReflectObservation, ReflectRequest, ReflectSignalConsumer, SessionOverview,
+    Diagnosis, EvidenceGraph, Insight, ObservationActionHint, ObservationAdaptationSignal,
+    ObservationCausalChain, ObservationConfidence, ObservationEvidence, ObservationFailureCluster,
+    ObservationRecord, ReflectRequest, ObservationSignalConsumer, SessionOverview,
 };
 
 pub(super) struct ObservationEnvelope {
     pub summary: String,
-    pub observations: Vec<ReflectObservation>,
-    pub evidence: Vec<ReflectEvidence>,
-    pub action_hints: Vec<ReflectActionHint>,
-    pub failure_clusters: Vec<ReflectFailureCluster>,
-    pub causal_chains: Vec<ReflectCausalChain>,
-    pub adaptation_signals: Vec<ReflectAdaptationSignal>,
+    pub observations: Vec<ObservationRecord>,
+    pub evidence: Vec<ObservationEvidence>,
+    pub action_hints: Vec<ObservationActionHint>,
+    pub failure_clusters: Vec<ObservationFailureCluster>,
+    pub causal_chains: Vec<ObservationCausalChain>,
+    pub adaptation_signals: Vec<ObservationAdaptationSignal>,
 }
 
 pub(super) fn build_observation_envelope(
@@ -38,31 +38,31 @@ pub(super) fn build_observation_envelope(
                 "urn:astra:artifact:cloud:reflect:{session_component}:diagnosis:{idx}:sample:{sample_idx}"
             );
             evidence_refs.push(evidence_ref.clone());
-            evidence.push(ReflectEvidence {
+            evidence.push(ObservationEvidence {
                 ref_id: evidence_ref,
                 evidence_class: "observed_evidence".to_string(),
                 source: "agent_events.error_sample".to_string(),
                 summary: truncate_chars(sample, 180),
-                confidence: ReflectConfidence::evidence(diagnosis_evidence_confidence(diagnosis)),
+                confidence: ObservationConfidence::evidence(diagnosis_evidence_confidence(diagnosis)),
             });
         }
 
         let (topic, facet) = diagnosis_topic_facet();
-        observations.push(ReflectObservation {
+        observations.push(ObservationRecord {
             ref_id: observation_ref.clone(),
             topic,
             facet,
             kind: format!("diagnosis:{}", diagnosis.category),
             severity: diagnosis.severity.clone(),
             summary: diagnosis.summary.clone(),
-            confidence: ReflectConfidence::complete(
+            confidence: ObservationConfidence::complete(
                 0.90,
                 diagnosis_evidence_confidence(diagnosis),
                 diagnosis_causal_confidence(diagnosis),
             ),
             evidence_refs,
         });
-        failure_clusters.push(ReflectFailureCluster {
+        failure_clusters.push(ObservationFailureCluster {
             cluster_ref: format!(
                 "urn:astra:failure_cluster:graph:reflect:{session_component}:{}:{}",
                 urn_component(&diagnosis.category.to_string()),
@@ -82,7 +82,7 @@ pub(super) fn build_observation_envelope(
             ),
             observation_refs: vec![observation_ref],
             evidence_class: "inferred_evidence".to_string(),
-            confidence: ReflectConfidence::classification_evidence(
+            confidence: ObservationConfidence::classification_evidence(
                 0.84,
                 diagnosis_evidence_confidence(diagnosis),
             ),
@@ -98,24 +98,24 @@ pub(super) fn build_observation_envelope(
                 "urn:astra:artifact:cloud:reflect:{session_component}:insight:{idx}:evidence"
             );
             evidence_refs.push(evidence_ref.clone());
-            evidence.push(ReflectEvidence {
+            evidence.push(ObservationEvidence {
                 ref_id: evidence_ref,
                 evidence_class: "inferred_evidence".to_string(),
                 source: "reflect.statistical_insight".to_string(),
                 summary: truncate_chars(&insight.evidence, 180),
-                confidence: ReflectConfidence::evidence(0.70),
+                confidence: ObservationConfidence::evidence(0.70),
             });
         }
 
         let (topic, facet) = insight_topic_facet(request, insight);
-        observations.push(ReflectObservation {
+        observations.push(ObservationRecord {
             ref_id: observation_ref,
             topic,
             facet,
             kind: format!("insight:{}", insight.category),
             severity: insight.severity.clone(),
             summary: insight.message.clone(),
-            confidence: ReflectConfidence::complete(
+            confidence: ObservationConfidence::complete(
                 0.80,
                 if evidence_refs.is_empty() { 0.45 } else { 0.70 },
                 0.40,
@@ -125,7 +125,7 @@ pub(super) fn build_observation_envelope(
     }
 
     if observations.is_empty() {
-        observations.push(ReflectObservation {
+        observations.push(ObservationRecord {
             ref_id: format!(
                 "urn:astra:observation:graph:reflect:{session_component}:session:health"
             ),
@@ -138,7 +138,7 @@ pub(super) fn build_observation_envelope(
                 "warning".to_string()
             },
             summary: summary.clone(),
-            confidence: ReflectConfidence::complete(
+            confidence: ObservationConfidence::complete(
                 0.70,
                 if overview.total_events > 0 {
                     0.65
@@ -153,7 +153,7 @@ pub(super) fn build_observation_envelope(
 
     if let Some(graph) = evidence_graph {
         for node in graph.nodes.iter().take(50) {
-            evidence.push(ReflectEvidence {
+            evidence.push(ObservationEvidence {
                 ref_id: graph_node_ref(&node.id),
                 evidence_class: "observed_evidence".to_string(),
                 source: "reflect.graph_slice".to_string(),
@@ -164,7 +164,7 @@ pub(super) fn build_observation_envelope(
                         .unwrap_or(&node.label),
                     180,
                 ),
-                confidence: ReflectConfidence::evidence(0.80),
+                confidence: ObservationConfidence::evidence(0.80),
             });
         }
     }
@@ -181,10 +181,10 @@ pub(super) fn build_observation_envelope(
                 insights,
                 &session_component,
             );
-            ReflectActionHint {
+            ObservationActionHint {
                 target_type: "user_guidance".to_string(),
                 summary: recommendation.trim().to_string(),
-                confidence: ReflectConfidence::classification_evidence(
+                confidence: ObservationConfidence::classification_evidence(
                     if observation_refs.is_empty() {
                         0.50
                     } else {
@@ -231,7 +231,7 @@ fn insight_topic_facet(request: &ReflectRequest, insight: &Insight) -> (String, 
 
 fn observation_refs_for_recommendation(
     recommendation: &str,
-    observations: &[ReflectObservation],
+    observations: &[ObservationRecord],
     diagnoses: &[Diagnosis],
     insights: &[Insight],
     session_component: &str,
@@ -271,9 +271,9 @@ fn observation_refs_for_recommendation(
 
 fn build_adaptation_signals(
     session_component: &str,
-    failure_clusters: &[ReflectFailureCluster],
-    action_hints: &[ReflectActionHint],
-) -> Vec<ReflectAdaptationSignal> {
+    failure_clusters: &[ObservationFailureCluster],
+    action_hints: &[ObservationActionHint],
+) -> Vec<ObservationAdaptationSignal> {
     failure_clusters
         .iter()
         .enumerate()
@@ -283,13 +283,13 @@ fn build_adaptation_signals(
                 return None;
             }
             let target_type = signal_target_type(action_hints, &observation_refs);
-            Some(ReflectAdaptationSignal {
+            Some(ObservationAdaptationSignal {
                 signal_id: format!(
                     "urn:astra:signal:graph:reflect:{session_component}:{target_type}:{idx}"
                 ),
                 observation_refs,
                 failure_cluster_refs: vec![cluster.cluster_ref.clone()],
-                consumer: ReflectSignalConsumer {
+                consumer: ObservationSignalConsumer {
                     suggested_tool_family: Some("tuning_control_plane".to_string()),
                     target_type: target_type.to_string(),
                     payload_kind: format!("{target_type}_signal"),
@@ -302,7 +302,7 @@ fn build_adaptation_signals(
 }
 
 fn signal_target_type<'a>(
-    action_hints: &'a [ReflectActionHint],
+    action_hints: &'a [ObservationActionHint],
     observation_refs: &[String],
 ) -> &'a str {
     action_hints
@@ -316,7 +316,7 @@ fn signal_target_type<'a>(
         .unwrap_or("tool_policy")
 }
 
-fn signal_priority(cluster: &ReflectFailureCluster) -> String {
+fn signal_priority(cluster: &ObservationFailureCluster) -> String {
     let summary = cluster.summary.to_ascii_lowercase();
     if summary.contains("critical")
         || summary.contains("resource_limit")

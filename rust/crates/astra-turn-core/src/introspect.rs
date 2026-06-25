@@ -11,10 +11,11 @@ mod request;
 use serde::{Deserialize, Serialize};
 
 use crate::injection_tracking::{ChannelFreshness, ChannelStatus, InjectionChannel};
-pub use observation::{IntrospectReport, build_introspect_report};
+use astra_core::ObservationFacet;
+pub use observation::{build_introspect_report, IntrospectReport};
 pub use request::{
-    IntrospectDepth, IntrospectFacet, IntrospectFormat, IntrospectRequest, ObservationHorizon,
-    ObservationTopic, SourcePolicy,
+    IntrospectDepth, IntrospectFormat, IntrospectRequest, ObservationHorizon, ObservationTopic,
+    SourcePolicy,
 };
 
 /// Input snapshot provided by the runtime to the introspect renderer.
@@ -153,6 +154,21 @@ pub struct ToolErrorEntry {
     pub failure_category: Option<String>,
     pub error_preview: Option<String>,
     pub at_epoch: u64,
+    /// Raw error message (not classified, not truncated).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error_message: String,
+    /// File path for read_file/write_file/str_replace errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// Line range for read_file errors (e.g., "200-400").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_range: Option<String>,
+    /// Turn index when the error occurred.
+    #[serde(default)]
+    pub turn: u32,
+    /// Round index within the turn.
+    #[serde(default)]
+    pub round: u32,
 }
 
 /// Bridge circuit breaker state snapshot.
@@ -190,17 +206,18 @@ pub fn render_introspect_request(
     }
 
     match &request.facet {
-        IntrospectFacet::Session => render_introspect(snapshot, request.depth.detail()),
-        IntrospectFacet::Recent => render_recent_rounds(snapshot),
-        IntrospectFacet::Volatile => render_volatile_pending(snapshot),
-        IntrospectFacet::Stall => render_stall_state(snapshot),
-        IntrospectFacet::Noise => render_injection_freshness(snapshot),
-        IntrospectFacet::Errors => render_errors(snapshot),
-        IntrospectFacet::All => render_all(snapshot),
-        IntrospectFacet::Cache | IntrospectFacet::SessionMemory => {
+        ObservationFacet::Session => render_introspect(snapshot, request.depth.detail()),
+        ObservationFacet::Recent => render_recent_rounds(snapshot),
+        ObservationFacet::Volatile => render_volatile_pending(snapshot),
+        ObservationFacet::Stall => render_stall_state(snapshot),
+        ObservationFacet::Noise => render_injection_freshness(snapshot),
+        ObservationFacet::Errors => render_errors(snapshot),
+        ObservationFacet::All => render_all(snapshot),
+        ObservationFacet::Performance | ObservationFacet::Memory => {
             render_edge_only_unavailable(request)
         }
-        IntrospectFacet::Unknown(_) => render_unknown_facet(snapshot, request),
+        ObservationFacet::Unknown => render_unknown_facet(snapshot, request),
+        _ => render_unknown_facet(snapshot, request),
     }
 }
 
@@ -483,8 +500,8 @@ pub fn render_errors(s: &IntrospectSnapshot) -> String {
     }
     let mut out = String::from(
         "## Recent Tool Errors (newest first)\n\
-         | Tool | Category | Age(s) | Preview |\n\
-         |------|----------|--------|---------|\n",
+         | Tool | Category | Turn | Age(s) | Preview |\n\
+         |------|----------|------|--------|---------|\n",
     );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -499,10 +516,38 @@ pub fn render_errors(s: &IntrospectSnapshot) -> String {
             .map(|p| p.replace('|', "\\|").replace('\n', " "))
             .unwrap_or_else(|| "-".to_string());
         let short: String = preview.chars().take(80).collect();
+        let turn_str = if e.turn > 0 {
+            format!("T{}R{}", e.turn, e.round)
+        } else {
+            "-".to_string()
+        };
         out.push_str(&format!(
-            "| {} | {} | {}s | {} |\n",
-            e.tool, cat, age, short,
+            "| {} | {} | {} | {}s | {} |\n",
+            e.tool, cat, turn_str, age, short,
         ));
+        // Detail line for file errors
+        if let Some(ref path) = e.file_path {
+            let range = e.file_range.as_deref().unwrap_or("");
+            let msg = if e.error_message.is_empty() {
+                "-"
+            } else {
+                &e.error_message
+            };
+            let msg_short: String = msg.chars().take(60).collect();
+            out.push_str(&format!(
+                "  → path: `{}{}` — {}\n",
+                path,
+                if range.is_empty() {
+                    String::new()
+                } else {
+                    format!(":{range}")
+                },
+                msg_short.replace('\n', " "),
+            ));
+        } else if !e.error_message.is_empty() {
+            let msg_short: String = e.error_message.chars().take(100).collect();
+            out.push_str(&format!("  → {}\n", msg_short.replace('\n', " "),));
+        }
     }
     if !s.tool_errors.is_empty() {
         out.push_str("\nSignature hints:\n");
@@ -740,6 +785,11 @@ mod tests {
             failure_category: Some("tool_timeout".into()),
             error_preview: Some("command timed out after 30s".into()),
             at_epoch: 1,
+            error_message: "command timed out after 30s".into(),
+            file_path: None,
+            file_range: None,
+            turn: 5,
+            round: 2,
         });
 
         let req = IntrospectRequest::from_args(&serde_json::json!({
@@ -762,25 +812,21 @@ mod tests {
         assert_eq!(report.view.topic, "execution");
         assert_eq!(report.view.facet, "errors");
         assert!(report.summary.contains("recent tool errors"));
-        assert!(
-            report
-                .observations
-                .iter()
-                .any(|observation| observation.ref_id
-                    == "urn:astra:observation:local:introspect:execution:error:0"
-                    && observation.kind == "tool_error:tool_timeout")
-        );
+        assert!(report
+            .observations
+            .iter()
+            .any(|observation| observation.ref_id
+                == "urn:astra:observation:local:introspect:execution:error:0"
+                && observation.kind == "tool_error:tool_timeout"));
         assert!(report.evidence.iter().any(
             |evidence| evidence.ref_id == "urn:astra:context:local:introspect:runtime_snapshot"
         ));
         assert_eq!(report.view.data_coverage.overall, "fresh");
-        assert!(
-            report
-                .view
-                .data_coverage
-                .providers
-                .contains_key("live_runtime")
-        );
+        assert!(report
+            .view
+            .data_coverage
+            .providers
+            .contains_key("live_runtime"));
         assert!(!report.budget_result.truncated);
         assert_report_refs_are_valid(&report);
     }
@@ -788,26 +834,24 @@ mod tests {
     #[test]
     fn render_json_edge_only_facet_reports_unavailable_without_unrelated_runtime_noise() {
         let req = IntrospectRequest::from_args(&serde_json::json!({
-            "facet": "session_memory",
+            "facet": "memory",
             "format": "json"
         }));
         let out = render_introspect_request(&sample_snapshot(), &req);
         let report: IntrospectReport = serde_json::from_str(&out).expect("json report");
 
-        assert_eq!(report.view.facet, "session_memory");
+        assert_eq!(report.view.facet, "memory");
         assert_eq!(
             report.view.data_coverage.source,
             "edge_local_artifacts_unavailable"
         );
         assert_eq!(report.view.data_coverage.events, 0);
-        assert!(
-            report
-                .view
-                .data_coverage
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("Edge-local"))
-        );
+        assert!(report
+            .view
+            .data_coverage
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Edge-local")));
         assert_eq!(report.observations.len(), 1);
         assert_eq!(
             report.observations[0].kind, "data_surface_unavailable",
@@ -876,7 +920,7 @@ mod tests {
         assert_eq!(report.observations.len(), 3);
         assert_eq!(report.action_hints.len(), 2);
         assert!(report.budget_result.truncated);
-        assert_eq!(report.budget_result.omitted.observations, 5);
+        assert_eq!(report.budget_result.omitted.observations, 6);
         assert_eq!(report.budget_result.omitted.action_hints, 3);
         assert_report_refs_are_valid(&report);
     }
@@ -901,14 +945,12 @@ mod tests {
             report.view.data_coverage.providers["visible_context"].status,
             "missing"
         );
-        assert!(
-            report
-                .view
-                .data_coverage
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("include_context requested"))
-        );
+        assert!(report
+            .view
+            .data_coverage
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("include_context requested")));
         assert_report_refs_are_valid(&report);
     }
 
@@ -948,11 +990,11 @@ mod tests {
     #[test]
     fn unavailable_message_explains_missing_edge_provider() {
         let req = IntrospectRequest::from_args(&serde_json::json!({
-            "facet": "session_memory"
+            "facet": "memory"
         }));
         let out = render_introspect_request(&IntrospectSnapshot::default(), &req);
         assert!(out.contains("Introspect Unavailable"), "{out}");
-        assert!(out.contains("facet=session_memory"), "{out}");
+        assert!(out.contains("facet=memory"), "{out}");
         assert!(out.contains("CLI/Edge-local session artifacts"), "{out}");
         assert!(
             out.contains("no CLI/Edge-local artifact provider is attached"),
@@ -963,7 +1005,7 @@ mod tests {
     #[test]
     fn unavailable_message_explains_source_policy_exclusion() {
         let req = IntrospectRequest::from_args(&serde_json::json!({
-            "facet": "session_memory",
+            "facet": "memory",
             "source_policy": "cloud_only"
         }));
         let out = render_introspect_request(&IntrospectSnapshot::default(), &req);
@@ -1282,6 +1324,11 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
+                error_message: "command timed out".into(),
+                file_path: None,
+                file_range: None,
+                turn: 3,
+                round: 1,
             }],
             ..Default::default()
         };
@@ -1306,6 +1353,11 @@ mod tests {
                 failure_category: None,
                 error_preview: Some(long_preview.clone()),
                 at_epoch: 1000,
+                error_message: long_preview.clone(),
+                file_path: Some("/long/path/file.txt".into()),
+                file_range: Some("200-400".into()),
+                turn: 10,
+                round: 3,
             }],
             ..Default::default()
         };

@@ -1,3 +1,4 @@
+use astra_core::ObservationFacet;
 use serde_json::Value;
 
 use super::IntrospectTextDepth;
@@ -40,51 +41,7 @@ impl ObservationTopic {
 }
 
 /// Runtime facet selected within an observation topic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IntrospectFacet {
-    Session,
-    Cache,
-    Recent,
-    Volatile,
-    Stall,
-    Noise,
-    Errors,
-    SessionMemory,
-    All,
-    Unknown(String),
-}
-
-impl IntrospectFacet {
-    fn from_arg(arg: &str) -> Self {
-        match normalize_arg(arg).as_str() {
-            "" | "session" | "runtime" | "overview" => Self::Session,
-            "cache" | "execution/cache" | "runtime/cache" | "performance/cache" => Self::Cache,
-            "recent" | "execution/recent" => Self::Recent,
-            "volatile" | "runtime/volatile" => Self::Volatile,
-            "stall" | "execution/stall" => Self::Stall,
-            "noise" | "knowledge/freshness" => Self::Noise,
-            "errors" | "execution/errors" => Self::Errors,
-            "session_memory" | "knowledge/memory" => Self::SessionMemory,
-            "all" => Self::All,
-            other => Self::Unknown(other.to_string()),
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Session => "session",
-            Self::Cache => "cache",
-            Self::Recent => "recent",
-            Self::Volatile => "volatile",
-            Self::Stall => "stall",
-            Self::Noise => "noise",
-            Self::Errors => "errors",
-            Self::SessionMemory => "session_memory",
-            Self::All => "all",
-            Self::Unknown(value) => value.as_str(),
-        }
-    }
-}
+/// Uses the unified observation-plane facet taxonomy from `astra_core`.
 
 /// Output depth requested by callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,7 +184,7 @@ impl IntrospectFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntrospectRequest {
     pub topic: ObservationTopic,
-    pub facet: IntrospectFacet,
+    pub facet: ObservationFacet,
     pub depth: IntrospectDepth,
     pub horizon: ObservationHorizon,
     pub source_policy: SourcePolicy,
@@ -239,7 +196,7 @@ impl Default for IntrospectRequest {
     fn default() -> Self {
         Self {
             topic: ObservationTopic::Runtime,
-            facet: IntrospectFacet::Session,
+            facet: ObservationFacet::Session,
             depth: IntrospectDepth::Summary,
             horizon: ObservationHorizon::CurrentTurn,
             source_policy: SourcePolicy::Auto,
@@ -269,7 +226,7 @@ impl IntrospectRequest {
 
         Self {
             topic,
-            facet: IntrospectFacet::from_arg(facet_raw),
+            facet: ObservationFacet::from_str(facet_raw),
             depth: IntrospectDepth::from_arg(depth_raw),
             horizon: ObservationHorizon::from_arg(
                 string_arg(args, "horizon").unwrap_or("current_turn"),
@@ -321,7 +278,7 @@ mod tests {
             "detail": "full"
         }));
         assert_eq!(req.topic, ObservationTopic::Runtime);
-        assert_eq!(req.facet, IntrospectFacet::Session);
+        assert_eq!(req.facet, ObservationFacet::Session);
         assert_eq!(req.depth, IntrospectDepth::Summary);
         assert_eq!(req.horizon, ObservationHorizon::CurrentTurn);
     }
@@ -336,7 +293,7 @@ mod tests {
             "include_context": true
         }));
         assert_eq!(req.topic, ObservationTopic::Execution);
-        assert_eq!(req.facet, IntrospectFacet::Errors);
+        assert_eq!(req.facet, ObservationFacet::Errors);
         assert_eq!(req.depth, IntrospectDepth::Forensic);
         assert_eq!(req.horizon, ObservationHorizon::Session);
         assert_eq!(req.source_policy, SourcePolicy::CloudOnly);
@@ -367,7 +324,7 @@ mod tests {
             "facet": "execution/errors"
         }));
         assert_eq!(req.topic, ObservationTopic::Execution);
-        assert_eq!(req.facet, IntrospectFacet::Errors);
+        assert_eq!(req.facet, ObservationFacet::Errors);
     }
 
     #[test]

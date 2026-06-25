@@ -387,10 +387,9 @@ mod tests {
             unsafe { std::env::remove_var("HOME") };
         }
         assert!(res.is_ok());
-        assert!(
-            !tmp.path()
-                .join(".astra/learning/profile-empty.json")
-                .exists()
-        );
+        assert!(!tmp
+            .path()
+            .join(".astra/learning/profile-empty.json")
+            .exists());
     }
 }

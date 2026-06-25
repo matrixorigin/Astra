@@ -396,10 +396,10 @@ pub use error_kind::{ClassifiedError, ErrorKind, classify_tool_output};
 pub use observation::{
     EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationAdaptationSignal,
     ObservationBudgetOmitted, ObservationBudgetResult, ObservationCausalChain,
-    ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
-    ObservationGraphEdge, ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
-    ObservationGraphNodeKind, ObservationGraphSlice, ObservationProviderCoverage,
-    ObservationRecord, ObservationSignalConsumer, ObservationView,
+    ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFacet,
+    ObservationFailureCluster, ObservationGraphEdge, ObservationGraphEdgeKind,
+    ObservationGraphLayer, ObservationGraphNode, ObservationGraphNodeKind, ObservationGraphSlice,
+    ObservationProviderCoverage, ObservationRecord, ObservationSignalConsumer, ObservationView,
 };
 pub use runtime_limits::RuntimeLimits;
 #[cfg(any(test, feature = "dev-defaults"))]

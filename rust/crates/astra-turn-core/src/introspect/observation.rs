@@ -9,7 +9,7 @@ use astra_core::{
     ObservationProviderCoverage, ObservationRecord, ObservationView,
 };
 
-use super::{IntrospectFacet, IntrospectRequest, IntrospectSnapshot, SourcePolicy};
+use super::{IntrospectRequest, IntrospectSnapshot, ObservationFacet, SourcePolicy};
 
 const RUNTIME_SNAPSHOT_REF: &str = "urn:astra:context:local:introspect:runtime_snapshot";
 
@@ -50,7 +50,7 @@ pub fn build_introspect_report(
 ) -> IntrospectReport {
     let edge_only_unavailable = is_edge_only_facet(&request.facet);
     let mut warnings = match request.facet {
-        IntrospectFacet::Cache | IntrospectFacet::SessionMemory => {
+        ObservationFacet::Performance | ObservationFacet::Memory => {
             vec!["requested facet requires CLI/Edge-local artifacts for full detail".to_string()]
         }
         _ => Vec::new(),
@@ -73,18 +73,6 @@ pub fn build_introspect_report(
 
     let summary = introspect_summary(snapshot, request);
     let mut observations = build_introspect_observations(snapshot, request, &summary);
-    if observations.is_empty() {
-        observations.push(ObservationRecord {
-            ref_id: "urn:astra:observation:local:introspect:runtime:health".to_string(),
-            topic: request.topic.as_str().to_string(),
-            facet: request.facet.as_str().to_string(),
-            kind: "runtime_health".to_string(),
-            severity: "info".to_string(),
-            summary: summary.clone(),
-            confidence: ObservationConfidence::complete(0.70, 0.60, 0.20),
-            evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
-        });
-    }
 
     let mut evidence = if edge_only_unavailable {
         Vec::new()
@@ -290,23 +278,23 @@ fn truncate_count<T>(items: &mut Vec<T>, max: usize) -> i64 {
     omitted
 }
 
-fn is_edge_only_facet(facet: &IntrospectFacet) -> bool {
+fn is_edge_only_facet(facet: &ObservationFacet) -> bool {
     matches!(
         facet,
-        IntrospectFacet::Cache | IntrospectFacet::SessionMemory
+        ObservationFacet::Performance | ObservationFacet::Memory
     )
 }
 
 fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest) -> String {
     match request.facet {
-        IntrospectFacet::Errors => {
+        ObservationFacet::Errors => {
             if snapshot.tool_errors.is_empty() {
                 "No recent tool errors recorded".to_string()
             } else {
                 format!("{} recent tool errors recorded", snapshot.tool_errors.len())
             }
         }
-        IntrospectFacet::Stall => {
+        ObservationFacet::Stall => {
             if snapshot.stall_state.nudge_count == 0 && snapshot.stall_state.events.is_empty() {
                 "No stall or loop-guard events recorded".to_string()
             } else {
@@ -317,7 +305,7 @@ fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
                 )
             }
         }
-        IntrospectFacet::Cache | IntrospectFacet::SessionMemory => {
+        ObservationFacet::Performance | ObservationFacet::Memory => {
             format!(
                 "{} requires Edge-local data for full detail",
                 request.facet.as_str()
@@ -346,7 +334,7 @@ fn build_introspect_observations(
 ) -> Vec<ObservationRecord> {
     if matches!(
         request.facet,
-        IntrospectFacet::Cache | IntrospectFacet::SessionMemory
+        ObservationFacet::Performance | ObservationFacet::Memory
     ) {
         return vec![ObservationRecord {
             ref_id: format!(
@@ -364,18 +352,78 @@ fn build_introspect_observations(
     }
 
     let mut observations = Vec::new();
-
-    for (idx, alert) in snapshot.alerts.iter().enumerate() {
-        observations.push(ObservationRecord {
-            ref_id: format!("urn:astra:observation:local:introspect:runtime:alert:{idx}"),
-            topic: request.topic.as_str().to_string(),
-            facet: request.facet.as_str().to_string(),
-            kind: "runtime_alert".to_string(),
-            severity: "warning".to_string(),
-            summary: alert.clone(),
-            confidence: ObservationConfidence::complete(0.80, 0.70, 0.30),
-            evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
-        });
+    match request.facet {
+        ObservationFacet::Session => {
+            if snapshot.alerts.is_empty() && snapshot.tool_errors.is_empty() {
+                observations.push(ObservationRecord {
+                    ref_id: "urn:astra:observation:local:introspect:runtime:health".to_string(),
+                    topic: request.topic.as_str().to_string(),
+                    facet: request.facet.as_str().to_string(),
+                    kind: "runtime_health".to_string(),
+                    severity: "info".to_string(),
+                    summary: summary.to_string(),
+                    confidence: ObservationConfidence::evidence(0.75),
+                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                });
+            } else {
+                if !snapshot.alerts.is_empty() {
+                    observations.push(ObservationRecord {
+                        ref_id: "urn:astra:observation:local:introspect:runtime:alerts".to_string(),
+                        topic: request.topic.as_str().to_string(),
+                        facet: request.facet.as_str().to_string(),
+                        kind: "runtime_alert".to_string(),
+                        severity: "warning".to_string(),
+                        summary: format!("{} runtime alerts active", snapshot.alerts.len()),
+                        confidence: ObservationConfidence::evidence(0.80),
+                        evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                    });
+                }
+            }
+        }
+        ObservationFacet::Errors => {
+            if !snapshot.tool_errors.is_empty() {
+                observations.push(ObservationRecord {
+                    ref_id: "urn:astra:observation:local:introspect:errors:recent".to_string(),
+                    topic: request.topic.as_str().to_string(),
+                    facet: request.facet.as_str().to_string(),
+                    kind: "tool_failure_cluster".to_string(),
+                    severity: "warning".to_string(),
+                    summary: format!("{} recent tool errors recorded", snapshot.tool_errors.len()),
+                    confidence: ObservationConfidence::evidence(0.85),
+                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                });
+            }
+        }
+        ObservationFacet::Stall => {
+            if snapshot.stall_state.nudge_count > 0 {
+                observations.push(ObservationRecord {
+                    ref_id: "urn:astra:observation:local:introspect:stall:state".to_string(),
+                    topic: request.topic.as_str().to_string(),
+                    facet: request.facet.as_str().to_string(),
+                    kind: "stall_telemetry".to_string(),
+                    severity: "info".to_string(),
+                    summary: format!("stall nudge count: {}", snapshot.stall_state.nudge_count),
+                    confidence: ObservationConfidence::evidence(0.90),
+                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                });
+            }
+        }
+        ObservationFacet::Performance | ObservationFacet::Memory => {
+            observations.push(ObservationRecord {
+                ref_id: "urn:astra:observation:local:introspect:edge_facet_unavailable".to_string(),
+                topic: request.topic.as_str().to_string(),
+                facet: request.facet.as_str().to_string(),
+                kind: "data_unavailable".to_string(),
+                severity: "info".to_string(),
+                summary: format!(
+                    "facet={} requires CLI/Edge-local session artifacts",
+                    request.facet.as_str()
+                ),
+                confidence: ObservationConfidence::evidence(0.70),
+                evidence_refs: vec![],
+            });
+        }
+        _ => {}
     }
 
     for (idx, error) in snapshot.tool_errors.iter().enumerate() {

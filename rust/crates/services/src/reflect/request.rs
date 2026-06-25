@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use astra_core::ObservationProviderCoverage;
 
-use super::{ReflectDataCoverage, ReflectView};
+use super::{ObservationDataCoverage, ObservationView};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflectRequest {
@@ -82,7 +82,7 @@ impl ReflectRequest {
         }
     }
 
-    pub(super) fn view(&self, total_events: i64, total_decisions: i64) -> ReflectView {
+    pub(super) fn view(&self, total_events: i64, total_decisions: i64) -> ObservationView {
         let mut warnings = Vec::new();
         if matches!(self.horizon.as_str(), "now" | "current_turn") {
             warnings.push(
@@ -106,12 +106,12 @@ impl ReflectRequest {
             );
         }
 
-        ReflectView {
+        ObservationView {
             topic: self.topic.clone(),
             facet: self.facet.clone(),
             depth: self.depth.clone(),
             horizon: self.horizon.clone(),
-            data_coverage: ReflectDataCoverage {
+            data_coverage: ObservationDataCoverage {
                 overall: if warnings.is_empty() {
                     "fresh".to_string()
                 } else {

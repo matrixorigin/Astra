@@ -32,25 +32,25 @@ pub struct ReflectReport {
     pub horizon: String,
     pub source_policy: String,
     pub include_context: bool,
-    pub data_coverage: ReflectDataCoverage,
+    pub data_coverage: ObservationDataCoverage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view: Option<ReflectView>,
+    pub view: Option<ObservationView>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub summary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub observations: Vec<ReflectObservation>,
+    pub observations: Vec<ObservationRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<ReflectEvidence>,
+    pub evidence: Vec<ObservationEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub action_hints: Vec<ReflectActionHint>,
+    pub action_hints: Vec<ObservationActionHint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub failure_clusters: Vec<ReflectFailureCluster>,
+    pub failure_clusters: Vec<ObservationFailureCluster>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub causal_chains: Vec<ReflectCausalChain>,
+    pub causal_chains: Vec<ObservationCausalChain>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub adaptation_signals: Vec<ReflectAdaptationSignal>,
+    pub adaptation_signals: Vec<ObservationAdaptationSignal>,
     #[serde(default)]
-    pub graph_slice: ReflectGraphSlice,
+    pub graph_slice: ObservationGraphSlice,
     #[serde(default)]
     pub budget_result: ObservationBudgetResult,
     pub overview: SessionOverview,
@@ -65,22 +65,7 @@ pub struct ReflectReport {
     pub prompt_preview: Option<String>,
 }
 
-pub type ReflectView = ObservationView;
-pub type ReflectDataCoverage = ObservationDataCoverage;
-pub type ReflectObservation = ObservationRecord;
-pub type ReflectConfidence = ObservationConfidence;
-pub type ReflectEvidence = ObservationEvidence;
-pub type ReflectActionHint = ObservationActionHint;
-pub type ReflectFailureCluster = ObservationFailureCluster;
-pub type ReflectCausalChain = ObservationCausalChain;
-pub type ReflectAdaptationSignal = ObservationAdaptationSignal;
-pub type ReflectSignalConsumer = ObservationSignalConsumer;
-pub type ReflectGraphSlice = ObservationGraphSlice;
-pub type ReflectGraphNode = ObservationGraphNode;
-pub type ReflectGraphEdge = ObservationGraphEdge;
-pub type ReflectGraphLayer = ObservationGraphLayer;
-pub type ReflectGraphNodeKind = ObservationGraphNodeKind;
-pub type ReflectGraphEdgeKind = ObservationGraphEdgeKind;
+// Type aliases removed — use Observation* types from astra_core directly
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionOverview {
@@ -1304,12 +1289,12 @@ fn budget_reflect_evidence_graph(
 
 fn build_reflect_graph_slice(
     evidence_graph: Option<&EvidenceGraph>,
-    observations: &[ReflectObservation],
-    evidence: &[ReflectEvidence],
-    failure_clusters: &[ReflectFailureCluster],
-    adaptation_signals: &[ReflectAdaptationSignal],
+    observations: &[ObservationRecord],
+    evidence: &[ObservationEvidence],
+    failure_clusters: &[ObservationFailureCluster],
+    adaptation_signals: &[ObservationAdaptationSignal],
     budget_result: &ObservationBudgetResult,
-) -> ReflectGraphSlice {
+) -> ObservationGraphSlice {
     let mut nodes = Vec::new();
     let mut node_refs = BTreeSet::new();
     let mut edges = Vec::new();
@@ -1321,9 +1306,9 @@ fn build_reflect_graph_slice(
             push_graph_node(
                 &mut nodes,
                 &mut node_refs,
-                ReflectGraphNode {
+                ObservationGraphNode {
                     ref_id,
-                    layer: ReflectGraphLayer::Runtime,
+                    layer: ObservationGraphLayer::Runtime,
                     kind: graph_node_kind(node.kind),
                     label: node.label.clone(),
                     summary: node.summary.clone(),
@@ -1346,10 +1331,10 @@ fn build_reflect_graph_slice(
         push_graph_node(
             &mut nodes,
             &mut node_refs,
-            ReflectGraphNode {
+            ObservationGraphNode {
                 ref_id: item.ref_id.clone(),
-                layer: ReflectGraphLayer::Runtime,
-                kind: ReflectGraphNodeKind::Evidence,
+                layer: ObservationGraphLayer::Runtime,
+                kind: ObservationGraphNodeKind::Evidence,
                 label: item.evidence_class.clone(),
                 summary: Some(item.summary.clone()),
                 metadata: None,
@@ -1361,10 +1346,10 @@ fn build_reflect_graph_slice(
         push_graph_node(
             &mut nodes,
             &mut node_refs,
-            ReflectGraphNode {
+            ObservationGraphNode {
                 ref_id: observation.ref_id.clone(),
-                layer: ReflectGraphLayer::Observation,
-                kind: ReflectGraphNodeKind::Observation,
+                layer: ObservationGraphLayer::Observation,
+                kind: ObservationGraphNodeKind::Observation,
                 label: observation.kind.clone(),
                 summary: Some(observation.summary.clone()),
                 metadata: None,
@@ -1376,7 +1361,7 @@ fn build_reflect_graph_slice(
                 &mut edge_keys,
                 observation.ref_id.clone(),
                 evidence_ref.clone(),
-                ReflectGraphEdgeKind::DerivedFrom,
+                ObservationGraphEdgeKind::DerivedFrom,
             );
         }
     }
@@ -1385,10 +1370,10 @@ fn build_reflect_graph_slice(
         push_graph_node(
             &mut nodes,
             &mut node_refs,
-            ReflectGraphNode {
+            ObservationGraphNode {
                 ref_id: cluster.cluster_ref.clone(),
-                layer: ReflectGraphLayer::Observation,
-                kind: ReflectGraphNodeKind::FailureCluster,
+                layer: ObservationGraphLayer::Observation,
+                kind: ObservationGraphNodeKind::FailureCluster,
                 label: cluster.label.clone(),
                 summary: Some(cluster.summary.clone()),
                 metadata: None,
@@ -1400,7 +1385,7 @@ fn build_reflect_graph_slice(
                 &mut edge_keys,
                 cluster.cluster_ref.clone(),
                 observation_ref.clone(),
-                ReflectGraphEdgeKind::DerivedFrom,
+                ObservationGraphEdgeKind::DerivedFrom,
             );
         }
     }
@@ -1409,10 +1394,10 @@ fn build_reflect_graph_slice(
         push_graph_node(
             &mut nodes,
             &mut node_refs,
-            ReflectGraphNode {
+            ObservationGraphNode {
                 ref_id: signal.signal_id.clone(),
-                layer: ReflectGraphLayer::Observation,
-                kind: ReflectGraphNodeKind::AdaptationSignal,
+                layer: ObservationGraphLayer::Observation,
+                kind: ObservationGraphNodeKind::AdaptationSignal,
                 label: signal.consumer.payload_kind.clone(),
                 summary: Some(format!(
                     "{}:{}:{}",
@@ -1429,7 +1414,7 @@ fn build_reflect_graph_slice(
                 &mut edge_keys,
                 signal.signal_id.clone(),
                 observation_ref.clone(),
-                ReflectGraphEdgeKind::References,
+                ObservationGraphEdgeKind::References,
             );
         }
         for cluster_ref in &signal.failure_cluster_refs {
@@ -1438,12 +1423,12 @@ fn build_reflect_graph_slice(
                 &mut edge_keys,
                 signal.signal_id.clone(),
                 cluster_ref.clone(),
-                ReflectGraphEdgeKind::References,
+                ObservationGraphEdgeKind::References,
             );
         }
     }
 
-    ReflectGraphSlice {
+    ObservationGraphSlice {
         nodes,
         edges,
         budget_result: budget_result.clone(),
@@ -1451,9 +1436,9 @@ fn build_reflect_graph_slice(
 }
 
 fn push_graph_node(
-    nodes: &mut Vec<ReflectGraphNode>,
+    nodes: &mut Vec<ObservationGraphNode>,
     node_refs: &mut BTreeSet<String>,
-    node: ReflectGraphNode,
+    node: ObservationGraphNode,
 ) {
     if node_refs.insert(node.ref_id.clone()) {
         nodes.push(node);
@@ -1461,30 +1446,30 @@ fn push_graph_node(
 }
 
 fn push_graph_edge(
-    edges: &mut Vec<ReflectGraphEdge>,
-    edge_keys: &mut BTreeSet<(String, String, ReflectGraphEdgeKind)>,
+    edges: &mut Vec<ObservationGraphEdge>,
+    edge_keys: &mut BTreeSet<(String, String, ObservationGraphEdgeKind)>,
     from: String,
     to: String,
-    kind: ReflectGraphEdgeKind,
+    kind: ObservationGraphEdgeKind,
 ) {
     if edge_keys.insert((from.clone(), to.clone(), kind)) {
-        edges.push(ReflectGraphEdge { from, to, kind });
+        edges.push(ObservationGraphEdge { from, to, kind });
     }
 }
 
-fn graph_node_kind(kind: EvidenceGraphNodeKind) -> ReflectGraphNodeKind {
+fn graph_node_kind(kind: EvidenceGraphNodeKind) -> ObservationGraphNodeKind {
     match kind {
-        EvidenceGraphNodeKind::Decision => ReflectGraphNodeKind::Decision,
-        EvidenceGraphNodeKind::Observation => ReflectGraphNodeKind::Event,
-        EvidenceGraphNodeKind::Outcome => ReflectGraphNodeKind::Outcome,
+        EvidenceGraphNodeKind::Decision => ObservationGraphNodeKind::Decision,
+        EvidenceGraphNodeKind::Observation => ObservationGraphNodeKind::Event,
+        EvidenceGraphNodeKind::Outcome => ObservationGraphNodeKind::Outcome,
     }
 }
 
-fn graph_edge_kind(kind: EvidenceGraphEdgeKind) -> ReflectGraphEdgeKind {
+fn graph_edge_kind(kind: EvidenceGraphEdgeKind) -> ObservationGraphEdgeKind {
     match kind {
-        EvidenceGraphEdgeKind::Causes => ReflectGraphEdgeKind::Causes,
-        EvidenceGraphEdgeKind::Supports => ReflectGraphEdgeKind::Supports,
-        EvidenceGraphEdgeKind::Contradicts => ReflectGraphEdgeKind::Contradicts,
+        EvidenceGraphEdgeKind::Causes => ObservationGraphEdgeKind::Causes,
+        EvidenceGraphEdgeKind::Supports => ObservationGraphEdgeKind::Supports,
+        EvidenceGraphEdgeKind::Contradicts => ObservationGraphEdgeKind::Contradicts,
     }
 }
 
@@ -2158,28 +2143,28 @@ mod tests {
 
         assert!(graph_slice.nodes.iter().any(|node| {
             node.ref_id == "urn:astra:event:cloud:evt-1"
-                && node.layer == ReflectGraphLayer::Runtime
-                && node.kind == ReflectGraphNodeKind::Event
+                && node.layer == ObservationGraphLayer::Runtime
+                && node.kind == ObservationGraphNodeKind::Event
         }));
         assert!(graph_slice.nodes.iter().any(|node| {
             node.ref_id == envelope.observations[0].ref_id
-                && node.layer == ReflectGraphLayer::Observation
-                && node.kind == ReflectGraphNodeKind::Observation
+                && node.layer == ObservationGraphLayer::Observation
+                && node.kind == ObservationGraphNodeKind::Observation
         }));
         assert!(graph_slice.nodes.iter().any(|node| {
             node.ref_id == envelope.failure_clusters[0].cluster_ref
-                && node.kind == ReflectGraphNodeKind::FailureCluster
+                && node.kind == ObservationGraphNodeKind::FailureCluster
         }));
         assert!(graph_slice.nodes.iter().any(|node| {
             node.ref_id == envelope.adaptation_signals[0].signal_id
-                && node.kind == ReflectGraphNodeKind::AdaptationSignal
+                && node.kind == ObservationGraphNodeKind::AdaptationSignal
         }));
         assert!(
             graph_slice
                 .nodes
                 .iter()
                 .any(|node| node.ref_id == envelope.evidence[0].ref_id
-                    && node.kind == ReflectGraphNodeKind::Evidence),
+                    && node.kind == ObservationGraphNodeKind::Evidence),
             "materialized evidence previews must be nodes so observation edges are not dangling"
         );
 
@@ -2247,11 +2232,11 @@ mod tests {
     }
 
     fn assert_refs_are_valid(
-        observations: &[ReflectObservation],
-        evidence: &[ReflectEvidence],
-        action_hints: &[ReflectActionHint],
-        failure_clusters: &[ReflectFailureCluster],
-        adaptation_signals: &[ReflectAdaptationSignal],
+        observations: &[ObservationRecord],
+        evidence: &[ObservationEvidence],
+        action_hints: &[ObservationActionHint],
+        failure_clusters: &[ObservationFailureCluster],
+        adaptation_signals: &[ObservationAdaptationSignal],
     ) {
         for observation in observations {
             EvidenceRef::parse(&observation.ref_id).unwrap_or_else(|err| {
@@ -2324,7 +2309,7 @@ mod tests {
             "recent_tactical_actions": ["check ulimit -u"],
             "token_utilisation": 0.0
         });
-        let data_coverage = ReflectDataCoverage {
+        let data_coverage = ObservationDataCoverage {
             overall: "fresh".into(),
             source: "server_db".into(),
             events: 10,
@@ -2344,7 +2329,7 @@ mod tests {
             source_policy: "auto".into(),
             include_context: false,
             data_coverage: data_coverage.clone(),
-            view: Some(ReflectView {
+            view: Some(ObservationView {
                 topic: "overview".into(),
                 facet: "overview".into(),
                 depth: "diagnostic".into(),
@@ -2352,34 +2337,34 @@ mod tests {
                 data_coverage,
             }),
             summary: "fork failed".into(),
-            observations: vec![ReflectObservation {
+            observations: vec![ObservationRecord {
                 ref_id: "urn:astra:observation:graph:reflect:test-sess:diagnosis:0".into(),
                 topic: "overview".into(),
                 facet: "overview".into(),
                 kind: "diagnosis:resource_limit".into(),
                 severity: "critical".into(),
                 summary: "fork failed".into(),
-                confidence: ReflectConfidence::complete(0.90, 0.90, 0.82),
+                confidence: ObservationConfidence::complete(0.90, 0.90, 0.82),
                 evidence_refs: vec![
                     "urn:astra:artifact:cloud:reflect:test-sess:diagnosis:0:sample:0".into(),
                 ],
             }],
-            evidence: vec![ReflectEvidence {
+            evidence: vec![ObservationEvidence {
                 ref_id: "urn:astra:artifact:cloud:reflect:test-sess:diagnosis:0:sample:0".into(),
                 evidence_class: "observed_evidence".into(),
                 source: "agent_events.error_sample".into(),
                 summary: "fork: Resource temporarily unavailable".into(),
-                confidence: ReflectConfidence::evidence(0.90),
+                confidence: ObservationConfidence::evidence(0.90),
             }],
-            action_hints: vec![ReflectActionHint {
+            action_hints: vec![ObservationActionHint {
                 target_type: "user_guidance".into(),
                 summary: "check ulimit -u".into(),
-                confidence: ReflectConfidence::classification_evidence(0.75, 0.70),
+                confidence: ObservationConfidence::classification_evidence(0.75, 0.70),
                 observation_refs: vec![
                     "urn:astra:observation:graph:reflect:test-sess:diagnosis:0".into(),
                 ],
             }],
-            failure_clusters: vec![ReflectFailureCluster {
+            failure_clusters: vec![ObservationFailureCluster {
                 cluster_ref:
                     "urn:astra:failure_cluster:graph:reflect:test-sess:resource_limit:bash".into(),
                 label: "resource_limit_bash".into(),
@@ -2388,10 +2373,10 @@ mod tests {
                     "urn:astra:observation:graph:reflect:test-sess:diagnosis:0".into(),
                 ],
                 evidence_class: "inferred_evidence".into(),
-                confidence: ReflectConfidence::classification_evidence(0.84, 0.90),
+                confidence: ObservationConfidence::classification_evidence(0.84, 0.90),
             }],
             causal_chains: vec![],
-            adaptation_signals: vec![ReflectAdaptationSignal {
+            adaptation_signals: vec![ObservationAdaptationSignal {
                 signal_id: "urn:astra:signal:graph:reflect:test-sess:tool_policy:0".into(),
                 observation_refs: vec![
                     "urn:astra:observation:graph:reflect:test-sess:diagnosis:0".into(),
@@ -2399,7 +2384,7 @@ mod tests {
                 failure_cluster_refs: vec![
                     "urn:astra:failure_cluster:graph:reflect:test-sess:resource_limit:bash".into(),
                 ],
-                consumer: ReflectSignalConsumer {
+                consumer: ObservationSignalConsumer {
                     suggested_tool_family: Some("tuning_control_plane".into()),
                     target_type: "tool_policy".into(),
                     payload_kind: "tool_policy_signal".into(),
@@ -2407,7 +2392,7 @@ mod tests {
                     scope_hint: "session".into(),
                 },
             }],
-            graph_slice: ReflectGraphSlice::default(),
+            graph_slice: ObservationGraphSlice::default(),
             budget_result: ObservationBudgetResult::default(),
             overview: make_overview(10, 1, vec![("bash".into(), 8)], 2, Some(5.0)),
             diagnoses: vec![Diagnosis {

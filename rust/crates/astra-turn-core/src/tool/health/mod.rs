@@ -9,7 +9,7 @@
 
 pub mod persistence;
 
-use crate::action_compensation::{FailureCategory, classify_execution_outcome};
+use crate::action_compensation::{classify_execution_outcome, FailureCategory};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -918,8 +918,13 @@ impl ToolHealthTracker {
                         tool,
                         signature_hint: sig_hint,
                         failure_category: outcome.failure_category.map(|c| format!("{c:?}")),
-                        error_preview: preview,
+                        error_preview: preview.clone(),
                         at_epoch: outcome.at_epoch,
+                        error_message: preview.unwrap_or_default(),
+                        file_path: None,
+                        file_range: None,
+                        turn: 0,
+                        round: 0,
                     },
                     seq,
                 });

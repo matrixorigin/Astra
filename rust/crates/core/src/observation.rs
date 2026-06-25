@@ -9,6 +9,101 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Canonical observation facet vocabulary shared by `introspect` and `reflect`.
+///
+/// This enum defines the unified observation-plane taxonomy. Both tools map their
+/// legacy facet names to these canonical variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationFacet {
+    /// Session-level health: pressure, cache, turns, alerts.
+    Session,
+    /// Recent execution rounds and tool calls.
+    Recent,
+    /// Currently-pending volatile injections.
+    Volatile,
+    /// Stall / loop-guard state and circuit breaker telemetry.
+    Stall,
+    /// Per-channel freshness of runtime-injected signals.
+    Noise,
+    /// Recent tool errors and failure previews.
+    Errors,
+    /// Runtime performance: latency, cost, cache efficiency.
+    Performance,
+    /// Tool execution trace and outcome history.
+    Trace,
+    /// Tool usage patterns and health rankings.
+    Tools,
+    /// Knowledge context: memory, data quality, freshness.
+    Context,
+    /// Memory and session state.
+    Memory,
+    /// Adaptation signals and tuning recommendations.
+    Signals,
+    /// Overview: aggregated session summary.
+    Overview,
+    /// All facets (introspect only).
+    All,
+    /// Unknown facet (fallback).
+    Unknown,
+}
+
+impl ObservationFacet {
+    /// Parse a facet string into canonical form.
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "" | "session" | "runtime" => Self::Session,
+            "recent" => Self::Recent,
+            "volatile" => Self::Volatile,
+            "stall" => Self::Stall,
+            "noise" | "freshness" => Self::Noise,
+            "errors" => Self::Errors,
+            "performance" | "latency" | "cost" | "cache" => Self::Performance,
+            "trace" | "history" => Self::Trace,
+            "tools" => Self::Tools,
+            "context" | "data_quality" => Self::Context,
+            "memory" | "session_memory" => Self::Memory,
+            "signals" | "adaptation" => Self::Signals,
+            "overview" => Self::Overview,
+            "all" => Self::All,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Convert to canonical string representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Recent => "recent",
+            Self::Volatile => "volatile",
+            Self::Stall => "stall",
+            Self::Noise => "noise",
+            Self::Errors => "errors",
+            Self::Performance => "performance",
+            Self::Trace => "trace",
+            Self::Tools => "tools",
+            Self::Context => "context",
+            Self::Memory => "memory",
+            Self::Signals => "signals",
+            Self::Overview => "overview",
+            Self::All => "all",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl Default for ObservationFacet {
+    fn default() -> Self {
+        Self::Session
+    }
+}
+
+impl fmt::Display for ObservationFacet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 const ALLOWED_EVIDENCE_KINDS: &[&str] = &[
     "event",
     "decision",
