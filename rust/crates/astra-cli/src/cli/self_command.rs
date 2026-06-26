@@ -35,6 +35,7 @@ struct ReflectResponse {
     source_policy: String,
     include_context: bool,
     analysis_view: String,
+    last_n: i32,
     question: Option<String>,
     persistence_warning: Option<String>,
     data_coverage: LocalReflectDataCoverage,
@@ -113,9 +114,10 @@ pub(crate) async fn execute_self_command(
                 i32::try_from(*last_n).unwrap_or(i32::MAX),
                 question.as_deref().unwrap_or(""),
             );
+            let journal_limit = usize::try_from(request.last_n).unwrap_or(20);
             render_reflect_surface_for_session_with_profile(
                 &resolve_target_session_id(session_id.as_deref(), profile).await?,
-                *last_n,
+                journal_limit,
                 request,
                 profile,
             )
@@ -244,7 +246,8 @@ pub(crate) async fn render_reflect_surface_for_session(
         i32::try_from(journal_limit).unwrap_or(i32::MAX),
         question.unwrap_or(""),
     );
-    render_reflect_surface_for_session_with_profile(session_id, journal_limit, request, None).await
+    let bounded_limit = usize::try_from(request.last_n).unwrap_or(20);
+    render_reflect_surface_for_session_with_profile(session_id, bounded_limit, request, None).await
 }
 
 pub(crate) async fn try_render_reflect_surface_for_session_with_profile(
@@ -263,9 +266,10 @@ pub(crate) async fn try_render_reflect_surface_for_session_with_profile(
         i32::try_from(journal_limit).unwrap_or(i32::MAX),
         question.unwrap_or(""),
     );
+    let bounded_limit = usize::try_from(request.last_n).unwrap_or(20);
     match render_reflect_surface_for_session_with_profile(
         session_id,
-        journal_limit,
+        bounded_limit,
         request,
         profile,
     )
@@ -289,7 +293,8 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
     profile: Option<&str>,
 ) -> Result<String, String> {
     let artifacts = self_surface::load_artifacts(session_id, profile).await?;
-    to_json(&build_reflect_response(&artifacts, journal_limit.max(1), request).await)
+    let bounded_limit = usize::try_from(request.last_n).unwrap_or(journal_limit.max(1));
+    to_json(&build_reflect_response(&artifacts, bounded_limit, request).await)
 }
 
 pub(crate) fn agent_info_surface_alias(dimension: &str) -> Option<&'static str> {
@@ -434,6 +439,7 @@ async fn build_reflect_response(
         "source_policy": request.source_policy.clone(),
         "include_context": request.include_context,
         "analysis_view": analysis_view.clone(),
+        "last_n": request.last_n,
         "question": question.clone(),
         "data_coverage": data_coverage.clone(),
         "persistence_warning": persistence_warning.clone(),
@@ -470,6 +476,7 @@ async fn build_reflect_response(
         source_policy: request.source_policy,
         include_context: request.include_context,
         analysis_view: analysis_view.to_string(),
+        last_n: request.last_n,
         question,
         persistence_warning,
         data_coverage,

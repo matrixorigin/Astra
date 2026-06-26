@@ -82,6 +82,7 @@ pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
     register_handler_or_log!(engine, "enter_plan_mode", EnterPlanModeToolHandler);
     register_handler_or_log!(engine, "exit_plan_mode", ExitPlanModeToolHandler);
     register_handler_or_log!(engine, "introspect", IntrospectToolHandler);
+    register_handler_or_log!(engine, "reflect", ReflectToolHandler);
     register_handler_or_log!(engine, "compress_context", CompressContextToolHandler);
     register_handler_or_log!(
         engine,
@@ -383,6 +384,93 @@ impl ToolHandler<ServerToolExecutor> for IntrospectToolHandler {
             &context.introspect_snapshot,
         ))
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReflectToolHandler;
+
+#[async_trait]
+impl ToolHandler<ServerToolExecutor> for ReflectToolHandler {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "Reflect tool not executed: run was cancelled".to_string(),
+            );
+        }
+
+        let topic = string_arg(args, "topic");
+        let facet = string_arg(args, "facet");
+        let depth = string_arg(args, "depth");
+        let horizon = string_arg(args, "horizon");
+        let source_policy = string_arg(args, "source_policy");
+        let include_context = args
+            .get("include_context")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let last_n = args
+            .get("last_n")
+            .and_then(Value::as_i64)
+            .unwrap_or(20)
+            .clamp(1, 100) as i32;
+        let question = args
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let request = astra_services::reflect::ReflectRequest::from_observation_params_with_source(
+            topic,
+            facet,
+            depth,
+            horizon,
+            source_policy,
+            include_context,
+            last_n,
+            question,
+        );
+
+        match context
+            .reflect_service
+            .build_evidence(&context.user_id, &context.session_id, request.clone())
+            .await
+        {
+            Ok(report) => match serde_json::to_string(&report) {
+                Ok(output) => astra_tools::ToolResult::text(output),
+                Err(error) => astra_tools::ToolResult::error(format!(
+                    "Error: failed to encode reflect report: {error}"
+                )),
+            },
+            Err((status, axum::Json(body))) => astra_tools::ToolResult::error(
+                serde_json::json!({
+                    "tool": "reflect",
+                    "status": "reflect_unavailable",
+                    "http_status": status.as_u16(),
+                    "error": body.detail,
+                    "error_code": body.error_code,
+                    "session_id": context.session_id,
+                    "topic": request.topic,
+                    "facet": request.facet,
+                    "depth": request.depth,
+                    "horizon": request.horizon,
+                    "source_policy": request.source_policy,
+                    "include_context": request.include_context,
+                    "last_n": request.last_n,
+                    "question": request.question,
+                })
+                .to_string(),
+            ),
+        }
+    }
+}
+
+fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Clone, Copy)]

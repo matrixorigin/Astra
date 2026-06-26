@@ -1338,7 +1338,8 @@ async fn execute_reflect_uses_local_surface_with_session() {
                 "depth": "forensic",
                 "horizon": "cross_session",
                 "source_policy": "cloud_only",
-                "include_context": true
+                "include_context": true,
+                "last_n": 250
             }),
         )
         .await;
@@ -1351,6 +1352,8 @@ async fn execute_reflect_uses_local_surface_with_session() {
     assert_eq!(value["source_policy"], "cloud_only");
     assert_eq!(value["include_context"], true);
     assert_eq!(value["analysis_view"], "execution_trace");
+    assert_eq!(value["last_n"], 100);
+    assert_eq!(value["reflection_context"]["last_n"], 100);
     assert_eq!(value["data_coverage"]["overall"], "partial");
     let warnings = value["data_coverage"]["warnings"]
         .as_array()

@@ -4497,7 +4497,7 @@ impl ToolExecutor {
                         .get("last_n")
                         .and_then(|v| v.as_i64())
                         .unwrap_or(20)
-                        .clamp(1, i64::from(i32::MAX)) as i32;
+                        .clamp(1, 100) as i32;
                     let request =
                         astra_services::reflect::ReflectRequest::from_observation_params_with_source(
                             topic,
@@ -4510,7 +4510,7 @@ impl ToolExecutor {
                             question,
                         );
                     if let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty()) {
-                        let limit = usize::try_from(last_n).unwrap_or(20);
+                        let limit = usize::try_from(request.last_n).unwrap_or(20);
                         match crate::cli::self_command::render_reflect_surface_for_session_with_profile(
                             &session_id,
                             limit,

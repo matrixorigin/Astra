@@ -63,7 +63,7 @@ impl ReflectRequest {
             source_policy: normalize_source_policy(source_policy.unwrap_or("auto")),
             include_context,
             analysis_view,
-            last_n,
+            last_n: normalize_last_n(last_n),
             question: question.trim().to_string(),
         }
     }
@@ -77,7 +77,7 @@ impl ReflectRequest {
             source_policy: "auto".to_string(),
             include_context: false,
             analysis_view: "execution_trace".to_string(),
-            last_n,
+            last_n: normalize_last_n(last_n),
             question: question.trim().to_string(),
         }
     }
@@ -221,6 +221,10 @@ fn normalize_source_policy(source_policy: &str) -> String {
         "cloud_only" => "cloud_only".to_string(),
         _ => "auto".to_string(),
     }
+}
+
+fn normalize_last_n(last_n: i32) -> i32 {
+    last_n.clamp(1, 100)
 }
 
 fn reflect_source_label(source_policy: &str) -> &'static str {
@@ -413,5 +417,21 @@ mod tests {
         assert_eq!(request.horizon, "session");
         assert_eq!(request.last_n, 10);
         assert_eq!(request.question, "why this decision?");
+    }
+
+    #[test]
+    fn evidence_budget_is_clamped_at_request_boundary() {
+        let too_large = ReflectRequest::from_observation_params(
+            Some("execution"),
+            Some("errors"),
+            None,
+            None,
+            250,
+            "",
+        );
+        assert_eq!(too_large.last_n, 100);
+
+        let too_small = ReflectRequest::decision_trace(0, "");
+        assert_eq!(too_small.last_n, 1);
     }
 }

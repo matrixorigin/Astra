@@ -1447,6 +1447,8 @@ pub struct AgenticRunLifecycleService {
     agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
     /// Optional model gateway registry for per-turn model resolution.
     model_gateway_service: Arc<dyn astra_services::ModelGatewayService>,
+    /// Persisted observation reflection service for server-side reflect tool calls.
+    reflect_service: Arc<dyn astra_services::ReflectService>,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<serde_json::Value>>>>,
@@ -1515,6 +1517,7 @@ impl AgenticRunLifecycleService {
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
             model_gateway_service: Arc::new(astra_services::UnconfiguredModelGatewayService),
+            reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -1638,6 +1641,14 @@ impl AgenticRunLifecycleService {
         service: Arc<dyn astra_services::ModelGatewayService>,
     ) -> Self {
         self.model_gateway_service = service;
+        self
+    }
+
+    pub fn with_reflect_service(
+        mut self,
+        service: Arc<dyn astra_services::ReflectService>,
+    ) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -1801,7 +1812,8 @@ impl AgenticRunLifecycleService {
             .with_pool(self.shared_pool.clone())
             .with_edge_connection_pool(self.edge_connection_pool.clone())
             .with_skill_service(self.skill_service.clone())
-            .with_memory_extraction_service(self.memory_extraction_service.clone()),
+            .with_memory_extraction_service(self.memory_extraction_service.clone())
+            .with_reflect_service(Arc::clone(&self.reflect_service)),
         );
         let executor_for_spawner: Arc<dyn SpawnAgentExecutor> = executor.clone();
         let mut spawner = DynamicAgentSpawner::with_broadcaster(
@@ -4655,6 +4667,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 None,
             )
             .with_cancel_token(loop_state.cancellation.token.clone())
+            .with_reflect_service(Arc::clone(&self.reflect_service))
             .with_task_store(task_store);
             if agent_binding_mode {
                 executor = executor.with_server_builtin_tools_disabled();
@@ -5468,6 +5481,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 None,
             )
             .with_cancel_token(state.cancellation.token.clone())
+            .with_reflect_service(Arc::clone(&self.reflect_service))
             .with_task_store(task_store);
             if agent_binding_mode {
                 executor = executor.with_server_builtin_tools_disabled();
@@ -6452,6 +6466,7 @@ pub struct ServerSpawnAgentExecutor {
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    reflect_service: Arc<dyn astra_services::ReflectService>,
     runtime_contexts: Arc<RwLock<HashMap<String, ServerSpawnRuntimeContext>>>,
 }
 
@@ -6471,6 +6486,7 @@ impl ServerSpawnAgentExecutor {
             edge_registry_service: None,
             skill_service: None,
             memory_extraction_service: None,
+            reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             runtime_contexts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -6514,6 +6530,14 @@ impl ServerSpawnAgentExecutor {
         svc: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     ) -> Self {
         self.memory_extraction_service = svc;
+        self
+    }
+
+    pub fn with_reflect_service(
+        mut self,
+        service: Arc<dyn astra_services::ReflectService>,
+    ) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -6576,6 +6600,7 @@ impl ServerSpawnAgentExecutor {
         if let Some(svc) = self.memory_extraction_service.clone() {
             executor = executor.with_memory_extraction_service(svc);
         }
+        executor = executor.with_reflect_service(Arc::clone(&self.reflect_service));
         executor
     }
 }
@@ -6840,6 +6865,7 @@ pub struct ServerSubRunExecutor {
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    reflect_service: Arc<dyn astra_services::ReflectService>,
     inherited_permissions: InheritedPermissions,
     /// Shared ToolExecutionService so executors share the same disabled_tools set.
     pub tool_execution_service: Option<ToolExecutionService>,
@@ -6863,6 +6889,7 @@ impl ServerSubRunExecutor {
             edge_registry_service: None,
             skill_service: None,
             memory_extraction_service: None,
+            reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             inherited_permissions: InheritedPermissions::auto_approve(),
             tool_execution_service: None,
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -6880,6 +6907,14 @@ impl ServerSubRunExecutor {
         svc: Arc<crate::session_memory::MemoryExtractionService>,
     ) -> Self {
         self.memory_extraction_service = Some(svc);
+        self
+    }
+
+    pub fn with_reflect_service(
+        mut self,
+        service: Arc<dyn astra_services::ReflectService>,
+    ) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -7290,6 +7325,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 self.shared_pool.is_some(),
             ))
             .with_cancel_token(config.cancel_token.clone())
+            .with_reflect_service(Arc::clone(&self.reflect_service))
             .with_task_store(task_store);
 
             // Enable exactly-once tool execution for crash recovery dedup.
