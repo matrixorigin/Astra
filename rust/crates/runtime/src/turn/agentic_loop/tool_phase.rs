@@ -1567,13 +1567,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             }
         }
 
-        if !step_actions.is_empty() {
-            let hint_parts = apply_tactical_actions(state, &step_actions);
-            if !hint_parts.is_empty() {
-                let hint_text = format!("[Tactical Adaptation]\n{}", hint_parts.join("\n"));
-                state.push_volatile(super::host::VolatileKind::TacticalAdaptation, hint_text);
-            }
-        }
     }
 
     if let Some(ref emitter) = state.messaging.progress_emitter {
@@ -1841,8 +1834,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     hub.record_low_confidence_tools(high_failure);
                 }
             }
-            let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
-            apply_per_turn_adaptation(state, turn_tokens);
+            let _turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
 
             // Context compaction is handled by the single unified pass in
             // lifecycle.rs (compact_tool_results_adaptive) which

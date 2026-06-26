@@ -1,7 +1,7 @@
 use astra_runtime::server::artifact_retention_sweeper::run_artifact_retention_gc_once;
 use astra_services::{
-    DatabaseRunStateStore, budget_for_turn_intent, build_presigned_artifact_download,
-    content_hash_with_normalize_version, expired_artifact_placeholder, runs::ToolOutputBatchItem,
+    budget_for_turn_intent, build_presigned_artifact_download, content_hash_with_normalize_version,
+    expired_artifact_placeholder, runs::ToolOutputBatchItem, DatabaseRunStateStore,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -18,7 +18,7 @@ fn require_db_it_env() -> astra_core::MatrixOneSettings {
 }
 
 fn strict_online_perf_enabled() -> bool {
-    std::env::var("ASTRA_STRICT_ONLINE_PERF").as_deref() == Ok("1")
+    std::env::var("ASTRA_STRICT_ONLINE_PERF").as_deref() != Ok("0")
 }
 
 async fn setup_pool() -> astra_core::SharedPool {
@@ -250,12 +250,11 @@ async fn l2_53_large_pg_dump_uses_artifact_ref_and_never_prompt_raw_payload() {
     .fetch_one(pool.get())
     .await
     .unwrap();
-    assert!(
-        row.try_get::<Option<String>, _>("artifact_ref")
-            .unwrap()
-            .as_deref()
-            .is_some_and(|value| value.starts_with("tool_output://"))
-    );
+    assert!(row
+        .try_get::<Option<String>, _>("artifact_ref")
+        .unwrap()
+        .as_deref()
+        .is_some_and(|value| value.starts_with("tool_output://")));
     assert!(row.try_get::<u64, _>("preview_len").unwrap() <= 1000);
     assert!(row.try_get::<i64, _>("payload_bytes").unwrap() > 1000);
 }

@@ -1498,7 +1498,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);
     }
-    let turn_intent = host.judge_turn_intent(state).await.or_else(|| {
+    let _turn_intent = host.judge_turn_intent(state).await.or_else(|| {
         // Structural fallback when the LLM judge is unavailable or failed.
         // Keeps scenario routing, continuation mode, and adaptive profiles
         // functional under judge outages instead of collapsing to defaults.

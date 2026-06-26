@@ -212,7 +212,7 @@ impl FeedbackSignalStore {
             buffer.signals.push_back(signal);
             trim_buffer(&mut buffer, self.max_signals);
         }
-        self.persist();
+        let _ = self.persist();
     }
 
     /// Return retained signals from oldest to newest.
