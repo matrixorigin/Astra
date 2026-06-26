@@ -1214,6 +1214,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             sess.stats.record_compaction(result.tokens_freed);
                         }
                         let tokens_freed = result.pipeline_outcome.total_tokens_freed;
+                        let messages_after = state.messages.len();
                         if !prep.quiet {
                             // In a retry context we know we overflowed the
                             // context window, so use max_turn_input_tokens as
@@ -1233,6 +1234,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                                 tokens_freed,
                                 tokens_before,
                                 state.max_turn_input_tokens,
+                                result.messages_removed,
+                                messages_after,
+                                result.layer_descriptions.clone(),
                             );
                             host.on_compaction(event);
                         }
@@ -2821,11 +2825,23 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 .unwrap_or_default()
                 .as_secs(),
         };
-        let mut total_freed = 0;
+        let mut total_freed = 0u64;
+        let mut layer_descriptions: Vec<String> = Vec::new();
+        let mut total_messages_removed: usize = 0;
         if state.compact_tier_applied < CompactionTier::CompactHistory {
             let pipeline = super::super::CompactionEngine::aggressive_pipeline();
             let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
             total_freed = outcome.total_tokens_freed;
+            total_messages_removed = outcome
+                .layer_results
+                .iter()
+                .map(|(_, r)| r.messages_removed)
+                .sum();
+            layer_descriptions = outcome
+                .layer_results
+                .iter()
+                .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
+                .collect();
         }
 
         // Tier 2: Spill old messages to disk if compression wasn't enough.
@@ -2842,6 +2858,9 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                     state.llm_rounds_completed,
                 );
                 total_freed += spill_freed;
+                if spill_freed > 0 {
+                    layer_descriptions.push(format!("spill_to_disk: ~{} tokens", spill_freed));
+                }
             }
         }
 
@@ -2854,6 +2873,9 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                     total_freed,
                     measured,
                     state.max_turn_input_tokens,
+                    total_messages_removed,
+                    state.messages.len(),
+                    layer_descriptions.clone(),
                 );
                 host.on_compaction(event);
             }

@@ -172,6 +172,12 @@ pub struct CompactionEvent {
     pub tokens_after: u64,
     /// Max context window tokens.
     pub max_tokens: u64,
+    /// Number of messages removed by compaction.
+    pub messages_removed: usize,
+    /// Number of messages remaining after compaction.
+    pub messages_after: usize,
+    /// Per-layer descriptions (name: ~tokens) for telemetry/UX.
+    pub layer_descriptions: Vec<String>,
     /// User-facing summary line.
     pub summary: String,
 }
@@ -184,10 +190,13 @@ impl CompactionEvent {
         tokens_freed: u64,
         tokens_before: u64,
         max_tokens: u64,
+        messages_removed: usize,
+        messages_after: usize,
+        layer_descriptions: Vec<String>,
     ) -> Self {
         let tokens_after = tokens_before.saturating_sub(tokens_freed);
         // Dimmed prefix so the line is visually distinct from agent output.
-        let summary = format!(
+        let mut summary = format!(
             "  ♻ {}: freed ~{} tokens ({}→{} of {}), pressure {:.0}%",
             kind,
             tokens_freed,
@@ -196,6 +205,17 @@ impl CompactionEvent {
             max_tokens,
             pressure * 100.0,
         );
+        // Append what was compacted so users know which tool results / turns
+        // have been summarized or removed — this makes compaction transparent
+        // instead of a silent loss of context.
+        if messages_removed > 0 {
+            summary.push_str(&format!(" — rm {} msgs", messages_removed));
+        }
+        if !layer_descriptions.is_empty() {
+            summary.push_str("\n    (");
+            summary.push_str(&layer_descriptions.join(", "));
+            summary.push(')');
+        }
         Self {
             kind,
             pressure,
@@ -203,6 +223,9 @@ impl CompactionEvent {
             tokens_before,
             tokens_after,
             max_tokens,
+            messages_removed,
+            messages_after,
+            layer_descriptions,
             summary,
         }
     }
@@ -227,6 +250,9 @@ mod tests {
             18_000,
             185_000,
             200_000,
+            12,
+            95,
+            vec!["old_turns: ~12000".into(), "tool_outputs: ~5000".into()],
         );
         assert!(ev.summary.contains("♻"));
         assert!(ev.summary.contains("reactive_budget"));
@@ -234,18 +260,35 @@ mod tests {
         assert!(ev.summary.contains("167"));
         assert!(ev.summary.contains("200"));
         assert!(ev.summary.contains("88%"));
+        assert!(ev.summary.contains("rm 12 msgs"));
+        assert!(ev.summary.contains("old_turns: ~12000"));
+        assert!(ev.summary.contains("tool_outputs: ~5000"));
         assert_eq!(ev.tokens_after, 167_000);
+        assert_eq!(ev.messages_removed, 12);
+        assert_eq!(ev.messages_after, 95);
     }
 
     #[test]
     fn compaction_event_should_warn_at_70_percent() {
-        let low = CompactionEvent::new(CompactionKind::ProactiveDefault, 0.69, 1000, 50000, 100000);
+        let low = CompactionEvent::new(
+            CompactionKind::ProactiveDefault,
+            0.69,
+            1000,
+            50000,
+            100000,
+            0,
+            50,
+            vec![],
+        );
         let high = CompactionEvent::new(
             CompactionKind::ProactiveAggressive,
             0.70,
             2000,
             70000,
             100000,
+            5,
+            45,
+            vec!["old_turns: ~2000".into()],
         );
         assert!(!low.should_warn());
         assert!(high.should_warn());
@@ -253,7 +296,16 @@ mod tests {
 
     #[test]
     fn compaction_event_tokens_after_saturates() {
-        let ev = CompactionEvent::new(CompactionKind::ProactiveDefault, 0.5, 500, 300, 500);
+        let ev = CompactionEvent::new(
+            CompactionKind::ProactiveDefault,
+            0.5,
+            500,
+            300,
+            500,
+            0,
+            10,
+            vec![],
+        );
         assert_eq!(ev.tokens_after, 0);
     }
 

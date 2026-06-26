@@ -351,6 +351,9 @@ mod tests {
                 tokens_before: 30000,
                 tokens_after: 29000,
                 max_tokens: 64000,
+                messages_removed: 2,
+                messages_after: 18,
+                layer_descriptions: vec![],
                 summary: "test".into(),
             }),
         ];
@@ -431,6 +434,9 @@ mod tests {
             tokens_before: 32000,
             tokens_after: 27500,
             max_tokens: 64000,
+            messages_removed: 5,
+            messages_after: 25,
+            layer_descriptions: vec!["microcompact: ~4500 tokens".into()],
             summary: "freed 4500 tokens".into(),
         };
         let json = event_to_json(&StreamEvent::Compaction(event));

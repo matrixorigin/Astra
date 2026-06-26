@@ -1162,14 +1162,25 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
     } else {
         CompactionEngine::default_pipeline_for(max_tokens)
     };
+    let messages_before = state.messages.len();
     let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
     if outcome.total_tokens_freed > 0 && !quiet {
+        let messages_after = state.messages.len();
+        let messages_removed = messages_before.saturating_sub(messages_after);
+        let layer_descriptions: Vec<String> = outcome
+            .layer_results
+            .iter()
+            .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
+            .collect();
         let event = CompactionEvent::new(
             kind,
             pressure,
             outcome.total_tokens_freed,
             tokens_measured,
             max_tokens,
+            messages_removed,
+            messages_after,
+            layer_descriptions,
         );
         host.on_compaction(event);
         if let Some(ref mut sess) = state.pipeline_session {
@@ -1823,6 +1834,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 0, // no tokens freed yet
                 pressure_estimate_tokens,
                 state.max_turn_input_tokens,
+                0,               // no messages removed
+                state.messages.len(), // current message count
+                vec![],          // no layers applied
             );
             host.on_compaction(warning);
         }
@@ -1872,6 +1886,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     mc.tokens_saved as u64,
                     pressure_estimate_tokens,
                     state.max_turn_input_tokens,
+                    mc.results_compacted,
+                    state.messages.len(),
+                    vec![format!("microcompact: ~{} tokens", mc.tokens_saved)],
                 );
                 host.on_compaction(event);
             }

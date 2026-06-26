@@ -7,16 +7,16 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use astra_runtime::{
     tool_registry::ToolRegistry,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, ControlToolRecovery, HostTurnResult,
-        TurnInteractionMode, interaction_scoped_tool_restrictions,
+        interaction_scoped_tool_restrictions, AgenticLoopHost, AgenticLoopState,
+        ControlToolRecovery, HostTurnResult, TurnInteractionMode,
     },
 };
 use astra_turn_core::{
@@ -28,14 +28,14 @@ use crossterm::style::Stylize;
 use serde_json::Value;
 
 use crate::{
-    ExplainMode,
     cli::permission_manager::{PermissionManager, PermissionMode},
     cli::stream::stream_render::RenderPolicy,
     edge_tools::ToolExecutor,
+    ExplainMode,
 };
 
 use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
-    ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
+    fetch_chat_turn_sse, ChatTurnSseFetchRequest, PrepareTurnTelemetry,
 };
 use crate::cli::chat_stream::sse_loop::refresh_root_permission_context;
 
@@ -1753,6 +1753,9 @@ mod tests {
             tokens_before: 48000,
             tokens_after: 36000,
             max_tokens: 64000,
+            messages_removed: 8,
+            messages_after: 42,
+            layer_descriptions: vec!["old_turns: ~8000".into(), "tool_outputs: ~4000".into()],
             summary: "reactive budget compaction".into(),
         };
 
