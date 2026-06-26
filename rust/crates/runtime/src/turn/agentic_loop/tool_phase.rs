@@ -16,7 +16,6 @@ use astra_services::evaluation::SessionQualityAssessmentRequest;
 use astra_services::runs::ToolOutputBatchItem;
 use astra_services::session_journal::ToolCallRecord;
 
-use super::super::agentic::adaptive_runtime::{apply_per_turn_adaptation, apply_tactical_actions};
 use super::super::agentic::delegate_interception::{
     DelegationInterceptionResult, intercept_delegations, tool_call_arguments_value, tool_call_name,
 };

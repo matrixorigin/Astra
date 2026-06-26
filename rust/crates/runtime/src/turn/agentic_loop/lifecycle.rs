@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::super::headless_round::HeadlessStderrStyle;
+use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::{CompactionEngine, TokenBudget};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, RunControlStatus,
@@ -1513,7 +1513,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             has_prior_assistant_turn,
         ))
     });
-    apply_adaptive_execution_profile_with_intent(state, turn_intent.as_ref());
+    // apply_adaptive_execution_profile_with_intent removed — observation plane
+    // records scenario signals without mutating runtime config (observe now, tune later).
 
     if (state.telemetry.observability_session.is_some() || state.skills.resolver.is_some())
         && state.telemetry.turn_trace_collector.is_none()
