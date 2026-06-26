@@ -1,4 +1,4 @@
-//! Budget-adaptive runtime introspection for the deferred `introspect` tool.
+//! Budget-adaptive runtime introspection for the always-load `introspect` tool.
 //!
 //! The LLM calls `introspect` to query its own session state — token pressure,
 //! cache efficiency, tool health, active alerts, and working memory. Output

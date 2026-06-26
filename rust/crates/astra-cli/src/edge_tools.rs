@@ -6214,77 +6214,80 @@ mod tests {
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
             serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
         ]);
-        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+        executor.set_current_activatable_tool_names(HashSet::from(["session".to_string()]));
 
         let before = executor
             .execute(
-                "memory",
-                &serde_json::json!({"action": "remember", "content": "do not write"}),
+                "session",
+                &serde_json::json!({"action": "sleep", "seconds": 1}),
             )
             .await;
         assert!(
-            before.contains("called directly")
-                && before.contains("select:memory")
+            before.contains("tool_search")
+                && before.contains("select:session")
                 && before.contains("not executed"),
             "direct deferred call must become a non-executing activation hint; got: {before}"
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
+            vec!["session".to_string()],
             "direct deferred call must record activation for the next schema-selection round"
         );
 
         let search = executor
             .execute(
                 "tool_search",
-                &serde_json::json!({"query": "select:memory"}),
+                &serde_json::json!({"query": "select:session"}),
             )
             .await;
         let parsed = parse_tool_search_output(&search);
-        assert_eq!(tool_search_match_names(&parsed), vec!["memory".to_string()]);
+        assert_eq!(
+            tool_search_match_names(&parsed),
+            vec!["session".to_string()]
+        );
         assert!(tool_search_string_array(&parsed, "missing").is_empty());
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()]
+            vec!["session".to_string()]
         );
 
-        let after = executor.execute("memory", &serde_json::json!({})).await;
+        let after = executor.execute("session", &serde_json::json!({})).await;
         assert!(
-            after.contains("called directly")
-                && after.contains("select:memory")
+            after.contains("tool_search")
+                && after.contains("select:session")
                 && after.contains("not executed"),
             "activation state alone must not bypass current tools[] visibility; got: {after}"
         );
         assert_eq!(
             executor.activated_deferred_tool_names_for_schema_injection(),
-            vec!["memory".to_string()],
+            vec!["session".to_string()],
             "schema assembly should surface the selected deferred tool"
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
+            vec!["session".to_string()],
             "schema assembly must not consume activation before the tool is called"
         );
         assert_eq!(
             executor.activated_deferred_tool_names_for_schema_injection(),
-            vec!["memory".to_string()],
+            vec!["session".to_string()],
             "repeated schema assembly must keep the selected tool available"
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
+            vec!["session".to_string()],
             "activation must remain pending until the tool is actually called"
         );
 
         executor.set_current_visible_tool_schemas(&[
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
             serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
-            serde_json::json!({"type": "function", "function": {"name": "memory"}}),
+            serde_json::json!({"type": "function", "function": {"name": "session"}}),
         ]);
         executor.set_current_activatable_tool_names(HashSet::new());
-        let injected = executor.execute("memory", &serde_json::json!({})).await;
+        let injected = executor.execute("session", &serde_json::json!({})).await;
         assert!(
-            injected.contains("missing required"),
+            injected.contains("Missing required parameter: action"),
             "visible schema must allow the real executor path; got: {injected}"
         );
         assert_eq!(

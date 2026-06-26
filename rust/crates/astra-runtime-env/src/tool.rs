@@ -253,8 +253,10 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         control_plane("enter_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("exit_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("get_agent_info", ToolLoadPolicy::Deferred),
-        control_plane("introspect", ToolLoadPolicy::Deferred),
-        control_plane("reflect", ToolLoadPolicy::Deferred),
+        // Self-observation and session reflection are control-plane recovery
+        // entrypoints. They must be callable without a discovery round-trip.
+        control_plane("introspect", ToolLoadPolicy::AlwaysLoad),
+        control_plane("reflect", ToolLoadPolicy::AlwaysLoad),
         // Non-blocking status updates are still part of the user communication
         // path, so keep notify available with ask_user instead of requiring a
         // discovery round-trip.
@@ -940,6 +942,26 @@ mod tests {
         assert_eq!(notify.required.executor, RequiredExecutor::ControlPlane);
         assert_eq!(ask_user.load_policy, ToolLoadPolicy::AlwaysLoad);
         assert_eq!(notify.load_policy, ToolLoadPolicy::AlwaysLoad);
+    }
+
+    #[test]
+    fn observation_control_plane_tools_are_always_load() {
+        let registry = registry();
+        for name in ["introspect", "reflect"] {
+            let spec = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} registered"));
+            assert_eq!(
+                spec.required.executor,
+                RequiredExecutor::ControlPlane,
+                "{name} must remain a control-plane observation entrypoint"
+            );
+            assert_eq!(
+                spec.load_policy,
+                ToolLoadPolicy::AlwaysLoad,
+                "{name} must not require deferred discovery"
+            );
+        }
     }
 
     #[test]

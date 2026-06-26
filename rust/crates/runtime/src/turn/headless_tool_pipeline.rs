@@ -729,26 +729,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_reflect_without_edge_row_reports_activation_not_runtime_missing() {
+    async fn deferred_control_plane_tool_reports_activation_not_runtime_missing() {
         let mut harness = PipelineHarness::new();
         harness.tool_calls = vec![json!({
-            "id": "call-reflect",
+            "id": "call-session",
             "type": "function",
             "function": {
-                "name": "reflect",
+                "name": "session",
                 "arguments": "{}",
             }
         })];
         harness.edge_tool_round.clear();
         harness.valid_tool_names = HashSet::from(["tool_search".to_string()]);
-        harness.deferred_tool_names = HashSet::from(["reflect".to_string()]);
+        harness.deferred_tool_names = HashSet::from(["session".to_string()]);
         begin_recorded_turn(&mut harness, 1);
 
         {
             let mut pipeline = harness.pipeline();
             match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
                 HeadlessPipelineStage::ShortCircuit => {}
-                _ => panic!("direct deferred reflect call must be rejected before execution"),
+                _ => panic!("direct deferred session call must be rejected before execution"),
             }
         }
 
@@ -759,11 +759,11 @@ mod tests {
             .to_string();
         assert!(
             result.contains("not available in this turn yet"),
-            "deferred local reflect should produce an activation/admission hint, got: {result}"
+            "deferred control-plane tool should produce an activation/admission hint, got: {result}"
         );
         assert!(
             !result.contains("required runtime capability is not connected"),
-            "reflect is a CLI-local facade, not an executor-gated runtime: {result}"
+            "control-plane deferred tools are not executor-gated runtime tools: {result}"
         );
     }
 

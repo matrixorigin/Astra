@@ -2202,6 +2202,8 @@ mod cache_stability_regression {
             "glob",
             "git",
             "memory",
+            "introspect",
+            "reflect",
         ] {
             assert!(
                 always_load.contains(name),

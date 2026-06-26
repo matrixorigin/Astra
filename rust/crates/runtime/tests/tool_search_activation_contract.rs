@@ -15,8 +15,8 @@
 //!
 //! `introspect` stays in the catalog — it exposes runtime diagnostics
 //! (token pressure, cache hit rate, tool health, volatile injections,
-//! stall state) that `session` does not duplicate. It's a genuinely
-//! separate capability, dispatched by the edge-tool executor.
+//! stall state) that `session` does not duplicate. It is a genuinely
+//! separate always-load capability, dispatched by the edge-tool executor.
 
 use astra_tools::schemas::all_tool_schemas;
 use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
@@ -89,30 +89,41 @@ fn tool_search_schema_advertises_select_mode() {
 
 // ── 2. introspect coexists with tool_search ─────────────────────────────────
 //
-// `introspect` surfaces runtime diagnostics (pressure, cache, health,
-// volatile injections, stall state). `session` does not cover those, so
-// `introspect` remains available, but diagnostic-only usage is deferred by
-// default to keep common turns lean.
+// `introspect` and `reflect` are recovery/debug entrypoints. They should not
+// require the model to discover that self-observation exists before it can use
+// it to recover from drift, runtime errors, or confusing state.
 
 #[test]
-fn introspect_is_available_but_deferred_by_default() {
+fn observation_tools_are_available_and_always_load_by_default() {
     let introspect = TOOL_CATALOG
         .iter()
         .find(|t| t.name == "introspect")
         .expect("introspect must remain in TOOL_CATALOG");
+    let reflect = TOOL_CATALOG
+        .iter()
+        .find(|t| t.name == "reflect")
+        .expect("reflect must remain in TOOL_CATALOG");
     assert_eq!(introspect.name, "introspect");
+    assert_eq!(reflect.name, "reflect");
+
+    let always_load = astra_runtime::tool_registry::surface::default_always_load_names();
     assert!(
-        !astra_runtime::tool_registry::surface::default_always_load_names()
-            .iter()
-            .any(|name| name == "introspect"),
-        "introspect is diagnostic-only and should not be in every turn's always_load tool prefix"
+        always_load.iter().any(|name| name == "introspect")
+            && always_load.iter().any(|name| name == "reflect"),
+        "observation tools must be in every local always_load tool prefix"
     );
+
     let names = schema_names(&all_tool_schemas());
     assert!(
         names.contains(&"introspect".to_string()),
         "introspect schema must still be emitted"
     );
-    // Both live side-by-side so tool_search can activate diagnostics on demand.
+    assert!(
+        names.contains(&"reflect".to_string()),
+        "reflect schema must still be emitted"
+    );
+    // They live side-by-side with tool_search; tool_search remains the
+    // activation primitive for the rest of the deferred catalog.
     assert!(names.contains(&"tool_search".to_string()));
 }
 
