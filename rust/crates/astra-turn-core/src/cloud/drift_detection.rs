@@ -121,7 +121,10 @@ pub fn parse_drift_detection_response(response: &str) -> Result<DriftDetectionRe
     match drift {
         "on_task" => Ok(DriftDetectionResult::OnTask { reason }),
         "drifting" => Ok(DriftDetectionResult::Drifting { reason }),
-        _ => Err(format!("Invalid drift value: {}, expected 'on_task' or 'drifting'", drift)),
+        _ => Err(format!(
+            "Invalid drift value: {}, expected 'on_task' or 'drifting'",
+            drift
+        )),
     }
 }
 
@@ -133,8 +136,14 @@ mod tests {
     fn test_build_drift_detection_messages_structure() {
         let user_query = "Fix the authentication bug";
         let recent_tool_turns = vec![
-            (vec!["read_file".to_string()], r#"{"path": "src/auth.rs"}"#.to_string()),
-            (vec!["bash".to_string()], r#"{"command": "cargo test"}"#.to_string()),
+            (
+                vec!["read_file".to_string()],
+                r#"{"path": "src/auth.rs"}"#.to_string(),
+            ),
+            (
+                vec!["bash".to_string()],
+                r#"{"command": "cargo test"}"#.to_string(),
+            ),
         ];
 
         let messages = build_drift_detection_messages(user_query, &recent_tool_turns);

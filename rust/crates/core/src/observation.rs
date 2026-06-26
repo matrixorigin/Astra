@@ -5,6 +5,7 @@
 //! actions; write-side systems may consume these records later.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -607,6 +608,67 @@ pub struct ObservationGraphSlice {
     pub budget_result: ObservationBudgetResult,
 }
 
+// ── Shared graph builders ─────────────────────────────────────────────────
+
+/// Deduplicated node insertion by `ref_id`. Returns `true` if the node was
+/// added (i.e. the `ref_id` was not already present).
+pub fn push_graph_node(
+    nodes: &mut Vec<ObservationGraphNode>,
+    node_refs: &mut BTreeSet<String>,
+    node: ObservationGraphNode,
+) -> bool {
+    if node_refs.insert(node.ref_id.clone()) {
+        nodes.push(node);
+        true
+    } else {
+        false
+    }
+}
+
+/// Deduplicated edge insertion by `(from, to, kind)`. Returns `true` if the
+/// edge was added.
+pub fn push_graph_edge(
+    edges: &mut Vec<ObservationGraphEdge>,
+    edge_keys: &mut BTreeSet<(String, String, ObservationGraphEdgeKind)>,
+    from: String,
+    to: String,
+    kind: ObservationGraphEdgeKind,
+) -> bool {
+    if edge_keys.insert((from.clone(), to.clone(), kind)) {
+        edges.push(ObservationGraphEdge { from, to, kind });
+        true
+    } else {
+        false
+    }
+}
+
+/// Trim and truncate a label or summary for graph node display.
+/// Returns `None` when the value is empty after trimming.
+pub fn truncate_graph_summary(value: &str, max_chars: usize) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let snippet: String = trimmed.chars().take(max_chars).collect();
+    Some(snippet)
+}
+
+/// Classify an event-type label into an [`ObservationGraphNodeKind`].
+/// Error-like and failure-like events map to `Outcome`; everything
+/// else maps to `Event`.
+pub fn classify_event_kind(event_type: &str) -> ObservationGraphNodeKind {
+    if matches!(
+        event_type,
+        "tool_result" | "tool_error" | "error" | "stall_detected"
+    ) || event_type.contains("error")
+        || event_type.contains("fail")
+    {
+        ObservationGraphNodeKind::Outcome
+    } else {
+        ObservationGraphNodeKind::Event
+    }
+}
+
 fn clamp_confidence(value: f64) -> f64 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
@@ -847,5 +909,144 @@ mod tests {
         let budget_json = serde_json::to_value(&budget).expect("serialize budget");
         assert_eq!(budget_json["truncated"], true);
         assert_eq!(budget_json["omitted"]["nodes"], 12);
+    }
+
+    // ── graph builder tests ──
+
+    #[test]
+    fn push_graph_node_inserts_unique_ref_ids() {
+        let mut nodes = Vec::new();
+        let mut node_refs = BTreeSet::new();
+
+        let added = push_graph_node(
+            &mut nodes,
+            &mut node_refs,
+            ObservationGraphNode {
+                ref_id: "urn:astra:event:cloud:evt-1".into(),
+                layer: ObservationGraphLayer::Runtime,
+                kind: ObservationGraphNodeKind::Event,
+                label: "test".into(),
+                summary: None,
+                metadata: None,
+            },
+        );
+        assert!(added);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(node_refs.len(), 1);
+    }
+
+    #[test]
+    fn push_graph_node_dedup_rejects_duplicate_ref_ids() {
+        let mut nodes = Vec::new();
+        let mut node_refs = BTreeSet::new();
+
+        let node = ObservationGraphNode {
+            ref_id: "urn:astra:event:cloud:evt-1".into(),
+            layer: ObservationGraphLayer::Runtime,
+            kind: ObservationGraphNodeKind::Event,
+            label: "test".into(),
+            summary: None,
+            metadata: None,
+        };
+        assert!(push_graph_node(&mut nodes, &mut node_refs, node.clone()));
+        assert!(!push_graph_node(&mut nodes, &mut node_refs, node.clone()));
+        assert_eq!(nodes.len(), 1);
+    }
+
+    #[test]
+    fn push_graph_edge_inserts_unique_triples() {
+        let mut edges = Vec::new();
+        let mut edge_keys = BTreeSet::new();
+
+        let added = push_graph_edge(
+            &mut edges,
+            &mut edge_keys,
+            "from".into(),
+            "to".into(),
+            ObservationGraphEdgeKind::Causes,
+        );
+        assert!(added);
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[test]
+    fn push_graph_edge_dedup_rejects_duplicate_triples() {
+        let mut edges = Vec::new();
+        let mut edge_keys = BTreeSet::new();
+
+        assert!(push_graph_edge(
+            &mut edges,
+            &mut edge_keys,
+            "from".into(),
+            "to".into(),
+            ObservationGraphEdgeKind::Causes,
+        ));
+        assert!(!push_graph_edge(
+            &mut edges,
+            &mut edge_keys,
+            "from".into(),
+            "to".into(),
+            ObservationGraphEdgeKind::Causes,
+        ));
+        // Different kind = different triple → allowed
+        assert!(push_graph_edge(
+            &mut edges,
+            &mut edge_keys,
+            "from".into(),
+            "to".into(),
+            ObservationGraphEdgeKind::Supports,
+        ));
+        assert_eq!(edges.len(), 2);
+    }
+
+    #[test]
+    fn truncate_graph_summary_trims_and_truncates() {
+        assert_eq!(
+            truncate_graph_summary("  hello world  ", 5),
+            Some("hello".into())
+        );
+        assert_eq!(truncate_graph_summary("   ", 10), None);
+        assert_eq!(truncate_graph_summary("", 10), None);
+        assert_eq!(truncate_graph_summary("hi", 100), Some("hi".into()));
+    }
+
+    #[test]
+    fn classify_event_kind_maps_errors_to_outcome() {
+        assert_eq!(
+            classify_event_kind("tool_error"),
+            ObservationGraphNodeKind::Outcome
+        );
+        assert_eq!(
+            classify_event_kind("tool_result"),
+            ObservationGraphNodeKind::Outcome
+        );
+        assert_eq!(
+            classify_event_kind("stall_detected"),
+            ObservationGraphNodeKind::Outcome
+        );
+        assert_eq!(
+            classify_event_kind("error"),
+            ObservationGraphNodeKind::Outcome
+        );
+        assert_eq!(
+            classify_event_kind("bash_failed"),
+            ObservationGraphNodeKind::Outcome
+        );
+    }
+
+    #[test]
+    fn classify_event_kind_maps_normal_events_to_event() {
+        assert_eq!(
+            classify_event_kind("tool_call"),
+            ObservationGraphNodeKind::Event
+        );
+        assert_eq!(
+            classify_event_kind("user_message"),
+            ObservationGraphNodeKind::Event
+        );
+        assert_eq!(
+            classify_event_kind("skill_started"),
+            ObservationGraphNodeKind::Event
+        );
     }
 }

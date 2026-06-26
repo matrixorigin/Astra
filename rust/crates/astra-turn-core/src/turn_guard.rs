@@ -1737,7 +1737,12 @@ mod tests {
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
         assert!(verdict.force_stop);
-        assert!(verdict.injections.iter().any(|m| m.contains("CRITICAL") && m.contains("drift")));
+        assert!(
+            verdict
+                .injections
+                .iter()
+                .any(|m| m.contains("CRITICAL") && m.contains("drift"))
+        );
     }
 
     #[test]
@@ -1747,7 +1752,12 @@ mod tests {
 
         let verdict = guard.evaluate();
         assert!(!verdict.force_stop);
-        assert!(!verdict.injections.iter().any(|m| m.contains("CRITICAL") && m.contains("drift")));
+        assert!(
+            !verdict
+                .injections
+                .iter()
+                .any(|m| m.contains("CRITICAL") && m.contains("drift"))
+        );
     }
 
     #[test]

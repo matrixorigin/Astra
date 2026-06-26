@@ -602,7 +602,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         if let IntentDrift::Drifting { correction, .. } = drift {
             state.stall.forced_intent_drift = true;
             state.stall.drift_nudge_count += 1;
-            state.turn_guard.sync_drift_nudge_count(state.stall.drift_nudge_count);
+            state
+                .turn_guard
+                .sync_drift_nudge_count(state.stall.drift_nudge_count);
             state.stall.last_drift_correction_round = state.llm_rounds_completed as usize;
             state.push_volatile(super::host::VolatileKind::IntentDrift, correction.clone());
             tracing::info!(
@@ -615,7 +617,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             if !prep.quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,
-                    format!("⚠ Intent drift detected — correcting course (nudge #{})", state.stall.drift_nudge_count),
+                    format!(
+                        "⚠ Intent drift detected — correcting course (nudge #{})",
+                        state.stall.drift_nudge_count
+                    ),
                 );
             }
         }

@@ -5,7 +5,8 @@ use astra_core::{
     ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationEvidence,
     ObservationFailureCluster, ObservationGraphEdge, ObservationGraphEdgeKind,
     ObservationGraphLayer, ObservationGraphNode, ObservationGraphNodeKind, ObservationGraphSlice,
-    ObservationRecord, ObservationView, SharedPool, error_response, internal_error,
+    ObservationRecord, ObservationView, SharedPool, classify_event_kind, error_response,
+    internal_error, push_graph_edge, push_graph_node, truncate_graph_summary,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -159,27 +160,6 @@ pub struct DataCompleteness {
     /// Human-readable warnings about data gaps.
     pub warnings: Vec<String>,
 }
-fn truncate_graph_summary(value: &str, max_chars: usize) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let snippet: String = trimmed.chars().take(max_chars).collect();
-    Some(snippet)
-}
-
-fn classify_evidence_event_kind(event_type: &str) -> ObservationGraphNodeKind {
-    if matches!(
-        event_type,
-        "tool_result" | "tool_error" | "error" | "stall_detected"
-    ) || event_type.contains("error")
-        || event_type.contains("fail")
-    {
-        ObservationGraphNodeKind::Outcome
-    } else {
-        ObservationGraphNodeKind::Event
-    }
-}
 
 fn build_evidence_graph(
     decisions: &[EvidenceDecision],
@@ -224,7 +204,7 @@ fn build_evidence_graph(
         nodes.push(ObservationGraphNode {
             ref_id,
             layer: ObservationGraphLayer::Runtime,
-            kind: classify_evidence_event_kind(&event.event_type),
+            kind: classify_event_kind(&event.event_type),
             label: event.event_type.clone(),
             summary: truncate_graph_summary(&event.content, 140),
             metadata: Some(serde_json::json!({
@@ -1211,28 +1191,6 @@ fn build_reflect_graph_slice(
         nodes,
         edges,
         budget_result: budget_result.clone(),
-    }
-}
-
-fn push_graph_node(
-    nodes: &mut Vec<ObservationGraphNode>,
-    node_refs: &mut BTreeSet<String>,
-    node: ObservationGraphNode,
-) {
-    if node_refs.insert(node.ref_id.clone()) {
-        nodes.push(node);
-    }
-}
-
-fn push_graph_edge(
-    edges: &mut Vec<ObservationGraphEdge>,
-    edge_keys: &mut BTreeSet<(String, String, ObservationGraphEdgeKind)>,
-    from: String,
-    to: String,
-    kind: ObservationGraphEdgeKind,
-) {
-    if edge_keys.insert((from.clone(), to.clone(), kind)) {
-        edges.push(ObservationGraphEdge { from, to, kind });
     }
 }
 

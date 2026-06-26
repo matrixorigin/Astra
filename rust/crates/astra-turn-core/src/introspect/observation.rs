@@ -3,10 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use astra_core::{
-    urn_component, ObservationActionHint, ObservationBudgetOmitted, ObservationBudgetResult,
+    ObservationActionHint, ObservationBudgetOmitted, ObservationBudgetResult,
     ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
-    ObservationGraphSlice, ObservationProviderCoverage, ObservationRecord, ObservationView,
-    SourcePolicy,
+    ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
+    ObservationGraphNodeKind, ObservationGraphSlice, ObservationProviderCoverage,
+    ObservationRecord, ObservationView, SourcePolicy, classify_event_kind, push_graph_edge,
+    push_graph_node, truncate_graph_summary, urn_component,
 };
 
 use super::{IntrospectRequest, IntrospectSnapshot, ObservationFacet};
@@ -90,6 +92,9 @@ pub fn build_introspect_report(
     let budget_result =
         apply_report_budget(request, &mut observations, &mut evidence, &mut action_hints);
 
+    let graph_slice =
+        build_introspect_graph_slice(snapshot, request, &observations, &evidence, &action_hints);
+
     IntrospectReport {
         schema_version: 1,
         tool: "introspect".to_string(),
@@ -106,7 +111,7 @@ pub fn build_introspect_report(
         evidence,
         action_hints,
         failure_clusters: Vec::new(),
-        graph_slice: ObservationGraphSlice::default(),
+        graph_slice,
         budget_result,
     }
 }
@@ -569,4 +574,525 @@ fn build_introspect_action_hints(
             })
         })
         .collect()
+}
+
+/// Build an observation graph slice from the introspect snapshot and
+/// computed observations/evidence/action-hints. This mirrors the pattern
+/// used in reflect's [`build_reflect_graph_slice`] but for live runtime data.
+fn build_introspect_graph_slice(
+    snapshot: &IntrospectSnapshot,
+    request: &IntrospectRequest,
+    observations: &[ObservationRecord],
+    evidence: &[ObservationEvidence],
+    action_hints: &[ObservationActionHint],
+) -> ObservationGraphSlice {
+    let mut nodes = Vec::new();
+    let mut node_refs = BTreeSet::new();
+    let mut edges = Vec::new();
+    let mut edge_keys = BTreeSet::new();
+
+    // ── evidence nodes (layer: Runtime, kind: Evidence) ──
+    for item in evidence {
+        push_graph_node(
+            &mut nodes,
+            &mut node_refs,
+            ObservationGraphNode {
+                ref_id: item.ref_id.clone(),
+                layer: ObservationGraphLayer::Runtime,
+                kind: ObservationGraphNodeKind::Evidence,
+                label: item.evidence_class.clone(),
+                summary: Some(item.summary.clone()),
+                metadata: None,
+            },
+        );
+    }
+
+    // ── observation nodes (layer: Observation, kind: Observation) ──
+    for obs in observations {
+        push_graph_node(
+            &mut nodes,
+            &mut node_refs,
+            ObservationGraphNode {
+                ref_id: obs.ref_id.clone(),
+                layer: ObservationGraphLayer::Observation,
+                kind: ObservationGraphNodeKind::Observation,
+                label: obs.kind.clone(),
+                summary: Some(obs.summary.clone()),
+                metadata: None,
+            },
+        );
+        // Link observation → evidence (DerivedFrom)
+        for ev_ref in &obs.evidence_refs {
+            push_graph_edge(
+                &mut edges,
+                &mut edge_keys,
+                obs.ref_id.clone(),
+                ev_ref.clone(),
+                ObservationGraphEdgeKind::DerivedFrom,
+            );
+        }
+    }
+
+    // ── action hints (layer: Observation, kind: Observation) ──
+    for hint in action_hints {
+        push_graph_node(
+            &mut nodes,
+            &mut node_refs,
+            ObservationGraphNode {
+                ref_id: format!(
+                    "urn:astra:observation:local:introspect:hint:{}",
+                    urn_component(&hint.target_type)
+                ),
+                layer: ObservationGraphLayer::Observation,
+                kind: ObservationGraphNodeKind::Observation,
+                label: "action_hint".to_string(),
+                summary: Some(hint.summary.clone()),
+                metadata: None,
+            },
+        );
+    }
+
+    // ── tool error nodes (layer: Runtime, kind: Outcome) ──
+    if matches!(
+        request.facet,
+        ObservationFacet::Errors | ObservationFacet::Overview | ObservationFacet::Session
+    ) {
+        for (idx, error) in snapshot.tool_errors.iter().enumerate() {
+            let error_ref = format!("urn:astra:observation:local:introspect:execution:error:{idx}");
+            let label = error
+                .failure_category
+                .as_deref()
+                .map(|category| format!("tool_error:{category}"))
+                .unwrap_or_else(|| "tool_error".to_string());
+            push_graph_node(
+                &mut nodes,
+                &mut node_refs,
+                ObservationGraphNode {
+                    ref_id: error_ref.clone(),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: classify_event_kind("tool_error"),
+                    label,
+                    summary: truncate_graph_summary(
+                        error
+                            .error_preview
+                            .as_deref()
+                            .filter(|preview| !preview.trim().is_empty())
+                            .unwrap_or(&error.signature_hint),
+                        140,
+                    ),
+                    metadata: Some(serde_json::json!({
+                        "tool": error.tool,
+                        "failure_category": error.failure_category,
+                        "file_path": error.file_path,
+                        "file_range": error.file_range,
+                        "turn": error.turn,
+                        "round": error.round,
+                    })),
+                },
+            );
+        }
+    }
+
+    // ── tool health nodes (layer: Runtime, kind: Outcome) ──
+    if matches!(
+        request.facet,
+        ObservationFacet::Session | ObservationFacet::Overview
+    ) {
+        for tool in snapshot.tool_health.iter().filter(|tool| {
+            tool.avoidance_advised || tool.errors > 0 || tool.consecutive_failures > 0
+        }) {
+            let health_ref = format!(
+                "urn:astra:observation:local:introspect:execution:tool:{}",
+                urn_component(&tool.name)
+            );
+            let severity = if tool.avoidance_advised || tool.consecutive_failures >= 3 {
+                "warning"
+            } else {
+                "info"
+            };
+            push_graph_node(
+                &mut nodes,
+                &mut node_refs,
+                ObservationGraphNode {
+                    ref_id: health_ref.clone(),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Outcome,
+                    label: "tool_health".to_string(),
+                    summary: Some(format!(
+                        "{name} calls={calls} errors={errors} consecutive_failures={cf}",
+                        name = tool.name,
+                        calls = tool.calls,
+                        errors = tool.errors,
+                        cf = tool.consecutive_failures
+                    )),
+                    metadata: Some(serde_json::json!({
+                        "tool_name": tool.name,
+                        "calls": tool.calls,
+                        "errors": tool.errors,
+                        "consecutive_failures": tool.consecutive_failures,
+                        "avoidance_advised": tool.avoidance_advised,
+                        "severity": severity,
+                    })),
+                },
+            );
+        }
+    }
+
+    // ── stall nodes (layer: Runtime, kind: Event) ──
+    if matches!(
+        request.facet,
+        ObservationFacet::Stall | ObservationFacet::Overview
+    ) {
+        if snapshot.stall_state.nudge_count > 0 {
+            push_graph_node(
+                &mut nodes,
+                &mut node_refs,
+                ObservationGraphNode {
+                    ref_id: "urn:astra:observation:local:introspect:stall:state".to_string(),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Event,
+                    label: "stall_telemetry".to_string(),
+                    summary: Some(format!(
+                        "stall nudge count: {}",
+                        snapshot.stall_state.nudge_count
+                    )),
+                    metadata: Some(serde_json::json!({
+                        "nudge_count": snapshot.stall_state.nudge_count,
+                        "event_count": snapshot.stall_state.events.len(),
+                        "introspection_count": snapshot.stall_state.introspection_count,
+                        "forced_corrections": snapshot.stall_state.forced_corrections,
+                    })),
+                },
+            );
+        }
+        for correction in &snapshot.stall_state.forced_corrections {
+            push_graph_node(
+                &mut nodes,
+                &mut node_refs,
+                ObservationGraphNode {
+                    ref_id: format!(
+                        "urn:astra:observation:local:introspect:stall:correction:{}",
+                        urn_component(correction)
+                    ),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Outcome,
+                    label: "stall_forced_correction".to_string(),
+                    summary: Some(format!("forced correction fired: {correction}")),
+                    metadata: None,
+                },
+            );
+        }
+    }
+
+    ObservationGraphSlice {
+        nodes,
+        edges,
+        budget_result: ObservationBudgetResult::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::introspect::{
+        IntrospectSnapshot, StallSnapshotSummary, ToolErrorEntry, ToolHealthEntry,
+    };
+    use astra_core::{ObservationFacet, ObservationTopic};
+
+    fn tool_error_entry(tool: &str, preview: &str, category: Option<&str>) -> ToolErrorEntry {
+        ToolErrorEntry {
+            tool: tool.to_string(),
+            signature_hint: format!("{tool} failed"),
+            failure_category: category.map(String::from),
+            error_preview: Some(preview.to_string()),
+            at_epoch: 1000,
+            error_message: String::new(),
+            file_path: None,
+            file_range: None,
+            turn: 1,
+            round: 1,
+        }
+    }
+
+    fn unhealthy_tool(name: &str) -> ToolHealthEntry {
+        ToolHealthEntry {
+            name: name.to_string(),
+            calls: 10,
+            errors: 3,
+            avg_ms: 500,
+            avoidance_advised: true,
+            consecutive_failures: 2,
+            last_failure_category: Some("timeout".to_string()),
+        }
+    }
+
+    // ── graph_slice tests ──
+
+    #[test]
+    fn graph_slice_empty_snapshot_has_only_evidence_node() {
+        let snapshot = IntrospectSnapshot::default();
+        let request = IntrospectRequest::default();
+        let observations = Vec::new();
+        let evidence = vec![ObservationEvidence {
+            ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
+            evidence_class: "observed_evidence".into(),
+            source: "runtime.introspect_snapshot".into(),
+            summary: "pressure=0% cache=0% turns=0/0 alerts=0 tool_errors=0".into(),
+            confidence: ObservationConfidence::evidence(0.75),
+        }];
+        let action_hints = Vec::new();
+
+        let slice = build_introspect_graph_slice(
+            &snapshot,
+            &request,
+            &observations,
+            &evidence,
+            &action_hints,
+        );
+        // Empty snapshot with Session facet should only have the evidence node.
+        assert_eq!(slice.nodes.len(), 1);
+        assert_eq!(slice.nodes[0].kind, ObservationGraphNodeKind::Evidence);
+        assert!(slice.edges.is_empty());
+    }
+
+    #[test]
+    fn graph_slice_tool_errors_facet_includes_error_nodes() {
+        let snapshot = IntrospectSnapshot {
+            tool_errors: vec![tool_error_entry(
+                "bash",
+                "timeout after 30s",
+                Some("timeout"),
+            )],
+            ..Default::default()
+        };
+        let request = IntrospectRequest {
+            topic: ObservationTopic::Execution,
+            facet: ObservationFacet::Errors,
+            ..Default::default()
+        };
+        let observations = vec![ObservationRecord {
+            ref_id: "urn:astra:observation:local:introspect:errors:recent".into(),
+            topic: "execution".into(),
+            facet: "errors".into(),
+            kind: "tool_failure_cluster".into(),
+            severity: "warning".into(),
+            summary: "1 recent tool errors recorded".into(),
+            confidence: ObservationConfidence::evidence(0.85),
+            evidence_refs: vec!["urn:astra:context:local:introspect:runtime_snapshot".into()],
+        }];
+        let evidence = vec![ObservationEvidence {
+            ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
+            evidence_class: "observed_evidence".into(),
+            source: "runtime.introspect_snapshot".into(),
+            summary: "pressure=0% cache=0% turns=0/0 alerts=0 tool_errors=1".into(),
+            confidence: ObservationConfidence::evidence(0.75),
+        }];
+        let action_hints = Vec::new();
+
+        let slice = build_introspect_graph_slice(
+            &snapshot,
+            &request,
+            &observations,
+            &evidence,
+            &action_hints,
+        );
+
+        // evidence + observation + 1 error node = 3
+        assert_eq!(slice.nodes.len(), 3, "expected 3 nodes, got: {slice:#?}");
+        let kinds: Vec<_> = slice.nodes.iter().map(|n| n.kind).collect();
+        assert!(kinds.contains(&ObservationGraphNodeKind::Evidence));
+        assert!(kinds.contains(&ObservationGraphNodeKind::Observation));
+        assert!(kinds.contains(&ObservationGraphNodeKind::Outcome));
+        // observation → evidence (DerivedFrom)
+        assert_eq!(slice.edges.len(), 1);
+        assert_eq!(slice.edges[0].kind, ObservationGraphEdgeKind::DerivedFrom);
+    }
+
+    #[test]
+    fn graph_slice_session_facet_includes_tool_health_nodes() {
+        let snapshot = IntrospectSnapshot {
+            tool_health: vec![unhealthy_tool("read_file")],
+            ..Default::default()
+        };
+        let request = IntrospectRequest {
+            topic: ObservationTopic::Runtime,
+            facet: ObservationFacet::Session,
+            ..Default::default()
+        };
+        let observations = Vec::new();
+        let evidence = vec![ObservationEvidence {
+            ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
+            evidence_class: "observed_evidence".into(),
+            source: "runtime.introspect_snapshot".into(),
+            summary: "healthy runtime".into(),
+            confidence: ObservationConfidence::evidence(0.75),
+        }];
+        let action_hints = Vec::new();
+
+        let slice = build_introspect_graph_slice(
+            &snapshot,
+            &request,
+            &observations,
+            &evidence,
+            &action_hints,
+        );
+
+        // evidence + tool_health = 2 nodes
+        assert_eq!(slice.nodes.len(), 2);
+        let health_node = slice
+            .nodes
+            .iter()
+            .find(|n| n.kind == ObservationGraphNodeKind::Outcome && n.label == "tool_health")
+            .expect("should have tool health node");
+        assert_eq!(health_node.layer, ObservationGraphLayer::Runtime);
+        assert_eq!(slice.edges.len(), 0);
+    }
+
+    #[test]
+    fn graph_slice_errors_facet_excludes_tool_health_nodes() {
+        let snapshot = IntrospectSnapshot {
+            tool_errors: vec![tool_error_entry("bash", "command not found", None)],
+            tool_health: vec![unhealthy_tool("bash")],
+            ..Default::default()
+        };
+        let request = IntrospectRequest {
+            topic: ObservationTopic::Execution,
+            facet: ObservationFacet::Errors,
+            ..Default::default()
+        };
+        let observations = Vec::new();
+        let evidence = vec![ObservationEvidence {
+            ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
+            evidence_class: "observed_evidence".into(),
+            source: "runtime.introspect_snapshot".into(),
+            summary: "errors present".into(),
+            confidence: ObservationConfidence::evidence(0.75),
+        }];
+        let action_hints = Vec::new();
+
+        let slice = build_introspect_graph_slice(
+            &snapshot,
+            &request,
+            &observations,
+            &evidence,
+            &action_hints,
+        );
+
+        // evidence + 1 error node, no tool_health node
+        assert_eq!(slice.nodes.len(), 2);
+        let labels: Vec<_> = slice.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert!(labels.contains(&"tool_error:timeout") || labels.contains(&"tool_error"));
+        // No tool_health node in errors facet
+        assert!(!slice.nodes.iter().any(|n| n.label == "tool_health"));
+    }
+
+    #[test]
+    fn graph_slice_dedups_duplicate_ref_ids() {
+        let snapshot = IntrospectSnapshot {
+            tool_errors: vec![tool_error_entry(
+                "bash",
+                "timeout after 30s",
+                Some("timeout"),
+            )],
+            ..Default::default()
+        };
+        let request = IntrospectRequest {
+            topic: ObservationTopic::Execution,
+            facet: ObservationFacet::Errors,
+            ..Default::default()
+        };
+        // Observation ref_id overlaps with the error node ref — dedup should prevent
+        // adding the same ref_id twice.
+        let observations = vec![ObservationRecord {
+            ref_id: "urn:astra:observation:local:introspect:execution:error:0".into(),
+            topic: "execution".into(),
+            facet: "errors".into(),
+            kind: "tool_error".into(),
+            severity: "warning".into(),
+            summary: "bash timeout after 30s".into(),
+            confidence: ObservationConfidence::evidence(0.80),
+            evidence_refs: vec!["urn:astra:context:local:introspect:runtime_snapshot".into()],
+        }];
+        let evidence = vec![ObservationEvidence {
+            ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
+            evidence_class: "observed_evidence".into(),
+            source: "runtime.introspect_snapshot".into(),
+            summary: "errors present".into(),
+            confidence: ObservationConfidence::evidence(0.75),
+        }];
+        let action_hints = Vec::new();
+
+        let slice = build_introspect_graph_slice(
+            &snapshot,
+            &request,
+            &observations,
+            &evidence,
+            &action_hints,
+        );
+
+        // The observation node is added first (observations step), then the
+        // tool_error node is skipped because its ref_id matches. So evidence (1)
+        // + observation (1) = 2. The node keeps Observation kind (first-writer wins).
+        assert_eq!(slice.nodes.len(), 2);
+        let error_node = slice
+            .nodes
+            .iter()
+            .find(|n| n.ref_id.contains("error:0"))
+            .expect("should have error node");
+        assert_eq!(error_node.kind, ObservationGraphNodeKind::Observation);
+    }
+
+    #[test]
+    fn graph_slice_stall_facet_includes_correction_nodes() {
+        let snapshot = IntrospectSnapshot {
+            stall_state: StallSnapshotSummary {
+                nudge_count: 3,
+                forced_corrections: vec!["execution_escalation".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let request = IntrospectRequest {
+            topic: ObservationTopic::Execution,
+            facet: ObservationFacet::Stall,
+            ..Default::default()
+        };
+        let observations = Vec::new();
+        let evidence = vec![ObservationEvidence {
+            ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
+            evidence_class: "observed_evidence".into(),
+            source: "runtime.introspect_snapshot".into(),
+            summary: "stall detected".into(),
+            confidence: ObservationConfidence::evidence(0.75),
+        }];
+        let action_hints = Vec::new();
+
+        let slice = build_introspect_graph_slice(
+            &snapshot,
+            &request,
+            &observations,
+            &evidence,
+            &action_hints,
+        );
+
+        // evidence + stall state + correction = 3
+        assert_eq!(slice.nodes.len(), 3);
+        let labels: Vec<_> = slice.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert!(labels.contains(&"stall_telemetry"));
+        assert!(labels.contains(&"stall_forced_correction"));
+    }
+
+    #[test]
+    fn graph_slice_budget_result_is_default() {
+        let slice = build_introspect_graph_slice(
+            &IntrospectSnapshot::default(),
+            &IntrospectRequest::default(),
+            &[],
+            &[],
+            &[],
+        );
+        // Graph budget_result is always default — budget is applied at the report
+        // level, not the graph level.
+        assert_eq!(slice.budget_result, ObservationBudgetResult::default());
+    }
 }

@@ -49,8 +49,8 @@
 //! which wraps this loop with consistent outcome mapping.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use astra_services::session_audit::RuntimePromotionEventData;
@@ -141,8 +141,8 @@ pub enum ControlToolRecovery {
 }
 
 pub use astra_turn_core::interaction_types::{
-    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence, TurnInteractionMode,
-    TurnInteractionPolicy, ASK_USER_TOOL_NAME,
+    ASK_USER_TOOL_NAME, TurnInteractionMode, TurnInteractionPolicy,
+    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
 };
 
 // ─── Host trait ──────────────────────────────────────────────────────────────
@@ -2144,27 +2144,27 @@ pub const DELEGATE_TOOL_NAME: &str =
     super::super::agentic::delegate_interception::DELEGATE_TOOL_NAME;
 
 pub(crate) use super::super::agentic::delegate_interception::{
-    coordination_pattern_name, delegation_adaptive_context, delegation_final_output_preview,
-    format_delegation_result, format_delegation_terminal_preview, is_delegation_call,
-    merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
+    DelegationAdaptiveContext, DelegationExecutionResult, DelegationFinalOutputSource,
+    DelegationOutcomeMetadata, coordination_pattern_name, delegation_adaptive_context,
+    delegation_final_output_preview, format_delegation_result, format_delegation_terminal_preview,
+    is_delegation_call, merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
     parse_delegate_agents, parse_delegation_request, partition_and_execute_delegations,
     pattern_from_name, select_default_coordination_pattern, task_needs_review,
-    tool_call_arguments_value, tool_call_name, DelegationAdaptiveContext,
-    DelegationExecutionResult, DelegationFinalOutputSource, DelegationOutcomeMetadata,
+    tool_call_arguments_value, tool_call_name,
 };
 
 use super::super::harness_adapter::harness_at;
 pub(crate) use super::execution_phase::{
-    execute_turn_and_ingest_phase, TurnExecutionControl, TurnExecutionPhase,
+    TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
 };
 pub(crate) use super::finalization::{
     finalize_and_render, finalize_turn_trace, run_agentic_loop_with_host,
     try_write_heavy_checkpoint,
 };
 pub(crate) use super::lifecycle::{
-    prepare_turn_iteration, run_loop_preamble, PreparedTurnIteration, TurnIterationPrep,
+    PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
 };
-pub(crate) use super::tool_phase::{execute_tool_phase, TurnToolPhaseControl};
+pub(crate) use super::tool_phase::{TurnToolPhaseControl, execute_tool_phase};
 
 #[cfg(feature = "harness")]
 pub(crate) fn set_harness_interruption(
@@ -3579,7 +3579,7 @@ pub(crate) mod tests {
         // Tokens accumulate across turns (+=)
         assert_eq!(state.total_prompt, 35); // 20 + 15
         assert_eq!(state.total_completion, 15); // 10 + 5
-                                                // Edge tool counted
+        // Edge tool counted
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
@@ -3759,7 +3759,7 @@ pub(crate) mod tests {
         assert_eq!(host.current_turn, 0); // No turns executed
         assert!(state.final_text.contains("without a final answer")); // EmptyCompletion message
         assert_eq!(state.remaining_turns, 10); // Unchanged
-                                               // EmptyCompletion interruption recorded
+        // EmptyCompletion interruption recorded
         let interruption = state
             .interruption
             .as_ref()
@@ -3931,11 +3931,13 @@ pub(crate) mod tests {
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         assert!(state.final_text.contains("Turn budget exhausted"));
-        assert!(!state
-            .messages
-            .iter()
-            .filter_map(|message| message.get("content").and_then(Value::as_str))
-            .any(|content| content.contains("Budget review")));
+        assert!(
+            !state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
     }
 
     #[tokio::test]
@@ -4040,14 +4042,18 @@ pub(crate) mod tests {
             !state.final_text.contains("changes look good"),
             "budget exhaustion must overwrite stale success-shaped text"
         );
-        assert!(state
-            .final_text
-            .contains("Turn budget exhausted after 2 agentic turn(s)"));
-        assert!(!state
-            .messages
-            .iter()
-            .filter_map(|message| message.get("content").and_then(Value::as_str))
-            .any(|content| content.contains("Budget review")));
+        assert!(
+            state
+                .final_text
+                .contains("Turn budget exhausted after 2 agentic turn(s)")
+        );
+        assert!(
+            !state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
     }
 
     #[tokio::test]
@@ -4755,14 +4761,14 @@ pub(crate) mod tests {
     // ── E2E delegation round-trip tests ─────────────────────────────────────
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
-    pub(crate) fn make_test_delegation_engine(
-    ) -> Arc<crate::server::delegation::engine::DelegationEngine> {
+    pub(crate) fn make_test_delegation_engine()
+    -> Arc<crate::server::delegation::engine::DelegationEngine> {
         use crate::server::delegation::engine::{
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run::engine::RunEngine;
-        use astra_services::coordination::{AgentProfile, AgentTier};
         use astra_services::AgentProfileRegistry;
+        use astra_services::coordination::{AgentProfile, AgentTier};
 
         let mut registry = AgentProfileRegistry::new();
         let _ = registry.register(AgentProfile::new(
@@ -5766,14 +5772,18 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
         assert_eq!(msg1.len(), 1);
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Follow these instructions carefully."));
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Follow these instructions carefully.")
+        );
 
         // Second call: replay loaded content + dedup note.
         let msg2: Vec<&Value> = state
@@ -5833,20 +5843,24 @@ pub(crate) mod tests {
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
 
         let msg2: Vec<&Value> = state
             .messages
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
             .collect();
-        assert!(msg2[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: other-skill"));
+        assert!(
+            msg2[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: other-skill")
+        );
 
         // Both tracked
         assert_eq!(state.skills.invoked.len(), 2);
@@ -5981,10 +5995,12 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
             .collect();
         assert_eq!(skill_msgs.len(), 1);
-        assert!(skill_msgs[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
+        assert!(
+            skill_msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
 
         // Skill exclusivity drop is now a debug log, not a user-facing headless line.
         // Verify the host did NOT receive any deferred notice (it goes to tracing now).
@@ -7231,8 +7247,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
     }
 
-    pub(crate) fn make_session(
-    ) -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
+    pub(crate) fn make_session()
+    -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
         std::sync::Arc::new(std::sync::RwLock::new(
             crate::observability::ObservabilitySession::new_simple("test-session"),
         ))
@@ -7274,9 +7290,11 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 threshold: 50_000
             }
         )));
-        assert!(signals
-            .iter()
-            .any(|signal| { signal.signal_type == astra_core::feedback::SignalType::Acceptance }));
+        assert!(
+            signals.iter().any(|signal| {
+                signal.signal_type == astra_core::feedback::SignalType::Acceptance
+            })
+        );
     }
 
     #[test]
@@ -8495,7 +8513,7 @@ mod parallel_execution_tests {
     /// Unit test for partition_tool_batches.
     #[test]
     fn partition_tool_batches_groups_correctly() {
-        use crate::turn::agentic::headless_round::{partition_tool_batches, ToolBatch};
+        use crate::turn::agentic::headless_round::{ToolBatch, partition_tool_batches};
         use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
 
         let tool_calls = vec![
