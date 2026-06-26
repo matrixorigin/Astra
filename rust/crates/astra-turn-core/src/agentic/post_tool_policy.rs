@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::chat_history_openai::append_openai_user_content_messages;
-use crate::guardrails::turn_guard::{TurnGuard, VerdictSeverity};
+use crate::guardrails::turn_guard::{TurnGuard, VerdictSeverity, is_read_only_never_restrict};
 use crate::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use crate::interaction_types::TurnInteractionMode;
 use crate::stall::{
@@ -28,7 +28,6 @@ pub struct AgenticPostToolPolicyRequest<'a> {
     pub restricted_tools: &'a mut HashSet<String>,
     pub remaining_turns: &'a mut usize,
     pub step_recorder: &'a mut StepRecorder,
-    pub current_user_id: Option<&'a str>,
     pub current_session_id: Option<&'a String>,
     pub max_turns: usize,
     pub loop_turn: usize,
@@ -82,7 +81,6 @@ pub fn apply_agentic_post_tool_policy(
         restricted_tools,
         remaining_turns,
         step_recorder,
-        current_user_id,
         current_session_id,
         max_turns,
         loop_turn,
@@ -115,9 +113,9 @@ pub fn apply_agentic_post_tool_policy(
                 VerdictSeverity::Healthy => unreachable!(),
             };
             let health_summary = turn_guard.health.summary();
-            let health_avoidance_tools = turn_guard
+            let deprioritized_tools = turn_guard
                 .health
-                .health_avoidance_tools()
+                .deprioritized_tools()
                 .iter()
                 .map(|tool| (*tool).to_string())
                 .collect::<Vec<_>>();
@@ -132,7 +130,7 @@ pub fn apply_agentic_post_tool_policy(
                 severity: severity_str.to_string(),
                 injections: verdict.injections.clone(),
                 avoid_tools: verdict.avoid_tools.clone(),
-                health_avoidance_tools,
+                deprioritized_tools,
                 force_stop: verdict.force_stop,
                 nudge_count: turn_guard.nudge_count,
                 interaction_mode: interaction_mode.label().to_string(),
@@ -142,7 +140,7 @@ pub fn apply_agentic_post_tool_policy(
                     .errors
                     .recent_error_count(crate::error_recovery::ErrorCategory::ToolTimeout),
                 total_errors: turn_guard.errors.total_errors,
-                health_avoidance_count: health_summary.health_avoidance_count,
+                deprioritized_count: health_summary.deprioritized_count,
                 total_timeouts: health_summary.total_timeouts,
                 timeout_dominant_tools,
                 total_cache_hits: health_summary.total_cache_hits,
@@ -154,11 +152,26 @@ pub fn apply_agentic_post_tool_policy(
             append_openai_user_content_messages(messages, &verdict.injections);
         }
 
-        // `avoid_tools` is advisory stall-recovery guidance. Removing those
-        // tools from the visible schema changes the model contract mid-turn and
-        // can force it onto a worse surface. Hard restrictions are owned by
-        // permission, interaction-mode, runtime allowlist, and resource-limit
-        // enforcement, not by soft health diagnostics.
+        // `avoid_tools` is advisory stall-recovery guidance for Warning and
+        // below: removing those tools from the visible schema changes the
+        // model contract mid-turn and can force it onto a worse surface.
+        //
+        // Critical is the exception. On a first Critical verdict the guard
+        // has already injected a "SESSION CRITICAL" nudge naming the
+        // high-risk write/execute tools. If we leave them merely advisory,
+        // the model can ignore the nudge and keep calling them — observed
+        // in sessions where the model burned the entire remaining turn
+        // budget retrying a failing `bash`/`write_file` after a Critical.
+        // Physically restricting the avoid_tools on Critical gives the model
+        // exactly one read-only recovery round; a second Critical then
+        // force-stops via the `critical_turns >= 2` path below.
+        if verdict.severity == VerdictSeverity::Critical && !verdict.force_stop {
+            for tool in &verdict.avoid_tools {
+                if !is_read_only_never_restrict(tool) {
+                    restricted_tools.insert(tool.clone());
+                }
+            }
+        }
 
         match verdict.severity {
             VerdictSeverity::Critical => {
@@ -195,7 +208,7 @@ pub fn apply_agentic_post_tool_policy(
         );
 
         let checkpoint_blocked_tools = checkpoint_blocked_tools(restricted_tools);
-        if let (Some(user_id), Some(sid)) = (current_user_id, current_session_id)
+        if let Some(sid) = current_session_id
             && let Some(heavy) = step_recorder.build_heavy_checkpoint(
                 messages,
                 0,
@@ -206,7 +219,6 @@ pub fn apply_agentic_post_tool_policy(
         {
             let cp = StepCheckpoint::Heavy(Box::new(heavy));
             let _ = step_checkpoint::write_step_checkpoint(
-                user_id,
                 sid,
                 step_recorder.summary().checkpoints,
                 &cp,
@@ -240,8 +252,6 @@ fn checkpoint_blocked_tools(restricted_tools: &HashSet<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const TEST_USER_ID: &str = "test-user";
     use serde_json::json;
 
     #[test]
@@ -252,7 +262,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls: Vec<Value> = Vec::new();
@@ -269,7 +279,6 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
-            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,
@@ -306,7 +315,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![
@@ -329,7 +338,6 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
-            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,
@@ -362,7 +370,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}})];
@@ -382,7 +390,6 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
-            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,
@@ -414,7 +421,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![
@@ -436,7 +443,6 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
-            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,
@@ -453,7 +459,7 @@ mod tests {
                 .contains(&"agent_fanout".to_string())
         );
         assert!(
-            !turn_guard.health.is_avoidance_advised("agent_fanout"),
+            !turn_guard.health.is_deprioritized("agent_fanout"),
             "stall advice alone must not mark the tool unhealthy"
         );
         assert!(
@@ -463,14 +469,81 @@ mod tests {
     }
 
     #[test]
-    fn health_avoidance_tools_remain_same_turn_advisory() {
+    fn critical_verdict_physically_restricts_avoid_tools() {
+        // First-Critical verdict (critical_turns == 1, force_stop == false)
+        // must physically move the named avoid_tools into restricted_tools
+        // so the model cannot keep calling them. Without this, the model
+        // can ignore the "SESSION CRITICAL" nudge and burn the remaining
+        // turn budget retrying the same failing write/execute tool.
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut stall_events = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
+        let mut turn_guard = TurnGuard::new();
+        // Drive the guard to a first-Critical verdict using only public API:
+        // `record_tool_result` with an error-looking string sets
+        // `round_had_error` and records actionable errors internally.
+        // With nudge_count = 4, three actionable errors escalate to Critical.
+        turn_guard.nudge_count = 4;
+        for _ in 0..3 {
+            turn_guard.record_tool_result("read_file", "Error: file not found");
+        }
+
+        let tool_calls = vec![json!({"name": "bash", "arguments": "{}"})];
+        turn_guard.record_tool_calls(&tool_calls);
+
+        let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            turn_index: 0,
+            message: "do something",
+            tool_calls_for_guard: &tool_calls,
+            intent_tool_turns: &mut intent_tool_turns,
+            messages: &mut messages,
+            stall_events: &mut stall_events,
+            turn_guard: &mut turn_guard,
+            verdict_events: &mut verdict_events,
+            restricted_tools: &mut restricted_tools,
+            remaining_turns: &mut remaining_turns,
+            step_recorder: &mut step_recorder,
+            current_session_id: None,
+            max_turns: 8,
+            loop_turn: 0,
+            recent_tools: &[],
+            last_heavy_checkpoint: &mut last_heavy_checkpoint,
+            interaction_mode: TurnInteractionMode::Prompt,
+        });
+
+        // First Critical does not force-stop (that's critical_turns >= 2).
+        let verdict = verdict_events.first().expect("verdict recorded");
+        assert_eq!(verdict.severity, "critical");
+        assert!(
+            verdict.avoid_tools.contains(&"bash".to_string()),
+            "first Critical must name bash in avoid_tools"
+        );
+        // The new hard-protection: bash is physically restricted.
+        assert!(
+            restricted_tools.contains("bash"),
+            "first Critical must physically restrict the avoid_tools"
+        );
+        assert_ne!(
+            out,
+            AgenticPostToolPolicyOutcome::Abort(String::new()),
+            "first Critical is not a force-stop"
+        );
+    }
+
+    #[test]
+    fn health_deprioritized_tools_remain_same_turn_advisory() {
+        let mut intent_tool_turns = Vec::new();
+        let mut messages = Vec::new();
+        let mut stall_events = Vec::new();
+        let mut verdict_events = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut remaining_turns = 10usize;
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         for _ in 0..3 {
@@ -489,7 +562,6 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
-            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,
@@ -499,10 +571,10 @@ mod tests {
         });
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
-        assert!(turn_guard.health.is_avoidance_advised("write_file"));
+        assert!(turn_guard.health.is_deprioritized("write_file"));
         assert!(
             !restricted_tools.contains("write_file"),
-            "soft health-avoidance tools must not be hidden"
+            "soft health-deprioritized tools must not be hidden"
         );
     }
 
@@ -516,13 +588,13 @@ mod tests {
         for _ in 0..3 {
             turn_guard.health.record_failure("flaky_soft_tool");
         }
-        assert!(turn_guard.health.is_avoidance_advised("flaky_soft_tool"));
+        assert!(turn_guard.health.is_deprioritized("flaky_soft_tool"));
 
         let blocked = super::checkpoint_blocked_tools(&restricted_tools);
         assert_eq!(blocked, vec!["bash".to_string(), "write_file".to_string()]);
         assert!(
             !blocked.contains(&"flaky_soft_tool".to_string()),
-            "soft tool-health avoidance must not persist as hard checkpoint blocked_tools"
+            "soft tool-health deprioritization must not persist as hard checkpoint blocked_tools"
         );
     }
 
@@ -534,7 +606,7 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence(TEST_USER_ID, "sid", "tid");
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![json!({
@@ -558,7 +630,6 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
-            current_user_id: None,
             current_session_id: None,
             max_turns: 8,
             loop_turn: 0,

@@ -364,6 +364,23 @@ impl InterruptionRecord {
                 "[{}] The run paused after a read-heavy stall.{tool_note}{checkpoint_note}{cause_note}{action_note}",
                 kind.label()
             ),
+            // Surface the guard-specific abort reason (stored in error_detail)
+            // instead of the opaque label. Without this, a guard pipeline abort
+            // shows "[guard_abort] N tool call(s) completed." with no indication
+            // of *why* the guard halted the turn — the reason lived only in
+            // `state.final_text`, which resume/checkpoint UIs do not display.
+            InterruptionKind::GuardAbort => {
+                let reason = summary
+                    .error_detail
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or("a loop guard detected a repeated failure pattern");
+                format!(
+                    "[{}] The run was stopped by a loop guard: {reason}.{tool_note}{checkpoint_note}{action_note}",
+                    kind.label()
+                )
+            }
             _ => format!(
                 "[{kind}]{tool_note}{checkpoint_note}{cause_note}{action_note}",
                 kind = kind.label()
