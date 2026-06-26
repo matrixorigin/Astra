@@ -662,10 +662,9 @@ fn local_reflect_observation_graph(
     for (idx, event) in recent_events.iter().enumerate() {
         let event_source = event_preview_evidence_source(event);
         let event_namespace = event_preview_ref_namespace(event);
-        let event_ref =
-            Urn::new("event", event_namespace, session_id)
-                .idx(idx + 1)
-                .build();
+        let event_ref = Urn::new("event", event_namespace, session_id)
+            .idx(idx + 1)
+            .build();
         let event_summary = event_preview_summary(event);
         evidence_refs.push(event_ref.clone());
         evidence.push(ObservationEvidence {

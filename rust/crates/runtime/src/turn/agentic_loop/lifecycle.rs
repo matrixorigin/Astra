@@ -1834,9 +1834,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 0, // no tokens freed yet
                 pressure_estimate_tokens,
                 state.max_turn_input_tokens,
-                0,               // no messages removed
+                0,                    // no messages removed
                 state.messages.len(), // current message count
-                vec![],          // no layers applied
+                vec![],               // no layers applied
             );
             host.on_compaction(warning);
         }

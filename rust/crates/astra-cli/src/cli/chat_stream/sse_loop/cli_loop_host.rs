@@ -7,16 +7,16 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use astra_runtime::{
     tool_registry::ToolRegistry,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::host::{
-        interaction_scoped_tool_restrictions, AgenticLoopHost, AgenticLoopState,
-        ControlToolRecovery, HostTurnResult, TurnInteractionMode,
+        AgenticLoopHost, AgenticLoopState, ControlToolRecovery, HostTurnResult,
+        TurnInteractionMode, interaction_scoped_tool_restrictions,
     },
 };
 use astra_turn_core::{
@@ -28,14 +28,14 @@ use crossterm::style::Stylize;
 use serde_json::Value;
 
 use crate::{
+    ExplainMode,
     cli::permission_manager::{PermissionManager, PermissionMode},
     cli::stream::stream_render::RenderPolicy,
     edge_tools::ToolExecutor,
-    ExplainMode,
 };
 
 use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
-    fetch_chat_turn_sse, ChatTurnSseFetchRequest, PrepareTurnTelemetry,
+    ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
 };
 use crate::cli::chat_stream::sse_loop::refresh_root_permission_context;
 

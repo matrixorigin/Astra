@@ -396,14 +396,15 @@ pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{ClassifiedError, ErrorKind, classify_tool_output};
 pub use observation::{
-    EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,
-    ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationDepth,
-    ObservationEvidence, ObservationFacet, ObservationFailureCluster, ObservationGraphEdge,
-    ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
+    ErrorStreak, EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,
+    ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage,
+    ObservationDepth, ObservationEvidence, ObservationFacet, ObservationFailureCluster,
+    ObservationGraphEdge, ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
     ObservationGraphNodeKind, ObservationGraphSlice, ObservationHorizon,
     ObservationProviderCoverage, ObservationRecord, ObservationTopic, ObservationView,
-    SourcePolicy, classify_event_kind, normalize_observation_arg, push_graph_edge, push_graph_node,
-    truncate_graph_summary, urn_component, Urn,
+    SourcePolicy, ToolFamily, TurnMetrics,
+    Urn, classify_event_kind, classify_tool_family, normalize_observation_arg,
+    push_graph_edge, push_graph_node, truncate_graph_summary, urn_component,
 };
 pub use runtime_limits::RuntimeLimits;
 #[cfg(any(test, feature = "dev-defaults"))]

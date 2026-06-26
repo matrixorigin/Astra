@@ -1,15 +1,336 @@
-//! Shared read-only observation DTOs.
+//! Turn metrics: pure data collection for agent self-observation.
 //!
-//! These are wire-shape types for tool views such as `introspect` and
-//! `reflect`. They deliberately do not imply graph persistence or tuning
-//! actions; write-side systems may consume these records later.
+//! This module collects orthogonal metric dimensions from each turn's tool
+//! calls. The data is surfaced through `introspect` so the agent can observe
+//! its own behavior and adjust — no intermediate layer pre-judges agent state.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ToolCallRecords → TurnMetrics → introspect exposure → Agent self-adjusts
+//! ```
+//!
+//! All judgment ("am I stuck?", "should I change approach?") belongs to the
+//! agent, not to the framework. TurnMetrics is a mirror, not a teacher.
 
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Lightweight sample representing a single tool call for metrics computation.
+/// Decoupled from `astra_services::session_journal::ToolCallRecord` to avoid
+/// cross-crate dependency from core → services.
+#[derive(Debug, Clone)]
+pub struct ToolCallSample<'a> {
+    pub name: &'a str,
+    pub ok: bool,
+    pub round: Option<u32>,
+    pub file_path: Option<&'a str>,
+    pub error: Option<&'a str>,
+}
+
+/// A consecutive streak of failures for the same tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorStreak {
+    /// Tool name that failed.
+    pub tool_name: String,
+    /// Number of consecutive failures.
+    pub count: u32,
+    /// First error message (truncated to 200 chars).
+    pub first_error: String,
+}
+
+/// Orthogonal metric dimensions extracted from turn state.
+///
+/// These are intentionally coarse-grained to avoid overfitting to specific
+/// tool names or scenarios. Tool families are abstract categories.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnMetrics {
+    /// Total LLM rounds completed this turn.
+    pub rounds_completed: u32,
+    /// Total tool calls (successful + failed).
+    pub tool_calls_total: u32,
+    /// Tool calls grouped by abstract family.
+    pub tool_calls_by_family: BTreeMap<ToolFamily, u32>,
+    /// Number of distinct tool names used.
+    pub unique_tools_used: u32,
+    /// Workspace-mutating operations (writes, edits, git commits).
+    pub mutation_count: u32,
+    /// Failed tool calls.
+    pub error_count: u32,
+    /// Calls that hit idempotency cache or returned identical results.
+    pub cache_hits: u32,
+    /// Rounds since the last workspace mutation.
+    pub rounds_since_last_mutation: u32,
+    /// Tokens consumed this turn (approximate).
+    pub tokens_consumed: u64,
+    /// Top tools by frequency: (tool_name, call_count), sorted descending.
+    /// Used for evidence-driven nudges.
+    pub top_tools: Vec<(String, u32)>,
+    /// File access counts: (file_path, access_count) for read/write tools.
+    /// Used to detect excessive exploration of the same file.
+    pub file_access_counts: BTreeMap<String, u32>,
+    /// Consecutive failure streaks per tool, sorted by count descending.
+    /// Used to detect spirals on the same tool (e.g., str_replace 3x old_str not found).
+    pub error_streaks: Vec<ErrorStreak>,
+}
+
+/// Abstract tool families — coarser than individual tool names.
+///
+/// Each tool maps to exactly one family. Search tools (grep, glob) are
+/// classified as `Read` since they are read-only inspection operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ToolFamily {
+    /// Read-only inspection: read_file, grep, glob, list_dir, symbols.
+    Read,
+    /// Workspace mutation: str_replace, write_file, apply_patch.
+    Write,
+    /// Version control: git operations.
+    Git,
+    /// Shell execution: bash, shell.
+    Shell,
+    /// Other tools (memory, notify, etc.).
+    Other,
+}
+
+impl std::fmt::Display for ToolFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read => write!(f, "read"),
+            Self::Write => write!(f, "write"),
+            Self::Git => write!(f, "git"),
+            Self::Shell => write!(f, "shell"),
+            Self::Other => write!(f, "other"),
+        }
+    }
+}
+
+/// Classify a tool name (lowercase) into an abstract family.
+///
+/// Search tools (grep, glob, list_dir) are classified as `Read` since they
+/// are read-only inspection operations.
+pub fn classify_tool_family(tool_name: &str) -> ToolFamily {
+    match tool_name {
+        // Read-only inspection
+        "read_file" | "grep" | "glob" | "list_dir" | "symbols" | "read" => ToolFamily::Read,
+        // Workspace mutation
+        "str_replace" | "write_file" | "apply_patch" | "write" | "edit" => ToolFamily::Write,
+        // Version control
+        "git" | "git_commit" | "git_push" | "git_diff" | "git_log" | "git_blame" => ToolFamily::Git,
+        // Shell execution
+        "bash" | "shell" | "run_command" | "exec" => ToolFamily::Shell,
+        // Everything else
+        _ => ToolFamily::Other,
+    }
+}
+
+impl TurnMetrics {
+    /// Build metrics from lightweight `ToolCallSample` records.
+    pub fn from_samples(
+        samples: &[ToolCallSample<'_>],
+        rounds_completed: u32,
+        tokens_consumed: u64,
+    ) -> Self {
+        let mut by_family: BTreeMap<ToolFamily, u32> = BTreeMap::new();
+        let mut unique_tools = std::collections::HashSet::new();
+        let mut mutation_count = 0u32;
+        let mut error_count = 0u32;
+        let mut last_mutation_round: Option<u32> = None;
+        let mut file_access_counts: BTreeMap<String, u32> = BTreeMap::new();
+        // Track consecutive failure streaks: tool_name → (count, first_error)
+        let mut streak_map: BTreeMap<String, (u32, String)> = BTreeMap::new();
+        let mut last_tool: Option<String> = None;
+
+        for sample in samples {
+            let lower = sample.name.to_lowercase();
+            unique_tools.insert(lower.clone());
+
+            let family = classify_tool_family(&lower);
+            *by_family.entry(family).or_insert(0) += 1;
+
+            if matches!(family, ToolFamily::Write | ToolFamily::Git) {
+                mutation_count += 1;
+                if let Some(r) = sample.round {
+                    last_mutation_round = Some(last_mutation_round.map_or(r, |prev| prev.max(r)));
+                }
+            }
+            if !sample.ok {
+                error_count += 1;
+                // Extend or start a streak
+                if let Some(ref last) = last_tool {
+                    if *last == lower {
+                        // Same tool failed consecutively — extend streak
+                        if let Some(entry) = streak_map.get_mut(&lower) {
+                            entry.0 += 1;
+                        } else {
+                            streak_map.insert(
+                                lower.clone(),
+                                (
+                                    1,
+                                    sample
+                                        .error
+                                        .map(|e| e[..e.len().min(200)].to_string())
+                                        .unwrap_or_default(),
+                                ),
+                            );
+                        }
+                    } else {
+                        // Different tool failed — start new streak for this tool
+                        let first_err = sample
+                            .error
+                            .map(|e| e[..e.len().min(200)].to_string())
+                            .unwrap_or_default();
+                        streak_map.insert(lower.clone(), (1, first_err));
+                    }
+                } else {
+                    // First failure in turn
+                    let first_err = sample
+                        .error
+                        .map(|e| e[..e.len().min(200)].to_string())
+                        .unwrap_or_default();
+                    streak_map.insert(lower.clone(), (1, first_err));
+                }
+                last_tool = Some(lower);
+            } else {
+                // Success resets streak for this tool
+                if let Some(ref last) = last_tool {
+                    if *last == lower {
+                        streak_map.remove(&lower);
+                    }
+                }
+                last_tool = Some(lower);
+            }
+
+            // Track file access for read/write tools
+            if matches!(family, ToolFamily::Read | ToolFamily::Write) {
+                if let Some(path) = sample.file_path {
+                    *file_access_counts.entry(path.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let rounds_since_last_mutation = match last_mutation_round {
+            None => rounds_completed,
+            Some(r) => rounds_completed.saturating_sub(r),
+        };
+
+        // Build top_tools: sorted by frequency descending, take top 5
+        let mut tool_freq: Vec<(String, u32)> = unique_tools
+            .iter()
+            .map(|name| {
+                let count = samples
+                    .iter()
+                    .filter(|s| s.name.to_lowercase() == *name)
+                    .count() as u32;
+                (name.clone(), count)
+            })
+            .collect();
+        tool_freq.sort_by(|a, b| b.1.cmp(&a.1));
+        let top_tools: Vec<(String, u32)> = tool_freq.into_iter().take(5).collect();
+
+        // Convert streak map to sorted list
+        let mut error_streaks: Vec<ErrorStreak> = streak_map
+            .into_iter()
+            .map(|(tool, (count, first_error))| ErrorStreak {
+                tool_name: tool,
+                count,
+                first_error,
+            })
+            .collect();
+        error_streaks.sort_by(|a, b| b.count.cmp(&a.count));
+
+        Self {
+            rounds_completed,
+            tool_calls_total: samples.len() as u32,
+            tool_calls_by_family: by_family,
+            unique_tools_used: unique_tools.len() as u32,
+            mutation_count,
+            error_count,
+            cache_hits: 0, // not tracked in journal records
+            rounds_since_last_mutation,
+            tokens_consumed,
+            top_tools,
+            file_access_counts,
+            error_streaks,
+        }
+    }
+
+    /// Build metrics from raw tool-call records (legacy tuple API).
+    ///
+    /// Each record is `(tool_name, ok, round, file_path)`. Surgically-removed
+    /// placeholders should already be filtered out before calling this.
+    #[deprecated(note = "Use from_samples with ToolCallSample for richer error tracking")]
+    pub fn from_tool_records(
+        records: &[(&str, bool, Option<u32>, Option<&str>)],
+        rounds_completed: u32,
+        tokens_consumed: u64,
+    ) -> Self {
+        // Sliding window: only count records from the last DEFAULT_WINDOW rounds.
+        // Records without a round marker are always included (conservative).
+        // e.g., rounds_completed=6, window=3 → rounds 4,5,6
+        const DEFAULT_WINDOW: u32 = 3;
+        let window_start = rounds_completed.saturating_sub(DEFAULT_WINDOW.saturating_sub(1));
+        let filtered: Vec<&(_, _, _, _)> = records
+            .iter()
+            .filter(|r| r.2.map_or(true, |round| round >= window_start))
+            .collect();
+        let samples: Vec<ToolCallSample<'_>> = filtered
+            .iter()
+            .map(|&&(name, ok, round, file_path)| ToolCallSample {
+                name,
+                ok,
+                round,
+                file_path,
+                error: None,
+            })
+            .collect();
+        Self::from_samples(&samples, rounds_completed, tokens_consumed)
+    }
+
+    /// Compute derived metrics that are ratios or aggregates.
+    pub fn read_write_ratio(&self) -> Option<f64> {
+        let reads = self
+            .tool_calls_by_family
+            .get(&ToolFamily::Read)
+            .copied()
+            .unwrap_or(0);
+        let writes = self
+            .tool_calls_by_family
+            .get(&ToolFamily::Write)
+            .copied()
+            .unwrap_or(0);
+        if writes == 0 {
+            None
+        } else {
+            Some(reads as f64 / writes as f64)
+        }
+    }
+
+    pub fn repetition_ratio(&self) -> f64 {
+        if self.tool_calls_total == 0 {
+            0.0
+        } else {
+            self.unique_tools_used as f64 / self.tool_calls_total as f64
+        }
+    }
+
+    pub fn error_rate(&self) -> f64 {
+        if self.tool_calls_total == 0 {
+            0.0
+        } else {
+            self.error_count as f64 / self.tool_calls_total as f64
+        }
+    }
+
+    pub fn cache_hit_ratio(&self) -> f64 {
+        if self.tool_calls_total == 0 {
+            0.0
+        } else {
+            self.cache_hits as f64 / self.tool_calls_total as f64
+        }
+    }
+}
 /// Canonical observation facet vocabulary shared by `introspect` and `reflect`.
 ///
 /// This enum defines the unified observation-plane taxonomy. Both tools map their
