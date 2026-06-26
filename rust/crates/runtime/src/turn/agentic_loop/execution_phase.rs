@@ -595,10 +595,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     //
     // One-shot per turn: once forced_intent_drift is set, no further
     // corrections are injected this turn, preserving prompt-cache prefix.
-    if !suppress_nudges
-        && !state.stall.forced_intent_drift
-        && state.llm_rounds_completed > 0
-    {
+    if !suppress_nudges && !state.stall.forced_intent_drift && state.llm_rounds_completed > 0 {
         let drift = host
             .detect_intent_drift(&state.message, &state.stall.intent_tool_turns)
             .await;

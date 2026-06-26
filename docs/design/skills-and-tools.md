@@ -20,14 +20,14 @@
 
 Skills and Tools are orthogonal systems that serve different purposes:
 
-| Aspect       | Tool                              | Skill                                |
-|--------------|-----------------------------------|--------------------------------------|
-| **What**     | JSON schema for LLM function call | AI instruction set (SKILL.md)        |
-| **Selection**| Always-load surface + deferred activation | Metadata budget, path activation     |
-| **Injection**| `tools` array in API request      | System prompt text (or sub-agent)    |
-| **Execution**| Tool call → handler → result      | Inline expand or fork sub-agent      |
-| **Budget**   | Schema JSON tokens                | Metadata tokens + instruction tokens |
-| **Source**    | Built-in handlers + MCP servers   | Bundled + local + DB + MCP + market  |
+| Aspect        | Tool                                      | Skill                                |
+| ------------- | ----------------------------------------- | ------------------------------------ |
+| **What**      | JSON schema for LLM function call         | AI instruction set (SKILL.md)        |
+| **Selection** | Always-load surface + deferred activation | Metadata budget, path activation     |
+| **Injection** | `tools` array in API request              | System prompt text (or sub-agent)    |
+| **Execution** | Tool call → handler → result              | Inline expand or fork sub-agent      |
+| **Budget**    | Schema JSON tokens                        | Metadata tokens + instruction tokens |
+| **Source**    | Built-in handlers + MCP servers           | Bundled + local + DB + MCP + market  |
 
 The **`skill` tool** is the bridge: a single JSON-schema tool that the LLM calls to invoke
 any skill. When called, it returns the skill's instructions for inline execution, or
@@ -42,15 +42,15 @@ A skill is a **versioned, instruction-based capability package** defined by SKIL
 name: code-review
 description: Review code for quality, security, and best practices
 version: 1.2.0
-context: fork          # inline (default) or fork (sub-agent)
-allowed-tools:         # empty = all tools available
+context: fork # inline (default) or fork (sub-agent)
+allowed-tools: # empty = all tools available
   - read_file
   - grep
   - glob
 when-to-use: When asked to review code, PRs, or assess code quality
-model: claude-sonnet-4-20250514   # optional override
-max_tokens: 8000       # optional budget
-paths:                 # conditional activation (glob patterns)
+model: claude-sonnet-4-20250514 # optional override
+max_tokens: 8000 # optional budget
+paths: # conditional activation (glob patterns)
   - "**/*.rs"
   - "**/*.py"
 tags:
@@ -62,7 +62,6 @@ arguments:
     description: What aspect to focus on (security, performance, style)
     required: false
 ---
-
 # Code Review Instructions
 
 You are an expert code reviewer. Analyze the code for...
@@ -183,12 +182,12 @@ pub trait SkillProvider: Send + Sync {
 }
 ```
 
-| Provider              | Location                      | Status      | Notes                              |
-|-----------------------|-------------------------------|-------------|------------------------------------|
-| BundledSkillProvider  | `skills/providers/bundled.rs` | ✅ Implemented | 16 skills compiled in binary      |
-| LocalSkillProvider    | `skills/providers/local.rs`   | ✅ Implemented | Scans 3 paths, symlink dedup      |
-| DatabaseSkillProvider | `skills/providers/database.rs`| ⚠️ Adapter   | Wraps SkillService, needs tests   |
-| McpSkillProvider      | `skills/providers/mcp.rs`     | ✅ Implemented | Keyed cache (server, skill) pair  |
+| Provider              | Location                       | Status         | Notes                            |
+| --------------------- | ------------------------------ | -------------- | -------------------------------- |
+| BundledSkillProvider  | `skills/providers/bundled.rs`  | ✅ Implemented | 16 skills compiled in binary     |
+| LocalSkillProvider    | `skills/providers/local.rs`    | ✅ Implemented | Scans 3 paths, symlink dedup     |
+| DatabaseSkillProvider | `skills/providers/database.rs` | ⚠️ Adapter     | Wraps SkillService, needs tests  |
+| McpSkillProvider      | `skills/providers/mcp.rs`      | ✅ Implemented | Keyed cache (server, skill) pair |
 
 ### 2.5 Discovery Flow
 
@@ -219,24 +218,24 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 
 ### 2.7 Bundled Skills (16)
 
-| Name           | Context | Description                                  |
-|----------------|---------|----------------------------------------------|
-| debug          | inline  | Debug issues and errors                      |
-| stuck          | inline  | Help when stuck or confused                  |
-| verify         | inline  | Verify changes work correctly                |
-| perf           | inline  | Performance optimization                     |
-| simplify       | inline  | Simplify complex code                        |
-| explain        | inline  | Explain code and concepts                    |
-| commit-msg     | inline  | Generate commit messages                     |
-| remember       | inline  | Store facts for future sessions              |
-| init-project   | inline  | Initialize new projects                      |
-| skillify       | inline  | Create new skills from patterns              |
-| github         | inline  | GitHub operations                            |
-| pr-review      | fork    | Review pull requests                         |
-| refactor       | fork    | Large-scale refactoring                      |
-| security-scan  | fork    | Security vulnerability scanning              |
-| test-gen       | fork    | Generate test suites                         |
-| batch          | fork    | Batch operations across files                |
+| Name          | Context | Description                     |
+| ------------- | ------- | ------------------------------- |
+| debug         | inline  | Debug issues and errors         |
+| stuck         | inline  | Help when stuck or confused     |
+| verify        | inline  | Verify changes work correctly   |
+| perf          | inline  | Performance optimization        |
+| simplify      | inline  | Simplify complex code           |
+| explain       | inline  | Explain code and concepts       |
+| commit-msg    | inline  | Generate commit messages        |
+| remember      | inline  | Store facts for future sessions |
+| init-project  | inline  | Initialize new projects         |
+| skillify      | inline  | Create new skills from patterns |
+| github        | inline  | GitHub operations               |
+| pr-review     | fork    | Review pull requests            |
+| refactor      | fork    | Large-scale refactoring         |
+| security-scan | fork    | Security vulnerability scanning |
+| test-gen      | fork    | Generate test suites            |
+| batch         | fork    | Batch operations across files   |
 
 ---
 
@@ -247,6 +246,7 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 **Lifecycle**: Create → Discover → Use → Edit → Hot-reload → Delete
 
 **Characteristics**:
+
 - **No registration required** — drop SKILL.md file, immediately available
 - **Weak constraints** — no version control, no permission management, no audit
 - **Hot-reload** — file watcher detects changes within 500ms
@@ -254,6 +254,7 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 - **Best for** — personal development, rapid iteration, project-specific skills
 
 **File Watcher** (`skills/watcher.rs`):
+
 - Uses `notify` crate with `RecommendedWatcher`
 - 500ms debounce interval
 - Monitors `.astra/skills/`, `skills/`, `~/.astra/skills/`
@@ -265,12 +266,14 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 **Lifecycle**: Author/Import → Publish → Discover → Filter/Activate → Use → Update → Unpublish
 
 **Characteristics**:
+
 - **Stored in MatrixOne** — `skills_registry` table
 - **Strong constraints** — version control, scope-based access (org/user), audit trail
 - **Catalog-scoped** — discovered through the visible catalog and filtered by request policy
 - **Best for** — team sharing, production environments, compliance
 
 **Proposed Schema**:
+
 ```sql
 CREATE TABLE skills_registry (
     id           BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -288,6 +291,7 @@ CREATE TABLE skills_registry (
 ```
 
 **CLI Commands**:
+
 ```bash
 /skill publish <name> [--scope=private|community]
 /skill installed
@@ -299,12 +303,14 @@ CREATE TABLE skills_registry (
 **Lifecycle**: Browse → Preview → Install → Cache/Index → Use
 
 **Characteristics**:
+
 - **Stored in MatrixOne Stage** — S3/MinIO backed object storage
 - **Install = Download + local cache** — server tracks marketplace installation state separately
 - **Versioned** — directory-based versioning in Stage
 - **Best for** — community sharing, enterprise skill stores
 
 **Stage Layout**:
+
 ```
 stage://mo_skill_marketplace/
 ├── official/                    # Verified skills
@@ -319,6 +325,7 @@ stage://mo_skill_marketplace/
 ```
 
 **Stage SQL**:
+
 ```sql
 -- Admin creates marketplace stage
 CREATE STAGE mo_skill_marketplace
@@ -336,6 +343,7 @@ SELECT manifest INTO OUTFILE 'stage://mo_skill_marketplace/private/<account>/my-
 ```
 
 **CLI Commands**:
+
 ```bash
 /skill browse [category]
 /skill install <name>[@version]
@@ -366,7 +374,7 @@ session-level always-include preference and no second budget exemption path.
 ### 4.2 Source Rules
 
 | Source          | Visible When                                     | Notes                         |
-|-----------------|--------------------------------------------------|-------------------------------|
+| --------------- | ------------------------------------------------ | ----------------------------- |
 | Bundled         | Runtime catalog includes it                      | Core functionality            |
 | Local (project) | CLI-local resolver includes project paths        | CLI-only until imported       |
 | Local (user)    | CLI/server resolver includes the user's home dir | User-scoped filesystem skills |
@@ -421,13 +429,13 @@ when they intentionally want that schema in `tools[]`.
 
 ### 5.3 Surface Methods
 
-| Method                | Use Case              | Features                              |
-|-----------------------|-----------------------|---------------------------------------|
-| `build_surface()` | Basic surface build | Always-load-only surface; conversational turns may return no tools |
-| `build_surface_with_report()` | Telemetry | Always-load-only surface + `ToolSurfaceReport` |
-| `build_surface_with_report_ctx()` | Recent-tool context | Preserves conversational short-circuit behavior |
-| `build_routed_surface()` | Pipeline-integrated surface | Returns the always-load-only surface after routing has decided the turn is tool-bearing |
-| `schema_by_name()`    | Activation/execution lookup | Resolves full schemas for explicitly selected deferred tools |
+| Method                            | Use Case                    | Features                                                                                |
+| --------------------------------- | --------------------------- | --------------------------------------------------------------------------------------- |
+| `build_surface()`                 | Basic surface build         | Always-load-only surface; conversational turns may return no tools                      |
+| `build_surface_with_report()`     | Telemetry                   | Always-load-only surface + `ToolSelectionReport`                                        |
+| `build_surface_with_report_ctx()` | Recent-tool context         | Preserves conversational short-circuit behavior                                         |
+| `build_routed_surface()`          | Pipeline-integrated surface | Returns the always-load-only surface after routing has decided the turn is tool-bearing |
+| `schema_by_name()`                | Activation/execution lookup | Resolves full schemas for explicitly selected deferred tools                            |
 
 ### 5.4 Skill Tool Integration
 
@@ -527,6 +535,7 @@ pub struct McpSkillProvider {
 ```
 
 **Key operations**:
+
 - `register_mcp_skill(server_name, skill_md_content)` — parse and cache
 - `remove_server_skills(server_name)` — cleanup on disconnect
 - Integrated into `UnifiedSkillRegistry` as a provider
@@ -537,10 +546,10 @@ pub struct McpSkillProvider {
 
 ### 8.1 Execution Contexts
 
-| Context  | Behavior                                   | Use Case                    |
-|----------|--------------------------------------------|-----------------------------|
-| `inline` | Instructions appended to conversation      | Quick tasks, advice, prompts|
-| `fork`   | Sub-agent with isolated context            | Large tasks, code review    |
+| Context  | Behavior                              | Use Case                     |
+| -------- | ------------------------------------- | ---------------------------- |
+| `inline` | Instructions appended to conversation | Quick tasks, advice, prompts |
+| `fork`   | Sub-agent with isolated context       | Large tasks, code review     |
 
 ### 8.2 Execution Flow
 
@@ -601,6 +610,7 @@ impl From<std::io::Error> for SkillError {
 ## 10. CLI Commands [IMPLEMENTED]
 
 ### Discovery & Inspection
+
 ```bash
 /skill                          # Show subcommand help
 /skill list [query] [--source=local|bundled|mcp] [--category=X]
@@ -609,6 +619,7 @@ impl From<std::io::Error> for SkillError {
 ```
 
 ### Skill Development
+
 ```bash
 /skill new <name>               # Scaffold .astra/skills/<name>/
 /skill dev <name|off>           # Dev mode (source injected each turn)
@@ -617,11 +628,13 @@ impl From<std::io::Error> for SkillError {
 ```
 
 ### Health
+
 ```bash
 /skill health                   # Catalog + on-disk SKILL.md checks (API when logged in)
 ```
 
 ### Marketplace [DESIGN TARGET]
+
 ```bash
 /skill browse [category]
 /skill install <name>[@version]
@@ -639,19 +652,20 @@ impl From<std::io::Error> for SkillError {
 
 Multi-field fuzzy search across all skill metadata:
 
-| Field         | Exact Match | Contains | Word Match |
-|---------------|-------------|----------|------------|
-| name          | 20 points   | 10       | 5          |
-| tags          | 8           | 4        | 4          |
-| description   | —           | 6        | 2          |
-| category      | —           | 5        | —          |
-| when_to_use   | —           | 4        | 1          |
+| Field       | Exact Match | Contains | Word Match |
+| ----------- | ----------- | -------- | ---------- |
+| name        | 20 points   | 10       | 5          |
+| tags        | 8           | 4        | 4          |
+| description | —           | 6        | 2          |
+| category    | —           | 5        | —          |
+| when_to_use | —           | 4        | 1          |
 
 Results ranked by score with star ratings (★★★ ≥10, ★★ ≥5, ★ <5).
 
 ### 11.2 `/skill list` — Filtered Listing
 
 Supports combined text + flag filtering:
+
 ```bash
 /skill list review                    # Text search
 /skill list --source=local            # Source filter
@@ -666,6 +680,7 @@ Supports combined text + flag filtering:
 ### 12.1 What is Stage?
 
 MatrixOne Stage is a storage abstraction layer for data import/export:
+
 - Supports S3, HDFS, local filesystem backends
 - Hierarchical: sub-stages can reference parent stages
 - Account-scoped with credential management
@@ -711,39 +726,44 @@ CREATE STAGE marketplace_private  URL = 'stage://mo_skill_marketplace/private/';
 
 ### 12.5 Local vs Cloud Private Skills
 
-| Feature         | Local (Layer 1)       | Cloud Private (Layer 3)   |
-|-----------------|-----------------------|---------------------------|
-| Storage         | Filesystem            | MatrixOne Stage (S3)      |
-| Availability    | This machine only     | Any logged-in device      |
-| Version control | Git (manual)          | Stage directory versioning|
-| Sharing         | Manual copy           | `/skill share <name>`     |
-| Backup          | None (user manages)   | Stage persistence         |
-| Constraints     | Weak (no validation)  | Medium (schema validated) |
-| Best for        | Development iteration | Production use            |
+| Feature         | Local (Layer 1)       | Cloud Private (Layer 3)    |
+| --------------- | --------------------- | -------------------------- |
+| Storage         | Filesystem            | MatrixOne Stage (S3)       |
+| Availability    | This machine only     | Any logged-in device       |
+| Version control | Git (manual)          | Stage directory versioning |
+| Sharing         | Manual copy           | `/skill share <name>`      |
+| Backup          | None (user manages)   | Stage persistence          |
+| Constraints     | Weak (no validation)  | Medium (schema validated)  |
+| Best for        | Development iteration | Production use             |
 
 ---
 
 ## 13. Design Decisions
 
 ### Q1: Do local skills need a database catalog row?
+
 **No.** Local skills are weak-constraint, zero-config. Drop file → use immediately.
 Matches Claude Code behavior and provides best development experience.
 
 ### Q2: Are active skills a ranking weight?
+
 **No.** Active skills are request intent. Catalog ranking remains separate and
 `discover_skills` handles search when the model needs more candidates.
 
 ### Q3: What happens after marketplace install?
+
 **Becomes a cached marketplace skill visible through the catalog.** Downloaded
 to local cache while server-side marketplace state tracks installation and
 version availability. Works offline via cache. Updates check marketplace for
 newer versions.
 
 ### Q4: How many active skills are reasonable?
+
 Per-turn active skills should stay small: they are user intent, not catalog
 storage. Large catalogs should rely on metadata plus `discover_skills`.
 
 ### Q5: How do MCP tools differ from MCP skills?
+
 **MCP tools** are JSON schemas → direct function calling.
 **MCP skills** are `skill://` resources → SKILL.md instructions.
 Both come from same MCP server but enter different systems.
@@ -752,24 +772,24 @@ Both come from same MCP server but enter different systems.
 
 ## 14. Implementation Status
 
-| Component                    | Status      | Location                                  | Tests |
-|------------------------------|-------------|-------------------------------------------|-------|
-| UnifiedSkillRegistry         | ✅ Done     | `runtime/src/skills/registry.rs`          | 30+   |
-| SKILL.md Parser              | ✅ Done     | `runtime/src/skills/loader.rs`            | 15+   |
-| BundledSkillProvider (16)    | ✅ Done     | `runtime/src/skills/providers/bundled.rs` | 10+   |
-| LocalSkillProvider           | ✅ Done     | `runtime/src/skills/providers/local.rs`   | 10+   |
-| McpSkillProvider             | ✅ Done     | `runtime/src/skills/providers/mcp.rs`     | 5+    |
-| DatabaseSkillProvider        | ⚠️ Adapter  | `runtime/src/skills/providers/database.rs`| 2     |
-| ToolRegistry (always-load/deferred)| ✅ Done     | `runtime/src/tool_registry/registry.rs`   | 50+   |
-| Skill tool schema + budget   | ✅ Done     | `runtime/src/turn/skill_tool.rs`          | 10+   |
-| Conditional activation       | ✅ Done     | `runtime/src/skills/activation.rs`        | 15+   |
-| File watcher hot-reload      | ✅ Done     | `runtime/src/skills/watcher.rs`           | 3     |
-| CLI /skill commands          | ✅ Done     | `rust/crates/astra-cli/src/cli/slash_skill.rs`    | 12    |
-| Non-blocking permission      | ✅ Done     | `rust/crates/astra-cli/src/cli/stream_render.rs`  | —     |
-| Per-turn active skill hints  | ✅ Done    | `edge_profile.active_skills`, `allow_skills` | 10+ |
-| Catalog-backed skills (DB)   | 🔵 Design  | —                                          | —     |
-| Marketplace (Stage)          | 🔵 Design  | —                                          | —     |
-| Skill sandbox mode           | 🔵 Design  | —                                          | —     |
+| Component                           | Status     | Location                                         | Tests |
+| ----------------------------------- | ---------- | ------------------------------------------------ | ----- |
+| UnifiedSkillRegistry                | ✅ Done    | `runtime/src/skills/registry.rs`                 | 30+   |
+| SKILL.md Parser                     | ✅ Done    | `runtime/src/skills/loader.rs`                   | 15+   |
+| BundledSkillProvider (16)           | ✅ Done    | `runtime/src/skills/providers/bundled.rs`        | 10+   |
+| LocalSkillProvider                  | ✅ Done    | `runtime/src/skills/providers/local.rs`          | 10+   |
+| McpSkillProvider                    | ✅ Done    | `runtime/src/skills/providers/mcp.rs`            | 5+    |
+| DatabaseSkillProvider               | ⚠️ Adapter | `runtime/src/skills/providers/database.rs`       | 2     |
+| ToolRegistry (always-load/deferred) | ✅ Done    | `runtime/src/tool_registry/registry.rs`          | 50+   |
+| Skill tool schema + budget          | ✅ Done    | `runtime/src/turn/skill_tool.rs`                 | 10+   |
+| Conditional activation              | ✅ Done    | `runtime/src/skills/activation.rs`               | 15+   |
+| File watcher hot-reload             | ✅ Done    | `runtime/src/skills/watcher.rs`                  | 3     |
+| CLI /skill commands                 | ✅ Done    | `rust/crates/astra-cli/src/cli/slash_skill.rs`   | 12    |
+| Non-blocking permission             | ✅ Done    | `rust/crates/astra-cli/src/cli/stream_render.rs` | —     |
+| Per-turn active skill hints         | ✅ Done    | `edge_profile.active_skills`, `allow_skills`     | 10+   |
+| Catalog-backed skills (DB)          | 🔵 Design  | —                                                | —     |
+| Marketplace (Stage)                 | 🔵 Design  | —                                                | —     |
+| Skill sandbox mode                  | 🔵 Design  | —                                                | —     |
 
 ---
 

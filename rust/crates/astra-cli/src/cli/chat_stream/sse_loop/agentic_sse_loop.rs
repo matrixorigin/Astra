@@ -315,7 +315,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
 }
 #[cfg(test)]
 mod tests {
-    use super::{build_stream_result, StreamResultBuild};
+    use super::{StreamResultBuild, build_stream_result};
     use astra_runtime::pipeline::step_recorder::StepRecorder;
     use astra_runtime::turn::turn_guard::TurnGuard;
     use astra_services::session_journal::ToolCallRecord;

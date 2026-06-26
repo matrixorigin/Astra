@@ -727,7 +727,7 @@ impl DriftDetector {
                         DriftCause::AmbiguousInstruction {
                             instruction: original_query.chars().take(80).collect(),
                             interpretations: vec![
-                                "User corrected the same intent multiple times".to_string()
+                                "User corrected the same intent multiple times".to_string(),
                             ],
                         }
                     }
@@ -735,7 +735,7 @@ impl DriftDetector {
                     DriftCause::AmbiguousInstruction {
                         instruction: original_query.chars().take(80).collect(),
                         interpretations: vec![
-                            "User corrected the same intent multiple times".to_string()
+                            "User corrected the same intent multiple times".to_string(),
                         ],
                     }
                 };

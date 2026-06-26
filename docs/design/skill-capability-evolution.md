@@ -27,12 +27,14 @@ User request → Skill selected → Markdown injected → LLM follows (maybe) �
 ```
 
 A skill today declares:
+
 - What it's about (`description`, `when_to_use`, `tags`)
 - What tools it may use (`allowed_tools`)
 - How to execute (`execution_context: inline | fork`)
 - Instructions (SKILL.md content)
 
 It does NOT declare:
+
 - What it **guarantees** (success criteria)
 - What it **needs** as input (typed schema)
 - What it **produces** as output (typed schema)
@@ -51,6 +53,7 @@ User request
 ```
 
 A capability-based skill additionally declares:
+
 - **Input schema** — structured parameters with types and validation
 - **Output schema** — what the skill produces (verifiable shape)
 - **Success criteria** — machine-executable verification (reuses existing `VerifierKind`)
@@ -99,6 +102,7 @@ output_schema:
 ```
 
 **Design decisions**:
+
 - Schemas are **optional** — existing skills without schemas continue to work
 - Use JSON Schema subset (not full spec) — `type`, `properties`, `required`, `enum`, `default`
 - Input schema → argument validation before execution
@@ -129,21 +133,21 @@ success_criteria:
       kind: llm_judge
       prompt: "Did the security scan cover all files in the target path and report findings with actionable remediation?"
       pass_threshold: 0.8
-    required: false  # advisory, not blocking
+    required: false # advisory, not blocking
 ```
 
 **Verifier types available** (from `durable_task.rs:702-746`):
 
-| Kind | Description | Example |
-|------|-------------|---------|
-| `command` | Exit code check | `cargo test` exits 0 |
-| `command_output` | Output pattern match | Output contains "PASSED" |
-| `file_exists` | File presence check | `report.md` exists |
-| `grep_check` | Pattern in file | File contains expected content |
-| `build_pass` | Build succeeds | `cargo build` exits 0 |
-| `test_pass` | Tests pass with min rate | 95% tests pass |
-| `llm_judge` | Semantic evaluation | "Does output follow SOLID?" |
-| `composite` | AND/OR of above | All of: tests pass AND builds |
+| Kind             | Description              | Example                        |
+| ---------------- | ------------------------ | ------------------------------ |
+| `command`        | Exit code check          | `cargo test` exits 0           |
+| `command_output` | Output pattern match     | Output contains "PASSED"       |
+| `file_exists`    | File presence check      | `report.md` exists             |
+| `grep_check`     | Pattern in file          | File contains expected content |
+| `build_pass`     | Build succeeds           | `cargo build` exits 0          |
+| `test_pass`      | Tests pass with min rate | 95% tests pass                 |
+| `llm_judge`      | Semantic evaluation      | "Does output follow SOLID?"    |
+| `composite`      | AND/OR of above          | All of: tests pass AND builds  |
 
 **Key insight**: We don't need to invent a new verification system. The durable task verification engine (`VerificationRunner`) already handles all 8 types. We just need to make it available at skill level.
 
@@ -168,6 +172,7 @@ required_tools:
 ```
 
 **Capability vs Tool**: Capabilities are abstract ("shell_execution"), tools are concrete ("bash"). This allows:
+
 - Skills to work across different tool sets (MCP tools that provide same capability)
 - Validation: "can this environment run this skill?"
 - Marketplace compatibility checking
@@ -177,10 +182,10 @@ required_tools:
 ```yaml
 # NEW: How this skill interacts with others
 composition:
-  composable: true           # Can be called by other skills
-  idempotent: false          # Running twice may produce different results
+  composable: true # Can be called by other skills
+  idempotent: false # Running twice may produce different results
   side_effects: [filesystem] # What external state it modifies
-  max_duration_sec: 120      # Timeout for composition orchestrators
+  max_duration_sec: 120 # Timeout for composition orchestrators
 ```
 
 ---
@@ -195,6 +200,7 @@ Skill execution → ??? → ??? ❌
 ```
 
 Tools have session-scoped health feedback. Skills do not yet have an equivalent quality loop. This means:
+
 - A skill that fails 80% of the time is selected as often as one that succeeds 95%
 - No data to improve skill instructions
 - No way to A/B test skill versions
@@ -289,11 +295,13 @@ Skill invoked
 ### Current Gap
 
 The current marketplace design is storage-only:
+
 ```
 Stage (S3) → download → register → use
 ```
 
 This is a CDN, not a marketplace. Missing:
+
 - **Ranking**: Which skills are good?
 - **Usage stats**: Which skills are popular?
 - **Trust**: Who published this? Is it safe?
@@ -349,14 +357,15 @@ CREATE TABLE skill_quality_reports (
 
 #### 4.3 Trust Tiers
 
-| Tier | Who | Trust Level | Verification |
-|------|-----|-------------|-------------|
-| **Bundled** | Platform team | Full trust | Built-in, tested in CI |
-| **Verified Publisher** | Approved orgs | High trust | Code review + automated scan |
-| **Community** | Any user | Medium trust | Automated scan only |
-| **Unverified** | Anonymous | Low trust | User accepts risk |
+| Tier                   | Who           | Trust Level  | Verification                 |
+| ---------------------- | ------------- | ------------ | ---------------------------- |
+| **Bundled**            | Platform team | Full trust   | Built-in, tested in CI       |
+| **Verified Publisher** | Approved orgs | High trust   | Code review + automated scan |
+| **Community**          | Any user      | Medium trust | Automated scan only          |
+| **Unverified**         | Anonymous     | Low trust    | User accepts risk            |
 
 Trust affects:
+
 - Default permission level (verified → auto-approve tools; unverified → prompt each time)
 - Marketplace ranking (verified publishers rank higher)
 - Skill budget priority (higher trust → more likely to fit in budget)
@@ -494,13 +503,13 @@ inside that visible catalog.
 
 ## 7. Comparison: Current → Target
 
-| Aspect | Current | Phase 1 | Phase 2 | Phase 3 |
-|--------|---------|---------|---------|---------|
-| **Nature** | Prompt template | Verifiable capability | Self-improving | Ecosystem participant |
-| **Success** | LLM says so | Machine-verified | Tracked over time | Aggregated across users |
-| **Selection** | Token budget | + schema validation | + quality boost | + marketplace ranking |
-| **Composition** | Independent | Input/output typed | Quality-aware chaining | Marketplace dependencies |
-| **Feedback** | None | Per-execution | Historical trends | Community signals |
+| Aspect          | Current         | Phase 1               | Phase 2                | Phase 3                  |
+| --------------- | --------------- | --------------------- | ---------------------- | ------------------------ |
+| **Nature**      | Prompt template | Verifiable capability | Self-improving         | Ecosystem participant    |
+| **Success**     | LLM says so     | Machine-verified      | Tracked over time      | Aggregated across users  |
+| **Selection**   | Token budget    | + schema validation   | + quality boost        | + marketplace ranking    |
+| **Composition** | Independent     | Input/output typed    | Quality-aware chaining | Marketplace dependencies |
+| **Feedback**    | None            | Per-execution         | Historical trends      | Community signals        |
 
 ---
 
@@ -519,16 +528,16 @@ inside that visible catalog.
 
 ### From durable_task.rs (already implemented)
 
-| Component | Location | Reuse for Skills |
-|-----------|----------|-----------------|
-| `VerifierKind` enum (8 types) | `services/src/durable_task.rs:702` | Skill success criteria |
-| `VerificationCriterion` struct | `services/src/durable_task.rs:676` | Skill verification config |
-| `VerificationRunner` | `services/src/durable_task.rs:770` | Execute skill verification |
+| Component                        | Location                                 | Reuse for Skills               |
+| -------------------------------- | ---------------------------------------- | ------------------------------ |
+| `VerifierKind` enum (8 types)    | `services/src/durable_task.rs:702`       | Skill success criteria         |
+| `VerificationCriterion` struct   | `services/src/durable_task.rs:676`       | Skill verification config      |
+| `VerificationRunner`             | `services/src/durable_task.rs:770`       | Execute skill verification     |
 | `parse_acceptance_to_criteria()` | `services/src/contract_generator.rs:145` | Auto-detect criteria from text |
 
 ### Current pattern references
 
-| Component | Location | Mirror for Skills |
-|-----------|----------|------------------|
-| `ToolSurfaceReport` | `astra-turn-core/src/tool/registry/report.rs` | → `SkillSurfaceReport` |
-| `ToolSurfaceFeedback` | `astra-turn-core/src/tool/registry/report.rs` | → `SkillFeedback` |
+| Component             | Location                                      | Mirror for Skills      |
+| --------------------- | --------------------------------------------- | ---------------------- |
+| `ToolSelectionReport` | `astra-turn-core/src/tool/registry/report.rs` | → `SkillSurfaceReport` |
+| `ToolSurfaceFeedback` | `astra-turn-core/src/tool/registry/report.rs` | → `SkillFeedback`      |

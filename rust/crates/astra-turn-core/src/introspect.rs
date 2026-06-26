@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::injection_tracking::{ChannelFreshness, ChannelStatus, InjectionChannel};
 use astra_core::ObservationFacet;
-pub use observation::{build_introspect_report, IntrospectReport};
+pub use observation::{IntrospectReport, build_introspect_report};
 pub use request::{
     IntrospectDepth, IntrospectFormat, IntrospectRequest, ObservationHorizon, ObservationTopic,
     SourcePolicy,
@@ -804,21 +804,25 @@ mod tests {
         assert_eq!(report.view.topic, "execution");
         assert_eq!(report.view.facet, "errors");
         assert!(report.summary.contains("recent tool errors"));
-        assert!(report
-            .observations
-            .iter()
-            .any(|observation| observation.ref_id
-                == "urn:astra:observation:local:introspect:execution:error:0"
-                && observation.kind == "tool_error:tool_timeout"));
+        assert!(
+            report
+                .observations
+                .iter()
+                .any(|observation| observation.ref_id
+                    == "urn:astra:observation:local:introspect:execution:error:0"
+                    && observation.kind == "tool_error:tool_timeout")
+        );
         assert!(report.evidence.iter().any(
             |evidence| evidence.ref_id == "urn:astra:context:local:introspect:runtime_snapshot"
         ));
         assert_eq!(report.view.data_coverage.overall, "fresh");
-        assert!(report
-            .view
-            .data_coverage
-            .providers
-            .contains_key("live_runtime"));
+        assert!(
+            report
+                .view
+                .data_coverage
+                .providers
+                .contains_key("live_runtime")
+        );
         assert!(!report.budget_result.truncated);
         assert_report_refs_are_valid(&report);
     }
@@ -838,12 +842,14 @@ mod tests {
             "edge_local_artifacts_unavailable"
         );
         assert_eq!(report.view.data_coverage.events, 0);
-        assert!(report
-            .view
-            .data_coverage
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("Edge-local")));
+        assert!(
+            report
+                .view
+                .data_coverage
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Edge-local"))
+        );
         assert_eq!(report.observations.len(), 1);
         assert_eq!(
             report.observations[0].kind, "data_surface_unavailable",
@@ -937,12 +943,14 @@ mod tests {
             report.view.data_coverage.providers["visible_context"].status,
             "missing"
         );
-        assert!(report
-            .view
-            .data_coverage
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("include_context requested")));
+        assert!(
+            report
+                .view
+                .data_coverage
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("include_context requested"))
+        );
         assert_report_refs_are_valid(&report);
     }
 

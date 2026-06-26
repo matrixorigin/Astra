@@ -17,11 +17,11 @@
 #![cfg(test)]
 
 use crate::tool_registry::surface::{
-    default_always_load_names, missing_always_load_schema_names, DeferredEntry, ToolSurface,
+    DeferredEntry, ToolSurface, default_always_load_names, missing_always_load_schema_names,
 };
 use astra_config::ToolSurfaceConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -751,7 +751,7 @@ fn always_load_schemas_are_sorted_alphabetically() {
 #[test]
 fn cache_control_sits_on_last_always_load_tool_schema() {
     use crate::turn::prompt_cache::{
-        annotate_tool_schemas_for_caching_with_always_load, PromptCacheConfig,
+        PromptCacheConfig, annotate_tool_schemas_for_caching_with_always_load,
     };
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);

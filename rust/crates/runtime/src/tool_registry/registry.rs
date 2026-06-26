@@ -6,7 +6,7 @@ use astra_config::ToolSurfaceConfig;
 
 use super::DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS;
 use astra_turn_core::tool::schema::tool_schema_name;
-use astra_turn_core::tool_registry_meta::{ToolMeta, TOOL_CATALOG};
+use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, ToolMeta};
 use astra_turn_core::tool_registry_report::ToolSelectionReport;
 
 fn sort_schemas_by_name(schemas: &mut [Value]) {

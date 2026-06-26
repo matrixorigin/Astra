@@ -2,7 +2,7 @@
 //!
 //! Run: `cargo bench -p astra-runtime --bench hot_paths`
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use serde_json::json;
 
 use astra_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame};
@@ -109,16 +109,18 @@ fn bench_retain_invoked_tool_schemas(c: &mut Criterion) {
         json!({"name": "str_replace", "tool_call_id": "c4", "content": "ok"}),
         json!({"name": "bash", "tool_call_id": "c5", "content": "ok"}),
     ];
-    let surface = vec![all_schemas
-        .iter()
-        .find(|s| {
-            s.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                == Some("read_file")
-        })
-        .cloned()
-        .unwrap()];
+    let surface = vec![
+        all_schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("read_file")
+            })
+            .cloned()
+            .unwrap(),
+    ];
     use astra_turn_core::tool_registry_report::ToolSelectionReport;
     let report = ToolSelectionReport {
         visible_count: surface.len() as u32,

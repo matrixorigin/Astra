@@ -29,8 +29,8 @@ mod tests {
     use super::*;
     use astra_turn_core::tool::schema::tool_schema_name;
     use astra_turn_core::tool_registry_report::ToolSelectionReport;
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
 
     fn mock_schemas() -> Vec<Value> {
         // Build schemas matching TOOL_CATALOG names

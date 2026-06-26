@@ -1017,9 +1017,11 @@ mod tests {
     fn tool_marker_not_on_tail_silent_when_marker_on_last() {
         // Healthy: 21 tools, cc on idx 20.
         let rs = vec![snap(3, 0, "anthropic", 2432, 0, &[0, 2, 4], 21, Some(20))];
-        assert!(!evaluate_all(&rs)
-            .iter()
-            .any(|f| f.rule_id == "tool_marker_not_on_tail"),);
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "tool_marker_not_on_tail"),
+        );
     }
 
     #[test]
@@ -1051,9 +1053,11 @@ mod tests {
             snap(3, 0, "anthropic", 10000, 0, &[], 21, Some(20)),
             snap(3, 1, "anthropic", 9000, 100, &[], 21, Some(20)),
         ];
-        assert!(!evaluate_all(&rs)
-            .iter()
-            .any(|f| f.rule_id == "cache_read_collapsed"),);
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "cache_read_collapsed"),
+        );
     }
 
     #[test]
@@ -1064,9 +1068,11 @@ mod tests {
             snap(3, 0, "anthropic", 500, 9000, &[], 21, Some(20)),
             snap(3, 1, "anthropic", 0, 100, &[], 21, Some(20)),
         ];
-        assert!(!evaluate_all(&rs)
-            .iter()
-            .any(|f| f.rule_id == "cache_read_collapsed"),);
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "cache_read_collapsed"),
+        );
     }
 
     #[test]
@@ -1076,9 +1082,11 @@ mod tests {
             snap(3, 0, "anthropic", 10000, 0, &[], 21, Some(20)),
             snap(3, 1, "bedrock", 0, 9000, &[], 21, Some(20)),
         ];
-        assert!(!evaluate_all(&rs)
-            .iter()
-            .any(|f| f.rule_id == "cache_read_collapsed"),);
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "cache_read_collapsed"),
+        );
     }
 
     // ── Rule 4: cache_creation_waste ────────────────────────────────────
@@ -1137,9 +1145,11 @@ mod tests {
             snap(6, 1, "bedrock", 50_000, 500, &[0, 4, 6], 21, Some(20)),
             snap(6, 2, "bedrock", 50_000, 500, &[0, 6, 8], 21, Some(20)),
         ];
-        assert!(!evaluate_all(&rs)
-            .iter()
-            .any(|f| f.rule_id == "cache_creation_waste"),);
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "cache_creation_waste"),
+        );
     }
 
     #[test]
@@ -1147,9 +1157,11 @@ mod tests {
         // A single round with ANY cache_creation doesn't imply waste —
         // the first round of any turn must create.
         let rs = vec![snap(6, 0, "bedrock", 0, 10_000, &[0], 21, Some(20))];
-        assert!(!evaluate_all(&rs)
-            .iter()
-            .any(|f| f.rule_id == "cache_creation_waste"),);
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "cache_creation_waste"),
+        );
     }
 
     #[test]
@@ -1407,9 +1419,11 @@ mod tests {
             &[11],
             12,
         )];
-        assert!(!evaluate_all(&rs)
-            .iter()
-            .any(|f| f.rule_id == "volatile_in_cached_prefix"),);
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+        );
     }
 
     #[test]
@@ -1441,18 +1455,22 @@ mod tests {
     #[test]
     fn volatile_rule_silent_on_openai_when_volatile_on_tail() {
         let rs = vec![snap_with_volatile(2, 0, "openai", "gpt-4o", &[], &[7], 8)];
-        assert!(!evaluate_all(&rs)
-            .iter()
-            .any(|f| f.rule_id == "volatile_in_cached_prefix"),);
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+        );
     }
 
     #[test]
     fn volatile_rule_silent_when_no_volatile_content_tracked() {
         // Empty volatile_msg_indices → nothing to evaluate.
         let rs = vec![snap(6, 2, "openai", 1000, 0, &[], 21, None)];
-        assert!(!evaluate_all(&rs)
-            .iter()
-            .any(|f| f.rule_id == "volatile_in_cached_prefix"),);
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+        );
     }
 
     /// Regression from session bc5764b6 — the system message renders
@@ -1536,9 +1554,11 @@ mod tests {
             &[5],
             10,
         )];
-        assert!(!evaluate_all(&rs)
-            .iter()
-            .any(|f| f.rule_id == "volatile_in_cached_prefix"),);
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+        );
     }
 
     // ── content-pattern detection (parser layer) ───────────────────────
