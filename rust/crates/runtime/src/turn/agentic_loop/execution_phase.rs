@@ -18,7 +18,7 @@ use astra_turn_core::agentic_turn_ingest::{
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interaction_types::TurnInteractionMode;
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
-use astra_turn_core::stall::{IntentDrift, detect_intent_drift};
+use astra_turn_core::stall::IntentDrift;
 use uuid::Uuid;
 
 /// Lazily-initialized process-wide alert dispatcher.
@@ -599,7 +599,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         && !state.stall.forced_intent_drift
         && state.llm_rounds_completed > 0
     {
-        let drift = detect_intent_drift(&state.message, &state.stall.intent_tool_turns);
+        let drift = host
+            .detect_intent_drift(&state.message, &state.stall.intent_tool_turns)
+            .await;
         if let IntentDrift::Drifting { correction, .. } = drift {
             state.stall.forced_intent_drift = true;
             state.push_volatile(super::host::VolatileKind::IntentDrift, correction.clone());

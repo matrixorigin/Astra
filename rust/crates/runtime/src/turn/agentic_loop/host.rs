@@ -71,6 +71,7 @@ use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+use astra_turn_core::stall::IntentDrift;
 use astra_turn_core::tool_registry_report::ToolSelectionReport;
 use tokio_util::sync::CancellationToken;
 
@@ -245,6 +246,24 @@ pub trait AgenticLoopHost: Send {
     /// they can fall through to edge/server execution resolution.
     fn plan_mode_active(&self, _state: &AgenticLoopState) -> bool {
         false
+    }
+
+    /// Semantic intent drift detection using LLM classification.
+    ///
+    /// Given the user's original query and recent tool calls, determine if
+    /// the agent has drifted from the intended task. Uses semantic understanding
+    /// rather than keyword matching to handle partial matches, synonyms, and
+    /// multi-language queries.
+    ///
+    /// Default implementation returns `OnTask` (conservative fallback). Hosts
+    /// that have access to an LLM client should override to provide accurate
+    /// drift detection.
+    async fn detect_intent_drift(
+        &mut self,
+        _user_query: &str,
+        _recent_tool_turns: &[(Vec<String>, String)],
+    ) -> IntentDrift {
+        IntentDrift::OnTask
     }
 
     /// Host-provided turn-start lifecycle summary for prompt/introspection.

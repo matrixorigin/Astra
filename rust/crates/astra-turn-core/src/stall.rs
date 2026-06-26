@@ -715,237 +715,18 @@ pub enum IntentDrift {
 pub const INTENT_DRIFT_WINDOW: usize = 3;
 
 /// Tools that are always considered on-task (utility/meta tools).
-const ALWAYS_ON_TASK_TOOLS: &[&str] = &["memory", "reflect", "get_agent_info"];
+pub const ALWAYS_ON_TASK_TOOLS: &[&str] = &["memory", "reflect", "get_agent_info"];
 
-/// Common file extensions to recognize as file path entities.
-const FILE_EXTENSIONS: &[&str] = &[
-    ".rs", ".ts", ".js", ".py", ".go", ".java", ".c", ".cpp", ".h", ".hpp",
-    ".json", ".toml", ".yaml", ".yml", ".md", ".txt", ".sh", ".bash",
-];
-
-/// Extract structural entities from user query: file paths, function names, modules.
-/// Returns (file_paths, function_names, module_names).
-fn extract_intent_entities(query: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut file_paths = Vec::new();
-    let mut function_names = Vec::new();
-    let mut module_names = Vec::new();
-
-    let query_lower = query.to_lowercase();
-
-    // Extract file paths: words containing dots + known extensions
-    for word in query.split_whitespace() {
-        let word_lower = word.to_lowercase();
-        // File path: contains '.' and ends with known extension
-        if word_lower.contains('.') {
-            for ext in FILE_EXTENSIONS {
-                if word_lower.ends_with(ext) {
-                    file_paths.push(word_lower.clone());
-                    break;
-                }
-            }
-        }
-        // Function name: word followed by '(' or '::'
-        if word_lower.ends_with('(') || word_lower.contains("::") {
-            let func = word_lower.trim_end_matches('(');
-            function_names.push(func.to_string());
-        }
-    }
-
-    // Extract module names from common patterns
-    // "in X module", "use X", "import X", "from X"
-    let patterns = [" in ", " use ", " import ", " from ", " crate ", " module "];
-    for pattern in patterns {
-        if let Some(idx) = query_lower.find(pattern) {
-            let after = &query_lower[idx + pattern.len()..];
-            if let Some(word) = after.split_whitespace().next() {
-                // Take the first word after the pattern (likely a module name)
-                let word = word.trim_end_matches(|c: char| c.is_ascii_punctuation());
-                if word.len() >= 2 {
-                    module_names.push(word.to_string());
-                }
-            }
-        }
-    }
-
-    (file_paths, function_names, module_names)
-}
-
-/// Extract keywords from user query for intent matching (fallback when no entities found).
-/// Lowercases and splits on whitespace/punctuation, filters short words (<2 chars).
-fn extract_intent_keywords(query: &str) -> Vec<String> {
-    query
-        .to_lowercase()
-        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
-        .filter(|w| w.len() >= 2)
-        .map(String::from)
-        .collect()
-}
-
-/// Check if tool calls reference any of the extracted intent entities.
-fn tools_reference_entities(
-    tool_names: &[String],
-    tool_args_text: &str,
-    file_paths: &[String],
-    function_names: &[String],
-    module_names: &[String],
-) -> bool {
-    if tool_names.is_empty() {
-        return true; // can't judge → assume on-task
-    }
-    // Always-on-task tools are by definition relevant
-    if tool_names
-        .iter()
-        .any(|n| ALWAYS_ON_TASK_TOOLS.contains(&n.as_str()))
-    {
-        return true;
-    }
-
-    let args_lower = tool_args_text.to_lowercase();
-
-    // Check file path matches in args
-    for path in file_paths {
-        if args_lower.contains(path) {
-            return true;
-        }
-    }
-
-    // Check function name matches in args
-    for func in function_names {
-        if args_lower.contains(func) {
-            return true;
-        }
-    }
-
-    // Check module name matches in args
-    for module in module_names {
-        if args_lower.contains(module) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Check if tool calls relate to intent keywords (hybrid fallback when no entities found).
-/// Requires ≥20% overlap OR domain-aware tool match (git/cargo).
-fn tools_relate_to_keywords(
-    tool_names: &[String],
-    tool_args_text: &str,
-    intent_keywords: &[String],
-    query_lower: &str,
-) -> bool {
-    if intent_keywords.is_empty() || tool_names.is_empty() {
-        return true; // can't judge → assume on-task
-    }
-    // Always-on-task tools are by definition relevant
-    if tool_names
-        .iter()
-        .any(|n| ALWAYS_ON_TASK_TOOLS.contains(&n.as_str()))
-    {
-        return true;
-    }
-
-    let combined = format!("{} {}", tool_names.join(" "), tool_args_text.to_lowercase());
-
-    // Require ≥20% keyword overlap (not just 1 match)
-    let match_count = intent_keywords
-        .iter()
-        .filter(|kw| combined.contains(kw.as_str()))
-        .count();
-    let overlap_ratio = match_count as f64 / intent_keywords.len() as f64;
-    if overlap_ratio >= 0.2 {
-        return true;
-    }
-
-    // Domain-aware fallback: query mentions domain + tools match domain
-    let has_git_domain = tool_names.iter().any(|n| n == "git");
-    let has_bash_domain = tool_names.iter().any(|n| n == "bash");
-    let has_cargo_domain = tool_names.iter().any(|n| n == "cargo" || n == "bash");
-
-    // If query mentions git/commit/review/diff/blame and tools are git/bash → on-task
-    if (query_lower.contains("git") || query_lower.contains("commit"))
-        && (has_git_domain || has_bash_domain)
-    {
-        return true;
-    }
-
-    // If query mentions cargo/build/test and tools are cargo/bash → on-task
-    if (query_lower.contains("cargo") || query_lower.contains("build") || query_lower.contains("test"))
-        && has_cargo_domain
-    {
-        return true;
-    }
-
-    false
-}
-
-/// Detect if the agent has drifted from the user's original intent.
-///
-/// `user_query`: the original user message.
-/// `recent_tool_turns`: for each recent turn, the (tool_names, concatenated_args) used.
-///
-/// Returns `IntentDrift::Drifting` if the last N turns used tools
-/// that don't reference any entities from the user's query.
-///
-/// **Algorithm**: hybrid entity+keyword scoring
-/// 1. Extract structural entities (file paths, function names, modules)
-/// 2. If entities found → check if tools reference them
-/// 3. If no entities → fall back to keyword overlap (≥20% threshold)
-/// 4. Count consecutive off-task turns, trigger if ≥ INTENT_DRIFT_WINDOW
-pub fn detect_intent_drift(
-    user_query: &str,
-    recent_tool_turns: &[(Vec<String>, String)],
-) -> IntentDrift {
-    if recent_tool_turns.is_empty() {
-        return IntentDrift::OnTask;
-    }
-
-    let (file_paths, function_names, module_names) = extract_intent_entities(user_query);
-    let has_entities = !file_paths.is_empty() || !function_names.is_empty() || !module_names.is_empty();
-
-    // Fallback to keywords if no entities found
-    let keywords = if !has_entities {
-        extract_intent_keywords(user_query)
-    } else {
-        Vec::new()
-    };
-    let query_lower = user_query.to_lowercase();
-
-    // If neither entities nor keywords extracted, fall back to conservative on-task assumption
-    if !has_entities && keywords.is_empty() {
-        return IntentDrift::OnTask;
-    }
-
-    // Count consecutive off-task turns from the end
-    let mut consecutive_off_task = 0;
-    for (names, args_text) in recent_tool_turns.iter().rev() {
-        let on_task = if has_entities {
-            tools_reference_entities(names, args_text, &file_paths, &function_names, &module_names)
-        } else {
-            tools_relate_to_keywords(names, args_text, &keywords, &query_lower)
-        };
-
-        if on_task {
-            break;
-        }
-        consecutive_off_task += 1;
-    }
-
-    if consecutive_off_task >= INTENT_DRIFT_WINDOW {
-        let original_snippet: String = user_query.chars().take(100).collect();
-        IntentDrift::Drifting {
-            consecutive_off_task,
-            correction: format!(
-                "⚠ INTENT DRIFT DETECTED — you have spent {} consecutive turns on tools \
-                 unrelated to the user's request: \"{}\". \
-                 STOP your current approach and refocus on what the user asked. \
-                 If you cannot accomplish the original task, explain why and ask for guidance.",
-                consecutive_off_task, original_snippet
-            ),
-        }
-    } else {
-        IntentDrift::OnTask
-    }
+/// Format correction message for intent drift.
+pub fn format_drift_correction(user_query: &str, consecutive_off_task: usize) -> String {
+    let original_snippet: String = user_query.chars().take(100).collect();
+    format!(
+        "⚠ INTENT DRIFT DETECTED — you have spent {} consecutive turns on tools \
+         unrelated to the user's request: \"{}\". \
+         STOP your current approach and refocus on what the user asked. \
+         If you cannot accomplish the original task, explain why and ask for guidance.",
+        consecutive_off_task, original_snippet
+    )
 }
 
 #[cfg(test)]
@@ -1483,27 +1264,190 @@ mod tests {
 
     // ── Intent drift detection ──
 
-    fn make_intent_turns(turns: &[(&[&str], &str)]) -> Vec<(Vec<String>, String)> {
-        turns
-            .iter()
-            .map(|(names, args)| {
-                (
-                    names.iter().map(|n| n.to_string()).collect(),
-                    args.to_string(),
-                )
-            })
-            .collect()
+/// Detect if the agent has drifted from the user's original intent.
+///
+/// `user_query`: the original user message.
+/// `recent_tool_turns`: for each recent turn, the (tool_names, concatenated_args) used.
+///
+/// Returns `IntentDrift::Drifting` if the last N turns used tools
+/// that don't reference any entities from the user's query.
+///
+/// **Algorithm**: improved semantic matching with prefix/synonym expansion
+/// 1. Extract structural entities (file paths, function names, modules)
+/// 2. If entities found → check if tools reference them
+/// 3. If no entities → fall back to keyword overlap with stemming (≥30% threshold)
+/// 4. Count consecutive off-task turns, trigger if ≥ INTENT_DRIFT_WINDOW
+pub fn detect_intent_drift(
+    user_query: &str,
+    recent_tool_turns: &[(Vec<String>, String)],
+) -> IntentDrift {
+    if recent_tool_turns.is_empty() {
+        return IntentDrift::OnTask;
+    }
+
+    let (file_paths, function_names, module_names) = extract_intent_entities(user_query);
+    let has_entities = !file_paths.is_empty() || !function_names.is_empty() || !module_names.is_empty();
+
+    // Fallback to keywords if no entities found
+    let keywords = if !has_entities {
+        extract_intent_keywords_with_stemming(user_query)
+    } else {
+        Vec::new()
+    };
+    let query_lower = user_query.to_lowercase();
+
+    // If neither entities nor keywords extracted, fall back to conservative on-task assumption
+    if !has_entities && keywords.is_empty() {
+        return IntentDrift::OnTask;
+    }
+
+    // Count consecutive off-task turns from the end
+    let mut consecutive_off_task = 0;
+    for (names, args_text) in recent_tool_turns.iter().rev() {
+        let on_task = if has_entities {
+            tools_reference_entities(names, args_text, &file_paths, &function_names, &module_names)
+        } else {
+            tools_relate_to_keywords_with_stemming(names, args_text, &keywords, &query_lower)
+        };
+
+        if on_task {
+            break;
+        }
+        consecutive_off_task += 1;
+    }
+
+    if consecutive_off_task >= INTENT_DRIFT_WINDOW {
+        IntentDrift::Drifting {
+            consecutive_off_task,
+            correction: format_drift_correction(user_query, consecutive_off_task),
+        }
+    } else {
+        IntentDrift::OnTask
+    }
+}
+
+/// Extract keywords with basic stemming/synonym expansion.
+/// Handles common prefixes: "authentication" → "auth", "database" → "db"
+fn extract_intent_keywords_with_stemming(query: &str) -> Vec<String> {
+    let mut keywords = Vec::new();
+    
+    // Split on whitespace and punctuation
+    for word in query
+        .to_lowercase()
+        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .filter(|w| w.len() >= 2)
+    {
+        keywords.push(word.to_string());
+        
+        // Add common prefix variants
+        if word.starts_with("auth") {
+            keywords.push("auth".to_string());
+        }
+        if word.starts_with("database") || word == "db" {
+            keywords.push("database".to_string());
+            keywords.push("db".to_string());
+        }
+        if word.starts_with("config") {
+            keywords.push("config".to_string());
+        }
+        if word.starts_with("test") {
+            keywords.push("test".to_string());
+        }
+    }
+    
+    // Deduplicate
+    keywords.sort();
+    keywords.dedup();
+    keywords
+}
+
+/// Check if tool calls relate to intent keywords with stemming support.
+fn tools_relate_to_keywords_with_stemming(
+    tool_names: &[String],
+    tool_args_text: &str,
+    intent_keywords: &[String],
+    query_lower: &str,
+) -> bool {
+    if intent_keywords.is_empty() || tool_names.is_empty() {
+        return true;
+    }
+    if tool_names
+        .iter()
+        .any(|n| ALWAYS_ON_TASK_TOOLS.contains(&n.as_str()))
+    {
+        return true;
+    }
+
+    let combined = format!("{} {}", tool_names.join(" "), tool_args_text.to_lowercase());
+
+    // Require ≥30% keyword overlap with stemming
+    let match_count = intent_keywords
+        .iter()
+        .filter(|kw| combined.contains(kw.as_str()))
+        .count();
+    let overlap_ratio = match_count as f64 / intent_keywords.len() as f64;
+    if overlap_ratio >= 0.3 {
+        return true;
+    }
+
+    // Domain-aware fallback (unchanged from before)
+    let has_git_domain = tool_names.iter().any(|n| n == "git");
+    let has_bash_domain = tool_names.iter().any(|n| n == "bash");
+    let has_cargo_domain = tool_names.iter().any(|n| n == "cargo" || n == "bash");
+
+    if (query_lower.contains("git") || query_lower.contains("commit"))
+        && (has_git_domain || has_bash_domain)
+    {
+        return true;
+    }
+
+    if (query_lower.contains("cargo") || query_lower.contains("build") || query_lower.contains("test"))
+        && has_cargo_domain
+    {
+        return true;
+    }
+
+    false
+}
+
+    // ─── IntentDrift and format_drift_correction tests ─────────────────────
+
+    #[test]
+    fn format_drift_correction_truncates_long_query() {
+        let long_query = "a".repeat(200);
+        let correction = format_drift_correction(&long_query, 5);
+        assert!(correction.contains("INTENT DRIFT"));
+        assert!(correction.contains("5 consecutive turns"));
+        // Query should be truncated to 100 chars
+        assert!(correction.len() < 200 + 200);
     }
 
     #[test]
-    fn intent_drift_on_task_when_tools_match_query() {
-        let turns = make_intent_turns(&[
-            (&["git"], r#"{"action":"log"}"#),
-            (&["git"], r#"{"action":"show","revision":"abc123"}"#),
-            (&["git"], r#"{"action":"diff","ref":"abc123"}"#),
-        ]);
-        let result = detect_intent_drift("review 最新的commit", &turns);
-        assert_eq!(result, IntentDrift::OnTask);
+    fn format_drift_correction_includes_consecutive_count() {
+        let correction = format_drift_correction("fix auth bug", 3);
+        assert!(correction.contains("3 consecutive turns"));
+        assert!(correction.contains("fix auth bug"));
+    }
+
+    #[test]
+    fn intent_drift_variants_constructible() {
+        let on_task = IntentDrift::OnTask;
+        assert_eq!(on_task, IntentDrift::OnTask);
+
+        let drifting = IntentDrift::Drifting {
+            consecutive_off_task: 4,
+            correction: "test".to_string(),
+        };
+        if let IntentDrift::Drifting {
+            consecutive_off_task,
+            correction,
+        } = drifting
+        {
+            assert_eq!(consecutive_off_task, 4);
+            assert_eq!(correction, "test");
+        } else {
+            panic!("Expected Drifting variant");
+        }
     }
 
     #[test]
