@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::injection_tracking::{ChannelFreshness, ChannelStatus, InjectionChannel};
 use astra_core::ObservationFacet;
-pub use observation::{IntrospectReport, build_introspect_report};
+pub use observation::{build_introspect_report, IntrospectReport};
 pub use request::{
     IntrospectDepth, IntrospectFormat, IntrospectRequest, ObservationHorizon, ObservationTopic,
     SourcePolicy,
@@ -129,6 +129,8 @@ pub struct StallSnapshotSummary {
     pub forced_search_fanout_corrective: bool,
     pub forced_exploration_family_lockout: bool,
     pub forced_exploration_family_corrective: bool,
+    #[serde(default)]
+    pub forced_intent_drift: bool,
 }
 
 /// Per-tool health entry.
@@ -419,7 +421,8 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
         || st.forced_cache_waste_corrective
         || st.forced_search_fanout_corrective
         || st.forced_exploration_family_lockout
-        || st.forced_exploration_family_corrective;
+        || st.forced_exploration_family_corrective
+        || st.forced_intent_drift;
     if st.nudge_count == 0 && st.events.is_empty() && !any_forced {
         return "## Stall / Loop-Guard\n(Healthy — no nudges, no forced corrections this turn.)"
             .to_string();
@@ -461,6 +464,9 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
     }
     if st.forced_exploration_family_corrective {
         forced.push("exploration_family_corrective");
+    }
+    if st.forced_intent_drift {
+        forced.push("intent_drift");
     }
     if !forced.is_empty() {
         out.push_str("\n### Forced corrections fired this turn\n");
@@ -798,25 +804,21 @@ mod tests {
         assert_eq!(report.view.topic, "execution");
         assert_eq!(report.view.facet, "errors");
         assert!(report.summary.contains("recent tool errors"));
-        assert!(
-            report
-                .observations
-                .iter()
-                .any(|observation| observation.ref_id
-                    == "urn:astra:observation:local:introspect:execution:error:0"
-                    && observation.kind == "tool_error:tool_timeout")
-        );
+        assert!(report
+            .observations
+            .iter()
+            .any(|observation| observation.ref_id
+                == "urn:astra:observation:local:introspect:execution:error:0"
+                && observation.kind == "tool_error:tool_timeout"));
         assert!(report.evidence.iter().any(
             |evidence| evidence.ref_id == "urn:astra:context:local:introspect:runtime_snapshot"
         ));
         assert_eq!(report.view.data_coverage.overall, "fresh");
-        assert!(
-            report
-                .view
-                .data_coverage
-                .providers
-                .contains_key("live_runtime")
-        );
+        assert!(report
+            .view
+            .data_coverage
+            .providers
+            .contains_key("live_runtime"));
         assert!(!report.budget_result.truncated);
         assert_report_refs_are_valid(&report);
     }
@@ -836,14 +838,12 @@ mod tests {
             "edge_local_artifacts_unavailable"
         );
         assert_eq!(report.view.data_coverage.events, 0);
-        assert!(
-            report
-                .view
-                .data_coverage
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("Edge-local"))
-        );
+        assert!(report
+            .view
+            .data_coverage
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Edge-local")));
         assert_eq!(report.observations.len(), 1);
         assert_eq!(
             report.observations[0].kind, "data_surface_unavailable",
@@ -937,14 +937,12 @@ mod tests {
             report.view.data_coverage.providers["visible_context"].status,
             "missing"
         );
-        assert!(
-            report
-                .view
-                .data_coverage
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("include_context requested"))
-        );
+        assert!(report
+            .view
+            .data_coverage
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("include_context requested")));
         assert_report_refs_are_valid(&report);
     }
 

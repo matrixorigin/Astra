@@ -49,8 +49,8 @@
 //! which wraps this loop with consistent outcome mapping.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use astra_services::session_audit::RuntimePromotionEventData;
@@ -140,8 +140,8 @@ pub enum ControlToolRecovery {
 }
 
 pub use astra_turn_core::interaction_types::{
-    ASK_USER_TOOL_NAME, TurnInteractionMode, TurnInteractionPolicy,
-    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
+    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence, TurnInteractionMode,
+    TurnInteractionPolicy, ASK_USER_TOOL_NAME,
 };
 
 // ─── Host trait ──────────────────────────────────────────────────────────────
@@ -482,6 +482,7 @@ pub(crate) fn build_introspect_snapshot(
         forced_exploration_family_lockout: state.stall.forced_exploration_family_phase2,
         forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
         forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
+        forced_intent_drift: state.stall.forced_intent_drift,
     };
 
     let current_round = state.current_round_index;
@@ -826,6 +827,10 @@ pub struct StallTrackingState {
     /// to detect whether later blocked rounds are simply retrying the same
     /// low-yield path instead of switching families or synthesizing.
     pub exploration_family_corrective_family: Option<String>,
+    /// Whether the intent-drift mid-loop corrective has fired this turn.
+    /// One-shot per turn — prevents repeated volatile injection that would
+    /// break prompt-cache prefix stability on every subsequent round.
+    pub forced_intent_drift: bool,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
@@ -877,6 +882,7 @@ impl StallTrackingState {
             || self.forced_exploration_family_corrective
             || self.forced_execution_escalation
             || self.forced_execution_retry
+            || self.forced_intent_drift
     }
 
     /// Whether the loop is already under *any* mid-loop intervention
@@ -1256,6 +1262,12 @@ pub enum VolatileKind {
     /// its plan via `exit_plan_mode(plan="…")` for user approval.
     /// Singleton — only the latest one ever rides the wire.
     PlanModeMarker,
+    /// Intent-drift correction: "⚠ INTENT DRIFT DETECTED — you have
+    /// spent N consecutive turns on tools unrelated to the user's
+    /// request…". Singleton so only the latest correction rides the
+    /// wire, avoiding prompt cache bloat from accumulated drift
+    /// messages across rounds.
+    IntentDrift,
     /// Catch-all for producers we haven't categorized yet. Prefer
     /// adding a new variant over reusing this — introspect reports
     /// by kind and a generic bucket degrades the signal.
@@ -1279,7 +1291,8 @@ impl VolatileKind {
                 | Self::CompactResume
                 | Self::TaskBoardCompletionGate
                 | Self::TaskBoardStartGate
-                | Self::PlanModeMarker,
+                | Self::PlanModeMarker
+                | Self::IntentDrift,
         )
     }
 
@@ -1304,7 +1317,8 @@ impl VolatileKind {
             | Self::ExecutionRetry
             | Self::ExplorationBudget
             | Self::DeferredUserInput
-            | Self::BudgetReview => "user",
+            | Self::BudgetReview
+            | Self::IntentDrift => "user",
             // System-role: prevents injection via attacker-crafted file content.
             Self::HallucinationTripwire => "system",
             // System-role: in-band runtime snapshots or coaching.
@@ -2075,27 +2089,27 @@ pub const DELEGATE_TOOL_NAME: &str =
     super::super::agentic::delegate_interception::DELEGATE_TOOL_NAME;
 
 pub(crate) use super::super::agentic::delegate_interception::{
-    DelegationAdaptiveContext, DelegationExecutionResult, DelegationFinalOutputSource,
-    DelegationOutcomeMetadata, coordination_pattern_name, delegation_adaptive_context,
-    delegation_final_output_preview, format_delegation_result, format_delegation_terminal_preview,
-    is_delegation_call, merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
+    coordination_pattern_name, delegation_adaptive_context, delegation_final_output_preview,
+    format_delegation_result, format_delegation_terminal_preview, is_delegation_call,
+    merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
     parse_delegate_agents, parse_delegation_request, partition_and_execute_delegations,
     pattern_from_name, select_default_coordination_pattern, task_needs_review,
-    tool_call_arguments_value, tool_call_name,
+    tool_call_arguments_value, tool_call_name, DelegationAdaptiveContext,
+    DelegationExecutionResult, DelegationFinalOutputSource, DelegationOutcomeMetadata,
 };
 
 use super::super::harness_adapter::harness_at;
 pub(crate) use super::execution_phase::{
-    TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
+    execute_turn_and_ingest_phase, TurnExecutionControl, TurnExecutionPhase,
 };
 pub(crate) use super::finalization::{
     finalize_and_render, finalize_turn_trace, run_agentic_loop_with_host,
     try_write_heavy_checkpoint,
 };
 pub(crate) use super::lifecycle::{
-    PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
+    prepare_turn_iteration, run_loop_preamble, PreparedTurnIteration, TurnIterationPrep,
 };
-pub(crate) use super::tool_phase::{TurnToolPhaseControl, execute_tool_phase};
+pub(crate) use super::tool_phase::{execute_tool_phase, TurnToolPhaseControl};
 
 #[cfg(feature = "harness")]
 pub(crate) fn set_harness_interruption(
@@ -3510,7 +3524,7 @@ pub(crate) mod tests {
         // Tokens accumulate across turns (+=)
         assert_eq!(state.total_prompt, 35); // 20 + 15
         assert_eq!(state.total_completion, 15); // 10 + 5
-        // Edge tool counted
+                                                // Edge tool counted
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
@@ -3690,7 +3704,7 @@ pub(crate) mod tests {
         assert_eq!(host.current_turn, 0); // No turns executed
         assert!(state.final_text.contains("without a final answer")); // EmptyCompletion message
         assert_eq!(state.remaining_turns, 10); // Unchanged
-        // EmptyCompletion interruption recorded
+                                               // EmptyCompletion interruption recorded
         let interruption = state
             .interruption
             .as_ref()
@@ -3862,13 +3876,11 @@ pub(crate) mod tests {
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         assert!(state.final_text.contains("Turn budget exhausted"));
-        assert!(
-            !state
-                .messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
-        );
+        assert!(!state
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("Budget review")));
     }
 
     #[tokio::test]
@@ -3973,18 +3985,14 @@ pub(crate) mod tests {
             !state.final_text.contains("changes look good"),
             "budget exhaustion must overwrite stale success-shaped text"
         );
-        assert!(
-            state
-                .final_text
-                .contains("Turn budget exhausted after 2 agentic turn(s)")
-        );
-        assert!(
-            !state
-                .messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
-        );
+        assert!(state
+            .final_text
+            .contains("Turn budget exhausted after 2 agentic turn(s)"));
+        assert!(!state
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("Budget review")));
     }
 
     #[tokio::test]
@@ -4692,14 +4700,14 @@ pub(crate) mod tests {
     // ── E2E delegation round-trip tests ─────────────────────────────────────
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
-    pub(crate) fn make_test_delegation_engine()
-    -> Arc<crate::server::delegation::engine::DelegationEngine> {
+    pub(crate) fn make_test_delegation_engine(
+    ) -> Arc<crate::server::delegation::engine::DelegationEngine> {
         use crate::server::delegation::engine::{
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run::engine::RunEngine;
-        use astra_services::AgentProfileRegistry;
         use astra_services::coordination::{AgentProfile, AgentTier};
+        use astra_services::AgentProfileRegistry;
 
         let mut registry = AgentProfileRegistry::new();
         let _ = registry.register(AgentProfile::new(
@@ -5703,18 +5711,14 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
         assert_eq!(msg1.len(), 1);
-        assert!(
-            msg1[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: test-skill")
-        );
-        assert!(
-            msg1[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Follow these instructions carefully.")
-        );
+        assert!(msg1[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: test-skill"));
+        assert!(msg1[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Follow these instructions carefully."));
 
         // Second call: replay loaded content + dedup note.
         let msg2: Vec<&Value> = state
@@ -5774,24 +5778,20 @@ pub(crate) mod tests {
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
-        assert!(
-            msg1[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: test-skill")
-        );
+        assert!(msg1[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: test-skill"));
 
         let msg2: Vec<&Value> = state
             .messages
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
             .collect();
-        assert!(
-            msg2[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: other-skill")
-        );
+        assert!(msg2[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: other-skill"));
 
         // Both tracked
         assert_eq!(state.skills.invoked.len(), 2);
@@ -5926,12 +5926,10 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
             .collect();
         assert_eq!(skill_msgs.len(), 1);
-        assert!(
-            skill_msgs[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: test-skill")
-        );
+        assert!(skill_msgs[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: test-skill"));
 
         // Skill exclusivity drop is now a debug log, not a user-facing headless line.
         // Verify the host did NOT receive any deferred notice (it goes to tracing now).
@@ -7178,8 +7176,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
     }
 
-    pub(crate) fn make_session()
-    -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
+    pub(crate) fn make_session(
+    ) -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
         std::sync::Arc::new(std::sync::RwLock::new(
             crate::observability::ObservabilitySession::new_simple("test-session"),
         ))
@@ -7221,11 +7219,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 threshold: 50_000
             }
         )));
-        assert!(
-            signals.iter().any(|signal| {
-                signal.signal_type == astra_core::feedback::SignalType::Acceptance
-            })
-        );
+        assert!(signals
+            .iter()
+            .any(|signal| { signal.signal_type == astra_core::feedback::SignalType::Acceptance }));
     }
 
     #[test]
@@ -8444,7 +8440,7 @@ mod parallel_execution_tests {
     /// Unit test for partition_tool_batches.
     #[test]
     fn partition_tool_batches_groups_correctly() {
-        use crate::turn::agentic::headless_round::{ToolBatch, partition_tool_batches};
+        use crate::turn::agentic::headless_round::{partition_tool_batches, ToolBatch};
         use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
 
         let tool_calls = vec![
@@ -8696,6 +8692,100 @@ mod parallel_execution_tests {
         assert!(
             !content.trim().is_empty(),
             "rendered content must not be empty whitespace: {content:?}"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Wire-format invariant tests — prompt cache protection
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn singleton_volatile_replaces_not_appends_on_wire() {
+        // Critical for prompt cache: pushing two IntentDrift corrections
+        // in the same round must REPLACE, not APPEND. Otherwise the wire
+        // format changes every round drift is detected, breaking the cache
+        // prefix stability.
+        let mut state = make_state();
+        state.push_volatile(VolatileKind::IntentDrift, "first correction");
+        state.push_volatile(VolatileKind::IntentDrift, "second correction");
+        assert_eq!(
+            state.volatile_pending.len(),
+            1,
+            "singleton kind must replace, not append — cache invariant violated"
+        );
+        let content = state.volatile_pending[0].content.as_str();
+        assert!(
+            content.contains("second"),
+            "replacement must keep the LATEST correction, got: {content}"
+        );
+    }
+
+    #[test]
+    fn take_volatile_pending_leaves_lane_empty_for_next_round() {
+        // Turn boundary invariant: after draining volatiles for the wire,
+        // the lane must be empty so the NEXT LLM call starts from a clean
+        // slate. Stale corrections leaking across rounds would bloat the
+        // wire and break cache prefix.
+        let mut state = make_state();
+        state.push_volatile(VolatileKind::StallNudge, "stale nudge from round 1");
+        let drained = state.take_volatile_pending();
+        assert_eq!(drained.len(), 1, "precondition: one volatile queued");
+        assert!(
+            state.volatile_pending.is_empty(),
+            "take_volatile_pending must leave the lane empty"
+        );
+        // Next "round" should start clean
+        assert!(
+            state.take_volatile_pending().is_empty(),
+            "stale volatile leaked across rounds — cache bloat risk"
+        );
+    }
+
+    #[test]
+    fn forced_intent_drift_flag_prevents_repeated_injection() {
+        // One-shot per turn: once forced_intent_drift is set, no further
+        // corrections are injected this turn, preserving prompt-cache prefix.
+        let mut state = make_state();
+        assert!(
+            !state.stall.forced_intent_drift,
+            "flag must start false each turn"
+        );
+        state.stall.forced_intent_drift = true;
+        assert!(
+            state.stall.any_corrective_fired(),
+            "forced_intent_drift must be included in any_corrective_fired()"
+        );
+    }
+
+    #[test]
+    fn different_volatile_kinds_coexist_on_wire() {
+        // Different kinds (StallNudge vs IntentDrift) are NOT singletons
+        // relative to each other — they coexist so the model sees all
+        // runtime signals. Only same-kind pushes replace.
+        let mut state = make_state();
+        state.push_volatile(VolatileKind::StallNudge, "stall warning");
+        state.push_volatile(VolatileKind::IntentDrift, "drift correction");
+        assert_eq!(
+            state.volatile_pending.len(),
+            2,
+            "different kinds must coexist on the wire"
+        );
+        // Same singleton kind replaces (IntentDrift is singleton)
+        state.push_volatile(VolatileKind::IntentDrift, "updated drift");
+        assert_eq!(
+            state.volatile_pending.len(),
+            2,
+            "same-kind singleton push must replace, not append"
+        );
+        let content = state
+            .volatile_pending
+            .iter()
+            .find(|v| matches!(v.kind, VolatileKind::IntentDrift))
+            .map(|v| v.content.as_str())
+            .unwrap_or("");
+        assert!(
+            content.contains("updated drift"),
+            "singleton must keep LATEST value, got: {content}"
         );
     }
 

@@ -1525,23 +1525,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     if let Some(intent) = judged_turn_intent.as_ref() {
         apply_judged_turn_intent_to_observability_session(state, intent);
     }
-    let _turn_intent = judged_turn_intent.or_else(|| {
-        // Structural fallback when the LLM judge is unavailable or failed.
-        // Keeps scenario routing, continuation mode, and adaptive profiles
-        // functional under judge outages instead of collapsing to defaults.
-        let has_prior_assistant_turn = state
-            .messages
-            .iter()
-            .rev()
-            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
-        Some(crate::turn::agentic::turn_intent::fallback_turn_intent(
-            &state.message,
-            &state.recent_tools,
-            has_prior_assistant_turn,
-        ))
-    });
-    // apply_adaptive_execution_profile_with_intent removed — observation plane
-    // records scenario signals without mutating runtime config (observe now, tune later).
+    // Turn intent not yet wired to adaptive execution profiles — observation
+    // plane records scenario signals without mutating runtime config.
 
     if (state.telemetry.observability_session.is_some() || state.skills.resolver.is_some())
         && state.telemetry.turn_trace_collector.is_none()

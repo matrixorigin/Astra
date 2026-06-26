@@ -766,6 +766,7 @@ pub(crate) async fn stream_chat_sse(
             forced_exploration_family_corrective: false,
             forced_exploration_family_phase2: false,
             exploration_family_corrective_family: None,
+            forced_intent_drift: false,
             nudge_count: 0,
             circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
                 circuit_breaker_config,

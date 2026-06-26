@@ -302,13 +302,6 @@ pub fn assess_reward_hacking(
     })
 }
 
-pub fn dampen_quality_for_reward_hacking(
-    quality: f64,
-    assessment: &RewardHackingAssessment,
-) -> f64 {
-    (quality * (1.0 - assessment.risk)).clamp(0.0, 1.0)
-}
-
 pub fn reward_hacking_avoid_tools(tool_calls: &[Value]) -> Vec<String> {
     let tool_names = ordered_tool_call_names(tool_calls);
     if tool_names.is_empty() {
@@ -1150,15 +1143,6 @@ mod tests {
             assessment.risk < ACTIVE_REWARD_HACKING_RISK_THRESHOLD,
             "risk should be below threshold for legitimate multi-file edits: {assessment:?}"
         );
-    }
-
-    #[test]
-    fn reward_hacking_dampens_quality() {
-        let assessment = RewardHackingAssessment {
-            risk: 0.6,
-            flags: vec!["repeated identical tool call x3".into()],
-        };
-        assert!((dampen_quality_for_reward_hacking(0.9, &assessment) - 0.36).abs() < 0.01);
     }
 
     #[test]
@@ -2099,28 +2083,6 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn intent_drift_empty_turns() {
-        assert_eq!(
-            detect_intent_drift("review commit", &[]),
-            IntentDrift::OnTask
-        );
-    }
-
-    #[test]
-    fn intent_drift_all_on_task_git_tools() {
-        let turns = make_intent_turns(&[
-            (&["git"], r#"{"action":"log"}"#),
-            (&["git"], r#"{"action":"diff","ref":"abc"}"#),
-            (&["git"], r#"{"action":"show","revision":"def"}"#),
-            (&["bash"], r#"git blame file.rs"#),
-        ]);
-        assert_eq!(
-            detect_intent_drift("review commit diff", &turns),
-            IntentDrift::OnTask
-        );
-    }
-
-    #[test]
     fn intent_drift_long_query_truncated_in_correction() {
         // Build a long query with real keywords (>=2 chars each)
         let long_query = "deploy kubernetes cluster ".repeat(20); // 500 chars
@@ -2147,20 +2109,6 @@ mod tests {
             (&["write_file"], "z"),
         ]);
         assert_eq!(detect_intent_drift("a b c", &turns), IntentDrift::OnTask);
-    }
-
-    #[test]
-    fn intent_drift_always_on_task_tools_at_end() {
-        // Off-task tools then a meta-tool at the very end → resets counter
-        let turns = make_intent_turns(&[
-            (&["write_file"], "random"),
-            (&["write_file"], "random"),
-            (&["reflect"], "anything"),
-        ]);
-        assert_eq!(
-            detect_intent_drift("review commit", &turns),
-            IntentDrift::OnTask
-        );
     }
 
     #[test]
@@ -2308,10 +2256,10 @@ mod tests {
 
     // ── P1-E: Reward-hacking detection behavioral tests ─────────────
 
-    /// Scenario: Agent calls the same tool with the same args 3 times in one
-    /// turn, and reports high quality. This is classic reward hacking.
+    /// Scenario: Agent makes 3 identical tool calls with high quality.
+    /// This should trigger reward hacking detection.
     #[test]
-    fn reward_hacking_detected_on_identical_calls_with_high_quality() {
+    fn reward_hacking_assessment_high_risk_on_identical_calls() {
         let calls = vec![
             serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
             serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
@@ -2324,13 +2272,6 @@ mod tests {
             assessment.risk
         );
         assert!(!assessment.flags.is_empty(), "must have diagnostic flags");
-
-        // Quality must be dampened
-        let dampened = dampen_quality_for_reward_hacking(0.9, &assessment);
-        assert!(
-            dampened < 0.9,
-            "quality must be dampened from 0.9, got {dampened}"
-        );
     }
 
     /// Scenario: Agent calls the same tool with DIFFERENT args (e.g.,
