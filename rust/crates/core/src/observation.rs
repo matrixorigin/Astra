@@ -451,10 +451,6 @@ pub struct ObservationBudgetResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ObservationBudgetOmitted {
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub events: i64,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub chains: i64,
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub nodes: i64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub evidence_previews: i64,
@@ -466,9 +462,7 @@ pub struct ObservationBudgetOmitted {
 
 impl ObservationBudgetOmitted {
     pub fn is_empty(&self) -> bool {
-        self.events == 0
-            && self.chains == 0
-            && self.nodes == 0
+        self.nodes == 0
             && self.evidence_previews == 0
             && self.observations == 0
             && self.action_hints == 0

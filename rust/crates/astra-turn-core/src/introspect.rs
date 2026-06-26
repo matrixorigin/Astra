@@ -1362,4 +1362,176 @@ mod tests {
         );
         assert!(out.contains("ConsecFail"), "header missing: {out}");
     }
+
+    // ── Unhappy-path tests ───────────────────────────────────────────────
+
+    #[test]
+    fn render_json_empty_snapshot_per_facet_no_crash() {
+        let empty = IntrospectSnapshot::default();
+        for facet_str in &["session", "recent", "volatile", "stall", "noise", "errors"] {
+            let req = IntrospectRequest::from_args(&serde_json::json!({
+                "facet": facet_str,
+                "format": "json"
+            }));
+            let out = render_introspect_request(&empty, &req);
+            let report: IntrospectReport = serde_json::from_str(&out).unwrap_or_else(|e| {
+                panic!("facet={facet_str}: JSON deserialize failed: {e}: {out}")
+            });
+            assert!(
+                !report.observations.iter().any(|o| o.severity == "critical"),
+                "facet={facet_str}: empty snapshot should not produce critical observations"
+            );
+            assert_report_refs_are_valid(&report);
+        }
+    }
+
+    #[test]
+    fn render_json_budget_priority_warnings_survive() {
+        let mut snap = sample_snapshot();
+        snap.alerts.clear();
+        snap.tool_health = (0..5)
+            .map(|idx| ToolHealthEntry {
+                name: format!("tool_{idx}"),
+                calls: 10,
+                errors: 3,
+                avg_ms: 100,
+                avoidance_advised: true,
+                consecutive_failures: 3,
+                last_failure_category: Some("timeout".into()),
+            })
+            .collect();
+        snap.tool_health.push(ToolHealthEntry {
+            name: "clean_tool".into(),
+            calls: 5,
+            errors: 0,
+            avg_ms: 5,
+            avoidance_advised: false,
+            consecutive_failures: 0,
+            last_failure_category: None,
+        });
+
+        let req = IntrospectRequest::from_args(&serde_json::json!({
+            "depth": "summary",
+            "format": "json"
+        }));
+        let out = render_introspect_request(&snap, &req);
+        let report: IntrospectReport = serde_json::from_str(&out).expect("json report");
+
+        // 1 health + 5 warning tool_health = 6 observations. Budget=8: fits.
+        // Action hints budget=4, but we have 5 → truncated flag set.
+        assert_eq!(report.observations.len(), 6);
+        assert_eq!(report.action_hints.len(), 4);
+        assert!(report.budget_result.truncated);
+        assert_eq!(report.budget_result.omitted.action_hints, 1);
+        let warning_obs: Vec<_> = report
+            .observations
+            .iter()
+            .filter(|o| o.severity == "warning")
+            .collect();
+        assert_eq!(
+            warning_obs.len(),
+            5,
+            "all warning tool_health observations should survive"
+        );
+        assert_report_refs_are_valid(&report);
+    }
+
+    #[test]
+    fn render_json_budget_truncation_drops_info_before_warning() {
+        let mut snap = sample_snapshot();
+        // sample_snapshot already has: bash (errors=5), read_file (all=0, filtered), grep (avoidance=true)
+        // Set alerts to avoid alert observation (would be warning)
+        snap.alerts.clear();
+        // Add 2 info + 4 warning tools = 6 new tools
+        // Total tools passing filter: bash + grep + 2 info + 4 warning = 8 (fits take(8))
+        // Observations: 1 health + 8 tool = 9 → budget=8 drops 1
+        for idx in 0..2 {
+            snap.tool_health.push(ToolHealthEntry {
+                name: format!("info_tool_{idx}"),
+                calls: 10,
+                errors: 1,
+                avg_ms: 100,
+                avoidance_advised: false,
+                consecutive_failures: 1,
+                last_failure_category: None,
+            });
+        }
+        for idx in 0..4 {
+            snap.tool_health.push(ToolHealthEntry {
+                name: format!("bad_tool_{idx}"),
+                calls: 10,
+                errors: 4,
+                avg_ms: 100,
+                avoidance_advised: true,
+                consecutive_failures: 3,
+                last_failure_category: Some("timeout".into()),
+            });
+        }
+
+        let req = IntrospectRequest::from_args(&serde_json::json!({
+            "depth": "summary",
+            "format": "json"
+        }));
+        let out = render_introspect_request(&snap, &req);
+        let report: IntrospectReport = serde_json::from_str(&out).expect("json report");
+
+        // 1 health + 8 tool = 9 observations. Budget=8, priority sort drops health (info).
+        // Remaining: 5 warnings (grep+4bad) + 3 info (bash+2info) = 8
+        assert_eq!(
+            report.observations.len(),
+            8,
+            "should hit summary budget of 8"
+        );
+        assert!(report.budget_result.truncated);
+        let retained_warnings: Vec<_> = report
+            .observations
+            .iter()
+            .filter(|o| o.severity == "warning")
+            .collect();
+        assert_eq!(
+            retained_warnings.len(),
+            5,
+            "all 5 warning observations must survive, only info gets truncated"
+        );
+        assert!(report.budget_result.omitted.observations >= 1);
+        assert_report_refs_are_valid(&report);
+    }
+
+    #[test]
+    fn render_json_tool_errors_facet_isolated_from_tool_health() {
+        let mut snap = sample_snapshot();
+        snap.tool_errors.push(ToolErrorEntry {
+            tool: "bash".into(),
+            signature_hint: "bash:ls -la".into(),
+            failure_category: Some("tool_timeout".into()),
+            error_preview: Some("command timed out after 30s".into()),
+            at_epoch: 1,
+            error_message: "command timed out after 30s".into(),
+            file_path: None,
+            file_range: None,
+            turn: 5,
+            round: 2,
+        });
+
+        let req = IntrospectRequest::from_args(&serde_json::json!({
+            "facet": "errors",
+            "format": "json"
+        }));
+        let out = render_introspect_request(&snap, &req);
+        let report: IntrospectReport = serde_json::from_str(&out).expect("json report");
+
+        assert_eq!(report.facet, "errors");
+        assert!(
+            !report.observations.iter().any(|o| o.kind == "tool_health"),
+            "errors facet must not contain tool_health observations"
+        );
+        assert!(
+            report
+                .observations
+                .iter()
+                .any(|o| o.kind == "tool_error:tool_timeout"),
+            "errors facet must contain tool_error observations"
+        );
+        assert_report_refs_are_valid(&report);
+    }
 }

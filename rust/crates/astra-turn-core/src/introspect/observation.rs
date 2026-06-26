@@ -498,17 +498,37 @@ fn build_introspect_observations(
             }
         }
 
-        ObservationFacet::Stall if snapshot.stall_state.nudge_count > 0 => {
-            observations.push(ObservationRecord {
-                ref_id: "urn:astra:observation:local:introspect:stall:state".to_string(),
-                topic: request.topic.as_str().to_string(),
-                facet: request.facet.as_str().to_string(),
-                kind: "stall_telemetry".to_string(),
-                severity: "info".to_string(),
-                summary: format!("stall nudge count: {}", snapshot.stall_state.nudge_count),
-                confidence: ObservationConfidence::evidence(0.90),
-                evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
-            });
+        ObservationFacet::Stall
+            if snapshot.stall_state.nudge_count > 0
+                || !snapshot.stall_state.forced_corrections.is_empty() =>
+        {
+            if snapshot.stall_state.nudge_count > 0 {
+                observations.push(ObservationRecord {
+                    ref_id: "urn:astra:observation:local:introspect:stall:state".to_string(),
+                    topic: request.topic.as_str().to_string(),
+                    facet: request.facet.as_str().to_string(),
+                    kind: "stall_telemetry".to_string(),
+                    severity: "info".to_string(),
+                    summary: format!("stall nudge count: {}", snapshot.stall_state.nudge_count),
+                    confidence: ObservationConfidence::evidence(0.90),
+                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                });
+            }
+            for correction in &snapshot.stall_state.forced_corrections {
+                observations.push(ObservationRecord {
+                    ref_id: format!(
+                        "urn:astra:observation:local:introspect:stall:correction:{}",
+                        urn_component(correction)
+                    ),
+                    topic: request.topic.as_str().to_string(),
+                    facet: request.facet.as_str().to_string(),
+                    kind: "stall_forced_correction".to_string(),
+                    severity: "warning".to_string(),
+                    summary: format!("forced correction fired: {correction}"),
+                    confidence: ObservationConfidence::evidence(0.95),
+                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                });
+            }
         }
 
         _ => {}
