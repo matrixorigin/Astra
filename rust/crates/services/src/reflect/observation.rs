@@ -2,7 +2,7 @@ use super::{
     Diagnosis, Insight, ObservationActionHint, ObservationConfidence, ObservationEvidence,
     ObservationFailureCluster, ObservationRecord, ReflectRequest, SessionOverview,
 };
-use astra_core::ObservationGraphSlice;
+use astra_core::{urn_component, ObservationGraphSlice, Urn};
 
 pub(super) struct ObservationEnvelope {
     pub summary: String,
@@ -22,19 +22,25 @@ pub(super) fn build_observation_envelope(
     evidence_graph: Option<&ObservationGraphSlice>,
 ) -> ObservationEnvelope {
     let summary = build_reflect_summary(overview, diagnoses, insights);
-    let session_component = urn_component(session_id);
     let mut observations = Vec::new();
     let mut evidence = Vec::new();
     let mut failure_clusters = Vec::new();
 
     for (idx, diagnosis) in diagnoses.iter().enumerate() {
-        let observation_ref =
-            format!("urn:astra:observation:graph:reflect:{session_component}:diagnosis:{idx}");
+        let observation_ref = Urn::new("observation", "graph", "reflect")
+            .seg(session_id)
+            .seg("diagnosis")
+            .idx(idx)
+            .build();
         let mut evidence_refs = Vec::new();
         for (sample_idx, sample) in diagnosis.samples.iter().enumerate() {
-            let evidence_ref = format!(
-                "urn:astra:artifact:cloud:reflect:{session_component}:diagnosis:{idx}:sample:{sample_idx}"
-            );
+            let evidence_ref = Urn::new("artifact", "cloud", "reflect")
+                .seg(session_id)
+                .seg("diagnosis")
+                .idx(idx)
+                .seg("sample")
+                .idx(sample_idx)
+                .build();
             evidence_refs.push(evidence_ref.clone());
             evidence.push(ObservationEvidence {
                 ref_id: evidence_ref,
@@ -63,11 +69,11 @@ pub(super) fn build_observation_envelope(
             evidence_refs,
         });
         failure_clusters.push(ObservationFailureCluster {
-            cluster_ref: format!(
-                "urn:astra:failure_cluster:graph:reflect:{session_component}:{}:{}",
-                urn_component(&diagnosis.category.to_string()),
-                urn_component(&diagnosis.affected_tool)
-            ),
+            cluster_ref: Urn::new("failure_cluster", "graph", "reflect")
+                .seg(session_id)
+                .seg(&diagnosis.category.to_string())
+                .seg(&diagnosis.affected_tool)
+                .build(),
             label: format!(
                 "{}_{}",
                 diagnosis.category,
@@ -90,13 +96,19 @@ pub(super) fn build_observation_envelope(
     }
 
     for (idx, insight) in insights.iter().enumerate() {
-        let observation_ref =
-            format!("urn:astra:observation:graph:reflect:{session_component}:insight:{idx}");
+        let observation_ref = Urn::new("observation", "graph", "reflect")
+            .seg(session_id)
+            .seg("insight")
+            .idx(idx)
+            .build();
         let mut evidence_refs = Vec::new();
         if !insight.evidence.trim().is_empty() {
-            let evidence_ref = format!(
-                "urn:astra:artifact:cloud:reflect:{session_component}:insight:{idx}:evidence"
-            );
+            let evidence_ref = Urn::new("artifact", "cloud", "reflect")
+                .seg(session_id)
+                .seg("insight")
+                .idx(idx)
+                .seg("evidence")
+                .build();
             evidence_refs.push(evidence_ref.clone());
             evidence.push(ObservationEvidence {
                 ref_id: evidence_ref,
@@ -126,9 +138,11 @@ pub(super) fn build_observation_envelope(
 
     if observations.is_empty() {
         observations.push(ObservationRecord {
-            ref_id: format!(
-                "urn:astra:observation:graph:reflect:{session_component}:session:health"
-            ),
+            ref_id: Urn::new("observation", "graph", "reflect")
+                .seg(session_id)
+                .seg("session")
+                .seg("health")
+                .build(),
             topic: request.topic.clone(),
             facet: request.facet.clone(),
             kind: "session_health".to_string(),
@@ -179,7 +193,7 @@ pub(super) fn build_observation_envelope(
                 observations.as_slice(),
                 diagnoses,
                 insights,
-                &session_component,
+                session_id,
             );
             ObservationActionHint {
                 target_type: "user_guidance".to_string(),
@@ -229,7 +243,7 @@ fn observation_refs_for_recommendation(
     observations: &[ObservationRecord],
     diagnoses: &[Diagnosis],
     insights: &[Insight],
-    session_component: &str,
+    session_id: &str,
 ) -> Vec<String> {
     let recommendation = recommendation.trim();
     let normalized = normalize_recommendation(recommendation);
@@ -239,18 +253,26 @@ fn observation_refs_for_recommendation(
         if !diagnosis.fix_hint.trim().is_empty()
             && normalize_recommendation(&diagnosis.fix_hint) == normalized
         {
-            refs.push(format!(
-                "urn:astra:observation:graph:reflect:{session_component}:diagnosis:{idx}"
-            ));
+            refs.push(
+                Urn::new("observation", "graph", "reflect")
+                    .seg(session_id)
+                    .seg("diagnosis")
+                    .idx(idx)
+                    .build(),
+            );
         }
     }
 
     if refs.is_empty() {
         for (idx, insight) in insights.iter().enumerate() {
             if recommendation_matches_insight(recommendation, insight) {
-                refs.push(format!(
-                    "urn:astra:observation:graph:reflect:{session_component}:insight:{idx}"
-                ));
+                refs.push(
+                    Urn::new("observation", "graph", "reflect")
+                        .seg(session_id)
+                        .seg("insight")
+                        .idx(idx)
+                        .build(),
+                );
             }
         }
     }
@@ -347,27 +369,11 @@ fn diagnosis_causal_confidence(diagnosis: &Diagnosis) -> f64 {
 }
 
 pub(super) fn graph_event_ref(event_id: &str) -> String {
-    format!("urn:astra:event:cloud:{}", urn_component(event_id))
+    Urn::new("event", "cloud", event_id).build()
 }
 
 pub(super) fn graph_decision_ref(decision_id: &str) -> String {
-    format!("urn:astra:decision:cloud:{}", urn_component(decision_id))
-}
-
-fn urn_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len().max(1));
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "unknown".to_string()
-    } else {
-        out
-    }
+    Urn::new("decision", "cloud", decision_id).build()
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {

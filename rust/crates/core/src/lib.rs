@@ -403,7 +403,7 @@ pub use observation::{
     ObservationGraphNodeKind, ObservationGraphSlice, ObservationHorizon,
     ObservationProviderCoverage, ObservationRecord, ObservationTopic, ObservationView,
     SourcePolicy, classify_event_kind, normalize_observation_arg, push_graph_edge, push_graph_node,
-    truncate_graph_summary, urn_component,
+    truncate_graph_summary, urn_component, Urn,
 };
 pub use runtime_limits::RuntimeLimits;
 #[cfg(any(test, feature = "dev-defaults"))]

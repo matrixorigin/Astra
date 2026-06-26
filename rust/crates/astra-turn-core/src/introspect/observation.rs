@@ -3,12 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use astra_core::{
+    classify_event_kind, push_graph_edge, push_graph_node, truncate_graph_summary, urn_component,
     ObservationActionHint, ObservationBudgetOmitted, ObservationBudgetResult,
     ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
     ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
     ObservationGraphNodeKind, ObservationGraphSlice, ObservationProviderCoverage,
-    ObservationRecord, ObservationView, SourcePolicy, classify_event_kind, push_graph_edge,
-    push_graph_node, truncate_graph_summary, urn_component,
+    ObservationRecord, ObservationView, SourcePolicy, Urn,
 };
 
 use super::{IntrospectRequest, IntrospectSnapshot, ObservationFacet};
@@ -173,7 +173,10 @@ fn build_edge_local_unavailable_report(request: &IntrospectRequest) -> Introspec
         }
     );
     let observations = vec![ObservationRecord {
-        ref_id: format!("urn:astra:observation:local:introspect:data_surface:{facet}"),
+        ref_id: Urn::new("observation", "local", "introspect")
+            .seg("data_surface")
+            .seg(&facet.to_string())
+            .build(),
         topic: request.topic.as_str().to_string(),
         facet: facet.to_string(),
         kind: "data_surface_unavailable".to_string(),
@@ -443,10 +446,11 @@ fn build_introspect_observations(
                 .take(8)
             {
                 observations.push(ObservationRecord {
-                    ref_id: format!(
-                        "urn:astra:observation:local:introspect:execution:tool:{}",
-                        urn_component(&tool.name)
-                    ),
+                    ref_id: Urn::new("observation", "local", "introspect")
+                        .seg("execution")
+                        .seg("tool")
+                        .seg(&tool.name)
+                        .build(),
                     topic: "execution".to_string(),
                     facet: request.facet.as_str().to_string(),
                     kind: "tool_health".to_string(),
@@ -483,7 +487,11 @@ fn build_introspect_observations(
             // Tool error entries — only for Errors facet
             for (idx, error) in snapshot.tool_errors.iter().enumerate() {
                 observations.push(ObservationRecord {
-                    ref_id: format!("urn:astra:observation:local:introspect:execution:error:{idx}"),
+                    ref_id: Urn::new("observation", "local", "introspect")
+                        .seg("execution")
+                        .seg("error")
+                        .idx(idx)
+                        .build(),
                     topic: "execution".to_string(),
                     facet: request.facet.as_str().to_string(),
                     kind: error
@@ -521,10 +529,11 @@ fn build_introspect_observations(
             }
             for correction in &snapshot.stall_state.forced_corrections {
                 observations.push(ObservationRecord {
-                    ref_id: format!(
-                        "urn:astra:observation:local:introspect:stall:correction:{}",
-                        urn_component(correction)
-                    ),
+                    ref_id: Urn::new("observation", "local", "introspect")
+                        .seg("stall")
+                        .seg("correction")
+                        .seg(correction)
+                        .build(),
                     topic: request.topic.as_str().to_string(),
                     facet: request.facet.as_str().to_string(),
                     kind: "stall_forced_correction".to_string(),
@@ -552,10 +561,11 @@ fn build_introspect_action_hints(
         .filter(|tool| tool.avoidance_advised)
         .take(5)
         .filter_map(|tool| {
-            let tool_ref = format!(
-                "urn:astra:observation:local:introspect:execution:tool:{}",
-                urn_component(&tool.name)
-            );
+            let tool_ref = Urn::new("observation", "local", "introspect")
+                .seg("execution")
+                .seg("tool")
+                .seg(&tool.name)
+                .build();
             let observation_refs: Vec<String> = observations
                 .iter()
                 .filter(|observation| observation.ref_id == tool_ref)
@@ -639,10 +649,10 @@ fn build_introspect_graph_slice(
             &mut nodes,
             &mut node_refs,
             ObservationGraphNode {
-                ref_id: format!(
-                    "urn:astra:observation:local:introspect:hint:{}",
-                    urn_component(&hint.target_type)
-                ),
+                ref_id: Urn::new("observation", "local", "introspect")
+                    .seg("hint")
+                    .seg(&hint.target_type)
+                    .build(),
                 layer: ObservationGraphLayer::Observation,
                 kind: ObservationGraphNodeKind::Observation,
                 label: "action_hint".to_string(),
@@ -658,7 +668,11 @@ fn build_introspect_graph_slice(
         ObservationFacet::Errors | ObservationFacet::Overview | ObservationFacet::Session
     ) {
         for (idx, error) in snapshot.tool_errors.iter().enumerate() {
-            let error_ref = format!("urn:astra:observation:local:introspect:execution:error:{idx}");
+            let error_ref = Urn::new("observation", "local", "introspect")
+                .seg("execution")
+                .seg("error")
+                .idx(idx)
+                .build();
             let label = error
                 .failure_category
                 .as_deref()
@@ -701,10 +715,11 @@ fn build_introspect_graph_slice(
         for tool in snapshot.tool_health.iter().filter(|tool| {
             tool.avoidance_advised || tool.errors > 0 || tool.consecutive_failures > 0
         }) {
-            let health_ref = format!(
-                "urn:astra:observation:local:introspect:execution:tool:{}",
-                urn_component(&tool.name)
-            );
+            let health_ref = Urn::new("observation", "local", "introspect")
+                .seg("execution")
+                .seg("tool")
+                .seg(&tool.name)
+                .build();
             let severity = if tool.avoidance_advised || tool.consecutive_failures >= 3 {
                 "warning"
             } else {

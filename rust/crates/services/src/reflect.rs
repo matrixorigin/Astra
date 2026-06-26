@@ -146,21 +146,6 @@ struct EvidenceEvent {
     created_at: String,
 }
 
-/// Data completeness assessment for a reflection report.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCompleteness {
-    /// Number of events found in local journal.
-    pub journal_events: u32,
-    /// Number of events found in cloud DB (0 if offline/unavailable).
-    pub cloud_events: u32,
-    /// Events in journal but missing from cloud (potential ingestion drops).
-    pub missing_from_cloud: u32,
-    /// Confidence score (0.0 = no data, 1.0 = complete).
-    pub confidence: f64,
-    /// Human-readable warnings about data gaps.
-    pub warnings: Vec<String>,
-}
-
 fn build_evidence_graph(
     decisions: &[EvidenceDecision],
     events: &[EvidenceEvent],
@@ -302,34 +287,6 @@ pub struct TurnAnalysisReport {
     pub tool_surface_quality: Option<String>,
     /// Data sources used for the analysis.
     pub data_sources: Vec<String>,
-}
-
-/// Unified session diagnostic report combining all inspection capabilities.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionDiagnosticReport {
-    pub session_id: String,
-    /// Data completeness assessment.
-    pub data_completeness: DataCompleteness,
-    /// Total turns in session.
-    pub total_turns: u32,
-    /// Count of turn errors.
-    pub error_count: u32,
-    /// Count of stall events.
-    pub stall_count: u32,
-    /// Count of TurnGuard verdict events.
-    pub verdict_count: u32,
-    /// Tools currently avoidance_advised by health feedback.
-    pub health_avoidance_tools: Vec<String>,
-    /// Summary of error types encountered.
-    pub error_summary: Vec<String>,
-    /// Actionable recommendations.
-    pub recommendations: Vec<String>,
-    /// Number of composite snapshots available for this session.
-    #[serde(default)]
-    pub composite_snapshot_count: u32,
-    /// Dimensions covered by the most recent composite snapshot.
-    #[serde(default)]
-    pub latest_snapshot_dimensions: Vec<String>,
 }
 
 pub type ServiceResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;

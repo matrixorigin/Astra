@@ -299,6 +299,61 @@ pub fn urn_component(value: &str) -> String {
     }
 }
 
+/// Builder for `urn:astra:{kind}:{namespace}:{component}[:{segments}...]` references.
+///
+/// Every segment (including `kind`, `namespace`, `component`) is sanitized via
+/// [`urn_component`]; indices appended via [`Urn::idx`] are decimal integers and
+/// are **not** sanitized.
+///
+/// # Examples
+///
+/// ```
+/// use astra_core::Urn;
+/// let urn = Urn::new("observation", "local", "introspect")
+///     .seg("execution")
+///     .seg("error")
+///     .idx(3)
+///     .build();
+/// assert_eq!(urn, "urn:astra:observation:local:introspect:execution:error:3");
+/// ```
+#[derive(Debug, Clone)]
+pub struct Urn {
+    base: String,
+}
+
+impl Urn {
+    /// Start a URN with `urn:astra:{kind}:{namespace}:{component}`.
+    pub fn new(kind: &str, namespace: &str, component: &str) -> Self {
+        Self {
+            base: format!(
+                "urn:astra:{}:{}:{}",
+                urn_component(kind),
+                urn_component(namespace),
+                urn_component(component),
+            ),
+        }
+    }
+
+    /// Append a sanitized segment.
+    pub fn seg(mut self, value: &str) -> Self {
+        self.base.push(':');
+        self.base.push_str(&urn_component(value));
+        self
+    }
+
+    /// Append a decimal-index segment (unsanitized).
+    pub fn idx(mut self, idx: usize) -> Self {
+        use std::fmt::Write;
+        let _ = write!(self.base, ":{idx}");
+        self
+    }
+
+    /// Consume the builder and return the URN string.
+    pub fn build(self) -> String {
+        self.base
+    }
+}
+
 const ALLOWED_EVIDENCE_KINDS: &[&str] = &[
     "event",
     "decision",

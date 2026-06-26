@@ -12,7 +12,7 @@ use astra_core::{
     ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationEvidence,
     ObservationGraphEdge, ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
     ObservationGraphNodeKind, ObservationGraphSlice, ObservationProviderCoverage,
-    ObservationRecord, ObservationView,
+    ObservationRecord, ObservationView, Urn,
 };
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
@@ -636,12 +636,11 @@ fn local_reflect_observation_graph(
     Vec<ObservationEvidence>,
     ObservationGraphSlice,
 ) {
-    let session_component = urn_component(session_id);
-    let observation_ref = format!(
-        "urn:astra:observation:local:reflect:{session_component}:{}:{}",
-        urn_component(&request.topic),
-        urn_component(&request.facet)
-    );
+    let observation_ref = Urn::new("observation", "local", "reflect")
+        .seg(session_id)
+        .seg(&request.topic)
+        .seg(&request.facet)
+        .build();
     let mut evidence = Vec::new();
     let mut nodes = vec![ObservationGraphNode {
         ref_id: observation_ref.clone(),
@@ -663,10 +662,10 @@ fn local_reflect_observation_graph(
     for (idx, event) in recent_events.iter().enumerate() {
         let event_source = event_preview_evidence_source(event);
         let event_namespace = event_preview_ref_namespace(event);
-        let event_ref = format!(
-            "urn:astra:event:{event_namespace}:{session_component}:{}",
-            idx + 1
-        );
+        let event_ref =
+            Urn::new("event", event_namespace, session_id)
+                .idx(idx + 1)
+                .build();
         let event_summary = event_preview_summary(event);
         evidence_refs.push(event_ref.clone());
         evidence.push(ObservationEvidence {
@@ -1229,23 +1228,6 @@ fn event_preview_ref_namespace(event: &EventPreview) -> &'static str {
     match event_preview_evidence_source(event) {
         "cloud_resume" => "cloud",
         _ => "local",
-    }
-}
-
-fn urn_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len().max(1));
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    let trimmed = out.trim_matches('_');
-    if trimmed.is_empty() {
-        "unknown".to_string()
-    } else {
-        trimmed.to_string()
     }
 }
 
