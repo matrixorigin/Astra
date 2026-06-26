@@ -45,7 +45,7 @@ mod circuit_breaker_integration {
 }
 
 mod stall_detection {
-    use astra_turn_core::stall::{SERVER_STALL_WINDOW, detect_server_stall};
+    use astra_turn_core::stall::{detect_server_stall, SERVER_STALL_WINDOW};
     use std::collections::BTreeSet;
 
     /// Proves stall detector catches repetitive tool calls
@@ -100,6 +100,41 @@ mod turn_guard_integration {
 
     fn tool_call(name: &str, args: &str) -> serde_json::Value {
         json!({"function": {"name": name, "arguments": args}})
+    }
+
+    /// Proves: drift escalation triggers force-stop when nudge count >= 3
+    #[test]
+    fn drift_escalation_force_stops_after_three_nudges() {
+        let mut guard = TurnGuard::new();
+        guard.drift_nudge_count = 3;
+
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Critical);
+        assert!(verdict.force_stop, "drift count >= 3 must force-stop");
+        assert!(
+            verdict
+                .injections
+                .iter()
+                .any(|m| m.contains("CRITICAL") && m.contains("drift")),
+            "must inject drift critical message"
+        );
+    }
+
+    /// Proves: drift escalation does NOT trigger below threshold
+    #[test]
+    fn drift_below_threshold_stays_healthy() {
+        let mut guard = TurnGuard::new();
+        guard.drift_nudge_count = 2;
+
+        let verdict = guard.evaluate();
+        assert!(!verdict.force_stop, "drift count < 3 must not force-stop");
+        assert!(
+            !verdict
+                .injections
+                .iter()
+                .any(|m| m.contains("CRITICAL") && m.contains("drift")),
+            "must not inject drift critical message"
+        );
     }
 
     /// Proves: normal session produces no injections
@@ -303,7 +338,7 @@ mod multi_file_edit_regression {
     use astra_turn_core::tool_registry_report::ToolSelectionReport;
     use astra_turn_core::tool_schema_prune::retain_invoked_tool_schemas;
     use astra_turn_core::turn_guard::{TurnGuard, VerdictSeverity};
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     fn tool_schema(name: &str) -> Value {
         json!({"type": "function", "function": {"name": name, "description": "d", "parameters": {}}})
@@ -595,7 +630,7 @@ mod input_guards {
 // ── Result Quality Integration ──────────────────────────────────────────────
 
 mod result_quality_integration {
-    use astra_runtime::turn::result_quality::{ResultQuality, classify_result};
+    use astra_runtime::turn::result_quality::{classify_result, ResultQuality};
 
     #[test]
     fn real_world_github_error() {
@@ -944,17 +979,14 @@ mod chat_stream_turnguard_e2e {
         guard.record_tool_result("rollback_database_snapshots", "Error: connection refused");
         guard.record_tool_result("rollback_database_snapshots", "Error: connection refused");
 
-        assert!(
-            guard
-                .health
-                .is_avoidance_advised("rollback_database_snapshots")
-        );
+        assert!(guard
+            .health
+            .is_avoidance_advised("rollback_database_snapshots"));
 
         let v = guard.evaluate();
-        assert!(
-            v.avoid_tools
-                .contains(&"rollback_database_snapshots".to_string())
-        );
+        assert!(v
+            .avoid_tools
+            .contains(&"rollback_database_snapshots".to_string()));
 
         // Apply verdict
         apply_verdict(&v, 25, &mut restricted);
@@ -1389,10 +1421,9 @@ mod chat_stream_turnguard_e2e {
             guard.record_tool_result("rollback_database_snapshots", "Error: fail");
         }
         let v = guard.evaluate();
-        assert!(
-            v.avoid_tools
-                .contains(&"rollback_database_snapshots".to_string())
-        );
+        assert!(v
+            .avoid_tools
+            .contains(&"rollback_database_snapshots".to_string()));
         apply_verdict(&v, 25, &mut restricted);
         assert!(!restricted.contains("rollback_database_snapshots"));
 
