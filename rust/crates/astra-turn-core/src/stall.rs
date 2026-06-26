@@ -1311,8 +1311,6 @@ mod tests {
         }
     }
 
-    #[test]
-
     // ── Tool call signature format tests ──
 
     #[test]

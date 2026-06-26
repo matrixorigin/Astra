@@ -3,12 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use astra_core::{
-    ObservationActionHint, ObservationBudgetOmitted, ObservationBudgetResult,
+    urn_component, ObservationActionHint, ObservationBudgetOmitted, ObservationBudgetResult,
     ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
     ObservationGraphSlice, ObservationProviderCoverage, ObservationRecord, ObservationView,
+    SourcePolicy,
 };
 
-use super::{IntrospectRequest, IntrospectSnapshot, ObservationFacet, SourcePolicy};
+use super::{IntrospectRequest, IntrospectSnapshot, ObservationFacet};
 
 const RUNTIME_SNAPSHOT_REF: &str = "urn:astra:context:local:introspect:runtime_snapshot";
 
@@ -293,7 +294,11 @@ fn apply_report_budget(
         "diagnostic" => (32, 16, 8),
         _ => (100, 50, 8),
     };
-    let omitted_observations = truncate_count(observations, max_observations);
+
+    // Sort by priority before truncation so high-value observations survive.
+    observations.sort_by_key(|o| std::cmp::Reverse(observation_priority_key(o)));
+
+    let omitted_observations = truncate_by_priority(observations, max_observations);
     let retained_observation_refs = observations
         .iter()
         .map(|observation| observation.ref_id.as_str())
@@ -305,8 +310,8 @@ fn apply_report_budget(
     });
     action_hints.retain(|hint| !hint.observation_refs.is_empty());
     let omitted_dangling_hints = hints_before_ref_filter.saturating_sub(action_hints.len()) as i64;
-    let omitted_evidence = truncate_count(evidence, max_evidence);
-    let omitted_hints = truncate_count(action_hints, max_hints);
+    let omitted_evidence = truncate_by_priority(evidence, max_evidence);
+    let omitted_hints = truncate_by_priority(action_hints, max_hints);
     ObservationBudgetResult {
         truncated: omitted_observations > 0
             || omitted_evidence > 0
@@ -322,7 +327,31 @@ fn apply_report_budget(
     }
 }
 
-fn truncate_count<T>(items: &mut Vec<T>, max: usize) -> i64 {
+/// Priority key for sorting observations before budget truncation.
+/// Higher = more important. warning > info; higher confidence > lower; system > detail.
+fn observation_priority_key(o: &ObservationRecord) -> i64 {
+    let severity_score = match o.severity.as_str() {
+        "critical" => 1000,
+        "error" => 800,
+        "warning" => 600,
+        _ => 0,
+    };
+    let confidence_score = (o.confidence.evidence.unwrap_or(0.5)
+        + o.confidence.classification.unwrap_or(0.0)
+        + o.confidence.causal.unwrap_or(0.0))
+        * 100.0;
+    let kind_score =
+        if o.kind.contains("alert") || o.kind.contains("stall") || o.kind.contains("failure") {
+            200
+        } else if o.kind.contains("health") || o.kind.contains("error") {
+            100
+        } else {
+            0
+        };
+    severity_score + confidence_score as i64 + kind_score
+}
+
+fn truncate_by_priority<T>(items: &mut Vec<T>, max: usize) -> i64 {
     let omitted = items.len().saturating_sub(max) as i64;
     items.truncate(max);
     omitted
@@ -370,8 +399,11 @@ fn build_introspect_observations(
     summary: &str,
 ) -> Vec<ObservationRecord> {
     let mut observations = Vec::new();
+
+    // ── facet-specific observations ──
     match request.facet {
-        ObservationFacet::Session => {
+        ObservationFacet::Session | ObservationFacet::Overview => {
+            // Session health observation
             if snapshot.alerts.is_empty() && snapshot.tool_errors.is_empty() {
                 observations.push(ObservationRecord {
                     ref_id: "urn:astra:observation:local:introspect:runtime:health".to_string(),
@@ -383,33 +415,89 @@ fn build_introspect_observations(
                     confidence: ObservationConfidence::evidence(0.75),
                     evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
                 });
-            } else {
-                if !snapshot.alerts.is_empty() {
-                    observations.push(ObservationRecord {
-                        ref_id: "urn:astra:observation:local:introspect:runtime:alerts".to_string(),
-                        topic: request.topic.as_str().to_string(),
-                        facet: request.facet.as_str().to_string(),
-                        kind: "runtime_alert".to_string(),
-                        severity: "warning".to_string(),
-                        summary: format!("{} runtime alerts active", snapshot.alerts.len()),
-                        confidence: ObservationConfidence::evidence(0.80),
-                        evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
-                    });
-                }
+            } else if !snapshot.alerts.is_empty() {
+                observations.push(ObservationRecord {
+                    ref_id: "urn:astra:observation:local:introspect:runtime:alerts".to_string(),
+                    topic: request.topic.as_str().to_string(),
+                    facet: request.facet.as_str().to_string(),
+                    kind: "runtime_alert".to_string(),
+                    severity: "warning".to_string(),
+                    summary: format!("{} runtime alerts active", snapshot.alerts.len()),
+                    confidence: ObservationConfidence::evidence(0.80),
+                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                });
+            }
+
+            // Tool health entries — only for Session/Overview facets
+            for tool in snapshot
+                .tool_health
+                .iter()
+                .filter(|tool| {
+                    tool.avoidance_advised || tool.errors > 0 || tool.consecutive_failures > 0
+                })
+                .take(8)
+            {
+                observations.push(ObservationRecord {
+                    ref_id: format!(
+                        "urn:astra:observation:local:introspect:execution:tool:{}",
+                        urn_component(&tool.name)
+                    ),
+                    topic: "execution".to_string(),
+                    facet: request.facet.as_str().to_string(),
+                    kind: "tool_health".to_string(),
+                    severity: if tool.avoidance_advised || tool.consecutive_failures >= 3 {
+                        "warning"
+                    } else {
+                        "info"
+                    }
+                    .to_string(),
+                    summary: format!(
+                        "{} calls={} errors={} consecutive_failures={}",
+                        tool.name, tool.calls, tool.errors, tool.consecutive_failures
+                    ),
+                    confidence: ObservationConfidence::complete(0.70, 0.75, 0.35),
+                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                });
             }
         }
-        ObservationFacet::Errors if !snapshot.tool_errors.is_empty() => {
-            observations.push(ObservationRecord {
-                ref_id: "urn:astra:observation:local:introspect:errors:recent".to_string(),
-                topic: request.topic.as_str().to_string(),
-                facet: request.facet.as_str().to_string(),
-                kind: "tool_failure_cluster".to_string(),
-                severity: "warning".to_string(),
-                summary: format!("{} recent tool errors recorded", snapshot.tool_errors.len()),
-                confidence: ObservationConfidence::evidence(0.85),
-                evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
-            });
+
+        ObservationFacet::Errors => {
+            if !snapshot.tool_errors.is_empty() {
+                observations.push(ObservationRecord {
+                    ref_id: "urn:astra:observation:local:introspect:errors:recent".to_string(),
+                    topic: request.topic.as_str().to_string(),
+                    facet: request.facet.as_str().to_string(),
+                    kind: "tool_failure_cluster".to_string(),
+                    severity: "warning".to_string(),
+                    summary: format!("{} recent tool errors recorded", snapshot.tool_errors.len()),
+                    confidence: ObservationConfidence::evidence(0.85),
+                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                });
+            }
+
+            // Tool error entries — only for Errors facet
+            for (idx, error) in snapshot.tool_errors.iter().enumerate() {
+                observations.push(ObservationRecord {
+                    ref_id: format!("urn:astra:observation:local:introspect:execution:error:{idx}"),
+                    topic: "execution".to_string(),
+                    facet: request.facet.as_str().to_string(),
+                    kind: error
+                        .failure_category
+                        .as_deref()
+                        .map(|category| format!("tool_error:{category}"))
+                        .unwrap_or_else(|| "tool_error".to_string()),
+                    severity: "warning".to_string(),
+                    summary: error
+                        .error_preview
+                        .clone()
+                        .filter(|preview| !preview.trim().is_empty())
+                        .unwrap_or_else(|| error.signature_hint.clone()),
+                    confidence: ObservationConfidence::complete(0.75, 0.80, 0.45),
+                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                });
+            }
         }
+
         ObservationFacet::Stall if snapshot.stall_state.nudge_count > 0 => {
             observations.push(ObservationRecord {
                 ref_id: "urn:astra:observation:local:introspect:stall:state".to_string(),
@@ -422,57 +510,8 @@ fn build_introspect_observations(
                 evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
             });
         }
+
         _ => {}
-    }
-
-    for (idx, error) in snapshot.tool_errors.iter().enumerate() {
-        observations.push(ObservationRecord {
-            ref_id: format!("urn:astra:observation:local:introspect:execution:error:{idx}"),
-            topic: "execution".to_string(),
-            facet: "errors".to_string(),
-            kind: error
-                .failure_category
-                .as_deref()
-                .map(|category| format!("tool_error:{category}"))
-                .unwrap_or_else(|| "tool_error".to_string()),
-            severity: "warning".to_string(),
-            summary: error
-                .error_preview
-                .clone()
-                .filter(|preview| !preview.trim().is_empty())
-                .unwrap_or_else(|| error.signature_hint.clone()),
-            confidence: ObservationConfidence::complete(0.75, 0.80, 0.45),
-            evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
-        });
-    }
-
-    for tool in snapshot
-        .tool_health
-        .iter()
-        .filter(|tool| tool.avoidance_advised || tool.errors > 0 || tool.consecutive_failures > 0)
-        .take(8)
-    {
-        observations.push(ObservationRecord {
-            ref_id: format!(
-                "urn:astra:observation:local:introspect:execution:tool:{}",
-                urn_component(&tool.name)
-            ),
-            topic: "execution".to_string(),
-            facet: "tools".to_string(),
-            kind: "tool_health".to_string(),
-            severity: if tool.avoidance_advised || tool.consecutive_failures >= 3 {
-                "warning"
-            } else {
-                "info"
-            }
-            .to_string(),
-            summary: format!(
-                "{} calls={} errors={} consecutive_failures={}",
-                tool.name, tool.calls, tool.errors, tool.consecutive_failures
-            ),
-            confidence: ObservationConfidence::complete(0.70, 0.75, 0.35),
-            evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
-        });
     }
 
     observations
@@ -510,20 +549,4 @@ fn build_introspect_action_hints(
             })
         })
         .collect()
-}
-
-fn urn_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len().max(1));
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "unknown".to_string()
-    } else {
-        out
-    }
 }

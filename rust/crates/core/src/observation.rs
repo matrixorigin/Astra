@@ -100,6 +100,204 @@ impl fmt::Display for ObservationFacet {
     }
 }
 
+// ── Shared observation-plane types ──
+// Used by both introspect and reflect for typed request/response fields.
+
+/// Normalized top-level observation topic for both `introspect` and `reflect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationTopic {
+    Overview,
+    Runtime,
+    Execution,
+    Knowledge,
+}
+
+impl ObservationTopic {
+    pub fn from_arg(arg: &str) -> Self {
+        match normalize_observation_arg(arg).as_str() {
+            "overview" | "" => Self::Overview,
+            "execution" => Self::Execution,
+            "knowledge" => Self::Knowledge,
+            "runtime" | "session" => Self::Runtime,
+            _ => Self::Runtime,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Runtime => "runtime",
+            Self::Execution => "execution",
+            Self::Knowledge => "knowledge",
+        }
+    }
+}
+
+impl Default for ObservationTopic {
+    fn default() -> Self {
+        Self::Runtime
+    }
+}
+
+impl fmt::Display for ObservationTopic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Output depth for observation requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationDepth {
+    Hint,
+    Summary,
+    Diagnostic,
+    Forensic,
+}
+
+impl ObservationDepth {
+    pub fn from_arg(arg: &str) -> Self {
+        match normalize_observation_arg(arg).as_str() {
+            "hint" => Self::Hint,
+            "diagnostic" => Self::Diagnostic,
+            "forensic" => Self::Forensic,
+            "summary" | "" => Self::Summary,
+            _ => Self::Summary,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hint => "hint",
+            Self::Summary => "summary",
+            Self::Diagnostic => "diagnostic",
+            Self::Forensic => "forensic",
+        }
+    }
+}
+
+impl Default for ObservationDepth {
+    fn default() -> Self {
+        Self::Summary
+    }
+}
+
+/// Time horizon for the observation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationHorizon {
+    Now,
+    CurrentTurn,
+    Recent,
+    Turn,
+    Session,
+    CrossSession,
+}
+
+impl ObservationHorizon {
+    pub fn from_arg(arg: &str) -> Self {
+        match normalize_observation_arg(arg).as_str() {
+            "now" => Self::Now,
+            "recent" => Self::Recent,
+            "turn" => Self::Turn,
+            "session" => Self::Session,
+            "cross_session" | "cross-session" => Self::CrossSession,
+            "current_turn" | "current-turn" | "" => Self::CurrentTurn,
+            _ => Self::CurrentTurn,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Now => "now",
+            Self::CurrentTurn => "current_turn",
+            Self::Recent => "recent",
+            Self::Turn => "turn",
+            Self::Session => "session",
+            Self::CrossSession => "cross_session",
+        }
+    }
+}
+
+impl Default for ObservationHorizon {
+    fn default() -> Self {
+        Self::CurrentTurn
+    }
+}
+
+/// Data source policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourcePolicy {
+    Auto,
+    LiveOnly,
+    LiveFirst,
+    DurableFirst,
+    LocalOnly,
+    CloudOnly,
+}
+
+impl SourcePolicy {
+    pub fn from_arg(arg: &str) -> Self {
+        match normalize_observation_arg(arg).as_str() {
+            "live_only" => Self::LiveOnly,
+            "live_first" => Self::LiveFirst,
+            "durable_first" => Self::DurableFirst,
+            "local_only" => Self::LocalOnly,
+            "cloud_only" => Self::CloudOnly,
+            "auto" | "" => Self::Auto,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::LiveOnly => "live_only",
+            Self::LiveFirst => "live_first",
+            Self::DurableFirst => "durable_first",
+            Self::LocalOnly => "local_only",
+            Self::CloudOnly => "cloud_only",
+        }
+    }
+
+    pub fn allows_edge_local_artifacts(self) -> bool {
+        matches!(
+            self,
+            Self::Auto | Self::LiveFirst | Self::DurableFirst | Self::LocalOnly
+        )
+    }
+}
+
+impl Default for SourcePolicy {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Shared observation-argument normalizer.
+pub fn normalize_observation_arg(arg: &str) -> String {
+    arg.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+/// Sanitize a string for use in a URN path component.
+pub fn urn_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().max(1));
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
 const ALLOWED_EVIDENCE_KINDS: &[&str] = &[
     "event",
     "decision",

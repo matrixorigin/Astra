@@ -493,15 +493,37 @@ pub(crate) fn build_introspect_snapshot(
         nudge_count: state.stall.nudge_count,
         events,
         introspection_count: state.stall.introspection_count,
-        forced_execution_escalation: state.stall.forced_execution_escalation,
-        forced_parallel_batching: state.stall.forced_parallel_batching,
-        forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
-        forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
-        forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
-        forced_exploration_family_lockout: state.stall.forced_exploration_family_phase2,
-        forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
-        forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
-        forced_intent_drift: state.stall.forced_intent_drift,
+        forced_corrections: {
+            let mut corrections = Vec::new();
+            if state.stall.forced_execution_escalation {
+                corrections.push("execution_escalation".to_string());
+            }
+            if state.stall.forced_parallel_batching {
+                corrections.push("parallel_batching_force".to_string());
+            }
+            if state.stall.forced_redundant_reads_corrective {
+                corrections.push("redundant_reads_corrective".to_string());
+            }
+            if state.stall.forced_cache_waste_corrective {
+                corrections.push("cache_waste_corrective".to_string());
+            }
+            if state.stall.forced_search_fanout_corrective {
+                corrections.push("search_fanout_corrective".to_string());
+            }
+            if state.stall.forced_exploration_family_phase2 {
+                corrections.push("exploration_family_lockout".to_string());
+            }
+            if state.stall.forced_exploration_family_corrective {
+                corrections.push("exploration_family_corrective".to_string());
+            }
+            if state.stall.forced_completion_soft_stop {
+                corrections.push("completion_soft_stop".to_string());
+            }
+            if state.stall.forced_intent_drift {
+                corrections.push("intent_drift".to_string());
+            }
+            corrections
+        },
         drift_nudge_count: state.stall.drift_nudge_count,
         last_drift_correction_round: state.stall.last_drift_correction_round,
     };

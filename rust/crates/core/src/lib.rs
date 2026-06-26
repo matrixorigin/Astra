@@ -397,10 +397,13 @@ pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{ClassifiedError, ErrorKind, classify_tool_output};
 pub use observation::{
     EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,
-    ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationEvidence,
-    ObservationFacet, ObservationFailureCluster, ObservationGraphEdge, ObservationGraphEdgeKind,
-    ObservationGraphLayer, ObservationGraphNode, ObservationGraphNodeKind, ObservationGraphSlice,
-    ObservationProviderCoverage, ObservationRecord, ObservationView,
+    ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage,
+    ObservationDepth, ObservationEvidence, ObservationFacet, ObservationFailureCluster,
+    ObservationGraphEdge, ObservationGraphEdgeKind, ObservationGraphLayer,
+    ObservationGraphNode, ObservationGraphNodeKind, ObservationGraphSlice,
+    ObservationHorizon, ObservationProviderCoverage, ObservationRecord,
+    ObservationTopic, ObservationView, SourcePolicy, normalize_observation_arg,
+    urn_component,
 };
 pub use runtime_limits::RuntimeLimits;
 #[cfg(any(test, feature = "dev-defaults"))]

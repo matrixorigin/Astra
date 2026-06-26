@@ -1,164 +1,11 @@
-use astra_core::ObservationFacet;
+use astra_core::{
+    ObservationDepth, ObservationFacet, ObservationHorizon, ObservationTopic, SourcePolicy,
+};
 use serde_json::Value;
 use std::str::FromStr;
 
-use super::IntrospectTextDepth;
-
-/// Normalized top-level observation topic for the `introspect` tool.
-///
-/// `introspect` remains a runtime/current-turn tool. These topic names mirror
-/// the broader observation-plane vocabulary without making this renderer own
-/// the future persistent graph model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObservationTopic {
-    Overview,
-    Runtime,
-    Execution,
-    Knowledge,
-}
-
-impl ObservationTopic {
-    fn from_arg(arg: &str) -> Self {
-        match normalize_arg(arg).as_str() {
-            "overview" => Self::Overview,
-            "execution" => Self::Execution,
-            "knowledge" => Self::Knowledge,
-            "runtime" | "session" | "" => Self::Runtime,
-            _ => Self::Runtime,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Overview => "overview",
-            Self::Runtime => "runtime",
-            Self::Execution => "execution",
-            Self::Knowledge => "knowledge",
-        }
-    }
-}
-
-/// Runtime facet selected within an observation topic.
-/// Uses the unified observation-plane facet taxonomy from `astra_core`.
-///
-/// Output depth requested by callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntrospectDepth {
-    Hint,
-    Summary,
-    Diagnostic,
-    Forensic,
-}
-
-impl IntrospectDepth {
-    fn from_arg(arg: &str) -> Self {
-        match normalize_arg(arg).as_str() {
-            "hint" => Self::Hint,
-            "diagnostic" => Self::Diagnostic,
-            "forensic" => Self::Forensic,
-            "summary" | "" => Self::Summary,
-            _ => Self::Summary,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Hint => "hint",
-            Self::Summary => "summary",
-            Self::Diagnostic => "diagnostic",
-            Self::Forensic => "forensic",
-        }
-    }
-
-    pub(super) fn detail(self) -> IntrospectTextDepth {
-        match self {
-            Self::Hint => IntrospectTextDepth::Hint,
-            Self::Summary => IntrospectTextDepth::Summary,
-            Self::Diagnostic | Self::Forensic => IntrospectTextDepth::Full,
-        }
-    }
-}
-
-/// Time horizon for the observation request. It is parsed and carried for
-/// semantic consistency; the current runtime snapshot can only satisfy
-/// current-turn/session-local horizons until persistent graph storage exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObservationHorizon {
-    Now,
-    CurrentTurn,
-    Recent,
-    Turn,
-    Session,
-    CrossSession,
-}
-
-impl ObservationHorizon {
-    fn from_arg(arg: &str) -> Self {
-        match normalize_arg(arg).as_str() {
-            "now" => Self::Now,
-            "recent" => Self::Recent,
-            "turn" => Self::Turn,
-            "session" => Self::Session,
-            "cross_session" | "cross-session" => Self::CrossSession,
-            "current_turn" | "current-turn" | "" => Self::CurrentTurn,
-            _ => Self::CurrentTurn,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Now => "now",
-            Self::CurrentTurn => "current_turn",
-            Self::Recent => "recent",
-            Self::Turn => "turn",
-            Self::Session => "session",
-            Self::CrossSession => "cross_session",
-        }
-    }
-}
-
-/// Data source policy requested by the caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourcePolicy {
-    Auto,
-    LiveOnly,
-    LiveFirst,
-    DurableFirst,
-    LocalOnly,
-    CloudOnly,
-}
-
-impl SourcePolicy {
-    fn from_arg(arg: &str) -> Self {
-        match normalize_arg(arg).as_str() {
-            "live_only" => Self::LiveOnly,
-            "live_first" => Self::LiveFirst,
-            "durable_first" => Self::DurableFirst,
-            "local_only" => Self::LocalOnly,
-            "cloud_only" => Self::CloudOnly,
-            "auto" | "" => Self::Auto,
-            _ => Self::Auto,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::LiveOnly => "live_only",
-            Self::LiveFirst => "live_first",
-            Self::DurableFirst => "durable_first",
-            Self::LocalOnly => "local_only",
-            Self::CloudOnly => "cloud_only",
-        }
-    }
-
-    pub fn allows_edge_local_artifacts(self) -> bool {
-        matches!(
-            self,
-            Self::Auto | Self::LiveFirst | Self::DurableFirst | Self::LocalOnly
-        )
-    }
-}
+// Compatibility aliases for existing callers.
+pub use astra_core::ObservationDepth as IntrospectDepth;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntrospectFormat {
@@ -168,7 +15,7 @@ pub enum IntrospectFormat {
 
 impl IntrospectFormat {
     fn from_arg(arg: &str) -> Self {
-        match normalize_arg(arg).as_str() {
+        match astra_core::normalize_observation_arg(arg).as_str() {
             "json" | "structured" | "envelope" => Self::Json,
             _ => Self::Text,
         }
@@ -183,7 +30,7 @@ impl IntrospectFormat {
 pub struct IntrospectRequest {
     pub topic: ObservationTopic,
     pub facet: ObservationFacet,
-    pub depth: IntrospectDepth,
+    pub depth: ObservationDepth,
     pub horizon: ObservationHorizon,
     pub source_policy: SourcePolicy,
     pub include_context: bool,
@@ -195,7 +42,7 @@ impl Default for IntrospectRequest {
         Self {
             topic: ObservationTopic::Runtime,
             facet: ObservationFacet::Session,
-            depth: IntrospectDepth::Summary,
+            depth: ObservationDepth::Summary,
             horizon: ObservationHorizon::CurrentTurn,
             source_policy: SourcePolicy::Auto,
             include_context: false,
@@ -233,7 +80,7 @@ impl IntrospectRequest {
         Self {
             topic,
             facet,
-            depth: IntrospectDepth::from_arg(depth_raw),
+            depth: ObservationDepth::from_arg(depth_raw),
             horizon: ObservationHorizon::from_arg(
                 string_arg(args, "horizon").unwrap_or("current_turn"),
             ),
@@ -252,10 +99,6 @@ fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 fn bool_arg(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
-}
-
-fn normalize_arg(arg: &str) -> String {
-    arg.trim().to_ascii_lowercase().replace('-', "_")
 }
 
 fn split_topic_facet(topic: &str) -> (&str, Option<&str>) {
@@ -285,7 +128,7 @@ mod tests {
         }));
         assert_eq!(req.topic, ObservationTopic::Runtime);
         assert_eq!(req.facet, ObservationFacet::Session);
-        assert_eq!(req.depth, IntrospectDepth::Summary);
+        assert_eq!(req.depth, ObservationDepth::Summary);
         assert_eq!(req.horizon, ObservationHorizon::CurrentTurn);
     }
 
@@ -300,7 +143,7 @@ mod tests {
         }));
         assert_eq!(req.topic, ObservationTopic::Execution);
         assert_eq!(req.facet, ObservationFacet::Errors);
-        assert_eq!(req.depth, IntrospectDepth::Forensic);
+        assert_eq!(req.depth, ObservationDepth::Forensic);
         assert_eq!(req.horizon, ObservationHorizon::Session);
         assert_eq!(req.source_policy, SourcePolicy::CloudOnly);
         assert!(req.include_context);
@@ -311,7 +154,7 @@ mod tests {
         let req = IntrospectRequest::from_args(&serde_json::json!({
             "depth": "hint"
         }));
-        assert_eq!(req.depth, IntrospectDepth::Hint);
+        assert_eq!(req.depth, ObservationDepth::Hint);
         assert_eq!(req.depth.as_str(), "hint");
     }
 
@@ -320,23 +163,23 @@ mod tests {
         let req = IntrospectRequest::from_args(&serde_json::json!({
             "depth": "minimal"
         }));
-        assert_eq!(req.depth, IntrospectDepth::Summary);
+        assert_eq!(req.depth, ObservationDepth::Summary);
         assert_eq!(req.depth.as_str(), "summary");
     }
 
     #[test]
-    fn from_args_infers_topic_from_slash_facet() {
+    fn from_args_infers_topic_from_slash_in_facet_arg() {
         let req = IntrospectRequest::from_args(&serde_json::json!({
-            "facet": "execution/errors"
+            "facet": "execution/trace"
         }));
         assert_eq!(req.topic, ObservationTopic::Execution);
-        assert_eq!(req.facet, ObservationFacet::Errors);
+        assert_eq!(req.facet, ObservationFacet::Trace);
     }
 
     #[test]
-    fn from_args_maps_knowledge_topic_to_session_memory_surface() {
+    fn from_args_topic_path_normalizes_to_topic_facet() {
         let req = IntrospectRequest::from_args(&serde_json::json!({
-            "topic": "knowledge"
+            "topic": "knowledge/session_memory"
         }));
         assert_eq!(req.topic, ObservationTopic::Knowledge);
         assert_eq!(req.facet, ObservationFacet::SessionMemory);

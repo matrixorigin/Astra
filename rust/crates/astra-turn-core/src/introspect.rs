@@ -11,12 +11,9 @@ mod request;
 use serde::{Deserialize, Serialize};
 
 use crate::injection_tracking::{ChannelFreshness, ChannelStatus, InjectionChannel};
-use astra_core::ObservationFacet;
-pub use observation::{IntrospectReport, build_introspect_report};
-pub use request::{
-    IntrospectDepth, IntrospectFormat, IntrospectRequest, ObservationHorizon, ObservationTopic,
-    SourcePolicy,
-};
+use astra_core::{ObservationDepth, ObservationFacet};
+pub use observation::{build_introspect_report, IntrospectReport};
+pub use request::{IntrospectDepth, IntrospectFormat, IntrospectRequest};
 
 /// Input snapshot provided by the runtime to the introspect renderer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -120,17 +117,10 @@ pub struct StallSnapshotSummary {
     pub events: Vec<String>,
     /// Total circuit-breaker introspection emissions this turn.
     pub introspection_count: u32,
-    pub forced_execution_escalation: bool,
-    pub forced_parallel_batching: bool,
-    pub forced_completion_soft_stop: bool,
-    pub forced_redundant_reads_corrective: bool,
-    pub forced_cache_waste_corrective: bool,
+    /// Correction labels fired this turn (e.g. "execution_escalation",
+    /// "parallel_batching_force", "cache_waste_corrective", …).
     #[serde(default)]
-    pub forced_search_fanout_corrective: bool,
-    pub forced_exploration_family_lockout: bool,
-    pub forced_exploration_family_corrective: bool,
-    #[serde(default)]
-    pub forced_intent_drift: bool,
+    pub forced_corrections: Vec<String>,
     /// How many drift nudges injected this session (persists across turns).
     #[serde(default)]
     pub drift_nudge_count: usize,
@@ -214,7 +204,16 @@ pub fn render_introspect_request(
     }
 
     match request.facet {
-        ObservationFacet::Session => render_introspect(snapshot, request.depth.detail()),
+        ObservationFacet::Session => {
+            let depth = match request.depth {
+                ObservationDepth::Hint => IntrospectTextDepth::Hint,
+                ObservationDepth::Summary => IntrospectTextDepth::Summary,
+                ObservationDepth::Diagnostic | ObservationDepth::Forensic => {
+                    IntrospectTextDepth::Full
+                }
+            };
+            render_introspect(snapshot, depth)
+        }
         ObservationFacet::Recent | ObservationFacet::Trace => render_recent_rounds(snapshot),
         ObservationFacet::Volatile => render_volatile_pending(snapshot),
         ObservationFacet::Stall => render_stall_state(snapshot),
@@ -420,15 +419,7 @@ pub fn render_volatile_pending(s: &IntrospectSnapshot) -> String {
 /// Render `facet=stall` — stall / loop-guard telemetry.
 pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
     let st = &s.stall_state;
-    let any_forced = st.forced_execution_escalation
-        || st.forced_parallel_batching
-        || st.forced_completion_soft_stop
-        || st.forced_redundant_reads_corrective
-        || st.forced_cache_waste_corrective
-        || st.forced_search_fanout_corrective
-        || st.forced_exploration_family_lockout
-        || st.forced_exploration_family_corrective
-        || st.forced_intent_drift;
+    let any_forced = !st.forced_corrections.is_empty();
     if st.nudge_count == 0 && st.events.is_empty() && !any_forced {
         return "## Stall / Loop-Guard\n(Healthy — no nudges, no forced corrections this turn.)"
             .to_string();
@@ -446,39 +437,11 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
             out.push('\n');
         }
     }
-    let mut forced: Vec<&str> = Vec::new();
-    if st.forced_execution_escalation {
-        forced.push("execution_escalation");
-    }
-    if st.forced_parallel_batching {
-        forced.push("parallel_batching_force");
-    }
-    if st.forced_completion_soft_stop {
-        forced.push("completion_soft_stop");
-    }
-    if st.forced_redundant_reads_corrective {
-        forced.push("redundant_reads_corrective");
-    }
-    if st.forced_cache_waste_corrective {
-        forced.push("cache_waste_corrective");
-    }
-    if st.forced_search_fanout_corrective {
-        forced.push("search_fanout_corrective");
-    }
-    if st.forced_exploration_family_lockout {
-        forced.push("exploration_family_lockout");
-    }
-    if st.forced_exploration_family_corrective {
-        forced.push("exploration_family_corrective");
-    }
-    if st.forced_intent_drift {
-        forced.push("intent_drift");
-    }
-    if !forced.is_empty() {
+    if any_forced {
         out.push_str("\n### Forced corrections fired this turn\n");
-        for f in &forced {
+        for correction in &st.forced_corrections {
             out.push_str("- ");
-            out.push_str(f);
+            out.push_str(correction);
             out.push('\n');
         }
     }
@@ -659,18 +622,12 @@ pub fn render_all(s: &IntrospectSnapshot) -> String {
 }
 
 fn preview_line(text: &str, max: usize) -> String {
-    let one_line: String = text
-        .lines()
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-        .unwrap_or("")
-        .chars()
-        .take(max)
-        .collect();
-    if one_line.len() < text.lines().next().map(str::len).unwrap_or(0) {
-        format!("{one_line}…")
+    let first_line = text.lines().next().unwrap_or("");
+    let first_line_trimmed: String = first_line.trim().chars().take(max).collect();
+    if first_line_trimmed.len() < first_line.trim().len() {
+        format!("{first_line_trimmed}…")
     } else {
-        one_line
+        first_line_trimmed
     }
 }
 
@@ -810,25 +767,21 @@ mod tests {
         assert_eq!(report.view.topic, "execution");
         assert_eq!(report.view.facet, "errors");
         assert!(report.summary.contains("recent tool errors"));
-        assert!(
-            report
-                .observations
-                .iter()
-                .any(|observation| observation.ref_id
-                    == "urn:astra:observation:local:introspect:execution:error:0"
-                    && observation.kind == "tool_error:tool_timeout")
-        );
+        assert!(report
+            .observations
+            .iter()
+            .any(|observation| observation.ref_id
+                == "urn:astra:observation:local:introspect:execution:error:0"
+                && observation.kind == "tool_error:tool_timeout"));
         assert!(report.evidence.iter().any(
             |evidence| evidence.ref_id == "urn:astra:context:local:introspect:runtime_snapshot"
         ));
         assert_eq!(report.view.data_coverage.overall, "fresh");
-        assert!(
-            report
-                .view
-                .data_coverage
-                .providers
-                .contains_key("live_runtime")
-        );
+        assert!(report
+            .view
+            .data_coverage
+            .providers
+            .contains_key("live_runtime"));
         assert!(!report.budget_result.truncated);
         assert_report_refs_are_valid(&report);
     }
@@ -848,14 +801,12 @@ mod tests {
             "edge_local_artifacts_unavailable"
         );
         assert_eq!(report.view.data_coverage.events, 0);
-        assert!(
-            report
-                .view
-                .data_coverage
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("Edge-local"))
-        );
+        assert!(report
+            .view
+            .data_coverage
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Edge-local")));
         assert_eq!(report.observations.len(), 1);
         assert_eq!(
             report.observations[0].kind, "data_surface_unavailable",
@@ -949,14 +900,12 @@ mod tests {
             report.view.data_coverage.providers["visible_context"].status,
             "missing"
         );
-        assert!(
-            report
-                .view
-                .data_coverage
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("include_context requested"))
-        );
+        assert!(report
+            .view
+            .data_coverage
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("include_context requested")));
         assert_report_refs_are_valid(&report);
     }
 
@@ -1123,7 +1072,7 @@ mod tests {
         let mut snap = IntrospectSnapshot::default();
         snap.stall_state.nudge_count = 2;
         snap.stall_state.introspection_count = 1;
-        snap.stall_state.forced_parallel_batching = true;
+        snap.stall_state.forced_corrections = vec!["parallel_batching_force".into()];
         snap.stall_state.events = vec!["sig_stall @ turn 5".into()];
         let out = render_stall_state(&snap);
         assert!(out.contains("Soft nudges: 2"));
