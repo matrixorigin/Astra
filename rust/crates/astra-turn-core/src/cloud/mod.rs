@@ -11,3 +11,4 @@ pub mod session_facts;
 pub mod session_memory_extract;
 pub mod summary;
 pub mod tool_delivery;
+pub mod drift_detection;

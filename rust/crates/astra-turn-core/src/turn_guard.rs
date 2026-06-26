@@ -381,7 +381,14 @@ impl TurnGuard {
     /// Keeps durable tool health but drops stall signatures and transient
     /// pressure from the previous user request.
     pub fn begin_fresh_user_turn(&mut self) {
-        self.clear_transient_pressure();
+        // Clear transient pressure but preserve lifetime diagnostic counters
+        // (critical_turns, critical_recovery_turns track escalation history).
+        self.nudge_count = 0;
+        self.last_reflection = None;
+        self.consecutive_warnings = 0;
+        self.round_had_error = false;
+        self.pending_correction = None;
+        self.errors.clear_recent_pressure();
         self.tool_sigs.clear();
         self.latest_tool_calls.clear();
     }
