@@ -503,6 +503,8 @@ pub(crate) fn build_introspect_snapshot(
         forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
         forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
         forced_intent_drift: state.stall.forced_intent_drift,
+        drift_nudge_count: state.stall.drift_nudge_count,
+        last_drift_correction_round: state.stall.last_drift_correction_round,
     };
 
     let current_round = state.current_round_index;
@@ -851,6 +853,14 @@ pub struct StallTrackingState {
     /// One-shot per turn — prevents repeated volatile injection that would
     /// break prompt-cache prefix stability on every subsequent round.
     pub forced_intent_drift: bool,
+    /// How many times intent-drift correction has been injected this session.
+    /// Persists across turns (unlike `forced_intent_drift` which is per-turn).
+    /// Used by TurnGuard escalation: if drift_nudge_count >= threshold,
+    /// escalate to force-stop.
+    pub drift_nudge_count: usize,
+    /// The round index at which the last drift correction was injected.
+    /// Used to detect if agent ignored the correction (next round still drifting).
+    pub last_drift_correction_round: usize,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,

@@ -811,6 +811,7 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_exploration_family_corrective = false;
     state.stall.forced_exploration_family_phase2 = false;
     state.stall.forced_intent_drift = false;
+    // NOTE: drift_nudge_count and last_drift_correction_round persist across turns
     state.stall.exploration_family_corrective_family = None;
     // Clear tool restrictions injected by exploration-family correctives so
     // they don't leak into the next user turn.

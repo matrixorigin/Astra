@@ -86,6 +86,7 @@ pub struct CorrectionOutcome {
 /// Accumulates signals across turns and composes non-happy-path decisions.
 #[derive(Debug, Clone)]
 pub struct TurnGuard {
+    /// Task execution profile (exploration window, thresholds).
     task_profile: TaskExecutionProfile,
     /// Per-turn tool call signatures for stall/divergence detection.
     pub tool_sigs: Vec<BTreeSet<String>>,
@@ -122,6 +123,9 @@ pub struct TurnGuard {
     pub correction_history: Vec<CorrectionOutcome>,
     /// Adaptive thresholds tuned by correction effectiveness.
     adaptive_thresholds: stall::AdaptiveStallThresholds,
+    /// Drift nudge count (persists across turns, fed from StallTrackingState).
+    /// When >= 3, TurnGuard escalates to force-stop.
+    pub drift_nudge_count: usize,
 }
 
 /// Check if a tool is read-only and must never be restricted.
@@ -180,6 +184,7 @@ impl TurnGuard {
             pending_correction: None,
             correction_history: Vec::new(),
             adaptive_thresholds: stall::AdaptiveStallThresholds::default(),
+            drift_nudge_count: 0,
         }
     }
 
@@ -197,6 +202,12 @@ impl TurnGuard {
             health,
             ..Self::with_profile(task_profile)
         }
+    }
+
+    /// Sync drift nudge count from StallTrackingState.
+    /// Call this before evaluate() to feed drift signals into TurnGuard.
+    pub fn sync_drift_nudge_count(&mut self, count: usize) {
+        self.drift_nudge_count = count;
     }
 
     pub fn stall_window(&self) -> usize {
@@ -800,7 +811,23 @@ impl TurnGuard {
         // Consolidate: at most 2 injection messages to avoid noise overload.
         // Primary = first (highest-priority: stall/divergence/escalation).
         // Secondary = remaining tips joined into one message.
-        let injections = consolidate_injections(injections);
+        let mut injections = consolidate_injections(injections);
+
+        // 9. Drift escalation
+        // If drift_nudge_count >= 3, agent has ignored 3+ drift corrections.
+        // Escalate to force-stop: the agent is persistently off-task.
+        const DRIFT_FORCE_STOP_THRESHOLD: usize = 3;
+        let drift_force_stop = self.drift_nudge_count >= DRIFT_FORCE_STOP_THRESHOLD;
+        if drift_force_stop {
+            injections.push(format!(
+                "🛑 CRITICAL: You have been corrected {} times for intent drift but continue to drift. \
+                 Session will be force-stopped. Please refocus on the user's original request.",
+                self.drift_nudge_count
+            ));
+            severity = VerdictSeverity::Critical;
+        }
+
+        let force_stop = force_stop || drift_force_stop;
 
         TurnVerdict {
             injections,

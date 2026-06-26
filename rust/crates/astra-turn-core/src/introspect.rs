@@ -131,6 +131,12 @@ pub struct StallSnapshotSummary {
     pub forced_exploration_family_corrective: bool,
     #[serde(default)]
     pub forced_intent_drift: bool,
+    /// How many drift nudges injected this session (persists across turns).
+    #[serde(default)]
+    pub drift_nudge_count: usize,
+    /// Round index of last drift correction.
+    #[serde(default)]
+    pub last_drift_correction_round: usize,
 }
 
 /// Per-tool health entry.

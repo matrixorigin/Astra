@@ -601,17 +601,20 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             .await;
         if let IntentDrift::Drifting { correction, .. } = drift {
             state.stall.forced_intent_drift = true;
+            state.stall.drift_nudge_count += 1;
+            state.stall.last_drift_correction_round = state.llm_rounds_completed;
             state.push_volatile(super::host::VolatileKind::IntentDrift, correction.clone());
             tracing::info!(
                 target: "astra::loop_guard",
                 tier = "intent_drift",
                 round = state.llm_rounds_completed,
+                drift_nudge_count = state.stall.drift_nudge_count,
                 "intent drift detected — injecting correction"
             );
             if !prep.quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,
-                    format!("⚠ Intent drift detected — correcting course"),
+                    format!("⚠ Intent drift detected — correcting course (nudge #{})", state.stall.drift_nudge_count),
                 );
             }
         }
