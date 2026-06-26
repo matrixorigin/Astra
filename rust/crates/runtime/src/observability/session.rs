@@ -41,7 +41,7 @@ impl ObservabilitySession {
             config,
             context_traces: Vec::new(),
             decision_explanations: Vec::new(),
-            drift_detector: DriftDetector::default(),
+
             recent_queries: Vec::new(),
             compressed_turns: Vec::new(),
             user_corrections: Vec::new(),
@@ -50,7 +50,6 @@ impl ObservabilitySession {
             last_query_at: None,
             turn_timings: Vec::new(),
             fuzzy_match_events: Vec::new(),
-            last_reported_drift_turn: None,
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
@@ -85,7 +84,7 @@ impl ObservabilitySession {
             config: RuntimeConfig::load(),
             context_traces: Vec::new(),
             decision_explanations: Vec::new(),
-            drift_detector: DriftDetector::default(),
+
             recent_queries: Vec::new(),
             compressed_turns: Vec::new(),
             user_corrections: Vec::new(),
@@ -94,7 +93,6 @@ impl ObservabilitySession {
             last_query_at: None,
             turn_timings: Vec::new(),
             fuzzy_match_events: Vec::new(),
-            last_reported_drift_turn: None,
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
@@ -529,56 +527,6 @@ impl ObservabilitySession {
     ///
     /// Uses the original query (from session start), recent queries,
     /// compression events, and user corrections to detect drift.
-    pub fn check_drift(&self) -> FocusDriftAnalysis {
-        let original = self.original_query.as_deref().unwrap_or_else(|| {
-            self.recent_queries
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or("")
-        });
-
-        self.check_drift_against(original)
-    }
-
-    /// Check drift against a specific original query (override).
-    ///
-    /// Uses context traces (memory retrieval + token budget) for richer analysis
-    /// when trace data is available.
-    pub fn check_drift_against(&self, original_query: &str) -> FocusDriftAnalysis {
-        let memory_traces: Vec<_> = self
-            .context_traces
-            .iter()
-            .map(|t| t.memory.clone())
-            .collect();
-        let budget_traces: Vec<_> = self
-            .context_traces
-            .iter()
-            .map(|t| t.token_budget.clone())
-            .collect();
-
-        self.drift_detector.analyze_with_context(
-            original_query,
-            &self.recent_queries,
-            &self.compressed_turns,
-            &self.user_corrections,
-            &memory_traces,
-            &budget_traces,
-        )
-    }
-
-    /// Return a newly-detected drift analysis only once per drift origin turn.
-    pub fn take_new_drift_signal(&mut self, detected_at_turn: u32) -> Option<FocusDriftAnalysis> {
-        let analysis = self.check_drift();
-        if !analysis.drift_detected {
-            return None;
-        }
-        let drift_origin_turn = analysis.drift_turn.unwrap_or(detected_at_turn);
-        if self.last_reported_drift_turn == Some(drift_origin_turn) {
-            return None;
-        }
-        self.last_reported_drift_turn = Some(drift_origin_turn);
-        Some(analysis)
-    }
 
     /// Record a tool result (no-op; previously fed the goal tracker).
     pub fn record_tool_result(&mut self, _tool_name: &str, _output: &str, _exit_code: Option<i32>) {
@@ -592,9 +540,6 @@ impl ObservabilitySession {
             compressed_turns: self.compressed_turns.clone(),
             user_corrections: self.user_corrections.clone(),
             context_traces: self.context_traces.clone(),
-            drift_min_severity_threshold: self.drift_detector.min_severity_threshold,
-            drift_analysis_window: self.drift_detector.analysis_window,
-            last_reported_drift_turn: self.last_reported_drift_turn,
             last_query_at: self.last_query_at,
         }
     }
@@ -606,11 +551,6 @@ impl ObservabilitySession {
         self.compressed_turns = snapshot.compressed_turns.clone();
         self.user_corrections = snapshot.user_corrections.clone();
         self.context_traces = snapshot.context_traces.clone();
-        self.drift_detector = DriftDetector {
-            min_severity_threshold: snapshot.drift_min_severity_threshold,
-            analysis_window: snapshot.drift_analysis_window,
-        };
-        self.last_reported_drift_turn = snapshot.last_reported_drift_turn;
         self.last_query_at = snapshot.last_query_at;
     }
 }

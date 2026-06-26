@@ -486,9 +486,6 @@ mod tests {
             compressed_turns: vec![],
             user_corrections: vec![],
             context_traces: vec![],
-            drift_min_severity_threshold: 0.5,
-            drift_analysis_window: 5,
-            last_reported_drift_turn: None,
             last_query_at: None,
         }
     }

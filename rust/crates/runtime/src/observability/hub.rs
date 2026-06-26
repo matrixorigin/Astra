@@ -13,7 +13,6 @@ use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, User
 use astra_core::delegation::DelegationOutcomeTracker;
 use astra_core::feedback::{FeedbackSignal, FeedbackSignalStore, SignalType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
-use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 
 use super::types::*;
 
@@ -491,44 +490,15 @@ pub fn on_tool_executed(hub: &ObservabilityHub, user_id: &str, tool_name: &str) 
 }
 
 /// Hook called at turn end.
-pub fn on_turn_end(hub: &ObservabilityHub, session: &mut ObservabilitySession, timing: TurnTiming) {
-    let detected_at_turn = timing.turn;
+pub fn on_turn_end(
+    _hub: &ObservabilityHub,
+    session: &mut ObservabilitySession,
+    timing: TurnTiming,
+) {
     session.record_turn_timing(timing);
 
-    if let Some(analysis) = session.take_new_drift_signal(detected_at_turn) {
-        let attribution = session_signal_attribution(session);
-        hub.record_feedback(
-            with_signal_attribution(
-                FeedbackSignal::new(SignalType::FocusDrift),
-                Some(&attribution),
-            )
-            .with_context(
-                "drift_detected_at_turn",
-                serde_json::json!(detected_at_turn),
-            )
-            .with_context(
-                "drift_turn",
-                serde_json::json!(analysis.drift_turn.unwrap_or(detected_at_turn)),
-            )
-            .with_context("drift_severity", serde_json::json!(analysis.drift_severity))
-            .with_context(
-                "drift_cause",
-                serde_json::json!(analysis.likely_cause.clone()),
-            )
-            .with_context("evidence_count", serde_json::json!(analysis.evidence.len())),
-        );
-
-        if let Ok(writer) = JournalWriter::new(&session.session_id) {
-            let _ = writer.append(&JournalEvent::drift_detected(
-                Some(&session.session_id),
-                detected_at_turn,
-                analysis.drift_severity,
-                analysis.likely_cause,
-                analysis.evidence,
-                &analysis.recovery_suggestion,
-            ));
-        }
-    }
+    // Drift detection: System A (stall.rs detect_intent_drift) handles hot-path correction.
+    // System B observability drift removed — duplicate signal path, zero integration.
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

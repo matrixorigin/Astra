@@ -13,7 +13,7 @@ use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
 use astra_core::feedback::FeedbackSignal;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
-use astra_turn_core::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
+use astra_turn_core::decision_explainer::DecisionExplanation;
 
 pub struct ObservabilitySession {
     /// User ID for this session.
@@ -38,7 +38,6 @@ pub struct ObservabilitySession {
     pub decision_explanations: Vec<DecisionExplanation>,
 
     /// Drift detector state.
-    pub drift_detector: DriftDetector,
 
     /// Recent queries for drift analysis.
     pub recent_queries: Vec<String>,
@@ -63,9 +62,6 @@ pub struct ObservabilitySession {
 
     /// Fuzzy str_replace matching telemetry for this session.
     pub fuzzy_match_events: Vec<FuzzyMatchEvent>,
-
-    /// Last drift origin turn already emitted as a signal/journal event.
-    pub(crate) last_reported_drift_turn: Option<u32>,
 
     // ── Anti-flap dampening state ──
     /// The turn at which the last scenario change occurred.
@@ -178,9 +174,6 @@ pub struct ObservabilitySessionRollbackSnapshot {
     pub compressed_turns: Vec<u32>,
     pub user_corrections: Vec<u32>,
     pub context_traces: Vec<ContextAssemblyTrace>,
-    pub drift_min_severity_threshold: f64,
-    pub drift_analysis_window: u32,
-    pub last_reported_drift_turn: Option<u32>,
     pub last_query_at: Option<Instant>,
 }
 
