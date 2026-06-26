@@ -678,7 +678,7 @@ test-ignored-integration:
 			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
 			-E 'not test(/perf_benchmark_/)' \
 			|| FAILED="$$FAILED integration"; \
-		echo "Running online performance benchmarks in an isolated serial lane (non-blocking unless ASTRA_STRICT_ONLINE_PERF=1)..."; \
+		echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 			-p astra-runtime \
 			--features astra-runtime/bridge-e2e-hooks \
@@ -691,11 +691,12 @@ test-ignored-integration:
 			exit 1; \
 		fi; \
 		if [ -n "$$PERF_FAILED" ]; then \
-			if [ "$${ASTRA_STRICT_ONLINE_PERF:-}" = "1" ]; then \
-				echo "❌ test-ignored-integration: online perf lane failed under ASTRA_STRICT_ONLINE_PERF=1"; \
+			if [ "$${ASTRA_STRICT_ONLINE_PERF:-}" = "0" ]; then \
+				echo "WARNING: online perf lane failed; continuing because ASTRA_STRICT_ONLINE_PERF=0"; \
+			else \
+				echo "❌ test-ignored-integration: online perf lane failed (set ASTRA_STRICT_ONLINE_PERF=0 to opt out)"; \
 				exit 1; \
 			fi; \
-			echo "WARNING: online perf lane failed; continuing because ASTRA_STRICT_ONLINE_PERF is not 1"; \
 		fi; \
 	fi
 
