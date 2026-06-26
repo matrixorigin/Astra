@@ -853,18 +853,19 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query read-only runtime observation state. Use topic/facet/depth for the normalized surface: topics are `runtime`, `execution`, `knowledge`, `adaptation`, `overview`; facets include `session` (default: token pressure, cache hit rate, tool health, alerts, working memory, plan/task/session lifecycle context including restore/resume state and last lifecycle event when available), `execution/errors`, `recent`, `volatile`, `stall`, `noise`, and `all`. CLI/Edge mode can also read Edge-local facets `cache` and `session_memory`; pure Server mode returns an explicit data-coverage unavailable message for those facets.",
+                "description": "Read the live observation snapshot for the running turn/session. Use for self-checks: token/cache pressure, tool health, recent rounds, runtime errors, stall/noise state, working memory, and plan/task/session lifecycle/resume state including the last lifecycle event when available. CLI/Edge can also inspect local cache and session_memory artifacts. For persisted multi-turn causal analysis, use reflect.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "topic": {"type": "string", "enum": ["overview","runtime","execution","knowledge","adaptation"], "description": "Top-level observation topic. `execution/errors` may also be passed as a facet."},
-                        "facet": {"type": "string", "enum": ["session","execution/errors","errors","recent","volatile","stall","noise","cache","session_memory","all"], "description": "Observation facet within the topic. `cache` and `session_memory` require CLI/Edge-local data."},
-                        "depth": {"type": "string", "enum": ["hint","summary","diagnostic","forensic"], "description": "Output depth. `hint` is the compact live nudge; `diagnostic` and `forensic` map to the full bounded renderer for current runtime snapshots."},
-                        "horizon": {"type": "string", "enum": ["now","current_turn","recent","turn","session","cross_session"], "description": "Time range. Trace is selected by facet/selector, not by horizon."},
-                        "source_policy": {"type": "string", "enum": ["auto","live_only","live_first","durable_first","local_only","cloud_only"], "description": "Preferred data source policy. Availability is reported in the output when the requested facet is not visible from this runtime."},
-                        "include_context": {"type": "boolean", "description": "Include visible prompt/context facts when a context provider is available. Context facts are reported as observed context, not durable truth."},
-                        "format": {"type": "string", "enum": ["text","json"], "description": "Output format. Defaults to text; json returns a structured read-only observation envelope with summary, view, observations, evidence, and action_hints."}
-                    }
+                        "topic": {"type": "string", "enum": ["overview","runtime","execution","knowledge"], "description": "Top-level observation area. Defaults to runtime; use execution for errors/trace and knowledge for session_memory/context artifacts."},
+                        "facet": {"type": "string", "enum": ["session","overview","recent","errors","trace","volatile","stall","noise","cache","session_memory"], "description": "Specific live view. cache and session_memory require CLI/Edge-local artifacts; unavailable providers are reported in data_coverage."},
+                        "depth": {"type": "string", "enum": ["hint","summary","diagnostic","forensic"], "description": "Output depth. hint is a compact nudge; diagnostic/forensic use the bounded full live renderer."},
+                        "horizon": {"type": "string", "enum": ["now","current_turn","recent","turn","session","cross_session"], "description": "Time range label. Choose trace-like content with facet=trace, not by changing horizon."},
+                        "source_policy": {"type": "string", "enum": ["auto","live_only","live_first","durable_first","local_only","cloud_only"], "description": "Preferred data source. Missing or unsatisfied providers are reported instead of fabricated."},
+                        "include_context": {"type": "boolean", "description": "Request visible prompt/context facts when a provider is available; these are observed context, not durable truth."},
+                        "format": {"type": "string", "enum": ["text","json"], "description": "Output format. text is default; json returns a structured read-only observation envelope."}
+                    },
+                    "additionalProperties": false
                 }
             }
         }),
@@ -872,46 +873,49 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "reflect",
-                "description": "Inspect persisted session observations through the normalized observation-plane surface. Use topic/facet/depth/horizon rather than removed focus-style parameters. CLI/Edge mode can use local session artifacts; without an active session the tool returns reflect_requires_session. Server-executed surfaces use HTTP reflect routes instead of this CLI-local facade.",
+                "description": "Analyze persisted observation evidence for the active session. Use for causal questions after errors, confusing tool choices, performance regressions, or trace review. Data may lag the current live turn; use introspect for immediate runtime health. Without an active session this returns reflect_requires_session.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "topic": {
                             "type": "string",
-                            "enum": ["overview", "runtime", "execution", "knowledge", "adaptation"],
-                            "description": "Top-level observation topic. Use execution/errors or execution/trace via topic+facet."
+                            "enum": ["overview", "runtime", "execution", "knowledge"],
+                            "description": "Top-level persisted evidence area. Use execution for errors/tools/trace, runtime for performance, knowledge for context/memory."
                         },
                         "facet": {
                             "type": "string",
-                            "enum": ["overview", "question", "performance", "errors", "tools", "trace", "context", "memory", "signals", "measurements"],
-                            "description": "Observation facet under the selected topic. Examples: execution/errors, execution/trace, runtime/performance, knowledge/context."
+                            "enum": ["overview", "performance", "errors", "tools", "trace", "context", "memory"],
+                            "description": "Persisted evidence view under the selected topic. Examples: topic=execution facet=errors, topic=execution facet=trace, topic=runtime facet=performance."
                         },
                         "depth": {
                             "type": "string",
                             "enum": ["hint", "summary", "diagnostic", "forensic"],
-                            "description": "Requested analysis depth. Local CLI surface is bounded and may summarize forensic requests."
+                            "description": "Analysis depth. forensic requests are still bounded by last_n and provider limits."
                         },
                         "horizon": {
                             "type": "string",
                             "enum": ["now", "current_turn", "recent", "turn", "session", "cross_session"],
-                            "description": "Time range. Trace is selected by facet, not by horizon."
+                            "description": "Time range label. Persisted evidence is strongest for recent/session; trace is selected with facet=trace."
                         },
                         "source_policy": {
                             "type": "string",
                             "enum": ["auto", "live_only", "live_first", "durable_first", "local_only", "cloud_only"],
-                            "description": "Preferred data source policy. Coverage is reported when a provider is missing or unavailable."
+                            "description": "Preferred data source. Missing or unsatisfied providers are reported in coverage warnings."
                         },
                         "include_context": {
                             "type": "boolean",
-                            "description": "Request visible prompt/context facts when a provider is available."
+                            "description": "Request persisted or visible context facts when a provider is available; missing providers are reported."
                         },
                         "question": {
                             "type": "string",
-                            "description": "Optional concrete question to orient the reflection."
+                            "description": "Concrete question to guide the analysis. Use this instead of a question facet."
                         },
                         "last_n": {
                             "type": "integer",
-                            "description": "Bounded evidence limit for recent events or decisions. This is not a horizon alias."
+                            "minimum": 1,
+                            "maximum": 100,
+                            "default": 20,
+                            "description": "Evidence budget for recent events or decisions. This is not a horizon alias."
                         }
                     },
                     "additionalProperties": false
@@ -1822,26 +1826,61 @@ mod tests {
     }
 
     #[test]
-    fn introspect_schema_mentions_lifecycle_and_resume_state() {
+    fn introspect_schema_describes_live_observation_surface() {
         let schemas = all_tool_schemas();
         let introspect = find_schema(&schemas, "introspect").expect("introspect schema must exist");
         let desc = introspect["function"]["description"]
             .as_str()
             .expect("introspect description must be a string");
+        let params = &introspect["function"]["parameters"];
         let properties = introspect["function"]["parameters"]["properties"]
             .as_object()
             .expect("introspect parameters properties must be an object");
         assert!(
-            desc.contains("plan/task/session lifecycle context"),
-            "introspect should advertise lifecycle visibility: {desc}"
+            desc.contains("live observation snapshot"),
+            "introspect should advertise live runtime scope: {desc}"
         );
         assert!(
-            desc.contains("restore/resume state"),
-            "introspect should advertise resume visibility: {desc}"
+            desc.contains("plan/task/session lifecycle/resume state"),
+            "introspect should advertise lifecycle and resume visibility: {desc}"
         );
         assert!(
             desc.contains("last lifecycle event"),
             "introspect should advertise causal last-event visibility: {desc}"
+        );
+        assert!(
+            desc.contains("use reflect"),
+            "introspect should tell the model to use reflect for persisted causal analysis: {desc}"
+        );
+        assert_eq!(
+            params.get("additionalProperties").and_then(Value::as_bool),
+            Some(false),
+            "introspect must be strict so removed/legacy parameters do not leak back"
+        );
+        assert_eq!(
+            enum_values(&properties["topic"]),
+            vec!["overview", "runtime", "execution", "knowledge"],
+            "introspect topic schema must expose only implemented top-level observation areas"
+        );
+        assert!(
+            !enum_values(&properties["topic"]).contains(&"adaptation"),
+            "introspect must not advertise premature adaptation topic"
+        );
+        assert_eq!(
+            enum_values(&properties["facet"]),
+            vec![
+                "session",
+                "overview",
+                "recent",
+                "errors",
+                "trace",
+                "volatile",
+                "stall",
+                "noise",
+                "cache",
+                "session_memory",
+            ],
+            "introspect facet schema must expose canonical leaf facets"
         );
         for key in [
             "topic",
@@ -1858,7 +1897,9 @@ mod tests {
             );
         }
         assert!(
-            !properties.contains_key("subtopic") && !properties.contains_key("detail"),
+            !properties.contains_key("subtopic")
+                && !properties.contains_key("detail")
+                && !properties.contains_key("focus"),
             "introspect schema must not expose removed legacy aliases"
         );
         assert_eq!(
@@ -1881,19 +1922,47 @@ mod tests {
     }
 
     #[test]
-    fn reflect_schema_is_cli_facade_shape_without_legacy_focus() {
+    fn reflect_schema_describes_persisted_observation_surface() {
         let schemas = all_tool_schemas();
         let reflect = find_schema(&schemas, "reflect").expect("reflect schema must exist");
         let desc = reflect["function"]["description"]
             .as_str()
             .expect("reflect description must be a string");
+        let params = &reflect["function"]["parameters"];
         let properties = reflect["function"]["parameters"]["properties"]
             .as_object()
             .expect("reflect parameters properties must be an object");
 
         assert!(
-            desc.contains("CLI/Edge mode") && desc.contains("HTTP reflect routes"),
-            "reflect schema should document local facade vs server routes: {desc}"
+            desc.contains("persisted observation evidence") && desc.contains("active session"),
+            "reflect schema should document persisted-session scope: {desc}"
+        );
+        assert!(
+            desc.contains("use introspect"),
+            "reflect schema should direct live runtime checks to introspect: {desc}"
+        );
+        assert_eq!(
+            params.get("additionalProperties").and_then(Value::as_bool),
+            Some(false),
+            "reflect must reject removed/legacy parameters"
+        );
+        assert_eq!(
+            enum_values(&properties["topic"]),
+            vec!["overview", "runtime", "execution", "knowledge"],
+            "reflect topic schema must expose only implemented observation areas"
+        );
+        assert_eq!(
+            enum_values(&properties["facet"]),
+            vec![
+                "overview",
+                "performance",
+                "errors",
+                "tools",
+                "trace",
+                "context",
+                "memory",
+            ],
+            "reflect facet schema must expose only implemented persisted evidence views"
         );
         for key in [
             "topic",
@@ -1911,13 +1980,27 @@ mod tests {
             );
         }
         assert!(
-            !properties.contains_key("focus"),
-            "reflect schema must not expose removed legacy focus parameter"
+            !properties.contains_key("focus")
+                && !enum_values(&properties["topic"]).contains(&"adaptation")
+                && !enum_values(&properties["facet"]).contains(&"signals")
+                && !enum_values(&properties["facet"]).contains(&"measurements")
+                && !enum_values(&properties["facet"]).contains(&"question"),
+            "reflect schema must not expose removed or premature adaptation/focus parameters"
         );
         assert_eq!(
             enum_values(&properties["depth"]),
             vec!["hint", "summary", "diagnostic", "forensic"],
             "reflect depth schema must expose canonical observation depths"
+        );
+        assert_eq!(
+            properties["last_n"].get("minimum").and_then(Value::as_i64),
+            Some(1),
+            "reflect last_n must declare a lower evidence-budget bound"
+        );
+        assert_eq!(
+            properties["last_n"].get("maximum").and_then(Value::as_i64),
+            Some(100),
+            "reflect last_n must declare an upper evidence-budget bound"
         );
     }
 

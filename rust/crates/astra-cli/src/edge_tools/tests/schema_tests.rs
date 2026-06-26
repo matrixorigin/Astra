@@ -654,13 +654,24 @@ fn local_cli_catalog_includes_normalized_reflect_schema() {
         "reflect schema must not expose removed focus parameter"
     );
     assert_eq!(
+        reflect["function"]["parameters"]["additionalProperties"],
+        serde_json::json!(false),
+        "reflect schema must reject legacy or misspelled parameters"
+    );
+    assert_eq!(
         properties["topic"]["enum"],
+        serde_json::json!(["overview", "runtime", "execution", "knowledge"])
+    );
+    assert_eq!(
+        properties["facet"]["enum"],
         serde_json::json!([
             "overview",
-            "runtime",
-            "execution",
-            "knowledge",
-            "adaptation"
+            "performance",
+            "errors",
+            "tools",
+            "trace",
+            "context",
+            "memory"
         ])
     );
     assert_eq!(
@@ -678,6 +689,8 @@ fn local_cli_catalog_includes_normalized_reflect_schema() {
             "cloud_only"
         ])
     );
+    assert_eq!(properties["last_n"]["minimum"], serde_json::json!(1));
+    assert_eq!(properties["last_n"]["maximum"], serde_json::json!(100));
 }
 
 #[test]
