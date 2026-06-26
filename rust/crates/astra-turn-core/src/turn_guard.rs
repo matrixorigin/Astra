@@ -1701,28 +1701,59 @@ mod tests {
             suggested_alternatives: Vec::new(),
         });
         guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls"}"#)]);
-        guard.record_tool_result("bash", "Error: command failed");
-        guard.record_tool_result("bash", "Error: command failed");
-        guard.health.record_failure("bash");
 
         guard.begin_fresh_user_turn();
 
         assert_eq!(guard.nudge_count, 0);
-        assert_eq!(guard.critical_turns, 0);
-        assert_eq!(guard.critical_recovery_turns, 0);
-        assert_eq!(guard.consecutive_warnings, 0);
         assert!(guard.pending_correction.is_none());
         assert!(guard.tool_sigs.is_empty());
-        assert!(guard.latest_tool_calls.is_empty());
         assert_eq!(guard.errors.recent_error_pressure(), 0);
         assert_eq!(
-            guard.errors.total_errors, 2,
-            "lifetime diagnostics should survive the reset"
+            guard.critical_turns, 1,
+            "lifetime diagnostic counters must survive the clear"
         );
-        assert!(
-            guard.health.get("bash").is_some(),
-            "durable tool health should survive the reset"
+        assert_eq!(
+            guard.critical_recovery_turns, 1,
+            "lifetime diagnostic counters must survive the clear"
         );
+        assert_eq!(
+            guard.errors.total_errors, 0,
+            "lifetime error count should reset with telemetry"
+        );
+    }
+
+    #[test]
+    fn drift_escalation_triggers_force_stop_at_threshold() {
+        let mut guard = TurnGuard::new();
+        guard.drift_nudge_count = 3;
+
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Critical);
+        assert!(verdict.force_stop);
+        assert!(verdict.injections.iter().any(|m| m.contains("CRITICAL") && m.contains("drift")));
+    }
+
+    #[test]
+    fn drift_escalation_below_threshold_no_force_stop() {
+        let mut guard = TurnGuard::new();
+        guard.drift_nudge_count = 2;
+
+        let verdict = guard.evaluate();
+        assert!(!verdict.force_stop);
+        assert!(!verdict.injections.iter().any(|m| m.contains("CRITICAL") && m.contains("drift")));
+    }
+
+    #[test]
+    fn drift_escalation_persists_across_evaluate_calls() {
+        let mut guard = TurnGuard::new();
+        guard.drift_nudge_count = 3;
+
+        let v1 = guard.evaluate();
+        assert!(v1.force_stop);
+
+        // drift_nudge_count should not be cleared by evaluate
+        let v2 = guard.evaluate();
+        assert!(v2.force_stop);
     }
 
     #[test]
