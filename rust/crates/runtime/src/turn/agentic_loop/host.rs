@@ -173,7 +173,11 @@ pub trait AgenticLoopHost: Send {
     /// current message plus `TaskExecutionProfile`; hosts can override it with a
     /// higher-fidelity classifier if they have one.
     async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-        infer_turn_intent_for_llm_call(&state.message, state.task_profile)
+        Some(crate::turn::agentic::turn_intent::fallback_turn_intent(
+            &state.message,
+            &state.recent_tools,
+            state.has_prior_assistant_turn,
+        ))
     }
 
     /// Whether the host already injects round budget guidance into the system
@@ -2434,6 +2438,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         delegations_this_turn: 0,
         delegation_chain: Vec::new(),
         self_agent_id: "orchestrator".to_string(),
+        runtime_manifest: None,
         run_control: None,
         project_context: None,
         checkpoint_gate: None,
@@ -2587,9 +2592,13 @@ pub(crate) mod tests {
         }
 
         async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-            self.turn_intent
-                .clone()
-                .or_else(|| infer_turn_intent(&state.message, state.task_profile))
+            self.turn_intent.clone().or_else(|| {
+                Some(crate::turn::agentic::turn_intent::fallback_turn_intent(
+                    &state.message,
+                    &state.recent_tools,
+                    state.has_prior_assistant_turn,
+                ))
+            })
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -2872,6 +2881,7 @@ pub(crate) mod tests {
             delegations_this_turn: 0,
             delegation_chain: Vec::new(),
             self_agent_id: "orchestrator".to_string(),
+            runtime_manifest: None,
             run_control: None,
             project_context: None,
             checkpoint_gate: None,
