@@ -1610,6 +1610,17 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     record_edge_tool_observability(state, &edge_tool_round);
 
+    // Feed every executed-tool outcome into the health tracker so that
+    // introspect/reflect and SelfModel can observe tool-level failures
+    // (including bash exit-code errors).  Without this, the
+    // ToolHealthTracker only saw successes and never learned about
+    // failing tools from the agentic-loop path.
+    for edge_result in &edge_tool_round {
+        state
+            .turn_guard
+            .record_tool_result(&edge_result.tool, &edge_result.output);
+    }
+
     if let Some(ref registry) = state.skills.registry_for_activation {
         let mut any_newly_activated = false;
         for edge_result in &edge_tool_round {
