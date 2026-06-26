@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use astra_core::{
-    classify_event_kind, push_graph_edge, push_graph_node, truncate_graph_summary, urn_component,
+    classify_event_kind, push_graph_edge, push_graph_node, truncate_graph_summary,
     ObservationActionHint, ObservationBudgetOmitted, ObservationBudgetResult,
     ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
     ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
@@ -785,10 +785,11 @@ fn build_introspect_graph_slice(
                 &mut nodes,
                 &mut node_refs,
                 ObservationGraphNode {
-                    ref_id: format!(
-                        "urn:astra:observation:local:introspect:stall:correction:{}",
-                        urn_component(correction)
-                    ),
+                    ref_id: Urn::new("observation", "local", "introspect")
+                        .seg("stall")
+                        .seg("correction")
+                        .seg(correction)
+                        .build(),
                     layer: ObservationGraphLayer::Runtime,
                     kind: ObservationGraphNodeKind::Outcome,
                     label: "stall_forced_correction".to_string(),
