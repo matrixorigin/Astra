@@ -195,7 +195,7 @@ fn record_early_exit_llm_round(
         turn: state.session_turn,
         round: state.current_round_index,
         provider: String::new(),
-        model: String::new(),
+        model: state.current_model_identity().unwrap_or("").to_string(),
         prompt_tokens: turn_result.accum.prompt_tokens,
         cache_read_tokens: turn_result.accum.cache_read_tokens,
         cache_creation_tokens: turn_result.accum.cache_creation_tokens,
@@ -349,9 +349,9 @@ async fn persist_context_manifest_for_llm_call(
     let turn_id = format!("{run_id}:llm:{llm_attempt_index}");
     let reason = manifest_reason_for_llm_call(state);
     let model_name = state
-        .context_manifest_model_name
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+        .current_model_identity()
+        .unwrap_or("")
+        .to_string();
     let context_window_tokens =
         u32::try_from(crate::prompts::budget_for_model(Some(&model_name)).model_limit)
             .unwrap_or(u32::MAX);
@@ -954,7 +954,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         prep.quiet,
         AgenticTurnIngestMut {
             task_profile: state.task_profile,
-            step_persistence_enabled: true,
+            step_persistence_enabled: state.context_manifest_user_id.is_some(),
             first_ttft_ms: &mut state.telemetry.first_ttft_ms,
             current_session_id: &mut state.current_session_id,
             current_run_id: &mut state.current_run_id,

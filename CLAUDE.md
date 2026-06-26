@@ -57,6 +57,7 @@ cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test http_contract
 `cargo nextest` uses profiles in `rust/.config/nextest.toml`. Default per-case slow-timeout is 30s (relaxed because of known contention in `session_sync_log` prune; see `plans/session-sync-log-prune-hotpath-*.md`). Override with `NEXTEST_OFFLINE_PROFILE=` / `NEXTEST_ONLINE_PROFILE=`.
 
 Important env vars for tests:
+
 - `ASTRA_TEST_DB_IT=1` — opt into online integration suites in `test-ignored-integration`
 - `ASTRA_TEST_DB_IT_TEST_THREADS=1` — serialize online tests (`-j 1`)
 - `ASTRA_TEST_DATABASE=astra_runtime_test` — separate DB for online tests
@@ -116,7 +117,7 @@ rust/             # Cargo workspace (24+ crates)
   crates/astra-tools/  built-in tools (server allowlist, executor allowlist, schemas)
   crates/astra-turn-core/, astra-turn-types/  chat turn primitives
   crates/astra-prompts/, astra-pipeline/, astra-sandbox/, astra-messaging/
-  crates/astra-config/, astra-credentials/, astra-logging/, astra-learning/
+  crates/astra-config/, astra-credentials/, astra-logging/
   crates/astra-test-harness/, astra-harness/  declarative test/run harness
   crates/astra-thin-client/  stateless HTTP+SSE client for thin-client protocol
 packages/sdk/     @astra/sdk (TypeScript) — Mode A in-process, Mode B remote E2E
@@ -131,6 +132,7 @@ benchmarks/       perf scenarios
 ```
 
 Stack:
+
 - Edition 2024, clippy warnings = errors
 - Async: Tokio • HTTP: Axum 0.8 • DB: SQLx against MatrixOne (MySQL protocol HTAP w/ vector, full-text, git4data, stage, pubsub, datalink)
 - Errors: `thiserror` everywhere (no `anyhow` in library code)
@@ -138,7 +140,7 @@ Stack:
 
 ## Skills
 
-`skills/<name>/SKILL.md` are first-class workflows agents follow when invoked. Read the SKILL.md *before* starting the corresponding task — each enforces a phased workflow:
+`skills/<name>/SKILL.md` are first-class workflows agents follow when invoked. Read the SKILL.md _before_ starting the corresponding task — each enforces a phased workflow:
 
 - `review_changes` — context-aware code review with symbol-level impact analysis
 - `review_code` — test-quality focus: unhappy paths, error scenarios, E2E with real DB assertions
