@@ -1,7 +1,7 @@
 /// Report of a tool surface decision — captures what was visible.
 /// Designed for journal persistence and quality analysis.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolSurfaceReport {
+pub struct ToolSelectionReport {
     /// Tool names visible to the LLM request.
     pub visible_tools: Vec<String>,
     /// Number of tools visible.
@@ -42,7 +42,7 @@ pub struct ToolSurfaceFeedback {
     pub recall: f64,
 }
 
-impl ToolSurfaceReport {
+impl ToolSelectionReport {
     pub fn snapshot_with_tiers(&self, tier_counts: ToolSurfaceTierCounts) -> ToolSurfaceSnapshot {
         ToolSurfaceSnapshot {
             visible_tools: self.visible_tools.clone(),
@@ -87,11 +87,11 @@ impl ToolSurfaceReport {
 mod tests {
     use super::*;
 
-    // ── ToolSurfaceReport::feedback ──
+    // ── ToolSelectionReport::feedback ──
 
     #[test]
     fn feedback_perfect_match() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into(), "grep".into()],
             visible_count: 2,
             schema_budget_used: 50,
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn feedback_partial_use() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into(), "grep".into(), "glob".into()],
             visible_count: 3,
             schema_budget_used: 75,
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn feedback_llm_used_tool_not_visible() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 25,
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn feedback_empty_usage() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 25,
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_visible_tools_and_tier_counts_without_selector_scores() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into(), "tool_search".into()],
             visible_count: 2,
             schema_budget_used: 100,

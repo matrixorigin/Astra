@@ -28,9 +28,9 @@ pub const DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS: u32 = 800;
 mod tests {
     use super::*;
     use astra_turn_core::tool::schema::tool_schema_name;
-    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
-    use serde_json::Value;
+    use astra_turn_core::tool_registry_report::ToolSelectionReport;
     use serde_json::json;
+    use serde_json::Value;
 
     fn mock_schemas() -> Vec<Value> {
         // Build schemas matching TOOL_CATALOG names
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn feedback_perfect_precision() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into(), "github".into()],
             visible_count: 2,
             schema_budget_used: 50,
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn feedback_no_tools_used() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into(), "github".into()],
             visible_count: 2,
             schema_budget_used: 50,
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn feedback_tool_not_visible() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 30,

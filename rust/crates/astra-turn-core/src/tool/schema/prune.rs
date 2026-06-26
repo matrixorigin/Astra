@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Value, json};
 
 use crate::compaction_types::CompactionTier;
-use crate::tool::registry::report::ToolSurfaceReport;
+use crate::tool::registry::report::ToolSelectionReport;
 use crate::tool::schema::tool_schema_name;
 
 /// Build an index mapping tool name → first schema with that name.
@@ -218,7 +218,7 @@ fn strip_property_descriptions(func: &mut Value) {
 /// in-place, returning the count of schemas that were added.
 pub fn retain_invoked_tool_schemas(
     surface: &mut Vec<Value>,
-    report: &mut ToolSurfaceReport,
+    report: &mut ToolSelectionReport,
     tool_results: &[Value],
     all_schemas: &[Value],
 ) -> u32 {
@@ -252,7 +252,7 @@ pub fn retain_invoked_tool_schemas(
 /// Deduplicates against both the existing surface and within the input list.
 fn inject_tool_names_inner(
     surface: &mut Vec<Value>,
-    report: &mut ToolSurfaceReport,
+    report: &mut ToolSelectionReport,
     names: impl IntoIterator<Item = impl AsRef<str>>,
     all_schemas: &[Value],
 ) -> u32 {
@@ -277,7 +277,7 @@ fn inject_tool_names_inner(
 /// Mutates `surface` and `report` in-place, returning the count of injected schemas.
 pub fn inject_skill_allowed_tools(
     surface: &mut Vec<Value>,
-    report: &mut ToolSurfaceReport,
+    report: &mut ToolSelectionReport,
     allowed_tools: &[String],
     all_schemas: &[Value],
 ) -> u32 {
@@ -288,7 +288,7 @@ pub fn inject_skill_allowed_tools(
 /// surrounding workflow depends on them (for example: plan-mode escape hatches).
 pub fn inject_required_tool_names(
     surface: &mut Vec<Value>,
-    report: &mut ToolSurfaceReport,
+    report: &mut ToolSelectionReport,
     required_tools: &[&str],
     all_schemas: &[Value],
 ) -> u32 {
@@ -581,7 +581,7 @@ mod tests {
             make_tool_schema("read_file", "read", false),
         ];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -602,7 +602,7 @@ mod tests {
     fn retain_does_not_duplicate_already_selected() {
         let all = vec![make_tool_schema("bash", "run", false)];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -620,7 +620,7 @@ mod tests {
     fn retain_skips_unknown_tools() {
         let all = vec![make_tool_schema("bash", "run", false)];
         let mut selected = vec![];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec![],
             visible_count: 0,
             schema_budget_used: 0,
@@ -638,7 +638,7 @@ mod tests {
     fn retain_empty_results_is_noop() {
         let all = vec![make_tool_schema("bash", "run", false)];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -662,7 +662,7 @@ mod tests {
             make_tool_schema("git", "version control", false),
         ];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -692,7 +692,7 @@ mod tests {
             make_tool_schema("glob", "find", false),
         ];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -729,7 +729,7 @@ mod tests {
     fn inject_skill_tools_skips_unknown() {
         let all = vec![make_tool_schema("bash", "run", false)];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -750,7 +750,7 @@ mod tests {
             make_tool_schema("grep", "search", false),
         ];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -777,7 +777,7 @@ mod tests {
     fn inject_skill_tools_noop_for_empty_inputs() {
         let all = vec![make_tool_schema("bash", "run", false)];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -807,7 +807,7 @@ mod tests {
             make_tool_schema("exit_plan_mode", "exit", false),
         ];
         let mut selected = vec![make_tool_schema("read_file", "read", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["read_file".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -848,7 +848,7 @@ mod tests {
     fn inject_required_tool_names_skips_already_selected_or_unknown() {
         let all = vec![make_tool_schema("exit_plan_mode", "exit", false)];
         let mut selected = vec![make_tool_schema("exit_plan_mode", "exit", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["exit_plan_mode".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -878,7 +878,7 @@ mod tests {
     fn inject_required_tool_names_deduplicates_duplicate_required_names() {
         let all = vec![make_tool_schema("exit_plan_mode", "exit", false)];
         let mut selected = vec![make_tool_schema("read_file", "read", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["read_file".into()],
             visible_count: 1,
             schema_budget_used: 0,
@@ -909,7 +909,7 @@ mod tests {
     fn inject_required_tool_names_noop_for_empty_inputs() {
         let all = vec![make_tool_schema("exit_plan_mode", "exit", false)];
         let mut selected = vec![make_tool_schema("read_file", "read", false)];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["read_file".into()],
             visible_count: 1,
             schema_budget_used: 0,

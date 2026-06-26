@@ -45,7 +45,7 @@ mod circuit_breaker_integration {
 }
 
 mod stall_detection {
-    use astra_turn_core::stall::{SERVER_STALL_WINDOW, detect_server_stall};
+    use astra_turn_core::stall::{detect_server_stall, SERVER_STALL_WINDOW};
     use std::collections::BTreeSet;
 
     /// Proves stall detector catches repetitive tool calls
@@ -300,10 +300,10 @@ mod turn_guard_integration {
 //    with different arguments (legitimate multi-file edits)
 
 mod multi_file_edit_regression {
-    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
+    use astra_turn_core::tool_registry_report::ToolSelectionReport;
     use astra_turn_core::tool_schema_prune::retain_invoked_tool_schemas;
     use astra_turn_core::turn_guard::{TurnGuard, VerdictSeverity};
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     fn tool_schema(name: &str) -> Value {
         json!({"type": "function", "function": {"name": name, "description": "d", "parameters": {}}})
@@ -331,7 +331,7 @@ mod multi_file_edit_regression {
 
         // Initial selection: bash + read_file (git NOT selected)
         let mut selected = vec![tool_schema("bash"), tool_schema("read_file")];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into(), "read_file".into()],
             visible_count: 2,
             schema_budget_used: 0,
@@ -595,7 +595,7 @@ mod input_guards {
 // ── Result Quality Integration ──────────────────────────────────────────────
 
 mod result_quality_integration {
-    use astra_runtime::turn::result_quality::{ResultQuality, classify_result};
+    use astra_runtime::turn::result_quality::{classify_result, ResultQuality};
 
     #[test]
     fn real_world_github_error() {
@@ -944,17 +944,14 @@ mod chat_stream_turnguard_e2e {
         guard.record_tool_result("rollback_database_snapshots", "Error: connection refused");
         guard.record_tool_result("rollback_database_snapshots", "Error: connection refused");
 
-        assert!(
-            guard
-                .health
-                .is_avoidance_advised("rollback_database_snapshots")
-        );
+        assert!(guard
+            .health
+            .is_avoidance_advised("rollback_database_snapshots"));
 
         let v = guard.evaluate();
-        assert!(
-            v.avoid_tools
-                .contains(&"rollback_database_snapshots".to_string())
-        );
+        assert!(v
+            .avoid_tools
+            .contains(&"rollback_database_snapshots".to_string()));
 
         // Apply verdict
         apply_verdict(&v, 25, &mut restricted);
@@ -1389,10 +1386,9 @@ mod chat_stream_turnguard_e2e {
             guard.record_tool_result("rollback_database_snapshots", "Error: fail");
         }
         let v = guard.evaluate();
-        assert!(
-            v.avoid_tools
-                .contains(&"rollback_database_snapshots".to_string())
-        );
+        assert!(v
+            .avoid_tools
+            .contains(&"rollback_database_snapshots".to_string()));
         apply_verdict(&v, 25, &mut restricted);
         assert!(!restricted.contains("rollback_database_snapshots"));
 

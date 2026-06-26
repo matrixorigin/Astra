@@ -6,8 +6,8 @@ use astra_config::ToolSurfaceConfig;
 
 use super::DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS;
 use astra_turn_core::tool::schema::tool_schema_name;
-use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, ToolMeta};
-use astra_turn_core::tool_registry_report::ToolSurfaceReport;
+use astra_turn_core::tool_registry_meta::{ToolMeta, TOOL_CATALOG};
+use astra_turn_core::tool_registry_report::ToolSelectionReport;
 
 fn sort_schemas_by_name(schemas: &mut [Value]) {
     schemas.sort_by(|a, b| {
@@ -269,7 +269,7 @@ impl ToolRegistry {
         &self,
         query: &str,
         schema_budget: u32,
-    ) -> (Vec<Value>, ToolSurfaceReport) {
+    ) -> (Vec<Value>, ToolSelectionReport) {
         self.build_initial_surface_with_report_ctx(query, schema_budget, &[])
     }
 
@@ -279,11 +279,11 @@ impl ToolRegistry {
         query: &str,
         schema_budget: u32,
         recent_tools: &[String],
-    ) -> (Vec<Value>, ToolSurfaceReport) {
+    ) -> (Vec<Value>, ToolSelectionReport) {
         // Conversational short-circuit: pure greetings/acks need no tools. If
         // recent tools exist, preserve tool continuity for follow-up turns.
         if recent_tools.is_empty() && is_pure_conversational_query(query) {
-            let report = ToolSurfaceReport {
+            let report = ToolSelectionReport {
                 visible_tools: Vec::new(),
                 visible_count: 0,
                 schema_budget_used: 0,
@@ -295,7 +295,7 @@ impl ToolRegistry {
         let schemas = self.always_load_only();
         let names = Self::visible_names(schemas.as_ref());
 
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_count: schemas.as_ref().len() as u32,
             visible_tools: names,
             schema_budget_used: 0,
@@ -310,12 +310,12 @@ impl ToolRegistry {
     /// Routing decides whether this is a tool-bearing turn. The built-in
     /// surface is deterministic: only always_load schemas are returned. Deferred
     /// tools stay deferred until explicitly activated via `tool_search`.
-    pub fn build_routed_surface(&self, schema_budget: u32) -> (Vec<Value>, ToolSurfaceReport) {
+    pub fn build_routed_surface(&self, schema_budget: u32) -> (Vec<Value>, ToolSelectionReport) {
         let schemas = self.always_load_only();
         let names = Self::visible_names(schemas.as_ref());
         (
             schemas.as_ref().clone(),
-            ToolSurfaceReport {
+            ToolSelectionReport {
                 visible_count: names.len() as u32,
                 visible_tools: names,
                 schema_budget_used: 0,

@@ -71,7 +71,7 @@ use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
-use astra_turn_core::tool_registry_report::ToolSurfaceReport;
+use astra_turn_core::tool_registry_report::ToolSelectionReport;
 use tokio_util::sync::CancellationToken;
 
 /// Anchors journal wall-clock timestamps to a single process-local epoch so
@@ -686,7 +686,7 @@ pub struct TelemetryState {
     /// All tool names used across all turns.
     pub all_tools_used: HashSet<String>,
     /// Selection report from the first turn's tool surface assembly.
-    pub first_selection_report: Option<ToolSurfaceReport>,
+    pub first_selection_report: Option<ToolSelectionReport>,
     /// Budget pressure value from the first turn.
     pub first_budget_pressure: f64,
     /// Context assembly duration from the first turn (ms).
@@ -872,7 +872,12 @@ impl StallTrackingState {
     /// burns the round budget faster.
     ///
     /// Does NOT include `hard_intervention_active` flags; those are checked
-    /// separately via [`hard_intervention_active`].
+    /// Whether any mid-loop corrective injection has been fired this turn.
+    ///
+    /// This tracks quality-related corrections (redundant reads, cache waste,
+    /// search fanout, etc.) but intentionally excludes drift correction,
+    /// which is semantically orthogonal (intent alignment vs tool quality).
+    /// Drift correction can coexist with quality corrections in the same turn.
     #[inline]
     pub fn any_corrective_fired(&self) -> bool {
         self.forced_parallel_batching
@@ -882,7 +887,6 @@ impl StallTrackingState {
             || self.forced_exploration_family_corrective
             || self.forced_execution_escalation
             || self.forced_execution_retry
-            || self.forced_intent_drift
     }
 
     /// Whether the loop is already under *any* mid-loop intervention
@@ -8742,9 +8746,10 @@ mod parallel_execution_tests {
     }
 
     #[test]
-    fn forced_intent_drift_flag_prevents_repeated_injection() {
-        // One-shot per turn: once forced_intent_drift is set, no further
-        // corrections are injected this turn, preserving prompt-cache prefix.
+    fn forced_intent_drift_flag_is_orthogonal_to_quality_corrections() {
+        // Drift correction (intent alignment) is semantically orthogonal to
+        // quality corrections (redundant reads, cache waste, etc.).
+        // It should NOT block other correction families in the same turn.
         let mut state = make_state();
         assert!(
             !state.stall.forced_intent_drift,
@@ -8752,8 +8757,9 @@ mod parallel_execution_tests {
         );
         state.stall.forced_intent_drift = true;
         assert!(
-            state.stall.any_corrective_fired(),
-            "forced_intent_drift must be included in any_corrective_fired()"
+            !state.stall.any_corrective_fired(),
+            "forced_intent_drift must NOT be in any_corrective_fired() — \
+             drift is orthogonal to quality corrections"
         );
     }
 

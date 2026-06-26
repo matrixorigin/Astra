@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use crate::tool::registry::report::ToolSurfaceReport;
+use crate::tool::registry::report::ToolSelectionReport;
 
 /// Set `*slot` to elapsed ms since `start` only when `slot` is still `None`.
 pub fn record_first_latency_ms_since(slot: &mut Option<u64>, start: Instant) {
@@ -16,9 +16,9 @@ pub fn record_first_latency_ms_since(slot: &mut Option<u64>, start: Instant) {
 /// is updated on every call, keeping the maximum observed value so that
 /// turn/eval journal events reflect actual peak pressure, not stale initial 0.0.
 pub fn capture_first_surface_report_if_empty(
-    slot: &mut Option<ToolSurfaceReport>,
+    slot: &mut Option<ToolSelectionReport>,
     peak_budget_pressure: &mut f64,
-    report: ToolSurfaceReport,
+    report: ToolSelectionReport,
     budget_pressure: f64,
 ) {
     if slot.is_none() {
@@ -75,7 +75,7 @@ mod tests {
     fn capture_surface_report_once() {
         let mut slot = None;
         let mut bp = 0.0;
-        let r1 = ToolSurfaceReport {
+        let r1 = ToolSelectionReport {
             visible_tools: vec!["a".into()],
             visible_count: 1,
             schema_budget_used: 1,
@@ -84,7 +84,7 @@ mod tests {
         capture_first_surface_report_if_empty(&mut slot, &mut bp, r1.clone(), 0.3);
         assert_eq!(slot.as_ref().unwrap().visible_tools, vec!["a"]);
         assert!((bp - 0.3).abs() < f64::EPSILON);
-        let r2 = ToolSurfaceReport {
+        let r2 = ToolSelectionReport {
             visible_tools: vec!["b".into()],
             visible_count: 1,
             schema_budget_used: 2,
@@ -103,7 +103,7 @@ mod tests {
     fn peak_pressure_does_not_regress() {
         let mut slot = None;
         let mut bp = 0.0;
-        let r = ToolSurfaceReport {
+        let r = ToolSelectionReport {
             visible_tools: vec!["a".into()],
             visible_count: 1,
             schema_budget_used: 1,

@@ -12,7 +12,7 @@ use astra_runtime::{
     turn::turn_guard::TurnGuard,
 };
 use astra_services::session_journal::ToolCallRecord;
-use astra_turn_core::tool_registry_report::ToolSurfaceReport;
+use astra_turn_core::tool_registry_report::ToolSelectionReport;
 use crossterm::style::Stylize;
 use serde_json::Value;
 
@@ -151,7 +151,7 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
     pub(crate) tool_calls_count: u32,
-    pub(crate) first_surface_report: Option<ToolSurfaceReport>,
+    pub(crate) first_surface_report: Option<ToolSelectionReport>,
     pub(crate) selected_skills: Vec<String>,
     pub(crate) tools_used: HashSet<String>,
     pub(crate) tool_call_records: Vec<ToolCallRecord>,
@@ -249,7 +249,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     }
     .to_string();
 
-    let report = first_surface_report.unwrap_or_else(|| ToolSurfaceReport {
+    let report = first_surface_report.unwrap_or_else(|| ToolSelectionReport {
         visible_tools: Vec::new(),
         visible_count: 0,
         schema_budget_used: 0,
@@ -315,7 +315,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
 }
 #[cfg(test)]
 mod tests {
-    use super::{StreamResultBuild, build_stream_result};
+    use super::{build_stream_result, StreamResultBuild};
     use astra_runtime::pipeline::step_recorder::StepRecorder;
     use astra_runtime::turn::turn_guard::TurnGuard;
     use astra_services::session_journal::ToolCallRecord;
