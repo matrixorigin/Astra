@@ -361,43 +361,11 @@ pub struct ObservationFailureCluster {
     pub confidence: ObservationConfidence,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObservationAdaptationSignal {
-    pub signal_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub observation_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub failure_cluster_refs: Vec<String>,
-    pub consumer: ObservationSignalConsumer,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObservationSignalConsumer {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub suggested_tool_family: Option<String>,
-    pub target_type: String,
-    pub payload_kind: String,
-    pub priority: String,
-    pub scope_hint: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ObservationCausalChain {
-    pub chain_ref: String,
-    pub summary: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub node_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence_refs: Vec<String>,
-    pub confidence: ObservationConfidence,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationGraphLayer {
     Runtime,
     Observation,
-    Adaptation,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -405,39 +373,19 @@ pub enum ObservationGraphLayer {
 pub enum ObservationGraphNodeKind {
     Event,
     Decision,
-    Trace,
     Outcome,
     Observation,
     FailureCluster,
-    AdaptationSignal,
-    CausalChain,
     Evidence,
-    Candidate,
-    EvaluationRun,
-    Intervention,
-    MeasurementRun,
-    TuningJob,
-    Condition,
-    ReconcileEvent,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationGraphEdgeKind {
-    Precedes,
     Causes,
-    LikelyCauses,
-    CorrelatesWith,
     Supports,
     Contradicts,
     DerivedFrom,
-    Duplicates,
-    Measures,
-    References,
-    Reconciles,
-    Selects,
-    Applies,
-    Finalizes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -541,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_cluster_and_adaptation_signal_wire_shapes_are_ref_based() {
+    fn failure_cluster_wire_shape_is_ref_based() {
         let cluster = ObservationFailureCluster {
             cluster_ref: "urn:astra:failure_cluster:graph:reflect:test:tool_timeout".into(),
             label: "tool_timeout".into(),
@@ -550,32 +498,11 @@ mod tests {
             evidence_class: "inferred_evidence".into(),
             confidence: ObservationConfidence::classification_evidence(0.82, 0.76),
         };
-        let signal = ObservationAdaptationSignal {
-            signal_id: "urn:astra:signal:graph:reflect:test:tool_policy:tool_timeout".into(),
-            observation_refs: cluster.observation_refs.clone(),
-            failure_cluster_refs: vec![cluster.cluster_ref.clone()],
-            consumer: ObservationSignalConsumer {
-                suggested_tool_family: Some("tuning_control_plane".into()),
-                target_type: "tool_policy".into(),
-                payload_kind: "tool_policy_signal".into(),
-                priority: "medium".into(),
-                scope_hint: "session".into(),
-            },
-        };
 
         EvidenceRef::parse(&cluster.cluster_ref).expect("cluster ref must be canonical");
-        EvidenceRef::parse(&signal.signal_id).expect("signal ref must be canonical");
         let cluster_json = serde_json::to_value(&cluster).expect("serialize cluster");
         assert_eq!(cluster_json["confidence"]["classification"], 0.82);
         assert!(cluster_json["confidence"].get("causal").is_none());
-        let signal_json = serde_json::to_value(&signal).expect("serialize signal");
-        assert!(signal_json.get("confidence").is_none());
-        assert!(signal_json.get("severity").is_none());
-        assert!(signal_json.get("evidence_refs").is_none());
-        assert_eq!(
-            signal_json["consumer"]["suggested_tool_family"],
-            "tuning_control_plane"
-        );
     }
 
     #[test]

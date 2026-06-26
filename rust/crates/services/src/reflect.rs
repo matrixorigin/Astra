@@ -1,12 +1,11 @@
 use std::collections::BTreeSet;
 
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, ObservationActionHint, ObservationAdaptationSignal,
-    ObservationBudgetOmitted, ObservationBudgetResult, ObservationCausalChain,
-    ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
-    ObservationGraphEdge, ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
-    ObservationGraphNodeKind, ObservationGraphSlice, ObservationRecord, ObservationSignalConsumer,
-    ObservationView, SharedPool, error_response, internal_error,
+    ErrorResponse, MatrixOneSettings, ObservationActionHint, ObservationBudgetOmitted,
+    ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationEvidence,
+    ObservationFailureCluster, ObservationGraphEdge, ObservationGraphEdgeKind,
+    ObservationGraphLayer, ObservationGraphNode, ObservationGraphNodeKind, ObservationGraphSlice,
+    ObservationRecord, ObservationView, SharedPool, error_response, internal_error,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -45,10 +44,6 @@ pub struct ReflectReport {
     pub action_hints: Vec<ObservationActionHint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failure_clusters: Vec<ObservationFailureCluster>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub causal_chains: Vec<ObservationCausalChain>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub adaptation_signals: Vec<ObservationAdaptationSignal>,
     #[serde(default)]
     pub graph_slice: ObservationGraphSlice,
     #[serde(default)]
@@ -1210,7 +1205,6 @@ impl ReflectService for DatabaseReflectService {
             &envelope.observations,
             &envelope.evidence,
             &envelope.failure_clusters,
-            &envelope.adaptation_signals,
             &budget_result,
         );
         let view = request.view(overview.total_events, overview.total_decisions);
@@ -1234,8 +1228,6 @@ impl ReflectService for DatabaseReflectService {
             evidence: envelope.evidence,
             action_hints: envelope.action_hints,
             failure_clusters: envelope.failure_clusters,
-            causal_chains: envelope.causal_chains,
-            adaptation_signals: envelope.adaptation_signals,
             graph_slice,
             budget_result,
             overview,
@@ -1292,7 +1284,6 @@ fn build_reflect_graph_slice(
     observations: &[ObservationRecord],
     evidence: &[ObservationEvidence],
     failure_clusters: &[ObservationFailureCluster],
-    adaptation_signals: &[ObservationAdaptationSignal],
     budget_result: &ObservationBudgetResult,
 ) -> ObservationGraphSlice {
     let mut nodes = Vec::new();
@@ -1386,44 +1377,6 @@ fn build_reflect_graph_slice(
                 cluster.cluster_ref.clone(),
                 observation_ref.clone(),
                 ObservationGraphEdgeKind::DerivedFrom,
-            );
-        }
-    }
-
-    for signal in adaptation_signals {
-        push_graph_node(
-            &mut nodes,
-            &mut node_refs,
-            ObservationGraphNode {
-                ref_id: signal.signal_id.clone(),
-                layer: ObservationGraphLayer::Adaptation,
-                kind: ObservationGraphNodeKind::AdaptationSignal,
-                label: signal.consumer.payload_kind.clone(),
-                summary: Some(format!(
-                    "{}:{}:{}",
-                    signal.consumer.target_type,
-                    signal.consumer.priority,
-                    signal.consumer.scope_hint
-                )),
-                metadata: None,
-            },
-        );
-        for observation_ref in &signal.observation_refs {
-            push_graph_edge(
-                &mut edges,
-                &mut edge_keys,
-                signal.signal_id.clone(),
-                observation_ref.clone(),
-                ObservationGraphEdgeKind::References,
-            );
-        }
-        for cluster_ref in &signal.failure_cluster_refs {
-            push_graph_edge(
-                &mut edges,
-                &mut edge_keys,
-                signal.signal_id.clone(),
-                cluster_ref.clone(),
-                ObservationGraphEdgeKind::References,
             );
         }
     }
@@ -1795,7 +1748,6 @@ mod tests {
         let evidence = envelope.evidence;
         let action_hints = envelope.action_hints;
         let failure_clusters = envelope.failure_clusters;
-        let adaptation_signals = envelope.adaptation_signals;
 
         assert!(summary.contains("Timeout (bash)"));
         assert_eq!(observations.len(), 1);
@@ -1830,29 +1782,7 @@ mod tests {
             failure_clusters[0].observation_refs,
             vec![observations[0].ref_id.clone()]
         );
-        assert_eq!(adaptation_signals.len(), 1);
-        assert_eq!(
-            adaptation_signals[0].failure_cluster_refs,
-            vec![failure_clusters[0].cluster_ref.clone()]
-        );
-        assert_eq!(
-            adaptation_signals[0].observation_refs,
-            vec![observations[0].ref_id.clone()]
-        );
-        assert_eq!(
-            adaptation_signals[0]
-                .consumer
-                .suggested_tool_family
-                .as_deref(),
-            Some("tuning_control_plane")
-        );
-        assert_refs_are_valid(
-            &observations,
-            &evidence,
-            &action_hints,
-            &failure_clusters,
-            &adaptation_signals,
-        );
+        assert_refs_are_valid(&observations, &evidence, &action_hints, &failure_clusters);
     }
 
     #[test]
@@ -1929,7 +1859,6 @@ mod tests {
         let observations = envelope.observations;
         let action_hints = envelope.action_hints;
         let failure_clusters = envelope.failure_clusters;
-        let adaptation_signals = envelope.adaptation_signals;
 
         assert_eq!(observations[0].topic, "execution");
         assert_eq!(observations[0].facet, "stall");
@@ -1947,10 +1876,6 @@ mod tests {
         assert!(
             failure_clusters.is_empty(),
             "statistical insights should not be promoted into failure clusters without diagnosis evidence"
-        );
-        assert!(
-            adaptation_signals.is_empty(),
-            "insight-only reports must not emit tuning/adaptation signals"
         );
     }
 
@@ -2013,6 +1938,7 @@ mod tests {
         let observations = envelope.observations;
         let evidence = envelope.evidence;
         let action_hints = envelope.action_hints;
+        let failure_clusters = envelope.failure_clusters;
 
         assert!(summary.contains("Session healthy"));
         assert_eq!(observations.len(), 1);
@@ -2020,8 +1946,8 @@ mod tests {
         assert_eq!(observations[0].severity, "info");
         assert!(evidence.is_empty());
         assert!(action_hints.is_empty());
-        assert!(envelope.failure_clusters.is_empty());
-        assert!(envelope.adaptation_signals.is_empty());
+        assert!(failure_clusters.is_empty());
+        assert_refs_are_valid(&observations, &evidence, &action_hints, &failure_clusters);
     }
 
     #[test]
@@ -2073,7 +1999,7 @@ mod tests {
                 .iter()
                 .any(|item| item.ref_id == "urn:astra:decision:cloud:dec-1")
         );
-        assert_refs_are_valid(&[], &evidence, &[], &[], &[]);
+        assert_refs_are_valid(&[], &evidence, &[], &[]);
     }
 
     #[test]
@@ -2137,7 +2063,6 @@ mod tests {
             &envelope.observations,
             &envelope.evidence,
             &envelope.failure_clusters,
-            &envelope.adaptation_signals,
             &ObservationBudgetResult::default(),
         );
 
@@ -2154,11 +2079,6 @@ mod tests {
         assert!(graph_slice.nodes.iter().any(|node| {
             node.ref_id == envelope.failure_clusters[0].cluster_ref
                 && node.kind == ObservationGraphNodeKind::FailureCluster
-        }));
-        assert!(graph_slice.nodes.iter().any(|node| {
-            node.ref_id == envelope.adaptation_signals[0].signal_id
-                && node.layer == ObservationGraphLayer::Adaptation
-                && node.kind == ObservationGraphNodeKind::AdaptationSignal
         }));
         assert!(
             graph_slice
@@ -2237,7 +2157,6 @@ mod tests {
         evidence: &[ObservationEvidence],
         action_hints: &[ObservationActionHint],
         failure_clusters: &[ObservationFailureCluster],
-        adaptation_signals: &[ObservationAdaptationSignal],
     ) {
         for observation in observations {
             EvidenceRef::parse(&observation.ref_id).unwrap_or_else(|err| {
@@ -2267,21 +2186,6 @@ mod tests {
             for observation_ref in &cluster.observation_refs {
                 EvidenceRef::parse(observation_ref).unwrap_or_else(|err| {
                     panic!("invalid failure cluster observation ref {observation_ref}: {err}")
-                });
-            }
-        }
-        for signal in adaptation_signals {
-            EvidenceRef::parse(&signal.signal_id).unwrap_or_else(|err| {
-                panic!("invalid adaptation signal ref {}: {err}", signal.signal_id)
-            });
-            for observation_ref in &signal.observation_refs {
-                EvidenceRef::parse(observation_ref).unwrap_or_else(|err| {
-                    panic!("invalid adaptation signal observation ref {observation_ref}: {err}")
-                });
-            }
-            for cluster_ref in &signal.failure_cluster_refs {
-                EvidenceRef::parse(cluster_ref).unwrap_or_else(|err| {
-                    panic!("invalid adaptation signal cluster ref {cluster_ref}: {err}")
                 });
             }
         }
@@ -2376,23 +2280,6 @@ mod tests {
                 evidence_class: "inferred_evidence".into(),
                 confidence: ObservationConfidence::classification_evidence(0.84, 0.90),
             }],
-            causal_chains: vec![],
-            adaptation_signals: vec![ObservationAdaptationSignal {
-                signal_id: "urn:astra:signal:graph:reflect:test-sess:tool_policy:0".into(),
-                observation_refs: vec![
-                    "urn:astra:observation:graph:reflect:test-sess:diagnosis:0".into(),
-                ],
-                failure_cluster_refs: vec![
-                    "urn:astra:failure_cluster:graph:reflect:test-sess:resource_limit:bash".into(),
-                ],
-                consumer: ObservationSignalConsumer {
-                    suggested_tool_family: Some("tuning_control_plane".into()),
-                    target_type: "tool_policy".into(),
-                    payload_kind: "tool_policy_signal".into(),
-                    priority: "high".into(),
-                    scope_hint: "session".into(),
-                },
-            }],
             graph_slice: ObservationGraphSlice::default(),
             budget_result: ObservationBudgetResult::default(),
             overview: make_overview(10, 1, vec![("bash".into(), 8)], 2, Some(5.0)),
@@ -2420,7 +2307,6 @@ mod tests {
             &report.evidence,
             &report.action_hints,
             &report.failure_clusters,
-            &report.adaptation_signals,
         );
         let json = serde_json::to_string(&report).unwrap();
         let json_value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2435,16 +2321,12 @@ mod tests {
             json_value["view"]["data_coverage"]
         );
         assert!(
-            json_value["adaptation_signals"][0]
-                .get("confidence")
-                .is_none(),
-            "adaptation signals must remain ref-based and not duplicate observation confidence"
+            json_value.get("adaptation_signals").is_none(),
+            "reflect reports must not embed tuning/adaptation signals in the observation report"
         );
         assert!(
-            json_value["adaptation_signals"][0]
-                .get("severity")
-                .is_none(),
-            "adaptation signals must not duplicate observation severity"
+            json_value.get("causal_chains").is_none(),
+            "reflect reports must not expose unused causal-chain placeholders"
         );
         assert!(
             json_value.get("graph_slice").is_some(),

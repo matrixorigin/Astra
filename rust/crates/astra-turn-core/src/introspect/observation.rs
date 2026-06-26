@@ -3,10 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use astra_core::{
-    ObservationActionHint, ObservationAdaptationSignal, ObservationBudgetOmitted,
-    ObservationBudgetResult, ObservationCausalChain, ObservationConfidence,
-    ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster, ObservationGraphSlice,
-    ObservationProviderCoverage, ObservationRecord, ObservationView,
+    ObservationActionHint, ObservationBudgetOmitted, ObservationBudgetResult,
+    ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
+    ObservationGraphSlice, ObservationProviderCoverage, ObservationRecord, ObservationView,
 };
 
 use super::{IntrospectRequest, IntrospectSnapshot, ObservationFacet, SourcePolicy};
@@ -34,10 +33,6 @@ pub struct IntrospectReport {
     pub action_hints: Vec<ObservationActionHint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failure_clusters: Vec<ObservationFailureCluster>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub causal_chains: Vec<ObservationCausalChain>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub adaptation_signals: Vec<ObservationAdaptationSignal>,
     #[serde(default)]
     pub graph_slice: ObservationGraphSlice,
     #[serde(default)]
@@ -110,8 +105,6 @@ pub fn build_introspect_report(
         evidence,
         action_hints,
         failure_clusters: Vec::new(),
-        causal_chains: Vec::new(),
-        adaptation_signals: Vec::new(),
         graph_slice: ObservationGraphSlice::default(),
         budget_result,
     }
@@ -200,8 +193,6 @@ fn build_edge_local_unavailable_report(request: &IntrospectRequest) -> Introspec
         evidence: Vec::new(),
         action_hints: Vec::new(),
         failure_clusters: Vec::new(),
-        causal_chains: Vec::new(),
-        adaptation_signals: Vec::new(),
         graph_slice: ObservationGraphSlice::default(),
         budget_result: ObservationBudgetResult::default(),
     }

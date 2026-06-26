@@ -1,7 +1,7 @@
 use super::{
-    Diagnosis, EvidenceGraph, Insight, ObservationActionHint, ObservationAdaptationSignal,
-    ObservationCausalChain, ObservationConfidence, ObservationEvidence, ObservationFailureCluster,
-    ObservationRecord, ObservationSignalConsumer, ReflectRequest, SessionOverview,
+    Diagnosis, EvidenceGraph, Insight, ObservationActionHint, ObservationConfidence,
+    ObservationEvidence, ObservationFailureCluster, ObservationRecord, ReflectRequest,
+    SessionOverview,
 };
 
 pub(super) struct ObservationEnvelope {
@@ -10,8 +10,6 @@ pub(super) struct ObservationEnvelope {
     pub evidence: Vec<ObservationEvidence>,
     pub action_hints: Vec<ObservationActionHint>,
     pub failure_clusters: Vec<ObservationFailureCluster>,
-    pub causal_chains: Vec<ObservationCausalChain>,
-    pub adaptation_signals: Vec<ObservationAdaptationSignal>,
 }
 
 pub(super) fn build_observation_envelope(
@@ -203,17 +201,12 @@ pub(super) fn build_observation_envelope(
         })
         .collect::<Vec<_>>();
 
-    let adaptation_signals =
-        build_adaptation_signals(&session_component, &failure_clusters, &action_hints);
-
     ObservationEnvelope {
         summary,
         observations,
         evidence,
         action_hints,
         failure_clusters,
-        causal_chains: Vec::new(),
-        adaptation_signals,
     }
 }
 
@@ -269,65 +262,6 @@ fn observation_refs_for_recommendation(
     });
     refs.truncate(5);
     refs
-}
-
-fn build_adaptation_signals(
-    session_component: &str,
-    failure_clusters: &[ObservationFailureCluster],
-    action_hints: &[ObservationActionHint],
-) -> Vec<ObservationAdaptationSignal> {
-    failure_clusters
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, cluster)| {
-            let observation_refs = cluster.observation_refs.clone();
-            if observation_refs.is_empty() {
-                return None;
-            }
-            let target_type = signal_target_type(action_hints, &observation_refs);
-            Some(ObservationAdaptationSignal {
-                signal_id: format!(
-                    "urn:astra:signal:graph:reflect:{session_component}:{target_type}:{idx}"
-                ),
-                observation_refs,
-                failure_cluster_refs: vec![cluster.cluster_ref.clone()],
-                consumer: ObservationSignalConsumer {
-                    suggested_tool_family: Some("tuning_control_plane".to_string()),
-                    target_type: target_type.to_string(),
-                    payload_kind: format!("{target_type}_signal"),
-                    priority: signal_priority(cluster),
-                    scope_hint: "session".to_string(),
-                },
-            })
-        })
-        .collect()
-}
-
-fn signal_target_type<'a>(
-    action_hints: &'a [ObservationActionHint],
-    observation_refs: &[String],
-) -> &'a str {
-    action_hints
-        .iter()
-        .find(|hint| {
-            hint.observation_refs
-                .iter()
-                .any(|hint_ref| observation_refs.iter().any(|obs_ref| obs_ref == hint_ref))
-        })
-        .map(|hint| hint.target_type.as_str())
-        .unwrap_or("tool_policy")
-}
-
-fn signal_priority(cluster: &ObservationFailureCluster) -> String {
-    let summary = cluster.summary.to_ascii_lowercase();
-    if summary.contains("critical")
-        || summary.contains("resource_limit")
-        || summary.contains("budget_exhausted")
-    {
-        "high".to_string()
-    } else {
-        "medium".to_string()
-    }
 }
 
 fn normalize_recommendation(value: &str) -> String {
