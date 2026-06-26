@@ -6,13 +6,14 @@ use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::*;
 use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
-    openai_tool_roundtrip_values_with_result_fields, READ_ONLY_TOOLS,
+    READ_ONLY_TOOLS, openai_tool_roundtrip_values_with_result_fields,
 };
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::journal_record_executed_tool_call;
 use astra_turn_core::headless_tool_postprocess::{
-    format_headless_tool_duration, record_headless_cacheable_success_and_semantic_hint_if_ok,
-    try_write_light_headless_step_checkpoint, HeadlessCacheableRecordCtx,
+    HeadlessCacheableRecordCtx, format_headless_tool_duration,
+    record_headless_cacheable_success_and_semantic_hint_if_ok,
+    try_write_light_headless_step_checkpoint,
 };
 use astra_turn_core::headless_tool_status_display::{
     tool_call_detail, tool_error_summary, tool_result_summary,

@@ -1179,6 +1179,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
         JournalEventType::Bootstrap => "bootstrap",
         JournalEventType::TraceSpan => "trace_span",
+        JournalEventType::ToolCallError => "tool_call_error",
     }
     .to_string()
 }

@@ -27,9 +27,8 @@ use super::super::agentic::tool_interception::{PreparedToolRound, prepare_interc
 use super::execution_phase::{TurnExecutionPhase, observe_turn_end_without_tools};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
-    ControlToolRecovery, MAX_TRACKED_FILE_READS, build_introspect_snapshot,
-    extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
-    introspect_token_pressure, publish_introspect_snapshot, record_edge_tool_observability,
+    ControlToolRecovery, MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render,
+    finalize_turn_trace, publish_introspect_snapshot, record_edge_tool_observability,
 };
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use astra_turn_core::agentic_post_tool_policy::{
@@ -191,6 +190,10 @@ fn agent_fanout_reason_from_edge_result(result: &EdgeToolExecResult) -> Option<S
     agent_fanout_reason_from_text(&result.output)
 }
 
+fn tool_allows_host_owned_control_recovery(tool_name: &str) -> bool {
+    matches!(tool_name, "agent_fanout")
+}
+
 async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
     host: &mut H,
     parent_run_id: Option<&str>,
@@ -201,6 +204,9 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
         let Some(tool_name) = tool_call_name(tool_call) else {
             continue;
         };
+        if !tool_allows_host_owned_control_recovery(tool_name) {
+            continue;
+        }
         let Some(tool_call_id) = tool_call.get("id").and_then(Value::as_str) else {
             tracing::warn!(
                 target: "astra_runtime::agentic_loop_tool_phase",
@@ -1295,6 +1301,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .turn_event_buffer
         .as_ref()
         .map(|b| b.turn_start_instant());
+    let tool_record_turn_start = obs_turn_start.unwrap_or(prep.turn_start_time);
     let obs_llm_round = state
         .turn_event_buffer
         .as_ref()
@@ -1337,7 +1344,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             progress_emitter: state.messaging.progress_emitter.as_ref(),
             pre_resolved_results: &pre_resolved_results,
             server_tool_executor: state.server_tool_executor.as_deref(),
-            turn_start: obs_turn_start,
+            turn_start: Some(tool_record_turn_start),
             llm_round: obs_llm_round,
             plan_mode_active,
         })
@@ -1361,9 +1368,16 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             if rec.round.is_none() {
                 rec.round = Some(obs_llm_round);
             }
+            if rec.start_offset_ms.is_none() {
+                rec.start_offset_ms = Some(tool_record_turn_start.elapsed().as_millis() as u64);
+            }
         }
         if !new_records.is_empty() && turn_result.accum.tool_calls.len() > 1 {
-            let batch_id = state.turn_event_buffer.as_mut().map(|b| b.next_batch_id());
+            let batch_id = state
+                .turn_event_buffer
+                .as_mut()
+                .map(|b| b.next_batch_id())
+                .or_else(|| Some(format!("b-{obs_llm_round}-0")));
             // Re-borrow after consuming turn_event_buffer's mutable access.
             let new_records = &mut state.stall.tool_call_records[new_records_start..];
             let has_parallel = new_records
@@ -1566,7 +1580,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 adapter.advance_step();
             }
         }
-
     }
 
     if let Some(ref emitter) = state.messaging.progress_emitter {
@@ -1732,7 +1745,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             restricted_tools: &mut state.restricted_tools,
             remaining_turns: &mut state.remaining_turns,
             step_recorder: &mut state.step_recorder,
-            current_user_id: state.context_manifest_user_id.as_deref(),
+            current_user_id: state.context_manifest_user_id.as_ref(),
             current_session_id: state.current_session_id.as_ref(),
             max_turns: state.max_turns,
             loop_turn: turn_index,
@@ -1883,6 +1896,7 @@ mod tests {
 
     use crate::observability::ObservabilityHub;
     use crate::turn::agentic_loop::host::tests::{make_state, text_result};
+    use crate::turn::agentic_loop::host::{build_introspect_snapshot, introspect_token_pressure};
 
     fn summary_tool_record(
         ok: bool,
@@ -2020,7 +2034,10 @@ mod tests {
             duration_ms: 7,
         };
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
-            .with_recovered_control_tool_result("call-fanout", recovered);
+            .with_recovered_control_tool_result(
+                "call-fanout",
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered),
+            );
         let tool_calls = vec![json!({
             "id": "call-fanout",
             "type": "function",
@@ -2093,7 +2110,10 @@ mod tests {
             duration_ms: 0,
         };
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
-            .with_recovered_control_tool_result("call-fanout-b", recovered_second);
+            .with_recovered_control_tool_result(
+                "call-fanout-b",
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered_second),
+            );
         let tool_calls = vec![json!({
             "id": "call-fanout-b",
             "type": "function",
@@ -2140,7 +2160,10 @@ mod tests {
             duration_ms: 0,
         };
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
-            .with_recovered_control_tool_result("call-fanout", recovered);
+            .with_recovered_control_tool_result(
+                "call-fanout",
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered),
+            );
         let tool_calls = vec![json!({
             "id": "call-bash",
             "type": "function",

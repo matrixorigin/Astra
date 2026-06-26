@@ -2278,7 +2278,8 @@ pub(crate) async fn handle_session_command(
                             | session_journal::JournalEventType::PipelineAlert
                             | session_journal::JournalEventType::PipelineCompactionAudit
                             | session_journal::JournalEventType::Bootstrap
-                            | session_journal::JournalEventType::TraceSpan => {
+                            | session_journal::JournalEventType::TraceSpan
+                            | session_journal::JournalEventType::ToolCallError => {
                                 // Rendered by /inspect; suppress in timeline for now
                             }
                         }

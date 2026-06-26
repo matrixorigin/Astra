@@ -6975,7 +6975,7 @@ mod tests {
             parsed
                 .get("evidence")
                 .and_then(serde_json::Value::as_array)
-                .map_or(true, |evidence| evidence.is_empty()),
+                .is_none_or(|evidence| evidence.is_empty()),
             "unavailable edge-only JSON must not expose unrelated runtime evidence: {parsed}"
         );
         assert!(

@@ -16,6 +16,7 @@ use crate::orchestration::{
     AgentToolRecordActionKind, project_agent_tool_budget_record,
     render_agent_tool_budget_unfinished_detail, summarize_agent_tool_budget_result,
 };
+use astra_config::user_profile::TurnIntent;
 use astra_services::SessionArtifactStore;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interruption::{
@@ -89,6 +90,29 @@ fn is_explicit_parallel_skill_request(message: &str) -> bool {
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
+}
+
+fn apply_judged_turn_intent_to_observability_session(
+    state: &AgenticLoopState,
+    intent: &TurnIntent,
+) {
+    let Some(session) = &state.telemetry.observability_session else {
+        return;
+    };
+
+    let mut session = astra_core::sync_poison::recover_rwlock_write(session);
+    if let Some(scenario) = intent.requested_scenario {
+        if !intent.prohibited_scenarios.contains(&scenario) {
+            session.profile.set_scenario(scenario);
+        }
+    } else if session
+        .profile
+        .current_scenario
+        .is_some_and(|scenario| intent.prohibited_scenarios.contains(&scenario))
+    {
+        session.profile.current_scenario = None;
+        session.profile.touch();
+    }
 }
 
 fn auto_route_tool_call_id(skill_name: &str) -> String {
@@ -1105,8 +1129,7 @@ pub(crate) fn estimate_context_pressure(
     if max_turn_input_tokens == 0 {
         return (0.0, 0);
     }
-    let tokens =
-        crate::prompts::estimate_tokens(messages, pinned_tool_schema_tokens, 0) as u64;
+    let tokens = crate::prompts::estimate_tokens(messages, pinned_tool_schema_tokens, 0) as u64;
     (tokens as f64 / max_turn_input_tokens as f64, tokens)
 }
 
@@ -1498,7 +1521,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);
     }
-    let _turn_intent = host.judge_turn_intent(state).await.or_else(|| {
+    let judged_turn_intent = host.judge_turn_intent(state).await;
+    if let Some(intent) = judged_turn_intent.as_ref() {
+        apply_judged_turn_intent_to_observability_session(state, intent);
+    }
+    let _turn_intent = judged_turn_intent.or_else(|| {
         // Structural fallback when the LLM judge is unavailable or failed.
         // Keeps scenario routing, continuation mode, and adaptive profiles
         // functional under judge outages instead of collapsing to defaults.

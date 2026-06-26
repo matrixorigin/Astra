@@ -1115,10 +1115,6 @@ mod tests {
             }),
             serde_json::json!({
                 "role": "user",
-                "content": format!("{}\nold tool round", crate::turn::agentic_loop::execution_phase::TOOL_ROUND_HARD_STOP_MARKER),
-            }),
-            serde_json::json!({
-                "role": "user",
                 "content": format!("{}\nold redundant reads", crate::turn::agentic_loop::execution_phase::REDUNDANT_READS_MARKER),
             }),
             serde_json::json!({
@@ -1143,7 +1139,7 @@ mod tests {
                 "role": "user",
                 "content": format!(
                     "{}\nold exploration family lockout",
-                    crate::turn::agentic_loop::execution_phase::EXPLORATION_FAMILY_LOCKOUT_MARKER
+                    crate::turn::agentic_loop::execution_phase::EXPLORATION_FAMILY_PHASE2_MARKER
                 ),
             }),
         ]);
@@ -1151,13 +1147,11 @@ mod tests {
         state.stall.forced_execution_retry = true;
         state.stall.forced_execution_escalation = true;
         state.stall.forced_parallel_batching = true;
-        state.stall.forced_tool_round_hard_stop = true;
-        state.stall.forced_tool_round_abort = true;
         state.stall.forced_redundant_reads_corrective = true;
         state.stall.forced_cache_waste_corrective = true;
         state.stall.forced_search_fanout_corrective = true;
         state.stall.forced_exploration_family_corrective = true;
-        state.stall.forced_exploration_family_lockout = true;
+        state.stall.forced_exploration_family_phase2 = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
         state.restricted_tools.insert("git".into());
         state.turn_guard.nudge_count = 5;
@@ -1193,13 +1187,11 @@ mod tests {
         assert!(!state.stall.forced_execution_retry);
         assert!(!state.stall.forced_execution_escalation);
         assert!(!state.stall.forced_parallel_batching);
-        assert!(!state.stall.forced_tool_round_hard_stop);
-        assert!(!state.stall.forced_tool_round_abort);
         assert!(!state.stall.forced_redundant_reads_corrective);
         assert!(!state.stall.forced_cache_waste_corrective);
         assert!(!state.stall.forced_search_fanout_corrective);
         assert!(!state.stall.forced_exploration_family_corrective);
-        assert!(!state.stall.forced_exploration_family_lockout);
+        assert!(!state.stall.forced_exploration_family_phase2);
         assert!(state.stall.exploration_family_corrective_family.is_none());
         assert!(
             state.restricted_tools.is_empty(),

@@ -241,15 +241,16 @@ fn build_evidence_graph(
             && let (Some(from), Some(to)) = (
                 event_refs.get(decision.event_id.as_str()),
                 decision_refs.get(decision.decision_id.as_str()),
-            ) {
-                push_graph_edge(
-                    &mut edges,
-                    &mut edge_keys,
-                    from.clone(),
-                    to.clone(),
-                    ObservationGraphEdgeKind::Supports,
-                );
-            }
+            )
+        {
+            push_graph_edge(
+                &mut edges,
+                &mut edge_keys,
+                from.clone(),
+                to.clone(),
+                ObservationGraphEdgeKind::Supports,
+            );
+        }
     }
 
     for event in events {
@@ -263,7 +264,24 @@ fn build_evidence_graph(
                 && let (Some(from), Some(to)) = (
                     event_refs.get(parent_event_id.as_str()),
                     event_refs.get(event.event_id.as_str()),
-                ) {
+                )
+            {
+                push_graph_edge(
+                    &mut edges,
+                    &mut edge_keys,
+                    from.clone(),
+                    to.clone(),
+                    ObservationGraphEdgeKind::Causes,
+                );
+            }
+
+            for decision in decisions {
+                if decision.event_id == parent_event_id
+                    && let (Some(from), Some(to)) = (
+                        decision_refs.get(decision.decision_id.as_str()),
+                        event_refs.get(event.event_id.as_str()),
+                    )
+                {
                     push_graph_edge(
                         &mut edges,
                         &mut edge_keys,
@@ -272,21 +290,6 @@ fn build_evidence_graph(
                         ObservationGraphEdgeKind::Causes,
                     );
                 }
-
-            for decision in decisions {
-                if decision.event_id == parent_event_id
-                    && let (Some(from), Some(to)) = (
-                        decision_refs.get(decision.decision_id.as_str()),
-                        event_refs.get(event.event_id.as_str()),
-                    ) {
-                        push_graph_edge(
-                            &mut edges,
-                            &mut edge_keys,
-                            from.clone(),
-                            to.clone(),
-                            ObservationGraphEdgeKind::Causes,
-                        );
-                    }
             }
         }
     }

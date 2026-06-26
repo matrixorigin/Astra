@@ -32,5 +32,7 @@ pub const BUDGET_REACHED_ADVISORY: &str = "Context note: input tokens reached th
 /// space is unconstrained; the latest user request remains authoritative.
 pub const COMPACT_RESUME_DIRECTIVE: &str = "Context compacted: the runtime compressed older \
      conversation history to reduce token pressure. The original task and \
-     the most recent tool activity are still present above. This notice is \
-     not a new user request; the latest user request remains authoritative.";
+     the most recent tool activity are still present above. The turn continues \
+     from the current state under the latest user request; compaction did not \
+     create a new request for a progress summary. This notice is not a new user \
+     request; the latest user request remains authoritative.";

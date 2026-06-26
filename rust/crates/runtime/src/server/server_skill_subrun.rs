@@ -12,18 +12,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
 
-use crate::turn::agentic_loop::host::{
-    run_agentic_loop_with_host, runtime_manifest_for_model, AgenticLoopHost as _, AgenticLoopState,
-    CancellationState, RequestConstraints, SkillState, StopHookState, TurnInteractionPolicy,
-};
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
+use crate::turn::agentic_loop::host::{
+    AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
+    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host, runtime_manifest_for_model,
+};
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
@@ -476,6 +476,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             ),
             message: task_context.to_string(),
             recent_tools: Vec::new(),
+            has_prior_assistant_turn: false,
             task_profile: infer_task_execution_profile(task_context),
             last_turn_policy: TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)

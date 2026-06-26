@@ -517,7 +517,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     // Load runtime config once per round for all mid-loop guards below.
-    let tool_cfg = &astra_config::runtime_config::RuntimeConfig::load().tool_selection;
+    let tool_cfg = &astra_config::runtime_config::RuntimeConfig::load().tool_policy;
     let resolved_tool_policy =
         tool_cfg.resolve_for_model(state.context_manifest_model_name.as_deref());
     let parallel_batching_force_threshold =
@@ -954,6 +954,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         prep.quiet,
         AgenticTurnIngestMut {
             task_profile: state.task_profile,
+            step_persistence_enabled: true,
             first_ttft_ms: &mut state.telemetry.first_ttft_ms,
             current_session_id: &mut state.current_session_id,
             current_run_id: &mut state.current_run_id,
@@ -1516,15 +1517,16 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
     let attempted_work_without_mutation = state.total_tool_calls > 0;
     let defers = final_text_defers_execution(&state.final_text);
     if state.task_profile.mutates_workspace {
-        if !defers && final_text_concludes_no_change_needed(&state.final_text) {
+        if attempted_work_without_mutation
+            && !defers
+            && final_text_concludes_no_change_needed(&state.final_text)
+        {
             return None;
         }
-        // Only retry when the model engaged with the task (made tool calls but
-        // committed nothing) or explicitly deferred. A bare "Done." or "no fix
-        // needed" reply with zero tool calls is treated as a legitimate no-op
-        // — retrying would burn a turn for nothing.
-        return (attempted_work_without_mutation || defers)
-            .then_some(ExecutionRetryReason::MissingMutation);
+        // Mutating-profile tasks need either a concrete workspace mutation or
+        // inspected evidence that no mutation is needed. A zero-tool text-only
+        // completion is a high-risk silent no-op, so force exactly one retry.
+        return Some(ExecutionRetryReason::MissingMutation);
     }
     (user_confirmed_execution_from_recent_context(state)
         && (attempted_work_without_mutation || defers))
@@ -2363,7 +2365,7 @@ pub(crate) fn is_exploration_family_phase2(m: &serde_json::Value) -> bool {
 
 fn restricted_tools_for_exploration_family(family: &str) -> &'static [&'static str] {
     match family {
-        "diff" => &["git_diff"],
+        "diff" => &["git"],
         "search" => &["glob", "grep", "rg"],
         "read" => &["read_file", "view"],
         _ => &[],
@@ -2912,42 +2914,6 @@ fn record_tool_selection(
     turn_result: &HostTurnResult,
     turn_index: usize,
 ) {
-    if let Some(session) = &state.telemetry.observability_session {
-        let selected_tools: Vec<String> = turn_result
-            .edge_tool_round
-            .iter()
-            .map(|r| r.tool.clone())
-            .collect();
-        if !selected_tools.is_empty() {
-            let explanation = astra_turn_core::decision_explainer::DecisionExplanation {
-                id: format!(
-                    "tool-sel-{}-{}",
-                    state.current_session_id.as_deref().unwrap_or("?"),
-                    turn_index
-                ),
-                timestamp: std::time::SystemTime::now(),
-                decision_type: astra_turn_core::decision_explainer::DecisionType::ToolSurface {
-                    visible_tools: selected_tools.clone(),
-                    total_available: state.telemetry.all_tools_used.len() as u32,
-                },
-                inputs: vec![astra_turn_core::decision_explainer::ExplainableInput {
-                    name: "user_query".to_string(),
-                    value: state.message.clone(),
-                    influence: 1.0,
-                    explanation: Some("Primary input driving tool selection".to_string()),
-                }],
-                reasoning: format!(
-                    "LLM selected {} tool(s) for this turn",
-                    selected_tools.len()
-                ),
-                alternatives: vec![],
-                confidence: 0.8,
-            };
-            let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
-            crate::observability::on_tool_selection(&mut session_guard, explanation);
-        }
-    }
-
     if let Some(ref collector) = state.telemetry.turn_trace_collector
         && !collector.has_tool_trace()
     {
@@ -2960,7 +2926,7 @@ fn record_tool_selection(
             &selected_tools,
             &[],
             state.telemetry.all_tools_used.len() as u32,
-            0,
+            turn_index as u64,
         );
     }
 }
@@ -3332,18 +3298,17 @@ mod tests {
     }
 
     #[test]
-    fn execution_retry_skips_done_without_tools_for_mutating_task() {
+    fn execution_retry_forces_retry_on_zero_tool_noop_for_mutating_task() {
         // A mutating-profile task where the model produces a bare conclusion
-        // with zero tool calls is treated as a legitimate no-op completion
-        // (e.g. "I reviewed the code and the bug doesn't exist"). Forcing a
-        // retry here would just waste a turn.
+        // with zero tool calls has no evidence for either a fix or a valid
+        // no-op conclusion. The runtime should force one corrective retry.
         let mut state = make_state();
         state.task_profile =
             astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         state.message = "fix the bug".into();
         state.final_text = "I reviewed the code and the bug does not exist.".into();
 
-        assert!(!should_force_execution_retry(&state));
+        assert!(should_force_execution_retry(&state));
     }
 
     #[test]
@@ -4648,44 +4613,6 @@ mod tests {
         assert!(!is_parallel_batching_force(&retry));
     }
 
-    #[test]
-    fn parallel_batching_force_keeps_resolved_threshold_in_round_budget_warning_zone() {
-        let below_force_threshold = PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD - 1;
-        let mut state = make_state();
-        state.message = "explore the codebase".into();
-        for _ in 0..below_force_threshold {
-            push_single_tool_round(&mut state);
-        }
-        // Before the warning zone, this must NOT fire.
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD - 1;
-        assert!(!should_force_parallel_batching(
-            &state,
-            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
-        ));
-
-        // The warning zone must not make the hard corrective more aggressive;
-        // it already has soft budget guidance for pacing.
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD;
-        assert!(!should_force_parallel_batching(
-            &state,
-            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
-        ));
-    }
-
-    #[test]
-    fn parallel_batching_force_warning_zone_still_fires_at_resolved_threshold() {
-        let mut state = make_state();
-        state.message = "explore the codebase".into();
-        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
-            push_single_tool_round(&mut state);
-        }
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD + 2;
-        assert!(should_force_parallel_batching(
-            &state,
-            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
-        ));
-    }
-
     // ─── Cascade-invariant + per-model resolver wiring ─────────────────────
 
     /// The runtime hard-corrective force MUST stay strictly above the
@@ -4696,7 +4623,7 @@ mod tests {
     /// failure-mode escalation.
     #[test]
     fn parallel_batching_force_default_above_nudge_threshold() {
-        let cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+        let cfg = astra_config::runtime_config::ToolPolicyConfig::default();
         let resolved = cfg.effective_parallel_batching_force_streak() as usize;
         assert!(
             resolved > crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD,
@@ -4722,7 +4649,7 @@ mod tests {
     /// floors drift apart across crates.
     #[test]
     fn parallel_batching_force_per_model_above_nudge_threshold() {
-        let cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+        let cfg = astra_config::runtime_config::ToolPolicyConfig::default();
         for model in &[
             "claude-opus-4-7",
             "claude-sonnet-4-6",
@@ -4757,7 +4684,7 @@ mod tests {
         // Configure a user profile well above the global default and nudge
         // threshold, so a default-length streak should NOT fire under this
         // profile but WOULD fire under the global default.
-        let mut cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+        let mut cfg = astra_config::runtime_config::ToolPolicyConfig::default();
         cfg.model_profiles
             .push(astra_config::runtime_config::ModelPolicyProfile {
                 model_match: "haiku".to_string(),
@@ -4807,7 +4734,7 @@ mod tests {
     #[test]
     fn parallel_batching_force_per_profile_clamp_above_nudge() {
         for low in 1..=crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD as u32 {
-            let mut cfg = astra_config::runtime_config::ToolSelectionConfig::default();
+            let mut cfg = astra_config::runtime_config::ToolPolicyConfig::default();
             cfg.model_profiles
                 .push(astra_config::runtime_config::ModelPolicyProfile {
                     model_match: "haiku".to_string(),
@@ -4829,25 +4756,6 @@ mod tests {
     /// Round-budget warning state must not override the resolved per-model
     /// threshold. Pacing hints can be soft; hard correction should stay tied
     /// to the explicit tool-selection policy.
-    #[test]
-    fn parallel_batching_force_warning_zone_respects_resolved_per_model_threshold() {
-        let mut state = make_state();
-        state.message = "explore the codebase".into();
-        for _ in 0..8 {
-            push_single_tool_round(&mut state);
-        }
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD + 1;
-
-        assert!(
-            should_force_parallel_batching(&state, 8),
-            "streak=8 in warning zone must fire under resolved threshold 8"
-        );
-        assert!(
-            !should_force_parallel_batching(&state, 9),
-            "streak=8 in warning zone must NOT fire under resolved threshold 9"
-        );
-    }
-
     // ─── Round-budget convergence guard — REMOVED ─────────────────────────
     // The old countdown-based phase1/phase2 tests have been replaced by
     // unit tests in `astra_turn_core::loop_circuit_breaker::tests`.
@@ -5373,10 +5281,12 @@ mod tests {
     fn push_diff_round(state: &mut AgenticLoopState, round: u32) {
         for idx in 0..2 {
             state.stall.tool_call_records.push(ToolCallRecord {
-                name: "git_diff".into(),
+                name: "git".into(),
                 ok: true,
                 round: Some(round),
-                args_full: Some(format!(r#"{{"path":"src/file_{round}_{idx}.rs"}}"#)),
+                args_full: Some(format!(
+                    r#"{{"action":"diff","path":"src/file_{round}_{idx}.rs"}}"#
+                )),
                 ..Default::default()
             });
         }
@@ -5436,8 +5346,8 @@ mod tests {
         );
 
         let restricted = apply_exploration_family_restrictions(&mut state, &family);
-        assert_eq!(restricted, vec!["git_diff".to_string()]);
-        assert!(state.restricted_tools.contains("git_diff"));
+        assert_eq!(restricted, vec!["git".to_string()]);
+        assert!(state.restricted_tools.contains("git"));
         assert!(
             !state.restricted_tools.contains("bash"),
             "exploration-family corrective must not globally block bash"
@@ -5494,7 +5404,7 @@ mod tests {
             "content": exploration_family_corrective_message(
                 "diff",
                 3,
-                &["git_diff".to_string()],
+                &["git".to_string()],
                 "review local changes",
             ),
         });
@@ -5510,12 +5420,12 @@ mod tests {
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
-        push_blocked_restricted_round(&mut state, "git_diff", 7);
+        push_blocked_restricted_round(&mut state, "git", 7);
 
         let candidate = exploration_family_phase2_candidate(&state);
         assert_eq!(
             candidate,
-            Some(("diff".to_string(), vec!["git_diff".to_string()])),
+            Some(("diff".to_string(), vec!["git".to_string()])),
         );
     }
 
@@ -5525,7 +5435,7 @@ mod tests {
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
-        push_blocked_restricted_round(&mut state, "git_diff", 7);
+        push_blocked_restricted_round(&mut state, "git", 7);
         state.stall.tool_call_records.push(ToolCallRecord {
             name: "bash".into(),
             ok: true,
@@ -5543,7 +5453,7 @@ mod tests {
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
-        push_blocked_restricted_round(&mut state, "git_diff", 7);
+        push_blocked_restricted_round(&mut state, "git", 7);
 
         assert!(exploration_family_phase2_candidate(&state).is_some());
         state.stall.forced_exploration_family_phase2 = true;
@@ -5556,7 +5466,7 @@ mod tests {
             "role": "user",
             "content": exploration_family_phase2_message(
                 "diff",
-                &["git_diff".to_string()],
+                &["git".to_string()],
                 "review local changes",
             ),
         });

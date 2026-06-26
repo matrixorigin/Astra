@@ -49,8 +49,8 @@
 //! which wraps this loop with consistent outcome mapping.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use astra_services::session_audit::RuntimePromotionEventData;
@@ -133,9 +133,15 @@ pub struct HostTurnResult {
     pub error_kind: Option<astra_core::ErrorKind>,
 }
 
+pub enum ControlToolRecovery {
+    Unsupported,
+    Missing,
+    Recovered(EdgeToolExecResult),
+}
+
 pub use astra_turn_core::interaction_types::{
-    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence, TurnInteractionMode,
-    TurnInteractionPolicy, ASK_USER_TOOL_NAME,
+    ASK_USER_TOOL_NAME, TurnInteractionMode, TurnInteractionPolicy,
+    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
 };
 
 // ─── Host trait ──────────────────────────────────────────────────────────────
@@ -249,6 +255,19 @@ pub trait AgenticLoopHost: Send {
         String::new()
     }
 
+    /// Receive the latest normalized runtime snapshot for the `introspect`
+    /// tool.
+    ///
+    /// The runtime owns snapshot construction because the authoritative token,
+    /// round, cache, and stall fields live in [`AgenticLoopState`]. Hosts only
+    /// decide where to publish the snapshot: the CLI stores it on its local
+    /// [`ToolExecutor`], while server mode uses [`ServerToolExecutor`] below.
+    fn on_introspect_snapshot(
+        &mut self,
+        _snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
+    ) {
+    }
+
     /// Optional LLM summary client for summary-based compaction helpers.
     ///
     /// Hosts can provide a client that uses the same model/credentials as the
@@ -301,6 +320,24 @@ pub trait AgenticLoopHost: Send {
     /// rather than inferring capabilities from the resolved tool list.
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
         astra_turn_core::capability::CapabilitySet::all()
+    }
+
+    /// Recover a host-owned control-tool result when the LLM emitted a tool
+    /// call but the post-SSE edge result row is missing.
+    ///
+    /// This is intentionally host-scoped: replaying arbitrary missing tools
+    /// would duplicate side effects. Implementations must recover only from
+    /// an authoritative host state source, such as the multi-agent fanout
+    /// registry for `agent_fanout`, and must return [`ControlToolRecovery::Unsupported`]
+    /// for tool names they do not own.
+    async fn recover_missing_control_tool_result(
+        &mut self,
+        _parent_run_id: Option<&str>,
+        _tool_call_id: &str,
+        _tool_name: &str,
+        _args: &Value,
+    ) -> ControlToolRecovery {
+        ControlToolRecovery::Unsupported
     }
 
     /// Inject an additional tool schema into the host's tool list.
@@ -370,6 +407,140 @@ pub trait AgenticLoopHost: Send {
     ///   exact "writing through multiple layers of references" pain
     ///   the dedicated capture slot was designed to avoid.
     fn on_turn_completed(&mut self, _state: &AgenticLoopState) {}
+}
+
+pub(crate) fn publish_introspect_snapshot<H: AgenticLoopHost + ?Sized>(
+    host: &mut H,
+    state: &AgenticLoopState,
+    lifecycle_summary: String,
+) {
+    let snapshot = build_introspect_snapshot(state, lifecycle_summary);
+    host.on_introspect_snapshot(&snapshot);
+    if let Some(executor) = state.server_tool_executor.as_deref() {
+        executor.update_introspect_snapshot(snapshot);
+    }
+}
+
+pub(crate) fn build_introspect_snapshot(
+    state: &AgenticLoopState,
+    lifecycle_summary: String,
+) -> astra_turn_core::introspect::IntrospectSnapshot {
+    let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
+    let cache_ratio = if total_in > 0 {
+        state.total_cache_read as f64 / total_in as f64
+    } else {
+        0.0
+    };
+    let working_mem = state
+        .pipeline_session
+        .as_ref()
+        .map(|s| s.working_memory().render_prompt_section())
+        .unwrap_or_default();
+
+    let recent_rounds = state
+        .recent_rounds
+        .iter()
+        .map(|r| astra_turn_core::introspect::RoundSnapshotEntry {
+            turn: r.turn,
+            round: r.round,
+            provider: r.provider.clone(),
+            model: r.model.clone(),
+            prompt_tokens: r.prompt_tokens,
+            cache_read_tokens: r.cache_read_tokens,
+            cache_creation_tokens: r.cache_creation_tokens,
+            completion_tokens: r.completion_tokens,
+            tool_calls_returned: r.tool_calls_returned,
+            tool_call_names: r.tool_call_names.clone(),
+            duration_ms: r.duration_ms,
+            finish_reason: r.finish_reason.clone(),
+        })
+        .collect();
+    let volatile_pending = state
+        .volatile_pending
+        .iter()
+        .map(|inj| astra_turn_core::introspect::VolatileSnapshotEntry {
+            kind: format!("{:?}", inj.kind),
+            content: inj.content.clone(),
+            round_index: inj.round_index,
+        })
+        .collect();
+    let events: Vec<String> = state
+        .stall
+        .events
+        .iter()
+        .map(|(name, turn)| format!("{name} @ turn {turn}"))
+        .collect();
+    let stall_state = astra_turn_core::introspect::StallSnapshotSummary {
+        nudge_count: state.stall.nudge_count,
+        events,
+        introspection_count: state.stall.introspection_count,
+        forced_execution_escalation: state.stall.forced_execution_escalation,
+        forced_parallel_batching: state.stall.forced_parallel_batching,
+        forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
+        forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
+        forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
+        forced_exploration_family_lockout: state.stall.forced_exploration_family_phase2,
+        forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
+        forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
+    };
+
+    let current_round = state.current_round_index;
+    let bias_map = state.turn_guard.health.outcome_bias_by_tool(3600);
+    let tool_health: Vec<astra_turn_core::introspect::ToolHealthEntry> = state
+        .turn_guard
+        .health
+        .all()
+        .iter()
+        .filter(|(_, h)| h.total_calls > 0)
+        .map(|(name, h)| {
+            let last_fail_cat = bias_map.get(name).and_then(|b| b.last_failure_tag.clone());
+            astra_turn_core::introspect::ToolHealthEntry {
+                name: name.clone(),
+                calls: h.total_calls as u32,
+                errors: h.total_failures as u32,
+                avg_ms: 0,
+                avoidance_advised: h.avoidance_advised,
+                consecutive_failures: h.consecutive_failures as u32,
+                last_failure_category: last_fail_cat,
+            }
+        })
+        .collect();
+
+    astra_turn_core::introspect::IntrospectSnapshot {
+        current_model: state.current_model_identity().map(str::to_string),
+        token_pressure: introspect_token_pressure(state),
+        cache_hit_ratio: cache_ratio,
+        turns_completed: state.llm_rounds_completed,
+        turns_remaining: state.remaining_turns as u32,
+        compaction_tier: format!("{:?}", state.compact_tier_applied),
+        alerts: Vec::new(),
+        tool_health,
+        working_memory_summary: working_mem,
+        lifecycle_summary,
+        total_input_tokens: state.total_prompt + state.total_cache_read,
+        total_output_tokens: state.total_completion,
+        cache_read_tokens: state.total_cache_read,
+        cache_creation_tokens: state.total_cache_creation,
+        recent_rounds,
+        volatile_pending,
+        stall_state,
+        injection_freshness: Vec::new(),
+        current_round,
+        tool_errors: state.turn_guard.health.recent_errors(10),
+        circuit_breaker: None,
+    }
+}
+
+pub(crate) fn introspect_token_pressure(state: &AgenticLoopState) -> f64 {
+    if state.max_turn_input_tokens == 0 {
+        return 0.0;
+    }
+    let fresh_estimate = crate::prompts::estimate_tokens(
+        &state.messages,
+        state.pinned_tool_schema_tokens as usize,
+        0,
+    ) as u64;
+    fresh_estimate as f64 / state.max_turn_input_tokens as f64
 }
 
 // ─── Loop state sub-structs ──────────────────────────────────────────────────
@@ -514,7 +685,7 @@ pub struct TelemetryState {
     /// All tool names used across all turns.
     pub all_tools_used: HashSet<String>,
     /// Selection report from the first turn's tool surface assembly.
-    pub first_selection_report: Option<SelectionReport>,
+    pub first_selection_report: Option<ToolSurfaceReport>,
     /// Budget pressure value from the first turn.
     pub first_budget_pressure: f64,
     /// Context assembly duration from the first turn (ms).
@@ -1278,6 +1449,10 @@ pub struct AgenticLoopState {
     /// ── Host-provided context (read-only by runtime) ──
     pub message: String,
     pub recent_tools: Vec<String>,
+    /// True when the prior (immediately preceding) turn produced assistant
+    /// output (text or tool calls). Set by the agentic loop on every turn
+    /// boundary (`has_any_usage` from the just-completed ingest).
+    pub has_prior_assistant_turn: bool,
     pub task_profile: TaskExecutionProfile,
     pub last_turn_policy: TurnInteractionPolicy,
 
@@ -1517,6 +1692,31 @@ pub struct AgenticLoopState {
 
     // ── Harness (observation + verification layer) ──
     pub harness: super::super::harness_adapter::HarnessSlot,
+}
+
+/// Build the stable runtime manifest carried through context metadata.
+///
+/// `model` must already be the selected concrete model for the run. Symbolic
+/// values such as `default` and invalid/control-character strings fail closed
+/// to `None` so callers cannot accidentally publish a guessed identity.
+pub fn runtime_manifest_for_model(
+    source: &'static str,
+    runtime_profile: &'static str,
+    model: Option<&str>,
+) -> Option<serde_json::Value> {
+    let model = astra_core::model_override::normalize_model_override(model)?;
+    Some(serde_json::json!({
+        "schema_version": "astra_runtime_manifest.v1",
+        "selected_model": {
+            "model": model,
+        },
+        "model_resolution": {
+            "source": source,
+            "model": model,
+            "resolved": true,
+        },
+        "runtime_profile": runtime_profile,
+    }))
 }
 
 impl AgenticLoopState {
@@ -1769,6 +1969,22 @@ impl AgenticLoopState {
             self.max_turns.saturating_sub(self.remaining_turns).max(1) as u32
         }
     }
+
+    /// Answers "which model is running this session/turn?" and must not
+    /// fall back to symbolic values such as `default`. Skill model overrides
+    /// remain secondary because they are transient execution hints; the
+    /// selected/context-manifest model is the user's chosen model identity.
+    pub fn current_model_identity(&self) -> Option<&str> {
+        self.context_manifest_model_name
+            .as_deref()
+            .or(self.skills.model_override.as_deref())
+            .or_else(|| {
+                self.recent_rounds
+                    .last()
+                    .map(|r| r.model.as_str())
+                    .filter(|model| !model.is_empty())
+            })
+    }
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -1830,24 +2046,7 @@ fn apply_harness_pause_recovery_threshold(
     }
 }
 
-// Adaptive tuning stubs — module was removed; these are no-ops for test compat.
-fn apply_adaptive_execution_profile_with_intent(
-    _state: &mut AgenticLoopState,
-    _intent: Option<&str>,
-) {
-}
-fn apply_per_turn_adaptation(_state: &mut AgenticLoopState, _tokens_used: u64) {}
-fn apply_tactical_actions(
-    _state: &mut AgenticLoopState,
-    _actions: &[astra_turn_core::liquid_tactical::TacticalAction],
-) -> Vec<String> {
-    Vec::new()
-}
-fn maybe_run_tuning_cycle(_state: &mut AgenticLoopState) {}
-const DEFAULT_TUNING_CYCLE_INTERVAL: u32 = 10;
-use super::super::agentic::adaptive_runtime::{
-    record_loop_completion_feedback, should_emit_adaptive_scenario_event,
-};
+use super::super::agentic::adaptive_runtime::record_loop_completion_feedback;
 #[cfg(test)]
 pub(crate) use super::tool_support::delegate_tool_schema;
 pub(crate) use super::tool_support::{extract_file_path_from_tool, record_edge_tool_observability};
@@ -1876,27 +2075,27 @@ pub const DELEGATE_TOOL_NAME: &str =
     super::super::agentic::delegate_interception::DELEGATE_TOOL_NAME;
 
 pub(crate) use super::super::agentic::delegate_interception::{
-    coordination_pattern_name, delegation_adaptive_context, delegation_final_output_preview,
-    format_delegation_result, format_delegation_terminal_preview, is_delegation_call,
-    merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
+    DelegationAdaptiveContext, DelegationExecutionResult, DelegationFinalOutputSource,
+    DelegationOutcomeMetadata, coordination_pattern_name, delegation_adaptive_context,
+    delegation_final_output_preview, format_delegation_result, format_delegation_terminal_preview,
+    is_delegation_call, merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
     parse_delegate_agents, parse_delegation_request, partition_and_execute_delegations,
     pattern_from_name, select_default_coordination_pattern, task_needs_review,
-    tool_call_arguments_value, tool_call_name, DelegationAdaptiveContext,
-    DelegationExecutionResult, DelegationFinalOutputSource, DelegationOutcomeMetadata,
+    tool_call_arguments_value, tool_call_name,
 };
 
 use super::super::harness_adapter::harness_at;
 pub(crate) use super::execution_phase::{
-    execute_turn_and_ingest_phase, TurnExecutionControl, TurnExecutionPhase,
+    TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
 };
 pub(crate) use super::finalization::{
     finalize_and_render, finalize_turn_trace, run_agentic_loop_with_host,
     try_write_heavy_checkpoint,
 };
 pub(crate) use super::lifecycle::{
-    prepare_turn_iteration, run_loop_preamble, PreparedTurnIteration, TurnIterationPrep,
+    PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
 };
-pub(crate) use super::tool_phase::{execute_tool_phase, TurnToolPhaseControl};
+pub(crate) use super::tool_phase::{TurnToolPhaseControl, execute_tool_phase};
 
 #[cfg(feature = "harness")]
 pub(crate) fn set_harness_interruption(
@@ -2358,7 +2557,7 @@ mod synthesise_finish_reason_tests {
 ///
 /// Delegates to [`make_test_loop_state_for_model`] with `None`, which
 /// resolves workflow-guard thresholds from the global config defaults.
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(any(test, feature = "bridge-e2e-hooks"))]
 pub fn make_test_loop_state() -> AgenticLoopState {
     make_test_loop_state_for_model(None)
 }
@@ -2367,10 +2566,10 @@ pub fn make_test_loop_state() -> AgenticLoopState {
 /// thresholds (`max_identical_tool_calls`, `max_tools_per_turn`) through
 /// [`astra_config::runtime_config::ToolSelectionConfig::resolve_for_model`], so a
 /// request carrying a specific model id sees that model's profile.
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(any(test, feature = "bridge-e2e-hooks"))]
 pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
     let policy = astra_config::runtime_config::RuntimeConfig::load()
-        .tool_selection
+        .tool_policy
         .resolve_for_model(model);
     AgenticLoopState {
         messages: Vec::new(),
@@ -2405,7 +2604,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         restricted_tools: HashSet::new(),
         boosted_tools: HashSet::new(),
         widen_selection_pending: false,
-        step_recorder: StepRecorder::new("test-session", "test-task"),
+        step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
         idempotency_cache: InMemoryIdempotencyCache::new(),
         semantic_dedup: SemanticDedup::new(0.95),
         call_counts: HashMap::new(),
@@ -2429,6 +2628,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         )),
         message: "test query".to_string(),
+        has_prior_assistant_turn: false,
         recent_tools: Vec::new(),
         task_profile: TaskExecutionProfile::default(),
         last_turn_policy: TurnInteractionPolicy::default(),
@@ -2526,13 +2726,11 @@ pub(crate) mod tests {
         pub(crate) rendered_final_text: Vec<String>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
         pub(crate) turn_intent: Option<TurnIntent>,
-        /// PR 5a test observer: number of times the turn loop has
-        /// invoked the parent-turn-completed hook. Each entry is the
-        /// value of `state.current_run_id` at hook time so tests can
-        /// assert the hook runs AFTER `ingest_agentic_turn_stream`
-        /// populated that field.
         pub(crate) turn_completed_run_ids: Vec<Option<String>>,
         pub(crate) cancelled_agent_ids: Vec<String>,
+        cancel_child_agents_delay: Option<std::time::Duration>,
+        recovered_control_tool_results: HashMap<String, ControlToolRecovery>,
+        pub(crate) recovered_control_requests: Vec<(String, String, Value, Option<String>)>,
     }
 
     impl MockHost {
@@ -2550,6 +2748,9 @@ pub(crate) mod tests {
                 turn_intent: None,
                 turn_completed_run_ids: Vec::new(),
                 cancelled_agent_ids: Vec::new(),
+                cancel_child_agents_delay: None,
+                recovered_control_tool_results: HashMap::new(),
+                recovered_control_requests: Vec::new(),
             }
         }
 
@@ -2565,6 +2766,21 @@ pub(crate) mod tests {
 
         pub(crate) fn with_turn_intent(mut self, intent: TurnIntent) -> Self {
             self.turn_intent = Some(intent);
+            self
+        }
+
+        pub(crate) fn with_cancel_child_agents_delay(mut self, delay: std::time::Duration) -> Self {
+            self.cancel_child_agents_delay = Some(delay);
+            self
+        }
+
+        pub(crate) fn with_recovered_control_tool_result(
+            mut self,
+            tool_call_id: &str,
+            recovery: ControlToolRecovery,
+        ) -> Self {
+            self.recovered_control_tool_results
+                .insert(tool_call_id.to_string(), recovery);
             self
         }
 
@@ -2632,11 +2848,32 @@ pub(crate) mod tests {
             self.rendered_final_text.push(text.to_string());
         }
 
+        async fn recover_missing_control_tool_result(
+            &mut self,
+            parent_run_id: Option<&str>,
+            tool_call_id: &str,
+            tool_name: &str,
+            args: &Value,
+        ) -> ControlToolRecovery {
+            self.recovered_control_requests.push((
+                tool_name.to_string(),
+                tool_call_id.to_string(),
+                args.clone(),
+                parent_run_id.map(str::to_string),
+            ));
+            self.recovered_control_tool_results
+                .remove(tool_call_id)
+                .unwrap_or(ControlToolRecovery::Missing)
+        }
+
         async fn cancel_child_agents(
             &mut self,
             agent_ids: &[String],
             _reason: &str,
         ) -> Vec<String> {
+            if let Some(delay) = self.cancel_child_agents_delay {
+                tokio::time::sleep(delay).await;
+            }
             self.cancelled_agent_ids.extend(agent_ids.iter().cloned());
             agent_ids.to_vec()
         }
@@ -2846,15 +3083,15 @@ pub(crate) mod tests {
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
             widen_selection_pending: false,
-            step_recorder: StepRecorder::new("test-session", "test-task"),
+            step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
             call_counts: HashMap::new(),
             max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_selection
+                .tool_policy
                 .effective_max_identical_calls(),
             max_tools_per_turn: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_selection
+                .tool_policy
                 .effective_max_tools_per_turn(),
             repeated_cache_hit_suppression: 3,
             max_consecutive_empty_name: 3,
@@ -2872,6 +3109,7 @@ pub(crate) mod tests {
             error_recovery: Default::default(),
             pipeline_session: None,
             message: "test query".to_string(),
+            has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
             last_turn_policy: TurnInteractionPolicy::default(),
@@ -3193,15 +3431,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn adaptive_scenario_event_only_emits_for_real_changes() {
-        assert!(should_emit_adaptive_scenario_event(true, false, true));
-        assert!(should_emit_adaptive_scenario_event(false, false, false));
-        assert!(!should_emit_adaptive_scenario_event(false, false, true));
-        assert!(!should_emit_adaptive_scenario_event(true, true, true));
-        assert!(!should_emit_adaptive_scenario_event(false, true, false));
-    }
-
     #[tokio::test]
     async fn budget_exhausted_returns_error() {
         let mut host = MockHost::new(vec![]);
@@ -3281,7 +3510,7 @@ pub(crate) mod tests {
         // Tokens accumulate across turns (+=)
         assert_eq!(state.total_prompt, 35); // 20 + 15
         assert_eq!(state.total_completion, 15); // 10 + 5
-                                                // Edge tool counted
+        // Edge tool counted
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
@@ -3461,7 +3690,7 @@ pub(crate) mod tests {
         assert_eq!(host.current_turn, 0); // No turns executed
         assert!(state.final_text.contains("without a final answer")); // EmptyCompletion message
         assert_eq!(state.remaining_turns, 10); // Unchanged
-                                               // EmptyCompletion interruption recorded
+        // EmptyCompletion interruption recorded
         let interruption = state
             .interruption
             .as_ref()
@@ -3613,7 +3842,7 @@ pub(crate) mod tests {
                 severity: "warning".into(),
                 injections: vec!["stall detected".into()],
                 avoid_tools: vec!["write_file".into()],
-                deprioritized_tools: vec![],
+                health_avoidance_tools: vec![],
                 force_stop: false,
                 nudge_count: 1,
                 interaction_mode: "prompt".into(),
@@ -3621,7 +3850,7 @@ pub(crate) mod tests {
                 recent_error_pressure: 0,
                 recent_timeout_pressure: 0,
                 total_errors: 0,
-                deprioritized_count: 0,
+                health_avoidance_count: 0,
                 total_timeouts: 0,
                 timeout_dominant_tools: vec![],
                 total_cache_hits: 0,
@@ -3633,11 +3862,13 @@ pub(crate) mod tests {
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         assert!(state.final_text.contains("Turn budget exhausted"));
-        assert!(!state
-            .messages
-            .iter()
-            .filter_map(|message| message.get("content").and_then(Value::as_str))
-            .any(|content| content.contains("Budget review")));
+        assert!(
+            !state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
     }
 
     #[tokio::test]
@@ -3742,14 +3973,18 @@ pub(crate) mod tests {
             !state.final_text.contains("changes look good"),
             "budget exhaustion must overwrite stale success-shaped text"
         );
-        assert!(state
-            .final_text
-            .contains("Turn budget exhausted after 2 agentic turn(s)"));
-        assert!(!state
-            .messages
-            .iter()
-            .filter_map(|message| message.get("content").and_then(Value::as_str))
-            .any(|content| content.contains("Budget review")));
+        assert!(
+            state
+                .final_text
+                .contains("Turn budget exhausted after 2 agentic turn(s)")
+        );
+        assert!(
+            !state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
     }
 
     #[tokio::test]
@@ -4457,14 +4692,14 @@ pub(crate) mod tests {
     // ── E2E delegation round-trip tests ─────────────────────────────────────
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
-    pub(crate) fn make_test_delegation_engine(
-    ) -> Arc<crate::server::delegation::engine::DelegationEngine> {
+    pub(crate) fn make_test_delegation_engine()
+    -> Arc<crate::server::delegation::engine::DelegationEngine> {
         use crate::server::delegation::engine::{
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run::engine::RunEngine;
-        use astra_services::coordination::{AgentProfile, AgentTier};
         use astra_services::AgentProfileRegistry;
+        use astra_services::coordination::{AgentProfile, AgentTier};
 
         let mut registry = AgentProfileRegistry::new();
         let _ = registry.register(AgentProfile::new(
@@ -5468,14 +5703,18 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
         assert_eq!(msg1.len(), 1);
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Follow these instructions carefully."));
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Follow these instructions carefully.")
+        );
 
         // Second call: replay loaded content + dedup note.
         let msg2: Vec<&Value> = state
@@ -5535,20 +5774,24 @@ pub(crate) mod tests {
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
-        assert!(msg1[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
 
         let msg2: Vec<&Value> = state
             .messages
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
             .collect();
-        assert!(msg2[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: other-skill"));
+        assert!(
+            msg2[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: other-skill")
+        );
 
         // Both tracked
         assert_eq!(state.skills.invoked.len(), 2);
@@ -5683,10 +5926,12 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
             .collect();
         assert_eq!(skill_msgs.len(), 1);
-        assert!(skill_msgs[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
+        assert!(
+            skill_msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
 
         // Skill exclusivity drop is now a debug log, not a user-facing headless line.
         // Verify the host did NOT receive any deferred notice (it goes to tracing now).
@@ -6933,196 +7178,102 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
     }
 
-    pub(crate) fn make_session(
-    ) -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
+    pub(crate) fn make_session()
+    -> std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>> {
         std::sync::Arc::new(std::sync::RwLock::new(
             crate::observability::ObservabilitySession::new_simple("test-session"),
         ))
     }
 
     #[test]
-    fn feedback_records_task_success_on_completed() {
+    fn feedback_no_signal_without_hub() {
+        let mut state = make_state();
+        let result = Ok(AgenticLoopOutcome::Completed);
+        record_loop_completion_feedback(&mut state, &result);
+        // Should not panic.
+    }
+
+    #[test]
+    fn feedback_records_completion_token_pressure_and_acceptance_signals() {
         let hub = make_hub();
         let mut state = make_state();
         state.telemetry.observability_hub = Some(hub.clone());
         state.current_run_id = Some("run-1".into());
-
-        let result = Ok(AgenticLoopOutcome::Completed);
-        record_loop_completion_feedback(&mut state, &result);
-
-        // Add a rule that fires on low success rate — it should NOT fire because
-        // we just recorded a success.
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "test-low-success",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.5,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "low success".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            triggered.is_empty(),
-            "rule should not fire with 100% success"
-        );
-
-        // Record failures to bring success rate below threshold.
-        let fail_result: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
-            Ok(AgenticLoopOutcome::Error("test error".into()));
-        record_loop_completion_feedback(&mut state, &fail_result);
-        let fail_result2: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
-            Ok(AgenticLoopOutcome::Error("test error 2".into()));
-        record_loop_completion_feedback(&mut state, &fail_result2);
-
-        let triggered = hub.tuning().evaluate(&config);
-        // success_rate = 1/3 ≈ 0.33 < 0.5 threshold
-        assert!(
-            !triggered.is_empty(),
-            "rule should fire with low success rate"
-        );
-
-        // Full cycle: evaluate + execute.
-        let mut config2 = astra_config::runtime_config::RuntimeConfig::default();
-        let executions = hub.run_tuning_cycle(&mut config2);
-        assert!(
-            !executions.is_empty(),
-            "tuning cycle should execute the triggered rule"
-        );
-    }
-
-    #[test]
-    fn feedback_records_task_failure_on_error() {
-        let hub = make_hub();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-
-        let result: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
-            Err("something broke".to_string().into());
-        record_loop_completion_feedback(&mut state, &result);
-
-        // TaskFailure lowers success rate. With 0 successes and 1 failure, rate = 0.0.
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "low-success",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.5,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "low success".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            !triggered.is_empty(),
-            "low success rate rule should fire after failure"
-        );
-    }
-
-    #[test]
-    fn feedback_records_interruption_on_cancel() {
-        let hub = make_hub();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-
-        let result = Ok(AgenticLoopOutcome::Cancelled);
-        record_loop_completion_feedback(&mut state, &result);
-
-        // Interruption is recorded as a signal — verify via accumulation.
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "interrupt-detect",
-                astra_learning::auto_tuning::EvolutionTrigger::SignalAccumulation {
-                    signal_type: "interruption".into(),
-                    count: 1,
-                    window_secs: 3600,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "interrupted".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            !triggered.is_empty(),
-            "interruption signal should fire accumulation rule"
-        );
-    }
-
-    #[test]
-    fn feedback_records_high_token_usage() {
-        let hub = make_hub();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
         state.total_prompt = 40_000;
-        state.total_completion = 20_000; // total = 60k > 50k threshold
+        state.total_completion = 20_000;
+        state.message = "thanks, looks good".into();
+        state
+            .messages
+            .push(serde_json::json!({"role": "assistant", "content": "done"}));
 
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "high-tokens",
-                astra_learning::auto_tuning::EvolutionTrigger::HighTokenUsage {
-                    threshold_tokens: 50_000,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "high tokens".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(!triggered.is_empty(), "high token usage rule should fire");
-    }
-
-    #[test]
-    fn feedback_records_tool_churn() {
-        let hub = make_hub();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.total_tool_calls = 30;
-        state.telemetry.all_tools_used = ["bash"].iter().map(|s| s.to_string()).collect();
-        // ratio = 30/1 = 30 > 5 threshold
-
-        let result = Ok(AgenticLoopOutcome::Completed);
-        record_loop_completion_feedback(&mut state, &result);
-
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "churn-detect",
-                astra_learning::auto_tuning::EvolutionTrigger::SignalAccumulation {
-                    signal_type: "tool_churn".into(),
-                    count: 1,
-                    window_secs: 3600,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "churn".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
+        let signals = hub.recent_feedback_signals();
+        assert!(signals.iter().any(|signal| {
+            signal.signal_type == astra_core::feedback::SignalType::TaskSuccess
+                && signal.turn_id.as_deref() == Some("run-1")
+        }));
+        assert!(signals.iter().any(|signal| matches!(
+            signal.signal_type,
+            astra_core::feedback::SignalType::HighTokenUsage {
+                tokens: 60_000,
+                threshold: 50_000
+            }
+        )));
         assert!(
-            !triggered.is_empty(),
-            "tool churn signal should fire accumulation rule"
+            signals.iter().any(|signal| {
+                signal.signal_type == astra_core::feedback::SignalType::Acceptance
+            })
         );
     }
 
     #[test]
-    fn feedback_ignores_synthetic_tool_churn_records() {
+    fn feedback_records_error_and_retry_without_tuning_engine() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.current_run_id = Some("run-retry".into());
+        state.stall.tool_call_records = vec![
+            astra_services::session_journal::ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 100,
+                error: Some("exit code 1".into()),
+                args_preview: Some("npm test".into()),
+                ..Default::default()
+            },
+            astra_services::session_journal::ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 120,
+                error: Some("exit code 1".into()),
+                args_preview: Some("npm test".into()),
+                ..Default::default()
+            },
+        ];
+
+        let result: Result<AgenticLoopOutcome, astra_core::ClassifiedError> = Err(
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ToolUnavailable, "bash failed"),
+        );
+        record_loop_completion_feedback(&mut state, &result);
+
+        let signals = hub.recent_feedback_signals();
+        assert!(signals.iter().any(|signal| matches!(
+            &signal.signal_type,
+            astra_core::feedback::SignalType::TaskFailure { reason }
+                if reason.contains("bash failed")
+        )));
+        assert!(signals.iter().any(|signal| {
+            matches!(
+                signal.signal_type,
+                astra_core::feedback::SignalType::Retry { count: 2 }
+            )
+        }));
+    }
+
+    #[test]
+    fn feedback_ignores_synthetic_tool_churn_placeholders() {
         let hub = make_hub();
         let mut state = make_state();
         state.telemetry.observability_hub = Some(hub.clone());
@@ -7139,7 +7290,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             tool_record(
                 SURGICAL_REMOVAL_TOOL_NAME,
                 true,
-                Some("(removed from context — skill covered this work)"),
+                Some("(removed from context - skill covered this work)"),
             ),
             tool_record(
                 "read_file",
@@ -7155,1476 +7306,13 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "churn-detect",
-                astra_learning::auto_tuning::EvolutionTrigger::SignalAccumulation {
-                    signal_type: "tool_churn".into(),
-                    count: 1,
-                    window_secs: 3600,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "churn".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
+        let signals = hub.recent_feedback_signals();
         assert!(
-            triggered.is_empty(),
-            "synthetic placeholders should not trigger churn feedback"
-        );
-    }
-
-    #[test]
-    fn feedback_no_signal_without_hub() {
-        let mut state = make_state();
-        let result = Ok(AgenticLoopOutcome::Completed);
-        record_loop_completion_feedback(&mut state, &result);
-        // Should not panic.
-    }
-
-    #[test]
-    fn feedback_skill_quality_signals() {
-        use crate::skills::quality::SkillOutcome;
-
-        let hub = make_hub();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-
-        state.skills.quality_tracker.record_outcome(&SkillOutcome {
-            skill_name: "good-skill".into(),
-            tokens_used: 100,
-            duration_ms: 50,
-            all_required_passed: true,
-            partial: false,
-        });
-        state.skills.quality_tracker.record_outcome(&SkillOutcome {
-            skill_name: "bad-skill".into(),
-            tokens_used: 200,
-            duration_ms: 100,
-            all_required_passed: false,
-            partial: false,
-        });
-
-        let result = Ok(AgenticLoopOutcome::Completed);
-        record_loop_completion_feedback(&mut state, &result);
-
-        // The bad skill failure adds a TaskFailure signal, lowering success rate.
-        // We have TaskSuccess (completed) + TaskSuccess (good-skill) + TaskFailure (bad-skill)
-        // = 2 successes / 3 total = 0.67 success rate.
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "low-success",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.8, // 0.67 < 0.8, so this should trigger
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "skill failure".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            !triggered.is_empty(),
-            "skill failure should lower success rate and trigger rule"
-        );
-    }
-
-    #[test]
-    fn tuning_cycle_runs_at_interval() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-
-        hub.tuning().add_rule(
-            astra_learning::auto_tuning::EvolutionRule::new(
-                "test-alert",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.5,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "low success detected".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            )
-            .with_cooldown(std::time::Duration::from_secs(0)),
-        );
-
-        // Record failures to satisfy the rule trigger.
-        for _ in 0..3 {
-            hub.record_feedback(astra_learning::auto_tuning::FeedbackSignal::new(
-                astra_learning::auto_tuning::SignalType::TaskFailure {
-                    reason: "test".into(),
-                },
-            ));
-        }
-
-        // Below interval — should NOT trigger.
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL - 1;
-        maybe_run_tuning_cycle(&mut state);
-        assert_eq!(
-            state.telemetry.completed_turns_for_tuning,
-            DEFAULT_TUNING_CYCLE_INTERVAL - 1,
-            "counter should not reset below interval"
-        );
-        assert!(
-            hub.tuning().get_executions().is_empty(),
-            "no cycle should run below interval"
-        );
-
-        // At interval — SHOULD trigger.
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-        maybe_run_tuning_cycle(&mut state);
-        assert_eq!(
-            state.telemetry.completed_turns_for_tuning, 0,
-            "counter should reset after cycle"
-        );
-        assert!(
-            !hub.tuning().get_executions().is_empty(),
-            "cycle should execute the triggered rule"
-        );
-    }
-
-    #[test]
-    fn tuning_cycle_skips_without_session() {
-        let hub = make_hub();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-        maybe_run_tuning_cycle(&mut state);
-        // Counter is reset (passes threshold check) but no cycle runs (no session).
-        assert_eq!(state.telemetry.completed_turns_for_tuning, 0);
-    }
-
-    #[test]
-    fn adaptive_profile_updates_session_scenario_and_budget() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-        state.message = "fix the bug in the parser".into();
-        state.recent_tools = vec!["bash".into(), "view".into()];
-
-        {
-            let mut guard = astra_core::sync_poison::recover_rwlock_write(&session);
-            for _ in 0..5 {
-                guard.record_query("fix the bug in the parser");
-            }
-        }
-
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        assert_eq!(
-            guard.profile.current_scenario,
-            Some(astra_config::user_profile::Scenario::Debugging)
-        );
-        assert!(state.max_turn_input_tokens >= 100_000);
-    }
-
-    #[test]
-    fn adaptive_profile_skips_scenario_after_user_cancellation() {
-        // Regression for session 721df7da: after the user hits Ctrl+C on a
-        // focused review task, the tool history of the cancelled turn was
-        // leaking into ScenarioDetector and falsely triggering the
-        // `Exploration` scenario (ratcheting tool_budget 722 → 1000).
-        // The fix gates `apply_adaptive_execution_profile` on the
-        // `previous_turn_user_cancelled` flag and consumes it after one
-        // turn.
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-        state.message = "继续啊".into();
-        // Exploratory tool history from the cancelled turn — would
-        // normally push the detector toward Exploration.
-        state.recent_tools = vec![
-            "glob".into(),
-            "grep".into(),
-            "view".into(),
-            "read_file".into(),
-            "git_show".into(),
-            "git_show".into(),
-            "view".into(),
-            "grep".into(),
-        ];
-
-        let scenario_before;
-        {
-            let mut guard = astra_core::sync_poison::recover_rwlock_write(&session);
-            guard.previous_turn_user_cancelled = true;
-            scenario_before = guard.profile.current_scenario;
-        }
-
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        // Flag must be consumed (one-turn suppression only).
-        assert!(
-            !guard.previous_turn_user_cancelled,
-            "previous_turn_user_cancelled flag must be cleared after being consumed"
-        );
-        // Scenario must NOT have changed as a side-effect of the cancelled
-        // turn's tool history.
-        assert_eq!(
-            guard.profile.current_scenario, scenario_before,
-            "scenario should not be re-detected on the turn after a user cancellation"
-        );
-    }
-
-    #[test]
-    fn adaptive_profile_resumes_on_turn_after_cancellation_cleared() {
-        // Verifies the suppression is strictly one turn: the second
-        // apply_adaptive_execution_profile call after a cancellation must
-        // behave normally (i.e. detect Debugging for a matching query).
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-        state.message = "fix the bug in the parser".into();
-        state.recent_tools = vec!["bash".into(), "view".into()];
-
-        {
-            let mut guard = astra_core::sync_poison::recover_rwlock_write(&session);
-            for _ in 0..5 {
-                guard.record_query("fix the bug in the parser");
-            }
-            guard.previous_turn_user_cancelled = true;
-        }
-
-        // First call: suppressed (flag was true) — scenario unchanged.
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-        {
-            let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-            assert!(!guard.previous_turn_user_cancelled);
-            assert_eq!(guard.profile.current_scenario, None);
-        }
-
-        // Second call: normal detection path runs.
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        assert_eq!(
-            guard.profile.current_scenario,
-            Some(astra_config::user_profile::Scenario::Debugging),
-            "scenario detection must resume on the turn after the cancellation flag is consumed"
-        );
-    }
-
-    #[test]
-    fn adaptive_profile_enables_liquid_runtime_when_adaptive_context_is_on() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.context_window.adaptive = true;
-            guard.config.token_budget.max_turn_input_tokens = 64_000;
-        }
-
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        assert!(state.tactical_adapter.is_some());
-        assert!(state.step_signal_collector.is_some());
-    }
-
-    #[test]
-    fn adaptive_profile_disables_liquid_runtime_when_adaptive_context_is_off() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-        state.tactical_adapter = Some(astra_turn_core::liquid_tactical::TacticalAdapter::new(
-            astra_turn_core::liquid_tactical::DampenerConfig::default(),
-        ));
-        state.step_signal_collector = Some(
-            astra_turn_core::liquid_step_signals::StepSignalCollector::new(
-                astra_turn_core::liquid_step_signals::StepSignalConfig::default(),
-                64_000,
-            ),
-        );
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.context_window.adaptive = false;
-        }
-
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        assert!(state.tactical_adapter.is_none());
-        assert!(state.step_signal_collector.is_none());
-    }
-
-    // ── Per-turn micro-adaptation tests ──
-
-    #[test]
-    fn per_turn_adaptation_shrinks_token_budget_on_high_usage() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 80_000;
-            guard.config.context_window.adaptive = true;
-            // Opt in to the (off-by-default) shrink path.
-            guard.config.context_window.adaptive_budget_reduction = true;
-        }
-        state.max_turn_input_tokens = 80_000;
-
-        // Simulate a turn that used 72k tokens (90% of 80k, above 85% threshold)
-        apply_per_turn_adaptation(&mut state, 72_000);
-
-        let guard = session.read().unwrap();
-        assert!(
-            guard.config.token_budget.max_turn_input_tokens < 80_000,
-            "budget should shrink: {}",
-            guard.config.token_budget.max_turn_input_tokens
-        );
-        assert!(
-            guard.config.token_budget.max_turn_input_tokens >= 30_000,
-            "budget should not go below floor"
-        );
-        assert_eq!(
-            state.max_turn_input_tokens, guard.config.token_budget.max_turn_input_tokens as u64,
-            "loop state should stay in sync"
-        );
-    }
-
-    #[test]
-    fn per_turn_adaptation_does_not_shrink_by_default() {
-        // Regression guard: adaptive_budget_reduction is OFF by default.
-        // Session 0e37eb46 shrank its own ceiling under pressure, produced
-        // a progress summary, and gave up. The shrink path must be opt-in.
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 80_000;
-            guard.config.context_window.adaptive = true;
-            // adaptive_budget_reduction stays at default (false).
-        }
-        state.max_turn_input_tokens = 80_000;
-
-        apply_per_turn_adaptation(&mut state, 72_000);
-
-        let guard = session.read().unwrap();
-        assert_eq!(
-            guard.config.token_budget.max_turn_input_tokens, 80_000,
-            "budget must be unchanged when adaptive_budget_reduction is off"
-        );
-    }
-
-    #[test]
-    fn per_turn_adaptation_no_change_on_low_usage() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 80_000;
-            guard.config.context_window.adaptive = true;
-        }
-        state.max_turn_input_tokens = 80_000;
-
-        // Simulate a turn that used only 40k tokens (50% of 80k, below 85% threshold)
-        apply_per_turn_adaptation(&mut state, 40_000);
-
-        let guard = session.read().unwrap();
-        assert_eq!(
-            guard.config.token_budget.max_turn_input_tokens, 80_000,
-            "budget should not change for low usage"
-        );
-    }
-
-    #[test]
-    fn per_turn_adaptation_lowers_compression_threshold_after_multiple_compressions() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.compression.compression_threshold = 0.8;
-            guard.config.context_window.dynamic_compression = true;
-            guard.config.context_window.compression_threshold_min = 0.5;
-            // Record 2 compressions
-            guard.record_compression(1);
-            guard.record_compression(3);
-        }
-
-        apply_per_turn_adaptation(&mut state, 0);
-
-        let guard = session.read().unwrap();
-        assert!(
-            (guard.config.compression.compression_threshold - 0.75).abs() < 0.001,
-            "threshold should drop by 0.05: {}",
-            guard.config.compression.compression_threshold
-        );
-    }
-
-    #[test]
-    fn per_turn_adaptation_respects_compression_threshold_floor() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.compression.compression_threshold = 0.52;
-            guard.config.context_window.dynamic_compression = true;
-            guard.config.context_window.compression_threshold_min = 0.5;
-            guard.record_compression(1);
-            guard.record_compression(2);
-        }
-
-        apply_per_turn_adaptation(&mut state, 0);
-
-        let guard = session.read().unwrap();
-        assert!(
-            guard.config.compression.compression_threshold >= 0.5,
-            "threshold should not go below floor: {}",
-            guard.config.compression.compression_threshold
-        );
-    }
-
-    #[test]
-    fn per_turn_adaptation_raises_verification_on_corrections() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-
-        let initial_strictness;
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.verification.adaptive = true;
-            guard.config.verification.increase_on_correction = true;
-            guard.config.verification.strictness = 0.5;
-            guard.config.verification.max_strictness = 0.9;
-            initial_strictness = guard.config.verification.strictness;
-            // Simulate a recent correction at current turn
-            guard.turn_number = 5;
-            guard.user_corrections.push(4);
-        }
-
-        apply_per_turn_adaptation(&mut state, 0);
-
-        let guard = session.read().unwrap();
-        assert!(
-            guard.config.verification.strictness > initial_strictness,
-            "strictness should increase: {} > {}",
-            guard.config.verification.strictness,
-            initial_strictness
-        );
-        assert!(
-            (guard.config.verification.strictness - 0.55).abs() < 0.001,
-            "should increase by 0.05: {}",
-            guard.config.verification.strictness
-        );
-    }
-
-    #[test]
-    fn per_turn_adaptation_no_verification_change_without_recent_corrections() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-        state.session_turn = 10;
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.verification.adaptive = true;
-            guard.config.verification.increase_on_correction = true;
-            guard.config.verification.strictness = 0.5;
-            // Old correction, not recent
-            guard.turn_number = 10;
-            guard.user_corrections.push(2);
-        }
-
-        apply_per_turn_adaptation(&mut state, 0);
-
-        let guard = session.read().unwrap();
-        assert!(
-            (guard.config.verification.strictness - 0.5).abs() < 0.001,
-            "strictness should not change for old corrections: {}",
-            guard.config.verification.strictness
-        );
-    }
-
-    #[test]
-    fn adaptive_profile_applies_scenario_memory_and_verification() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-        state.message = "review the PR diff and approve the change".into();
-        state.recent_tools = vec!["view".into()];
-
-        {
-            let mut guard = session.write().unwrap();
-            for _ in 0..5 {
-                guard.record_query("review the PR diff and approve the change");
-            }
-        }
-
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        let guard = session.read().unwrap();
-        // CodeReview scenario should set memory_top_k=7 and verification_strictness=0.7
-        assert_eq!(
-            guard.profile.current_scenario,
-            Some(astra_config::user_profile::Scenario::CodeReview)
-        );
-        assert_eq!(guard.config.memory.retrieval_top_k, 7);
-        assert!(
-            (guard.config.verification.strictness - 0.7).abs() < 0.01,
-            "verification should be 0.7 for code review: {}",
-            guard.config.verification.strictness
-        );
-    }
-
-    // ── Anti-flap dampening tests ──
-
-    #[test]
-    fn anti_flap_scenario_cooldown_suppresses_rapid_change() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-
-        // First call: set up Debugging scenario via queries
-        state.message = "fix the crash in the parser module".into();
-        state.recent_tools = vec!["bash".into()];
-        {
-            let mut guard = session.write().unwrap();
-            guard.turn_number = 1;
-            for _ in 0..5 {
-                guard.record_query("fix the crash in the parser module");
-            }
-        }
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        let scenario_after_first = {
-            let guard = session.read().unwrap();
-            guard.profile.current_scenario
-        };
-
-        // Second call at turn 2 (within cooldown): try switching to CodeReview
-        state.message = "review the PR diff and approve the change".into();
-        state.recent_tools = vec!["view".into()];
-        {
-            let mut guard = session.write().unwrap();
-            guard.turn_number = 2;
-            guard.recent_queries.clear();
-            for _ in 0..5 {
-                guard.record_query("review the PR diff and approve the change");
-            }
-        }
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        let scenario_after_second = {
-            let guard = session.read().unwrap();
-            guard.profile.current_scenario
-        };
-
-        // Scenario should NOT have changed due to cooldown
-        assert_eq!(
-            scenario_after_first, scenario_after_second,
-            "scenario should be suppressed by cooldown: first={:?}, second={:?}",
-            scenario_after_first, scenario_after_second
-        );
-    }
-
-    #[test]
-    fn anti_flap_scenario_change_allowed_after_cooldown() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-
-        // First call: set up Debugging scenario
-        state.message = "fix the crash in the parser module".into();
-        state.recent_tools = vec!["bash".into()];
-        {
-            let mut guard = session.write().unwrap();
-            guard.turn_number = 1;
-            for _ in 0..5 {
-                guard.record_query("fix the crash in the parser module");
-            }
-        }
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        // Second call at turn 10 (well past cooldown of 5): switch to CodeReview
-        state.message = "review the PR diff and approve the change".into();
-        state.recent_tools = vec!["view".into()];
-        {
-            let mut guard = session.write().unwrap();
-            guard.turn_number = 10;
-            guard.recent_queries.clear();
-            for _ in 0..5 {
-                guard.record_query("review the PR diff and approve the change");
-            }
-        }
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        let guard = session.read().unwrap();
-        // After cooldown expires, scenario should be allowed to change
-        assert_ne!(
-            guard.profile.current_scenario,
-            Some(astra_config::user_profile::Scenario::Debugging),
-            "scenario should change after cooldown expires"
-        );
-    }
-
-    #[test]
-    fn anti_flap_token_budget_oscillation_suppressed() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 80_000;
-            guard.config.context_window.adaptive = true;
-            guard.turn_number = 5;
-            // Simulate that a tuning cycle just increased the budget at turn 4
-            guard.last_token_budget_direction = 1; // increase
-            guard.last_token_budget_change_turn = Some(4);
-        }
-        state.max_turn_input_tokens = 80_000;
-
-        // Now per-turn wants to decrease (turn 5, within cooldown of 3 from turn 4)
-        apply_per_turn_adaptation(&mut state, 72_000);
-
-        let guard = session.read().unwrap();
-        // Budget should NOT decrease because we'd be oscillating
-        assert_eq!(
-            guard.config.token_budget.max_turn_input_tokens, 80_000,
-            "budget should be unchanged due to oscillation suppression"
-        );
-    }
-
-    #[test]
-    fn anti_flap_token_budget_decrease_allowed_after_cooldown() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-        state.session_turn = 10;
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 80_000;
-            guard.config.context_window.adaptive = true;
-            guard.config.context_window.adaptive_budget_reduction = true;
-            guard.turn_number = 10;
-            // Previous increase was at turn 2 — well past cooldown
-            guard.last_token_budget_direction = 1;
-            guard.last_token_budget_change_turn = Some(2);
-        }
-        state.max_turn_input_tokens = 80_000;
-
-        apply_per_turn_adaptation(&mut state, 72_000);
-
-        let guard = session.read().unwrap();
-        assert!(
-            guard.config.token_budget.max_turn_input_tokens < 80_000,
-            "budget should decrease after cooldown: {}",
-            guard.config.token_budget.max_turn_input_tokens
-        );
-        assert_eq!(
-            guard.last_token_budget_direction, -1,
-            "direction should be updated to decrease"
-        );
-    }
-
-    #[test]
-    fn anti_flap_consecutive_decreases_not_suppressed() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 80_000;
-            guard.config.context_window.adaptive = true;
-            guard.config.context_window.adaptive_budget_reduction = true;
-            guard.turn_number = 5;
-            // Previous change was also a decrease
-            guard.last_token_budget_direction = -1;
-            guard.last_token_budget_change_turn = Some(4);
-        }
-        state.max_turn_input_tokens = 80_000;
-
-        // Another decrease should be allowed (same direction = not oscillation)
-        apply_per_turn_adaptation(&mut state, 72_000);
-
-        let guard = session.read().unwrap();
-        assert!(
-            guard.config.token_budget.max_turn_input_tokens < 80_000,
-            "consecutive decreases should not be suppressed: {}",
-            guard.config.token_budget.max_turn_input_tokens
-        );
-    }
-
-    // ── Journal event attribution tests ──
-
-    #[test]
-    fn adaptive_profile_emits_journal_event_on_scenario_change() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-        state.current_session_id = Some("journal-test-session".into());
-
-        state.message = "fix the crash in the parser module".into();
-        state.recent_tools = vec!["bash".into()];
-        {
-            let mut guard = session.write().unwrap();
-            for _ in 0..5 {
-                guard.record_query("fix the crash in the parser module");
-            }
-        }
-
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        // Verify a scenario was detected (journal event emission is best-effort
-        // in tests since we don't have a real journal backend, but the function
-        // should not panic).
-        let guard = session.read().unwrap();
-        assert!(
-            guard.profile.current_scenario.is_some(),
-            "scenario should be detected for journal event"
-        );
-    }
-
-    #[test]
-    fn per_turn_adaptation_tracks_budget_direction_state() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-        state.session_turn = 1;
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 80_000;
-            guard.config.context_window.adaptive = true;
-            guard.config.context_window.adaptive_budget_reduction = true;
-            guard.turn_number = 1;
-        }
-        state.max_turn_input_tokens = 80_000;
-
-        apply_per_turn_adaptation(&mut state, 72_000);
-
-        let guard = session.read().unwrap();
-        // After a decrease, direction should be -1
-        assert_eq!(guard.last_token_budget_direction, -1);
-        assert_eq!(guard.last_token_budget_change_turn, Some(1));
-    }
-
-    #[test]
-    fn tuning_cycle_updates_budget_direction_on_increase() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-
-        // Set a low budget so tuning might increase it
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 50_000;
-            guard.turn_number = 10;
-        }
-        state.max_turn_input_tokens = 50_000;
-
-        // Add a rule that increases token budget
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "test-increase-budget",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 1.0, // always fires
-                    window_secs: 3600,
-                    min_samples: 0,
-                },
-                astra_learning::auto_tuning::EvolutionAction::AdjustConfig {
-                    path: "token_budget.max_turn_input_tokens".into(),
-                    delta: 10_000.0,
-                    min: None,
-                    max: None,
-                },
-            ));
-
-        maybe_run_tuning_cycle(&mut state);
-
-        let guard = session.read().unwrap();
-        if guard.config.token_budget.max_turn_input_tokens > 50_000 {
-            // If the rule fired and increased budget, direction should be +1
-            assert_eq!(guard.last_token_budget_direction, 1);
-            assert_eq!(guard.last_token_budget_change_turn, Some(10));
-        }
-        // (If the rule didn't fire due to min_samples, that's OK — the direction
-        // tracking only activates on actual changes.)
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // Stress & integration tests
-    // ══════════════════════════════════════════════════════════════════════
-
-    /// Simulate a single "turn" through all adaptive phases:
-    /// 1. apply_adaptive_execution_profile (scenario routing)
-    /// 2. apply_per_turn_adaptation (micro-adaptation based on token usage)
-    /// 3. record_loop_completion_feedback (outcome signal)
-    /// 4. maybe_run_tuning_cycle (if interval reached)
-    fn simulate_turn(
-        state: &mut AgenticLoopState,
-        session: &std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>,
-        query: &str,
-        tools: &[&str],
-        tokens_used: u64,
-        outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
-    ) {
-        // Advance turn
-        {
-            let mut guard = session.write().unwrap();
-            guard.turn_number += 1;
-            guard.record_query(query);
-        }
-        state.message = query.into();
-        state.recent_tools = tools.iter().map(|s| s.to_string()).collect();
-
-        // Phase 1: scenario routing
-        apply_adaptive_execution_profile_with_intent(state, None);
-
-        // Phase 2: micro-adaptation
-        apply_per_turn_adaptation(state, tokens_used);
-
-        // Phase 3: feedback
-        state.telemetry.completed_turns_for_tuning += 1;
-        record_loop_completion_feedback(state, outcome);
-
-        // Phase 4: tuning cycle (fires at interval)
-        maybe_run_tuning_cycle(state);
-    }
-
-    #[test]
-    fn stress_full_adaptive_loop_20_turns() {
-        // See `stress_multi_turn_state_continuity_50_turns` for why we pin
-        // journal I/O to a tempdir — adaptive-tuning fans out journal writes
-        // for `state.current_session_id` and would otherwise pollute
-        // `~/.astra/sessions/stress-test.jsonl` across local test runs.
-        let _journal_dir = tempfile::tempdir().unwrap();
-        let _journal_guard =
-            astra_services::session_journal::JournalDirGuard::new(_journal_dir.path());
-
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-        state.current_session_id = Some("stress-test".into());
-        state.current_run_id = Some("run-stress".into());
-
-        // Pre-seed queries for scenario detection
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.context_window.adaptive = true;
-            guard.config.token_budget.max_turn_input_tokens = 100_000;
-        }
-        state.max_turn_input_tokens = 100_000;
-
-        let success: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
-            Ok(AgenticLoopOutcome::Completed);
-        let failure: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
-            Ok(AgenticLoopOutcome::Error("test error".into()));
-
-        // Turns 1-10: Debugging scenario, moderate token usage, mostly successful
-        for i in 0..10 {
-            let outcome = if i == 7 { &failure } else { &success };
-            let tokens = 50_000 + (i as u64 * 2_000); // 50k → 68k
-            simulate_turn(
-                &mut state,
-                &session,
-                "fix the crash in the parser",
-                &["bash", "view"],
-                tokens,
-                outcome,
-            );
-        }
-
-        let mid_state = {
-            let guard = session.read().unwrap();
-            (
-                guard.profile.current_scenario,
-                guard.config.token_budget.max_turn_input_tokens,
-                guard.turn_number,
-            )
-        };
-        assert_eq!(mid_state.2, 10, "should be at turn 10");
-        assert!(
-            mid_state.0.is_some(),
-            "scenario should be detected after 10 debugging queries"
-        );
-
-        // Turns 11-20: Switch to CodeReview (some may be suppressed by cooldown)
-        for _ in 0..10 {
-            simulate_turn(
-                &mut state,
-                &session,
-                "review the PR diff and approve the change",
-                &["view"],
-                40_000,
-                &success,
-            );
-        }
-
-        let final_state = {
-            let guard = session.read().unwrap();
-            (
-                guard.profile.current_scenario,
-                guard.config.token_budget.max_turn_input_tokens,
-                guard.turn_number,
-            )
-        };
-        assert_eq!(final_state.2, 20);
-        // Budget should still be within valid range
-        assert!(
-            final_state.1 >= 30_000 && final_state.1 <= 200_000,
-            "budget should be in valid range: {}",
-            final_state.1
-        );
-        // No panic, no corruption — full loop survived 20 turns
-    }
-
-    #[test]
-    fn stress_budget_conflict_tuning_increase_then_per_turn_decrease() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-        state.current_run_id = Some("run-conflict".into());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 50_000;
-            guard.config.context_window.adaptive = true;
-            guard.turn_number = 9;
-        }
-        state.max_turn_input_tokens = 50_000;
-
-        // Add a rule that increases token budget
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "increase-budget",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 1.0,
-                    window_secs: 3600,
-                    min_samples: 0,
-                },
-                astra_learning::auto_tuning::EvolutionAction::AdjustConfig {
-                    path: "token_budget.max_turn_input_tokens".into(),
-                    delta: 20_000.0,
-                    min: None,
-                    max: None,
-                },
-            ));
-
-        // Step 1: Fire tuning cycle — should increase budget
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-        maybe_run_tuning_cycle(&mut state);
-
-        let budget_after_tuning = {
-            let guard = session.read().unwrap();
-            guard.config.token_budget.max_turn_input_tokens
-        };
-
-        // Step 2: Advance turn, then per-turn wants to decrease due to high usage
-        {
-            let mut guard = session.write().unwrap();
-            guard.turn_number = 10;
-        }
-
-        // High token usage relative to new budget
-        let high_usage = (budget_after_tuning as f64 * 0.92) as u64;
-        apply_per_turn_adaptation(&mut state, high_usage);
-
-        let budget_after_per_turn = {
-            let guard = session.read().unwrap();
-            guard.config.token_budget.max_turn_input_tokens
-        };
-
-        // Anti-flap should suppress the decrease because tuning just increased
-        // (direction reversal within cooldown)
-        if budget_after_tuning > 50_000 {
-            // Tuning rule fired, so anti-flap should kick in
-            assert_eq!(
-                budget_after_per_turn, budget_after_tuning,
-                "anti-flap should suppress decrease right after tuning increase: tuning={}, per_turn={}",
-                budget_after_tuning, budget_after_per_turn
-            );
-        }
-        // In all cases, budget should be valid
-        assert!(budget_after_per_turn >= 30_000);
-    }
-
-    #[test]
-    fn stress_rapid_scenario_switching_100_turns() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-
-        let debugging_queries = [
-            "fix the crash in the parser module",
-            "debug the segfault in memory allocator",
-            "trace the bug causing data corruption",
-        ];
-        let review_queries = [
-            "review the PR diff and approve the change",
-            "review this pull request for correctness",
-            "approve the PR after reviewing all changes",
-        ];
-
-        let mut scenario_changes = 0u32;
-        let mut last_scenario: Option<astra_config::user_profile::Scenario> = None;
-
-        for turn in 1..=100u32 {
-            let query = if turn % 2 == 1 {
-                debugging_queries[(turn as usize / 2) % 3]
-            } else {
-                review_queries[(turn as usize / 2) % 3]
-            };
-
-            {
-                let mut guard = session.write().unwrap();
-                guard.turn_number = turn;
-                // Keep only recent queries for scenario detection
-                if guard.recent_queries.len() > 5 {
-                    let drain_end = guard.recent_queries.len() - 2;
-                    guard.recent_queries.drain(0..drain_end);
-                }
-                guard.record_query(query);
-            }
-            state.message = query.into();
-            state.recent_tools = vec!["view".into()];
-
-            apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-            let current = {
-                let guard = session.read().unwrap();
-                guard.profile.current_scenario
-            };
-            if current != last_scenario {
-                scenario_changes += 1;
-                last_scenario = current;
-            }
-        }
-
-        // With scenario_cooldown_turns=5 (default), max possible changes in 100 turns is ~20
-        // (initial detection + one change per 5 turns).
-        assert!(
-            scenario_changes <= 25,
-            "anti-flap should limit scenario changes: got {} in 100 turns",
-            scenario_changes
-        );
-        // Verify no panic, no corruption
-        let guard = session.read().unwrap();
-        assert_eq!(guard.turn_number, 100);
-    }
-
-    #[test]
-    fn stress_oscillating_token_usage_50_turns() {
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.token_budget.max_turn_input_tokens = 80_000;
-            guard.config.context_window.adaptive = true;
-        }
-        state.max_turn_input_tokens = 80_000;
-
-        let mut direction_changes = 0u32;
-        let mut prev_direction: i8 = 0;
-
-        for turn in 1..=50u32 {
-            {
-                let mut guard = session.write().unwrap();
-                guard.turn_number = turn;
-            }
-
-            // Alternate between high (92%) and low (40%) usage
-            let budget = {
-                let guard = session.read().unwrap();
-                guard.config.token_budget.max_turn_input_tokens
-            };
-            let tokens = if turn % 2 == 0 {
-                (budget as f64 * 0.92) as u64 // high usage
-            } else {
-                (budget as f64 * 0.40) as u64 // low usage (no change)
-            };
-
-            apply_per_turn_adaptation(&mut state, tokens);
-
-            let current_direction = {
-                let guard = session.read().unwrap();
-                guard.last_token_budget_direction
-            };
-            if current_direction != prev_direction && current_direction != 0 {
-                direction_changes += 1;
-                prev_direction = current_direction;
-            }
-        }
-
-        let final_budget = {
-            let guard = session.read().unwrap();
-            guard.config.token_budget.max_turn_input_tokens
-        };
-
-        // Budget should still be valid
-        assert!(
-            (30_000..=80_000).contains(&final_budget),
-            "budget should be in valid range: {}",
-            final_budget
-        );
-
-        // Direction changes should be limited (per-turn only decreases, so
-        // oscillation only occurs if something else increases — in this test
-        // nothing increases, so direction_changes should be ≤ 1)
-        assert!(
-            direction_changes <= 5,
-            "direction changes should be limited: got {}",
-            direction_changes
-        );
-    }
-
-    #[test]
-    fn stress_multi_turn_state_continuity_50_turns() {
-        // Test isolation: every adaptive-tuning turn fans out a journal write
-        // for the active session id.  Without a `JournalDirGuard`, those writes
-        // land in the developer's real `~/.astra/sessions/<sid>.jsonl` file,
-        // accumulating across runs (observed at >10 MB / 38k events) until
-        // the next invocation of this test re-reads the entire file on every
-        // append and blows the per-test timeout.  Pin journal I/O to a
-        // tempdir scoped to this thread.
-        let _journal_dir = tempfile::tempdir().unwrap();
-        let _journal_guard =
-            astra_services::session_journal::JournalDirGuard::new(_journal_dir.path());
-
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-        state.current_session_id = Some("continuity-test".into());
-        state.current_run_id = Some("run-continuity".into());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.context_window.adaptive = true;
-            guard.config.verification.adaptive = true;
-            guard.config.verification.increase_on_correction = true;
-            guard.config.memory_pressure.adaptive = true;
-            guard.config.memory_pressure.expand_on_correction = true;
-            guard.config.token_budget.max_turn_input_tokens = 100_000;
-        }
-        state.max_turn_input_tokens = 100_000;
-
-        let success: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
-            Ok(AgenticLoopOutcome::Completed);
-
-        for turn in 1..=50u32 {
-            // Add some corrections every 10 turns
-            if turn % 10 == 0 {
-                let mut guard = session.write().unwrap();
-                guard.user_corrections.push(turn);
-            }
-
-            let tokens = 60_000 + (turn as u64 * 500); // gradually increasing
-            simulate_turn(
-                &mut state,
-                &session,
-                "fix the crash in the parser module",
-                &["bash", "view"],
-                tokens,
-                &success,
-            );
-        }
-
-        let guard = session.read().unwrap();
-        assert_eq!(guard.turn_number, 50);
-
-        // Verify anti-flap state is coherent
-        assert!(
-            guard.last_scenario_change_turn.is_some(),
-            "scenario change should have been recorded"
-        );
-
-        // Budget should have been influenced by high usage
-        assert!(
-            guard.config.token_budget.max_turn_input_tokens <= 100_000,
-            "budget should not have increased: {}",
-            guard.config.token_budget.max_turn_input_tokens
-        );
-        assert!(
-            guard.config.token_budget.max_turn_input_tokens >= 30_000,
-            "budget should be above floor: {}",
-            guard.config.token_budget.max_turn_input_tokens
-        );
-
-        // Verification strictness should have increased from corrections
-        assert!(
-            guard.config.verification.strictness >= 0.5,
-            "strictness should have increased from corrections: {:.3}",
-            guard.config.verification.strictness
-        );
-    }
-
-    #[test]
-    fn stress_all_8_default_rules_fire() {
-        use astra_learning::auto_tuning::{default_rules, FeedbackSignal, SignalType};
-
-        let hub = make_hub();
-        // Load default evolution rules so the tuning engine has something to evaluate
-        for rule in default_rules() {
-            hub.tuning().add_rule(rule);
-        }
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-        state.current_run_id = Some("run-all-rules".into());
-
-        // Record diverse feedback to trigger as many rules as possible
-        for _ in 0..15 {
-            // Failures (triggers LowSuccessRate rules)
-            hub.record_feedback(
-                FeedbackSignal::new(SignalType::TaskFailure {
-                    reason: "test error".into(),
-                })
-                .with_turn("turn-1"),
-            );
-
-            // High token usage
-            hub.record_feedback(
-                FeedbackSignal::new(SignalType::HighTokenUsage {
-                    tokens: 90_000,
-                    threshold: 80_000,
-                })
-                .with_turn("turn-1"),
-            );
-
-            // Tool churn
-            hub.record_feedback(
-                FeedbackSignal::new(SignalType::ToolChurn {
-                    calls: 30,
-                    unique_tools: 2,
-                })
-                .with_turn("turn-1"),
-            );
-
-            // Corrections
-            hub.record_feedback(FeedbackSignal::new(SignalType::Correction).with_turn("turn-1"));
-
-            // Interruptions
-            hub.record_feedback(FeedbackSignal::new(SignalType::Interruption).with_turn("turn-1"));
-        }
-
-        // Trigger tuning cycle
-        {
-            let mut guard = session.write().unwrap();
-            guard.turn_number = 10;
-        }
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-
-        let config_before = {
-            let guard = session.read().unwrap();
-            guard.config.clone()
-        };
-
-        maybe_run_tuning_cycle(&mut state);
-
-        let config_after = {
-            let guard = session.read().unwrap();
-            guard.config.clone()
-        };
-
-        // At least some rules should have fired
-        let executions = hub.tuning().get_executions();
-        assert!(
-            !executions.is_empty(),
-            "at least some rules should fire with diverse feedback signals"
-        );
-
-        // Config should still be valid (no corruption from multiple simultaneous adjustments)
-        assert!(config_after.token_budget.max_turn_input_tokens >= 10_000);
-        assert!(config_after.token_budget.max_turn_input_tokens <= 500_000);
-        assert!(config_after.memory.retrieval_top_k >= 1);
-        assert!(config_after.memory.retrieval_top_k <= 50);
-
-        // Verify that config actually changed (at least one rule had an effect)
-        let budget_changed = config_before.token_budget.max_turn_input_tokens
-            != config_after.token_budget.max_turn_input_tokens;
-        let memory_changed =
-            config_before.memory.retrieval_top_k != config_after.memory.retrieval_top_k;
-        let _some_change = budget_changed || memory_changed;
-
-        // No panic, no corruption — all rules composed successfully
-    }
-
-    #[test]
-    fn retry_signal_emitted_on_consecutive_identical_tool_calls() {
-        let hub = make_hub();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.stall.tool_call_records = vec![
-            astra_services::session_journal::ToolCallRecord {
-                name: "bash".into(),
-                ok: false,
-                ms: 100,
-                error: Some("exit code 1".into()),
-                input_bytes: None,
-                output_bytes: None,
-                args_preview: Some("npm test".into()),
-                result_preview: None,
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            },
-            astra_services::session_journal::ToolCallRecord {
-                name: "bash".into(),
-                ok: false,
-                ms: 100,
-                error: Some("exit code 1".into()),
-                input_bytes: None,
-                output_bytes: None,
-                args_preview: Some("npm test".into()),
-                result_preview: None,
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            },
-        ];
-
-        let result = Ok(AgenticLoopOutcome::Completed);
-        record_loop_completion_feedback(&mut state, &result);
-
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        // Add a rule that triggers on high retry rate.
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "retry-trigger",
-                astra_learning::auto_tuning::EvolutionTrigger::HighRetryRate {
-                    threshold: 0.3,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "retries detected".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            !triggered.is_empty(),
-            "consecutive identical tool calls should emit Retry signal"
-        );
-    }
-
-    #[test]
-    fn acceptance_signal_emitted_when_no_correction() {
-        let hub = make_hub();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.message = "thanks, looks good".into();
-        state.messages =
-            vec![serde_json::json!({"role": "assistant", "content": "here is the code"})];
-
-        let result = Ok(AgenticLoopOutcome::Completed);
-        record_loop_completion_feedback(&mut state, &result);
-
-        // Verify Acceptance signal was recorded — check success rate.
-        // Acceptance + TaskSuccess = 2 successes, both positive.
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "high-success-check",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.5,
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "acceptance".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
-                },
-            ));
-        let triggered = hub.tuning().evaluate(&config);
-        // With Acceptance + TaskSuccess = 100% success rate, LowSuccessRate (0.5) should NOT trigger.
-        assert!(
-            triggered.is_empty(),
-            "acceptance + task success should keep success rate high"
-        );
-    }
-
-    #[test]
-    fn no_acceptance_signal_when_correction_detected() {
-        let hub = make_hub();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.message = "no that's wrong, please fix it".into();
-        state.messages =
-            vec![serde_json::json!({"role": "assistant", "content": "here is the code"})];
-
-        let result = Ok(AgenticLoopOutcome::Completed);
-        record_loop_completion_feedback(&mut state, &result);
-
-        // Only TaskSuccess should be recorded (no Acceptance because "wrong" is a correction keyword).
-        // We can verify by checking there's only 1 signal.
-        let config = astra_config::runtime_config::RuntimeConfig::default();
-        hub.tuning()
-            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
-                "success-check",
-                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 1.1, // impossible to reach — we're just counting signals
-                    window_secs: 3600,
-                    min_samples: 1,
-                },
-                astra_learning::auto_tuning::EvolutionAction::Alert {
-                    message: "check".into(),
-                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
-                },
-            ));
-        // This would trigger if there's any signal below the impossible threshold.
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            !triggered.is_empty(),
-            "TaskSuccess alone with threshold 1.1 should trigger (success rate < 1.1)"
+            signals.iter().all(|signal| !matches!(
+                signal.signal_type,
+                astra_core::feedback::SignalType::ToolChurn { .. }
+            )),
+            "{signals:?}"
         );
     }
 
@@ -8744,124 +7432,13 @@ print(json.dumps({'context': 'user said: ' + msg}))
             "3 consecutive errors should produce tactical actions, got none"
         );
 
-        let hint_parts = apply_tactical_actions(&mut state, &step_actions);
-
-        assert!(!hint_parts.is_empty(), "Should produce non-empty hint text");
-    }
-
-    #[test]
-    fn tactical_actions_apply_bounded_runtime_mutations() {
-        use astra_turn_core::liquid_tactical::TacticalAction;
-
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_session = Some(session.clone());
-        state.max_turn_input_tokens = 100_000;
-        state.tool_budget_override = Some(1000);
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.verification.strictness = 0.5;
-            guard.config.verification.max_strictness = 0.9;
-            guard.config.compression.compression_threshold = 0.8;
-            guard.config.context_window.compression_threshold_min = 0.5;
-            guard.config.tool_selection.tool_budget_tokens = 1000;
-            guard.config.token_budget.max_turn_input_tokens = 100_000;
-        }
-
-        let hints = apply_tactical_actions(
-            &mut state,
-            &[
-                TacticalAction::IncreaseVerification {
-                    reason: "3 consecutive errors".into(),
-                },
-                TacticalAction::SuggestToolSwitch {
-                    from_tool: "bash".into(),
-                    reason: "repeated failures".into(),
-                },
-                TacticalAction::TokenBudgetWarning {
-                    used: 90_000,
-                    budget: 100_000,
-                },
-                TacticalAction::ThrottleHint {
-                    reason: "latency spike".into(),
-                },
-            ],
-        );
-
-        let guard = session.read().unwrap();
-        assert!(guard.config.verification.strictness > 0.5);
-        assert!(state.turn_guard.health.is_avoidance_advised("bash"));
-        assert_eq!(state.tool_budget_override, Some(850));
-        assert!(guard.config.compression.compression_threshold < 0.8);
-        assert!(guard.config.token_budget.max_turn_input_tokens < 100_000);
-        assert_eq!(
-            state.max_turn_input_tokens,
-            guard.config.token_budget.max_turn_input_tokens as u64
-        );
-        assert!(!hints.is_empty());
-    }
-
-    #[test]
-    fn tactical_budget_mutations_survive_next_adaptive_profile_application() {
-        use astra_turn_core::liquid_tactical::TacticalAction;
-
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-        state.message = "fix the failing bug in the parser".into();
-
-        {
-            let mut guard = session.write().unwrap();
-            for _ in 0..5 {
-                guard.record_query("fix the failing bug in the parser");
-            }
-            guard.config.context_window.adaptive = true;
-            guard.config.tool_selection.tool_budget_tokens = 1100;
-            guard.config.token_budget.max_turn_input_tokens = 100_000;
-            guard.config.compression.compression_threshold = 0.8;
-            guard.config.context_window.compression_threshold_min = 0.5;
-        }
-
-        apply_tactical_actions(
-            &mut state,
-            &[
-                TacticalAction::TokenBudgetWarning {
-                    used: 90_000,
-                    budget: 100_000,
-                },
-                TacticalAction::ThrottleHint {
-                    reason: "latency spike".into(),
-                },
-            ],
-        );
-
-        let lowered_tool_budget = state.tool_budget_override.expect("tool budget override");
-        let lowered_turn_budget = state.max_turn_input_tokens;
-        assert!(lowered_tool_budget < 1100);
-        assert!(lowered_turn_budget < 100_000);
-
-        apply_adaptive_execution_profile_with_intent(&mut state, None);
-
-        let guard = session.read().unwrap();
-        assert_eq!(
-            state.tool_budget_override,
-            Some(lowered_tool_budget),
-            "scenario profile should not wipe tactical tool budget reductions"
-        );
-        assert_eq!(
-            state.max_turn_input_tokens, lowered_turn_budget,
-            "scenario profile should not wipe tactical turn budget reductions"
-        );
-        assert_eq!(
-            guard.config.tool_selection.tool_budget_tokens, lowered_tool_budget,
-            "session config should retain tactical tool budget reductions across turns"
-        );
-        assert_eq!(
-            guard.config.token_budget.max_turn_input_tokens, lowered_turn_budget as u32,
-            "session config should retain tactical turn budget reductions across turns"
+        assert!(
+            step_actions.iter().any(|action| matches!(
+                action,
+                TacticalAction::IncreaseVerification { .. }
+                    | TacticalAction::SuggestToolSwitch { .. }
+            )),
+            "repeated failures should produce an actionable tactical response: {step_actions:?}"
         );
     }
 
@@ -9715,6 +8292,8 @@ mod parallel_execution_tests {
     fn tool_call_json_named(name: &str, id: &str) -> Value {
         let arguments = if name == "bash" {
             json!({"command": "true"})
+        } else if name == "git" {
+            json!({"action": "diff", "path": format!("/tmp/{id}.txt")})
         } else {
             json!({"path": format!("/tmp/{name}.txt")})
         };
@@ -9865,7 +8444,7 @@ mod parallel_execution_tests {
     /// Unit test for partition_tool_batches.
     #[test]
     fn partition_tool_batches_groups_correctly() {
-        use crate::turn::agentic::headless_round::{partition_tool_batches, ToolBatch};
+        use crate::turn::agentic::headless_round::{ToolBatch, partition_tool_batches};
         use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
 
         let tool_calls = vec![
@@ -9873,7 +8452,7 @@ mod parallel_execution_tests {
             json!({"function": {"name": "grep"}}),
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "glob"}}),
-            json!({"function": {"name": "git_diff"}}),
+            json!({"function": {"name": "git", "arguments": "{\"action\":\"diff\"}"}}),
         ];
         let indices: Vec<HeadlessRoundToolIdx> =
             (0..5).map(HeadlessRoundToolIdx::ServerToolCall).collect();

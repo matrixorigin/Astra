@@ -804,62 +804,67 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
-        let args_str = serde_json::to_string(&execution.args).ok();
-        let permission_context = self.ctx.permission_context;
-        let effective_permission_timeout = self.ctx.effective_permission_timeout;
-        let mailbox = self.ctx.mailbox.as_deref_mut();
-        let plan_mode_active = self.ctx.plan_mode_active;
-        match crate::turn::permission_gate::check_tool_permission_in_plan_mode(
-            &execution.name,
-            args_str.as_deref(),
-            permission_context,
-            mailbox,
-            effective_permission_timeout,
-            plan_mode_active,
-        )
-        .await
-        {
-            PermissionCheckResult::Allowed => {}
-            PermissionCheckResult::AllowedImplicit { reason } => {
-                if !self.ctx.quiet {
-                    self.ctx.term.emit_line(
-                        HeadlessStderrStyle::Yellow,
-                        astra_turn_core::permission::notice::format_auto_approved_permission(
-                            &execution.name,
-                            &reason,
-                        ),
-                    );
+        if !execution.is_edge_tool {
+            let args_str = serde_json::to_string(&execution.args).ok();
+            let permission_context = self.ctx.permission_context;
+            let effective_permission_timeout = self.ctx.effective_permission_timeout;
+            let mailbox = self.ctx.mailbox.as_deref_mut();
+            let plan_mode_active = self.ctx.plan_mode_active;
+            match crate::turn::permission_gate::check_tool_permission_in_plan_mode(
+                &execution.name,
+                args_str.as_deref(),
+                permission_context,
+                mailbox,
+                effective_permission_timeout,
+                plan_mode_active,
+            )
+            .await
+            {
+                PermissionCheckResult::Allowed => {}
+                PermissionCheckResult::AllowedImplicit { reason } => {
+                    if !self.ctx.quiet {
+                        self.ctx.term.emit_line(
+                            HeadlessStderrStyle::Yellow,
+                            astra_turn_core::permission::notice::format_auto_approved_permission(
+                                &execution.name,
+                                &reason,
+                            ),
+                        );
+                    }
                 }
-            }
-            PermissionCheckResult::AllowedViaRequest { .. } => {
-                if !self.ctx.quiet {
-                    self.ctx.term.emit_line(
-                        HeadlessStderrStyle::Yellow,
-                        format!("  🔓 Permission granted by parent: {}", execution.name),
-                    );
+                PermissionCheckResult::AllowedViaRequest { .. } => {
+                    if !self.ctx.quiet {
+                        self.ctx.term.emit_line(
+                            HeadlessStderrStyle::Yellow,
+                            format!("  🔓 Permission granted by parent: {}", execution.name),
+                        );
+                    }
                 }
-            }
-            PermissionCheckResult::Denied { reason } => {
-                let err_msg = permission_denied_error_result(&execution.name, &reason);
-                emit_blocked_tool_result(
-                    HeadlessBlockedTool {
-                        id: &execution.id,
-                        name: &execution.name,
-                        args: &execution.args,
-                        reason_code: "permission_denied",
-                        err_msg,
-                        journal_reason: reason,
-                        early_exit_ms: execution.early_exit_ms,
-                        status_line: Some(format!("  🔒 Permission denied: {}", execution.name)),
-                    },
-                    self.ctx.step_recorder,
-                    self.ctx.quiet,
-                    self.ctx.term,
-                    self.ctx.messages,
-                    self.ctx.tool_results,
-                    self.ctx.tool_call_records,
-                );
-                return HeadlessPipelineStage::ShortCircuit;
+                PermissionCheckResult::Denied { reason } => {
+                    let err_msg = permission_denied_error_result(&execution.name, &reason);
+                    emit_blocked_tool_result(
+                        HeadlessBlockedTool {
+                            id: &execution.id,
+                            name: &execution.name,
+                            args: &execution.args,
+                            reason_code: "permission_denied",
+                            err_msg,
+                            journal_reason: reason,
+                            early_exit_ms: execution.early_exit_ms,
+                            status_line: Some(format!(
+                                "  🔒 Permission denied: {}",
+                                execution.name
+                            )),
+                        },
+                        self.ctx.step_recorder,
+                        self.ctx.quiet,
+                        self.ctx.term,
+                        self.ctx.messages,
+                        self.ctx.tool_results,
+                        self.ctx.tool_call_records,
+                    );
+                    return HeadlessPipelineStage::ShortCircuit;
+                }
             }
         }
 

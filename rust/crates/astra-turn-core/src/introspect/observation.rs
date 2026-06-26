@@ -398,32 +398,30 @@ fn build_introspect_observations(
                 }
             }
         }
-        ObservationFacet::Errors
-            if !snapshot.tool_errors.is_empty() => {
-                observations.push(ObservationRecord {
-                    ref_id: "urn:astra:observation:local:introspect:errors:recent".to_string(),
-                    topic: request.topic.as_str().to_string(),
-                    facet: request.facet.as_str().to_string(),
-                    kind: "tool_failure_cluster".to_string(),
-                    severity: "warning".to_string(),
-                    summary: format!("{} recent tool errors recorded", snapshot.tool_errors.len()),
-                    confidence: ObservationConfidence::evidence(0.85),
-                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
-                });
-            }
-        ObservationFacet::Stall
-            if snapshot.stall_state.nudge_count > 0 => {
-                observations.push(ObservationRecord {
-                    ref_id: "urn:astra:observation:local:introspect:stall:state".to_string(),
-                    topic: request.topic.as_str().to_string(),
-                    facet: request.facet.as_str().to_string(),
-                    kind: "stall_telemetry".to_string(),
-                    severity: "info".to_string(),
-                    summary: format!("stall nudge count: {}", snapshot.stall_state.nudge_count),
-                    confidence: ObservationConfidence::evidence(0.90),
-                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
-                });
-            }
+        ObservationFacet::Errors if !snapshot.tool_errors.is_empty() => {
+            observations.push(ObservationRecord {
+                ref_id: "urn:astra:observation:local:introspect:errors:recent".to_string(),
+                topic: request.topic.as_str().to_string(),
+                facet: request.facet.as_str().to_string(),
+                kind: "tool_failure_cluster".to_string(),
+                severity: "warning".to_string(),
+                summary: format!("{} recent tool errors recorded", snapshot.tool_errors.len()),
+                confidence: ObservationConfidence::evidence(0.85),
+                evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+            });
+        }
+        ObservationFacet::Stall if snapshot.stall_state.nudge_count > 0 => {
+            observations.push(ObservationRecord {
+                ref_id: "urn:astra:observation:local:introspect:stall:state".to_string(),
+                topic: request.topic.as_str().to_string(),
+                facet: request.facet.as_str().to_string(),
+                kind: "stall_telemetry".to_string(),
+                severity: "info".to_string(),
+                summary: format!("stall nudge count: {}", snapshot.stall_state.nudge_count),
+                confidence: ObservationConfidence::evidence(0.90),
+                evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+            });
+        }
         _ => {}
     }
 

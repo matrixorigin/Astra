@@ -97,12 +97,13 @@ impl DelegationOutcomeTracker {
             }
         }
         if let Some((scenario, pattern, _)) = worst
-            && let Some(inner) = data.get_mut(&scenario) {
-                inner.remove(&pattern);
-                if inner.is_empty() {
-                    data.remove(&scenario);
-                }
+            && let Some(inner) = data.get_mut(&scenario)
+        {
+            inner.remove(&pattern);
+            if inner.is_empty() {
+                data.remove(&scenario);
             }
+        }
     }
 
     /// Record a delegation outcome. Auto-persists and enforces capacity bounds.

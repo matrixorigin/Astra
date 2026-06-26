@@ -103,9 +103,7 @@ fn every_catalog_tool_has_schema() {
     // This list is self-validated below — if a tool listed here gains a static
     // schema or is removed from the catalog, the test will catch it.
     // `skill` embeds the live skill catalog and is generated per session.
-    // `reflect` is a CLI-local observation facade; the server has HTTP reflect
-    // routes, not a globally executable model-facing reflect tool.
-    const DYNAMIC_SCHEMA_TOOLS: &[&str] = &["skill", "reflect"];
+    const DYNAMIC_SCHEMA_TOOLS: &[&str] = &["skill"];
 
     let schemas = all_tool_schemas();
     let schema_names: std::collections::HashSet<&str> = schemas

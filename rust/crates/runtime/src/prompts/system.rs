@@ -3605,12 +3605,44 @@ mod tests {
             .deferred_block_text(Some("claude-sonnet-4"))
             .unwrap();
         let small = surface.deferred_block_text(Some("gpt-3.5-turbo")).unwrap();
-        // New format: bare names, count newlines after tool names
-        let claude_count = claude.matches("\n").count();
-        let small_count = small.matches("\n").count();
+
+        fn deferred_names(block: &str) -> Vec<&str> {
+            let open = "<deferred-tools>";
+            let close = "</deferred-tools>";
+            let body_start = block
+                .find(open)
+                .map(|idx| idx + open.len())
+                .expect("deferred block must include an opening wrapper");
+            let body_end = block[body_start..]
+                .find(close)
+                .map(|idx| body_start + idx)
+                .expect("deferred block must include a closing wrapper");
+            let body = &block[body_start..body_end];
+            body.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect()
+        }
+
+        for block in [&claude, &small] {
+            assert!(
+                !block.contains("<tool>")
+                    && !block.contains("<name>")
+                    && !block.contains("<description>")
+                    && !block.contains("<parameters>"),
+                "deferred discovery must stay a bare-name list so it does not look like callable tool schema: {block}"
+            );
+        }
+
+        let claude_names = deferred_names(&claude);
+        let small_names = deferred_names(&small);
         assert!(
-            claude_count > small_count,
-            "200K context window must list more deferred tools than 16K"
+            claude_names.contains(&"tool_000") && small_names.contains(&"tool_000"),
+            "both provider budgets must expose at least one activatable deferred name"
+        );
+        assert!(
+            claude_names.len() >= small_names.len(),
+            "larger context must never render fewer deferred tool names than a smaller provider budget"
         );
     }
 

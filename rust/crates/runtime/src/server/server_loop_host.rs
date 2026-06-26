@@ -5054,6 +5054,20 @@ mod tests {
             .join("\n")
     }
 
+    fn deferred_block_body_text(text: &str) -> &str {
+        let open = "<deferred-tools>";
+        let close = "</deferred-tools>";
+        let body_start = text
+            .find(open)
+            .map(|idx| idx + open.len())
+            .unwrap_or_else(|| panic!("missing deferred tools block in {text}"));
+        let body_end = text[body_start..]
+            .find(close)
+            .map(|idx| body_start + idx)
+            .unwrap_or_else(|| panic!("unterminated deferred tools block in {text}"));
+        &text[body_start..body_end]
+    }
+
     #[test]
     fn llm_request_dump_failures_are_not_silently_ignored() {
         let source = include_str!("server_loop_host.rs");
@@ -5810,9 +5824,10 @@ mod tests {
             text.contains("<deferred-tools>") && text.contains("github"),
             "prompt must keep the still-activatable deferred tool: {text}"
         );
+        let deferred_body = deferred_block_body_text(&text);
         assert!(
-            !text.contains("bash"),
-            "prompt must filter names that are already visible in tools[]: {text}"
+            !deferred_body.lines().any(|line| line.trim() == "bash"),
+            "prompt must filter names that are already visible in tools[]: {deferred_body}"
         );
     }
 
@@ -6008,15 +6023,11 @@ mod tests {
             })])
             .await;
         assert_eq!(direct_results.len(), 1);
+        assert_eq!(direct_results[0].status, "failed");
         assert!(
-            direct_results[0]
-                .output
-                .contains("full schema has not been loaded yet")
-                && direct_results[0].output.contains("select:github")
-                && direct_results[0]
-                    .output
-                    .contains("The arguments from this attempt were not executed"),
-            "direct call to deferred-only github must recover as activation without executing guessed args: {:?}",
+            direct_results[0].output.contains("select:github")
+                && direct_results[0].output.contains("not executed"),
+            "direct call to deferred-only github must return a non-executing activation hint: {:?}",
             direct_results[0]
         );
         assert_eq!(
@@ -7565,6 +7576,7 @@ mod tests {
                 astra_turn_core::pipeline_config::PipelineConfig::default(),
             )),
             message: "test query".to_string(),
+            has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
@@ -7597,6 +7609,7 @@ mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

@@ -401,7 +401,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
-            widen_surface_pending: false,
+            widen_selection_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -462,6 +462,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             ),
             message: config.task.clone(),
             recent_tools: Vec::new(),
+            has_prior_assistant_turn: false,
             task_profile,
             last_turn_policy:
                 astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
@@ -480,7 +481,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            always_load_tool_schema_tokens: 0,
+            pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -494,6 +495,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

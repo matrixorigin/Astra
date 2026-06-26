@@ -61,7 +61,7 @@
 use std::collections::HashSet;
 
 use super::agentic_loop::host::{
-    run_agentic_loop_with_host, AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host,
 };
 
 // ─── Wait reason ─────────────────────────────────────────────────────────────
@@ -196,8 +196,8 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use tokio_util::sync::CancellationToken;
 
     // ── Test host ────────────────────────────────────────────────────────────
@@ -320,8 +320,10 @@ mod tests {
             )),
             message: message.to_string(),
             recent_tools: Vec::new(),
+            has_prior_assistant_turn: false,
             task_profile: TaskExecutionProfile::default(),
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
+            runtime_manifest: None,
             api: astra_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),
             api_token: "test".to_string(),
             delegation_engine: None,

@@ -3344,6 +3344,7 @@ impl AgenticRunLifecycleService {
             ),
             message: request.message.clone(),
             recent_tools: Vec::new(),
+            has_prior_assistant_turn: false,
             task_profile,
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
@@ -3376,6 +3377,7 @@ impl AgenticRunLifecycleService {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -7238,6 +7240,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             ),
             message: full_task,
             recent_tools: Vec::new(),
+            has_prior_assistant_turn: false,
             task_profile,
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
@@ -7270,6 +7273,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

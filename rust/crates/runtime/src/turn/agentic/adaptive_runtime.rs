@@ -8,30 +8,7 @@
 
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
-
 use super::super::agentic_loop::host::{AgenticLoopOutcome, AgenticLoopState};
-
-pub(crate) const MAX_RECENT_TACTICAL_ACTIONS: usize = 8;
-
-/// Decide whether to emit an adaptive scenario event based on change signals.
-pub(crate) fn should_emit_adaptive_scenario_event(
-    scenario_changed: bool,
-    scenario_suppressed: bool,
-    config_changes_empty: bool,
-) -> bool {
-    !scenario_suppressed && (scenario_changed || !config_changes_empty)
-}
-
-/// Pure function to shrink a u32 budget by a percentage with a floor.
-/// Used by future tuning jobs for budget calculations.
-fn shrink_u32_budget(current: u32, percent: u32, floor: u32) -> u32 {
-    let retained = 100_u32.saturating_sub(percent.min(100));
-    current
-        .saturating_mul(retained)
-        .saturating_div(100)
-        .max(floor)
-}
 
 fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
     if state.stall.tool_call_records.is_empty() {
@@ -52,19 +29,6 @@ fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
     }
 
     (tool_calls, unique_tools.len() as u32)
-}
-
-fn write_session_journal_event(
-    state: &AgenticLoopState,
-    event: astra_services::session_journal::JournalEvent,
-) {
-    let Some(session_id) = state.current_session_id.as_deref() else {
-        return;
-    };
-    let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) else {
-        return;
-    };
-    let _ = writer.append(&event);
 }
 
 /// Decide whether the current user message implicitly accepts the previous

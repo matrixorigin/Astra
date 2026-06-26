@@ -824,11 +824,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permit_execution_without_permission_context_denies() {
+    async fn permit_server_execution_without_permission_context_denies() {
         let mut harness = PipelineHarness::new();
         harness.permission_context = None;
+        harness.tool_calls = vec![json!({
+            "id": "call-grep",
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "arguments": r#"{"pattern":"headless"}"#
+            }
+        })];
+        harness.edge_tool_round.clear();
         let mut pipeline = harness.pipeline();
-        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
             HeadlessPipelineStage::Continue(validated) => validated,
             _ => panic!("expected validated execution"),
         };
@@ -847,6 +856,25 @@ mod tests {
             error.contains("no permission context configured"),
             "expected actionable missing-context denial, got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn permit_edge_execution_without_local_permission_context_uses_edge_result() {
+        let mut harness = PipelineHarness::new();
+        harness.permission_context = None;
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated edge execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => {
+                assert_eq!(permitted.execution.name, "grep");
+                assert!(permitted.execution.is_edge_tool);
+            }
+            _ => panic!("edge results with runtime advertisement must not be denied locally"),
+        }
     }
 
     #[tokio::test]
@@ -1841,7 +1869,7 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            body.contains("called directly")
+            body.contains("requires `tool_search` activation first")
                 && body.contains("select:github")
                 && body.contains("not executed"),
             "direct deferred call must become a non-executing activation hint; got: {body}"
