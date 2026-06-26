@@ -187,7 +187,6 @@ fn normalize_topic(topic: &str) -> String {
         "runtime" => "runtime".to_string(),
         "execution" => "execution".to_string(),
         "knowledge" => "knowledge".to_string(),
-        "adaptation" => "adaptation".to_string(),
         _ => "overview".to_string(),
     }
 }
@@ -243,7 +242,6 @@ fn default_reflect_facet_for_topic(topic: &str) -> &'static str {
         "runtime" => "performance",
         "execution" => "tools",
         "knowledge" => "context",
-        "adaptation" => "signals",
         _ => "overview",
     }
 }

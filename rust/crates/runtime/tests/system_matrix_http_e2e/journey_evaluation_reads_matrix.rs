@@ -67,11 +67,5 @@ pub async fn run_evaluation_read_http_smoke() {
     let (st_obs, obs_j) = get_json(&ctx.app, &obs_path, None, xuid).await;
     assert_eq!(st_obs, StatusCode::OK, "observability: {obs_j}");
 
-    let (st_learn_h, learn_h) = get_json(&ctx.app, "/api/v1/learning/health", None, &[]).await;
-    assert_eq!(st_learn_h, StatusCode::OK, "learning health: {learn_h}");
-
-    let (st_sig, sig) = get_json(&ctx.app, "/api/v1/learning/signals", Some(auth), &[]).await;
-    assert_eq!(st_sig, StatusCode::OK, "learning signals: {sig}");
-
     b.ctx.pool.close().await;
 }

@@ -196,7 +196,7 @@ Recommended runtime shape:
 The command should not run a long optimization loop synchronously in the chat
 turn. It should create or resume durable work, then return a job id and current
 status. The agent or user can inspect progress through `/tuning status`,
-`/tuning list`, `reflect(topic="adaptation", facet="measurements")`, or a UI
+`/tuning list`, a future adaptation-measurement reflect provider, or a UI
 panel.
 
 Do not force tuning into the generic task schema if that hides domain structure.
@@ -700,9 +700,8 @@ When the budget is exhausted, the job should finish with `rejected` or
 | `blocked` | Job needs user input or missing harness/data |
 | `failed` | Infrastructure or harness failure |
 
-State transitions must be evented so
-`reflect(topic="adaptation", facet="measurements")` can explain where the job
-stands and why.
+State transitions must be evented so future reflect measurement views can
+explain where the job stands and why.
 
 `phase` should stay coarse and mostly linear. `conditions` carry richer,
 composable status such as `AwaitingApproval`, `BudgetExhausted`,
@@ -1344,8 +1343,8 @@ user says result is wrong
 ### Skill Improvement
 
 ```text
-reflect(topic="adaptation", facet="signals", horizon="session", depth="forensic")
--> signal: skill_patch for repeated bad skill guidance
+reflect(topic="execution", facet="errors", horizon="session", depth="forensic")
+-> selected failure refs show repeated bad skill guidance
 -> feedback service opens skill patch proposal
 -> review workflow approves
 -> skill registry updates version

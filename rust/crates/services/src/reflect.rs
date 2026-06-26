@@ -54,10 +54,6 @@ pub struct ReflectReport {
     /// Statistical insights (secondary)
     pub insights: Vec<Insight>,
     pub recommendations: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reflection_context: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_preview: Option<String>,
 }
 
 // Type aliases removed — use Observation* types from astra_core directly
@@ -634,140 +630,6 @@ pub fn generate_recommendations(
     recs
 }
 
-fn build_reflection_context_value(
-    session_id: &str,
-    overview: &SessionOverview,
-    diagnoses: &[Diagnosis],
-    insights: &[Insight],
-    recommendations: &[String],
-) -> serde_json::Value {
-    let mut signals = Vec::new();
-    for diag in diagnoses.iter().take(6) {
-        signals.push(serde_json::json!({
-            "kind": diag.category.to_string(),
-            "detail": diag.summary,
-            "skill_context": if diag.affected_tool.is_empty() || diag.affected_tool == "unknown" {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(diag.affected_tool.clone())
-            },
-            "turn_id": "server",
-        }));
-    }
-    for insight in insights.iter().filter(|insight| insight.severity != "info") {
-        if signals.len() >= 6 {
-            break;
-        }
-        let detail = if insight.evidence.is_empty() {
-            insight.message.clone()
-        } else {
-            format!("{} — {}", insight.message, insight.evidence)
-        };
-        signals.push(serde_json::json!({
-            "kind": insight.category,
-            "detail": detail,
-            "skill_context": serde_json::Value::Null,
-            "turn_id": "server",
-        }));
-    }
-
-    let mut by_tool: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    for diag in diagnoses {
-        if diag.affected_tool.is_empty() || diag.affected_tool == "unknown" {
-            continue;
-        }
-        *by_tool.entry(diag.affected_tool.clone()).or_default() += diag.occurrences;
-    }
-    let mut tool_stats = by_tool
-        .into_iter()
-        .map(|(tool_name, failures)| {
-            serde_json::json!({
-                "tool_name": tool_name,
-                "calls": failures,
-                "failures": failures,
-                "avg_latency_ms": 0,
-            })
-        })
-        .collect::<Vec<_>>();
-    tool_stats.sort_by(|a, b| {
-        b["failures"]
-            .as_i64()
-            .unwrap_or_default()
-            .cmp(&a["failures"].as_i64().unwrap_or_default())
-    });
-    tool_stats.truncate(8);
-
-    serde_json::json!({
-        "session_id": session_id,
-        "turns_completed": overview.total_decisions.max(0),
-        "scenario": serde_json::Value::Null,
-        "signals": signals,
-        "active_experiment": serde_json::Value::Null,
-        "tool_stats": tool_stats,
-        "token_utilisation": 0.0,
-        "recent_tactical_actions": recommendations.iter().take(6).cloned().collect::<Vec<_>>(),
-    })
-}
-
-fn render_reflection_prompt_preview(
-    session_id: &str,
-    analysis_view: &str,
-    question: &str,
-    context: &serde_json::Value,
-) -> String {
-    let mut lines = vec![
-        format!("Session: {session_id}"),
-        format!("Analysis view: {analysis_view}"),
-        format!(
-            "Turns completed: {}",
-            context["turns_completed"].as_i64().unwrap_or_default()
-        ),
-    ];
-    if !question.trim().is_empty() {
-        lines.push(format!("Question: {}", question.trim()));
-    }
-
-    if let Some(tool_stats) = context["tool_stats"]
-        .as_array()
-        .filter(|stats| !stats.is_empty())
-    {
-        lines.push("Tool pressure:".to_string());
-        for stat in tool_stats.iter().take(4) {
-            lines.push(format!(
-                "- {}: {} failures",
-                stat["tool_name"].as_str().unwrap_or("unknown"),
-                stat["failures"].as_i64().unwrap_or_default()
-            ));
-        }
-    }
-
-    if let Some(signals) = context["signals"]
-        .as_array()
-        .filter(|signals| !signals.is_empty())
-    {
-        lines.push("Signals:".to_string());
-        for signal in signals.iter().take(4) {
-            lines.push(format!(
-                "- {}: {}",
-                signal["kind"].as_str().unwrap_or("signal"),
-                signal["detail"].as_str().unwrap_or("")
-            ));
-        }
-    }
-
-    if let Some(actions) = context["recent_tactical_actions"]
-        .as_array()
-        .filter(|actions| !actions.is_empty())
-    {
-        lines.push("Recent tactical actions:".to_string());
-        for action in actions.iter().take(4).filter_map(serde_json::Value::as_str) {
-            lines.push(format!("- {action}"));
-        }
-    }
-
-    lines.join("\n")
-}
-
 // ── Database implementation ──────────────────────────────────────────────────
 
 pub struct DatabaseReflectService {
@@ -842,10 +704,6 @@ impl DatabaseReflectService {
             })
             .collect();
 
-        if decisions.is_empty() {
-            return Ok(None);
-        }
-
         let event_limit = std::cmp::max(decision_limit * 10, 50);
         let event_rows = query(
             "SELECT event_id, event_type, \
@@ -876,15 +734,6 @@ impl DatabaseReflectService {
             })
             .collect();
 
-        let decision_event_ids: std::collections::HashSet<String> = decisions
-            .iter()
-            .map(|decision| decision.event_id.clone())
-            .collect();
-        let relevant_chain_ids: std::collections::HashSet<String> = recent_events
-            .iter()
-            .filter(|event| decision_event_ids.contains(&event.event_id))
-            .filter_map(|event| event.causal_chain_id.clone())
-            .collect();
         let parent_id_map = crate::storage::load_agent_event_parent_ids(
             pool,
             &recent_events
@@ -895,30 +744,8 @@ impl DatabaseReflectService {
         .await
         .map_err(|e| internal_error(format!("evidence graph parent query: {e}")))?;
 
-        let filtered_events: Vec<EvidenceEvent> = recent_events
-            .into_iter()
-            .filter(|event| {
-                decision_event_ids.contains(&event.event_id)
-                    || event
-                        .parent_event_id
-                        .as_ref()
-                        .map(|parent_event_id| decision_event_ids.contains(parent_event_id))
-                        .unwrap_or(false)
-                    || event
-                        .causal_chain_id
-                        .as_ref()
-                        .map(|causal_chain_id| relevant_chain_ids.contains(causal_chain_id))
-                        .unwrap_or(false)
-                    || parent_id_map
-                        .get(&event.event_id)
-                        .map(|parent_ids| {
-                            parent_ids
-                                .iter()
-                                .any(|parent_event_id| decision_event_ids.contains(parent_event_id))
-                        })
-                        .unwrap_or(false)
-            })
-            .collect();
+        let filtered_events =
+            filter_evidence_events_for_graph(&decisions, recent_events, &parent_id_map);
 
         Ok(build_evidence_graph(
             &decisions,
@@ -926,6 +753,51 @@ impl DatabaseReflectService {
             &parent_id_map,
         ))
     }
+}
+
+fn filter_evidence_events_for_graph(
+    decisions: &[EvidenceDecision],
+    recent_events: Vec<EvidenceEvent>,
+    parent_id_map: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<EvidenceEvent> {
+    if decisions.is_empty() {
+        return recent_events;
+    }
+
+    let decision_event_ids: std::collections::HashSet<String> = decisions
+        .iter()
+        .map(|decision| decision.event_id.clone())
+        .collect();
+    let relevant_chain_ids: std::collections::HashSet<String> = recent_events
+        .iter()
+        .filter(|event| decision_event_ids.contains(&event.event_id))
+        .filter_map(|event| event.causal_chain_id.clone())
+        .collect();
+
+    recent_events
+        .into_iter()
+        .filter(|event| {
+            decision_event_ids.contains(&event.event_id)
+                || event
+                    .parent_event_id
+                    .as_ref()
+                    .map(|parent_event_id| decision_event_ids.contains(parent_event_id))
+                    .unwrap_or(false)
+                || event
+                    .causal_chain_id
+                    .as_ref()
+                    .map(|causal_chain_id| relevant_chain_ids.contains(causal_chain_id))
+                    .unwrap_or(false)
+                || parent_id_map
+                    .get(&event.event_id)
+                    .map(|parent_ids| {
+                        parent_ids
+                            .iter()
+                            .any(|parent_event_id| decision_event_ids.contains(parent_event_id))
+                    })
+                    .unwrap_or(false)
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -1138,19 +1010,6 @@ impl ReflectService for DatabaseReflectService {
 
         let insights = generate_insights(&overview, &error_patterns, &decision_aggs);
         let recommendations = generate_recommendations(&overview, &diagnoses, &insights);
-        let reflection_context = build_reflection_context_value(
-            session_id,
-            &overview,
-            &diagnoses,
-            &insights,
-            &recommendations,
-        );
-        let prompt_preview = render_reflection_prompt_preview(
-            session_id,
-            &request.analysis_view,
-            &request.question,
-            &reflection_context,
-        );
         let raw_evidence_graph = self
             .build_recent_evidence_graph(
                 &pool,
@@ -1204,8 +1063,6 @@ impl ReflectService for DatabaseReflectService {
             diagnoses,
             insights,
             recommendations,
-            reflection_context: Some(reflection_context),
-            prompt_preview: Some(prompt_preview),
         })
     }
 }
@@ -2157,14 +2014,6 @@ mod tests {
 
     #[test]
     fn report_serialization_roundtrip() {
-        let reflection_context = serde_json::json!({
-            "session_id": "test-sess",
-            "turns_completed": 2,
-            "tool_stats": [{"tool_name": "bash", "calls": 3, "failures": 3, "avg_latency_ms": 0}],
-            "signals": [{"kind": "resource_limit", "detail": "fork failed", "skill_context": "bash", "turn_id": "server"}],
-            "recent_tactical_actions": ["check ulimit -u"],
-            "token_utilisation": 0.0
-        });
         let data_coverage = ObservationDataCoverage {
             overall: "fresh".into(),
             source: "server_db".into(),
@@ -2250,8 +2099,6 @@ mod tests {
                 evidence: "test evidence".into(),
             }],
             recommendations: vec!["do something".into()],
-            reflection_context: Some(reflection_context),
-            prompt_preview: Some("Session: test-sess".into()),
         };
         assert_refs_are_valid(
             &report.observations,
@@ -2286,6 +2133,14 @@ mod tests {
         assert!(
             json_value.get("evidence_graph").is_none(),
             "legacy evidence_graph must not be part of the public reflect report"
+        );
+        assert!(
+            json_value.get("reflection_context").is_none(),
+            "legacy reflection_context must not be part of the public reflect report"
+        );
+        assert!(
+            json_value.get("prompt_preview").is_none(),
+            "legacy prompt_preview must not be part of the public reflect report"
         );
         let parsed: ReflectReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, parsed);
@@ -2340,44 +2195,45 @@ mod tests {
     }
 
     #[test]
-    fn reflect_shape_helpers_build_local_compatible_fields() {
-        let overview = make_overview(10, 2, vec![("bash".into(), 8)], 3, Some(5.0));
-        let diagnoses = vec![Diagnosis {
-            category: astra_core::ErrorKind::ToolTimeout,
-            severity: "warning".into(),
-            summary: "bash timed out".into(),
-            samples: vec!["command timed out".into()],
-            occurrences: 2,
-            affected_tool: "bash".into(),
-            fix_hint: "narrow the command scope".into(),
-        }];
-        let insights = vec![Insight {
-            severity: "warning".into(),
-            category: "performance".into(),
-            message: "slow turn".into(),
-            evidence: "2 timeouts".into(),
-        }];
-        let recommendations = vec!["narrow the command scope".to_string()];
+    fn evidence_graph_keeps_event_only_failure_chains() {
+        let events = vec![
+            EvidenceEvent {
+                event_id: "evt-call".into(),
+                event_type: "tool_call".into(),
+                content: "run bash".into(),
+                skill_name: Some("bash".into()),
+                parent_event_id: None,
+                causal_chain_id: Some("chain-1".into()),
+                created_at: "2026-04-12T10:00:00".into(),
+            },
+            EvidenceEvent {
+                event_id: "evt-error".into(),
+                event_type: "tool_error".into(),
+                content: "permission denied".into(),
+                skill_name: Some("bash".into()),
+                parent_event_id: Some("evt-call".into()),
+                causal_chain_id: Some("chain-1".into()),
+                created_at: "2026-04-12T10:00:01".into(),
+            },
+        ];
+        let parent_id_map = std::collections::HashMap::from([(
+            "evt-error".to_string(),
+            vec!["evt-call".to_string()],
+        )]);
+        let filtered = filter_evidence_events_for_graph(&[], events, &parent_id_map);
 
-        let context = build_reflection_context_value(
-            "test-sess",
-            &overview,
-            &diagnoses,
-            &insights,
-            &recommendations,
-        );
-        let prompt = render_reflection_prompt_preview(
-            "test-sess",
-            "runtime_performance",
-            "why so slow?",
-            &context,
-        );
-
-        assert_eq!(context["session_id"], "test-sess");
-        assert_eq!(context["tool_stats"][0]["tool_name"], "bash");
-        assert_eq!(context["signals"][0]["kind"], "tool_timeout");
-        assert!(prompt.contains("Analysis view: runtime_performance"));
-        assert!(prompt.contains("Question: why so slow?"));
+        let graph = build_evidence_graph(&[], &filtered, &parent_id_map)
+            .expect("event-only failures still produce graph evidence");
+        assert_eq!(graph.nodes.len(), 2);
+        assert!(graph.nodes.iter().any(|node| {
+            node.ref_id == graph_event_ref("evt-error")
+                && node.kind == ObservationGraphNodeKind::Outcome
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == graph_event_ref("evt-call")
+                && edge.to == graph_event_ref("evt-error")
+                && edge.kind == ObservationGraphEdgeKind::Causes
+        }));
     }
 
     /// Validate that all GROUP BY queries only SELECT grouped columns or aggregate functions.

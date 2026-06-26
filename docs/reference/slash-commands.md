@@ -278,7 +278,6 @@ Examples:
 /reflect
 /reflect execution/errors diagnostic
 /reflect execution/trace forensic
-/reflect adaptation/signals
 ```
 
 ### `/turn` _(removed)_

@@ -1087,24 +1087,6 @@ pub async fn run_product_matrix_full_journey(
         "GET /models should return array: {models_j}"
     );
 
-    let (st_sig, sig) = get_json(
-        app,
-        "/api/v1/learning/signals",
-        Some(auth_header.as_str()),
-        &[],
-    )
-    .await;
-    assert_eq!(st_sig, StatusCode::OK, "learning signals: {sig}");
-
-    let (st_lrn_stats, lrn_stats) = get_json(
-        app,
-        "/api/v1/learning/stats",
-        Some(auth_header.as_str()),
-        &[],
-    )
-    .await;
-    assert_eq!(st_lrn_stats, StatusCode::OK, "learning stats: {lrn_stats}");
-
     let (st_drift, drift) = get_json(
         app,
         "/evaluation/drift",
@@ -1224,19 +1206,6 @@ pub async fn run_product_matrix_full_journey(
         Some(uq_event_id.as_str()),
         "llm_response should parent to user_query"
     );
-
-    let (st_fb, fb_j) = post_json(
-        app,
-        "/api/v1/learning/feedback",
-        Some(auth_header.as_str()),
-        json!({
-            "event_id": uq_event_id,
-            "satisfaction_score": 2
-        }),
-    )
-    .await;
-    assert_eq!(st_fb, StatusCode::OK, "learning feedback: {fb_j}");
-    assert_eq!(fb_j["status"], "success");
 
     assert_eq!(row_get_opt_i64(llm, "token_input"), Some(5));
     assert_eq!(row_get_opt_i64(llm, "token_output"), Some(15));

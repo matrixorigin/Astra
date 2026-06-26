@@ -398,80 +398,6 @@ pub struct HealthResponse {
 }
 
 #[cfg(feature = "server")]
-#[derive(Serialize, PartialEq, Eq)]
-pub struct LearningHealthResponse {
-    pub status: String,
-    pub service: String,
-    pub version: String,
-    pub timestamp: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lesson_count: Option<u64>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq, Eq)]
-pub struct LearningSignalsResponse {
-    pub signal_types: Vec<&'static str>,
-    pub descriptions: LearningSignalDescriptions,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq, Eq)]
-pub struct LearningSignalDescriptions {
-    pub wrong_skill: &'static str,
-    pub slow_execution: &'static str,
-    pub high_cost: &'static str,
-    pub low_satisfaction: &'static str,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq)]
-pub struct LearningStatsResponse {
-    pub total_learnings: i32,
-    pub high_confidence: i32,
-    pub low_confidence: i32,
-    pub avg_confidence: f64,
-    pub by_signal_type: serde_json::Map<String, serde_json::Value>,
-    pub weights: serde_json::Map<String, serde_json::Value>,
-    pub weights_per_signal: serde_json::Map<String, serde_json::Value>,
-    pub decay: serde_json::Map<String, serde_json::Value>,
-    pub total_gates: i32,
-    pub passed_gates: i32,
-    pub failed_gates: i32,
-    pub pass_rate: f64,
-    pub avg_improvement_pct: f64,
-    pub per_skill: serde_json::Map<String, serde_json::Value>,
-    pub last_learning_time: Option<String>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-pub struct LearningTriggerRequest {
-    #[serde(default = "default_days")]
-    pub days: i32,
-    #[serde(default)]
-    pub force: bool,
-    #[serde(default = "default_signal_types")]
-    pub signal_types: Vec<String>,
-    #[serde(default)]
-    pub weights: Option<serde_json::Map<String, serde_json::Value>>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq)]
-pub struct LearningTriggerResponse {
-    pub status: &'static str,
-    pub learned: i32,
-    pub signals_by_type: Option<serde_json::Value>,
-    pub gate_verdict: Option<String>,
-    pub improvement_pct: Option<serde_json::Value>,
-    pub test_count: Option<i32>,
-    pub error: Option<&'static str>,
-    pub message: Option<serde_json::Value>,
-    pub model_version: &'static str,
-}
-
-#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct AdminTokenListQuery {
     pub token_type: Option<String>,
@@ -799,10 +725,6 @@ pub fn merge_plan_subtask_context(
 
 #[cfg(feature = "server")]
 #[doc(hidden)]
-pub fn default_days() -> i32 {
-    7
-}
-
 #[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_admin_scope() -> String {
@@ -853,10 +775,6 @@ pub fn default_admin_audit_limit() -> u32 {
 
 #[cfg(feature = "server")]
 #[doc(hidden)]
-pub fn default_signal_types() -> Vec<String> {
-    vec!["wrong_skill".to_string()]
-}
-
 #[cfg(feature = "server")]
 pub fn sse_error_code_for_status(status: u16) -> &'static str {
     match status {

@@ -9,7 +9,6 @@ type DefaultCase<'a> = (&'a str, Box<dyn Fn() -> String>);
 #[test]
 fn default_functions_return_expected_values() {
     let cases: &[DefaultCase] = &[
-        ("days", Box::new(|| default_days().to_string())),
         (
             "admin_scope",
             Box::new(|| default_admin_scope().to_string()),
@@ -30,20 +29,8 @@ fn default_functions_return_expected_values() {
             "admin_audit_limit",
             Box::new(|| default_admin_audit_limit().to_string()),
         ),
-        (
-            "signal_types",
-            Box::new(|| format!("{:?}", default_signal_types())),
-        ),
     ];
-    let expected = &[
-        "7",
-        "global",
-        "50",
-        "compression",
-        "jsonl",
-        "100",
-        r#"["wrong_skill"]"#,
-    ];
+    let expected = &["global", "50", "compression", "jsonl", "100"];
     for ((label, f), exp) in cases.iter().zip(expected) {
         assert_eq!(f(), *exp, "default_{label}");
     }
@@ -73,11 +60,6 @@ fn deserialization_applies_defaults() {
     // ChatRouteRequest
     let q: ChatRouteRequest = serde_json::from_str("{}").unwrap();
     assert_eq!(q.query, "");
-
-    // LearningTriggerRequest
-    let req: LearningTriggerRequest = serde_json::from_str("{}").unwrap();
-    assert_eq!(req.days, 7);
-    assert!(!req.force);
 
     // AdminTokenCreateRequest
     let req: AdminTokenCreateRequest = serde_json::from_str(r#"{"token_type":"api_key"}"#).unwrap();
@@ -303,22 +285,6 @@ fn auth_register_request_without_display_name() {
     });
     let req: AuthRegisterRequest = serde_json::from_value(input).unwrap();
     assert!(req.display_name.is_none());
-}
-
-#[test]
-fn learning_trigger_request_all_fields() {
-    let input = json!({
-        "days": 14,
-        "force": true,
-        "signal_types": ["slow_execution", "high_cost"],
-        "weights": {"alpha": 0.5}
-    });
-    let req: LearningTriggerRequest = serde_json::from_value(input).unwrap();
-    assert_eq!(req.days, 14);
-    assert!(req.force);
-    assert_eq!(req.signal_types, vec!["slow_execution", "high_cost"]);
-    let w = req.weights.unwrap();
-    assert_eq!(w.get("alpha").unwrap(), &json!(0.5));
 }
 
 #[test]

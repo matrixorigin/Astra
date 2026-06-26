@@ -225,26 +225,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(reflect_handlers::decision_trace_handler),
         )
         .route(
-            "/api/v1/learning/health",
-            get(learning_handlers::learning_health_handler),
-        )
-        .route(
-            "/api/v1/learning/signals",
-            get(learning_handlers::learning_signals_handler),
-        )
-        .route(
-            "/api/v1/learning/stats",
-            get(learning_handlers::learning_stats_handler),
-        )
-        .route(
-            "/api/v1/learning/trigger",
-            post(learning_handlers::learning_trigger_handler),
-        )
-        .route(
-            "/api/v1/learning/feedback",
-            post(reflect_handlers::feedback_signal_handler),
-        )
-        .route(
             "/agents/edge/heartbeat",
             post(edge::edge_callback_handlers::post_agents_edge_heartbeat_handler),
         )

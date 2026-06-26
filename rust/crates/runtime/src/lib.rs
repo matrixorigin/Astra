@@ -171,10 +171,6 @@ pub use astra_services::{
     jobs::{
         InMemoryJobService, JobRecord, JobService, JobSubmitRequestData, UnconfiguredJobService,
     },
-    learning::{
-        DatabaseLearningFeedbackService, LearningFeedbackRecord, LearningFeedbackRequestData,
-        LearningFeedbackService, UnconfiguredLearningFeedbackService,
-    },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
     marketplace_stats::{
         DatabaseMarketplaceStatsService, MarketplaceStatsService, NoopMarketplaceStatsService,

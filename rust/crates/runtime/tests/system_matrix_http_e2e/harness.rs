@@ -825,9 +825,6 @@ async fn bootstrap_local_jwt() -> BootstrapResult {
     assert_eq!(st_me2, StatusCode::OK, "me after refresh: {me2}");
     assert_eq!(me2["user_id"].as_str(), Some(user_id.as_str()));
 
-    let (st_learn_h, learn_h) = get_json(&app, "/api/v1/learning/health", None, &[]).await;
-    assert_eq!(st_learn_h, StatusCode::OK, "learning health: {learn_h}");
-
     let (st_sess, sess) = post_json(
         &app,
         "/sessions",
@@ -961,13 +958,6 @@ pub async fn bootstrap_trusted_moi() -> TrustedMoiBootstrapResult {
     );
 
     cleanup_edge_registry(&pool, &user_id, &edge_agent_id).await;
-
-    let (st_learn_h, learn_h) = get_json(&app, "/api/v1/learning/health", None, &[]).await;
-    assert_eq!(
-        st_learn_h,
-        StatusCode::OK,
-        "trusted_moi learning health: {learn_h}"
-    );
 
     // Seed a mock model directly in DB so run-lifecycle tests don't depend on admin auth mode.
     let mock_model = format!("mock-{suffix}");

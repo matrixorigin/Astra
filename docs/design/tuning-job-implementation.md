@@ -1156,7 +1156,7 @@ Every material tuning output should be visible as graph evidence:
 | tuning decision | `audit_evidence` |
 | status/event | `audit_evidence` |
 
-`reflect(topic="adaptation", facet="measurements")` should be able to explain:
+Once an adaptation provider exists, reflect measurement views should be able to explain:
 
 - current job phase
 - last event
@@ -1214,8 +1214,8 @@ Every material tuning output should be visible as graph evidence:
    Generate bounded candidates, evaluate, rank, and emit `TuningDecision`.
 
 8. **Observation integration**
-   Add provider support so `reflect(topic="adaptation", facet="measurements")`
-   can explain job state and decisions.
+   Add provider support so reflect measurement views can explain job state and
+   decisions.
 
 ## Non-Goals for MVP
 

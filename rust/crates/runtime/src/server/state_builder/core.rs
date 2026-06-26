@@ -130,10 +130,6 @@ pub(super) fn build_core_state(
     .with_reflect_service(Arc::new(
         DatabaseReflectService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
-    .with_learning_feedback_service(Arc::new(
-        DatabaseLearningFeedbackService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
 }
 
 pub(super) fn install_turn_persistence_services(

@@ -23,7 +23,6 @@ pub mod events;
 pub mod harness;
 pub mod introspection;
 pub mod jobs;
-pub mod learning;
 pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
@@ -197,10 +196,6 @@ pub use introspection::{
 };
 pub use jobs::{
     InMemoryJobService, JobRecord, JobService, JobSubmitRequestData, UnconfiguredJobService,
-};
-pub use learning::{
-    DatabaseLearningFeedbackService, LearningFeedbackRecord, LearningFeedbackRequestData,
-    LearningFeedbackService, UnconfiguredLearningFeedbackService,
 };
 pub use llm_trusted_domains::{
     DatabaseLlmTrustedDomainService, LlmTrustedDomainDeleteResponse, LlmTrustedDomainRecord,

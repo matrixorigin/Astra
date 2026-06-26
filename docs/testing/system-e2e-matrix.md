@@ -44,7 +44,7 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 
 | Test name | File / module | Scope |
 |-----------|---------------|-------|
-| `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, learning (signals/stats + **POST /api/v1/learning/feedback** after `chat/turn`), evaluation reads, marketplace probe, `chat/turn` SSE + `agent_events`, audit/replay, logout |
+| `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, reflect/decision-trace, evaluation reads, marketplace probe, `chat/turn` SSE + `agent_events`, audit/replay, logout |
 | `e2e_matrix_tasks_lease_and_db_assertions` | `journey_tasks_runs.rs` | `POST /tasks`, `GET /tasks`, `GET /tasks/{id}`, `GET .../progress`, `agent_tasks`; edge register; lease claim / `GET` lease / renew / release; `task_leases`; `PUT /tasks/{id}/status` |
 | `e2e_matrix_chat_run_pause_resume_http` | `journey_tasks_runs.rs` | `POST /chat` (background run), `POST .../pause`, `GET /chat/runs/{id}`, `POST .../resume` |
 | `e2e_matrix_session_cancel_delete` | `journey_extended.rs` | `POST /sessions/{id}/cancel` + `agent_sessions.status`, `DELETE /sessions/{id}` |
@@ -69,7 +69,7 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_team_cross_user_isolation` | `journey_team_isolation_matrix.rs` | Second user: 404 on other user's team; list has no foreign team name |
 | `e2e_matrix_meta_health` | `journey_meta_matrix.rs` | `GET /`, `GET /health` (root metadata, DB connected, persist counters) |
 | `e2e_matrix_session_http_db` | `journey_session_http_db_matrix.rs` | `GET`/`PUT /sessions/{id}` vs `agent_sessions` (`title`, `user_id`) |
-| `e2e_matrix_evaluation_reads` | `journey_evaluation_reads_matrix.rs` | Evaluation GET smoke (`x-user-id`), seed agent for trust/SLO/observability; learning health/signals |
+| `e2e_matrix_evaluation_reads` | `journey_evaluation_reads_matrix.rs` | Evaluation GET smoke (`x-user-id`), seed agent for trust/SLO/observability |
 | `e2e_matrix_context_decision_chain` | `journey_context_decision_chain_matrix.rs` | Event → context → decision chain + `ctx_snapshots` / `ctx_decision_audits` SQL |
 | `e2e_matrix_chat_route_models` | `journey_chat_route_models_matrix.rs` | `POST /chat/route`, `GET /models` |
 | `e2e_matrix_branches_cost_estimate_http` | `journey_branches_matrix.rs` | `POST /branches/cost-estimate` (+ 401 without auth); no DDL branch/create |
@@ -106,7 +106,6 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Sandbox | P1 | `/sandbox` | `infra_sandbox_metadata` | `product_matrix_*` |
 | Triggers | P1 | `/triggers`, fire, delete | `wf_triggers` | `product_matrix_*` |
 | Skills / introspection | P1 | `/skills`, `/introspection/*` | mixed | `product_matrix_*` |
-| Learning | P1 | `/api/v1/learning/*` | — | `product_matrix_*` |
 | Evaluation | P1 | `/evaluation/*` reads | — | `product_matrix_*`, `e2e_matrix_evaluation_reads` |
 | Evaluation (writes) | P1 | `POST` gate/validate, drift/run, loop | — | — (no system E2E; add when implementations return success) |
 | Marketplace | P1 | quality report, stats, search | marketplace stats tables | `product_matrix_*` |
@@ -138,7 +137,6 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../rust/crat
 | chat | `/chat` | Partial | `/chat/turn` + SSE + `agent_events` in `product_matrix_*`, plus callback HTTP-boundary failures in `e2e_matrix_edge_callback_http_boundary_failures`, duplicate callback handoff coverage in `e2e_matrix_duplicate_tool_result_idempotency` / `e2e_matrix_duplicate_approval_response_idempotency`, mixed-success handoff coverage in `e2e_matrix_chat_turn_partial_batch_failure`, out-of-order callback handoff coverage in `e2e_matrix_chat_turn_out_of_order_tool_results`, concurrent same-session isolation in `e2e_matrix_same_session_concurrent_turns_isolated`, and waiting-turn overlap isolation in `e2e_matrix_same_session_waiting_turn_overlap_isolated`; `POST /chat` + run pause/resume in `e2e_matrix_chat_run_pause_resume_http`; `/chat/stream` smoke in `e2e_matrix_chat_stream_session_info`; delegation list + `POST .../delegate` validation boundary in `e2e_matrix_delegate_http_boundaries`; no `/chat/ws` E2E |
 | sessions | `/sessions` | Yes | CRUD/close/resume/activity + DB |
 | admin | `/admin/` | Partial | `GET /admin/tokens` smoke in `e2e_matrix_admin_tokens_smoke` |
-| learning | `/api/v1/learning/` | Yes (reads) | Health/signals/stats in `product_matrix_*` |
 | agents | `/agents` | Yes | Includes edge register path |
 | events | `/events` | Yes | |
 | skills | `/skills` | Partial | List/status; not publish/config/resources E2E |

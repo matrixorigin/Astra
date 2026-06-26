@@ -79,7 +79,7 @@
 //!   deterministic when multiple artifacts share the same `created_at`, returning the newest
 //!   artifact consistently instead of relying on database tie behavior.
 //! - **`e2e_matrix_evaluation_reads`** — evaluation GETs (`x-user-id`), optional agent seed for trust/SLO/
-//!   observability, plus learning health/signals.
+//!   observability.
 //! - **`e2e_matrix_context_decision_chain`** — `POST /events` → `/context` → `/decisions` + `ctx_snapshots` /
 //!   `ctx_decision_audits` SQL.
 //! - **`e2e_matrix_chat_route_models`** — `POST /chat/route` shape + `GET /models`.

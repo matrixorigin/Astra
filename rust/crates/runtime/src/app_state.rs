@@ -171,7 +171,6 @@ pub struct AppState {
     pub(crate) evaluation_service: Arc<dyn EvaluationService>,
     pub(crate) introspection_service: Arc<dyn IntrospectionService>,
     pub(crate) reflect_service: Arc<dyn ReflectService>,
-    pub(crate) learning_feedback_service: Arc<dyn LearningFeedbackService>,
     pub(crate) fernet_encryptor: FernetTokenEncryptor,
     pub(crate) turn_persistence: TurnPersistenceState,
     pub(crate) execution: ExecutionServicesState,
@@ -267,7 +266,6 @@ impl AppState {
             evaluation_service: Arc::new(UnconfiguredEvaluationService),
             introspection_service: Arc::new(UnconfiguredIntrospectionService),
             reflect_service: Arc::new(UnconfiguredReflectService),
-            learning_feedback_service: Arc::new(UnconfiguredLearningFeedbackService),
             fernet_encryptor: FernetTokenEncryptor::new("dev-key-not-for-production")
                 .or_else(|_| FernetTokenEncryptor::new("0123456789abcdef"))
                 .unwrap_or_else(|e| {
@@ -536,14 +534,6 @@ impl AppState {
 
     pub fn with_reflect_service(mut self, reflect_service: Arc<dyn ReflectService>) -> Self {
         self.reflect_service = reflect_service;
-        self
-    }
-
-    pub fn with_learning_feedback_service(
-        mut self,
-        learning_feedback_service: Arc<dyn LearningFeedbackService>,
-    ) -> Self {
-        self.learning_feedback_service = learning_feedback_service;
         self
     }
 

@@ -68,35 +68,3 @@ fn non_empty(value: &str) -> Option<&str> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then_some(trimmed)
 }
-
-#[derive(Deserialize)]
-pub(super) struct FeedbackSignalRequest {
-    pub event_id: String,
-    pub satisfaction_score: Option<i64>,
-}
-
-#[derive(Serialize)]
-pub(super) struct FeedbackSignalResponse {
-    pub status: String,
-    pub message: String,
-}
-
-pub(super) async fn feedback_signal_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<FeedbackSignalRequest>,
-) -> Result<Json<FeedbackSignalResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let record = state
-        .learning_feedback_service
-        .submit_feedback(LearningFeedbackRequestData {
-            event_id: request.event_id,
-            user_id: user.user_id,
-            satisfaction_score: request.satisfaction_score,
-        })
-        .await?;
-    Ok(Json(FeedbackSignalResponse {
-        status: record.status,
-        message: record.message,
-    }))
-}

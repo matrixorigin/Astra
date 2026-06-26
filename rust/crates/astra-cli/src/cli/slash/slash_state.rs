@@ -1023,15 +1023,12 @@ pub(crate) async fn handle_state_command(
             if let Some(body) =
                 crate::cli::self_command::try_render_reflect_surface_for_session_with_profile(
                     &sid,
-                    20,
-                    Some(reflect_args.topic.as_str()),
-                    reflect_args.facet.as_deref(),
-                    reflect_args.question.as_deref(),
+                    reflect_args.request(20),
                     profile,
                 )
                 .await?
             {
-                render_reflect_report(&body, &sid, reflect_args.question.as_deref());
+                render_reflect_report(&body, &sid);
                 return Ok(());
             }
 
@@ -1048,10 +1045,13 @@ pub(crate) async fn handle_state_command(
                 .to_string();
             let mut query_parts: Vec<String> = Vec::new();
             if reflect_args.topic != "overview" {
-                query_parts.push(format!("topic={}", reflect_args.topic));
+                query_parts.push(format!("topic={}", urlencoding(&reflect_args.topic)));
             }
             if let Some(facet) = reflect_args.facet.as_deref() {
-                query_parts.push(format!("facet={facet}"));
+                query_parts.push(format!("facet={}", urlencoding(facet)));
+            }
+            if reflect_args.depth != "diagnostic" {
+                query_parts.push(format!("depth={}", urlencoding(&reflect_args.depth)));
             }
             if let Some(question) = reflect_args
                 .question
@@ -1064,7 +1064,7 @@ pub(crate) async fn handle_state_command(
                 rel = format!("{rel}?{}", query_parts.join("&"));
             }
             match api.get_authed_path_text(tok, &rel).await {
-                Ok(body) => render_reflect_report(&body, &sid, reflect_args.question.as_deref()),
+                Ok(body) => render_reflect_report(&body, &sid),
                 Err(astra_thin_client::ThinClientError::Api {
                     status,
                     body: err_body,
@@ -1087,8 +1087,22 @@ pub(crate) async fn handle_state_command(
 struct ParsedReflectArgs {
     topic: String,
     facet: Option<String>,
+    depth: String,
     question: Option<String>,
     diff: bool,
+}
+
+impl ParsedReflectArgs {
+    fn request(&self, last_n: i32) -> astra_services::reflect::ReflectRequest {
+        astra_services::reflect::ReflectRequest::from_observation_params(
+            Some(self.topic.as_str()),
+            self.facet.as_deref(),
+            Some(self.depth.as_str()),
+            None,
+            last_n,
+            self.question.as_deref().unwrap_or(""),
+        )
+    }
 }
 
 fn parse_reflect_args(arg: &str) -> ParsedReflectArgs {
@@ -1097,6 +1111,7 @@ fn parse_reflect_args(arg: &str) -> ParsedReflectArgs {
         return ParsedReflectArgs {
             topic: "overview".to_string(),
             facet: None,
+            depth: "diagnostic".to_string(),
             question: None,
             diff: false,
         };
@@ -1108,6 +1123,7 @@ fn parse_reflect_args(arg: &str) -> ParsedReflectArgs {
         return ParsedReflectArgs {
             topic: "overview".to_string(),
             facet: None,
+            depth: "diagnostic".to_string(),
             question: None,
             diff: true,
         };
@@ -1115,6 +1131,7 @@ fn parse_reflect_args(arg: &str) -> ParsedReflectArgs {
 
     let mut topic = "overview".to_string();
     let mut facet = None;
+    let mut depth = "diagnostic".to_string();
     let mut question_start = 0usize;
     let mut parsed_topic = false;
 
@@ -1128,7 +1145,7 @@ fn parse_reflect_args(arg: &str) -> ParsedReflectArgs {
         }
         question_start = 1;
     } else if is_reflect_topic(&first) {
-        topic = first;
+        topic = first.clone();
         parsed_topic = true;
         question_start = 1;
     }
@@ -1141,11 +1158,23 @@ fn parse_reflect_args(arg: &str) -> ParsedReflectArgs {
         }
     }
 
+    if question_start < tokens.len() {
+        let candidate = normalize_reflect_token(tokens[question_start]);
+        if is_reflect_depth(&candidate) {
+            depth = candidate;
+            question_start += 1;
+        }
+    } else if !parsed_topic && is_reflect_depth(&first) {
+        depth = first;
+        question_start = 1;
+    }
+
     let question = (question_start < tokens.len()).then(|| tokens[question_start..].join(" "));
 
     ParsedReflectArgs {
         topic,
         facet,
+        depth,
         question,
         diff: false,
     }
@@ -1156,10 +1185,11 @@ fn normalize_reflect_token(token: &str) -> String {
 }
 
 fn is_reflect_topic(token: &str) -> bool {
-    matches!(
-        token,
-        "overview" | "runtime" | "execution" | "knowledge" | "adaptation"
-    )
+    matches!(token, "overview" | "runtime" | "execution" | "knowledge")
+}
+
+fn is_reflect_depth(token: &str) -> bool {
+    matches!(token, "hint" | "summary" | "diagnostic" | "forensic")
 }
 
 fn is_reflect_facet(token: &str) -> bool {
@@ -1177,16 +1207,10 @@ fn is_reflect_facet(token: &str) -> bool {
             | "cost"
             | "context"
             | "memory"
-            | "signals"
-            | "measurements"
             | "progress"
             | "loop"
             | "cache"
     )
-}
-
-fn is_local_reflect_report(report: &serde_json::Value) -> bool {
-    report.get("reflection_context").is_some()
 }
 
 /// Render a compact diff view of what the agent has learned this session
@@ -1252,18 +1276,12 @@ pub(crate) fn render_reflect_diff(state: &SessionState) -> String {
     out
 }
 
-/// Render either the local reflect surface or a server `ReflectReport`
-/// as a compact, colored terminal report.
-fn render_reflect_report(body: &str, session_id: &str, requested_question: Option<&str>) {
+/// Render a `ReflectReport` as a compact, colored terminal report.
+fn render_reflect_report(body: &str, session_id: &str) {
     let Ok(report) = serde_json::from_str::<serde_json::Value>(body) else {
         print_json_or_raw(body);
         return;
     };
-
-    if is_local_reflect_report(&report) {
-        render_local_reflect_report(&report, session_id, requested_question);
-        return;
-    }
 
     let overview = &report["overview"];
     let short_sid = prefix_chars(session_id, 8);
@@ -1439,152 +1457,6 @@ fn render_reflect_report(body: &str, session_id: &str, requested_question: Optio
     }
 }
 
-fn render_local_reflect_report(
-    report: &serde_json::Value,
-    session_id: &str,
-    requested_question: Option<&str>,
-) {
-    let short_sid = prefix_chars(session_id, 8);
-    let context = &report["reflection_context"];
-    let turns_completed = context["turns_completed"].as_u64().unwrap_or(0);
-    let scenario = context["scenario"].as_str().unwrap_or("unknown");
-    let token_utilisation = context["token_utilisation"].as_f64().unwrap_or(0.0) * 100.0;
-
-    eprintln!(
-        "{}",
-        format!("🔍 Session Reflection — {short_sid}")
-            .magenta()
-            .bold()
-    );
-    eprintln!("{}", "─────────────────────────────────────".dim());
-    eprintln!(
-        "  {} {} turns, scenario {}, token {:.0}%",
-        "Overview:".bold(),
-        turns_completed,
-        scenario,
-        token_utilisation
-    );
-
-    if let Some(topic) = context["topic"].as_str().filter(|topic| !topic.is_empty()) {
-        eprintln!("  {} {}", "Topic:".bold(), topic);
-    }
-    if let Some(facet) = context["facet"].as_str().filter(|facet| !facet.is_empty()) {
-        eprintln!("  {} {}", "Facet:".bold(), facet);
-    }
-    if let Some(analysis_view) = context["analysis_view"]
-        .as_str()
-        .filter(|analysis_view| !analysis_view.is_empty())
-    {
-        eprintln!("  {} {}", "Analysis:".bold(), analysis_view);
-    }
-    if let Some(question) = requested_question.filter(|question| !question.is_empty()) {
-        eprintln!("  {} {}", "Question:".bold(), question);
-    }
-    if let Some(experiment) = context["active_experiment"].as_object() {
-        let experiment_id = experiment
-            .get("experiment_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let variant = experiment
-            .get("variant")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let samples = experiment
-            .get("samples")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        eprintln!(
-            "  {} {} / {} ({} samples)",
-            "Experiment:".bold(),
-            experiment_id,
-            variant,
-            samples
-        );
-    }
-
-    if let Some(tool_stats) = context["tool_stats"]
-        .as_array()
-        .filter(|stats| !stats.is_empty())
-    {
-        eprintln!();
-        eprintln!("  {}", "Tool pressure:".bold());
-        for stat in tool_stats.iter().take(6) {
-            let tool_name = stat["tool_name"].as_str().unwrap_or("unknown");
-            let calls = stat["calls"].as_u64().unwrap_or(0);
-            let failures = stat["failures"].as_u64().unwrap_or(0);
-            let avg_latency_ms = stat["avg_latency_ms"].as_u64().unwrap_or(0);
-            let line =
-                format!("{tool_name}: {calls} calls, {failures} failures, avg {avg_latency_ms}ms");
-            if failures > 0 {
-                eprintln!("  ⚠️ {}", line.yellow());
-            } else {
-                eprintln!("  • {line}");
-            }
-        }
-    }
-
-    if let Some(signals) = context["signals"]
-        .as_array()
-        .filter(|signals| !signals.is_empty())
-    {
-        eprintln!();
-        eprintln!("  {}", "Signals:".bold());
-        for signal in signals.iter().take(6) {
-            let kind = signal["kind"].as_str().unwrap_or("signal");
-            let detail = signal["detail"].as_str().unwrap_or("");
-            let turn_id = signal["turn_id"].as_str().unwrap_or("session");
-            eprintln!("  • {} [{}] {}", kind.bold(), turn_id.dim(), detail);
-        }
-    }
-
-    if let Some(actions) = context["recent_tactical_actions"]
-        .as_array()
-        .filter(|actions| !actions.is_empty())
-    {
-        eprintln!();
-        eprintln!("  {}", "Recent tactical actions:".bold());
-        for action in actions.iter().take(6).filter_map(serde_json::Value::as_str) {
-            eprintln!("  • {action}");
-        }
-    }
-
-    if let Some(turns) = report["recent_turns"]
-        .as_array()
-        .filter(|turns| !turns.is_empty())
-    {
-        eprintln!();
-        eprintln!("  {}", "Recent events:".bold());
-        for event in turns.iter().take(4) {
-            let event_type = event["event_type"].as_str().unwrap_or("event");
-            let turn = event["turn"]
-                .as_u64()
-                .map(|turn| format!("turn-{turn}"))
-                .unwrap_or_else(|| "session".to_string());
-            let detail = event["error"]
-                .as_str()
-                .or_else(|| event["user_input_preview"].as_str())
-                .or_else(|| event["assistant_output_preview"].as_str())
-                .unwrap_or("");
-            if detail.is_empty() {
-                eprintln!("  • {} [{}]", event_type, turn.dim());
-            } else {
-                eprintln!("  • {} [{}] {}", event_type, turn.dim(), detail);
-            }
-        }
-    }
-
-    if let Some(prompt_preview) = report["prompt_preview"]
-        .as_str()
-        .filter(|preview| !preview.is_empty())
-    {
-        eprintln!();
-        eprintln!("  {}", "Prompt preview:".bold());
-        for line in prompt_preview.lines().take(14) {
-            eprintln!("    {}", line.dim());
-        }
-    }
-}
-
 #[cfg(test)]
 mod state_command_tests {
     use super::{
@@ -1593,7 +1465,7 @@ mod state_command_tests {
     use crate::cli::session::session_state::SessionState;
     use crate::lock_recovery::LockRecovery;
     use astra_services::session_journal::{self, JournalEventType};
-    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::matchers::{header_exists, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[serial_test::serial]
@@ -1974,11 +1846,32 @@ mod state_command_tests {
             .and(path(format!("/chat/session/{sid}/reflect")))
             .and(header_exists("authorization"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "tool": "reflect",
                 "session_id": sid,
+                "analysis_view": "overview",
+                "topic": "overview",
+                "facet": "overview",
+                "depth": "diagnostic",
+                "horizon": "session",
+                "source_policy": "auto",
+                "include_context": false,
+                "data_coverage": {"overall":"fresh","source":"server_db","events":1,"decisions":0},
                 "overview": {
-                    "summary": "remote reflect"
+                    "total_events": 1,
+                    "total_decisions": 0,
+                    "duration_minutes": null,
+                    "unique_skills_used": 0,
+                    "error_count": 0,
+                    "error_rate_pct": 0.0,
+                    "top_event_types": [],
+                    "top_skills": []
                 },
-                "recent_turns": []
+                "summary": "remote reflect",
+                "diagnoses": [],
+                "insights": [],
+                "recommendations": [],
+                "graph_slice": {"nodes":[],"edges":[],"budget_result":{"truncated":false}}
             })))
             .mount(&server)
             .await;
@@ -2003,6 +1896,68 @@ mod state_command_tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn reflect_remote_fallback_sends_depth_and_encoded_question_query() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/chat/session/{sid}/reflect")))
+            .and(header_exists("authorization"))
+            .and(query_param("topic", "execution"))
+            .and(query_param("facet", "trace"))
+            .and(query_param("depth", "forensic"))
+            .and(query_param("question", "why bash & tools?"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "tool": "reflect",
+                "session_id": sid,
+                "analysis_view": "execution_trace",
+                "topic": "execution",
+                "facet": "trace",
+                "depth": "forensic",
+                "horizon": "session",
+                "source_policy": "auto",
+                "include_context": false,
+                "data_coverage": {"overall":"fresh","source":"server_db","events":1,"decisions":0},
+                "overview": {
+                    "total_events": 1,
+                    "total_decisions": 0,
+                    "duration_minutes": null,
+                    "unique_skills_used": 0,
+                    "error_count": 0,
+                    "error_rate_pct": 0.0,
+                    "top_event_types": [],
+                    "top_skills": []
+                },
+                "summary": "remote reflect",
+                "diagnoses": [],
+                "insights": [],
+                "recommendations": [],
+                "graph_slice": {"nodes":[],"edges":[],"budget_result":{"truncated":false}}
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState::default();
+        state.set_session_id(sid);
+
+        handle_state_command(
+            "/reflect",
+            "execution/trace forensic why bash & tools?",
+            StateCommandContext {
+                api: &api,
+                profile: None,
+                token: Some("test-token"),
+            },
+            &mut state,
+        )
+        .await
+        .expect("remote reflect query should include encoded observation params");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn reflect_surfaces_local_artifact_error_without_remote_fallback() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
@@ -2011,11 +1966,32 @@ mod state_command_tests {
             .and(path(format!("/chat/session/{sid}/reflect")))
             .and(header_exists("authorization"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "tool": "reflect",
                 "session_id": sid,
+                "analysis_view": "overview",
+                "topic": "overview",
+                "facet": "overview",
+                "depth": "diagnostic",
+                "horizon": "session",
+                "source_policy": "auto",
+                "include_context": false,
+                "data_coverage": {"overall":"fresh","source":"server_db","events":1,"decisions":0},
                 "overview": {
-                    "summary": "remote reflect should not mask local corruption"
+                    "total_events": 1,
+                    "total_decisions": 0,
+                    "duration_minutes": null,
+                    "unique_skills_used": 0,
+                    "error_count": 0,
+                    "error_rate_pct": 0.0,
+                    "top_event_types": [],
+                    "top_skills": []
                 },
-                "recent_turns": []
+                "summary": "remote reflect should not mask local corruption",
+                "diagnoses": [],
+                "insights": [],
+                "recommendations": [],
+                "graph_slice": {"nodes":[],"edges":[],"budget_result":{"truncated":false}}
             })))
             .mount(&server)
             .await;
@@ -2046,7 +2022,7 @@ mod state_command_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_local_reflect_report, parse_reflect_args, render_reflect_diff};
+    use super::{parse_reflect_args, render_reflect_diff};
     use crate::cli::session::session_state::SessionState;
 
     #[test]
@@ -2055,6 +2031,7 @@ mod tests {
         assert!(args.diff);
         assert_eq!(args.topic, "overview");
         assert_eq!(args.facet, None);
+        assert_eq!(args.depth, "diagnostic");
         assert_eq!(args.question, None);
     }
 
@@ -2114,7 +2091,26 @@ mod tests {
         assert!(!args.diff);
         assert_eq!(args.topic, "execution");
         assert_eq!(args.facet.as_deref(), Some("errors"));
+        assert_eq!(args.depth, "diagnostic");
         assert_eq!(args.question.as_deref(), Some("why did bash fail"));
+    }
+
+    #[test]
+    fn parse_reflect_args_accepts_depth_after_topic_facet() {
+        let args = parse_reflect_args("execution/trace forensic why did it fail");
+        assert_eq!(args.topic, "execution");
+        assert_eq!(args.facet.as_deref(), Some("trace"));
+        assert_eq!(args.depth, "forensic");
+        assert_eq!(args.question.as_deref(), Some("why did it fail"));
+    }
+
+    #[test]
+    fn parse_reflect_args_accepts_depth_without_topic() {
+        let args = parse_reflect_args("summary what happened");
+        assert_eq!(args.topic, "overview");
+        assert_eq!(args.facet, None);
+        assert_eq!(args.depth, "summary");
+        assert_eq!(args.question.as_deref(), Some("what happened"));
     }
 
     #[test]
@@ -2122,6 +2118,7 @@ mod tests {
         let args = parse_reflect_args("runtime performance why was bash slow");
         assert_eq!(args.topic, "runtime");
         assert_eq!(args.facet.as_deref(), Some("performance"));
+        assert_eq!(args.depth, "diagnostic");
         assert_eq!(args.question.as_deref(), Some("why was bash slow"));
     }
 
@@ -2130,6 +2127,7 @@ mod tests {
         let args = parse_reflect_args("performance why was bash slow");
         assert_eq!(args.topic, "overview");
         assert_eq!(args.facet, None);
+        assert_eq!(args.depth, "diagnostic");
         assert_eq!(
             args.question.as_deref(),
             Some("performance why was bash slow")
@@ -2141,9 +2139,22 @@ mod tests {
         let args = parse_reflect_args("skill_failure why did bash fail");
         assert_eq!(args.topic, "overview");
         assert_eq!(args.facet, None);
+        assert_eq!(args.depth, "diagnostic");
         assert_eq!(
             args.question.as_deref(),
             Some("skill_failure why did bash fail")
+        );
+    }
+
+    #[test]
+    fn parse_reflect_args_does_not_accept_unimplemented_adaptation_topic() {
+        let args = parse_reflect_args("adaptation/signals forensic");
+        assert_eq!(args.topic, "overview");
+        assert_eq!(args.facet, None);
+        assert_eq!(args.depth, "diagnostic");
+        assert_eq!(
+            args.question.as_deref(),
+            Some("adaptation/signals forensic")
         );
     }
 
@@ -2152,25 +2163,8 @@ mod tests {
         let args = parse_reflect_args("");
         assert_eq!(args.topic, "overview");
         assert_eq!(args.facet, None);
+        assert_eq!(args.depth, "diagnostic");
         assert_eq!(args.question, None);
-    }
-
-    #[test]
-    fn local_reflect_shape_is_detected() {
-        let local = serde_json::json!({
-            "session_id": "s1",
-            "reflection_context": {
-                "turns_completed": 3
-            }
-        });
-        let server = serde_json::json!({
-            "session_id": "s1",
-            "overview": {
-                "total_events": 3
-            }
-        });
-        assert!(is_local_reflect_report(&local));
-        assert!(!is_local_reflect_report(&server));
     }
 
     // ── /undo tests ──

@@ -2369,8 +2369,6 @@ esac
                 diagnoses: vec![],
                 insights: vec![],
                 recommendations: vec![],
-                reflection_context: None,
-                prompt_preview: None,
             })
         }
     }

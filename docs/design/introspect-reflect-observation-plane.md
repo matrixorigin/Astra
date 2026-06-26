@@ -215,10 +215,10 @@ Use a small top-level topic vocabulary. Detailed views are expressed through
 | `runtime` | Live model, turn, execution binding, budget, cache, compaction, capability |
 | `execution` | Actions, errors, tools, traces, metrics, progress, loops |
 | `knowledge` | Context, memory, retrieval, facts, drift |
-| `adaptation` | Read-only signals for future feedback/policy tools |
-
-`tuning` may remain as a user-facing alias for `adaptation`, but the canonical
-topic should be `adaptation`. This avoids implying that the tool applies tuning.
+Current tool schemas expose only `overview`, `runtime`, `execution`, and
+`knowledge`. Read-only adaptation signal views are a future provider surface;
+they should be added only when the signal provider, schema, slash parser, and
+service routing are implemented end to end.
 
 ### Facets
 
@@ -229,7 +229,6 @@ topic should be `adaptation`. This avoids implying that the tool applies tuning.
 | `runtime` | `budget`, `cache`, `capability`, `binding`, `model` |
 | `execution` | `progress`, `errors`, `tools`, `trace`, `performance`, `loop` |
 | `knowledge` | `context`, `memory`, `retrieval`, `facts`, `drift` |
-| `adaptation` | `signals`, `measurements`, `candidates` |
 | `overview` | `summary`, `question` |
 
 For CLI ergonomics, slash commands may accept path-like aliases such as
@@ -614,10 +613,10 @@ Reserved future fields include `mode`, `generated_at`, and `current_state`.
 They should only become part of the public contract when every producer can
 fill them with explicit provenance and tests.
 
-Existing `reflect` compatibility fields such as `session_id`, `analysis_view`,
-`overview`, `diagnoses`, `insights`, `recommendations`, `reflection_context`,
-and `prompt_preview` may continue to exist during migration. New consumers
-should not depend on those fields for observation-plane behavior.
+Existing `reflect` summary fields such as `session_id`, `analysis_view`,
+`overview`, `diagnoses`, `insights`, and `recommendations` may continue as
+derived convenience fields. Legacy blobs such as `reflection_context` and
+`prompt_preview` are not part of the public observation-plane contract.
 
 ### Field Semantics
 
@@ -946,9 +945,9 @@ agent observes trouble
 User-triggered loop:
 
 ```text
-/reflect adaptation/signals forensic
--> returns durable signals and evidence graph
--> user or agent selects signals for a TuningJob or write-side tool
+/reflect execution/errors forensic
+-> returns durable failure observations and evidence graph
+-> user or agent selects observation/failure refs for a TuningJob or write-side tool
 ```
 
 ### Tuning Operator Consumption
@@ -1135,8 +1134,8 @@ Normalized request:
   "tool": "reflect",
   "arguments": {
     "horizon": "session",
-    "topic": "adaptation",
-    "facet": "signals",
+    "topic": "execution",
+    "facet": "errors",
     "depth": "diagnostic"
   }
 }
@@ -1179,8 +1178,9 @@ Implemented foundation:
    - shared graph-slice projection
 4. First-class error and provider-unavailable observations for the current
    runtime and server database surfaces.
-5. Read-only adaptation signals that reference observations and failure
-   clusters instead of duplicating severity, confidence, or evidence.
+5. Future read-only adaptation signals must reference observations and failure
+   clusters instead of duplicating severity, confidence, or evidence. They are
+   not part of the current `reflect` tool schema until the provider exists.
 6. Removal of obsolete public contracts:
    - `introspect.subtopic`
    - `introspect.detail`

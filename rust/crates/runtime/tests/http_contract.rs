@@ -6,7 +6,6 @@ use axum::{
     Router, body,
     http::{Request, StatusCode},
 };
-use chrono::DateTime;
 use serde::Deserialize;
 use tower::util::ServiceExt;
 use uuid::Uuid;
@@ -21,31 +20,12 @@ struct ResponseContract {
 struct HttpShellContract {
     root: ResponseContract,
     health: HealthContractVariants,
-    learning_health: LearningHealthContract,
-    auth_error: ResponseContract,
-    learning_signals: ResponseContract,
-    learning_stats: ResponseContract,
-    learning_trigger: TriggerContract,
 }
 
 #[derive(Deserialize)]
 struct HealthContractVariants {
     healthy: ResponseContract,
     unhealthy: ResponseContract,
-}
-
-#[derive(Deserialize)]
-struct LearningHealthContract {
-    status: u16,
-    json: serde_json::Value,
-    timestamp_timezone: String,
-}
-
-#[derive(Deserialize)]
-struct TriggerContract {
-    request: serde_json::Value,
-    status: u16,
-    json: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -82,6 +62,13 @@ async fn read_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
     read_json_with_headers(app, path, &[]).await
 }
 
+async fn read_status(app: Router, method: &str, path: &str) -> StatusCode {
+    app.oneshot(build_request(method, path, &[], body::Body::empty()))
+        .await
+        .unwrap()
+        .status()
+}
+
 async fn read_json_with_headers(
     app: Router,
     path: &str,
@@ -89,29 +76,6 @@ async fn read_json_with_headers(
 ) -> (StatusCode, serde_json::Value) {
     let response = app
         .oneshot(build_request("GET", path, headers, body::Body::empty()))
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json = serde_json::from_slice(&bytes).unwrap();
-    (status, json)
-}
-
-async fn post_json(
-    app: Router,
-    path: &str,
-    headers: &[(&str, &str)],
-    payload: serde_json::Value,
-) -> (StatusCode, serde_json::Value) {
-    let response = app
-        .oneshot(build_request(
-            "POST",
-            path,
-            headers,
-            body::Body::from(payload.to_string()),
-        ))
         .await
         .unwrap();
     let status = response.status();
@@ -199,83 +163,21 @@ async fn unhealthy_state_matches_shared_contract() {
 }
 
 #[tokio::test]
-async fn learning_health_matches_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = read_json(build_test_app(true), "/api/v1/learning/health").await;
-    let timestamp = json["timestamp"]
-        .as_str()
-        .expect("timestamp should be present");
-
-    assert_eq!(status.as_u16(), contract.learning_health.status);
-    assert_eq!(json["status"], contract.learning_health.json["status"]);
-    assert_eq!(json["service"], contract.learning_health.json["service"]);
-    assert_eq!(json["version"], contract.learning_health.json["version"]);
-    assert!(timestamp.ends_with(&contract.learning_health.timestamp_timezone));
-    assert!(DateTime::parse_from_rfc3339(timestamp).is_ok());
-}
-
-#[tokio::test]
-async fn learning_routes_require_auth() {
-    let contract = load_contract();
+async fn removed_learning_routes_are_not_public_contracts() {
     let app = build_test_app(true);
 
-    for path in ["/api/v1/learning/signals", "/api/v1/learning/stats"] {
-        let (status, json) = read_json(app.clone(), path).await;
-        assert_eq!(status.as_u16(), contract.auth_error.status, "{path}");
-        assert_contract_json(&json, &contract.auth_error.json, path);
+    for (method, path) in [
+        ("GET", "/api/v1/learning/health"),
+        ("GET", "/api/v1/learning/signals"),
+        ("GET", "/api/v1/learning/stats"),
+        ("POST", "/api/v1/learning/trigger"),
+        ("POST", "/api/v1/learning/feedback"),
+    ] {
+        let status = read_status(app.clone(), method, path).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{method} {path} must stay removed instead of returning a stub"
+        );
     }
-
-    let (status, json) = post_json(
-        app,
-        "/api/v1/learning/trigger",
-        &[],
-        contract.learning_trigger.request.clone(),
-    )
-    .await;
-    assert_eq!(status.as_u16(), contract.auth_error.status);
-    assert_contract_json(
-        &json,
-        &contract.auth_error.json,
-        "learning_trigger_auth_error",
-    );
-}
-
-#[tokio::test]
-async fn learning_routes_match_shared_contract_when_authenticated() {
-    let contract = load_contract();
-    let app = build_test_app(true);
-    let auth = &[("authorization", "Bearer test-token")];
-
-    let (status, json) =
-        read_json_with_headers(app.clone(), "/api/v1/learning/signals", auth).await;
-    assert_eq!(status.as_u16(), contract.learning_signals.status);
-    assert_contract_json(&json, &contract.learning_signals.json, "learning_signals");
-
-    let (status, json) = read_json_with_headers(app.clone(), "/api/v1/learning/stats", auth).await;
-    assert_eq!(status.as_u16(), contract.learning_stats.status);
-    assert_contract_json(&json, &contract.learning_stats.json, "learning_stats");
-
-    let (status, json) = post_json(
-        app,
-        "/api/v1/learning/trigger",
-        auth,
-        contract.learning_trigger.request.clone(),
-    )
-    .await;
-    assert_eq!(status.as_u16(), contract.learning_trigger.status);
-    assert_contract_json(&json, &contract.learning_trigger.json, "learning_trigger");
-}
-
-#[tokio::test]
-async fn learning_trigger_validates_days_range() {
-    let (status, _) = post_json(
-        build_test_app(true),
-        "/api/v1/learning/trigger",
-        &[("authorization", "Bearer test-token")],
-        serde_json::json!({"days": 100}),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
