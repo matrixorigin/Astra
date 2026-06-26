@@ -1,14 +1,14 @@
-//! Adaptive runtime profile and per-turn dampening.
+//! Adaptive runtime: observation and scenario detection only.
+//!
+//! This module provides scenario detection and signal recording for the
+//! observation plane. It does NOT mutate runtime configuration.
+//!
+//! Future tuning jobs (via `/tuning`) will consume these observations and
+//! propose mutations through explicit write-side channels.
 
 use std::collections::{HashMap, HashSet};
 
-use astra_config::user_profile::{Scenario, TurnIntent};
-use astra_services::session_audit::{
-    RuntimePromotionController, RuntimePromotionEventData, RuntimePromotionOutcome,
-    RuntimePromotionRecommendation,
-};
-
-use super::super::agentic_loop::host::{AgenticLoopOutcome, AgenticLoopState};
+use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_RECENT_TACTICAL_ACTIONS: usize = 8;
 
