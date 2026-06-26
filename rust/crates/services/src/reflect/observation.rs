@@ -1,8 +1,8 @@
 use super::{
-    Diagnosis, EvidenceGraph, Insight, ObservationActionHint, ObservationConfidence,
-    ObservationEvidence, ObservationFailureCluster, ObservationRecord, ReflectRequest,
-    SessionOverview,
+    Diagnosis, Insight, ObservationActionHint, ObservationConfidence, ObservationEvidence,
+    ObservationFailureCluster, ObservationRecord, ReflectRequest, SessionOverview,
 };
+use astra_core::ObservationGraphSlice;
 
 pub(super) struct ObservationEnvelope {
     pub summary: String,
@@ -19,7 +19,7 @@ pub(super) fn build_observation_envelope(
     diagnoses: &[Diagnosis],
     insights: &[Insight],
     recommendations: &[String],
-    evidence_graph: Option<&EvidenceGraph>,
+    evidence_graph: Option<&ObservationGraphSlice>,
 ) -> ObservationEnvelope {
     let summary = build_reflect_summary(overview, diagnoses, insights);
     let session_component = urn_component(session_id);
@@ -154,7 +154,7 @@ pub(super) fn build_observation_envelope(
     if let Some(graph) = evidence_graph {
         for node in graph.nodes.iter().take(50) {
             evidence.push(ObservationEvidence {
-                ref_id: graph_node_ref(&node.id),
+                ref_id: node.ref_id.clone(),
                 evidence_class: "observed_evidence".to_string(),
                 source: "reflect.graph_slice".to_string(),
                 summary: truncate_chars(
@@ -346,14 +346,12 @@ fn diagnosis_causal_confidence(diagnosis: &Diagnosis) -> f64 {
     }
 }
 
-pub(super) fn graph_node_ref(node_id: &str) -> String {
-    if let Some(id) = node_id.strip_prefix("event:") {
-        format!("urn:astra:event:cloud:{}", urn_component(id))
-    } else if let Some(id) = node_id.strip_prefix("decision:") {
-        format!("urn:astra:decision:cloud:{}", urn_component(id))
-    } else {
-        format!("urn:astra:artifact:cloud:{}", urn_component(node_id))
-    }
+pub(super) fn graph_event_ref(event_id: &str) -> String {
+    format!("urn:astra:event:cloud:{}", urn_component(event_id))
+}
+
+pub(super) fn graph_decision_ref(decision_id: &str) -> String {
+    format!("urn:astra:decision:cloud:{}", urn_component(decision_id))
 }
 
 fn urn_component(value: &str) -> String {

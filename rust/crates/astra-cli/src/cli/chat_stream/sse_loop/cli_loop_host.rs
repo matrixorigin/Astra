@@ -835,9 +835,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     fn on_introspect_snapshot(
         &mut self,
-        snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+        snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
     ) {
-        self.executor.update_introspect_snapshot(snapshot);
+        self.executor.update_introspect_snapshot(snapshot.clone());
     }
 
     async fn recover_missing_control_tool_result(

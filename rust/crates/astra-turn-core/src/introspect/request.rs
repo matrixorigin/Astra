@@ -14,7 +14,6 @@ pub enum ObservationTopic {
     Runtime,
     Execution,
     Knowledge,
-    Adaptation,
 }
 
 impl ObservationTopic {
@@ -23,7 +22,6 @@ impl ObservationTopic {
             "overview" => Self::Overview,
             "execution" => Self::Execution,
             "knowledge" => Self::Knowledge,
-            "adaptation" => Self::Adaptation,
             "runtime" | "session" | "" => Self::Runtime,
             _ => Self::Runtime,
         }
@@ -35,7 +33,6 @@ impl ObservationTopic {
             Self::Runtime => "runtime",
             Self::Execution => "execution",
             Self::Knowledge => "knowledge",
-            Self::Adaptation => "adaptation",
         }
     }
 }
@@ -358,5 +355,14 @@ mod tests {
             "format": "json"
         }));
         assert!(req.format.is_json());
+    }
+
+    #[test]
+    fn from_args_does_not_accept_premature_adaptation_topic() {
+        let req = IntrospectRequest::from_args(&serde_json::json!({
+            "topic": "adaptation"
+        }));
+        assert_eq!(req.topic, ObservationTopic::Runtime);
+        assert_eq!(req.topic.as_str(), "runtime");
     }
 }

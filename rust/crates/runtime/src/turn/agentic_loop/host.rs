@@ -261,7 +261,7 @@ pub trait AgenticLoopHost: Send {
     /// [`ToolExecutor`], while server mode uses [`ServerToolExecutor`] below.
     fn on_introspect_snapshot(
         &mut self,
-        _snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+        _snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
     ) {
     }
 
@@ -412,7 +412,7 @@ pub(crate) fn publish_introspect_snapshot<H: AgenticLoopHost + ?Sized>(
     lifecycle_summary: String,
 ) {
     let snapshot = build_introspect_snapshot(state, lifecycle_summary);
-    host.on_introspect_snapshot(snapshot.clone());
+    host.on_introspect_snapshot(&snapshot);
     if let Some(executor) = state.server_tool_executor.as_deref() {
         executor.update_introspect_snapshot(snapshot);
     }
@@ -2828,9 +2828,9 @@ pub(crate) mod tests {
 
         fn on_introspect_snapshot(
             &mut self,
-            snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+            snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
         ) {
-            self.introspect_snapshots.push(snapshot);
+            self.introspect_snapshots.push(snapshot.clone());
         }
 
         async fn cancel_child_agents(

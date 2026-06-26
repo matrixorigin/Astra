@@ -40,15 +40,13 @@ pub enum ObservationFacet {
 
 /// Error type for facet parsing failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ObservationFacetError {
-    UnknownFacet(String),
+pub struct ObservationFacetError {
+    unknown: String,
 }
 
 impl fmt::Display for ObservationFacetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownFacet(s) => write!(f, "unknown observation facet: {}", s),
-        }
+        write!(f, "unknown observation facet: {}", self.unknown)
     }
 }
 
@@ -69,7 +67,9 @@ impl ObservationFacet {
             "overview" | "all" => Ok(Self::Overview),
             "cache" => Ok(Self::Cache),
             "session_memory" => Ok(Self::SessionMemory),
-            unknown => Err(ObservationFacetError::UnknownFacet(unknown.to_string())),
+            unknown => Err(ObservationFacetError {
+                unknown: unknown.to_string(),
+            }),
         }
     }
 

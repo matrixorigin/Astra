@@ -14,7 +14,7 @@ use sqlx::{Row, query};
 
 mod observation;
 mod request;
-use observation::{build_observation_envelope, graph_node_ref};
+use observation::{build_observation_envelope, graph_decision_ref, graph_event_ref};
 pub use request::ReflectRequest;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -104,52 +104,6 @@ pub struct Insight {
     pub evidence: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-enum EvidenceGraphNodeKind {
-    Decision,
-    Observation,
-    Outcome,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-enum EvidenceGraphEdgeKind {
-    Causes,
-    Supports,
-    Contradicts,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct EvidenceGraphNode {
-    id: String,
-    kind: EvidenceGraphNodeKind,
-    label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    anchor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    created_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    metadata: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct EvidenceGraphEdge {
-    from: String,
-    to: String,
-    kind: EvidenceGraphEdgeKind,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-struct EvidenceGraph {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    nodes: Vec<EvidenceGraphNode>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    edges: Vec<EvidenceGraphEdge>,
-}
-
 /// Raw error record fetched from DB for content analysis.
 #[derive(Debug, Clone)]
 pub struct RawError {
@@ -218,16 +172,16 @@ fn truncate_graph_summary(value: &str, max_chars: usize) -> Option<String> {
     Some(snippet)
 }
 
-fn classify_evidence_event_kind(event_type: &str) -> EvidenceGraphNodeKind {
+fn classify_evidence_event_kind(event_type: &str) -> ObservationGraphNodeKind {
     if matches!(
         event_type,
         "tool_result" | "tool_error" | "error" | "stall_detected"
     ) || event_type.contains("error")
         || event_type.contains("fail")
     {
-        EvidenceGraphNodeKind::Outcome
+        ObservationGraphNodeKind::Outcome
     } else {
-        EvidenceGraphNodeKind::Observation
+        ObservationGraphNodeKind::Event
     }
 }
 
@@ -235,7 +189,7 @@ fn build_evidence_graph(
     decisions: &[EvidenceDecision],
     events: &[EvidenceEvent],
     parent_id_map: &std::collections::HashMap<String, Vec<String>>,
-) -> Option<EvidenceGraph> {
+) -> Option<ObservationGraphSlice> {
     if decisions.is_empty() && events.is_empty() {
         return None;
     }
@@ -243,54 +197,62 @@ fn build_evidence_graph(
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut event_node_ids = std::collections::HashSet::new();
-    let mut edge_keys = std::collections::HashSet::new();
+    let mut event_refs = std::collections::HashMap::new();
+    let mut decision_refs = std::collections::HashMap::new();
+    let mut edge_keys = BTreeSet::new();
     let event_ids: std::collections::HashSet<&str> =
         events.iter().map(|event| event.event_id.as_str()).collect();
 
     for decision in decisions {
-        nodes.push(EvidenceGraphNode {
-            id: format!("decision:{}", decision.decision_id),
-            kind: EvidenceGraphNodeKind::Decision,
+        let ref_id = graph_decision_ref(&decision.decision_id);
+        decision_refs.insert(decision.decision_id.clone(), ref_id.clone());
+        nodes.push(ObservationGraphNode {
+            ref_id,
+            layer: ObservationGraphLayer::Runtime,
+            kind: ObservationGraphNodeKind::Decision,
             label: decision.decision_type.clone(),
             summary: truncate_graph_summary(&decision.decision_output.to_string(), 140),
-            anchor: Some(decision.event_id.clone()),
-            created_at: Some(decision.created_at.clone()),
             metadata: Some(serde_json::json!({
                 "decision_id": decision.decision_id,
                 "event_id": decision.event_id,
                 "decision_output": decision.decision_output,
+                "created_at": decision.created_at,
             })),
         });
     }
 
     for event in events {
-        let node_id = format!("event:{}", event.event_id);
+        let ref_id = graph_event_ref(&event.event_id);
         event_node_ids.insert(event.event_id.clone());
-        nodes.push(EvidenceGraphNode {
-            id: node_id,
+        event_refs.insert(event.event_id.clone(), ref_id.clone());
+        nodes.push(ObservationGraphNode {
+            ref_id,
+            layer: ObservationGraphLayer::Runtime,
             kind: classify_evidence_event_kind(&event.event_type),
             label: event.event_type.clone(),
             summary: truncate_graph_summary(&event.content, 140),
-            anchor: Some(event.event_id.clone()),
-            created_at: Some(event.created_at.clone()),
             metadata: Some(serde_json::json!({
+                "event_id": event.event_id,
                 "skill_name": event.skill_name,
                 "causal_chain_id": event.causal_chain_id,
+                "created_at": event.created_at,
             })),
         });
     }
 
     for decision in decisions {
         if event_node_ids.contains(&decision.event_id) {
-            let from = format!("event:{}", decision.event_id);
-            let to = format!("decision:{}", decision.decision_id);
-            let key = format!("{from}->{to}:supports");
-            if edge_keys.insert(key) {
-                edges.push(EvidenceGraphEdge {
-                    from,
-                    to,
-                    kind: EvidenceGraphEdgeKind::Supports,
-                });
+            if let (Some(from), Some(to)) = (
+                event_refs.get(decision.event_id.as_str()),
+                decision_refs.get(decision.decision_id.as_str()),
+            ) {
+                push_graph_edge(
+                    &mut edges,
+                    &mut edge_keys,
+                    from.clone(),
+                    to.clone(),
+                    ObservationGraphEdgeKind::Supports,
+                );
             }
         }
     }
@@ -303,36 +265,44 @@ fn build_evidence_graph(
 
         for parent_event_id in full_parent_ids {
             if event_ids.contains(parent_event_id.as_str()) {
-                let from = format!("event:{parent_event_id}");
-                let to = format!("event:{}", event.event_id);
-                let key = format!("{from}->{to}:causes");
-                if edge_keys.insert(key) {
-                    edges.push(EvidenceGraphEdge {
-                        from,
-                        to,
-                        kind: EvidenceGraphEdgeKind::Causes,
-                    });
+                if let (Some(from), Some(to)) = (
+                    event_refs.get(parent_event_id.as_str()),
+                    event_refs.get(event.event_id.as_str()),
+                ) {
+                    push_graph_edge(
+                        &mut edges,
+                        &mut edge_keys,
+                        from.clone(),
+                        to.clone(),
+                        ObservationGraphEdgeKind::Causes,
+                    );
                 }
             }
 
             for decision in decisions {
                 if decision.event_id == parent_event_id {
-                    let from = format!("decision:{}", decision.decision_id);
-                    let to = format!("event:{}", event.event_id);
-                    let key = format!("{from}->{to}:causes");
-                    if edge_keys.insert(key) {
-                        edges.push(EvidenceGraphEdge {
-                            from,
-                            to,
-                            kind: EvidenceGraphEdgeKind::Causes,
-                        });
+                    if let (Some(from), Some(to)) = (
+                        decision_refs.get(decision.decision_id.as_str()),
+                        event_refs.get(event.event_id.as_str()),
+                    ) {
+                        push_graph_edge(
+                            &mut edges,
+                            &mut edge_keys,
+                            from.clone(),
+                            to.clone(),
+                            ObservationGraphEdgeKind::Causes,
+                        );
                     }
                 }
             }
         }
     }
 
-    Some(EvidenceGraph { nodes, edges })
+    Some(ObservationGraphSlice {
+        nodes,
+        edges,
+        budget_result: ObservationBudgetResult::default(),
+    })
 }
 /// Request for LLM-powered single-turn analysis.
 #[derive(Debug, Clone)]
@@ -832,7 +802,7 @@ impl DatabaseReflectService {
         session_id: &str,
         analysis_view: &str,
         last_n: i32,
-    ) -> ServiceResult<Option<EvidenceGraph>> {
+    ) -> ServiceResult<Option<ObservationGraphSlice>> {
         if !analysis_view_queries_recent_evidence_graph(analysis_view) {
             return Ok(None);
         }
@@ -1243,8 +1213,8 @@ impl ReflectService for DatabaseReflectService {
 const REFLECT_EVIDENCE_GRAPH_NODE_BUDGET: usize = 50;
 
 fn budget_reflect_evidence_graph(
-    evidence_graph: Option<EvidenceGraph>,
-) -> (Option<EvidenceGraph>, ObservationBudgetResult) {
+    evidence_graph: Option<ObservationGraphSlice>,
+) -> (Option<ObservationGraphSlice>, ObservationBudgetResult) {
     let Some(mut graph) = evidence_graph else {
         return (None, ObservationBudgetResult::default());
     };
@@ -1258,7 +1228,7 @@ fn budget_reflect_evidence_graph(
         let retained = graph
             .nodes
             .iter()
-            .map(|node| node.id.as_str())
+            .map(|node| node.ref_id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         graph.edges.retain(|edge| {
             retained.contains(edge.from.as_str()) && retained.contains(edge.to.as_str())
@@ -1280,7 +1250,7 @@ fn budget_reflect_evidence_graph(
 }
 
 fn build_reflect_graph_slice(
-    evidence_graph: Option<&EvidenceGraph>,
+    evidence_graph: Option<&ObservationGraphSlice>,
     observations: &[ObservationRecord],
     evidence: &[ObservationEvidence],
     failure_clusters: &[ObservationFailureCluster],
@@ -1293,14 +1263,13 @@ fn build_reflect_graph_slice(
 
     if let Some(graph) = evidence_graph {
         for node in &graph.nodes {
-            let ref_id = graph_node_ref(&node.id);
             push_graph_node(
                 &mut nodes,
                 &mut node_refs,
                 ObservationGraphNode {
-                    ref_id,
-                    layer: ObservationGraphLayer::Runtime,
-                    kind: graph_node_kind(node.kind),
+                    ref_id: node.ref_id.clone(),
+                    layer: node.layer,
+                    kind: node.kind,
                     label: node.label.clone(),
                     summary: node.summary.clone(),
                     metadata: node.metadata.clone(),
@@ -1311,9 +1280,9 @@ fn build_reflect_graph_slice(
             push_graph_edge(
                 &mut edges,
                 &mut edge_keys,
-                graph_node_ref(&edge.from),
-                graph_node_ref(&edge.to),
-                graph_edge_kind(edge.kind),
+                edge.from.clone(),
+                edge.to.clone(),
+                edge.kind,
             );
         }
     }
@@ -1407,22 +1376,6 @@ fn push_graph_edge(
 ) {
     if edge_keys.insert((from.clone(), to.clone(), kind)) {
         edges.push(ObservationGraphEdge { from, to, kind });
-    }
-}
-
-fn graph_node_kind(kind: EvidenceGraphNodeKind) -> ObservationGraphNodeKind {
-    match kind {
-        EvidenceGraphNodeKind::Decision => ObservationGraphNodeKind::Decision,
-        EvidenceGraphNodeKind::Observation => ObservationGraphNodeKind::Event,
-        EvidenceGraphNodeKind::Outcome => ObservationGraphNodeKind::Outcome,
-    }
-}
-
-fn graph_edge_kind(kind: EvidenceGraphEdgeKind) -> ObservationGraphEdgeKind {
-    match kind {
-        EvidenceGraphEdgeKind::Causes => ObservationGraphEdgeKind::Causes,
-        EvidenceGraphEdgeKind::Supports => ObservationGraphEdgeKind::Supports,
-        EvidenceGraphEdgeKind::Contradicts => ObservationGraphEdgeKind::Contradicts,
     }
 }
 
@@ -1954,28 +1907,27 @@ mod tests {
     fn observation_envelope_adds_standard_refs_for_evidence_graph_nodes() {
         let request = ReflectRequest::from_observation_params(None, None, None, None, 20, "");
         let overview = make_overview(2, 0, vec![], 1, None);
-        let graph = EvidenceGraph {
+        let graph = ObservationGraphSlice {
             nodes: vec![
-                EvidenceGraphNode {
-                    id: "event:evt-1".into(),
-                    kind: EvidenceGraphNodeKind::Observation,
+                ObservationGraphNode {
+                    ref_id: graph_event_ref("evt-1"),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Event,
                     label: "user_query".into(),
                     summary: Some("asked a question".into()),
-                    anchor: None,
-                    created_at: None,
                     metadata: None,
                 },
-                EvidenceGraphNode {
-                    id: "decision:dec-1".into(),
-                    kind: EvidenceGraphNodeKind::Decision,
+                ObservationGraphNode {
+                    ref_id: graph_decision_ref("dec-1"),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Decision,
                     label: "tool_surface".into(),
                     summary: None,
-                    anchor: None,
-                    created_at: None,
                     metadata: None,
                 },
             ],
             edges: vec![],
+            budget_result: ObservationBudgetResult::default(),
         };
 
         let envelope = build_observation_envelope(
@@ -2022,32 +1974,31 @@ mod tests {
             affected_tool: "bash".into(),
             fix_hint: "Narrow Command Scope".into(),
         }];
-        let graph = EvidenceGraph {
+        let graph = ObservationGraphSlice {
             nodes: vec![
-                EvidenceGraphNode {
-                    id: "event:evt-1".into(),
-                    kind: EvidenceGraphNodeKind::Observation,
+                ObservationGraphNode {
+                    ref_id: graph_event_ref("evt-1"),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Event,
                     label: "tool_call".into(),
                     summary: Some("ran bash".into()),
-                    anchor: None,
-                    created_at: None,
                     metadata: None,
                 },
-                EvidenceGraphNode {
-                    id: "event:evt-2".into(),
-                    kind: EvidenceGraphNodeKind::Outcome,
+                ObservationGraphNode {
+                    ref_id: graph_event_ref("evt-2"),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Outcome,
                     label: "tool_error".into(),
                     summary: Some("timeout".into()),
-                    anchor: None,
-                    created_at: None,
                     metadata: None,
                 },
             ],
-            edges: vec![EvidenceGraphEdge {
-                from: "event:evt-1".into(),
-                to: "event:evt-2".into(),
-                kind: EvidenceGraphEdgeKind::Causes,
+            edges: vec![ObservationGraphEdge {
+                from: graph_event_ref("evt-1"),
+                to: graph_event_ref("evt-2"),
+                kind: ObservationGraphEdgeKind::Causes,
             }],
+            budget_result: ObservationBudgetResult::default(),
         };
         let envelope = build_observation_envelope(
             "sess-graph-slice",
@@ -2108,30 +2059,30 @@ mod tests {
 
     #[test]
     fn reflect_graph_budget_truncates_nodes_and_prunes_dangling_edges() {
-        let graph = EvidenceGraph {
+        let graph = ObservationGraphSlice {
             nodes: (0..55)
-                .map(|idx| EvidenceGraphNode {
-                    id: format!("event:evt-{idx}"),
-                    kind: EvidenceGraphNodeKind::Observation,
+                .map(|idx| ObservationGraphNode {
+                    ref_id: graph_event_ref(&format!("evt-{idx}")),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Event,
                     label: format!("event {idx}"),
                     summary: None,
-                    anchor: None,
-                    created_at: None,
                     metadata: None,
                 })
                 .collect(),
             edges: vec![
-                EvidenceGraphEdge {
-                    from: "event:evt-0".into(),
-                    to: "event:evt-49".into(),
-                    kind: EvidenceGraphEdgeKind::Supports,
+                ObservationGraphEdge {
+                    from: graph_event_ref("evt-0"),
+                    to: graph_event_ref("evt-49"),
+                    kind: ObservationGraphEdgeKind::Supports,
                 },
-                EvidenceGraphEdge {
-                    from: "event:evt-49".into(),
-                    to: "event:evt-54".into(),
-                    kind: EvidenceGraphEdgeKind::Causes,
+                ObservationGraphEdge {
+                    from: graph_event_ref("evt-49"),
+                    to: graph_event_ref("evt-54"),
+                    kind: ObservationGraphEdgeKind::Causes,
                 },
             ],
+            budget_result: ObservationBudgetResult::default(),
         };
 
         let (budgeted_graph, budget) = budget_reflect_evidence_graph(Some(graph));
@@ -2141,7 +2092,7 @@ mod tests {
         assert_eq!(budget.omitted.evidence_previews, 5);
         assert_eq!(budgeted_graph.nodes.len(), 50);
         assert_eq!(budgeted_graph.edges.len(), 1);
-        assert_eq!(budgeted_graph.edges[0].to, "event:evt-49");
+        assert_eq!(budgeted_graph.edges[0].to, graph_event_ref("evt-49"));
     }
 
     #[test]
@@ -2377,14 +2328,14 @@ mod tests {
         let graph = build_evidence_graph(&decisions, &events, &parent_id_map).expect("graph");
         assert_eq!(graph.nodes.len(), 3);
         assert!(graph.edges.iter().any(|edge| {
-            edge.from == "event:evt-user"
-                && edge.to == "decision:d1"
-                && edge.kind == EvidenceGraphEdgeKind::Supports
+            edge.from == graph_event_ref("evt-user")
+                && edge.to == graph_decision_ref("d1")
+                && edge.kind == ObservationGraphEdgeKind::Supports
         }));
         assert!(graph.edges.iter().any(|edge| {
-            edge.from == "decision:d1"
-                && edge.to == "event:evt-tool"
-                && edge.kind == EvidenceGraphEdgeKind::Causes
+            edge.from == graph_decision_ref("d1")
+                && edge.to == graph_event_ref("evt-tool")
+                && edge.kind == ObservationGraphEdgeKind::Causes
         }));
     }
 
