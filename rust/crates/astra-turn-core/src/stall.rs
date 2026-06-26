@@ -717,8 +717,61 @@ pub const INTENT_DRIFT_WINDOW: usize = 3;
 /// Tools that are always considered on-task (utility/meta tools).
 const ALWAYS_ON_TASK_TOOLS: &[&str] = &["memory", "reflect", "get_agent_info"];
 
-/// Extract keywords from user query for intent matching.
-/// Lowercases and splits on whitespace/punctuation, filters short words.
+/// Common file extensions to recognize as file path entities.
+const FILE_EXTENSIONS: &[&str] = &[
+    ".rs", ".ts", ".js", ".py", ".go", ".java", ".c", ".cpp", ".h", ".hpp",
+    ".json", ".toml", ".yaml", ".yml", ".md", ".txt", ".sh", ".bash",
+];
+
+/// Extract structural entities from user query: file paths, function names, modules.
+/// Returns (file_paths, function_names, module_names).
+fn extract_intent_entities(query: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut file_paths = Vec::new();
+    let mut function_names = Vec::new();
+    let mut module_names = Vec::new();
+
+    let query_lower = query.to_lowercase();
+
+    // Extract file paths: words containing dots + known extensions
+    for word in query.split_whitespace() {
+        let word_lower = word.to_lowercase();
+        // File path: contains '.' and ends with known extension
+        if word_lower.contains('.') {
+            for ext in FILE_EXTENSIONS {
+                if word_lower.ends_with(ext) {
+                    file_paths.push(word_lower.clone());
+                    break;
+                }
+            }
+        }
+        // Function name: word followed by '(' or '::'
+        if word_lower.ends_with('(') || word_lower.contains("::") {
+            let func = word_lower.trim_end_matches('(');
+            function_names.push(func.to_string());
+        }
+    }
+
+    // Extract module names from common patterns
+    // "in X module", "use X", "import X", "from X"
+    let patterns = [" in ", " use ", " import ", " from ", " crate ", " module "];
+    for pattern in patterns {
+        if let Some(idx) = query_lower.find(pattern) {
+            let after = &query_lower[idx + pattern.len()..];
+            if let Some(word) = after.split_whitespace().next() {
+                // Take the first word after the pattern (likely a module name)
+                let word = word.trim_end_matches(|c: char| c.is_ascii_punctuation());
+                if word.len() >= 2 {
+                    module_names.push(word.to_string());
+                }
+            }
+        }
+    }
+
+    (file_paths, function_names, module_names)
+}
+
+/// Extract keywords from user query for intent matching (fallback when no entities found).
+/// Lowercases and splits on whitespace/punctuation, filters short words (<2 chars).
 fn extract_intent_keywords(query: &str) -> Vec<String> {
     query
         .to_lowercase()
@@ -728,12 +781,58 @@ fn extract_intent_keywords(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// Check if a set of tool names + their arguments have any relevance to
-/// the user's original query keywords.
-fn tools_relate_to_intent(
+/// Check if tool calls reference any of the extracted intent entities.
+fn tools_reference_entities(
+    tool_names: &[String],
+    tool_args_text: &str,
+    file_paths: &[String],
+    function_names: &[String],
+    module_names: &[String],
+) -> bool {
+    if tool_names.is_empty() {
+        return true; // can't judge → assume on-task
+    }
+    // Always-on-task tools are by definition relevant
+    if tool_names
+        .iter()
+        .any(|n| ALWAYS_ON_TASK_TOOLS.contains(&n.as_str()))
+    {
+        return true;
+    }
+
+    let args_lower = tool_args_text.to_lowercase();
+
+    // Check file path matches in args
+    for path in file_paths {
+        if args_lower.contains(path) {
+            return true;
+        }
+    }
+
+    // Check function name matches in args
+    for func in function_names {
+        if args_lower.contains(func) {
+            return true;
+        }
+    }
+
+    // Check module name matches in args
+    for module in module_names {
+        if args_lower.contains(module) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if tool calls relate to intent keywords (hybrid fallback when no entities found).
+/// Requires ≥20% overlap OR domain-aware tool match (git/cargo).
+fn tools_relate_to_keywords(
     tool_names: &[String],
     tool_args_text: &str,
     intent_keywords: &[String],
+    query_lower: &str,
 ) -> bool {
     if intent_keywords.is_empty() || tool_names.is_empty() {
         return true; // can't judge → assume on-task
@@ -748,24 +847,36 @@ fn tools_relate_to_intent(
 
     let combined = format!("{} {}", tool_names.join(" "), tool_args_text.to_lowercase());
 
-    // Check if any intent keyword appears in tool names or args
+    // Require ≥20% keyword overlap (not just 1 match)
     let match_count = intent_keywords
         .iter()
         .filter(|kw| combined.contains(kw.as_str()))
         .count();
-
-    // At least 1 keyword match, or >20% overlap
-    match_count > 0 || {
-        // Fallback: check if tool names themselves suggest the right domain
-        let query_lower = intent_keywords.join(" ");
-        // Git-related queries match git tools
-        (query_lower.contains("commit")
-            || query_lower.contains("git")
-            || query_lower.contains("review")
-            || query_lower.contains("diff")
-            || query_lower.contains("blame"))
-            && tool_names.iter().any(|n| n == "git" || n == "bash")
+    let overlap_ratio = match_count as f64 / intent_keywords.len() as f64;
+    if overlap_ratio >= 0.2 {
+        return true;
     }
+
+    // Domain-aware fallback: query mentions domain + tools match domain
+    let has_git_domain = tool_names.iter().any(|n| n == "git");
+    let has_bash_domain = tool_names.iter().any(|n| n == "bash");
+    let has_cargo_domain = tool_names.iter().any(|n| n == "cargo" || n == "bash");
+
+    // If query mentions git/commit/review/diff/blame and tools are git/bash → on-task
+    if (query_lower.contains("git") || query_lower.contains("commit"))
+        && (has_git_domain || has_bash_domain)
+    {
+        return true;
+    }
+
+    // If query mentions cargo/build/test and tools are cargo/bash → on-task
+    if (query_lower.contains("cargo") || query_lower.contains("build") || query_lower.contains("test"))
+        && has_cargo_domain
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Detect if the agent has drifted from the user's original intent.
@@ -774,20 +885,47 @@ fn tools_relate_to_intent(
 /// `recent_tool_turns`: for each recent turn, the (tool_names, concatenated_args) used.
 ///
 /// Returns `IntentDrift::Drifting` if the last N turns used tools
-/// unrelated to the user's query.
+/// that don't reference any entities from the user's query.
+///
+/// **Algorithm**: hybrid entity+keyword scoring
+/// 1. Extract structural entities (file paths, function names, modules)
+/// 2. If entities found → check if tools reference them
+/// 3. If no entities → fall back to keyword overlap (≥20% threshold)
+/// 4. Count consecutive off-task turns, trigger if ≥ INTENT_DRIFT_WINDOW
 pub fn detect_intent_drift(
     user_query: &str,
     recent_tool_turns: &[(Vec<String>, String)],
 ) -> IntentDrift {
-    let keywords = extract_intent_keywords(user_query);
-    if keywords.is_empty() || recent_tool_turns.is_empty() {
+    if recent_tool_turns.is_empty() {
+        return IntentDrift::OnTask;
+    }
+
+    let (file_paths, function_names, module_names) = extract_intent_entities(user_query);
+    let has_entities = !file_paths.is_empty() || !function_names.is_empty() || !module_names.is_empty();
+
+    // Fallback to keywords if no entities found
+    let keywords = if !has_entities {
+        extract_intent_keywords(user_query)
+    } else {
+        Vec::new()
+    };
+    let query_lower = user_query.to_lowercase();
+
+    // If neither entities nor keywords extracted, fall back to conservative on-task assumption
+    if !has_entities && keywords.is_empty() {
         return IntentDrift::OnTask;
     }
 
     // Count consecutive off-task turns from the end
     let mut consecutive_off_task = 0;
     for (names, args_text) in recent_tool_turns.iter().rev() {
-        if tools_relate_to_intent(names, args_text, &keywords) {
+        let on_task = if has_entities {
+            tools_reference_entities(names, args_text, &file_paths, &function_names, &module_names)
+        } else {
+            tools_relate_to_keywords(names, args_text, &keywords, &query_lower)
+        };
+
+        if on_task {
             break;
         }
         consecutive_off_task += 1;
