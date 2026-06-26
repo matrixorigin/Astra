@@ -2222,7 +2222,7 @@ mod tests {
         let mut state = make_state();
         state.max_turn_input_tokens = 0;
         state.messages = vec![json!({"role": "user", "content": "hello world"})];
-        state.always_load_tool_schema_tokens = 50;
+        state.pinned_tool_schema_tokens = 50;
         assert_eq!(introspect_token_pressure(&state), 0.0);
     }
 
@@ -2233,10 +2233,10 @@ mod tests {
             json!({"role": "system", "content": "system prompt"}),
             json!({"role": "user", "content": "hello world"}),
         ];
-        state.always_load_tool_schema_tokens = 120;
+        state.pinned_tool_schema_tokens = 120;
         let expected = crate::prompts::estimate_tokens(
             &state.messages,
-            state.always_load_tool_schema_tokens as usize,
+            state.pinned_tool_schema_tokens as usize,
             0,
         ) as f64
             / 10_000.0;

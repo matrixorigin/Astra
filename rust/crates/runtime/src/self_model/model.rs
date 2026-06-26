@@ -198,7 +198,7 @@ pub struct CapabilityView {
     /// `widen_surface` request from the pipeline (a one-shot hard restriction
     /// reset after a correction or strategy signal).
     #[serde(default)]
-    pub widen_surface_pending: bool,
+    pub widen_selection_pending: bool,
     /// Compact recent signature-level execution memory surfaced back to the
     /// model so it can avoid blindly repeating identical tool calls.
     #[serde(default)]
@@ -349,7 +349,7 @@ impl SelfModel {
 
     /// Same as [`Self::snapshot`] but also incorporates the most recent
     /// [`StrategyApplication`] so the rendered self-awareness section surfaces
-    /// `boosted_tools` / `widen_surface_pending` to the agent.
+    /// `boosted_tools` / `widen_selection_pending` to the agent.
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot_with_strategy(
         tool_names: &[&str],
@@ -416,7 +416,7 @@ impl SelfModel {
 
         health_avoidance.sort();
 
-        let (boosted_tools, widen_surface_pending) = match last_strategy {
+        let (boosted_tools, widen_selection_pending) = match last_strategy {
             Some(app) => {
                 let mut boosted: Vec<String> = app
                     .newly_boosted
@@ -438,7 +438,7 @@ impl SelfModel {
             health_avoidance_tools: health_avoidance,
             skills: skills.to_vec(),
             boosted_tools,
-            widen_surface_pending,
+            widen_selection_pending,
             outcome_memory,
         };
 
@@ -713,7 +713,7 @@ impl SelfModel {
                 self.capabilities.boosted_tools.join(", ")
             );
         }
-        if self.capabilities.widen_surface_pending {
+        if self.capabilities.widen_selection_pending {
             s.push_str(
                 "Tool surface: hard restrictions reset for next turn (one-shot recovery after correction/strategy signal).\n",
             );
@@ -1057,7 +1057,7 @@ impl SelfModel {
         if !self.capabilities.outcome_memory.is_empty()
             || !self.capabilities.health_avoidance_tools.is_empty()
             || !self.capabilities.boosted_tools.is_empty()
-            || self.capabilities.widen_surface_pending
+            || self.capabilities.widen_selection_pending
         {
             return true;
         }
@@ -1670,7 +1670,7 @@ mod tests {
             model.capabilities.boosted_tools,
             vec!["bash", "grep", "read_file"]
         );
-        assert!(model.capabilities.widen_surface_pending);
+        assert!(model.capabilities.widen_selection_pending);
         let rendered = model.to_system_prompt_section();
         assert!(
             rendered.contains("Boosted tools: bash, grep, read_file"),
@@ -1737,7 +1737,7 @@ mod tests {
             &config,
         );
         assert!(model.capabilities.boosted_tools.is_empty());
-        assert!(!model.capabilities.widen_surface_pending);
+        assert!(!model.capabilities.widen_selection_pending);
         let rendered = model.to_system_prompt_section();
         assert!(!rendered.contains("Boosted tools"), "got: {rendered}");
         assert!(

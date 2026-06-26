@@ -801,15 +801,15 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_execution_retry = false;
     state.stall.forced_execution_escalation = false;
     state.stall.forced_parallel_batching = false;
-    state.stall.forced_tool_round_hard_stop = false;
-    state.stall.forced_tool_round_abort = false;
+    state.stall.forced_round_budget_phase1 = false;
+    state.stall.forced_round_budget_phase2 = false;
     state.stall.forced_completion_soft_stop = false;
     state.stall.forced_task_board_completion_gate = false;
     state.stall.forced_redundant_reads_corrective = false;
     state.stall.forced_cache_waste_corrective = false;
     state.stall.forced_search_fanout_corrective = false;
     state.stall.forced_exploration_family_corrective = false;
-    state.stall.forced_exploration_family_lockout = false;
+    state.stall.forced_exploration_family_phase2 = false;
     state.stall.exploration_family_corrective_family = None;
     // Clear tool restrictions injected by exploration-family correctives so
     // they don't leak into the next user turn.

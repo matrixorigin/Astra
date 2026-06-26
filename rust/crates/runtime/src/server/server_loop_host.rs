@@ -2869,7 +2869,7 @@ impl ServerAgenticLoopHost {
     /// 4. boost rescue
     /// 5. activated-deferred-tool rescue
     ///
-    /// `consume_widen` controls whether the `widen_surface_pending` flag is
+    /// `consume_widen` controls whether the `widen_selection_pending` flag is
     /// consumed (authoritative path: main turn / test helper) or merely
     /// peeked (preview path: pre-turn summary, which must not steal the flag
     /// from the main turn that follows it). This is the only legitimate
@@ -2885,7 +2885,7 @@ impl ServerAgenticLoopHost {
         // 1. Consume or peek the widen flag. Soft health diagnostics are not
         // promoted into the hard restricted-tool set.
         if consume_widen {
-            let _ = std::mem::take(&mut state.widen_surface_pending);
+            let _ = std::mem::take(&mut state.widen_selection_pending);
         }
         // 2-5. layered restrictions from the merged base.
         let mut effective = state.restricted_tools.clone();
@@ -3528,7 +3528,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &final_system_prompt_breakdown,
             state.last_llm_context_manifest_trace.as_ref(),
         );
-        state.always_load_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
+        state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
         state.last_turn_policy =
             TurnInteractionPolicy::from_tool_schemas(self.turn_interaction_mode(), &final_tools);
 
@@ -7541,7 +7541,7 @@ mod tests {
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
-            widen_surface_pending: false,
+            widen_selection_pending: false,
             step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
@@ -7583,7 +7583,7 @@ mod tests {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            always_load_tool_schema_tokens: 0,
+            pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,

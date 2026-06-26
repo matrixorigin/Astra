@@ -12,18 +12,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
 
+use crate::turn::agentic_loop::host::{
+    run_agentic_loop_with_host, runtime_manifest_for_model, AgenticLoopHost as _, AgenticLoopState,
+    CancellationState, RequestConstraints, SkillState, StopHookState, TurnInteractionPolicy,
+};
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
-use crate::turn::agentic_loop::host::{
-    AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
-    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host, runtime_manifest_for_model,
-};
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
@@ -424,7 +424,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
-            widen_surface_pending: false,
+            widen_selection_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -494,7 +494,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            always_load_tool_schema_tokens: 0,
+            pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -508,6 +508,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

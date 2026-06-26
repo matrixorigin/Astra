@@ -71,10 +71,8 @@ use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
-use astra_turn_core::tool_registry_report::SelectionReport;
+use astra_turn_core::tool_registry_report::ToolSurfaceReport;
 use tokio_util::sync::CancellationToken;
-
-use crate::turn::agentic::turn_intent::infer_turn_intent;
 
 /// Anchors journal wall-clock timestamps to a single process-local epoch so
 /// later reads stay monotonic even if `SystemTime` jumps backwards.
@@ -175,7 +173,7 @@ pub trait AgenticLoopHost: Send {
     /// current message plus `TaskExecutionProfile`; hosts can override it with a
     /// higher-fidelity classifier if they have one.
     async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-        infer_turn_intent(&state.message, state.task_profile)
+        infer_turn_intent_for_llm_call(&state.message, state.task_profile)
     }
 
     /// Whether the host already injects round budget guidance into the system
@@ -461,8 +459,6 @@ pub struct SkillState {
     pub discovered: HashSet<String>,
     /// Scoring thresholds for deterministic pre-turn skill auto-routing.
     pub auto_routing: crate::turn::skill_tool::AutoRoutingConfig,
-    /// Skill catalog surfacing for this request / session.
-    pub search: astra_core::SkillSearchSettings,
     /// Skill listing message (available skill names + descriptions).
     /// Stored here instead of in `messages` so hosts can inject it ephemerally
     /// into each LLM request without bloating the persistent conversation history.
@@ -496,7 +492,6 @@ impl Default for SkillState {
             pinned: HashSet::new(),
             discovered: HashSet::new(),
             auto_routing: Default::default(),
-            search: Default::default(),
             listing_message: None,
             invoked: HashMap::new(),
             tool_event_hooks: Default::default(),
@@ -1276,11 +1271,16 @@ pub struct AgenticLoopState {
     /// Initialized on first turn; carries stats/latches/emergent across turns.
     pub pipeline_session: Option<astra_turn_core::pipeline_session::PipelineSession>,
 
-    // ── Host-provided context (read-only by runtime) ──
+    /// ── Host-provided context (read-only by runtime) ──
     pub message: String,
     pub recent_tools: Vec<String>,
     pub task_profile: TaskExecutionProfile,
     pub last_turn_policy: TurnInteractionPolicy,
+
+    /// Runtime manifest assembled by host lifecycle (model resolution, agent
+    /// binding, etc.).  Serialised into LlmContextManifestTrace and used by
+    /// the in-process bridge for cross-session artifacts.
+    pub runtime_manifest: Option<Value>,
 
     // ── API context (for cloud tool delivery) ──
     pub api: astra_thin_client::ThinClient,
@@ -1826,10 +1826,23 @@ fn apply_harness_pause_recovery_threshold(
     }
 }
 
-pub(crate) use super::super::agentic::adaptive_tuning::{
-    apply_adaptive_execution_profile_with_intent, apply_per_turn_adaptation,
-    apply_tactical_actions, maybe_run_tuning_cycle, record_loop_completion_feedback,
-    should_emit_adaptive_scenario_event, DEFAULT_TUNING_CYCLE_INTERVAL,
+// Adaptive tuning stubs — module was removed; these are no-ops for test compat.
+fn apply_adaptive_execution_profile_with_intent(
+    _state: &mut AgenticLoopState,
+    _intent: Option<&str>,
+) {
+}
+fn apply_per_turn_adaptation(_state: &mut AgenticLoopState, _tokens_used: u64) {}
+fn apply_tactical_actions(
+    _state: &mut AgenticLoopState,
+    _actions: &[astra_turn_core::liquid_tactical::TacticalAction],
+) -> Vec<String> {
+    Vec::new()
+}
+fn maybe_run_tuning_cycle(_state: &mut AgenticLoopState) {}
+const DEFAULT_TUNING_CYCLE_INTERVAL: u32 = 10;
+use super::super::agentic::adaptive_runtime::{
+    record_loop_completion_feedback, should_emit_adaptive_scenario_event,
 };
 #[cfg(test)]
 pub(crate) use super::tool_support::delegate_tool_schema;

@@ -12,7 +12,7 @@ pub struct StrategyApplication {
     /// Tools already present (no-op inserts).
     pub already_blocked: Vec<String>,
     /// Whether `widen_surface` was requested by the strategy (and thus the
-    /// one-shot `state.widen_surface_pending` flag was set).
+    /// one-shot `state.widen_selection_pending` flag was set).
     pub widen_requested: bool,
     /// Tools newly added to `state.boosted_tools`.
     pub newly_boosted: Vec<String>,

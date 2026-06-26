@@ -61,7 +61,7 @@
 use std::collections::HashSet;
 
 use super::agentic_loop::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host,
+    run_agentic_loop_with_host, AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState,
 };
 
 // ─── Wait reason ─────────────────────────────────────────────────────────────
@@ -196,8 +196,8 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
     // ── Test host ────────────────────────────────────────────────────────────
@@ -273,7 +273,6 @@ mod tests {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: None,
-            runtime_manifest: None,
             recursion_depth: 0,
             final_text: String::new(),
             final_text_streamed: false,
@@ -296,7 +295,7 @@ mod tests {
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
-            widen_surface_pending: false,
+            widen_selection_pending: false,
             step_recorder: StepRecorder::new("test-user", "test", "run"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
@@ -338,7 +337,8 @@ mod tests {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            always_load_tool_schema_tokens: 0,
+            pinned_tool_schema_tokens: 0,
+            tool_budget_override: None,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,

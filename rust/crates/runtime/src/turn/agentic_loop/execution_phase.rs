@@ -2926,8 +2926,8 @@ fn record_tool_selection(
                     turn_index
                 ),
                 timestamp: std::time::SystemTime::now(),
-                decision_type: astra_turn_core::decision_explainer::DecisionType::ToolSelection {
-                    selected_tools: selected_tools.clone(),
+                decision_type: astra_turn_core::decision_explainer::DecisionType::ToolSurface {
+                    visible_tools: selected_tools.clone(),
                     total_available: state.telemetry.all_tools_used.len() as u32,
                 },
                 inputs: vec![astra_turn_core::decision_explainer::ExplainableInput {
@@ -2956,10 +2956,8 @@ fn record_tool_selection(
             .iter()
             .map(|r| r.tool.clone())
             .collect();
-        collector.record_tool_selection(
+        collector.record_tool_surface(
             &selected_tools,
-            "llm",
-            0.0,
             &[],
             state.telemetry.all_tools_used.len() as u32,
             0,
