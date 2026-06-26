@@ -261,8 +261,7 @@ impl FeedbackSignalStore {
         }
         let data = {
             let buffer = self.buffer.read().unwrap_or_else(|e| e.into_inner());
-            serde_json::to_vec_pretty(&*buffer)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            serde_json::to_vec_pretty(&*buffer).map_err(std::io::Error::other)?
         };
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, data)?;

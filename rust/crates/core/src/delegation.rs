@@ -96,14 +96,13 @@ impl DelegationOutcomeTracker {
                 }
             }
         }
-        if let Some((scenario, pattern, _)) = worst {
-            if let Some(inner) = data.get_mut(&scenario) {
+        if let Some((scenario, pattern, _)) = worst
+            && let Some(inner) = data.get_mut(&scenario) {
                 inner.remove(&pattern);
                 if inner.is_empty() {
                     data.remove(&scenario);
                 }
             }
-        }
     }
 
     /// Record a delegation outcome. Auto-persists and enforces capacity bounds.
@@ -141,9 +140,7 @@ impl DelegationOutcomeTracker {
     /// Return the best historical pattern for a scenario.
     pub fn preferred_pattern(&self, scenario: &str, min_observations: u32) -> Option<String> {
         let map = self.data.read().unwrap_or_else(|e| e.into_inner());
-        let Some(inner) = map.get(scenario) else {
-            return None;
-        };
+        let inner = map.get(scenario)?;
         let mut best: Option<(String, f64)> = None;
 
         for (pattern, stats) in inner.iter() {
@@ -229,7 +226,7 @@ mod tests {
 
         assert_eq!(tracker.stats("a:b", "c").unwrap().successes, 1);
         assert_eq!(tracker.stats("a", "b:c").unwrap().failures, 1);
-        assert_eq!(tracker.stats("a", "b").is_none(), true);
+        assert!(tracker.stats("a", "b").is_none());
     }
 
     #[test]

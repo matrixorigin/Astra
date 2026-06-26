@@ -398,8 +398,8 @@ fn build_introspect_observations(
                 }
             }
         }
-        ObservationFacet::Errors => {
-            if !snapshot.tool_errors.is_empty() {
+        ObservationFacet::Errors
+            if !snapshot.tool_errors.is_empty() => {
                 observations.push(ObservationRecord {
                     ref_id: "urn:astra:observation:local:introspect:errors:recent".to_string(),
                     topic: request.topic.as_str().to_string(),
@@ -411,9 +411,8 @@ fn build_introspect_observations(
                     evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
                 });
             }
-        }
-        ObservationFacet::Stall => {
-            if snapshot.stall_state.nudge_count > 0 {
+        ObservationFacet::Stall
+            if snapshot.stall_state.nudge_count > 0 => {
                 observations.push(ObservationRecord {
                     ref_id: "urn:astra:observation:local:introspect:stall:state".to_string(),
                     topic: request.topic.as_str().to_string(),
@@ -425,7 +424,6 @@ fn build_introspect_observations(
                     evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
                 });
             }
-        }
         _ => {}
     }
 

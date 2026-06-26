@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 /// legacy facet names to these canonical variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ObservationFacet {
     /// Session-level health: pressure, cache, turns, alerts.
+    #[default]
     Session,
     /// Recent execution rounds and tool calls.
     Recent,
@@ -52,10 +54,10 @@ impl fmt::Display for ObservationFacetError {
 
 impl std::error::Error for ObservationFacetError {}
 
-impl ObservationFacet {
-    /// Parse a facet string into canonical form.
-    /// Returns an error for unknown facets instead of falling back to Session.
-    pub fn from_str(s: &str) -> Result<Self, ObservationFacetError> {
+impl std::str::FromStr for ObservationFacet {
+    type Err = ObservationFacetError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "" | "session" | "runtime" => Ok(Self::Session),
             "recent" => Ok(Self::Recent),
@@ -72,7 +74,9 @@ impl ObservationFacet {
             }),
         }
     }
+}
 
+impl ObservationFacet {
     /// Convert to canonical string representation.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -87,12 +91,6 @@ impl ObservationFacet {
             Self::Cache => "cache",
             Self::SessionMemory => "session_memory",
         }
-    }
-}
-
-impl Default for ObservationFacet {
-    fn default() -> Self {
-        Self::Session
     }
 }
 
@@ -432,11 +430,11 @@ mod tests {
     #[test]
     fn observation_facet_parses_advertised_edge_local_facets() {
         assert_eq!(
-            ObservationFacet::from_str("cache").unwrap(),
+            "cache".parse::<ObservationFacet>().unwrap(),
             ObservationFacet::Cache
         );
         assert_eq!(
-            ObservationFacet::from_str("session-memory").unwrap(),
+            "session-memory".parse::<ObservationFacet>().unwrap(),
             ObservationFacet::SessionMemory
         );
         assert_eq!(ObservationFacet::Cache.as_str(), "cache");

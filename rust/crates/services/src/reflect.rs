@@ -237,8 +237,8 @@ fn build_evidence_graph(
     }
 
     for decision in decisions {
-        if event_node_ids.contains(&decision.event_id) {
-            if let (Some(from), Some(to)) = (
+        if event_node_ids.contains(&decision.event_id)
+            && let (Some(from), Some(to)) = (
                 event_refs.get(decision.event_id.as_str()),
                 decision_refs.get(decision.decision_id.as_str()),
             ) {
@@ -250,7 +250,6 @@ fn build_evidence_graph(
                     ObservationGraphEdgeKind::Supports,
                 );
             }
-        }
     }
 
     for event in events {
@@ -260,8 +259,8 @@ fn build_evidence_graph(
         );
 
         for parent_event_id in full_parent_ids {
-            if event_ids.contains(parent_event_id.as_str()) {
-                if let (Some(from), Some(to)) = (
+            if event_ids.contains(parent_event_id.as_str())
+                && let (Some(from), Some(to)) = (
                     event_refs.get(parent_event_id.as_str()),
                     event_refs.get(event.event_id.as_str()),
                 ) {
@@ -273,11 +272,10 @@ fn build_evidence_graph(
                         ObservationGraphEdgeKind::Causes,
                     );
                 }
-            }
 
             for decision in decisions {
-                if decision.event_id == parent_event_id {
-                    if let (Some(from), Some(to)) = (
+                if decision.event_id == parent_event_id
+                    && let (Some(from), Some(to)) = (
                         decision_refs.get(decision.decision_id.as_str()),
                         event_refs.get(event.event_id.as_str()),
                     ) {
@@ -289,7 +287,6 @@ fn build_evidence_graph(
                             ObservationGraphEdgeKind::Causes,
                         );
                     }
-                }
             }
         }
     }

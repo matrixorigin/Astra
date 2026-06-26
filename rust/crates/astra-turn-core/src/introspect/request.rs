@@ -1,5 +1,6 @@
 use astra_core::ObservationFacet;
 use serde_json::Value;
+use std::str::FromStr;
 
 use super::IntrospectTextDepth;
 
@@ -39,7 +40,7 @@ impl ObservationTopic {
 
 /// Runtime facet selected within an observation topic.
 /// Uses the unified observation-plane facet taxonomy from `astra_core`.
-
+///
 /// Output depth requested by callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntrospectDepth {

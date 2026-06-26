@@ -8768,7 +8768,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         let guard = session.read().unwrap();
         assert!(guard.config.verification.strictness > 0.5);
-        assert!(state.turn_guard.health.is_deprioritized("bash"));
+        assert!(state.turn_guard.health.is_avoidance_advised("bash"));
         assert_eq!(state.tool_budget_override, Some(850));
         assert!(guard.config.compression.compression_threshold < 0.8);
         assert!(guard.config.token_budget.max_turn_input_tokens < 100_000);
