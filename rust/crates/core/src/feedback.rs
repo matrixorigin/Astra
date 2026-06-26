@@ -249,32 +249,25 @@ impl FeedbackSignalStore {
     }
 
     /// Persist retained feedback signals using an atomic rename.
-    pub fn persist(&self) {
+    ///
+    /// Returns `Ok(())` on success or the first I/O error encountered.
+    /// Errors are not silently swallowed; callers decide whether to log or propagate.
+    pub fn persist(&self) -> std::io::Result<()> {
         let Some(path) = &self.storage_path else {
-            return;
+            return Ok(());
         };
-        if let Some(parent) = path.parent()
-            && let Err(err) = std::fs::create_dir_all(parent)
-        {
-            eprintln!("[feedback-signals] failed to create storage directory: {err}");
-            return;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
         let data = {
             let buffer = self.buffer.read().unwrap_or_else(|e| e.into_inner());
-            let Ok(data) = serde_json::to_vec_pretty(&*buffer) else {
-                return;
-            };
-            data
+            serde_json::to_vec_pretty(&*buffer)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
         };
         let tmp = path.with_extension("tmp");
-        if let Err(err) = std::fs::write(&tmp, data) {
-            eprintln!("[feedback-signals] failed to write temp file: {err}");
-            return;
-        }
-        if let Err(err) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            eprintln!("[feedback-signals] failed to rename temp file: {err}");
-        }
+        std::fs::write(&tmp, data)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 }
 

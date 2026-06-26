@@ -4,11 +4,13 @@
 //! outcomes and exposes the historically preferred pattern for a scenario. It
 //! does not mutate runtime configuration.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+
+const DEFAULT_MAX_ENTRIES: usize = 1000;
 
 /// Per-(scenario, pattern) outcome statistics for coordination auto-select.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -35,8 +37,13 @@ impl OutcomeStats {
 }
 
 /// Tracks delegation outcomes per (scenario, pattern) pair.
+///
+/// Uses a nested `BTreeMap<scenario, BTreeMap<pattern, stats>>` to eliminate
+/// delimiter-collision bugs that arise from concatenating two arbitrary strings
+/// into a single key. Bounding is enforced on total (scenario, pattern) pairs.
 pub struct DelegationOutcomeTracker {
-    data: RwLock<HashMap<String, OutcomeStats>>,
+    data: RwLock<BTreeMap<String, BTreeMap<String, OutcomeStats>>>,
+    max_entries: usize,
     storage_path: Option<PathBuf>,
 }
 
@@ -50,7 +57,8 @@ impl DelegationOutcomeTracker {
     /// Create an in-memory tracker.
     pub fn new() -> Self {
         Self {
-            data: RwLock::new(HashMap::new()),
+            data: RwLock::new(BTreeMap::new()),
+            max_entries: DEFAULT_MAX_ENTRIES,
             storage_path: None,
         }
     }
@@ -60,30 +68,64 @@ impl DelegationOutcomeTracker {
         let data = if path.exists() {
             match std::fs::read(&path) {
                 Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-                Err(_) => HashMap::new(),
+                Err(_) => BTreeMap::new(),
             }
         } else {
-            HashMap::new()
+            BTreeMap::new()
         };
         Self {
             data: RwLock::new(data),
+            max_entries: DEFAULT_MAX_ENTRIES,
             storage_path: Some(path),
         }
     }
 
-    fn key(scenario: &str, pattern: &str) -> String {
-        format!("{scenario}:{pattern}")
+    /// Count total (scenario, pattern) entries across all scenarios.
+    fn total_entries(data: &BTreeMap<String, BTreeMap<String, OutcomeStats>>) -> usize {
+        data.values().map(|inner| inner.len()).sum()
     }
 
-    /// Record a delegation outcome.
-    pub fn record(&self, scenario: &str, pattern: &str, succeeded: bool) {
-        let mut map = self.data.write().unwrap_or_else(|e| e.into_inner());
-        let entry = map.entry(Self::key(scenario, pattern)).or_default();
-        if succeeded {
-            entry.successes += 1;
-        } else {
-            entry.failures += 1;
+    /// Evict the entry with the fewest total observations when over capacity.
+    fn evict_least_observed(data: &mut BTreeMap<String, BTreeMap<String, OutcomeStats>>) {
+        let mut worst: Option<(String, String, u32)> = None;
+        for (scenario, inner) in data.iter() {
+            for (pattern, stats) in inner.iter() {
+                let total = stats.total();
+                if worst.as_ref().is_none_or(|(_, _, t)| total < *t) {
+                    worst = Some((scenario.clone(), pattern.clone(), total));
+                }
+            }
         }
+        if let Some((scenario, pattern, _)) = worst {
+            if let Some(inner) = data.get_mut(&scenario) {
+                inner.remove(&pattern);
+                if inner.is_empty() {
+                    data.remove(&scenario);
+                }
+            }
+        }
+    }
+
+    /// Record a delegation outcome. Auto-persists and enforces capacity bounds.
+    pub fn record(&self, scenario: &str, pattern: &str, succeeded: bool) {
+        {
+            let mut map = self.data.write().unwrap_or_else(|e| e.into_inner());
+            let entry = map
+                .entry(scenario.to_string())
+                .or_default()
+                .entry(pattern.to_string())
+                .or_default();
+            if succeeded {
+                entry.successes += 1;
+            } else {
+                entry.failures += 1;
+            }
+            // Enforce capacity bound.
+            while Self::total_entries(&map) > self.max_entries {
+                Self::evict_least_observed(&mut map);
+            }
+        }
+        self.persist();
     }
 
     /// Get outcome stats for a specific scenario/pattern pair.
@@ -91,24 +133,26 @@ impl DelegationOutcomeTracker {
         self.data
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&Self::key(scenario, pattern))
+            .get(scenario)
+            .and_then(|inner| inner.get(pattern))
             .cloned()
     }
 
     /// Return the best historical pattern for a scenario.
     pub fn preferred_pattern(&self, scenario: &str, min_observations: u32) -> Option<String> {
         let map = self.data.read().unwrap_or_else(|e| e.into_inner());
-        let prefix = format!("{scenario}:");
+        let Some(inner) = map.get(scenario) else {
+            return None;
+        };
         let mut best: Option<(String, f64)> = None;
 
-        for (key, stats) in map.iter() {
-            if !key.starts_with(&prefix) || stats.total() < min_observations {
+        for (pattern, stats) in inner.iter() {
+            if stats.total() < min_observations {
                 continue;
             }
-            let pattern = &key[prefix.len()..];
             let rate = stats.success_rate();
             if best.as_ref().is_none_or(|(_, best_rate)| rate > *best_rate) {
-                best = Some((pattern.to_string(), rate));
+                best = Some((pattern.clone(), rate));
             }
         }
         best.map(|(pattern, _)| pattern)
@@ -138,6 +182,7 @@ impl DelegationOutcomeTracker {
             return;
         }
         if let Err(err) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
             eprintln!("[delegation-outcomes] failed to rename temp file: {err}");
         }
     }
@@ -169,11 +214,38 @@ mod tests {
 
         let tracker = DelegationOutcomeTracker::with_storage(path.clone());
         tracker.record("research", "parallel", true);
-        tracker.persist();
 
         let reloaded = DelegationOutcomeTracker::with_storage(path);
         let stats = reloaded.stats("research", "parallel").unwrap();
         assert_eq!(stats.successes, 1);
         assert_eq!(stats.failures, 0);
+    }
+
+    #[test]
+    fn scenario_with_colons_does_not_collide() {
+        let tracker = DelegationOutcomeTracker::new();
+        tracker.record("a:b", "c", true);
+        tracker.record("a", "b:c", false);
+
+        assert_eq!(tracker.stats("a:b", "c").unwrap().successes, 1);
+        assert_eq!(tracker.stats("a", "b:c").unwrap().failures, 1);
+        assert_eq!(tracker.stats("a", "b").is_none(), true);
+    }
+
+    #[test]
+    fn bounded_eviction_removes_least_observed() {
+        let tracker = DelegationOutcomeTracker {
+            max_entries: 2,
+            ..DelegationOutcomeTracker::new()
+        };
+        tracker.record("s1", "p1", true);
+        tracker.record("s1", "p1", true);
+        tracker.record("s2", "p2", true);
+        // Now at capacity (2 entries). Adding a third should evict s2:p2 (1 obs).
+        tracker.record("s3", "p3", true);
+
+        assert!(tracker.stats("s1", "p1").is_some());
+        assert!(tracker.stats("s3", "p3").is_some());
+        assert!(tracker.stats("s2", "p2").is_none());
     }
 }
