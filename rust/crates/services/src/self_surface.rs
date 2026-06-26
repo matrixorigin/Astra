@@ -2029,6 +2029,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
         JournalEventType::Bootstrap => "bootstrap",
         JournalEventType::TraceSpan => "trace_span",
+        JournalEventType::ToolCallError => "tool_call_error",
     }
     .to_string()
 }
@@ -2346,12 +2347,10 @@ mod tests {
                 .contains(&"hard_restricted_tool".to_string()),
             "checkpoint hard restrictions must not be reported as health-avoidance tools"
         );
-        assert!(
-            snapshot
-                .run
-                .risk_flags
-                .contains(&"health_avoidance_tools".to_string())
-        );
+        assert!(snapshot
+            .run
+            .risk_flags
+            .contains(&"health_avoidance_tools".to_string()));
 
         let environment_json = serde_json::to_value(&snapshot.environment).unwrap();
         assert_eq!(
@@ -2506,24 +2505,20 @@ mod tests {
             snapshot.run.persistence_error.as_deref(),
             Some("failed to append turn event")
         );
-        assert!(
-            snapshot
-                .run
-                .risk_flags
-                .contains(&"session_persistence_degraded".to_string())
-        );
+        assert!(snapshot
+            .run
+            .risk_flags
+            .contains(&"session_persistence_degraded".to_string()));
         assert!(snapshot
             .run
             .pending_blockers
             .iter()
             .any(|blocker| blocker.contains("session_persistence: failed to append turn event")));
         assert!(!snapshot.acceptance.ok);
-        assert!(
-            snapshot
-                .acceptance
-                .failing_checks
-                .contains(&"session_persistence_healthy".to_string())
-        );
+        assert!(snapshot
+            .acceptance
+            .failing_checks
+            .contains(&"session_persistence_healthy".to_string()));
     }
 
     #[tokio::test]
@@ -2588,12 +2583,10 @@ mod tests {
             panic!("expected verify surface");
         };
         assert!(!verify.ok, "journal is missing so acceptance should fail");
-        assert!(
-            verify
-                .checks
-                .iter()
-                .any(|check| check.name == "runtime_config_parse")
-        );
+        assert!(verify
+            .checks
+            .iter()
+            .any(|check| check.name == "runtime_config_parse"));
     }
 
     #[tokio::test]
@@ -2723,11 +2716,9 @@ mod tests {
             .expect("verification evolution record");
 
         assert_eq!(verification.status, "recorded");
-        assert!(
-            verification
-                .summary
-                .contains("verification failed global subtask-1")
-        );
+        assert!(verification
+            .summary
+            .contains("verification failed global subtask-1"));
         assert!(verification.summary.contains("integration-tests"));
     }
 }

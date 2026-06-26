@@ -6,14 +6,13 @@ use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::*;
 use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
-    READ_ONLY_TOOLS, openai_tool_roundtrip_values_with_result_fields,
+    openai_tool_roundtrip_values_with_result_fields, READ_ONLY_TOOLS,
 };
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::journal_record_executed_tool_call;
 use astra_turn_core::headless_tool_postprocess::{
-    HeadlessCacheableRecordCtx, format_headless_tool_duration,
-    record_headless_cacheable_success_and_semantic_hint_if_ok,
-    try_write_light_headless_step_checkpoint,
+    format_headless_tool_duration, record_headless_cacheable_success_and_semantic_hint_if_ok,
+    try_write_light_headless_step_checkpoint, HeadlessCacheableRecordCtx,
 };
 use astra_turn_core::headless_tool_status_display::{
     tool_call_detail, tool_error_summary, tool_result_summary,
@@ -98,6 +97,17 @@ fn maybe_persist_model_tool_result(
     }
 }
 
+fn truncate_tool_error(result_str: &str) -> String {
+    // Take the first non-empty line as the error summary, truncated to 200 chars.
+    result_str
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("(no output)")
+        .chars()
+        .take(200)
+        .collect()
+}
+
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) async fn record_execution(&mut self, executed: ExecutedExecution) {
         let ExecutedExecution {
@@ -159,6 +169,42 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
             rec.round = Some(self.ctx.llm_round);
         }
+
+        // Emit a ToolCallError journal event when a tool fails.
+        // This closes the gap where non-zero bash exits weren't surfaced
+        // to introspect/reflect because they weren't promoted to error events.
+        if is_err {
+            if let Some(sid) = self.ctx.current_session_id {
+                if let Some(rec) = self.ctx.tool_call_records.last() {
+                    let error_msg = format!(
+                        "tool '{}' failed: {}",
+                        &execution.name,
+                        truncate_tool_error(&execution.result_str)
+                    );
+                    let event = astra_services::session_journal::JournalEvent::tool_call_error(
+                        Some(sid),
+                        self.ctx.session_turn,
+                        &execution.name,
+                        &error_msg,
+                        rec.clone(),
+                    );
+                    match astra_services::session_journal::JournalWriter::new(sid) {
+                        Ok(journal) => {
+                            let _ = journal.append(&event);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "astra_runtime::headless_tool_pipeline",
+                                session_id = %sid,
+                                err = %err,
+                                "failed to open journal for ToolCallError event"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         self.ctx
             .step_recorder
             .complete_tool_with_result_and_metadata(

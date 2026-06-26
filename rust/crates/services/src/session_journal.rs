@@ -1233,6 +1233,8 @@ pub enum JournalEventType {
     Turn,
     /// A turn failed with an error.
     TurnError,
+    /// A tool call failed with an error (non-zero exit, crash, signal, timeout).
+    ToolCallError,
     /// Manual or auto compact.
     Compact,
     /// Configuration changed (model, explain, skill toggle).
@@ -3405,6 +3407,23 @@ impl JournalEvent {
     pub fn error(session_id: Option<&str>, error: &str) -> Self {
         let mut evt = Self::base(JournalEventType::Error, session_id);
         evt.error = Some(truncate(error, 500));
+        evt
+    }
+
+    /// A tool call failed with a non-zero exit, crash, signal, or timeout.
+    /// Stores the error message and the associated [`ToolCallRecord`].
+    pub fn tool_call_error(
+        session_id: Option<&str>,
+        turn: u32,
+        tool_name: &str,
+        error_msg: &str,
+        record: ToolCallRecord,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::ToolCallError, session_id);
+        evt.turn = Some(turn);
+        evt.error = Some(truncate(error_msg, 500));
+        evt.tools_used = Some(vec![tool_name.to_string()]);
+        evt.tool_calls = Some(vec![record]);
         evt
     }
 
