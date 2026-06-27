@@ -162,6 +162,37 @@ impl Default for CircuitPolicy {
     }
 }
 
+// ─── Textless Stop Policy ─────────────────────────────────────────────────────
+
+/// Policy for handling turns where the model stops with tool calls but no text.
+///
+/// Exploration tasks (code review, large-scale investigation) legitimately
+/// batch many tool calls before producing a summary — the circuit breaker
+/// and stall detection handle real anomalies. This policy controls how many
+/// retry nudges to inject before accepting the silent stop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextlessPolicy {
+    /// Maximum retries: inject a "produce text" nudge and ContinueLoop this
+    /// many times before admitting defeat. 0 disables retry entirely.
+    pub max_retries: u32,
+    /// When true, skip retry for exploration-profile tasks (code review,
+    /// large-scale read-only investigation).
+    pub exclude_exploratory: bool,
+    /// When true, append a `[truncated]` marker when the LLM's output was
+    /// cut off by the API token limit (`finish_reason == "length"`).
+    pub mark_truncated_text: bool,
+}
+
+impl Default for TextlessPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            exclude_exploratory: true,
+            mark_truncated_text: true,
+        }
+    }
+}
+
 // ─── Runtime Policy ──────────────────────────────────────────────────────────
 
 /// Runtime policy that uses purely factual thresholds — consecutive outcomes
@@ -193,6 +224,9 @@ pub struct RuntimePolicy {
     /// Circuit breaker sub-policy.
     #[serde(default)]
     pub circuit: CircuitPolicy,
+    /// Textless-stop retry sub-policy.
+    #[serde(default)]
+    pub textless: TextlessPolicy,
 }
 
 impl Default for RuntimePolicy {
@@ -204,6 +238,7 @@ impl Default for RuntimePolicy {
             reflect_after_consecutive_zero: 3,
             compact: CompactPolicy::default(),
             circuit: CircuitPolicy::default(),
+            textless: TextlessPolicy::default(),
         }
     }
 }
@@ -305,6 +340,80 @@ impl RuntimePolicy {
         }
 
         actions
+    }
+
+    /// Decide whether to retry a textless stop.
+    ///
+    /// Called at `StopIterating` when the model produced tool calls but no
+    /// text summary. Returns `Some(InjectSignal)` with a nudge when a retry
+    /// is warranted, or `None` to accept the silent stop.
+    ///
+    /// Suppressed when:
+    /// - `suppress_nudges` is true (Auto mode)
+    /// - `textless.exclude_exploratory && is_exploratory` (exploration tasks)
+    /// - `retry_count >= textless.max_retries` (exhausted)
+    /// - No tool calls were made (`total_tool_calls == 0`)
+    pub fn decide_textless_stop(
+        &self,
+        retry_count: u32,
+        total_tool_calls: u32,
+        is_exploratory: bool,
+        suppress_nudges: bool,
+    ) -> Option<FrameworkAction> {
+        if suppress_nudges {
+            return None;
+        }
+        if self.textless.exclude_exploratory && is_exploratory {
+            return None;
+        }
+        if total_tool_calls == 0 {
+            return None;
+        }
+        if retry_count >= self.textless.max_retries {
+            tracing::info!(
+                retry_count,
+                max = self.textless.max_retries,
+                total_tool_calls,
+                "textless_stop_retries_exhausted: {} tools, {} retries",
+                total_tool_calls,
+                retry_count,
+            );
+            return None;
+        }
+        let nudge = format!(
+            "⚠ {} tool call(s) executed but NO summary text produced. \
+             Summarize what you found and any changes made. \
+             If you have more work to do, call tools as needed — \
+             just include a brief text update alongside them. \
+             (reminder {}/{})",
+            total_tool_calls,
+            retry_count + 1,
+            self.textless.max_retries,
+        );
+        tracing::info!(
+            retry = retry_count + 1,
+            max = self.textless.max_retries,
+            total_tool_calls,
+            "textless_stop_retry: injecting nudge (attempt {}/{})",
+            retry_count + 1,
+            self.textless.max_retries,
+        );
+        Some(FrameworkAction::InjectSignal { message: nudge })
+    }
+
+    /// Produce a truncation marker when the model's output was cut off by the
+    /// API token limit (`finish_reason == "length"`). Returns `Some(marker)`
+    /// when the policy is enabled and the reason signals truncation; `None`
+    /// otherwise (prevents noise for normal stop/tool_calls).
+    pub fn truncation_marker(&self, finish_reason: Option<&str>) -> Option<&'static str> {
+        if !self.textless.mark_truncated_text {
+            return None;
+        }
+        if finish_reason == Some("length") {
+            Some("[truncated — output cut off by token limit]")
+        } else {
+            None
+        }
     }
 }
 
@@ -445,6 +554,7 @@ mod tests {
             reflect_after_consecutive_zero: 5,
             compact: CompactPolicy::default(),
             circuit: CircuitPolicy::default(),
+            textless: TextlessPolicy::default(),
         };
         let f = facts(4, 0, 3, 10);
         let actions = policy.decide(&f);
@@ -466,6 +576,7 @@ mod tests {
             reflect_after_consecutive_zero: 3,
             compact: CompactPolicy::default(),
             circuit: CircuitPolicy::default(),
+            textless: TextlessPolicy::default(),
         };
         let f = facts(1, 0, 5, 10);
         let actions = policy.decide(&f);
@@ -665,6 +776,7 @@ mod tests {
                 aggressive_pressure_threshold: 0.80,
             },
             circuit: CircuitPolicy::default(),
+            textless: TextlessPolicy::default(),
         };
         let mut f = facts(0, 0, 8, 10);
         f.cache_pressure = 0.55; // above custom threshold of 0.50
@@ -777,6 +889,7 @@ mod tests {
                 max_consecutive_reads: 5,
                 error_rate_threshold: 0.10,
             },
+            textless: TextlessPolicy::default(),
         };
         let mut f = facts(0, 0, 8, 20);
         f.current_error_rate = 0.15;

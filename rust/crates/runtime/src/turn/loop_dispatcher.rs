@@ -324,6 +324,8 @@ mod tests {
             recent_tools: Vec::new(),
             has_prior_assistant_turn: false,
             task_profile: TaskExecutionProfile::default(),
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             runtime_manifest: None,
             api: astra_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),

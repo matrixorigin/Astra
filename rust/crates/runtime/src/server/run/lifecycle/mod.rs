@@ -145,6 +145,7 @@ fn load_budget_policy_from_config() -> Option<crate::turn::runtime_policy::Runti
         reflect_after_consecutive_zero: cfg.reflect_after_consecutive_zero,
         compact: Default::default(),
         circuit: Default::default(),
+        textless: Default::default(),
     })
 }
 
@@ -3295,6 +3296,8 @@ impl AgenticRunLifecycleService {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns,
@@ -7191,6 +7194,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns,

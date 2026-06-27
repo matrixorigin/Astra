@@ -700,6 +700,7 @@ pub(crate) async fn stream_chat_sse(
         .clone();
 
     let mut state = AgenticLoopState {
+        observation_store: None,
         observation_journal: Default::default(),
         messages,
         volatile_pending: Vec::new(),
@@ -721,6 +722,8 @@ pub(crate) async fn stream_chat_sse(
         total_cache_read: 0,
         total_cache_creation: 0,
         total_tool_calls: 0,
+        textless_stop_retries: 0,
+        last_finish_reason: None,
         total_evidence_tool_calls: 0,
         has_any_usage: false,
         max_turns,

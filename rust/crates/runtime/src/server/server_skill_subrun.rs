@@ -411,6 +411,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,

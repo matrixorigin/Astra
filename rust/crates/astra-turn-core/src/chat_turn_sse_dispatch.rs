@@ -77,6 +77,10 @@ pub struct ChatTurnSseAccum {
     /// `Empty` in the freshness report. Stays `None` → downstream
     /// observers skip those channels (history remains `Untracked`).
     pub bridge_injection_fingerprints: Option<BridgeInjectionFingerprints>,
+    /// The model's `finish_reason` from the final SSE chunk. `"stop"` for
+    /// natural completion, `"length"` when output was truncated by the API's
+    /// max_tokens limit, `"tool_calls"` when the model requested tools.
+    pub finish_reason: Option<String>,
 }
 
 /// Deferred edge work from `tool_request` / `approval_required` events.
@@ -493,6 +497,22 @@ fn apply_one_event(
         _ => {
             if let Some(rid) = event.get("run_id").and_then(|v| v.as_str()) {
                 accum.run_id = Some(rid.to_string());
+            }
+            // Capture finish_reason from the final SSE chunk when the API
+            // streams it as `choices[0].finish_reason`. This is the raw
+            // OpenAI-protocol value: "stop", "length", "tool_calls", etc.
+            if accum.finish_reason.is_none() {
+                if let Some(reason) = event
+                    .get("choices")
+                    .and_then(|v| v.as_array())
+                    .and_then(|choices| choices.first())
+                    .and_then(|choice| choice.get("finish_reason"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !reason.is_empty() {
+                        accum.finish_reason = Some(reason.to_string());
+                    }
+                }
             }
         }
     }

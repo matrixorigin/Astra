@@ -274,15 +274,12 @@ fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec
             .collect(),
     );
     let completed = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_completed()).collect());
+    // Cancelled tasks are intentionally excluded from the task board display:
+    // the user cancelled them, so they shouldn't clutter the view.
     let terminal = sort_by_id_asc(
         tasks
             .iter()
-            .filter(|t| {
-                matches!(
-                    t.status,
-                    SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled
-                )
-            })
+            .filter(|t| matches!(t.status, SessionTaskStatusKind::Failed))
             .collect(),
     );
     let archival = sort_by_id_asc(

@@ -1487,6 +1487,16 @@ pub struct AgenticLoopState {
     // ── Turn management ──
     pub max_turns: usize,
     pub remaining_turns: usize,
+    /// Retry counter: model stopped producing text but had called tools
+    /// in prior rounds. Incremented by `execute_turn_and_ingest_phase`
+    /// when it retries the stop; capped by `RuntimePolicy::textless.max_retries`.
+    pub textless_stop_retries: u32,
+    /// The `finish_reason` from the most recent LLM turn. `Some("length")`
+    /// when the model hit its output token limit (prose truncated by the API);
+    /// `Some("stop")` for natural completion; `None` on the first turn.
+    /// Used by textless-stop retry and terminal-text logic to distinguish
+    /// true silence from forced truncation.
+    pub last_finish_reason: Option<String>,
     /// Latches for the per-budget self-pacing hints emitted at
     /// 50 % / 20 % remaining. Reset when a budget extension
     /// lands so the newly-extended budget gets the hint sequence
@@ -2732,6 +2742,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         total_tool_calls: 0,
         total_evidence_tool_calls: 0,
         has_any_usage: false,
+        textless_stop_retries: 0,
+        last_finish_reason: None,
         max_turns: 10,
         remaining_turns: 10,
         turn_budget_hint_emitted_90: false,
@@ -3259,6 +3271,8 @@ pub(crate) mod tests {
             has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             last_turn_policy: TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),

@@ -617,7 +617,7 @@ function TaskCard({ task }: { task: SessionTask }) {
           </div>
           {subtasks.length ? (
             <div className="space-y-1">
-              {subtasks.slice(0, 4).map((subtask) => (
+              {subtasks.slice(0, 6).map((subtask) => (
                 <div
                   key={subtask.id}
                   className="flex items-center gap-2 text-xs"
@@ -630,14 +630,15 @@ function TaskCard({ task }: { task: SessionTask }) {
                         ? "text-text-muted line-through decoration-border-strong"
                         : "text-text-secondary",
                     )}
+                    title={subtask.title}
                   >
                     {subtask.title}
                   </span>
                 </div>
               ))}
-              {subtasks.length > 4 ? (
+              {subtasks.length > 6 ? (
                 <div className="pl-5 text-[11px] text-text-muted">
-                  +{subtasks.length - 4} more
+                  +{subtasks.length - 6} more
                 </div>
               ) : null}
             </div>

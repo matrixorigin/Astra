@@ -1166,6 +1166,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // calls for guidance-threshold purposes, not just successful ones).
     let turn_result = host.execute_turn(state).await;
     state.llm_rounds_completed += 1;
+    // Capture finish_reason before the match consumes turn_result.
+    // Used by textless-stop retry (loop level) and ensure_terminal_text
+    // (finalization level) to distinguish true silence from forced truncation
+    // when the API's max_tokens limit cuts off the model's output.
+    state.last_finish_reason = turn_result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.accum.finish_reason.clone());
     // Persist the per-call manifest only after the host returns: the durable
     // record includes observed token usage and the emitted context-manifest
     // trace, both of which are only available on the completed turn result.
@@ -1669,6 +1677,39 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
                 return Ok(TurnExecutionControl::ContinueLoop);
+            }
+
+            // ── Textless stop retry (policy-driven) ──────────────────────
+            // Delegate to RuntimePolicy::decide_textless_stop which
+            // centralizes the retry logic, exploration-task exemption,
+            // and nudge construction. The policy returns InjectSignal
+            // when a retry is warranted.
+            if state.final_text.trim().is_empty() {
+                let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
+                let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
+                if let Some(action) = policy.decide_textless_stop(
+                    state.textless_stop_retries,
+                    state.total_tool_calls as u32,
+                    state.task_profile.exploratory_task,
+                    suppress_nudges,
+                ) {
+                    if let crate::turn::runtime_policy::FrameworkAction::InjectSignal {
+                        message: nudge,
+                    } = action
+                    {
+                        state.textless_stop_retries += 1;
+                        state.push_volatile(super::host::VolatileKind::BudgetAdvisory, nudge);
+                        record_early_exit_llm_round(
+                            state,
+                            &turn_result,
+                            prep.turn_start_time,
+                            Some("textless_stop_retry"),
+                        );
+                        state.step_recorder.end_turn(false);
+                        try_write_heavy_checkpoint(state);
+                        return Ok(TurnExecutionControl::ContinueLoop);
+                    }
+                }
             }
 
             // Record the LLM round even for text-only responses (no tool calls).
