@@ -26,8 +26,8 @@
 //! be shared with `RuntimePolicy::decide()` and `execution_phase`.
 
 use crate::turn::runtime_policy::TuningPolicy;
-use astra_core::observation::{TuningJob, TuningSignalType};
 use astra_core::ObservationFacet;
+use astra_core::observation::{TuningJob, TuningSignalType};
 use astra_turn_core::introspect::{CircuitBreakerSnapshot, IntrospectSnapshot};
 
 use super::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
@@ -646,10 +646,11 @@ mod tests {
         with_inspection(&state, |svc| {
             let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
             // No compaction signals when pressure ≤ 0.80
-            assert!(jobs
-                .iter()
-                .all(|j| j.signal != TuningSignalType::PromptCompaction
-                    && j.signal != TuningSignalType::AggressiveCompaction));
+            assert!(
+                jobs.iter()
+                    .all(|j| j.signal != TuningSignalType::PromptCompaction
+                        && j.signal != TuningSignalType::AggressiveCompaction)
+            );
         });
     }
 
@@ -706,9 +707,10 @@ mod tests {
         state.stall.tool_call_records = vec![Default::default(); 10];
         with_inspection(&state, |svc| {
             let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            assert!(jobs
-                .iter()
-                .all(|j| j.signal != TuningSignalType::CircuitBreakerTuning));
+            assert!(
+                jobs.iter()
+                    .all(|j| j.signal != TuningSignalType::CircuitBreakerTuning)
+            );
         });
     }
 
@@ -739,9 +741,10 @@ mod tests {
         state.remaining_turns = 5;
         with_inspection(&state, |svc| {
             let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            assert!(jobs
-                .iter()
-                .all(|j| j.signal != TuningSignalType::CacheWarming));
+            assert!(
+                jobs.iter()
+                    .all(|j| j.signal != TuningSignalType::CacheWarming)
+            );
         });
     }
 
@@ -789,9 +792,10 @@ mod tests {
         state.hooks.task_board_snapshot.pending_count = 1;
         with_inspection(&state, |svc| {
             let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            assert!(jobs
-                .iter()
-                .all(|j| j.signal != TuningSignalType::TaskDecomposition));
+            assert!(
+                jobs.iter()
+                    .all(|j| j.signal != TuningSignalType::TaskDecomposition)
+            );
         });
     }
 
@@ -804,7 +808,7 @@ mod tests {
         // Many turns → CacheWarming
         state.max_turns = 30;
         state.remaining_turns = 15; // 15 turns > 10
-                                    // Stalled journal → TaskDecomposition
+        // Stalled journal → TaskDecomposition
         use astra_core::observation::TurnMetrics;
         for _ in 0..6 {
             let mut m = TurnMetrics::default();

@@ -3231,7 +3231,7 @@ async fn observability_persist_ok_counter_increments_after_turn() {
 
     let after = PERSIST_OK_COUNT.load(Ordering::Relaxed);
     assert!(
-        after >= before + 1,
+        after > before,
         "PERSIST_OK_COUNT should increment by at least 1: before={before}, after={after}"
     );
 }
@@ -4482,7 +4482,7 @@ async fn explain_event_text_only_no_tools() {
     let ex = explain_events[0];
     assert_eq!(ex.get("tool_calls").and_then(Value::as_i64), Some(0));
     assert!(
-        ex.get("first_tool_call").map_or(true, Value::is_null),
+        ex.get("first_tool_call").is_none_or(Value::is_null),
         "no first_tool_call when no tools called"
     );
 }
@@ -8184,7 +8184,7 @@ async fn a3_multi_turn_error_isolation_turn2_error_preserves_turn1() {
 
     // Turn 1's persisted data should still be intact
     let core = cap.core_plans.lock().await;
-    assert!(core.len() >= 1, "turn 1 core plan still present");
+    assert!(!core.is_empty(), "turn 1 core plan still present");
     let t1_uq = core[0].user_query_event.as_ref().unwrap();
     assert!(t1_uq.content.contains("hello"), "turn 1 data intact");
 }
@@ -8290,7 +8290,7 @@ async fn a4_skill_tool_name_in_edge_tools_treated_as_regular_tool() {
     // The skill tool call should be emitted as a tool_request (for edge execution)
     let tool_reqs = events_of_type(&events, "tool_request");
     assert!(
-        tool_reqs.len() >= 1,
+        !tool_reqs.is_empty(),
         "skill tool call emitted as tool_request"
     );
 

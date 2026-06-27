@@ -520,9 +520,11 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 4, 10);
         let actions = policy.decide(&f);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
     }
 
     #[test]
@@ -530,9 +532,11 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 8, 10);
         let actions = policy.decide(&f);
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
     }
 
     #[test]
@@ -540,9 +544,11 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 5, 10);
         let actions = policy.decide(&f);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
     }
 
     #[test]
@@ -550,9 +556,11 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 6, 10);
         let actions = policy.decide(&f);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
     }
 
     // ── Zero-streak signal (existing) ───────────────────────────────────────
@@ -562,9 +570,11 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 3, 7, 10);
         let actions = policy.decide(&f);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::InjectSignal { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+        );
     }
 
     #[test]
@@ -572,9 +582,11 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 2, 7, 10);
         let actions = policy.decide(&f);
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::InjectSignal { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+        );
     }
 
     // ── Continue default (existing) ─────────────────────────────────────────
@@ -688,9 +700,11 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 3, 10);
         let actions = policy.decide(&f);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
     }
 
     #[test]
@@ -698,9 +712,11 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 3, 7, 10);
         let actions = policy.decide(&f);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::InjectSignal { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+        );
     }
 
     #[test]
@@ -721,15 +737,19 @@ mod tests {
 
         // State 2: outcome streak + tight budget → ExpandBudget
         let actions = policy.decide(&facts(2, 0, 3, 10));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
 
         // State 3: zero streak → InjectSignal
         let actions = policy.decide(&facts(0, 3, 7, 10));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::InjectSignal { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+        );
 
         // State 4: stall → InjectSignal only
         let mut stall_facts = facts(2, 0, 3, 10);
@@ -783,9 +803,11 @@ mod tests {
         let mut f = facts(1, 0, 8, 10);
         f.performance.token_pressure = 0.60;
         let actions = policy.decide(&f);
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. }))
+        );
     }
 
     #[test]
@@ -902,9 +924,11 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("without observable outcome")))
         );
-        assert!(actions
-            .iter()
-            .all(|a| !matches!(a, FrameworkAction::ExpandBudget { .. })));
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
     }
 
     #[test]
@@ -996,9 +1020,11 @@ mod tests {
         let mut f = facts(1, 0, 8, 10);
         f.task.task_completion_ratio = 0.5;
         let actions = policy.decide(&f);
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+        );
     }
 
     #[test]
@@ -1006,9 +1032,11 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 0, 10, 10); // task_completion_ratio = 0.0 (default)
         let actions = policy.decide(&f);
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+        );
     }
 
     // ── Multiple actions same turn (14 tests) ──────────────────────────────
@@ -1026,9 +1054,11 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. }))
+        );
     }
 
     #[test]
@@ -1037,12 +1067,16 @@ mod tests {
         let mut f = facts(2, 0, 3, 10);
         f.task.task_completion_ratio = 1.0;
         let actions = policy.decide(&f);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. })));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
     }
 
     // ── Zero all facts → Continue (unhappy path) ───────────────────────────

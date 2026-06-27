@@ -1539,7 +1539,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             }
             dispatcher.dispatch(
                 crate::turn::observation_dispatcher::ObservationEvent::TurnCompleted {
-                    metrics,
+                    metrics: Box::new(metrics),
                     facts,
                 },
             );
@@ -3260,7 +3260,10 @@ esac
 
         let mut dispatcher = ObservationDispatcher::new();
         dispatcher.register(MemorySink::new(&mut journal));
-        dispatcher.dispatch(ObservationEvent::TurnCompleted { metrics, facts });
+        dispatcher.dispatch(ObservationEvent::TurnCompleted {
+            metrics: Box::new(metrics),
+            facts,
+        });
         drop(dispatcher); // release &mut journal borrow
 
         assert!(

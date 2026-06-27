@@ -930,11 +930,11 @@ async fn spawn_sse_reader(body: Body) -> (mpsc::UnboundedReceiver<Value>, JoinHa
             while let Some(idx) = buf.find("\n\n") {
                 let event_str = buf[..idx].to_string();
                 buf = buf[idx + 2..].to_string();
-                if let Some(data) = event_str.strip_prefix("data: ") {
-                    if let Ok(v) = serde_json::from_str::<Value>(data) {
-                        let _ = tx.send(v.clone());
-                        events.push(v);
-                    }
+                if let Some(data) = event_str.strip_prefix("data: ")
+                    && let Ok(v) = serde_json::from_str::<Value>(data)
+                {
+                    let _ = tx.send(v.clone());
+                    events.push(v);
                 }
             }
         }
@@ -1192,10 +1192,8 @@ async fn poll_run_status(app: &Router, run_id: &str, expected: &str, timeout_sec
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         let (st, body) = get_run_status(app, run_id).await;
-        if st == StatusCode::OK {
-            if body["status"].as_str().unwrap_or("") == expected {
-                return body;
-            }
+        if st == StatusCode::OK && body["status"].as_str().unwrap_or("") == expected {
+            return body;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("timed out ({timeout_secs}s) waiting for run '{run_id}' → '{expected}'");
@@ -1950,7 +1948,7 @@ async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
     poll_until(
         || {
             let ow = ow.clone();
-            async move { ow.requests.lock().await.len() > 0 }
+            async move { !ow.requests.lock().await.is_empty() }
         },
         5,
     )
@@ -2020,7 +2018,7 @@ async fn skill_resolve_round_trip_carries_instructions_to_next_turn() {
         poll_until(
             || {
                 let ow = ow.clone();
-                async move { ow.requests.lock().await.len() > 0 }
+                async move { !ow.requests.lock().await.is_empty() }
             },
             5,
         )
@@ -2224,7 +2222,7 @@ async fn unknown_skill_returns_error_without_edge_tool_request() {
     poll_until(
         || {
             let ow = ow.clone();
-            async move { ow.requests.lock().await.len() > 0 }
+            async move { !ow.requests.lock().await.is_empty() }
         },
         5,
     )
@@ -2737,33 +2735,33 @@ async fn cancel_mid_stream_stops_further_rounds() {
         while let Some(idx) = buf.find("\n\n") {
             let event_str = buf[..idx].to_string();
             buf = buf[idx + 2..].to_string();
-            if let Some(data) = event_str.strip_prefix("data: ") {
-                if let Ok(v) = serde_json::from_str::<Value>(data) {
-                    let event_type = v
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+            if let Some(data) = event_str.strip_prefix("data: ")
+                && let Ok(v) = serde_json::from_str::<Value>(data)
+            {
+                let event_type = v
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
 
-                    // Capture run_id from session_info.
-                    if event_type == "session_info" {
-                        run_id = v.get("run_id").and_then(Value::as_str).map(String::from);
-                    }
+                // Capture run_id from session_info.
+                if event_type == "session_info" {
+                    run_id = v.get("run_id").and_then(Value::as_str).map(String::from);
+                }
 
-                    collected_events.push(v);
+                collected_events.push(v);
 
-                    // After seeing tool_request, cancel the run, then post result to unblock.
-                    if event_type == "tool_request" && !cancelled {
-                        if let Some(rid) = &run_id {
-                            let st = cancel_run(&app, rid).await;
-                            assert_eq!(st, 200, "cancel_run failed");
-                            cancelled = true;
+                // After seeing tool_request, cancel the run, then post result to unblock.
+                if event_type == "tool_request"
+                    && !cancelled
+                    && let Some(rid) = &run_id
+                {
+                    let st = cancel_run(&app, rid).await;
+                    assert_eq!(st, 200, "cancel_run failed");
+                    cancelled = true;
 
-                            // Post tool result to unblock the ledger wait.
-                            post_tool_result(&app, "tc-cancel-1", "file contents", "completed")
-                                .await;
-                        }
-                    }
+                    // Post tool result to unblock the ledger wait.
+                    post_tool_result(&app, "tc-cancel-1", "file contents", "completed").await;
                 }
             }
         }
@@ -3421,7 +3419,7 @@ async fn run_status_queryable_after_stream_completes() {
         .expect("run_id in session_info");
 
     // Poll run status until finalized.
-    let body = poll_run_status(&app, &run_id, "completed", 5).await;
+    let body = poll_run_status(&app, run_id, "completed", 5).await;
     let status = body["status"].as_str().unwrap_or("");
     assert!(
         status == "completed" || status == "running",
@@ -4322,13 +4320,12 @@ async fn client_disconnect_run_still_finalizes() {
     while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next()).await {
         let bytes = chunk.unwrap();
         let text = String::from_utf8_lossy(&bytes);
-        if let Some(line) = text.lines().find(|l| l.starts_with("data: ")) {
-            if let Ok(v) = serde_json::from_str::<Value>(line.strip_prefix("data: ").unwrap()) {
-                if v["type"].as_str() == Some("session_info") {
-                    run_id = v["run_id"].as_str().unwrap_or("").to_string();
-                    break;
-                }
-            }
+        if let Some(line) = text.lines().find(|l| l.starts_with("data: "))
+            && let Ok(v) = serde_json::from_str::<Value>(line.strip_prefix("data: ").unwrap())
+            && v["type"].as_str() == Some("session_info")
+        {
+            run_id = v["run_id"].as_str().unwrap_or("").to_string();
+            break;
         }
     }
     assert!(!run_id.is_empty(), "should get session_info with run_id");
@@ -4379,7 +4376,7 @@ async fn hook_db_decision_audit_text_only() {
     poll_until(
         || {
             let hw = hw.clone();
-            async move { hw.plans.lock().await.len() > 0 }
+            async move { !hw.plans.lock().await.is_empty() }
         },
         5,
     )
@@ -4445,7 +4442,7 @@ async fn hook_db_decision_audit_with_tools() {
     poll_until(
         || {
             let hw = hw.clone();
-            async move { hw.plans.lock().await.len() > 0 }
+            async move { !hw.plans.lock().await.is_empty() }
         },
         5,
     )
@@ -4494,7 +4491,7 @@ async fn hook_db_decision_audit_model_name() {
     poll_until(
         || {
             let hw = hw.clone();
-            async move { hw.plans.lock().await.len() > 0 }
+            async move { !hw.plans.lock().await.is_empty() }
         },
         5,
     )
@@ -4530,7 +4527,7 @@ async fn observer_fired_with_correct_metadata() {
     poll_until(
         || {
             let ow = ow.clone();
-            async move { ow.requests.lock().await.len() > 0 }
+            async move { !ow.requests.lock().await.is_empty() }
         },
         5,
     )
@@ -4595,7 +4592,7 @@ async fn hook_db_multiple_visible_tools() {
     poll_until(
         || {
             let hw = hw.clone();
-            async move { hw.plans.lock().await.len() > 0 }
+            async move { !hw.plans.lock().await.is_empty() }
         },
         5,
     )
@@ -5555,7 +5552,7 @@ async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocatio
         poll_until(
             || {
                 let ow = ow.clone();
-                async move { ow.requests.lock().await.len() > 0 }
+                async move { !ow.requests.lock().await.is_empty() }
             },
             5,
         )
@@ -5749,7 +5746,7 @@ async fn tool_events_persisted_for_tool_calls() {
     poll_until(
         || {
             let tw = tw.clone();
-            async move { tw.plans.lock().await.len() > 0 }
+            async move { !tw.plans.lock().await.is_empty() }
         },
         5,
     )
@@ -5805,7 +5802,7 @@ async fn tool_events_multiple_tools_distinct_names() {
     poll_until(
         || {
             let tw = tw.clone();
-            async move { tw.plans.lock().await.len() > 0 }
+            async move { !tw.plans.lock().await.is_empty() }
         },
         5,
     )
@@ -5915,7 +5912,7 @@ async fn mock_llm_tool_error_then_recovery_persists_both_events() {
     // (Existing coverage only deduplicates distinct tool *names* — a known
     // quirk — but at minimum read_file must be present.)
     assert!(
-        all_tool_call_names.iter().any(|n| *n == "read_file"),
+        all_tool_call_names.contains(&"read_file"),
         "read_file tool_call must be persisted, got {all_tool_call_names:?}"
     );
 }

@@ -129,8 +129,8 @@ async fn run_tool_backed_chat_turn(
 
 pub async fn run_product_matrix_full_journey(
     ctx: &MatrixE2eCtx,
-    auth_header: &mut String,
-    refresh_token: &mut String,
+    auth_header: &str,
+    refresh_token: &mut str,
     auth_mode: E2eAuthMode,
 ) {
     let session_id = ctx.session_id.clone();
@@ -146,7 +146,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_root, root) = get_json(app, "/", None, &[]).await;
     assert_eq!(st_root, StatusCode::OK, "root: {root}");
 
-    let (st_list_s, list_s) = get_json(app, "/sessions", Some(auth_header.as_str()), &[]).await;
+    let (st_list_s, list_s) = get_json(app, "/sessions", Some(auth_header), &[]).await;
     assert_eq!(st_list_s, StatusCode::OK, "list sessions: {list_s}");
     assert!(
         list_s["sessions"].as_array().is_some_and(|a| a
@@ -158,7 +158,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_get_s, got_s) = get_json(
         app,
         &format!("/sessions/{session_id}"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -167,7 +167,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_put_s, put_s) = put_json(
         app,
         &format!("/sessions/{session_id}"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({ "title": "product matrix session (updated)" }),
     )
     .await;
@@ -180,7 +180,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_close, closed) = post_empty(
         app,
         &format!("/sessions/{session_id}/close"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
     )
     .await;
     assert_eq!(st_close, StatusCode::OK, "close session: {closed}");
@@ -204,7 +204,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_res, resm) = post_empty(
         app,
         &format!("/sessions/{session_id}/resume"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
     )
     .await;
     assert_eq!(st_res, StatusCode::OK, "resume session: {resm}");
@@ -228,14 +228,13 @@ pub async fn run_product_matrix_full_journey(
     let (st_act, act) = get_json(
         app,
         &format!("/sessions/{session_id}/activity"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
     assert_eq!(st_act, StatusCode::OK, "session activity: {act}");
 
-    let (st_plat, plat) =
-        get_json(app, "/platform/snapshot", Some(auth_header.as_str()), &[]).await;
+    let (st_plat, plat) = get_json(app, "/platform/snapshot", Some(auth_header), &[]).await;
     assert_eq!(st_plat, StatusCode::OK, "platform snapshot: {plat}");
     assert!(
         plat["health"]["status"].is_string(),
@@ -246,20 +245,19 @@ pub async fn run_product_matrix_full_journey(
     let (st_au_sum, au_sum) = get_json(
         app,
         &format!("/sessions/{session_id}/audit/summary"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
     assert_eq!(st_au_sum, StatusCode::OK, "audit summary: {au_sum}");
 
-    let (st_au_stats, au_stats) =
-        get_json(app, "/audit/stats", Some(auth_header.as_str()), &[]).await;
+    let (st_au_stats, au_stats) = get_json(app, "/audit/stats", Some(auth_header), &[]).await;
     assert_eq!(st_au_stats, StatusCode::OK, "audit stats: {au_stats}");
 
     let (st_au_sess, au_sess) = get_json(
         app,
         "/audit/sessions?page=1&per_page=10",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -268,7 +266,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_au_turns, au_turns) = get_json(
         app,
         &format!("/sessions/{session_id}/audit/turns?page=1&per_page=20"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -277,7 +275,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_au_sess_tools, au_sess_tools) = get_json(
         app,
         &format!("/sessions/{session_id}/audit/tools"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -290,7 +288,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_au_errs, au_errs) = get_json(
         app,
         &format!("/sessions/{session_id}/audit/errors"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -300,8 +298,7 @@ pub async fn run_product_matrix_full_journey(
         "session audit errors: {au_errs}"
     );
 
-    let (st_au_tools, au_tools) =
-        get_json(app, "/audit/tools", Some(auth_header.as_str()), &[]).await;
+    let (st_au_tools, au_tools) = get_json(app, "/audit/tools", Some(auth_header), &[]).await;
     assert_eq!(
         st_au_tools,
         StatusCode::OK,
@@ -311,7 +308,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_mkt, mkt_j) = get_json(
         app,
         "/marketplace/installed?limit=20",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -322,7 +319,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_qr, qr_j) = post_json(
         app,
         "/marketplace/quality-report",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({
             "skill_name": mkt_probe_skill.as_str(),
             "skill_version": "1.0.0",
@@ -394,7 +391,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_agent, agent_j) = post_json(
         app,
         "/agents",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({
             "name": "matrix-crud-agent",
             "agent_config": { "suite": "matrix" },
@@ -424,20 +421,15 @@ pub async fn run_product_matrix_full_journey(
         Some(user_id.as_str())
     );
 
-    let (st_get_ag, got_ag) = get_json(
-        app,
-        &format!("/agents/{agent_id}"),
-        Some(auth_header.as_str()),
-        &[],
-    )
-    .await;
+    let (st_get_ag, got_ag) =
+        get_json(app, &format!("/agents/{agent_id}"), Some(auth_header), &[]).await;
     assert_eq!(st_get_ag, StatusCode::OK, "get agent: {got_ag}");
     assert_eq!(got_ag["name"].as_str(), Some("matrix-crud-agent"));
 
     let (st_put_ag, put_ag) = put_json(
         app,
         &format!("/agents/{agent_id}"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({ "name": "matrix-crud-agent-renamed" }),
     )
     .await;
@@ -487,7 +479,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_ev, ev_j) = post_json(
         app,
         "/events",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({
             "session_id": session_id,
             "event_type": "e2e_capability_probe",
@@ -503,7 +495,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_ev_one, ev_one) = get_json(
         app,
         &format!("/events/{manual_event_id}"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -517,7 +509,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_cc, cc_j) = get_json(
         app,
         &format!("/events/causal-chain/{causal_chain_id}"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -531,7 +523,7 @@ pub async fn run_product_matrix_full_journey(
     );
 
     let list_ev_path = format!("/events?session_id={session_id}&limit=20");
-    let (st_list_ev, list_ev) = get_json(app, &list_ev_path, Some(auth_header.as_str()), &[]).await;
+    let (st_list_ev, list_ev) = get_json(app, &list_ev_path, Some(auth_header), &[]).await;
     assert_eq!(st_list_ev, StatusCode::OK, "list events (query): {list_ev}");
     assert!(
         list_ev["events"].as_array().is_some_and(|arr| {
@@ -544,7 +536,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_ev_sess, ev_sess) = get_json(
         app,
         &format!("/events/session/{session_id}?limit=50"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -560,7 +552,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_dv_chain, dv_chain) = get_json(
         app,
         &format!("/data-versioning/lineage/{manual_event_id}/chain"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -577,7 +569,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_dv_up, dv_up) = get_json(
         app,
         &format!("/data-versioning/lineage/{manual_event_id}/upstream"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -590,7 +582,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_ctx, ctx_j) = post_json(
         app,
         "/context",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({
             "session_id": session_id,
             "event_id": manual_event_id,
@@ -628,7 +620,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_get_ctx, got_ctx) = get_json(
         app,
         &format!("/context/{context_capture_id}"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -637,7 +629,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_dec, dec_j) = post_json(
         app,
         "/decisions",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({
             "session_id": session_id,
             "event_id": manual_event_id,
@@ -681,7 +673,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_get_dec, got_dec) = get_json(
         app,
         &format!("/decisions/{decision_id}"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
@@ -690,14 +682,14 @@ pub async fn run_product_matrix_full_journey(
     let (st_audit, audit) = get_json(
         app,
         &format!("/decisions/{decision_id}/audit"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[],
     )
     .await;
     assert_eq!(st_audit, StatusCode::OK, "decision audit: {audit}");
 
     let list_dec_path = format!("/decisions?session_id={session_id}&limit=20");
-    let (st_list_d, list_d) = get_json(app, &list_dec_path, Some(auth_header.as_str()), &[]).await;
+    let (st_list_d, list_d) = get_json(app, &list_dec_path, Some(auth_header), &[]).await;
     assert_eq!(st_list_d, StatusCode::OK, "list decisions: {list_d}");
     assert!(
         list_d["decisions"].as_array().is_some_and(|arr| {
@@ -710,7 +702,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_mem_s, mem_s) = post_json(
         app,
         "/memory/store",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({ "content": "matrix e2e memory", "memory_type": "semantic" }),
     )
     .await;
@@ -719,7 +711,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_mem_r, mem_r) = post_json(
         app,
         "/memory/retrieve",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({ "query": "matrix" }),
     )
     .await;
@@ -728,7 +720,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_mem_q, mem_q) = post_json(
         app,
         "/memory/search",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({ "query": "matrix", "top_k": 3 }),
     )
     .await;
@@ -737,7 +729,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_mem_p, mem_p) = post_json(
         app,
         "/memory/purge",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({ "memory_id": "e2e-purge-dummy" }),
     )
     .await;
@@ -751,7 +743,7 @@ pub async fn run_product_matrix_full_journey(
     let edge_reg = Request::builder()
         .method("POST")
         .uri("/agents/edge")
-        .header("authorization", auth_header.as_str())
+        .header("authorization", auth_header)
         .header("content-type", "application/json")
         .header("x-astra-edge-id", "matrix-e2e-edge")
         .body(Body::from(
@@ -783,7 +775,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_hb, hb) = post_json_with_headers(
         app,
         "/agents/edge/heartbeat",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         &[("x-astra-edge-id", "matrix-e2e-edge")],
         json!({ "edge_agent_id": edge_agent_id }),
     )
@@ -793,7 +785,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_tool, tool_j) = post_json(
         app,
         "/tools/result",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({
             "request_id": "matrix-tool-req-1",
             "status": "completed",
@@ -812,7 +804,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_appr, appr_j) = post_json(
         app,
         "/approval/respond",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({
             "request_id": "matrix-appr-1",
             "decision": "allow",
@@ -822,20 +814,15 @@ pub async fn run_product_matrix_full_journey(
     .await;
     assert_eq!(st_appr, StatusCode::OK, "approval/respond: {appr_j}");
 
-    let (st_runs, runs) = get_json(app, "/runs", Some(auth_header.as_str()), &[]).await;
+    let (st_runs, runs) = get_json(app, "/runs", Some(auth_header), &[]).await;
     assert_eq!(st_runs, StatusCode::OK, "list runs: {runs}");
 
-    let (st_wf, wf_j) = get_json(app, "/workflows", Some(auth_header.as_str()), &[]).await;
+    let (st_wf, wf_j) = get_json(app, "/workflows", Some(auth_header), &[]).await;
     assert_eq!(st_wf, StatusCode::OK, "list workflows: {wf_j}");
     assert!(wf_j.is_array(), "workflows JSON should be an array: {wf_j}");
 
-    let (st_cpl, cpl_j) = get_json(
-        app,
-        "/data-versioning/checkpoints",
-        Some(auth_header.as_str()),
-        &[],
-    )
-    .await;
+    let (st_cpl, cpl_j) =
+        get_json(app, "/data-versioning/checkpoints", Some(auth_header), &[]).await;
     assert_eq!(
         st_cpl,
         StatusCode::OK,
@@ -849,7 +836,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_task, task_j) = post_json(
         app,
         "/tasks",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({
             "title": "matrix e2e task",
             "description": "exercise task endpoint",
@@ -860,20 +847,14 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(st_task, StatusCode::CREATED, "submit task: {task_j}");
     let task_id = task_j["task_id"].as_str().expect("task_id").to_string();
 
-    let (st_gj, gj) = get_json(
-        app,
-        &format!("/tasks/{task_id}"),
-        Some(auth_header.as_str()),
-        &[],
-    )
-    .await;
+    let (st_gj, gj) = get_json(app, &format!("/tasks/{task_id}"), Some(auth_header), &[]).await;
     assert_eq!(st_gj, StatusCode::OK, "get task: {gj}");
     assert_eq!(gj["status"].as_str(), Some("pending"));
 
     let (st_wh, wh_j) = put_json(
         app,
         &format!("/tasks/{task_id}/status"),
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({
             "status": "completed"
         }),
@@ -881,13 +862,7 @@ pub async fn run_product_matrix_full_journey(
     .await;
     assert_eq!(st_wh, StatusCode::OK, "task status update: {wh_j}");
 
-    let (st_gj2, gj2) = get_json(
-        app,
-        &format!("/tasks/{task_id}"),
-        Some(auth_header.as_str()),
-        &[],
-    )
-    .await;
+    let (st_gj2, gj2) = get_json(app, &format!("/tasks/{task_id}"), Some(auth_header), &[]).await;
     assert_eq!(
         st_gj2,
         StatusCode::OK,
@@ -899,7 +874,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_sb, sb_j) = post_json(
         app,
         "/sandbox",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({ "name": sb_name, "description": "matrix e2e sandbox" }),
     )
     .await;
@@ -917,7 +892,7 @@ pub async fn run_product_matrix_full_journey(
         Some(user_id.as_str())
     );
 
-    let (st_sbl, sbl) = get_json(app, "/sandbox", Some(auth_header.as_str()), &[]).await;
+    let (st_sbl, sbl) = get_json(app, "/sandbox", Some(auth_header), &[]).await;
     assert_eq!(st_sbl, StatusCode::OK, "list sandboxes: {sbl}");
     assert!(
         sbl["sandboxes"].as_array().is_some_and(|a| {
@@ -927,21 +902,10 @@ pub async fn run_product_matrix_full_journey(
         "sandbox not listed: {sbl}"
     );
 
-    let (st_sbg, sbg) = get_json(
-        app,
-        &format!("/sandbox/{sb_name}"),
-        Some(auth_header.as_str()),
-        &[],
-    )
-    .await;
+    let (st_sbg, sbg) = get_json(app, &format!("/sandbox/{sb_name}"), Some(auth_header), &[]).await;
     assert_eq!(st_sbg, StatusCode::OK, "get sandbox: {sbg}");
 
-    let st_sbd = delete_no_content(
-        app,
-        &format!("/sandbox/{sb_name}"),
-        Some(auth_header.as_str()),
-    )
-    .await;
+    let st_sbd = delete_no_content(app, &format!("/sandbox/{sb_name}"), Some(auth_header)).await;
     assert_eq!(st_sbd, StatusCode::NO_CONTENT, "delete sandbox");
 
     let sb_gone = sqlx::query("SELECT 1 FROM infra_sandbox_metadata WHERE sandbox_name = ?")
@@ -957,7 +921,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_tr, tr_j) = post_json(
         app,
         "/triggers",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({
             "trigger_type": "webhook",
             "name": format!("wh_{suffix}"),
@@ -972,7 +936,7 @@ pub async fn run_product_matrix_full_journey(
     let trigger_id = tr_j["trigger_id"].as_str().expect("trigger_id").to_string();
     let wh_secret = tr_j["secret"].as_str().expect("webhook secret");
 
-    let (st_tr_l, tr_l) = get_json(app, "/triggers", Some(auth_header.as_str()), &[]).await;
+    let (st_tr_l, tr_l) = get_json(app, "/triggers", Some(auth_header), &[]).await;
     assert_eq!(st_tr_l, StatusCode::OK, "list triggers: {tr_l}");
     assert!(
         tr_l.as_array().is_some_and(|a| {
@@ -992,12 +956,8 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(st_fire, StatusCode::OK, "fire webhook: {fire_j}");
     assert_eq!(fire_j["fired"], true);
 
-    let (st_tr_d, tr_d) = delete_json(
-        app,
-        &format!("/triggers/{trigger_id}"),
-        Some(auth_header.as_str()),
-    )
-    .await;
+    let (st_tr_d, tr_d) =
+        delete_json(app, &format!("/triggers/{trigger_id}"), Some(auth_header)).await;
     assert_eq!(st_tr_d, StatusCode::OK, "delete trigger: {tr_d}");
 
     let trig_gone = sqlx::query("SELECT 1 FROM wf_triggers WHERE trigger_id = ?")
@@ -1010,32 +970,21 @@ pub async fn run_product_matrix_full_journey(
         "wf_triggers row should be deleted: {trigger_id}"
     );
 
-    let (st_sks, sks_j) = get_json(app, "/skills", Some(auth_header.as_str()), &[]).await;
+    let (st_sks, sks_j) = get_json(app, "/skills", Some(auth_header), &[]).await;
     assert_eq!(st_sks, StatusCode::OK, "list skills: {sks_j}");
     assert!(sks_j["skills"].is_array(), "skills list record: {sks_j}");
 
-    let (st_sst, sst_j) = get_json(
-        app,
-        "/skills/status?per_group=50",
-        Some(auth_header.as_str()),
-        &[],
-    )
-    .await;
+    let (st_sst, sst_j) =
+        get_json(app, "/skills/status?per_group=50", Some(auth_header), &[]).await;
     assert_eq!(st_sst, StatusCode::OK, "skills status: {sst_j}");
 
-    let (st_intro, intro_j) = get_json(
-        app,
-        "/introspection/skills",
-        Some(auth_header.as_str()),
-        &[],
-    )
-    .await;
+    let (st_intro, intro_j) = get_json(app, "/introspection/skills", Some(auth_header), &[]).await;
     assert_eq!(st_intro, StatusCode::OK, "introspection skills: {intro_j}");
 
     let intro_ct = format!(
         "/introspection/context/trend?session_id={session_id}&turns=8&context_window=128000"
     );
-    let (st_ict, ict_j) = get_json(app, &intro_ct, Some(auth_header.as_str()), &[]).await;
+    let (st_ict, ict_j) = get_json(app, &intro_ct, Some(auth_header), &[]).await;
     assert_eq!(
         st_ict,
         StatusCode::OK,
@@ -1043,7 +992,7 @@ pub async fn run_product_matrix_full_journey(
     );
 
     let intro_cs = format!("/introspection/context/snapshot?session_id={session_id}&detail=false");
-    let (st_ics, ics_j) = get_json(app, &intro_cs, Some(auth_header.as_str()), &[]).await;
+    let (st_ics, ics_j) = get_json(app, &intro_cs, Some(auth_header), &[]).await;
     assert_eq!(
         st_ics,
         StatusCode::OK,
@@ -1052,7 +1001,7 @@ pub async fn run_product_matrix_full_journey(
 
     let intro_rq =
         format!("/introspection/context/retrieval_quality?session_id={session_id}&turns=5");
-    let (st_irq, irq_j) = get_json(app, &intro_rq, Some(auth_header.as_str()), &[]).await;
+    let (st_irq, irq_j) = get_json(app, &intro_rq, Some(auth_header), &[]).await;
     assert_eq!(
         st_irq,
         StatusCode::OK,
@@ -1062,7 +1011,7 @@ pub async fn run_product_matrix_full_journey(
     let (st_route, route_j) = post_json(
         app,
         "/chat/route",
-        Some(auth_header.as_str()),
+        Some(auth_header),
         json!({ "query": "run tests and fix failures" }),
     )
     .await;
@@ -1080,7 +1029,7 @@ pub async fn run_product_matrix_full_journey(
         "chat/route shape: {route_j}"
     );
 
-    let (st_models, models_j) = get_json(app, "/models", Some(auth_header.as_str()), &[]).await;
+    let (st_models, models_j) = get_json(app, "/models", Some(auth_header), &[]).await;
     assert_eq!(st_models, StatusCode::OK, "list models: {models_j}");
     assert!(
         models_j.as_array().is_some(),
@@ -1097,11 +1046,11 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(st_drift, StatusCode::OK, "evaluation drift: {drift}");
 
     let reflect_path = format!("/chat/session/{session_id}/reflect");
-    let (st_refl, refl) = get_json(app, &reflect_path, Some(auth_header.as_str()), &[]).await;
+    let (st_refl, refl) = get_json(app, &reflect_path, Some(auth_header), &[]).await;
     assert_eq!(st_refl, StatusCode::OK, "reflect: {refl}");
 
     let trace_path = format!("/chat/session/{session_id}/decision-trace");
-    let (st_trace, trace) = get_json(app, &trace_path, Some(auth_header.as_str()), &[]).await;
+    let (st_trace, trace) = get_json(app, &trace_path, Some(auth_header), &[]).await;
     assert_eq!(st_trace, StatusCode::OK, "decision-trace: {trace}");
 
     const LLM_TEXT: &str = "product-matrix-e2e-reply";
@@ -1122,7 +1071,7 @@ pub async fn run_product_matrix_full_journey(
     let chat_req = Request::builder()
         .method("POST")
         .uri("/chat/turn")
-        .header("authorization", auth_header.as_str())
+        .header("authorization", auth_header)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", &test_secret)
         .body(Body::from(chat_body.to_string()))
@@ -1237,7 +1186,7 @@ pub async fn run_product_matrix_full_journey(
     );
     let last_turn_n = n_turns as u32;
     let turn_detail_path = format!("/sessions/{session_id}/audit/turns/{last_turn_n}");
-    let (st_td, td_j) = get_json(app, &turn_detail_path, Some(auth_header.as_str()), &[]).await;
+    let (st_td, td_j) = get_json(app, &turn_detail_path, Some(auth_header), &[]).await;
     assert_eq!(st_td, StatusCode::OK, "audit turn detail: {td_j}");
     assert_eq!(
         td_j["turn"].as_u64(),
@@ -1252,7 +1201,7 @@ pub async fn run_product_matrix_full_journey(
 
     let tool_turn_sse = run_tool_backed_chat_turn(
         app,
-        auth_header.as_str(),
+        auth_header,
         &session_id,
         &agent_id,
         seeded_selected_model(ctx),
@@ -1356,7 +1305,7 @@ pub async fn run_product_matrix_full_journey(
     );
 
     let replay_cmp_path = format!("/sessions/{session_id}/replay/compare");
-    let (st_rcmp, rcmp_j) = get_json(app, &replay_cmp_path, Some(auth_header.as_str()), &[]).await;
+    let (st_rcmp, rcmp_j) = get_json(app, &replay_cmp_path, Some(auth_header), &[]).await;
     assert_eq!(st_rcmp, StatusCode::OK, "replay compare: {rcmp_j}");
     assert!(
         rcmp_j["original_event_count"].as_i64().unwrap_or(0) > 0,
@@ -1366,12 +1315,7 @@ pub async fn run_product_matrix_full_journey(
     cleanup_session_data(pool, &session_id).await;
     cleanup_edge_registry(pool, &user_id, &edge_agent_id).await;
 
-    let del_agent = delete_no_content(
-        app,
-        &format!("/agents/{agent_id}"),
-        Some(auth_header.as_str()),
-    )
-    .await;
+    let del_agent = delete_no_content(app, &format!("/agents/{agent_id}"), Some(auth_header)).await;
     assert_eq!(
         del_agent,
         StatusCode::NO_CONTENT,
@@ -1381,8 +1325,8 @@ pub async fn run_product_matrix_full_journey(
     let (st_out, out_j) = post_json(
         app,
         "/auth/logout",
-        Some(auth_header.as_str()),
-        json!({ "refresh_token": refresh_token.as_str() }),
+        Some(auth_header),
+        json!({ "refresh_token": refresh_token }),
     )
     .await;
     match auth_mode {

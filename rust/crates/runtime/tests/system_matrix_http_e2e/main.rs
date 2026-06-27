@@ -144,7 +144,7 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     let mut b = harness::bootstrap().await;
     journey_full::run_product_matrix_full_journey(
         &b.ctx,
-        &mut b.auth_header,
+        &b.auth_header,
         &mut b.refresh_token,
         b.auth_mode,
     )

@@ -488,8 +488,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         {
             // Construct a lightweight provider for live metrics.
             use crate::turn::providers::{LiveRuntimeProvider, SessionStateProvider};
-            let status_provider =
-                crate::turn::local_provider::LocalSessionProvider::new(state);
+            let status_provider = crate::turn::local_provider::LocalSessionProvider::new(state);
             let cb_state = status_provider.circuit_breaker_state().to_string();
             let cache_ratio = status_provider.cache_hit_ratio();
             let token_pressure = status_provider.token_pressure();
@@ -1666,15 +1665,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             if state.final_text.trim().is_empty() {
                 let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
                 let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
-                if let Some(action) = policy.decide_textless_stop(
+                if let Some(crate::turn::runtime_policy::FrameworkAction::InjectSignal {
+                    message: nudge,
+                }) = policy.decide_textless_stop(
                     state.textless_stop_retries,
-                    state.total_tool_calls as u32,
+                    state.total_tool_calls,
                     state.task_profile.exploratory_task,
                     suppress_nudges,
                 ) {
-                    if let crate::turn::runtime_policy::FrameworkAction::InjectSignal {
-                        message: nudge,
-                    } = action
                     {
                         state.textless_stop_retries += 1;
                         state.push_volatile(super::host::VolatileKind::BudgetAdvisory, nudge);
@@ -2972,6 +2970,7 @@ pub(crate) fn observe_turn_end_without_tools(
     turn_start_time: Instant,
     ttft_ms: Option<u64>,
 ) {
+    // ── Telemetry timing ─────────────────────────────────────────
     if let (Some(hub), Some(session)) = (
         state.telemetry.observability_hub.as_ref(),
         state.telemetry.observability_session.as_ref(),
@@ -2988,6 +2987,45 @@ pub(crate) fn observe_turn_end_without_tools(
         let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
         crate::observability::on_turn_end(hub, &mut session_guard, timing);
     }
+
+    // ── Observation pipeline: dispatch TurnCompleted for tool-less turns ──
+    // Tool-less turns (text-only stops, early exits, budget exhaustion) still
+    // need to feed the observation journal and persistence store so the
+    // self-status block and cross-session analysis see them.
+    {
+        let tokens = state.total_prompt
+            + state.total_completion
+            + state.total_cache_read
+            + state.total_cache_creation;
+        let mut metrics = astra_core::TurnMetrics::default();
+        metrics.rounds_completed = state.llm_rounds_completed;
+        metrics.tokens_consumed = tokens;
+
+        let facts = state
+            .observation_journal
+            .extract_facts(state.remaining_turns as u32, state.max_turns as u32);
+
+        let mut dispatcher = crate::turn::observation_dispatcher::ObservationDispatcher::new();
+        dispatcher.register(crate::turn::observation_dispatcher::MemorySink::new(
+            &mut state.observation_journal,
+        ));
+        if let Some(ref store) = state.observation_store {
+            dispatcher.register(crate::turn::observation_dispatcher::FileSink::new(
+                Some(store.clone()),
+                state
+                    .current_session_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_string(),
+            ));
+        }
+        dispatcher.dispatch(
+            crate::turn::observation_dispatcher::ObservationEvent::TurnCompleted {
+                metrics: Box::new(metrics),
+                facts,
+            },
+        );
+    } // dispatcher dropped — releases &mut observation_journal
 }
 
 fn emit_subrun_text_preview<H: AgenticLoopHost>(

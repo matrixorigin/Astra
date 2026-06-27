@@ -444,12 +444,16 @@ mod tests {
 
         let session_jobs: Vec<_> = jobs.iter().filter(|(sid, _)| *sid == sess).collect();
         assert_eq!(session_jobs.len(), 2);
-        assert!(session_jobs
-            .iter()
-            .any(|(_, j)| j.signal == TuningSignalType::PromptCompaction));
-        assert!(session_jobs
-            .iter()
-            .any(|(_, j)| j.signal == TuningSignalType::CacheWarming));
+        assert!(
+            session_jobs
+                .iter()
+                .any(|(_, j)| j.signal == TuningSignalType::PromptCompaction)
+        );
+        assert!(
+            session_jobs
+                .iter()
+                .any(|(_, j)| j.signal == TuningSignalType::CacheWarming)
+        );
     }
 
     // ── aggregate ────────────────────────────────────────────────────────
@@ -722,10 +726,7 @@ mod tests {
         // In a shared test_store, other tests may have written data.
         // Verify core invariants: summary is valid, no panic.
         assert!(summary.aggregations.len() <= summary.total_jobs as usize);
-        assert_eq!(
-            summary.suggestions.len() <= summary.total_jobs as usize,
-            true
-        );
+        assert!(summary.suggestions.len() <= summary.total_jobs as usize);
         assert!(!summary.summary_text.is_empty());
         // Our session should not have produced any jobs.
         let our_jobs: Vec<_> = consumer

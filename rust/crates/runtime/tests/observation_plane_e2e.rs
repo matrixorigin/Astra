@@ -19,7 +19,7 @@ use astra_core::observation_journal::{
     StoredEntry, StreakSnapshot, TaskSnapshot, TuningStore,
 };
 use astra_runtime::turn::agentic_loop::host;
-use astra_runtime::turn::inspection_service::{local_reflect_from_snapshot, InspectionService};
+use astra_runtime::turn::inspection_service::{InspectionService, local_reflect_from_snapshot};
 use astra_runtime::turn::local_provider::LocalSessionProvider;
 use astra_runtime::turn::observation_dispatcher::{
     FileSink, FileTuningSink, MemorySink, ObservationDispatcher, ObservationEvent, ObservationSink,
@@ -447,7 +447,6 @@ fn e2e_policy_decide_transition_phase_on_completion() {
     let facts = JournalFacts {
         task: TaskSnapshot {
             task_completion_ratio: 1.0,
-            ..Default::default()
         },
         budget: BudgetSnapshot {
             budget_remaining: 5,
@@ -716,7 +715,7 @@ fn e2e_dispatcher_fan_out_to_multiple_sinks() {
         ));
 
         let event = ObservationEvent::TurnCompleted {
-            metrics: make_turn_metrics(0, 5, 2),
+            metrics: Box::new(make_turn_metrics(0, 5, 2)),
             facts: JournalFacts::default(),
         };
         dispatcher.dispatch(event);
@@ -749,7 +748,7 @@ fn e2e_dispatcher_tolerates_failing_sink_and_continues() {
         dispatcher.register(MemorySink::new(&mut journal));
 
         let event = ObservationEvent::TurnCompleted {
-            metrics: make_turn_metrics(0, 3, 1),
+            metrics: Box::new(make_turn_metrics(0, 3, 1)),
             facts: JournalFacts::default(),
         };
         dispatcher.dispatch(event);
@@ -772,15 +771,15 @@ fn e2e_dispatcher_all_event_variants_flow_to_sinks() {
         dispatcher.register(MemorySink::new(&mut journal));
 
         dispatcher.dispatch(ObservationEvent::TurnCompleted {
-            metrics: make_turn_metrics(0, 5, 2),
+            metrics: Box::new(make_turn_metrics(0, 5, 2)),
             facts: JournalFacts::default(),
         });
         dispatcher.dispatch(ObservationEvent::TurnCompleted {
-            metrics: make_turn_metrics(1, 3, 0),
+            metrics: Box::new(make_turn_metrics(1, 3, 0)),
             facts: JournalFacts::default(),
         });
         dispatcher.dispatch(ObservationEvent::TurnCompleted {
-            metrics: make_turn_metrics(2, 4, 1),
+            metrics: Box::new(make_turn_metrics(2, 4, 1)),
             facts: JournalFacts::default(),
         });
 
@@ -829,7 +828,7 @@ fn e2e_none_observation_store_is_graceful() {
         dispatcher.register(FileSink::new(None, "no-store-session".to_string()));
 
         dispatcher.dispatch(ObservationEvent::TurnCompleted {
-            metrics: make_turn_metrics(0, 4, 2),
+            metrics: Box::new(make_turn_metrics(0, 4, 2)),
             facts: JournalFacts::default(),
         });
         assert_eq!(dispatcher.failure_count(), 0);

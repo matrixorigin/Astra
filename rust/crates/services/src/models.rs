@@ -73,6 +73,27 @@ pub struct QuirksData {
     /// provider payloads for this model row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body_overrides: Option<Map<String, Value>>,
+    /// Custom headers to send during connectivity probes.
+    ///
+    /// Some providers (e.g., Kimi) require specific User-Agent or other
+    /// headers to identify coding agents. Without these, probes return 403.
+    /// Example: `{"User-Agent": "claude-code/1.0"}`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_headers: Option<Map<String, Value>>,
+    /// Override the probe endpoint path (appended to base_url).
+    ///
+    /// Some providers use non-standard endpoints. For example, Kimi uses
+    /// `/messages` (Anthropic-style) despite using OpenAI-compatible auth.
+    /// Default: `/chat/completions` for openai, `/messages` for anthropic.
+    /// Example: `"/messages"`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_endpoint: Option<String>,
+    /// Custom headers to send with every actual LLM request (not just probes).
+    ///
+    /// Some providers require specific headers for authentication or identification.
+    /// Example: `{"x-api-key": "sk-xxx"}`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<Map<String, Value>>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -357,6 +378,8 @@ pub struct ResolvedActiveLlmModel {
     /// Context window size from model config (`.models.yaml` or DB).
     /// `None` means use the hardcoded fallback table.
     pub context_window: Option<u32>,
+    /// Custom headers to send with every LLM request (not just probes).
+    pub request_headers: Option<Map<String, Value>>,
 }
 
 impl std::fmt::Debug for ResolvedActiveLlmModel {
@@ -475,6 +498,7 @@ fn build_resolved_active_llm_from_row(
     let wire_model_name = quirks.wire_model_name;
     let prompt_cache_capability = quirks.prompt_cache_capability;
     let request_body_overrides = quirks.request_body_overrides;
+    let request_headers = quirks.request_headers;
 
     let context_window: Option<i32> = row.try_get("context_window").ok().flatten();
 
@@ -490,6 +514,7 @@ fn build_resolved_active_llm_from_row(
         prompt_cache_capability,
         thinking_capability,
         context_window: context_window.map(|cw| cw as u32),
+        request_headers,
     })
 }
 
@@ -1278,6 +1303,14 @@ impl ModelService for DatabaseModelService {
             probe_name,
             &request.api_key,
             base_url.as_deref(),
+            request
+                .quirks
+                .as_ref()
+                .and_then(|q| q.probe_headers.as_ref()),
+            request
+                .quirks
+                .as_ref()
+                .and_then(|q| q.probe_endpoint.as_deref()),
         )
         .await;
         let is_active: i16 = if conn_result.is_none() { 1 } else { 0 };
@@ -1468,6 +1501,14 @@ impl ModelService for DatabaseModelService {
                 &probe_name,
                 api_key,
                 base_url.as_deref(),
+                request
+                    .quirks
+                    .as_ref()
+                    .and_then(|q| q.probe_headers.as_ref()),
+                request
+                    .quirks
+                    .as_ref()
+                    .and_then(|q| q.probe_endpoint.as_deref()),
             )
             .await;
 
@@ -1608,8 +1649,15 @@ impl ModelService for DatabaseModelService {
         let api_key = self.encryptor.decrypt(&encrypted).map_err(internal_error)?;
 
         // Phase 1: connectivity probe
-        let check =
-            validate_connectivity(&provider, &probe_name, &api_key, base_url.as_deref()).await;
+        let check = validate_connectivity(
+            &provider,
+            &probe_name,
+            &api_key,
+            base_url.as_deref(),
+            quirks.probe_headers.as_ref(),
+            quirks.probe_endpoint.as_deref(),
+        )
+        .await;
 
         let is_active: i16 = if check.is_none() { 1 } else { 0 };
         query("UPDATE infra_llm_models SET is_active = ?, updated_at = NOW() WHERE model_name = ?")
@@ -1719,6 +1767,8 @@ pub async fn validate_connectivity(
     model_name: &str,
     api_key: &str,
     base_url: Option<&str>,
+    probe_headers: Option<&Map<String, Value>>,
+    probe_endpoint: Option<&str>,
 ) -> Option<String> {
     if provider == "mock" {
         return None;
@@ -1739,11 +1789,19 @@ pub async fn validate_connectivity(
 
     let result = if provider == "anthropic" {
         let probe = anthropic_messages_probe_url(base_url);
-        let send_result = client
+        let mut req = client
             .post(&probe)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(headers) = probe_headers {
+            for (k, v) in headers {
+                if let Some(s) = v.as_str() {
+                    req = req.header(k, s);
+                }
+            }
+        }
+        let send_result = req
             .json(&serde_json::json!({
                "model": model_name,
                "max_tokens": 1,
@@ -1765,10 +1823,18 @@ pub async fn validate_connectivity(
                 base_url_value
             ));
         };
-        let send_result = client
+        let mut req = client
             .post(&probe)
             .header("authorization", format!("Bearer {}", api_key))
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(headers) = probe_headers {
+            for (k, v) in headers {
+                if let Some(s) = v.as_str() {
+                    req = req.header(k, s);
+                }
+            }
+        }
+        let send_result = req
             .json(&serde_json::json!({
                 "messages": [{
                     "role": "user",
@@ -1797,11 +1863,20 @@ pub async fn validate_connectivity(
                 ));
             }
         };
-        let probe = format!("{}/chat/completions", url);
-        let send_result = client
+        let endpoint = probe_endpoint.unwrap_or("/chat/completions");
+        let probe = format!("{}{}", url, endpoint);
+        let mut req = client
             .post(&probe)
             .header("authorization", format!("Bearer {}", api_key))
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(headers) = probe_headers {
+            for (k, v) in headers {
+                if let Some(s) = v.as_str() {
+                    req = req.header(k, s);
+                }
+            }
+        }
+        let send_result = req
             .json(&serde_json::json!({
                 "model": model_name,
                 "max_tokens": 1,
@@ -2842,6 +2917,7 @@ mod tests {
             prompt_cache_capability: None,
             thinking_capability: None,
             context_window: None,
+            request_headers: None,
         };
         assert_eq!(r.upstream_model_name(), "deepseek-v4-pro");
         // The local name is still reachable for routing / metrics.
@@ -2862,6 +2938,7 @@ mod tests {
             prompt_cache_capability: None,
             thinking_capability: None,
             context_window: None,
+            request_headers: None,
         };
         assert_eq!(r.upstream_model_name(), "claude-sonnet-4-6");
     }
@@ -2870,6 +2947,9 @@ mod tests {
     fn quirks_wire_model_name_round_trips_through_json() {
         let q = QuirksData {
             wire_model_name: Some("deepseek-v4-pro".into()),
+            probe_endpoint: None,
+            probe_headers: None,
+            request_headers: None,
             ..QuirksData::default()
         };
         let json = serde_json::to_string(&q).unwrap();
@@ -3019,6 +3099,9 @@ mod tests {
                 "context_management".into(),
                 serde_json::json!({"edits": [{"type": "clear_tool_uses_20250919"}]}),
             )])),
+            probe_endpoint: None,
+            probe_headers: None,
+            request_headers: None,
         };
         let json = serde_json::to_string(&q).unwrap();
         let restored: QuirksData = serde_json::from_str(&json).unwrap();
@@ -3418,7 +3501,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_connectivity_mock_provider_skips_network() {
-        let result = super::validate_connectivity("mock", "any-model", "key", None).await;
+        let result =
+            super::validate_connectivity("mock", "any-model", "key", None, None, None).await;
         assert!(
             result.is_none(),
             "mock provider should short-circuit to success"
@@ -3427,7 +3511,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_connectivity_unknown_provider_no_base_url_errors() {
-        let result = super::validate_connectivity("dashscope", "qwen-plus", "key", None).await;
+        let result =
+            super::validate_connectivity("dashscope", "qwen-plus", "key", None, None, None).await;
         let msg = result.expect("should return an error");
         assert!(msg.contains("No base_url"), "got: {msg}");
     }
@@ -3438,6 +3523,8 @@ mod tests {
             "bedrock",
             "anthropic.claude-3-5-sonnet-v1:0",
             "key",
+            None,
+            None,
             None,
         )
         .await;
@@ -3452,6 +3539,8 @@ mod tests {
             "anthropic.claude-3-5-sonnet-v1:0",
             "key",
             Some("not a url"),
+            None,
+            None,
         )
         .await;
         let msg = result.expect("should return an error");

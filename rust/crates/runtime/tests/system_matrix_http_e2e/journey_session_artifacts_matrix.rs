@@ -1511,6 +1511,7 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
     ctx.pool.close().await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_bridge_failure_session_artifact_latest_and_download_routes(
     title: &str,
     suite: &str,

@@ -158,6 +158,22 @@ fn apply_optional_yaml_fields(
             );
         }
     }
+    if let Some(headers) = yaml_json(entry, "probe_headers") {
+        if headers.is_object() {
+            let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
+            if let Some(qobj) = quirks.as_object_mut() {
+                qobj.insert("probe_headers".into(), headers);
+            }
+        } else {
+            eprintln!("warning: probe_headers must be a JSON object; ignoring non-object value");
+        }
+    }
+    if let Some(endpoint) = yaml_str(entry, "probe_endpoint") {
+        let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
+        if let Some(qobj) = quirks.as_object_mut() {
+            qobj.insert("probe_endpoint".into(), serde_json::json!(endpoint));
+        }
+    }
 }
 
 fn build_model_update_payload(

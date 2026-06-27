@@ -674,23 +674,26 @@ fn build_server_skill_executor(
 
     // Wire skill checkpoint manager for crash recovery resume.
     // This allows skills to resume from their last checkpoint instead of starting over.
-    #[cfg(feature = "crash-recovery")]
-    {
-        let checkpoint_dir = astra_services::session_journal::journal_file_path(session_id)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("skill_checkpoints");
-        let checkpoint_manager = Arc::new(std::sync::Mutex::new(
-            astra_pipeline::skill_checkpoint::SkillCheckpointManager::new(checkpoint_dir),
-        ));
-        let isolated = IsolatedSkillExecutor::with_checkpoint_manager(
-            Arc::new(subrun_executor),
-            checkpoint_manager,
-        );
-        let isolated = Arc::new(isolated);
-    }
-    #[cfg(not(feature = "crash-recovery"))]
-    let isolated = Arc::new(IsolatedSkillExecutor::new(Arc::new(subrun_executor)));
+    let isolated = {
+        #[cfg(feature = "crash-recovery")]
+        {
+            let checkpoint_dir = astra_services::session_journal::journal_file_path(session_id)
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("skill_checkpoints");
+            let checkpoint_manager = Arc::new(TokioMutex::new(
+                astra_pipeline::skill_checkpoint::SkillCheckpointManager::new(checkpoint_dir),
+            ));
+            Arc::new(IsolatedSkillExecutor::with_checkpoint_manager(
+                Arc::new(subrun_executor),
+                checkpoint_manager,
+            ))
+        }
+        #[cfg(not(feature = "crash-recovery"))]
+        {
+            Arc::new(IsolatedSkillExecutor::new(Arc::new(subrun_executor)))
+        }
+    };
 
     let router = SkillExecutionRouter::new(Some(isolated));
     Some(Arc::new(router))

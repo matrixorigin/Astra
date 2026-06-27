@@ -44,7 +44,7 @@ pub enum ObservationEvent {
     /// Emitted after every tool phase completes with tool call samples.
     TurnCompleted {
         /// The computed metrics for this turn.
-        metrics: TurnMetrics,
+        metrics: Box<TurnMetrics>,
         /// Journal facts extracted from the updated journal.
         facts: JournalFacts,
     },
@@ -347,7 +347,7 @@ mod tests {
         dispatcher.register(rec2);
 
         dispatcher.dispatch(ObservationEvent::TurnCompleted {
-            metrics: TurnMetrics::default(),
+            metrics: Box::new(TurnMetrics::default()),
             facts: JournalFacts::default(),
         });
 
@@ -363,7 +363,7 @@ mod tests {
         dispatcher.register(RecordingSink::new());
 
         dispatcher.dispatch(ObservationEvent::TurnCompleted {
-            metrics: TurnMetrics::default(),
+            metrics: Box::new(TurnMetrics::default()),
             facts: JournalFacts::default(),
         });
 
@@ -414,7 +414,7 @@ mod tests {
         dispatcher.register(shared);
 
         dispatcher.dispatch(ObservationEvent::TurnCompleted {
-            metrics: TurnMetrics::default(),
+            metrics: Box::new(TurnMetrics::default()),
             facts: JournalFacts::default(),
         });
         dispatcher.dispatch(ObservationEvent::PolicyDecision {
@@ -430,7 +430,7 @@ mod tests {
     fn empty_dispatcher_noops() {
         let mut dispatcher = ObservationDispatcher::new();
         dispatcher.dispatch(ObservationEvent::TurnCompleted {
-            metrics: TurnMetrics::default(),
+            metrics: Box::new(TurnMetrics::default()),
             facts: JournalFacts::default(),
         });
         assert_eq!(dispatcher.event_count(), 1);
