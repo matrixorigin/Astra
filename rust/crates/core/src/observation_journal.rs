@@ -570,6 +570,11 @@ impl ObservationJournal {
         self.entries.is_empty()
     }
 
+    /// The most recent entry, if any.
+    pub fn last_entry(&self) -> Option<&JournalEntry> {
+        self.entries.last()
+    }
+
     /// Clear the journal.
     pub fn clear(&mut self) {
         self.entries.clear();
@@ -914,9 +919,11 @@ mod tests {
             ..Default::default()
         };
         let actions = policy.decide(&facts);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
     }
 
     #[test]
@@ -930,9 +937,11 @@ mod tests {
         };
         let actions = policy.decide(&facts);
         // Budget is > 50% remaining → no expansion
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
     }
 
     #[test]
@@ -945,9 +954,11 @@ mod tests {
             ..Default::default()
         };
         let actions = policy.decide(&facts);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+        );
     }
 
     #[test]
@@ -960,9 +971,11 @@ mod tests {
             ..Default::default()
         };
         let actions = policy.decide(&facts);
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+        );
     }
 
     #[test]
@@ -1022,5 +1035,181 @@ mod tests {
             &actions[0],
             FrameworkAction::TransitionPhase { target } if target == "reflect"
         ));
+    }
+
+    // ─── Production-integration tests ──────────────────────────────────
+
+    #[test]
+    fn policy_production_typical_facts_expands_when_tight() {
+        let policy = BudgetPolicy::default();
+        // Typical production scenario: 10 rounds done, 5 remaining, 15 max,
+        // 2 consecutive outcomes — should expand.
+        let facts = JournalFacts {
+            rounds_completed: 10,
+            consecutive_rounds_with_outcome: 2,
+            budget_remaining: 5,
+            budget_max: 15,
+            total_tool_calls: 45,
+            total_errors: 1,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn policy_emits_continue_when_no_conditions_met() {
+        let policy = BudgetPolicy::default();
+        // Agent is making steady progress, not stalled, budget is fine.
+        let facts = JournalFacts {
+            rounds_completed: 3,
+            consecutive_rounds_with_outcome: 1,
+            consecutive_rounds_without_outcome: 0,
+            budget_remaining: 12,
+            budget_max: 15,
+            total_tool_calls: 15,
+            total_errors: 0,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], FrameworkAction::Continue));
+    }
+
+    #[test]
+    fn policy_budget_exactly_at_half_triggers_expand() {
+        let policy = BudgetPolicy::default();
+        // Budget at exactly 50% should trigger expand (remaining ≤ max/2)
+        let facts = JournalFacts {
+            consecutive_rounds_with_outcome: 2,
+            budget_remaining: 5,
+            budget_max: 10,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
+    }
+
+    #[test]
+    fn policy_budget_one_above_half_skips_expand() {
+        let policy = BudgetPolicy::default();
+        // Budget just above 50% — should not expand
+        let facts = JournalFacts {
+            consecutive_rounds_with_outcome: 2,
+            budget_remaining: 6,
+            budget_max: 10,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
+    }
+
+    #[test]
+    fn policy_reflect_at_exact_threshold() {
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            consecutive_rounds_without_outcome: 3,
+            budget_remaining: 7,
+            budget_max: 10,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(actions.iter().any(
+            |a| matches!(a, FrameworkAction::TransitionPhase { target } if target == "reflect")
+        ));
+    }
+
+    #[test]
+    fn policy_reflect_below_threshold_skipped() {
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            consecutive_rounds_without_outcome: 2,
+            budget_remaining: 8,
+            budget_max: 10,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+        );
+    }
+
+    #[test]
+    fn policy_delta_facts_preserved_in_output() {
+        // Verify that delta facts (text_growth, new_tool_calls, new_failures)
+        // pass through unchanged — the Policy does not interpret them,
+        // it only uses outcome/consecutive fields.
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            consecutive_rounds_with_outcome: 2,
+            budget_remaining: 4,
+            budget_max: 10,
+            text_growth: 1500,
+            new_tool_calls: 5,
+            new_failures: 2,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        // Delta facts don't affect this Policy, but they must not break it
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
+    }
+
+    #[test]
+    fn policy_zero_rounds_safe_defaults() {
+        let policy = BudgetPolicy::default();
+        // First round — all zeros, no history. Must not crash.
+        let facts = JournalFacts::default();
+        let actions = policy.decide(&facts);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], FrameworkAction::Continue));
+    }
+
+    #[test]
+    fn policy_max_ceiling_respected_by_caller() {
+        let policy = BudgetPolicy {
+            expand_after_consecutive_outcomes: 1,
+            expand_factor: 3.0,
+            max_ceiling: 30,
+            reflect_after_consecutive_zero: 3,
+            max_reflections: 3,
+        };
+        let facts = JournalFacts {
+            consecutive_rounds_with_outcome: 1,
+            budget_remaining: 4,
+            budget_max: 20,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        if let Some(FrameworkAction::ExpandBudget {
+            factor,
+            max_ceiling,
+        }) = actions.first()
+        {
+            let raw = (20.0 * factor).ceil() as u32;
+            let capped = raw.min(*max_ceiling);
+            assert_eq!(capped, 30); // 60 → capped to 30
+            assert_eq!(*max_ceiling, 30);
+        } else {
+            panic!("Expected ExpandBudget action");
+        }
     }
 }

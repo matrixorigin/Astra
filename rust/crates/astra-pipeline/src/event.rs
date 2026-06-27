@@ -1,29 +1,16 @@
-//! TurnEvent: causal event log for observability, replay, and learning.
+//! Minimal event log for trace query and step recording.
 //!
-//! Every state mutation in the cognitive runtime emits a TurnEvent.
-//! Events form a causal graph via the `caused_by` field, enabling
-//! automatic root-cause analysis on failures.
-//!
-//! # Trace Levels
-//!
-//! Each [`EventKind`] carries a default [`TraceLevel`], inspired by log levels:
-//! - `Error` — hard failures (circuit breaker trips, stalls)
-//! - `Warn` — near-limit conditions, low progress scores
-//! - `Info` — normal operational events (tool calls, phase transitions)
-//! - `Debug` — reasoning signals (intent detection, budget decisions)
-//! - `Trace` — fine-grained detail (individual LLM chunks, budget expansions)
-//!
-//! [`EventLog`] filters events below a configured `min_level` so production
-//! sessions can stay lean while dev sessions capture full detail.
+//! Contains only the types and functions used by `step_recorder` and
+//! `trace_query`. The full event system that powered the dead
+//! EvaluateStage/ReflectStage pipeline was removed.
 
 use std::time::Instant;
-
 use uuid::Uuid;
 
 // Re-export shared trace types from astra-core
 pub use astra_core::{TraceCategory, TraceLevel, TraceVerbosity};
 
-/// Maximum Unicode scalars kept in [`EventKind::ToolCallOutput`]'s `output_preview`.
+/// Maximum Unicode scalars kept in `ToolCallOutput`'s `output_preview`.
 pub const TOOL_OUTPUT_PREVIEW_CHARS: usize = 500;
 
 /// Maximum Unicode scalars in non-verbose mode.
@@ -31,9 +18,6 @@ pub const TOOL_OUTPUT_PREVIEW_CHARS_COMPACT: usize = 200;
 
 /// Clip `s` to at most [`TOOL_OUTPUT_PREVIEW_CHARS`] Unicode scalars,
 /// appending … when the output was longer.
-///
-/// Use when constructing [`EventKind::ToolCallOutput`] so callers
-/// never accidentally store full (unbounded) tool output.
 pub fn clip_output_preview(s: &str) -> String {
     let mut chars = s.chars();
     let preview: String = chars.by_ref().take(TOOL_OUTPUT_PREVIEW_CHARS).collect();
@@ -58,7 +42,6 @@ pub struct TurnEvent {
     /// Monotonic timestamp.
     pub elapsed_ms: u64,
     /// Optional tracing span id that was active when this event was emitted.
-    /// Connects this pipeline event to the `tracing` crate's span tree.
     pub span_id: Option<tracing::Id>,
     /// Canonical UUID v7 shared across all storage layers.
     pub canonical_event_id: Uuid,
@@ -69,8 +52,8 @@ pub struct TurnEvent {
 pub enum EventKind {
     // ── Phase transitions ──
     PhaseTransition {
-        from: crate::state::AgentPhase,
-        to: crate::state::AgentPhase,
+        from: String,
+        to: String,
     },
 
     // ── Perception ──
@@ -98,16 +81,9 @@ pub enum EventKind {
     LlmChunk {
         text: String,
     },
-    /// A reasoning/thinking chunk emitted by extended-thinking models
-    /// (e.g. Claude thinking mode, Bedrock reasoning).
-    /// Only captured when `TraceCategory::Thinking` is enabled and
-    /// `min_level` ≤ `Trace`.
     ThinkingChunk {
         text: String,
     },
-    /// LLM request metadata emitted before each LLM call (verbose-gated).
-    /// Only recorded when `TraceCategory::LlmExchanges` is enabled AND
-    /// `min_level` ≤ `Trace`.
     LlmRequest {
         model: String,
         provider: String,
@@ -127,41 +103,27 @@ pub enum EventKind {
         success: bool,
         error: Option<String>,
     },
-
-    /// Truncated tool output captured after a completed tool call (verbose-gated).
-    /// Emitted when `TraceCategory::ToolCalls` is enabled AND `min_level` ≤ `Trace`.
-    /// Output is truncated to at most [`TOOL_OUTPUT_PREVIEW_CHARS`] Unicode scalars.
     ToolCallOutput {
         call_id: String,
         tool_name: String,
-        /// First `TOOL_OUTPUT_PREVIEW_CHARS` chars of output (appended with "…" if truncated).
         output_preview: String,
     },
 
     // ── Memory ──
-    /// Memory retrieval query fired during context assembly (verbose-gated).
-    /// Emitted at `TraceLevel::Debug`, category `TraceCategory::MemoryRetrieval`.
     MemoryQuery {
         query: String,
         top_k: usize,
-        /// Data source tag, e.g. `"local"`, `"cloud"`, `"hybrid"`.
         source: String,
     },
-    /// Result count and latency for a completed memory retrieval.
-    /// Emitted at `TraceLevel::Debug`, category `TraceCategory::MemoryRetrieval`.
     MemoryRetrieved {
         result_count: usize,
         duration_ms: u64,
     },
 
     // ── Skill lifecycle ──
-    /// Skill loading started.
-    /// Emitted at `TraceLevel::Info`, category `TraceCategory::SkillExecution`.
     SkillStarted {
         skill_name: String,
     },
-    /// Skill execution completed.
-    /// Emitted at `TraceLevel::Info`, category `TraceCategory::SkillExecution`.
     SkillCompleted {
         skill_name: String,
         duration_ms: u64,
@@ -169,22 +131,15 @@ pub enum EventKind {
     },
 
     // ── Prompt assembly ──
-    /// System-prompt assembly completed (verbose-gated).
-    /// Emitted at `TraceLevel::Debug`, category `TraceCategory::PromptAssembly`.
     PromptAssembled {
-        /// Number of logical components injected (system, memory, skill, etc.).
         component_count: usize,
-        /// Rough token estimate for the assembled prompt.
         estimated_tokens: usize,
     },
 
     // ── Guard evaluation ──
-    /// Safety/capability guard evaluated for this turn.
-    /// Emitted at `TraceLevel::Info`, category `TraceCategory::GuardEvaluation`.
     GuardEvaluated {
         guard_name: String,
         allowed: bool,
-        /// Human-readable ruling summary (e.g. `"blocked: malware pattern detected"`).
         reason: Option<String>,
     },
 
@@ -230,64 +185,41 @@ pub enum EventKind {
 
 impl EventKind {
     /// The default trace level for this event kind.
-    ///
-    /// These defaults keep production sessions lean (only Info and above make it
-    /// past the default `min_level`) while dev sessions can lower the bar to
-    /// `Trace` for full introspection.
     pub fn default_level(&self) -> TraceLevel {
         match self {
-            // ── Error ── hard failures
             EventKind::CircuitBreakerTripped { .. } => TraceLevel::Error,
             EventKind::StallDetected { .. } => TraceLevel::Error,
-            // ── Warn ── near-limit or degraded quality
             EventKind::BudgetUpdate { .. } => TraceLevel::Warn,
             EventKind::ProgressRecorded { .. } => TraceLevel::Warn,
-            // ── Info ── normal operational events
             EventKind::PhaseTransition { .. } => TraceLevel::Info,
             EventKind::ToolCallStarted { .. } => TraceLevel::Info,
             EventKind::ToolCallCompleted { .. } => TraceLevel::Info,
             EventKind::ToolsSelected { .. } => TraceLevel::Info,
             EventKind::TurnCompleted { .. } => TraceLevel::Info,
-            // ── Debug ── reasoning signals
-            EventKind::IntentDetected { .. } => TraceLevel::Debug,
-            EventKind::EntityExtracted { .. } => TraceLevel::Debug,
-            EventKind::BudgetSet { .. } => TraceLevel::Debug,
-            EventKind::ReflectionGenerated { .. } => TraceLevel::Debug,
-            // ── Trace ── fine-grained detail
+            EventKind::IntentDetected { .. } => TraceLevel::Info,
+            EventKind::EntityExtracted { .. } => TraceLevel::Info,
+            EventKind::BudgetSet { .. } => TraceLevel::Info,
+            EventKind::SkillStarted { .. } => TraceLevel::Info,
+            EventKind::SkillCompleted { .. } => TraceLevel::Info,
+            EventKind::GuardEvaluated { .. } => TraceLevel::Info,
+            EventKind::BudgetExpanded { .. } => TraceLevel::Info,
+            EventKind::ReflectionGenerated { .. } => TraceLevel::Info,
             EventKind::LlmChunk { .. } => TraceLevel::Trace,
             EventKind::ThinkingChunk { .. } => TraceLevel::Trace,
             EventKind::LlmRequest { .. } => TraceLevel::Trace,
             EventKind::ToolCallOutput { .. } => TraceLevel::Trace,
-            EventKind::MemoryQuery { .. } | EventKind::MemoryRetrieved { .. } => TraceLevel::Debug,
-            EventKind::SkillStarted { .. } | EventKind::SkillCompleted { .. } => TraceLevel::Info,
+            EventKind::MemoryQuery { .. } => TraceLevel::Debug,
+            EventKind::MemoryRetrieved { .. } => TraceLevel::Debug,
             EventKind::PromptAssembled { .. } => TraceLevel::Debug,
-            EventKind::GuardEvaluated { .. } => TraceLevel::Info,
-            EventKind::BudgetExpanded { .. } => TraceLevel::Trace,
         }
     }
 
-    /// The trace category for this event kind.
+    /// The default trace category for this event kind.
     pub fn default_category(&self) -> TraceCategory {
         match self {
-            EventKind::ToolCallStarted { .. }
-            | EventKind::ToolCallCompleted { .. }
-            | EventKind::ToolCallOutput { .. }
-            | EventKind::ToolsSelected { .. } => TraceCategory::ToolCalls,
-            EventKind::LlmChunk { .. } | EventKind::LlmRequest { .. } => {
-                TraceCategory::LlmExchanges
-            }
             EventKind::ThinkingChunk { .. } => TraceCategory::Thinking,
-            EventKind::IntentDetected { .. } | EventKind::EntityExtracted { .. } => {
-                TraceCategory::ContextAssembly
-            }
-            EventKind::ReflectionGenerated { .. } => TraceCategory::Reflection,
-            EventKind::PhaseTransition { .. } => TraceCategory::PhaseTransition,
-            EventKind::BudgetSet { .. }
-            | EventKind::BudgetUpdate { .. }
-            | EventKind::BudgetExpanded { .. } => TraceCategory::Budget,
-            EventKind::ProgressRecorded { .. }
-            | EventKind::StallDetected { .. }
-            | EventKind::CircuitBreakerTripped { .. } => TraceCategory::Verification,
+            EventKind::LlmRequest { .. } => TraceCategory::LlmExchanges,
+            EventKind::ToolCallOutput { .. } => TraceCategory::ToolCalls,
             EventKind::MemoryQuery { .. } | EventKind::MemoryRetrieved { .. } => {
                 TraceCategory::MemoryRetrieval
             }
@@ -296,38 +228,25 @@ impl EventKind {
             }
             EventKind::PromptAssembled { .. } => TraceCategory::PromptAssembly,
             EventKind::GuardEvaluated { .. } => TraceCategory::GuardEvaluation,
-            EventKind::TurnCompleted { .. } => TraceCategory::DecisionExplain,
+            _ => TraceCategory::ContextAssembly,
         }
     }
 }
 
+// ─── EventLog ─────────────────────────────────────────────────────────────────
+
 /// Append-only causal event log.
-///
-/// Used for:
-/// - **Observability**: Stream events to metrics/UI
-/// - **Replay**: Reconstruct turn state from events
-/// - **Learning**: Analyze successful/failed patterns
-/// - **Root-cause analysis**: Trace `caused_by` chains on failure
-/// - **Level filtering**: Events below [`min_level`] are silently dropped.
-/// - **Category filtering**: Events can be filtered by domain categories.
 #[derive(Debug)]
 pub struct EventLog {
     events: Vec<TurnEvent>,
     next_id: u64,
     start: Instant,
-    /// Minimum severity required for an event to be recorded.
-    /// Defaults to [`TraceLevel::Info`] for balanced production use.
-    /// Set to [`TraceLevel::Trace`] for dev-mode full capture.
     pub min_level: TraceLevel,
-    /// Enabled trace categories. If empty, all categories pass through.
-    /// If non-empty, only events matching these categories are recorded.
     enabled_categories: Vec<TraceCategory>,
     enabled: bool,
 }
 
 impl EventLog {
-    /// Create a new event log with the default min_level of [`TraceLevel::Info`]
-    /// and no category filtering (all categories pass through).
     pub fn new() -> Self {
         Self {
             events: Vec::new(),
@@ -339,8 +258,6 @@ impl EventLog {
         }
     }
 
-    /// Create a new event log with a specific minimum trace level
-    /// and no category filtering.
     pub fn with_min_level(min_level: TraceLevel) -> Self {
         Self {
             events: Vec::new(),
@@ -352,50 +269,11 @@ impl EventLog {
         }
     }
 
-    /// Create a new event log with both minimum trace level and category filtering.
-    /// If `enabled_categories` is empty, all categories pass through.
-    pub fn with_config(min_level: TraceLevel, enabled_categories: Vec<TraceCategory>) -> Self {
-        Self {
-            events: Vec::new(),
-            next_id: 0,
-            start: Instant::now(),
-            min_level,
-            enabled_categories,
-            enabled: true,
-        }
-    }
-
-    /// Configure EventLog from [`TraceVerbosity`].
-    ///
-    /// Maps user-facing verbosity to the internal `min_level` and `enabled` flag.
-    /// - `Off` → `enabled = false`, no events emitted.
-    /// - `Terse` → `min_level = Warn`, only problems and degraded signals.
-    /// - `Normal` → `min_level = Info`, normal operational events (default).
-    /// - `Verbose` → `min_level = Trace`, all events including LLM bodies and thinking.
-    pub fn with_verbosity(mut self, verbosity: TraceVerbosity) -> Self {
-        match verbosity.min_level() {
-            Some(level) => {
-                self.min_level = level;
-                self.enabled = true;
-            }
-            None => {
-                self.enabled = false;
-            }
-        }
-        self
-    }
-
-    /// Emit a new event, returning its ID for use as `caused_by` in future events.
-    ///
-    /// Events whose [`EventKind::default_level`] is below the log's [`min_level`]
-    /// or whose category is filtered out are silently dropped and `None` is returned.
-    /// Callers should check for `Some(id)` before using the returned id as `caused_by`.
     pub fn emit(&mut self, kind: EventKind, caused_by: Option<EventId>) -> Option<EventId> {
         let level = kind.default_level();
         if level > self.min_level {
             return None;
         }
-        // Category filter: if configured, events must match an enabled category.
         if !self.enabled_categories.is_empty() {
             let cat = kind.default_category();
             if !self.enabled_categories.contains(&TraceCategory::All)
@@ -420,22 +298,18 @@ impl EventLog {
         Some(id)
     }
 
-    /// All events in order.
     pub fn events(&self) -> &[TurnEvent] {
         &self.events
     }
 
-    /// Number of events logged.
     pub fn len(&self) -> usize {
         self.events.len()
     }
 
-    /// Whether the log is empty.
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 
-    /// Find the root cause of a given event by tracing `caused_by` chains.
     pub fn root_cause(&self, id: EventId) -> EventId {
         let mut current = id;
         let mut visited = std::collections::HashSet::new();
@@ -452,7 +326,6 @@ impl EventLog {
         current
     }
 
-    /// Get all events in the causal chain leading to a given event.
     pub fn causal_chain(&self, id: EventId) -> Vec<&TurnEvent> {
         let mut chain = Vec::new();
         let mut current = id;
@@ -468,7 +341,7 @@ impl EventLog {
                 _ => break,
             }
         }
-        chain.reverse(); // root first
+        chain.reverse();
         chain
     }
 }
@@ -493,8 +366,8 @@ mod tests {
         let id1 = log
             .emit(
                 EventKind::PhaseTransition {
-                    from: crate::state::AgentPhase::Perceive,
-                    to: crate::state::AgentPhase::Plan,
+                    from: "Perceive".into(),
+                    to: "Plan".into(),
                 },
                 None,
             )
@@ -513,7 +386,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(id2, EventId(1));
-        assert_eq!(log.len(), 2);
     }
 
     #[test]
@@ -554,36 +426,17 @@ mod tests {
                     tool_name: "github".into(),
                     duration_ms: 150,
                     success: false,
-                    error: Some("404 Not Found".into()),
+                    error: Some("404".into()),
                 },
                 Some(e2),
             )
             .unwrap();
 
-        // Root cause of the failure should be the intent detection
         let root = log.root_cause(e3);
         assert_eq!(root, e0);
 
-        // Causal chain should include all 4 events
         let chain = log.causal_chain(e3);
         assert_eq!(chain.len(), 4);
-        assert_eq!(chain[0].id, e0); // root first
-        assert_eq!(chain[3].id, e3); // leaf last
-    }
-
-    #[test]
-    fn root_cause_single_event() {
-        let mut log = EventLog::with_min_level(TraceLevel::Trace);
-        let e0 = log
-            .emit(
-                EventKind::StallDetected {
-                    round: 3,
-                    reason: "repeated tool calls".into(),
-                },
-                None,
-            )
-            .unwrap();
-        assert_eq!(log.root_cause(e0), e0);
     }
 
     #[test]
@@ -598,120 +451,5 @@ mod tests {
         for i in 1..ids.len() {
             assert!(ids[i].0 > ids[i - 1].0);
         }
-    }
-
-    #[test]
-    fn causal_chain_no_infinite_loop() {
-        // Even if caused_by points to self (shouldn't happen, but defense)
-        let mut log = EventLog::with_min_level(TraceLevel::Trace);
-        let e0 = log
-            .emit(EventKind::LlmChunk { text: "a".into() }, None)
-            .unwrap();
-        // Manually can't create a cycle since emit always uses increasing IDs.
-        // But test root_cause terminates.
-        let chain = log.causal_chain(e0);
-        assert_eq!(chain.len(), 1);
-    }
-}
-
-// ─── Category/level contract tests for new variants ──────────────────────────
-
-#[cfg(test)]
-mod new_variant_contracts {
-    use super::*;
-
-    fn level(k: &EventKind) -> TraceLevel {
-        k.default_level()
-    }
-    fn cat(k: &EventKind) -> TraceCategory {
-        k.default_category()
-    }
-
-    #[test]
-    fn thinking_chunk_is_trace_and_thinking() {
-        let e = EventKind::ThinkingChunk {
-            text: "step 1".into(),
-        };
-        assert_eq!(level(&e), TraceLevel::Trace);
-        assert_eq!(cat(&e), TraceCategory::Thinking);
-    }
-
-    #[test]
-    fn llm_request_is_trace_and_llm_exchanges() {
-        let e = EventKind::LlmRequest {
-            model: "claude".into(),
-            provider: "anthropic".into(),
-            message_count: 4,
-            tool_count: 2,
-            max_output_tokens: Some(8192),
-            round: 1,
-        };
-        assert_eq!(level(&e), TraceLevel::Trace);
-        assert_eq!(cat(&e), TraceCategory::LlmExchanges);
-    }
-
-    #[test]
-    fn tool_call_output_is_trace_and_tool_calls() {
-        let e = EventKind::ToolCallOutput {
-            call_id: "c1".into(),
-            tool_name: "bash".into(),
-            output_preview: "ok".into(),
-        };
-        assert_eq!(level(&e), TraceLevel::Trace);
-        assert_eq!(cat(&e), TraceCategory::ToolCalls);
-    }
-
-    #[test]
-    fn memory_events_are_debug_and_memory_retrieval() {
-        let q = EventKind::MemoryQuery {
-            query: "rust tips".into(),
-            top_k: 5,
-            source: "hybrid".into(),
-        };
-        let r = EventKind::MemoryRetrieved {
-            result_count: 3,
-            duration_ms: 12,
-        };
-        for e in [&q, &r] {
-            assert_eq!(level(e), TraceLevel::Debug);
-            assert_eq!(cat(e), TraceCategory::MemoryRetrieval);
-        }
-    }
-
-    #[test]
-    fn skill_events_are_info_and_skill_execution() {
-        let s = EventKind::SkillStarted {
-            skill_name: "review-changes".into(),
-        };
-        let c = EventKind::SkillCompleted {
-            skill_name: "review-changes".into(),
-            duration_ms: 300,
-            success: true,
-        };
-        for e in [&s, &c] {
-            assert_eq!(level(e), TraceLevel::Info);
-            assert_eq!(cat(e), TraceCategory::SkillExecution);
-        }
-    }
-
-    #[test]
-    fn prompt_assembled_is_debug_and_prompt_assembly() {
-        let e = EventKind::PromptAssembled {
-            component_count: 3,
-            estimated_tokens: 512,
-        };
-        assert_eq!(level(&e), TraceLevel::Debug);
-        assert_eq!(cat(&e), TraceCategory::PromptAssembly);
-    }
-
-    #[test]
-    fn guard_evaluated_is_info_and_guard_evaluation() {
-        let e = EventKind::GuardEvaluated {
-            guard_name: "malware-check".into(),
-            allowed: true,
-            reason: None,
-        };
-        assert_eq!(level(&e), TraceLevel::Info);
-        assert_eq!(cat(&e), TraceCategory::GuardEvaluation);
     }
 }

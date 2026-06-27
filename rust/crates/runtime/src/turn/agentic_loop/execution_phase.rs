@@ -639,6 +639,93 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
+    // ── Policy-driven evaluation (BudgetPolicy) ──────────────────────────
+    // Compute JournalFacts from the current loop state and delegate to
+    // BudgetPolicy::decide(). The Policy produces FrameworkActions that
+    // complement the guard pipeline above — budget expansion, phase
+    // transitions, and signal injection.
+    //
+    // This runs after the guard pipeline so it sees the latest tool-call
+    // records and circuit-breaker state.
+    {
+        use astra_core::observation_journal::{BudgetPolicy, FrameworkAction, JournalFacts};
+
+        let mut facts = state
+            .observation_journal
+            .extract_facts(state.remaining_turns as u32, state.max_turns as u32);
+
+        // Override with canonical state values (journal may lag).
+        facts.rounds_completed = state.llm_rounds_completed;
+        facts.total_mutations = state.total_evidence_tool_calls;
+        facts.total_errors = state.turn_guard.health.recent_errors(10).len() as u32;
+        facts.total_tool_calls = state.total_tool_calls;
+
+        // Stall reason from the unified stall diagnosis.
+        facts.stall_reason = interruption_diagnosis_summary(state);
+
+        // Per-round delta facts from the most recent journal entry.
+        if let Some(last) = state.observation_journal.last_entry() {
+            facts.new_tool_calls = last.total_tool_calls;
+            facts.new_failures = last.error_count as usize;
+            facts.text_growth = last.tokens_consumed as usize;
+        }
+
+        let actions = BudgetPolicy::default().decide(&facts);
+        for action in actions {
+            match action {
+                FrameworkAction::ExpandBudget {
+                    factor,
+                    max_ceiling,
+                } => {
+                    let new_max = ((state.max_turns as f64) * factor).ceil() as usize;
+                    let ceiling = max_ceiling as usize;
+                    let capped = new_max.min(ceiling);
+                    if capped > state.max_turns {
+                        let added = capped - state.max_turns;
+                        state.max_turns = capped;
+                        state.remaining_turns += added;
+                        // Reset self-pacing hint flags so the new budget gets fresh hints
+                        state.turn_budget_hint_emitted_90 = false;
+                        state.turn_budget_hint_emitted_50 = false;
+                        state.turn_budget_hint_emitted_20 = false;
+                        let msg = format!(
+                            "[Budget review] Recent progress: expanding budget by ×{factor:.1} ({added} additional turns). Hard ceiling: {ceiling} total turns."
+                        );
+                        state.push_volatile(super::host::VolatileKind::BudgetReview, msg);
+                        tracing::info!(
+                            target: "astra::policy",
+                            factor,
+                            max_ceiling,
+                            new_max = capped,
+                            "Policy-driven budget expansion"
+                        );
+                    }
+                }
+                FrameworkAction::TransitionPhase { target } => {
+                    tracing::info!(
+                        target: "astra::policy",
+                        target_phase = %target,
+                        "Policy requested phase transition"
+                    );
+                    // Phase transitions (e.g. "reflect") are advisory in the
+                    // production loop — the circuit breaker owns termination.
+                }
+                FrameworkAction::InjectSignal { message } => {
+                    state.push_volatile(
+                        super::host::VolatileKind::Corrective,
+                        format!("[Framework signal] {}", message),
+                    );
+                    tracing::info!(
+                        target: "astra::policy",
+                        signal = %message,
+                        "Policy injected signal into agent context"
+                    );
+                }
+                FrameworkAction::Continue => {}
+            }
+        }
+    }
+
     // ── Intent drift detection ─────────────────────────────────────────
     // Check if the agent has drifted from the user's original intent by
     // analyzing recent tool calls against the user query. If drift is

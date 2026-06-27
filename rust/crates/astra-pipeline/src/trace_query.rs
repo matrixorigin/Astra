@@ -397,8 +397,8 @@ mod tests {
         let mut log = EventLog::new();
         log.emit(
             EventKind::PhaseTransition {
-                from: crate::state::AgentPhase::Plan,
-                to: crate::state::AgentPhase::Execute,
+                from: "Plan".into(),
+                to: "Execute".into(),
             },
             None,
         );
@@ -416,15 +416,15 @@ mod tests {
         let mut log = EventLog::with_min_level(TraceLevel::Debug);
         log.emit(
             EventKind::PhaseTransition {
-                from: crate::state::AgentPhase::Plan,
-                to: crate::state::AgentPhase::Execute,
+                from: "Plan".into(),
+                to: "Execute".into(),
             },
             None,
         );
         log.emit(
             EventKind::PhaseTransition {
-                from: crate::state::AgentPhase::Execute,
-                to: crate::state::AgentPhase::Complete,
+                from: "Execute".into(),
+                to: "Complete".into(),
             },
             None,
         );
@@ -443,8 +443,8 @@ mod tests {
         let mut log = EventLog::new();
         log.emit(
             EventKind::PhaseTransition {
-                from: crate::state::AgentPhase::Plan,
-                to: crate::state::AgentPhase::Execute,
+                from: "Plan".into(),
+                to: "Execute".into(),
             },
             None,
         );

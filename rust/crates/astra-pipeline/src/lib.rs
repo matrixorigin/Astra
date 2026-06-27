@@ -8,7 +8,6 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod crash_recovery;
-pub mod engine;
 pub mod event;
 pub mod exactly_once;
 pub mod feedback_extraction;
@@ -18,8 +17,6 @@ pub mod reflection_feedback;
 pub mod routing;
 pub mod scheduling;
 pub mod skill_checkpoint;
-pub mod stages;
-pub mod state;
 pub mod step_checkpoint;
 pub mod step_protocol;
 pub mod step_recorder;
@@ -30,7 +27,6 @@ pub mod tool_health_types;
 pub mod trace_query;
 pub mod trace_retention;
 pub mod trace_usage;
-pub mod trace_volume;
 pub use tool_health_types::{
     TOOL_OUTCOME_RING_CAPACITY, ToolHealthEntry, ToolOutcome, ToolOutcomeCacheEntry,
 };

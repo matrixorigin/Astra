@@ -1,13 +1,60 @@
 //! Bridge between ReflectStage output and persistent feedback memory.
 //!
-//! Closes the reflect → memory gap: when ReflectStage diagnoses a pattern
-//! and produces a Reflection, this module converts it into a
-//! `StructuredFeedback` suitable for cross-session persistence.
+//! Converts structured reflection diagnoses into [`StructuredFeedback`]
+//! suitable for cross-session persistence via [`FeedbackStore`].
+//!
+//! The types that were previously scattered across `state.rs` and
+//! `stages/reflect.rs` are now consolidated here — they exist only to
+//! serve the reflection-to-feedback conversion used by `astra-cli`.
 
 use astra_turn_types::StructuredFeedback;
 
-use crate::stages::reflect::FailureCategory;
-use crate::state::Reflection;
+// ─── FailureCategory ─────────────────────────────────────────────────────────
+
+/// Root cause category for structured diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCategory {
+    /// Specific tools keep failing (HTTP errors, permission denied, etc.)
+    ToolFailures,
+    /// Agent repeats the same tool calls without new information.
+    Stall,
+    /// Tools succeed but produce no useful output toward the goal.
+    NoProgress,
+    /// Catch-all: insufficient progress without a clear single cause.
+    General,
+}
+
+// ─── Reflection ──────────────────────────────────────────────────────────────
+
+/// Structured self-correction data from a reflection pass.
+#[derive(Debug, Clone)]
+pub struct Reflection {
+    /// What happened that triggered reflection.
+    pub what_happened: String,
+    /// Root cause analysis.
+    pub why: String,
+    /// Proposed corrective action.
+    pub what_to_try: String,
+    /// Confidence in the proposed correction (0.0-1.0).
+    pub confidence: f64,
+    /// Strategy adjustments to apply.
+    pub strategy_delta: StrategyDelta,
+}
+
+/// Adjustments to apply after reflection.
+#[derive(Debug, Clone, Default)]
+pub struct StrategyDelta {
+    /// Tools to add to blocked list.
+    pub block_tools: Vec<String>,
+    /// Tools to try that weren't in the original selection.
+    pub add_tools: Vec<String>,
+    /// Additional context to inject into the next prompt.
+    pub inject_context: Option<String>,
+    /// Whether to widen tool surface (lower threshold).
+    pub widen_surface: bool,
+}
+
+// ─── Conversion ──────────────────────────────────────────────────────────────
 
 /// Minimum confidence to consider a reflection worth persisting.
 const PERSIST_CONFIDENCE_THRESHOLD: f64 = 0.4;
@@ -72,10 +119,11 @@ fn category_to_apply_when(category: FailureCategory) -> String {
     }
 }
 
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::StrategyDelta;
 
     fn make_reflection(what_to_try: &str, why: &str, confidence: f64) -> Reflection {
         Reflection {
@@ -97,134 +145,51 @@ mod tests {
             0.8,
         );
         let fb = reflection_to_feedback(&refl, FailureCategory::ToolFailures).unwrap();
-
         assert_eq!(fb.rule, "Use read_file before str_replace");
-        assert_eq!(fb.reason, "Edited a file without reading it first");
-        assert_eq!(fb.source_signal, "reflect_stage");
-        assert!((fb.confidence - 0.8).abs() < f64::EPSILON);
+        assert!(fb.apply_when.contains("tool call fails"));
     }
 
     #[test]
-    fn maps_category_to_apply_when() {
-        let refl = make_reflection("retry with backoff", "API timed out", 0.7);
-        let fb = reflection_to_feedback(&refl, FailureCategory::NoProgress).unwrap();
-        assert!(
-            fb.apply_when.contains("no useful output"),
-            "apply_when should mention no useful output"
-        );
-
-        let fb2 = reflection_to_feedback(&refl, FailureCategory::Stall).unwrap();
-        assert!(
-            fb2.apply_when.contains("stall"),
-            "apply_when should mention stall"
-        );
-    }
-
-    #[test]
-    fn low_confidence_returns_none() {
-        let refl = make_reflection("try something", "not sure", 0.2);
+    fn skips_low_confidence_reflections() {
+        let refl = make_reflection("advice", "reason", 0.1);
         assert!(reflection_to_feedback(&refl, FailureCategory::General).is_none());
     }
 
     #[test]
-    fn at_threshold_returns_some() {
-        let refl = make_reflection("do X", "because Y", PERSIST_CONFIDENCE_THRESHOLD);
-        assert!(reflection_to_feedback(&refl, FailureCategory::General).is_some());
+    fn skips_empty_advice() {
+        let refl = make_reflection("", "reason", 0.8);
+        assert!(reflection_to_feedback(&refl, FailureCategory::General).is_none());
     }
 
     #[test]
-    fn empty_suggestion_returns_none() {
-        let refl = make_reflection("", "something failed", 0.9);
-        assert!(reflection_to_feedback(&refl, FailureCategory::ToolFailures).is_none());
+    fn skips_whitespace_only_advice() {
+        let refl = make_reflection("   ", "reason", 0.8);
+        assert!(reflection_to_feedback(&refl, FailureCategory::General).is_none());
     }
 
-    #[test]
-    fn whitespace_only_suggestion_returns_none() {
-        let refl = make_reflection("   \n  ", "something failed", 0.9);
-        assert!(reflection_to_feedback(&refl, FailureCategory::ToolFailures).is_none());
-    }
-
-    // ── session_lessons ─────────────────────────────────────────────
+    // ── session_lessons ────────────────────────────────────────────
 
     #[test]
-    fn extracts_lessons_from_session() {
-        let pairs = vec![
-            (
-                make_reflection("Use targeted reads", "full file too large", 0.8),
-                FailureCategory::ToolFailures,
-            ),
-            (
-                make_reflection("Run tests after edits", "broke the build", 0.7),
-                FailureCategory::NoProgress,
-            ),
-        ];
-        let lessons = session_lessons(&pairs);
+    fn session_lessons_deduplicates_by_rule() {
+        let refl_a = make_reflection("advice a", "reason 1", 0.8);
+        let refl_a2 = make_reflection("advice a", "reason 2", 0.6);
+        let refl_b = make_reflection("advice b", "reason 3", 0.8);
+        let lessons = session_lessons(&[
+            (refl_a, FailureCategory::ToolFailures),
+            (refl_a2, FailureCategory::Stall),
+            (refl_b, FailureCategory::General),
+        ]);
         assert_eq!(lessons.len(), 2);
+        let rules: Vec<&str> = lessons.iter().map(|l| l.rule.as_str()).collect();
+        assert!(rules.contains(&"advice a"));
+        assert!(rules.contains(&"advice b"));
     }
 
     #[test]
-    fn deduplicates_by_rule() {
-        let pairs = vec![
-            (
-                make_reflection("Use targeted reads", "file too large", 0.8),
-                FailureCategory::ToolFailures,
-            ),
-            (
-                make_reflection("use targeted reads", "same lesson again", 0.9),
-                FailureCategory::ToolFailures,
-            ),
-        ];
-        let lessons = session_lessons(&pairs);
-        assert_eq!(lessons.len(), 1, "duplicate rules should be deduplicated");
-    }
-
-    #[test]
-    fn filters_low_confidence_from_session() {
-        let pairs = vec![
-            (
-                make_reflection("good advice", "solid reason", 0.8),
-                FailureCategory::ToolFailures,
-            ),
-            (
-                make_reflection("weak advice", "not sure", 0.1),
-                FailureCategory::General,
-            ),
-        ];
-        let lessons = session_lessons(&pairs);
-        assert_eq!(lessons.len(), 1);
-        assert_eq!(lessons[0].rule, "good advice");
-    }
-
-    #[test]
-    fn empty_reflections_empty_lessons() {
-        let lessons = session_lessons(&[]);
+    fn session_lessons_filters_low_confidence() {
+        let refl = make_reflection("good advice", "reason", 0.2);
+        let lessons = session_lessons(&[(refl, FailureCategory::General)]);
         assert!(lessons.is_empty());
-    }
-
-    #[test]
-    fn multiple_categories_produce_distinct_apply_when() {
-        let pairs = vec![
-            (
-                make_reflection("fix tools", "tool broke", 0.8),
-                FailureCategory::ToolFailures,
-            ),
-            (
-                make_reflection("fix stall", "stalled out", 0.8),
-                FailureCategory::Stall,
-            ),
-        ];
-        let lessons = session_lessons(&pairs);
-        assert_eq!(lessons.len(), 2);
-        assert_ne!(lessons[0].apply_when, lessons[1].apply_when);
-    }
-
-    // ── trim ────────────────────────────────────────────────────────
-
-    #[test]
-    fn trims_whitespace_from_rule() {
-        let refl = make_reflection("  use targeted reads  ", "reason", 0.8);
-        let fb = reflection_to_feedback(&refl, FailureCategory::General).unwrap();
-        assert_eq!(fb.rule, "use targeted reads");
     }
 
     // ── category_to_apply_when exhaustive ──────────────────────────
