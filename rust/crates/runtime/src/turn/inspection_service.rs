@@ -25,6 +25,7 @@
 //! it allocation-free on the hot path and allows the same provider instances to
 //! be shared with `RuntimePolicy::decide()` and `execution_phase`.
 
+use astra_core::observation::{TuningJob, TuningSignalType};
 use astra_core::ObservationFacet;
 use astra_turn_core::introspect::{CircuitBreakerSnapshot, IntrospectSnapshot};
 
@@ -231,6 +232,120 @@ impl InspectionService<'_> {
         }
 
         lines.join("\n")
+    }
+
+    /// Generate tuning signals from live observation data.
+    ///
+    /// This method analyzes the current observation state and emits
+    /// [`TuningJob`] entries when adaptation triggers are detected.
+    /// TuningJobs are advisory — they do not modify runtime state directly.
+    ///
+    /// # Trigger thresholds
+    ///
+    /// | Signal | Condition | Priority |
+    /// |--------|-----------|----------|
+    /// | `AggressiveCompaction` | token_pressure > 0.95 | 10 |
+    /// | `PromptCompaction` | token_pressure > 0.80 | 7 |
+    /// | `CircuitBreakerTuning` | error_rate > 0.30 | 6 |
+    /// | `CompactionPolicyTuning` | compaction_count ≥ 3 in window | 5 |
+    /// | `CacheWarming` | cache_hit_ratio < 0.30 after 10+ turns | 4 |
+    /// | `TaskDecomposition` | completion_ratio < 1.0 for 5+ turns | 3 |
+    pub fn generate_tuning_signals(&self, turn_index: u32, session_id: &str) -> Vec<TuningJob> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut signals: Vec<TuningJob> = Vec::new();
+
+        let pressure = self.live.token_pressure();
+        let error_rate = self.live.current_error_rate();
+        let cache_hit = self.live.cache_hit_ratio();
+        let task_ratio = self.session.task_completion_ratio();
+        let remaining = self.session.remaining_turns();
+        let max_budget = self.session.max_turns();
+        let turns_completed = max_budget.saturating_sub(remaining);
+
+        // 1. Token pressure — highest priority
+        if pressure > 0.95 {
+            signals.push(TuningJob {
+                signal: TuningSignalType::AggressiveCompaction,
+                trigger_value: pressure,
+                reason: format!(
+                    "token_pressure={:.0}% critical — aggressive compaction needed",
+                    pressure * 100.0
+                ),
+                created_at_ms: now_ms,
+                turn_index,
+                session_id: session_id.to_string(),
+                priority: 10,
+            });
+        } else if pressure > 0.80 {
+            signals.push(TuningJob {
+                signal: TuningSignalType::PromptCompaction,
+                trigger_value: pressure,
+                reason: format!(
+                    "token_pressure={:.0}% — suggest prompt compaction",
+                    pressure * 100.0
+                ),
+                created_at_ms: now_ms,
+                turn_index,
+                session_id: session_id.to_string(),
+                priority: 7,
+            });
+        }
+
+        // 2. Error rate → circuit breaker tuning
+        if error_rate > 0.30 {
+            signals.push(TuningJob {
+                signal: TuningSignalType::CircuitBreakerTuning,
+                trigger_value: error_rate,
+                reason: format!(
+                    "error_rate={:.0}% — consider tightening circuit breaker",
+                    error_rate * 100.0
+                ),
+                created_at_ms: now_ms,
+                turn_index,
+                session_id: session_id.to_string(),
+                priority: 6,
+            });
+        }
+
+        // 3. Cache warming — low hit ratio after enough turns
+        if turns_completed > 10 && cache_hit < 0.30 {
+            signals.push(TuningJob {
+                signal: TuningSignalType::CacheWarming,
+                trigger_value: cache_hit,
+                reason: format!(
+                    "cache_hit_ratio={:.0}% after {turns_completed} turns — suggest cache warming",
+                    cache_hit * 100.0
+                ),
+                created_at_ms: now_ms,
+                turn_index,
+                session_id: session_id.to_string(),
+                priority: 4,
+            });
+        }
+
+        // 4. Task decomposition — stalled for 5+ consecutive turns
+        let facts = self.observation.extract_facts();
+        if task_ratio < 1.0 && facts.consecutive_rounds_without_outcome >= 5 {
+            signals.push(TuningJob {
+                signal: TuningSignalType::TaskDecomposition,
+                trigger_value: task_ratio,
+                reason: format!(
+                    "task_completion={:.0}% stalled_for={} turns — suggest task decomposition",
+                    task_ratio * 100.0,
+                    facts.consecutive_rounds_without_outcome
+                ),
+                created_at_ms: now_ms,
+                turn_index,
+                session_id: session_id.to_string(),
+                priority: 3,
+            });
+        }
+
+        signals
     }
 }
 

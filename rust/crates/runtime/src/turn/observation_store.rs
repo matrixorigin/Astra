@@ -56,6 +56,12 @@ impl FileObservationStore {
         self.root_dir.join(format!("{safe}.jsonl"))
     }
 
+    /// Return the tuning file path for `session_id`.
+    fn session_path_tuning(&self, session_id: &str) -> PathBuf {
+        let safe = session_id.replace('/', "_").replace("..", "_");
+        self.root_dir.join(format!("{safe}.tuning.jsonl"))
+    }
+
     /// Ensure the root directory exists.
     fn ensure_root_dir(&self) -> Result<(), String> {
         fs::create_dir_all(&self.root_dir)
@@ -159,6 +165,34 @@ impl ObservationStore for FileObservationStore {
             fs::remove_file(&path).map_err(|e| format!("cannot delete {:?}: {e}", path))?;
         }
         Ok(())
+    }
+
+    fn save_tuning_entry(
+        &self,
+        session_id: &str,
+        _turn_index: u32,
+        raw_json: &str,
+    ) -> Result<(), String> {
+        self.ensure_root_dir()?;
+
+        let path = self.session_path_tuning(session_id);
+
+        let mut line = raw_json.to_string();
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("cannot open tuning file {:?}: {e}", path))?;
+
+        file.write_all(line.as_bytes())
+            .map_err(|e| format!("write failed for tuning {:?}: {e}", path))?;
+
+        file.flush()
+            .map_err(|e| format!("flush failed for tuning {:?}: {e}", path))
     }
 }
 

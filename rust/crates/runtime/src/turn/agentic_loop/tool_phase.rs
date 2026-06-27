@@ -33,6 +33,7 @@ use super::host::{
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use crate::turn::inspection_service::InspectionService;
 use crate::turn::local_provider::LocalSessionProvider;
+use crate::turn::observation_dispatcher::TuningSink;
 use crate::turn::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
 use crate::turn::runtime_policy::RuntimePolicy;
 use astra_turn_core::agentic_post_tool_policy::{
@@ -1482,15 +1483,17 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     };
     state.push_recent_round(recent_summary);
 
-    // Publish after the round summary enters the in-memory ring so the next
-    // LLM round sees the same token/cache counters and recent-round view on
-    // CLI and server surfaces.
-    let lifecycle_summary = host.turn_start_lifecycle_summary(state);
-    let default_policy = RuntimePolicy::default();
-    let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
-    let provider = LocalSessionProvider::new(state, policy);
-    let inspection = InspectionService::new(&provider, &provider, &provider);
-    publish_introspect_snapshot(host, state, lifecycle_summary, Some(&inspection));
+    // ── Publish introspect snapshot ──
+    // Scoped so provider + inspection borrows are released before the
+    // mutable observation_journal access below.
+    {
+        let lifecycle_summary = host.turn_start_lifecycle_summary(state);
+        let default_policy = RuntimePolicy::default();
+        let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
+        let provider = LocalSessionProvider::new(state, policy);
+        let inspection = InspectionService::new(&provider, &provider, &provider);
+        publish_introspect_snapshot(host, state, lifecycle_summary, Some(&inspection));
+    } // provider + inspection dropped — releases immutable borrow of state
 
     // ── Record turn metrics into observation journal ──
     // Feed the sliding window so the next round's auto-injected self-status
@@ -1543,6 +1546,41 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 crate::turn::observation_dispatcher::ObservationEvent::TurnCompleted { metrics, facts },
             );
         } // dispatcher dropped here — releases &mut observation_journal
+
+        // ── Tuning signal generation ──
+        // Generate adaptation signals from observation state and persist
+        // them via the TuningSink. Non-blocking: failures are logged only.
+        // Re-create provider + inspection now that the mutable borrow is released.
+        {
+            let default_policy = RuntimePolicy::default();
+            let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
+            let provider = LocalSessionProvider::new(state, policy);
+            let inspection = InspectionService::new(&provider, &provider, &provider);
+            let tuning_jobs = inspection.generate_tuning_signals(
+                state.llm_rounds_completed,
+                state.current_session_id.as_deref().unwrap_or_default(),
+            );
+            if !tuning_jobs.is_empty() {
+                if let Some(ref store) = state.observation_store {
+                    let mut tuning_sink =
+                        crate::turn::observation_dispatcher::FileTuningSink::new(
+                            Some(store.clone()),
+                            state
+                                .current_session_id
+                                .as_deref()
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                    if let Err(e) = tuning_sink.consume_batch(&tuning_jobs) {
+                        tracing::warn!(
+                            error = %e,
+                            count = tuning_jobs.len(),
+                            "tuning sink failure (non-fatal)"
+                        );
+                    }
+                }
+            }
+        }
 
         // ── Agent-marked strategy change ──
         // Scan memory tool calls for `strategy_change` tag so the agent

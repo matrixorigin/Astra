@@ -1037,6 +1037,70 @@ fn clamp_confidence(value: f64) -> f64 {
     }
 }
 
+// ── TuningJob ────────────────────────────────────────────────────────────────
+
+/// A tuning signal emitted when the Observation Plane detects adaptation
+/// triggers. TuningJobs are fire-and-forget — they are written to a sink
+/// (file, cloud queue) without blocking the agentic loop.
+///
+/// # When TuningJobs are generated
+///
+/// | Trigger | Generated Signal |
+/// |---------|-----------------|
+/// | Token pressure > 0.8 | `PromptCompaction` |
+/// | Token pressure > 0.95 | `AggressiveCompaction` |
+/// | Error rate > 0.3 | `CircuitBreakerTuning` |
+/// | Frequent compaction (≥3 in recent window) | `CompactionPolicyTuning` |
+/// | Cache hit ratio < 0.3 after 10+ turns | `CacheWarming` |
+/// | Task completion stalled (ratio < 1.0 for 5+ turns) | `TaskDecomposition` |
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuningJob {
+    /// Type of tuning signal.
+    pub signal: TuningSignalType,
+    /// The current value that triggered this signal.
+    pub trigger_value: f64,
+    /// Brief diagnostic summary (max 200 chars).
+    pub reason: String,
+    /// Unix timestamp in milliseconds.
+    pub created_at_ms: u64,
+    /// Turn index when the signal was generated.
+    pub turn_index: u32,
+    /// Session id for traceability.
+    pub session_id: String,
+    /// Priority: 0 (advisory) to 10 (critical).
+    pub priority: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TuningSignalType {
+    /// Token pressure crossed normal threshold → suggest compaction.
+    PromptCompaction,
+    /// Token pressure critical → urgent aggressive compaction.
+    AggressiveCompaction,
+    /// Error rate too high → tighten circuit breaker thresholds.
+    CircuitBreakerTuning,
+    /// Compaction triggered too frequently → adjust compaction policy.
+    CompactionPolicyTuning,
+    /// Cache hit ratio too low → warm cache or adjust prefetch.
+    CacheWarming,
+    /// Task board stalled for many turns → suggest decomposition.
+    TaskDecomposition,
+}
+
+impl std::fmt::Display for TuningSignalType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PromptCompaction => write!(f, "prompt_compaction"),
+            Self::AggressiveCompaction => write!(f, "aggressive_compaction"),
+            Self::CircuitBreakerTuning => write!(f, "circuit_breaker_tuning"),
+            Self::CompactionPolicyTuning => write!(f, "compaction_policy_tuning"),
+            Self::CacheWarming => write!(f, "cache_warming"),
+            Self::TaskDecomposition => write!(f, "task_decomposition"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

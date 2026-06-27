@@ -698,6 +698,20 @@ pub trait ObservationStore: Send + Sync {
     ///
     /// Returns `Ok(())` even if no entries existed (idempotent delete).
     fn delete_session(&self, session_id: &str) -> Result<(), String>;
+
+    /// Save a tuning job entry as a raw JSON line.
+    ///
+    /// Tuning jobs are advisory and separate from turn metrics.
+    /// The `raw_json` is a pre-serialized [`TuningJob`] line.
+    /// Default: no-op (most stores don't support tuning persistence).
+    fn save_tuning_entry(
+        &self,
+        _session_id: &str,
+        _turn_index: u32,
+        _raw_json: &str,
+    ) -> Result<(), String> {
+        Ok(()) // default no-op
+    }
 }
 
 /// A single persisted observation record, reconstructed from storage.

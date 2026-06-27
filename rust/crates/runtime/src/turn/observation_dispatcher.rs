@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use astra_core::observation::TurnMetrics;
+use astra_core::observation::{TuningJob, TurnMetrics};
 use astra_core::observation_journal::{JournalFacts, ObservationJournal, ObservationStore};
 
 use super::runtime_policy::FrameworkAction;
@@ -142,6 +142,70 @@ impl ObservationSink for FileSink {
 
         if let ObservationEvent::TurnCompleted { metrics, facts, .. } = event {
             store.save_entry(&self.session_id, metrics.rounds_completed, metrics, facts)?;
+        }
+        Ok(())
+    }
+}
+
+// ── Tuning Sink ─────────────────────────────────────────────────────────────
+
+/// Consumes [`TuningJob`] entries and writes them to a persistent store.
+///
+/// Unlike [`ObservationSink`] which handles real-time turn events, `TuningSink`
+/// handles *derived* tuning signals generated after analysis. Sinks are
+/// fire-and-forget: failure is logged but never propagated.
+pub trait TuningSink {
+    /// Human-readable name for logging and diagnostics.
+    fn name(&self) -> &'static str;
+
+    /// Consume a batch of tuning jobs.
+    ///
+    /// Returns `Ok(())` on success, or an error message on failure.
+    /// Errors are informational; callers never unwind on sink failure.
+    fn consume_batch(&mut self, jobs: &[TuningJob]) -> Result<(), String>;
+}
+
+// ── File Tuning Sink ────────────────────────────────────────────────────────
+
+/// Persists [`TuningJob`] entries as JSON lines to a file.
+///
+/// The file path follows the same convention as [`FileObservationStore`]:
+/// `~/.astra/observations/{session_id}.tuning.jsonl`
+pub struct FileTuningSink {
+    store: Option<Arc<dyn ObservationStore>>,
+    session_id: String,
+}
+
+impl std::fmt::Debug for FileTuningSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTuningSink")
+            .field("session_id", &self.session_id)
+            .field("has_store", &self.store.is_some())
+            .finish()
+    }
+}
+
+impl FileTuningSink {
+    pub fn new(store: Option<Arc<dyn ObservationStore>>, session_id: String) -> Self {
+        Self { store, session_id }
+    }
+}
+
+impl TuningSink for FileTuningSink {
+    fn name(&self) -> &'static str {
+        "file_tuning"
+    }
+
+    fn consume_batch(&mut self, jobs: &[TuningJob]) -> Result<(), String> {
+        let store = match &self.store {
+            Some(s) => s,
+            None => return Ok(()), // No store configured — skip silently.
+        };
+
+        for job in jobs {
+            let json = serde_json::to_string(job)
+                .map_err(|e| format!("tuning_job serialization failed: {e}"))?;
+            store.save_tuning_entry(&self.session_id, job.turn_index, &json)?;
         }
         Ok(())
     }
