@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use astra_tools::ToolExecutor;
 use astra_tools::tool_engine::{
     DynamicToolHandler, NotifyToolHandler, ToolEngine, ToolHandler, WebSearchToolHandler,
 };
+use astra_tools::ToolExecutor;
 
 use super::ServerToolExecutor;
-use crate::server::tool_agent_info::{AgentInfoIdentity, render_agent_info};
+use crate::server::tool_agent_info::{render_agent_info, AgentInfoIdentity};
 use crate::server::tool_agent_runtime::{execute_agent_fanout_tool, execute_agent_tool};
 use crate::server::tool_database_snapshots::{execute_mo_query, rollback_database_snapshots};
 use crate::server::tool_execution_result::tool_result_from_output;
@@ -443,25 +443,42 @@ impl ToolHandler<ServerToolExecutor> for ReflectToolHandler {
                     "Error: failed to encode reflect report: {error}"
                 )),
             },
-            Err((status, axum::Json(body))) => astra_tools::ToolResult::error(
-                serde_json::json!({
-                    "tool": "reflect",
-                    "status": "reflect_unavailable",
-                    "http_status": status.as_u16(),
-                    "error": body.detail,
-                    "error_code": body.error_code,
-                    "session_id": context.session_id,
-                    "topic": request.topic,
-                    "facet": request.facet,
-                    "depth": request.depth,
-                    "horizon": request.horizon,
-                    "source_policy": request.source_policy,
-                    "include_context": request.include_context,
-                    "last_n": request.last_n,
-                    "question": request.question,
-                })
-                .to_string(),
-            ),
+            Err((_status, axum::Json(body))) => {
+                // Fall back to local snapshot-based reflect when the cloud
+                // service is unavailable and the source policy allows local data.
+                if request.source_policy.allows_edge_local_artifacts() {
+                    if let Ok(guard) = context.introspect_snapshot.read() {
+                        if let Some(ref snapshot) = *guard {
+                            let local_summary =
+                                crate::turn::inspection_service::local_reflect_from_snapshot(
+                                    snapshot,
+                                    request.facet,
+                                );
+                            return astra_tools::ToolResult::text(local_summary);
+                        }
+                    }
+                }
+
+                astra_tools::ToolResult::error(
+                    serde_json::json!({
+                        "tool": "reflect",
+                        "status": "reflect_unavailable",
+                        "http_status": _status.as_u16(),
+                        "error": body.detail,
+                        "error_code": body.error_code,
+                        "session_id": context.session_id,
+                        "topic": request.topic,
+                        "facet": request.facet,
+                        "depth": request.depth,
+                        "horizon": request.horizon,
+                        "source_policy": request.source_policy,
+                        "include_context": request.include_context,
+                        "last_n": request.last_n,
+                        "question": request.question,
+                    })
+                    .to_string(),
+                )
+            }
         }
     }
 }

@@ -1482,7 +1482,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     // LLM round sees the same token/cache counters and recent-round view on
     // CLI and server surfaces.
     let lifecycle_summary = host.turn_start_lifecycle_summary(state);
-    publish_introspect_snapshot(host, state, lifecycle_summary);
+    publish_introspect_snapshot(host, state, lifecycle_summary, None);
 
     // ── Record turn metrics into observation journal ──
     // Feed the sliding window so the next round's auto-injected self-status
@@ -1986,7 +1986,7 @@ mod tests {
     #[test]
     fn introspect_snapshot_includes_host_lifecycle_summary() {
         let state = make_state();
-        let snapshot = build_introspect_snapshot(&state, "turn-start lifecycle".to_string());
+        let snapshot = build_introspect_snapshot(&state, "turn-start lifecycle".to_string(), None);
         assert_eq!(snapshot.lifecycle_summary, "turn-start lifecycle");
     }
 
