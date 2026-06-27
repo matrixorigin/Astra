@@ -7549,8 +7549,8 @@ mod tests {
             budget_policy: astra_config::runtime_config::RuntimeConfig::load()
                 .budget_policy
                 .map(|cfg| {
-                    use astra_core::observation_journal::BudgetPolicy;
-                    BudgetPolicy {
+                    use crate::turn::runtime_policy::RuntimePolicy;
+                    RuntimePolicy {
                         expand_after_consecutive_outcomes: cfg.expand_after_consecutive_outcomes,
                         expand_factor: cfg.expand_factor,
                         max_ceiling: cfg.max_ceiling,

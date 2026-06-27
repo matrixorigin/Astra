@@ -8,6 +8,7 @@ use crate::cli::cli_config::cli_args::{
 use crate::cli::cli_config::cli_utils::local_resumable_last_session_id;
 use crate::cli::session::session_continuation::extract_text_content;
 use astra_config::runtime_config::RuntimeConfig;
+use astra_core::observation::SourcePolicy;
 use astra_core::{
     ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationEvidence,
     ObservationGraphEdge, ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
@@ -16,7 +17,6 @@ use astra_core::{
 };
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
-use astra_core::observation::SourcePolicy;
 use astra_services::reflect::{ReflectReport, ReflectRequest};
 use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
@@ -392,7 +392,7 @@ async fn build_reflect_response(
     if let Some(warning) = persistence_warning {
         warnings.push(warning);
     }
-    let total_events = if artifacts.journal_events.len() > 0 {
+    let total_events = if !artifacts.journal_events.is_empty() {
         artifacts.journal_events.len() as i64
     } else {
         recent_events.len() as i64
@@ -406,12 +406,8 @@ async fn build_reflect_response(
             error_count += 1;
         }
     }
-    let data_coverage = local_reflect_data_coverage(
-        &request,
-        total_events,
-        warnings.clone(),
-        &recent_events,
-    );
+    let data_coverage =
+        local_reflect_data_coverage(&request, total_events, warnings.clone(), &recent_events);
     let summary = if total_events == 0 {
         "No local session observations are available yet.".to_string()
     } else if error_count > 0 {

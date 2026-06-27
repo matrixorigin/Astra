@@ -408,8 +408,8 @@ pub use observation::{
     truncate_graph_summary, urn_component,
 };
 pub use observation_journal::{
-    BudgetPolicy, FrameworkAction, JournalEntry, JournalFacts, MetricTrend, ObservationJournal,
-    StrategyVerification, render_compact_status,
+    JournalEntry, JournalFacts, MetricTrend, ObservationJournal, StrategyVerification,
+    render_compact_status,
 };
 pub use runtime_limits::RuntimeLimits;
 #[cfg(any(test, feature = "dev-defaults"))]

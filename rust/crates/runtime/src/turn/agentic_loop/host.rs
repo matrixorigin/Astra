@@ -53,7 +53,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use astra_core::{BudgetPolicy, ObservationJournal};
+use crate::turn::runtime_policy::RuntimePolicy;
+use astra_core::ObservationJournal;
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::{ToolCallRecord, TraceSpanBuilder};
 use astra_services::{DatabaseEvaluationService, DatabaseEventService};
@@ -1488,7 +1489,7 @@ pub struct AgenticLoopState {
     pub agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
     /// Budget policy for auto-expansion based on outcome streaks.
     /// When `None` (default), the production `Default::default()` is used.
-    pub budget_policy: Option<BudgetPolicy>,
+    pub budget_policy: Option<RuntimePolicy>,
     /// Set to true when budget policy expanded the turn budget this turn.
     /// Prevents [`maybe_extend_turn_budget`] from double-extending.
     pub policy_expanded_this_turn: bool,

@@ -102,7 +102,7 @@ pub struct RuntimeConfig {
     /// Controls when the framework automatically extends the turn budget
     /// (expand after consecutive productive rounds) and when it injects
     /// corrective signals (nudge after consecutive unproductive rounds).
-    /// Uses BudgetPolicy::default() when left unset.
+    /// Uses RuntimePolicy::default() when left unset.
     #[serde(default)]
     pub budget_policy: Option<BudgetPolicyConfig>,
 }
@@ -112,7 +112,7 @@ pub struct RuntimeConfig {
 /// User-configurable budget policy parameters.
 ///
 /// All fields have sensible defaults matching
-/// [`astra_core::observation_journal::BudgetPolicy::default()`].
+/// [`astra_runtime::turn::runtime_policy::RuntimePolicy::default()`].
 /// Users may set only the fields they wish to override; omitted
 /// fields fall back to their default via `#[serde(default)]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3425,22 +3425,20 @@ mod tests {
     // ─── BudgetPolicyConfig tests ────────────────────────────────────────
 
     /// BudgetPolicyConfig::default() must produce values identical to
-    /// BudgetPolicy::default() so that a user who writes no config gets
+    /// RuntimePolicy::default() so that a user who writes no config gets
     /// the same behaviour as a caller who passes `None`.
     #[test]
     fn budget_policy_config_default_matches_policy_default() {
         let cfg = BudgetPolicyConfig::default();
-        let policy = astra_core::observation_journal::BudgetPolicy::default();
-        assert_eq!(
-            cfg.expand_after_consecutive_outcomes,
-            policy.expand_after_consecutive_outcomes
-        );
-        assert!((cfg.expand_factor - policy.expand_factor).abs() < f64::EPSILON);
-        assert_eq!(cfg.max_ceiling, policy.max_ceiling);
-        assert_eq!(
-            cfg.reflect_after_consecutive_zero,
-            policy.reflect_after_consecutive_zero
-        );
+        // RuntimePolicy defaults (must match):
+        // expand_after_consecutive_outcomes: 2
+        // expand_factor: 1.5
+        // max_ceiling: 1000
+        // reflect_after_consecutive_zero: 3
+        assert_eq!(cfg.expand_after_consecutive_outcomes, 2);
+        assert!((cfg.expand_factor - 1.5).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_ceiling, 1000);
+        assert_eq!(cfg.reflect_after_consecutive_zero, 3);
     }
 
     /// BudgetPolicyConfig round-trips through TOML serialization with all

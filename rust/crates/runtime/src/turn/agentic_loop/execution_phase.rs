@@ -639,16 +639,17 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
-    // ── Policy-driven evaluation (BudgetPolicy) ──────────────────────────
+    // ── Policy-driven evaluation (RuntimePolicy) ───────────────────────
     // Compute JournalFacts from the current loop state and delegate to
-    // BudgetPolicy::decide(). The Policy produces FrameworkActions that
+    // RuntimePolicy::decide(). The Policy produces FrameworkActions that
     // complement the guard pipeline above — budget expansion, phase
     // transitions, and signal injection.
     //
     // This runs after the guard pipeline so it sees the latest tool-call
     // records and circuit-breaker state.
     {
-        use astra_core::observation_journal::{BudgetPolicy, FrameworkAction, JournalFacts};
+        use crate::turn::runtime_policy::{FrameworkAction, RuntimePolicy};
+        use astra_core::observation_journal::JournalFacts;
 
         let mut facts = state
             .observation_journal
@@ -668,7 +669,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         let actions = state
             .budget_policy
             .as_ref()
-            .unwrap_or(&BudgetPolicy::default())
+            .unwrap_or(&RuntimePolicy::default())
             .decide(&facts);
         for action in actions {
             match action {

@@ -1024,20 +1024,10 @@ fn build_reflect_graph_slice(
 
     if let Some(graph) = evidence_graph {
         for node in graph.nodes {
-            push_graph_node(
-                &mut nodes,
-                &mut node_refs,
-                node,
-            );
+            push_graph_node(&mut nodes, &mut node_refs, node);
         }
         for edge in graph.edges {
-            push_graph_edge(
-                &mut edges,
-                &mut edge_keys,
-                edge.from,
-                edge.to,
-                edge.kind,
-            );
+            push_graph_edge(&mut edges, &mut edge_keys, edge.from, edge.to, edge.kind);
         }
     }
 
@@ -1421,15 +1411,16 @@ mod tests {
         }];
         let recommendations = vec![" narrow   command scope ".to_string()];
 
-    let (summary, observations, evidence, action_hints, failure_clusters) = build_observation_envelope(
-        "sess/with spaces",
-        &request,
-        &overview,
-        &diagnoses,
-        &[],
-        &recommendations,
-        None,
-    );
+        let (summary, observations, evidence, action_hints, failure_clusters) =
+            build_observation_envelope(
+                "sess/with spaces",
+                &request,
+                &overview,
+                &diagnoses,
+                &[],
+                &recommendations,
+                None,
+            );
 
         assert!(summary.contains("Timeout (bash)"));
         assert_eq!(observations.len(), 1);
@@ -1482,15 +1473,15 @@ mod tests {
             fix_hint: "check ulimit".into(),
         }];
 
-    let (_, observations, _, _, _) = build_observation_envelope(
-        "sess-overview",
-        &request,
-        &overview,
-        &diagnoses,
-        &[],
-        &[],
-        None,
-    );
+        let (_, observations, _, _, _) = build_observation_envelope(
+            "sess-overview",
+            &request,
+            &overview,
+            &diagnoses,
+            &[],
+            &[],
+            None,
+        );
 
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].topic, "execution");
@@ -1528,15 +1519,15 @@ mod tests {
             "Consider using more DIVERSE TOOLS for better coverage".to_string(),
         ];
 
-    let (_, observations, _, action_hints, failure_clusters) = build_observation_envelope(
-        "sess-insights",
-        &request,
-        &overview,
-        &[],
-        &insights,
-        &recommendations,
-        None,
-    );
+        let (_, observations, _, action_hints, failure_clusters) = build_observation_envelope(
+            "sess-insights",
+            &request,
+            &overview,
+            &[],
+            &insights,
+            &recommendations,
+            None,
+        );
 
         assert_eq!(observations[0].topic, "execution");
         assert_eq!(observations[0].facet, "stall");
@@ -1650,15 +1641,15 @@ mod tests {
             budget_result: ObservationBudgetResult::default(),
         };
 
-    let (_, _, evidence, _, _) = build_observation_envelope(
-        "sess-graph",
-        &request,
-        &overview,
-        &[],
-        &[],
-        &[],
-        Some(&graph),
-    );
+        let (_, _, evidence, _, _) = build_observation_envelope(
+            "sess-graph",
+            &request,
+            &overview,
+            &[],
+            &[],
+            &[],
+            Some(&graph),
+        );
 
         assert!(
             evidence
@@ -1719,22 +1710,22 @@ mod tests {
             }],
             budget_result: ObservationBudgetResult::default(),
         };
-    let (_, observations, evidence, _, failure_clusters) = build_observation_envelope(
-        "sess-graph-slice",
-        &request,
-        &overview,
-        &diagnoses,
-        &[],
-        &["narrow command scope".to_string()],
-        Some(&graph),
-    );
-    let graph_slice = build_reflect_graph_slice(
-        Some(graph),
-        &observations,
-        &evidence,
-        &failure_clusters,
-        &ObservationBudgetResult::default(),
-    );
+        let (_, observations, evidence, _, failure_clusters) = build_observation_envelope(
+            "sess-graph-slice",
+            &request,
+            &overview,
+            &diagnoses,
+            &[],
+            &["narrow command scope".to_string()],
+            Some(&graph),
+        );
+        let graph_slice = build_reflect_graph_slice(
+            Some(graph),
+            &observations,
+            &evidence,
+            &failure_clusters,
+            &ObservationBudgetResult::default(),
+        );
 
         assert!(graph_slice.nodes.iter().any(|node| {
             node.ref_id == "urn:astra:event:cloud:evt-1"

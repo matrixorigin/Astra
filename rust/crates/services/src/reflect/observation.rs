@@ -2,7 +2,7 @@ use super::{
     Diagnosis, Insight, ObservationActionHint, ObservationConfidence, ObservationEvidence,
     ObservationFailureCluster, ObservationRecord, ReflectRequest, SessionOverview,
 };
-use astra_core::{urn_component, ObservationGraphSlice, Urn};
+use astra_core::{ObservationGraphSlice, Urn, urn_component};
 
 // ── Confidence constants ──────────────────────────────────────────────────────
 // Named constants for observation confidence values, replacing magic numbers.

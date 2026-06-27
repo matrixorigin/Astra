@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_MAX_ENTRIES: usize = 1000;
 
 /// Per-(scenario, pattern) outcome statistics for coordination auto-select.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct OutcomeStats {
     pub successes: u32,
     pub failures: u32,
@@ -143,22 +143,18 @@ impl DelegationOutcomeTracker {
             .cloned()
     }
 
-    /// Return the best historical pattern for a scenario.
-    pub fn preferred_pattern(&self, scenario: &str, min_observations: u32) -> Option<String> {
-        let map = self.data.read().unwrap_or_else(|e| e.into_inner());
-        let inner = map.get(scenario)?;
-        let mut best: Option<(String, f64)> = None;
-
-        for (pattern, stats) in inner.iter() {
-            if stats.total() < min_observations {
-                continue;
-            }
-            let rate = stats.success_rate();
-            if best.as_ref().is_none_or(|(_, best_rate)| rate > *best_rate) {
-                best = Some((pattern.clone(), rate));
-            }
-        }
-        best.map(|(pattern, _)| pattern)
+    /// Return all pattern stats for a scenario.
+    ///
+    /// Returns the full map of pattern → stats so callers can apply their
+    /// own selection criteria (minimum observations, success rate threshold,
+    /// recency weighting, etc.) rather than having the tracker decide.
+    pub fn stats_for_scenario(&self, scenario: &str) -> BTreeMap<String, OutcomeStats> {
+        self.data
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(scenario)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Persist data to storage using an atomic rename.
@@ -188,18 +184,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preferred_pattern_requires_min_observations() {
+    fn stats_for_scenario_returns_filtered_patterns() {
         let tracker = DelegationOutcomeTracker::new();
         tracker.record("coding", "solo", true);
         tracker.record("coding", "team", false);
         tracker.record("coding", "team", true);
         tracker.record("coding", "team", true);
 
-        assert_eq!(
-            tracker.preferred_pattern("coding", 3).as_deref(),
-            Some("team")
-        );
-        assert_eq!(tracker.preferred_pattern("coding", 4), None);
+        let stats = tracker.stats_for_scenario("coding");
+        // "team" has 3 observations (1 fail, 2 success)
+        assert_eq!(stats.get("team").map(|s| s.total()), Some(3));
+        assert_eq!(stats.get("solo").map(|s| s.total()), Some(1));
+        // Caller decides minimum observations threshold
+        let best = stats
+            .iter()
+            .filter(|(_, s)| s.total() >= 3)
+            .max_by(|(_, a), (_, b)| a.success_rate().partial_cmp(&b.success_rate()).unwrap());
+        assert_eq!(best.map(|(p, _)| p.as_str()), Some("team"));
+        // No patterns meet threshold of 4
+        let none = stats
+            .iter()
+            .filter(|(_, s)| s.total() >= 4)
+            .max_by(|(_, a), (_, b)| a.success_rate().partial_cmp(&b.success_rate()).unwrap());
+        assert_eq!(none, None);
     }
 
     #[test]

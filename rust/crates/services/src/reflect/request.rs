@@ -233,7 +233,6 @@ fn analysis_view_for_topic_facet(topic: ObservationTopic, facet: ObservationFace
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     #[test]
     fn topic_facet_maps_to_analysis_view() {

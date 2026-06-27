@@ -131,13 +131,13 @@ const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 #[cfg(test)]
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
 
-/// Load BudgetPolicy from RuntimeConfig, converting BudgetPolicyConfig into the
-/// runtime BudgetPolicy type. Returns None when the config section is absent,
-/// causing the caller to fall back to BudgetPolicy::default().
-fn load_budget_policy_from_config() -> Option<astra_core::observation_journal::BudgetPolicy> {
-    use astra_core::observation_journal::BudgetPolicy;
+/// Load RuntimePolicy from RuntimeConfig, converting BudgetPolicyConfig into the
+/// runtime RuntimePolicy type. Returns None when the config section is absent,
+/// causing the caller to fall back to RuntimePolicy::default().
+fn load_budget_policy_from_config() -> Option<crate::turn::runtime_policy::RuntimePolicy> {
+    use crate::turn::runtime_policy::RuntimePolicy;
     let cfg = astra_config::runtime_config::RuntimeConfig::load().budget_policy?;
-    Some(BudgetPolicy {
+    Some(RuntimePolicy {
         expand_after_consecutive_outcomes: cfg.expand_after_consecutive_outcomes,
         expand_factor: cfg.expand_factor,
         max_ceiling: cfg.max_ceiling,

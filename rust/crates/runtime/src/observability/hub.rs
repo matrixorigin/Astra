@@ -230,8 +230,12 @@ impl ObservabilityHub {
         scenario: &str,
         min_observations: u32,
     ) -> Option<String> {
-        self.delegation_outcomes
-            .preferred_pattern(scenario, min_observations)
+        let stats = self.delegation_outcomes.stats_for_scenario(scenario);
+        stats
+            .iter()
+            .filter(|(_, s)| s.total() >= min_observations)
+            .max_by(|(_, a), (_, b)| a.success_rate().partial_cmp(&b.success_rate()).unwrap())
+            .map(|(pattern, _)| pattern.clone())
     }
 
     // ─── Query Observation ──────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 use super::{fanout_test_context, test_executor, test_spawner};
-use crate::edge_tools::{all_tool_schemas, truncate_output, ToolExecutor};
+use crate::edge_tools::{ToolExecutor, all_tool_schemas, truncate_output};
 use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
 use chrono::Utc;
@@ -131,10 +131,12 @@ async fn consolidated_github_create_issue_error_does_not_leak_helper_style_name(
     let parsed: serde_json::Value = serde_json::from_str(&result).expect("github error json");
     assert_eq!(parsed["ok"], false);
     assert_eq!(parsed["tool"], "github");
-    assert!(parsed["error"]
-        .as_str()
-        .unwrap_or("")
-        .contains("create_issue"));
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("create_issue")
+    );
 }
 
 /// Standalone `delegate` is not a CLI executor tool. Server/runtime

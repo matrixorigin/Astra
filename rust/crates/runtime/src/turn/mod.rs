@@ -27,6 +27,7 @@ pub mod permission_gate;
 pub(crate) mod plan_mode_guard;
 pub mod prompt_cache;
 pub mod run_control;
+pub mod runtime_policy;
 pub mod session_current_date;
 pub mod session_end_debounce;
 /// Re-exported from astra-turn-types

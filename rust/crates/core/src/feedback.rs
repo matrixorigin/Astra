@@ -127,6 +127,20 @@ pub enum Sentiment {
     Negative,
 }
 
+/// A hint derived from feedback signal analysis for downstream adaptation.
+///
+/// These are pure observations — the store reports facts, it does not
+/// decide what the runtime should do about them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptationHint {
+    /// Hint category: "high_retry_rate", "elevated_failure_rate", etc.
+    pub kind: String,
+    /// Human-readable detail for logging or prompt injection.
+    pub detail: String,
+    /// Severity: "info", "warning", "critical".
+    pub severity: String,
+}
+
 /// Aggregate statistics for streaming speculative tool execution.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamingSpeculationStats {
@@ -158,13 +172,26 @@ struct FeedbackBuffer {
     signals: VecDeque<FeedbackSignal>,
 }
 
-/// Thread-safe in-memory signal buffer.
+/// Thread-safe in-memory signal buffer with deferred persistence.
+///
+/// # Batch persistence
+///
+/// To reduce filesystem pressure, `record()` buffers signals in memory
+/// and only persists every [`BATCH_PERSIST_INTERVAL`] signals (default 10).
+/// Call [`flush`] to force an immediate write (e.g., on shutdown or
+/// before reading signals for adaptation).
 pub struct FeedbackSignalStore {
     buffer: RwLock<FeedbackBuffer>,
     max_signals: usize,
     streaming_spec: RwLock<StreamingSpeculationStats>,
     storage_path: Option<PathBuf>,
+    /// Number of signals recorded since last persist.
+    dirty_count: RwLock<usize>,
 }
+
+/// Persist to disk every N signals to avoid excessive fs renames.
+/// Tune based on expected signal volume.
+pub const BATCH_PERSIST_INTERVAL: usize = 10;
 
 impl Default for FeedbackSignalStore {
     fn default() -> Self {
@@ -180,6 +207,7 @@ impl FeedbackSignalStore {
             max_signals: DEFAULT_MAX_SIGNALS,
             streaming_spec: RwLock::new(StreamingSpeculationStats::default()),
             storage_path: None,
+            dirty_count: RwLock::new(0),
         }
     }
 
@@ -202,17 +230,24 @@ impl FeedbackSignalStore {
             max_signals: DEFAULT_MAX_SIGNALS,
             streaming_spec: RwLock::new(StreamingSpeculationStats::default()),
             storage_path: Some(path),
+            dirty_count: RwLock::new(0),
         }
     }
 
     /// Record a new feedback signal.
+    ///
+    /// Persists to disk only when `BATCH_PERSIST_INTERVAL` unpersisted
+    /// signals have accumulated. Call [`flush`] for immediate persistence.
     pub fn record(&self, signal: FeedbackSignal) {
-        {
+        let should_persist = {
             let mut buffer = self.buffer.write().unwrap_or_else(|e| e.into_inner());
             buffer.signals.push_back(signal);
             trim_buffer(&mut buffer, self.max_signals);
-        }
-        if let Err(err) = self.persist() {
+            let mut dirty = self.dirty_count.write().unwrap_or_else(|e| e.into_inner());
+            *dirty += 1;
+            *dirty >= BATCH_PERSIST_INTERVAL
+        };
+        if should_persist && let Err(err) = self.persist() {
             eprintln!("[feedback] persist failed: {err}");
         }
     }
@@ -248,6 +283,79 @@ impl FeedbackSignalStore {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Analyze recent feedback signals and produce adaptation hints.
+    ///
+    /// Returns a summary of the most frequent signal types and their
+    /// sentiment distribution. Callers (e.g., RuntimePolicy or SelfModel)
+    /// can use these hints to adjust behavior — the store only reports
+    /// facts, it does not decide what to do with them.
+    pub fn adaptation_hints(&self) -> Vec<AdaptationHint> {
+        let signals = self.recent_signals();
+        if signals.is_empty() {
+            return Vec::new();
+        }
+        let mut hints = Vec::new();
+        let total = signals.len() as f64;
+
+        // Count by signal type
+        let mut type_counts: std::collections::HashMap<&str, u32> =
+            std::collections::HashMap::new();
+        for s in &signals {
+            *type_counts.entry(s.signal_type.type_name()).or_default() += 1;
+        }
+
+        // Repeated retries suggest the current approach is failing
+        let retry_count = type_counts.get("Retry").copied().unwrap_or(0);
+        if retry_count as f64 / total > 0.3 {
+            hints.push(AdaptationHint {
+                kind: "high_retry_rate".to_string(),
+                detail: format!(
+                    "{} retry signals in {} feedback events — consider changing approach",
+                    retry_count,
+                    signals.len()
+                ),
+                severity: if retry_count > 5 {
+                    "critical"
+                } else {
+                    "warning"
+                }
+                .to_string(),
+            });
+        }
+
+        // High error rate signals
+        let error_count = type_counts.get("TaskFailure").copied().unwrap_or(0);
+        if error_count > 0 && error_count as f64 / total > 0.2 {
+            hints.push(AdaptationHint {
+                kind: "elevated_failure_rate".to_string(),
+                detail: format!(
+                    "{} task failures in {} feedback events",
+                    error_count,
+                    signals.len()
+                ),
+                severity: "warning".to_string(),
+            });
+        }
+
+        hints
+    }
+
+    /// Count of unpersisted signals since last flush/persist.
+    pub fn dirty_count(&self) -> usize {
+        *self.dirty_count.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Force immediate persistence of all buffered signals.
+    ///
+    /// Resets the dirty counter. Call this before shutdown, before reading
+    /// signals for adaptation analysis, or after a burst of high-value signals.
+    pub fn flush(&self) -> std::io::Result<()> {
+        self.persist()?;
+        let mut dirty = self.dirty_count.write().unwrap_or_else(|e| e.into_inner());
+        *dirty = 0;
+        Ok(())
     }
 
     /// Persist retained feedback signals using an atomic rename.
@@ -304,6 +412,8 @@ mod tests {
         let store = FeedbackSignalStore::with_storage(path.clone());
         store.record(FeedbackSignal::new(SignalType::TaskSuccess).with_turn("t1"));
         store.record(FeedbackSignal::new(SignalType::Correction).with_turn("t2"));
+        // Batch persist defers writes; flush before reloading.
+        store.flush().unwrap();
 
         let reloaded = FeedbackSignalStore::with_storage(path);
         let signals = reloaded.recent_signals();
@@ -326,6 +436,8 @@ mod tests {
         store.record(FeedbackSignal::new(SignalType::TaskFailure {
             reason: "bad output".to_string(),
         }));
+        // Batch persist defers writes; flush before reloading.
+        store.flush().unwrap();
 
         let reloaded = FeedbackSignalStore::with_storage(path);
         let signals = reloaded.recent_signals();
