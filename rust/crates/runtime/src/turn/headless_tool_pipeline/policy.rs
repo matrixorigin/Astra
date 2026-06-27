@@ -1,4 +1,5 @@
 use astra_core::agent_warn;
+use astra_pipeline::step_protocol::ContextSignature;
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::permission_gate::{PermissionCheckResult, permission_denied_error_result};
@@ -30,10 +31,128 @@ const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
 const OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS: u64 = 60 * 60;
 const NON_PROGRESS_BACKOFF_WINDOW: usize = 2;
 const NON_PROGRESS_BACKOFF_SECS: u64 = 15;
+const MAX_VALIDATION_ATTEMPTS_PER_WORKSPACE_EPOCH: u32 = 2;
 // `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD` moved into `EffectiveToolPolicy`
 // as `repeated_cache_hit_suppression`; read from `ctx` on every call.
 const REASON_DUPLICATE_WITHIN_TURN: &str = "duplicate_within_turn";
 const REASON_REPEATED_CACHE_HIT_SUPPRESSED: &str = "repeated_cache_hit_suppressed";
+const REASON_REDUNDANT_VALIDATION_SUPPRESSED: &str = "redundant_validation_suppressed";
+
+fn workspace_context_signature(workspace_epoch: u64) -> ContextSignature {
+    ContextSignature {
+        workspace_version: Some(format!("workspace_epoch:{workspace_epoch}")),
+        memory_snapshot_id: None,
+    }
+}
+
+fn policy_idempotency_key(tool_name: &str, args: &Value, workspace_epoch: u64) -> IdempotencyKey {
+    let key = IdempotencyKey::semantic(tool_name, args);
+    if READ_ONLY_TOOLS.contains(&tool_name) {
+        key.with_context(workspace_context_signature(workspace_epoch))
+    } else {
+        key
+    }
+}
+
+fn observation_scoped_signature(
+    tool_name: &str,
+    base_signature: &str,
+    workspace_epoch: u64,
+) -> String {
+    if READ_ONLY_TOOLS.contains(&tool_name) {
+        format!("{base_signature}@ws={workspace_epoch}")
+    } else {
+        base_signature.to_string()
+    }
+}
+
+fn bash_command_arg(args: &Value) -> Option<&str> {
+    args.get("command").and_then(Value::as_str)
+}
+
+fn split_shell_control_segments(command: &str) -> Vec<&str> {
+    command
+        .split(';')
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+        .collect()
+}
+
+fn simple_cd_target(segment: &str) -> Option<String> {
+    let mut parts = segment.split_whitespace();
+    if parts.next()? != "cd" {
+        return None;
+    }
+    let target = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(
+        target
+            .trim_matches(|ch| ch == '\'' || ch == '"')
+            .to_string(),
+    )
+}
+
+fn is_validation_command_prefix(lower: &str) -> bool {
+    lower == "cargo check"
+        || lower.starts_with("cargo check ")
+        || lower == "cargo test"
+        || lower.starts_with("cargo test ")
+        || lower == "cargo clippy"
+        || lower.starts_with("cargo clippy ")
+        || lower == "cargo build"
+        || lower.starts_with("cargo build ")
+        || lower == "npx tsc --noemit"
+        || lower.starts_with("npx tsc --noemit ")
+        || lower == "tsc --noemit"
+        || lower.starts_with("tsc --noemit ")
+        || lower == "pytest"
+        || lower.starts_with("pytest ")
+        || lower == "npm test"
+        || lower.starts_with("npm test ")
+        || lower == "npm run build"
+        || lower.starts_with("npm run build ")
+        || lower == "go test"
+        || lower.starts_with("go test ")
+}
+
+fn normalize_validation_prefix(tool_name: &str, args: &Value) -> Option<String> {
+    if tool_name != "bash" {
+        return None;
+    }
+    let command = bash_command_arg(args)?.trim();
+    if command.is_empty() {
+        return None;
+    }
+
+    let mut cwd: Option<String> = None;
+    for raw_segment in split_shell_control_segments(command) {
+        let segment = raw_segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if let Some(target) = simple_cd_target(segment) {
+            cwd = Some(target);
+            continue;
+        }
+
+        let primary = segment.split('|').next().unwrap_or(segment).trim();
+        let stripped = astra_turn_core::cloud_approval_policy::strip_benign_fd_redirects(primary);
+        let normalized = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            continue;
+        }
+        let lower = normalized.to_ascii_lowercase();
+        if is_validation_command_prefix(&lower) {
+            return Some(match cwd {
+                Some(ref dir) => format!("cd {dir} && {normalized}"),
+                None => normalized,
+            });
+        }
+    }
+    None
+}
 
 fn emit_blocked_tool_result(
     blocked: HeadlessBlockedTool<'_>,
@@ -265,79 +384,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         self.consecutive_empty_name = 0;
 
         let call_sig = tool_dedup_signature(&slot.name, &slot.args);
-        let count = self.ctx.call_counts.entry(call_sig.clone()).or_insert(0);
-        *count += 1;
-        if *count > self.ctx.max_identical_calls {
-            let idem_key = IdempotencyKey::semantic(&slot.name, &slot.args);
-            let mut skip_reason = REASON_DUPLICATE_WITHIN_TURN;
-            let args_preview = make_args_preview(&slot.name, &slot.args);
-            if let Some(_cached) = self.ctx.idempotency_cache.check(&idem_key) {
-                let prior_cache_hits = self
-                    .ctx
-                    .turn_guard
-                    .health
-                    .cache_hits_for_signature(&call_sig);
-                let body = if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
-                    skip_reason = REASON_REPEATED_CACHE_HIT_SUPPRESSED;
-                    format!(
-                        "Repeated cached read skipped: this exact {} request has already \
-                         been served from cache {} time(s). Use the earlier cached result in the \
-                         conversation instead of calling again; if you need different evidence, \
-                         change the arguments.",
-                        slot.name, prior_cache_hits
-                    )
-                } else {
-                    format!(
-                        "Cached repeat skipped (call #{} for identical args, limit: {}). \
-                         The result is already in this conversation from an earlier call. \
-                         Do NOT call this tool again with the same arguments.",
-                        *count, self.ctx.max_identical_calls
-                    )
-                };
-                let (tool_msg, tr) = if skip_reason == REASON_REPEATED_CACHE_HIT_SUPPRESSED {
-                    openai_tool_roundtrip_values(&slot.id, &slot.name, &body)
-                } else {
-                    headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body)
-                };
-                self.ctx.messages.push(tool_msg);
-                self.ctx.tool_results.push(tr);
-            } else {
-                let (tool_msg, tr) =
-                    headless_openai_duplicate_within_turn_pair(&slot.id, &slot.name);
-                self.ctx.messages.push(tool_msg);
-                self.ctx.tool_results.push(tr);
-            }
-            trace_short_circuit_tool_skip(
-                self.ctx.step_recorder,
-                &slot.id,
-                &slot.name,
-                skip_reason,
-                Some(&idem_key.cache_key()),
-                args_preview.as_deref(),
-                None,
-                skip_reason == REASON_REPEATED_CACHE_HIT_SUPPRESSED,
-            );
-            self.ctx
-                .tool_call_records
-                .push(journal_record_duplicate_within_turn(
-                    slot.name.clone(),
-                    args_preview,
-                ));
-            self.ctx
-                .turn_guard
-                .record_cache_hit_for_signature(&slot.name, &call_sig);
-            agent_warn!(
-                "dedup",
-                "Hard cap: tool '{}' (id={}) call #{} (limit: {})",
-                slot.name,
-                slot.id,
-                *count,
-                self.ctx.max_identical_calls
-            );
-            return HeadlessPipelineStage::ShortCircuit;
-        }
-
-        let idem_key = IdempotencyKey::semantic(&slot.name, &slot.args);
+        let workspace_epoch = self.ctx.turn_guard.workspace_epoch();
+        let scoped_call_sig = observation_scoped_signature(&slot.name, &call_sig, workspace_epoch);
+        let idem_key = policy_idempotency_key(&slot.name, &slot.args, workspace_epoch);
         if READ_ONLY_TOOLS.contains(&slot.name.as_str())
             && let Some(cached) = self.ctx.idempotency_cache.check(&idem_key)
         {
@@ -347,7 +396,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .ctx
                 .turn_guard
                 .health
-                .cache_hits_for_signature(&call_sig);
+                .cache_hits_for_signature(&scoped_call_sig);
             if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
                 let body = format!(
                     "⛔ Repeated cached read suppressed: this exact {} request has already \
@@ -375,7 +424,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 );
                 self.ctx
                     .turn_guard
-                    .record_cache_hit_for_signature(&slot.name, &call_sig);
+                    .record_cache_hit_for_signature(&slot.name, &scoped_call_sig);
                 self.ctx
                     .tool_call_records
                     .push(journal_record_cross_turn_cache_hit(
@@ -431,7 +480,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 );
             self.ctx
                 .turn_guard
-                .record_cache_hit_for_signature(&slot.name, &call_sig);
+                .record_cache_hit_for_signature(&slot.name, &scoped_call_sig);
             self.ctx
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
@@ -445,23 +494,34 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         if READ_ONLY_TOOLS.contains(&slot.name.as_str())
             && let Some((prev_turn, cached_output)) =
-                self.ctx
-                    .semantic_dedup
-                    .pre_check_block(&slot.name, &slot.args, self.ctx.turn_index)
+                self.ctx.semantic_dedup.pre_check_block_with_generation(
+                    &slot.name,
+                    &slot.args,
+                    self.ctx.turn_index,
+                    workspace_epoch,
+                )
         {
             let args_preview = make_args_preview(&slot.name, &slot.args);
-            let body = format!(
-                "⛔ BLOCKED DUPLICATE: This {} call is semantically \
-                 identical to turn {} — same tool with equivalent arguments. \
-                 Execution was skipped without replaying the previous output. \
-                 Use the earlier result in the conversation instead of calling again{}.",
-                slot.name,
-                prev_turn + 1,
-                args_preview
-                    .as_deref()
-                    .map(|preview| format!(" (args: {preview})"))
-                    .unwrap_or_default(),
-            );
+            let prior_cache_hits = self
+                .ctx
+                .turn_guard
+                .health
+                .cache_hits_for_signature(&scoped_call_sig);
+            let (body, reason_code) =
+                if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
+                    (
+                        format!(
+                            "⛔ Repeated cached read suppressed: this exact {} request has \
+                             already been served from cache {} time(s). Use the earlier cached \
+                             result in the conversation instead of calling again; if you need \
+                             different evidence, change the arguments.",
+                            slot.name, prior_cache_hits
+                        ),
+                        REASON_REPEATED_CACHE_HIT_SUPPRESSED,
+                    )
+                } else {
+                    (cached_output.clone(), "semantic_dedup_pre_check")
+                };
             let (mut tool_msg, tr) =
                 headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
             if let Some(obj) = tool_msg.as_object_mut() {
@@ -480,15 +540,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 self.ctx.step_recorder,
                 &slot.id,
                 &slot.name,
-                "semantic_dedup_pre_check",
+                reason_code,
                 Some(&idem_key.cache_key()),
                 args_preview.as_deref(),
                 Some(&body),
-                false,
+                true,
             );
             self.ctx
                 .turn_guard
-                .record_cache_hit_for_signature(&slot.name, &call_sig);
+                .record_cache_hit_for_signature(&slot.name, &scoped_call_sig);
             self.ctx
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
@@ -499,10 +559,51 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 ));
             agent_warn!(
                 "dedup",
-                "Semantic block: tool '{}' (id={}) matches turn {} via param-aware dedup",
+                "Semantic cache hit: tool '{}' (id={}) matches turn {} via param-aware dedup",
                 slot.name,
                 slot.id,
                 prev_turn + 1,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        let count = {
+            let count = self
+                .ctx
+                .call_counts
+                .entry(scoped_call_sig.clone())
+                .or_insert(0);
+            *count = count.saturating_add(1);
+            *count
+        };
+        if count > self.ctx.max_identical_calls {
+            let args_preview = make_args_preview(&slot.name, &slot.args);
+            let (tool_msg, tr) = headless_openai_duplicate_within_turn_pair(&slot.id, &slot.name);
+            self.ctx.messages.push(tool_msg);
+            self.ctx.tool_results.push(tr);
+            trace_short_circuit_tool_skip(
+                self.ctx.step_recorder,
+                &slot.id,
+                &slot.name,
+                REASON_DUPLICATE_WITHIN_TURN,
+                Some(&idem_key.cache_key()),
+                args_preview.as_deref(),
+                None,
+                false,
+            );
+            self.ctx
+                .tool_call_records
+                .push(journal_record_duplicate_within_turn(
+                    slot.name.clone(),
+                    args_preview,
+                ));
+            agent_warn!(
+                "dedup",
+                "Hard cap: tool '{}' (id={}) call #{} (limit: {})",
+                slot.name,
+                slot.id,
+                count,
+                self.ctx.max_identical_calls
             );
             return HeadlessPipelineStage::ShortCircuit;
         }
@@ -724,6 +825,48 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 self.ctx.tool_call_records,
             );
             return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        if let Some(validation_prefix) =
+            normalize_validation_prefix(&execution.name, &execution.args)
+        {
+            let prior_attempts = self
+                .ctx
+                .turn_guard
+                .validation_attempts_since_workspace_mutation(&validation_prefix);
+            if prior_attempts >= MAX_VALIDATION_ATTEMPTS_PER_WORKSPACE_EPOCH {
+                let body = format!(
+                    "⛔ Redundant validation suppressed: `{validation_prefix}` has already run \
+                     {prior_attempts} time(s) since the last workspace mutation. Re-running the \
+                     same validation cannot produce new source-state evidence. Inspect the \
+                     reported files, make a change, or run a narrower diagnostic with different \
+                     arguments."
+                );
+                emit_blocked_tool_result(
+                    HeadlessBlockedTool {
+                        id: &execution.id,
+                        name: &execution.name,
+                        args: &execution.args,
+                        reason_code: REASON_REDUNDANT_VALIDATION_SUPPRESSED,
+                        err_msg: body.clone(),
+                        journal_reason: body,
+                        early_exit_ms: execution.early_exit_ms,
+                        status_line: Some(format!(
+                            "  ⛔ Redundant validation suppressed: {validation_prefix}"
+                        )),
+                    },
+                    self.ctx.step_recorder,
+                    self.ctx.quiet,
+                    self.ctx.term,
+                    self.ctx.messages,
+                    self.ctx.tool_results,
+                    self.ctx.tool_call_records,
+                );
+                return HeadlessPipelineStage::ShortCircuit;
+            }
+            self.ctx
+                .turn_guard
+                .record_validation_attempt(&validation_prefix);
         }
 
         HeadlessPipelineStage::Continue(ValidatedExecution {

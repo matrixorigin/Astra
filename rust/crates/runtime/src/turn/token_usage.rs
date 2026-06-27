@@ -128,6 +128,16 @@ fn as_u64(v: Option<&Value>) -> Option<u64> {
 }
 
 fn extract_openai(u: &Map<String, Value>) -> Option<TokenUsage> {
+    if !u.contains_key("prompt_tokens")
+        && !u.contains_key("completion_tokens")
+        && (u.contains_key("input_tokens")
+            || u.contains_key("output_tokens")
+            || u.contains_key("cache_read_input_tokens")
+            || u.contains_key("cache_creation_input_tokens"))
+    {
+        return extract_anthropic(u);
+    }
+
     // Required: prompt_tokens + completion_tokens (either one is enough to
     // consider this a usage object).
     let prompt_total = as_u64(u.get("prompt_tokens"));
@@ -296,6 +306,22 @@ mod tests {
         assert_eq!(t.cache_creation_tokens, 0);
         assert_eq!(t.output_tokens, 50);
         assert_eq!(t.total_tokens(), 150);
+    }
+
+    #[test]
+    fn openai_path_accepts_anthropic_native_usage_aliases() {
+        let u = obj(json!({
+            "input_tokens": 200,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 800,
+            "cache_creation_input_tokens": 100
+        }));
+        let t = extract_usage(UsageDialect::OpenAi, &u).unwrap();
+        assert_eq!(t.input_tokens, 200);
+        assert_eq!(t.cached_input_tokens, 800);
+        assert_eq!(t.cache_creation_tokens, 100);
+        assert_eq!(t.output_tokens, 50);
+        assert_eq!(t.total_tokens(), 1150);
     }
 
     #[test]

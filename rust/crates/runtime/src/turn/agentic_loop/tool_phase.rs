@@ -1497,15 +1497,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     // Feed the sliding window so the next round's auto-injected self-status
     // block can show trends and strategy verification.
     {
-        let samples: Vec<astra_core::ToolCallSample<'_>> = state
-            .stall
-            .tool_call_records
+        let samples: Vec<astra_core::ToolCallSample<'_>> = round_tool_calls
             .iter()
             .filter(|r| !r.is_synthetic_placeholder())
             .map(|r| astra_core::ToolCallSample {
                 name: &r.name,
                 ok: r.ok,
-                round: Some(state.llm_rounds_completed),
+                round: r.round.or(Some(state.llm_rounds_completed)),
                 file_path: r.file_path.as_deref(),
                 error: r.error.as_deref(),
             })
@@ -1517,26 +1515,22 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         let metrics =
             astra_core::TurnMetrics::from_samples(&samples, state.llm_rounds_completed, tokens);
 
-        // ── Observation pipeline: journal + store via dispatcher ──
+        // ── Observation pipeline: journal first, then persist updated facts ──
+        state.observation_journal.record_turn(&metrics);
         let facts = state
             .observation_journal
             .extract_facts(state.remaining_turns as u32, state.max_turns as u32);
 
-        {
+        if let Some(ref store) = state.observation_store {
             let mut dispatcher = crate::turn::observation_dispatcher::ObservationDispatcher::new();
-            dispatcher.register(crate::turn::observation_dispatcher::MemorySink::new(
-                &mut state.observation_journal,
+            dispatcher.register(crate::turn::observation_dispatcher::FileSink::new(
+                Some(store.clone()),
+                state
+                    .current_session_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_string(),
             ));
-            if let Some(ref store) = state.observation_store {
-                dispatcher.register(crate::turn::observation_dispatcher::FileSink::new(
-                    Some(store.clone()),
-                    state
-                        .current_session_id
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_string(),
-                ));
-            }
             dispatcher.dispatch(
                 crate::turn::observation_dispatcher::ObservationEvent::TurnCompleted {
                     metrics: Box::new(metrics),
@@ -1584,7 +1578,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         // Scan memory tool calls for `strategy_change` tag so the agent
         // can explicitly signal "I changed my approach" and later see
         // before/after verification in the self-status block.
-        for record in &state.stall.tool_call_records {
+        for record in &round_tool_calls {
             if record.name == "memory" {
                 if let Some(ref args) = record.args_preview {
                     if args.contains("strategy_change") {
@@ -3294,8 +3288,8 @@ esac
         assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
 
         // SessionStateProvider
-        // Empty board → fully complete (nothing to do)
-        assert_eq!(provider.task_completion_ratio(), 1.0);
+        // Empty board means no authoritative task-progress signal.
+        assert_eq!(provider.task_completion_ratio(), 0.0);
         assert_eq!(provider.current_phase_label(), "execution");
         assert_eq!(provider.circuit_breaker_state(), "monitoring");
         assert_eq!(provider.remaining_turns(), 10);

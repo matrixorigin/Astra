@@ -86,8 +86,8 @@ mod turn_limits {
         let cap = BreakerConfig::default().absolute_max_rounds;
         assert!(cap > 0, "absolute_max_rounds must be positive, got {cap}");
         assert!(
-            cap <= 300,
-            "absolute_max_rounds default should be <= 300 (infrastructure ceiling), got {cap}"
+            cap <= 1000,
+            "absolute_max_rounds default should be <= 1000 (infrastructure ceiling), got {cap}"
         );
     }
 }

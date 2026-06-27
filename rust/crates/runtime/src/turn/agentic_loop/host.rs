@@ -1104,8 +1104,13 @@ pub struct MessagingState {
 /// Point-in-time summary of the active session task board.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskBoardSnapshot {
+    /// Non-archived tasks visible in the current board snapshot.
+    pub tracked_count: usize,
     pub pending_count: usize,
     pub in_progress_count: usize,
+    pub paused_count: usize,
+    pub completed_count: usize,
+    pub terminal_non_success_count: usize,
     /// Count of active (pending/in_progress) tasks that have at least one
     /// blocker in their `blocked_by` list.  This counts tasks waiting on
     /// dependencies, *not* tasks whose status is literally "blocked"
@@ -1119,18 +1124,41 @@ impl TaskBoardSnapshot {
     pub fn from_active_tasks(tasks: &[SessionTask]) -> Self {
         let mut snapshot = Self::default();
         for task in tasks {
-            if !task.status.is_active() {
+            if matches!(
+                task.status,
+                astra_tools::task_mgmt::SessionTaskStatusKind::Archived
+                    | astra_tools::task_mgmt::SessionTaskStatusKind::Deleted
+                    | astra_tools::task_mgmt::SessionTaskStatusKind::Migrated
+            ) {
                 continue;
             }
-            if task.status.is_in_progress() {
-                snapshot.in_progress_count += 1;
-            } else {
-                snapshot.pending_count += 1;
+            snapshot.tracked_count += 1;
+            match task.status {
+                astra_tools::task_mgmt::SessionTaskStatusKind::InProgress => {
+                    snapshot.in_progress_count += 1;
+                }
+                astra_tools::task_mgmt::SessionTaskStatusKind::Pending => {
+                    snapshot.pending_count += 1;
+                }
+                astra_tools::task_mgmt::SessionTaskStatusKind::Paused => {
+                    snapshot.paused_count += 1;
+                }
+                astra_tools::task_mgmt::SessionTaskStatusKind::Completed => {
+                    snapshot.completed_count += 1;
+                }
+                astra_tools::task_mgmt::SessionTaskStatusKind::Failed
+                | astra_tools::task_mgmt::SessionTaskStatusKind::Cancelled => {
+                    snapshot.terminal_non_success_count += 1;
+                }
+                astra_tools::task_mgmt::SessionTaskStatusKind::Other
+                | astra_tools::task_mgmt::SessionTaskStatusKind::Archived
+                | astra_tools::task_mgmt::SessionTaskStatusKind::Deleted
+                | astra_tools::task_mgmt::SessionTaskStatusKind::Migrated => {}
             }
             if !task.blocked_by.is_empty() {
                 snapshot.blocked_count += 1;
             }
-            if snapshot.active_tasks.len() < 3 {
+            if task.status.is_open_work() && snapshot.active_tasks.len() < 3 {
                 snapshot
                     .active_tasks
                     .push(format!("{} {} [{}]", task.id, task.title, task.status));
@@ -1141,7 +1169,17 @@ impl TaskBoardSnapshot {
 
     #[must_use]
     pub fn has_unfinished_tasks(&self) -> bool {
-        self.pending_count > 0 || self.in_progress_count > 0
+        self.pending_count > 0 || self.in_progress_count > 0 || self.paused_count > 0
+    }
+
+    #[must_use]
+    pub fn has_any_tracked_tasks(&self) -> bool {
+        self.tracked_count > 0
+    }
+
+    #[must_use]
+    pub fn all_tracked_tasks_completed(&self) -> bool {
+        self.tracked_count > 0 && self.completed_count == self.tracked_count
     }
 
     #[must_use]
@@ -1175,6 +1213,9 @@ impl TaskBoardSnapshot {
         }
         if self.pending_count > 0 {
             parts.push(format!("{} pending", self.pending_count));
+        }
+        if self.paused_count > 0 {
+            parts.push(format!("{} paused", self.paused_count));
         }
         parts
     }
@@ -1887,11 +1928,12 @@ impl AgenticLoopState {
         };
         let load = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            task_manager.load_active_tasks(),
+            task_manager.try_snapshot_state(),
         );
         match load.await {
-            Ok(Ok(tasks)) => {
-                self.hooks.task_board_snapshot = TaskBoardSnapshot::from_active_tasks(&tasks);
+            Ok(Ok(snapshot)) => {
+                self.hooks.task_board_snapshot =
+                    TaskBoardSnapshot::from_active_tasks(&snapshot.tasks);
             }
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -3413,8 +3455,12 @@ pub(crate) mod tests {
             },
         ]);
 
+        assert_eq!(snapshot.tracked_count, 3);
         assert_eq!(snapshot.pending_count, 1);
         assert_eq!(snapshot.in_progress_count, 1);
+        assert_eq!(snapshot.paused_count, 0);
+        assert_eq!(snapshot.completed_count, 1);
+        assert_eq!(snapshot.terminal_non_success_count, 0);
         assert_eq!(snapshot.blocked_count, 1);
         assert_eq!(
             snapshot.active_tasks,
@@ -3424,6 +3470,7 @@ pub(crate) mod tests {
             ]
         );
         assert!(snapshot.has_unfinished_tasks());
+        assert!(!snapshot.all_tracked_tasks_completed());
         assert!(snapshot.short_summary().contains("task(s) remain"));
         assert_eq!(
             snapshot.status_count_summary(),
@@ -3434,7 +3481,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn task_board_snapshot_ignores_terminal_and_archived_tasks() {
+    fn task_board_snapshot_counts_terminal_and_excludes_archived_tasks() {
         let snapshot = TaskBoardSnapshot::from_active_tasks(&[
             SessionTask {
                 archived_at: None,
@@ -3498,13 +3545,67 @@ pub(crate) mod tests {
             },
         ]);
 
+        assert_eq!(snapshot.tracked_count, 3);
         assert_eq!(snapshot.pending_count, 1);
         assert_eq!(snapshot.in_progress_count, 0);
+        assert_eq!(snapshot.paused_count, 0);
+        assert_eq!(snapshot.completed_count, 1);
+        assert_eq!(snapshot.terminal_non_success_count, 1);
         assert_eq!(snapshot.blocked_count, 0);
         assert_eq!(
             snapshot.active_tasks,
             vec!["task-1 waiting [pending]".to_string()]
         );
+        assert!(!snapshot.all_tracked_tasks_completed());
+    }
+
+    #[test]
+    fn task_board_snapshot_completed_only_is_explicitly_complete() {
+        let snapshot = TaskBoardSnapshot::from_active_tasks(&[SessionTask {
+            archived_at: None,
+            id: "task-1".to_string(),
+            title: "done".to_string(),
+            description: None,
+            status: astra_tools::task_mgmt::SessionTaskStatusKind::Completed,
+            subtasks: Vec::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        }]);
+
+        assert_eq!(snapshot.tracked_count, 1);
+        assert_eq!(snapshot.completed_count, 1);
+        assert!(!snapshot.has_unfinished_tasks());
+        assert!(snapshot.all_tracked_tasks_completed());
+    }
+
+    #[test]
+    fn task_board_snapshot_paused_is_unfinished_work() {
+        let snapshot = TaskBoardSnapshot::from_active_tasks(&[SessionTask {
+            archived_at: None,
+            id: "task-1".to_string(),
+            title: "paused follow-up".to_string(),
+            description: None,
+            status: astra_tools::task_mgmt::SessionTaskStatusKind::Paused,
+            subtasks: Vec::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        }]);
+
+        assert_eq!(snapshot.tracked_count, 1);
+        assert_eq!(snapshot.paused_count, 1);
+        assert!(snapshot.has_unfinished_tasks());
+        assert!(!snapshot.all_tracked_tasks_completed());
+        assert_eq!(snapshot.status_count_summary(), "1 paused task(s) remain");
     }
 
     #[tokio::test]

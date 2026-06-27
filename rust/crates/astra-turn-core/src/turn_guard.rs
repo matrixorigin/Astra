@@ -8,7 +8,7 @@
 //! Individual components (stall.rs, tool_health.rs, error_recovery.rs)
 //! remain independent and testable; this module composes them.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +126,12 @@ pub struct TurnGuard {
     /// Drift nudge count (persists across turns, fed from StallTrackingState).
     /// When >= 3, TurnGuard escalates to force-stop.
     pub drift_nudge_count: usize,
+    /// Monotonic session-local epoch for observations whose result depends on
+    /// workspace state. Successful workspace mutations advance the epoch.
+    workspace_epoch: u64,
+    /// Validation command attempts observed in the current workspace epoch,
+    /// keyed by a normalized validation prefix.
+    validation_attempts_since_workspace_mutation: HashMap<String, u32>,
 }
 
 /// Check if a tool is read-only and must never be restricted.
@@ -185,6 +191,8 @@ impl TurnGuard {
             correction_history: Vec::new(),
             adaptive_thresholds: stall::AdaptiveStallThresholds::default(),
             drift_nudge_count: 0,
+            workspace_epoch: 0,
+            validation_attempts_since_workspace_mutation: HashMap::new(),
         }
     }
 
@@ -208,6 +216,43 @@ impl TurnGuard {
     /// Call this before evaluate() to feed drift signals into TurnGuard.
     pub fn sync_drift_nudge_count(&mut self, count: usize) {
         self.drift_nudge_count = count;
+    }
+
+    /// Current workspace observation epoch.
+    #[must_use]
+    pub fn workspace_epoch(&self) -> u64 {
+        self.workspace_epoch
+    }
+
+    /// Advance the workspace observation epoch after a successful mutation.
+    ///
+    /// Validation attempts are scoped to an epoch: after a real mutation, the
+    /// same validation command can produce new evidence and must not inherit
+    /// stale retry pressure from the previous workspace state.
+    pub fn record_workspace_mutation(&mut self) {
+        self.workspace_epoch = self.workspace_epoch.saturating_add(1);
+        self.validation_attempts_since_workspace_mutation.clear();
+    }
+
+    /// Number of attempts already recorded for a normalized validation prefix
+    /// in the current workspace epoch.
+    #[must_use]
+    pub fn validation_attempts_since_workspace_mutation(&self, prefix: &str) -> u32 {
+        self.validation_attempts_since_workspace_mutation
+            .get(prefix)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Record that a validation command is about to execute in this workspace
+    /// epoch. Returns the updated attempt count.
+    pub fn record_validation_attempt(&mut self, prefix: &str) -> u32 {
+        let count = self
+            .validation_attempts_since_workspace_mutation
+            .entry(prefix.to_string())
+            .or_default();
+        *count = count.saturating_add(1);
+        *count
     }
 
     pub fn stall_window(&self) -> usize {

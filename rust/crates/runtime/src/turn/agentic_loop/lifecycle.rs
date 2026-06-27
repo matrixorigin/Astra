@@ -1070,6 +1070,10 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
     kind: CompactionKind,
     audit_label: &str,
 ) {
+    if state.compaction_effectiveness.is_circuit_open() {
+        return;
+    }
+
     let max_tokens = state.max_turn_input_tokens;
     let budget = TokenBudget {
         max_prompt_tokens: max_tokens,
@@ -1087,6 +1091,9 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
     };
     let messages_before = state.messages.len();
     let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+    state
+        .compaction_effectiveness
+        .record_compaction(outcome.total_tokens_freed);
     if outcome.total_tokens_freed > 0 && !quiet {
         let messages_after = state.messages.len();
         let messages_removed = messages_before.saturating_sub(messages_after);
@@ -2080,8 +2087,12 @@ mod tests {
         let mut state = make_state();
         state.message = "multi-agent review current branch changes from first principles".into();
         state.hooks.task_board_snapshot = TaskBoardSnapshot {
+            tracked_count: 1,
             pending_count: 1,
             in_progress_count: 0,
+            paused_count: 0,
+            completed_count: 0,
+            terminal_non_success_count: 0,
             blocked_count: 0,
             active_tasks: vec!["task-1 Review branch [pending]".into()],
         };

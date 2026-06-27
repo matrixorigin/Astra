@@ -62,6 +62,8 @@ impl TuningConsumer {
     pub fn load_all_jobs(&self) -> Vec<(String, TuningJob)> {
         let sessions = self.store.list_tuning_sessions();
         let mut all_jobs: Vec<(String, TuningJob)> = Vec::new();
+        let mut seen: std::collections::BTreeSet<(String, u32, TuningSignalType)> =
+            std::collections::BTreeSet::new();
 
         for sid in &sessions {
             let raw_lines = self.store.load_tuning_entries(sid);
@@ -79,7 +81,10 @@ impl TuningConsumer {
                             );
                             job.session_id = sid.clone();
                         }
-                        all_jobs.push((sid.clone(), job));
+                        let key = (sid.clone(), job.turn_index, job.signal);
+                        if seen.insert(key) {
+                            all_jobs.push((sid.clone(), job));
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -195,7 +200,7 @@ impl TuningConsumer {
             .filter_map(|agg| {
                 // Skip signals with insufficient evidence (< 2 occurrences
                 // or only one session, as it may be a fluke).
-                if agg.total_count < 2 && agg.session_count < 2 {
+                if agg.total_count < 2 || agg.session_count < 2 {
                     return None;
                 }
 
@@ -484,6 +489,29 @@ mod tests {
     }
 
     #[test]
+    fn load_all_jobs_deduplicates_same_session_turn_signal() {
+        let store = test_store().expect("test_store");
+        let sess = format!("dedup-sess-{}", std::process::id());
+        let job = serde_json::to_string(&make_job(
+            TuningSignalType::PromptCompaction,
+            0.82,
+            7,
+            "pressure high",
+        ))
+        .unwrap();
+        store.save_tuning_entry(&sess, 1, &job).unwrap();
+        store.save_tuning_entry(&sess, 1, &job).unwrap();
+
+        let consumer = TuningConsumer::new(store);
+        let session_jobs: Vec<_> = consumer
+            .load_all_jobs()
+            .into_iter()
+            .filter(|(sid, _)| *sid == sess)
+            .collect();
+        assert_eq!(session_jobs.len(), 1);
+    }
+
+    #[test]
     fn aggregate_groups_by_signal_type() {
         let store = test_store().expect("test_store");
         let consumer = TuningConsumer::new(store);
@@ -644,6 +672,31 @@ mod tests {
 
         let sugs = consumer.generate_suggestions(&aggs);
         assert!(sugs.is_empty(), "single occurrence should be skipped");
+    }
+
+    #[test]
+    fn generate_suggestions_requires_cross_session_evidence() {
+        let store = test_store().expect("test_store");
+        let consumer = TuningConsumer::new(store);
+
+        let aggs = vec![TuningAggregation {
+            signal_type: TuningSignalType::PromptCompaction,
+            total_count: 10,
+            session_count: 1,
+            avg_priority: 9.0,
+            avg_trigger_value: 0.95,
+            latest_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            sample_reasons: vec!["same session repeated pressure".into()],
+        }];
+
+        let sugs = consumer.generate_suggestions(&aggs);
+        assert!(
+            sugs.is_empty(),
+            "one noisy long session must not tune global policy by itself"
+        );
     }
 
     #[test]

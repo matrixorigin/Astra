@@ -10,7 +10,7 @@
 use crate::text_tokenize::{build_tf, tokenize};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Structured record of a detected near-duplicate tool call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +333,8 @@ fn semantic_bash_git_key(args: &Value) -> Option<String> {
 /// Token-frequency cosine similarity between two tool outputs.
 /// Returns 0.0-1.0. Outputs shorter than MIN_OUTPUT_LEN are not compared.
 const MIN_OUTPUT_LEN: usize = 30;
+const DEFAULT_PARAM_CACHE_ENTRIES: usize = 512;
+const DEFAULT_AUDIT_ENTRIES: usize = 256;
 
 /// Conservative read-only predicate used to decide whether a short cached
 /// output can be safely re-executed. Action-shaped tools must inspect args so
@@ -418,15 +420,21 @@ pub fn token_cosine_similarity(output1: &str, output2: &str) -> f64 {
 /// Tracks tool call history for semantic near-duplicate detection.
 pub struct SemanticDedup {
     threshold: f64,
-    /// Tier 2: semantic_key → (turn, tool_name)
-    param_cache: HashMap<String, (usize, String)>,
+    /// Tier 2: semantic_key → (turn, tool_name, context_generation)
+    param_cache: HashMap<String, (usize, String, u64)>,
+    /// FIFO order for bounding `param_cache`.
+    param_order: VecDeque<String>,
     /// Tier 3: truncated output for same semantic key similarity comparison.
     /// Only stores first 2000 chars of output to bound memory.
     output_log: Vec<OutputLogEntry>,
     /// Max entries in output_log before oldest are evicted
     max_output_entries: usize,
+    /// Max semantic-key entries before oldest are evicted.
+    max_param_entries: usize,
     /// Structured audit trail of detected duplicates.
     dedup_audit: Vec<DedupAuditRecord>,
+    /// Max audit records before oldest are evicted.
+    max_audit_entries: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +442,7 @@ struct OutputLogEntry {
     tool_name: String,
     semantic_key: Option<String>,
     turn: usize,
+    context_generation: u64,
     output: String,
 }
 
@@ -442,9 +451,68 @@ impl SemanticDedup {
         Self {
             threshold,
             param_cache: HashMap::new(),
+            param_order: VecDeque::new(),
             output_log: Vec::new(),
             max_output_entries: 50,
+            max_param_entries: DEFAULT_PARAM_CACHE_ENTRIES,
             dedup_audit: Vec::new(),
+            max_audit_entries: DEFAULT_AUDIT_ENTRIES,
+        }
+    }
+
+    /// Clear cached observations whose freshness depends on external state.
+    /// Audit records are retained for diagnostics and remain bounded.
+    pub fn clear_observation_cache(&mut self) {
+        self.param_cache.clear();
+        self.param_order.clear();
+        self.output_log.clear();
+    }
+
+    fn record_param_key(
+        &mut self,
+        key: String,
+        current_turn: usize,
+        tool_name: &str,
+        context_generation: u64,
+    ) {
+        if self.param_cache.contains_key(&key)
+            && let Some(pos) = self
+                .param_order
+                .iter()
+                .position(|existing| existing == &key)
+        {
+            self.param_order.remove(pos);
+        }
+        self.param_order.push_back(key.clone());
+        self.param_cache.insert(
+            key,
+            (current_turn, tool_name.to_string(), context_generation),
+        );
+        while self.param_cache.len() > self.max_param_entries {
+            let Some(oldest) = self.param_order.pop_front() else {
+                break;
+            };
+            self.param_cache.remove(&oldest);
+        }
+    }
+
+    fn record_audit_duplicate(&mut self, tool_name: &str, signature: String) {
+        let existing = self
+            .dedup_audit
+            .iter_mut()
+            .find(|r| r.tool_name == tool_name && r.original_signature == signature);
+        if let Some(rec) = existing {
+            rec.duplicate_count += 1;
+            return;
+        }
+        self.dedup_audit.push(DedupAuditRecord {
+            tool_name: tool_name.to_string(),
+            duplicate_count: 1,
+            original_signature: signature,
+        });
+        if self.dedup_audit.len() > self.max_audit_entries {
+            let overflow = self.dedup_audit.len() - self.max_audit_entries;
+            self.dedup_audit.drain(0..overflow);
         }
     }
 
@@ -463,8 +531,25 @@ impl SemanticDedup {
         args: &Value,
         current_turn: usize,
     ) -> Option<(usize, String)> {
+        self.pre_check_block_with_generation(tool_name, args, current_turn, 0)
+    }
+
+    /// Like [`Self::pre_check_block`], but scopes duplicate detection to an
+    /// external observation generation. Callers should advance the generation
+    /// whenever the world being observed may have changed, e.g. after a
+    /// workspace mutation.
+    pub fn pre_check_block_with_generation(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        current_turn: usize,
+        context_generation: u64,
+    ) -> Option<(usize, String)> {
         let sem_key = semantic_call_key(tool_name, args)?;
-        let (latest_turn, _prev_tool) = self.param_cache.get(&sem_key)?;
+        let (latest_turn, _prev_tool, latest_generation) = self.param_cache.get(&sem_key)?;
+        if *latest_generation != context_generation {
+            return None;
+        }
         if current_turn <= *latest_turn {
             return None;
         }
@@ -480,7 +565,10 @@ impl SemanticDedup {
         // return the cached short output as-is so the caller short-circuits.
         let tool_is_read_only = is_read_only_tool(tool_name, args);
         for entry in self.output_log.iter().rev() {
-            if entry.tool_name == tool_name && entry.semantic_key.as_deref() == Some(&sem_key) {
+            if entry.tool_name == tool_name
+                && entry.semantic_key.as_deref() == Some(&sem_key)
+                && entry.context_generation == context_generation
+            {
                 if entry.output.starts_with("[Cleared") || entry.output.starts_with("(cached") {
                     return None; // Force re-execution — cached content is gone
                 }
@@ -506,18 +594,31 @@ impl SemanticDedup {
         output: &str,
         current_turn: usize,
     ) -> Option<(usize, String)> {
+        self.check_and_record_with_generation(tool_name, args, output, current_turn, 0)
+    }
+
+    /// Like [`Self::check_and_record`], but scopes duplicate matching and
+    /// output history to a caller-supplied observation generation.
+    pub fn check_and_record_with_generation(
+        &mut self,
+        tool_name: &str,
+        args: &Value,
+        output: &str,
+        current_turn: usize,
+        context_generation: u64,
+    ) -> Option<(usize, String)> {
         let mut result = None;
         let sem_key = semantic_call_key(tool_name, args);
 
         // Tier 2: Parameter-aware match
         if let Some(key) = sem_key.as_ref() {
-            if let Some((prev_turn, _prev_tool)) = self.param_cache.get(key)
+            if let Some((prev_turn, _prev_tool, prev_generation)) = self.param_cache.get(key)
+                && *prev_generation == context_generation
                 && current_turn > *prev_turn
             {
                 result = Some((*prev_turn, "param_match".to_string()));
             }
-            self.param_cache
-                .insert(key.clone(), (current_turn, tool_name.to_string()));
+            self.record_param_key(key.clone(), current_turn, tool_name, context_generation);
         }
 
         // Tier 3: Output similarity, scoped to the same semantic key.
@@ -530,6 +631,7 @@ impl SemanticDedup {
             for entry in self.output_log.iter().rev() {
                 if entry.tool_name == tool_name
                     && entry.semantic_key.as_deref() == Some(key)
+                    && entry.context_generation == context_generation
                     && current_turn > entry.turn
                 {
                     let sim = token_cosine_similarity(output, &entry.output);
@@ -545,19 +647,7 @@ impl SemanticDedup {
             let sig = sem_key
                 .clone()
                 .unwrap_or_else(|| format!("{}:<no-key>", tool_name));
-            let existing = self
-                .dedup_audit
-                .iter_mut()
-                .find(|r| r.tool_name == tool_name && r.original_signature == sig);
-            if let Some(rec) = existing {
-                rec.duplicate_count += 1;
-            } else {
-                self.dedup_audit.push(DedupAuditRecord {
-                    tool_name: tool_name.to_string(),
-                    duplicate_count: 1,
-                    original_signature: sig,
-                });
-            }
+            self.record_audit_duplicate(tool_name, sig);
             let _ = reason; // used above via ref
         }
 
@@ -576,6 +666,7 @@ impl SemanticDedup {
             tool_name: tool_name.to_string(),
             semantic_key: sem_key,
             turn: current_turn,
+            context_generation,
             output: truncated.to_string(),
         });
         if self.output_log.len() > self.max_output_entries {
@@ -593,9 +684,28 @@ impl SemanticDedup {
         args: &Value,
         turn_index: usize,
     ) {
-        if let Some((prev_turn, reason)) =
-            self.check_and_record(tool_name, args, result_str.as_str(), turn_index)
-        {
+        self.append_near_duplicate_hint_if_any_with_generation(
+            result_str, tool_name, args, turn_index, 0,
+        );
+    }
+
+    /// Like [`Self::append_near_duplicate_hint_if_any`], scoped to an external
+    /// observation generation.
+    pub fn append_near_duplicate_hint_if_any_with_generation(
+        &mut self,
+        result_str: &mut String,
+        tool_name: &str,
+        args: &Value,
+        turn_index: usize,
+        context_generation: u64,
+    ) {
+        if let Some((prev_turn, reason)) = self.check_and_record_with_generation(
+            tool_name,
+            args,
+            result_str.as_str(),
+            turn_index,
+            context_generation,
+        ) {
             result_str.push_str(&format!(
                 "\n\n⚠️ DUPLICATE HINT: This {tool_name} output matches turn {} ({reason}). \
                  If this is the same data, use the earlier result. \
@@ -637,7 +747,7 @@ impl SemanticDedup {
         let mut memory_ops: Vec<&str> = Vec::new();
         let mut other: Vec<String> = Vec::new();
 
-        for (key, (_turn, tool)) in &self.param_cache {
+        for (key, (_turn, tool, _generation)) in &self.param_cache {
             match tool.as_str() {
                 "read_file" => {
                     if let Some(path) = key.strip_prefix("read_file:") {
@@ -1241,6 +1351,7 @@ mod tests {
             tool_name: "read_file".to_string(),
             semantic_key: Some(sem_key),
             turn: 1,
+            context_generation: 0,
             output: output1.to_string(),
         });
 
@@ -1587,6 +1698,46 @@ mod tests {
         assert!(block.is_some(), "normalized path should match");
     }
 
+    #[test]
+    fn pre_check_block_is_scoped_by_context_generation() {
+        let mut dedup = SemanticDedup::new(0.75);
+        let args = json!({"path": "src/main.rs"});
+        dedup.check_and_record_with_generation(
+            "read_file",
+            &args,
+            "fn before() { println!(\"fresh enough content\"); }",
+            0,
+            7,
+        );
+
+        assert!(
+            dedup
+                .pre_check_block_with_generation("read_file", &args, 1, 7)
+                .is_some(),
+            "same generation should still allow a semantic cache hit"
+        );
+        assert!(
+            dedup
+                .pre_check_block_with_generation("read_file", &args, 1, 8)
+                .is_none(),
+            "new generation must force a fresh observation"
+        );
+    }
+
+    #[test]
+    fn clear_observation_cache_drops_stale_semantic_state() {
+        let mut dedup = SemanticDedup::new(0.75);
+        let args = json!({"path": "src/main.rs"});
+        dedup.check_and_record("read_file", &args, "fn before() {}", 0);
+        assert!(dedup.has_file("src/main.rs"));
+
+        dedup.clear_observation_cache();
+
+        assert!(!dedup.has_file("src/main.rs"));
+        assert!(dedup.pre_check_block("read_file", &args, 1).is_none());
+        assert_eq!(dedup.output_log_size(), 0);
+    }
+
     /// When microcompact has cleared the cached output to `[Cleared]`,
     /// pre_check_block must allow re-execution rather than returning a
     /// useless stub. Without this, long sessions hit a deadlock:
@@ -1645,6 +1796,38 @@ mod tests {
             block.is_none(),
             "trivially short output should not block re-execution"
         );
+    }
+
+    #[test]
+    fn param_cache_is_bounded() {
+        let mut dedup = SemanticDedup::new(0.75);
+        for i in 0..(DEFAULT_PARAM_CACHE_ENTRIES + 10) {
+            dedup.check_and_record(
+                "read_file",
+                &json!({"path": format!("src/{i}.rs")}),
+                "long enough content for cache bookkeeping",
+                i,
+            );
+        }
+
+        assert_eq!(dedup.param_cache.len(), DEFAULT_PARAM_CACHE_ENTRIES);
+        assert!(
+            !dedup.has_file("src/0.rs"),
+            "oldest semantic keys should be evicted"
+        );
+        assert!(dedup.has_file(&format!("src/{}.rs", DEFAULT_PARAM_CACHE_ENTRIES + 9)));
+    }
+
+    #[test]
+    fn dedup_audit_is_bounded() {
+        let mut dedup = SemanticDedup::new(0.75);
+        for i in 0..(DEFAULT_AUDIT_ENTRIES + 10) {
+            let args = json!({"path": format!("src/{i}.rs")});
+            dedup.check_and_record("read_file", &args, "first long enough output", i * 2);
+            dedup.check_and_record("read_file", &args, "second long enough output", i * 2 + 1);
+        }
+
+        assert_eq!(dedup.dedup_audit.len(), DEFAULT_AUDIT_ENTRIES);
     }
 
     // ── P1-H: Semantic dedup behavioral tests ───────────────────────

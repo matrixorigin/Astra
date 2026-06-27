@@ -125,6 +125,17 @@ pub fn classify_tool_family(tool_name: &str) -> ToolFamily {
     }
 }
 
+fn is_workspace_mutation_tool(tool_name: &str, family: ToolFamily) -> bool {
+    match family {
+        ToolFamily::Write => true,
+        ToolFamily::Git => matches!(
+            tool_name,
+            "git_commit" | "git_push" | "git_merge" | "git_rebase" | "git_checkout" | "git_reset"
+        ),
+        _ => false,
+    }
+}
+
 impl TurnMetrics {
     /// Build metrics from lightweight `ToolCallSample` records.
     pub fn from_samples(
@@ -149,7 +160,7 @@ impl TurnMetrics {
             let family = classify_tool_family(&lower);
             *by_family.entry(family).or_insert(0) += 1;
 
-            if matches!(family, ToolFamily::Write | ToolFamily::Git) {
+            if is_workspace_mutation_tool(&lower, family) {
                 mutation_count += 1;
                 if let Some(r) = sample.round {
                     last_mutation_round = Some(last_mutation_round.map_or(r, |prev| prev.max(r)));
@@ -1231,6 +1242,62 @@ mod tests {
         assert_eq!(json["confidence"]["classification"], 0.8);
         assert_eq!(json["confidence"]["evidence"], 0.0);
         assert!(json["confidence"].get("causal").is_none());
+    }
+
+    #[test]
+    fn read_only_git_tools_do_not_count_as_workspace_mutations() {
+        let samples = [
+            ToolCallSample {
+                name: "git_diff",
+                ok: true,
+                round: Some(1),
+                file_path: None,
+                error: None,
+            },
+            ToolCallSample {
+                name: "git_log",
+                ok: true,
+                round: Some(1),
+                file_path: None,
+                error: None,
+            },
+            ToolCallSample {
+                name: "git_blame",
+                ok: true,
+                round: Some(1),
+                file_path: None,
+                error: None,
+            },
+        ];
+        let metrics = TurnMetrics::from_samples(&samples, 1, 100);
+        assert_eq!(metrics.tool_calls_by_family.get(&ToolFamily::Git), Some(&3));
+        assert_eq!(
+            metrics.mutation_count, 0,
+            "read-only git inspection must not fabricate workspace progress"
+        );
+    }
+
+    #[test]
+    fn mutating_git_tools_count_as_workspace_mutations() {
+        let samples = [
+            ToolCallSample {
+                name: "git_commit",
+                ok: true,
+                round: Some(2),
+                file_path: None,
+                error: None,
+            },
+            ToolCallSample {
+                name: "git_push",
+                ok: true,
+                round: Some(2),
+                file_path: None,
+                error: None,
+            },
+        ];
+        let metrics = TurnMetrics::from_samples(&samples, 2, 100);
+        assert_eq!(metrics.mutation_count, 2);
+        assert_eq!(metrics.rounds_since_last_mutation, 0);
     }
 
     #[test]

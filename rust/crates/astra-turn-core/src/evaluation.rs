@@ -638,11 +638,17 @@ fn align_high_cost_low_yield_verdict(
         llm_rounds: telemetry.llm_rounds,
     });
     eval.quality = (eval.quality - 0.12).clamp(0.0, 1.0);
-    eval.confidence = (eval.confidence - 0.10).clamp(0.0, 1.0);
+    eval.confidence = (eval.confidence - 0.25)
+        .clamp(0.0, 1.0)
+        .min(high_cost_low_yield_confidence_cap(eval.quality));
 
     let error_count = tool_calls.iter().filter(|tc| !tc.ok).count();
     let error_rate = error_count as f64 / tool_calls.len().max(1) as f64;
     eval.success = error_rate < 0.5 && eval.quality > 0.35;
+}
+
+fn high_cost_low_yield_confidence_cap(quality: f64) -> f64 {
+    (0.25 + quality.clamp(0.0, 1.0) * 0.60).clamp(0.25, 0.55)
 }
 
 fn result_class_is_outcome_failure(class: &str) -> bool {
@@ -2257,10 +2263,20 @@ mod tests {
             eval
         );
         assert!(
-            eval.confidence < 0.8,
-            "confidence should be downgraded for low-certainty high-cost churn, got {}",
+            eval.confidence <= 0.55,
+            "confidence should be capped for low-certainty high-cost churn, got {}",
             eval.confidence
         );
+    }
+
+    #[test]
+    fn high_cost_low_yield_zero_quality_has_low_confidence_cap() {
+        assert_eq!(high_cost_low_yield_confidence_cap(0.0), 0.25);
+        assert!(
+            high_cost_low_yield_confidence_cap(0.35) < 0.50,
+            "low quality should not retain high confidence"
+        );
+        assert_eq!(high_cost_low_yield_confidence_cap(1.0), 0.55);
     }
 
     #[test]

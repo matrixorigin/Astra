@@ -264,11 +264,6 @@ impl ObservationJournal {
     /// Strategy changes are marked explicitly by the agent via
     /// [`mark_strategy_change`], not auto-detected from metrics patterns.
     pub fn record_turn(&mut self, metrics: &TurnMetrics) {
-        // Skip turns with zero tool calls (no data to analyze).
-        if metrics.tool_calls_total == 0 {
-            return;
-        }
-
         let entry = JournalEntry::from(metrics);
         self.entries.push(entry);
 
@@ -536,7 +531,7 @@ impl ObservationJournal {
             if abs_idx < streak_start {
                 break;
             }
-            if entry.write_ratio == 0.0 {
+            if entry.total_tool_calls > 0 && entry.write_ratio == 0.0 {
                 zero_streak += 1;
             } else {
                 break;
@@ -851,6 +846,43 @@ mod tests {
     fn empty_journal_returns_no_trends() {
         let journal = ObservationJournal::default();
         assert!(journal.compute_trends().is_empty());
+    }
+
+    #[test]
+    fn record_turn_keeps_toolless_turns_observable() {
+        let mut journal = ObservationJournal::default();
+        let metrics = TurnMetrics {
+            rounds_completed: 7,
+            tokens_consumed: 1200,
+            ..TurnMetrics::default()
+        };
+
+        journal.record_turn(&metrics);
+
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal.last_entry().map(|entry| entry.turn), Some(7));
+        let facts = journal.extract_facts(3, 10);
+        assert_eq!(facts.budget.rounds_completed, 8);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_read_only, 0);
+    }
+
+    #[test]
+    fn toolless_turn_breaks_zero_outcome_tool_streak() {
+        let mut journal = ObservationJournal::default();
+        journal.record_turn(&make_metrics(0, 4, 0, 0, 1000, vec![("read_file", 4)]));
+        journal.record_turn(&make_metrics(1, 3, 0, 0, 1000, vec![("grep", 3)]));
+        let tool_less = TurnMetrics {
+            rounds_completed: 2,
+            ..TurnMetrics::default()
+        };
+        journal.record_turn(&tool_less);
+
+        let facts = journal.extract_facts(7, 10);
+        assert_eq!(
+            facts.streaks.consecutive_rounds_without_outcome, 0,
+            "a text-only turn is not another read-only tool round"
+        );
     }
 
     #[test]

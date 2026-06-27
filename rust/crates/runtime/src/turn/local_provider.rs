@@ -102,23 +102,10 @@ impl ObservationProvider for LocalSessionProvider<'_> {
 impl SessionStateProvider for LocalSessionProvider<'_> {
     fn task_completion_ratio(&self) -> f64 {
         let snapshot = &self.state.hooks.task_board_snapshot;
-        if !snapshot.has_unfinished_tasks()
-            && (snapshot.pending_count > 0
-                || snapshot.in_progress_count > 0
-                || snapshot.blocked_count > 0)
-        {
-            // There are tasks but none are unfinished → 100% complete.
-            return 1.0;
+        if !snapshot.has_any_tracked_tasks() {
+            return 0.0;
         }
-        // No tasks at all or unfinished tasks remain.
-        if snapshot.pending_count == 0
-            && snapshot.in_progress_count == 0
-            && snapshot.blocked_count == 0
-        {
-            // Empty board — treat as complete (nothing to do).
-            return 1.0;
-        }
-        0.0
+        snapshot.completed_count as f64 / snapshot.tracked_count.max(1) as f64
     }
 
     fn current_phase_label(&self) -> &'static str {
@@ -239,9 +226,17 @@ mod tests {
     // ── SessionStateProvider tests ──────────────────────────────────────
 
     #[test]
-    fn session_provider_complete_or_empty_board() {
-        // Default task board is empty → should be "complete"
+    fn session_provider_empty_board_is_unknown_not_complete() {
         let state = make_state();
+        let p = make_provider(&state);
+        assert!((p.task_completion_ratio() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn session_provider_completed_board_is_complete() {
+        let mut state = make_state();
+        state.hooks.task_board_snapshot.tracked_count = 2;
+        state.hooks.task_board_snapshot.completed_count = 2;
         let p = make_provider(&state);
         assert!((p.task_completion_ratio() - 1.0).abs() < f64::EPSILON);
     }

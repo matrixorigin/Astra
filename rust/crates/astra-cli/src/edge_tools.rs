@@ -7064,8 +7064,9 @@ mod tests {
                 last_failure_tag: Some("timeout".to_string()),
             },
         );
-        let fingerprint =
-            astra_turn_core::injection_tracking::InjectionFingerprint::from_content("bash=-0.100");
+        let fingerprint = astra_turn_core::injection_tracking::InjectionFingerprint::from_content(
+            "bash=-0.100:timeout",
+        );
         for round in 0..=17 {
             session.injection_history.observe(
                 round,

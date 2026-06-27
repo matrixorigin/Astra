@@ -1252,7 +1252,7 @@ mod tests {
         // `0` in user config means "use default", NOT the BreakerConfig sentinel "unbounded".
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 2);
-        assert_eq!(cfg.absolute_max_rounds, 300);
+        assert_eq!(cfg.absolute_max_rounds, 1000);
     }
 
     #[test]

@@ -230,7 +230,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 Some(&execution.args),
             )
         {
+            self.ctx.turn_guard.record_workspace_mutation();
             self.ctx.idempotency_cache.evict_tools(&READ_ONLY_TOOLS);
+            self.ctx.semantic_dedup.clear_observation_cache();
+            self.ctx.call_counts.clear();
         }
 
         if READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
@@ -246,6 +249,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     result_str: &mut execution.result_str,
                     call_id: Some(&execution.id),
                     turn_index: self.ctx.turn_index,
+                    semantic_context_generation: self.ctx.turn_guard.workspace_epoch(),
                     idempotency_cache: self.ctx.idempotency_cache,
                     step_recorder: self.ctx.step_recorder,
                     semantic_dedup: self.ctx.semantic_dedup,

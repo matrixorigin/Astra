@@ -148,7 +148,7 @@ impl Default for BreakerConfig {
             read_only_stall_threshold: 12,
             max_introspect_emissions: 3,
             half_open_patience: 2,
-            absolute_max_rounds: 300,
+            absolute_max_rounds: 1000,
         }
     }
 }

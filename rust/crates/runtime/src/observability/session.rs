@@ -169,7 +169,10 @@ impl ObservabilitySession {
         let bias_text = self
             .outcome_bias
             .iter()
-            .map(|(t, b)| format!("{t}={:.3}", b.score))
+            .map(|(t, b)| {
+                let tag = b.last_failure_tag.as_deref().unwrap_or("");
+                format!("{t}={:.3}:{tag}", b.score)
+            })
             .collect::<Vec<_>>()
             .join(",");
         self.injection_history.observe(

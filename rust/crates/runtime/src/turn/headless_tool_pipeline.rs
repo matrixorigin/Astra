@@ -489,7 +489,7 @@ mod tests {
     use crate::orchestration::{PermissionMode, PermissionSyncContext, PermissionSyncHandle};
     use crate::skills::hooks::{HookAction, ToolEventHook, ToolEventHookRegistry, ToolEventKind};
     use crate::turn::agentic::headless_round::NoopHeadlessTerminal;
-    use astra_pipeline::step_protocol::CachedToolResult;
+    use astra_pipeline::step_protocol::{CachedToolResult, ContextSignature};
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 
     fn init_git_repo(dir: &Path) {
@@ -522,8 +522,7 @@ mod tests {
             "id": call_id,
             "function": { "name": "read_file", "arguments": serde_json::to_string(&json!({ "path": path })).unwrap() }
         }));
-        let args = json!({ "path": path });
-        let idem_key = IdempotencyKey::semantic("read_file", &args);
+        let idem_key = read_cache_key_at_epoch(path, 0);
         harness.idempotency_cache.record(
             &idem_key,
             CachedToolResult {
@@ -531,7 +530,7 @@ mod tests {
                 output: format!("cached {path}"),
                 is_error: false,
                 cached_at: 0,
-                context_signature: None,
+                context_signature: idem_key.context_signature.clone(),
             },
         );
 
@@ -566,6 +565,14 @@ mod tests {
             })
             .map(|event| (event.event_type.clone(), event.payload.clone()))
             .collect()
+    }
+
+    fn read_cache_key_at_epoch(path: &str, workspace_epoch: u64) -> IdempotencyKey {
+        let args = json!({ "path": path });
+        IdempotencyKey::semantic("read_file", &args).with_context(ContextSignature {
+            workspace_version: Some(format!("workspace_epoch:{workspace_epoch}")),
+            memory_snapshot_id: None,
+        })
     }
 
     fn edge_runtime_environment_fields() -> Map<String, Value> {
@@ -816,7 +823,12 @@ mod tests {
                 assert_eq!(permitted.execution.name, "grep");
                 assert_eq!(
                     permitted.idem_key.cache_key(),
-                    IdempotencyKey::semantic("grep", &json!({ "pattern": "headless" })).cache_key()
+                    IdempotencyKey::semantic("grep", &json!({ "pattern": "headless" }))
+                        .with_context(ContextSignature {
+                            workspace_version: Some("workspace_epoch:0".into()),
+                            memory_snapshot_id: None,
+                        })
+                        .cache_key()
                 );
             }
             _ => panic!("expected permitted execution"),
@@ -1218,12 +1230,8 @@ mod tests {
             .and_then(Value::as_str)
             .expect("semantic dedup skip output");
         assert!(
-            !skipped_output.contains("previous grep output"),
-            "semantic dedup skip must not re-inject prior output into context: {skipped_output}"
-        );
-        assert!(
-            skipped_output.contains("semantically identical"),
-            "semantic dedup skip should keep a bounded reference advisory"
+            skipped_output.contains("previous grep output"),
+            "semantic dedup cache hit should replay the useful prior output: {skipped_output}"
         );
         let model_tool_output = harness.messages.last().and_then(|msg| {
             msg.get("content")
@@ -1231,8 +1239,8 @@ mod tests {
                 .and_then(Value::as_str)
         });
         assert!(
-            model_tool_output.is_some_and(|output| !output.contains("previous grep output")),
-            "model-facing duplicate tool message must not replay prior output: {model_tool_output:?}"
+            model_tool_output.is_some_and(|output| output.contains("previous grep output")),
+            "model-facing semantic cache hit must include usable evidence: {model_tool_output:?}"
         );
     }
 
@@ -1382,8 +1390,7 @@ mod tests {
         for (tool_name, args, is_err, should_evict) in cases {
             let mut harness = PipelineHarness::new();
             begin_recorded_turn(&mut harness, 1);
-            let read_args = json!({ "path": "a.txt" });
-            let read_key = IdempotencyKey::semantic("read_file", &read_args);
+            let read_key = read_cache_key_at_epoch("a.txt", 0);
             harness.idempotency_cache.record(
                 &read_key,
                 CachedToolResult {
@@ -1391,7 +1398,7 @@ mod tests {
                     output: "old content".into(),
                     is_error: false,
                     cached_at: 0,
-                    context_signature: None,
+                    context_signature: read_key.context_signature.clone(),
                 },
             );
 
@@ -1421,6 +1428,168 @@ mod tests {
                 "{tool_name} with is_err={is_err} eviction mismatch"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn successful_mutation_clears_semantic_dedup_observations() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        harness.valid_tool_names.insert("read_file".to_string());
+        harness.semantic_dedup.check_and_record_with_generation(
+            "read_file",
+            &json!({"path": "models.rs", "start_line": 2900, "end_line": 2940}),
+            "stale models.rs content that used to block fresh reads",
+            0,
+            0,
+        );
+        harness.tool_calls = vec![json!({
+            "id": "call-read-stale",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": r#"{"path":"models.rs","start_line":2900,"end_line":2940}"#
+            }
+        })];
+
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(1, None);
+            assert!(
+                matches!(
+                    pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+                    HeadlessPipelineStage::ShortCircuit
+                ),
+                "same epoch should use the semantic cache"
+            );
+        }
+
+        {
+            let mut pipeline = harness.pipeline();
+            let args = json!({"path": "models.rs", "old_str": "before", "new_str": "after"});
+            pipeline
+                .record_execution(ExecutedExecution {
+                    execution: HeadlessResolvedExecution {
+                        id: "call-edit".into(),
+                        name: "str_replace".into(),
+                        args: args.clone(),
+                        result_str: "mutation succeeded".into(),
+                        tool_result_fields: None,
+                        edge_duration_ms: 1,
+                        is_edge_tool: true,
+                        early_exit_ms: 0,
+                    },
+                    idem_key: IdempotencyKey::semantic("str_replace", &args),
+                    is_err: false,
+                    executed_ms: 1,
+                })
+                .await;
+        }
+
+        harness.tool_calls = vec![json!({
+            "id": "call-read-fresh",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": r#"{"path":"models.rs","start_line":2900,"end_line":2940}"#
+            }
+        })];
+        let mut pipeline = harness.pipeline_with_server_executor(2, None);
+        assert!(
+            matches!(
+                pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+                HeadlessPipelineStage::Continue(_)
+            ),
+            "mutation must force a fresh read instead of semantic duplicate blocking"
+        );
+    }
+
+    #[tokio::test]
+    async fn redundant_validation_is_suppressed_until_workspace_mutates() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        harness.valid_tool_names.insert("bash".to_string());
+
+        for i in 0..2 {
+            harness.tool_calls = vec![json!({
+                "id": format!("call-check-{i}"),
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": r#"{"command":"cd rust && cargo check 2>&1 | head -50"}"#
+                }
+            })];
+            let mut pipeline = harness.pipeline_with_server_executor(i, None);
+            assert!(
+                matches!(
+                    pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+                    HeadlessPipelineStage::Continue(_)
+                ),
+                "first two validation attempts in an epoch are allowed"
+            );
+        }
+
+        harness.tool_calls = vec![json!({
+            "id": "call-check-blocked",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"cd rust && cargo check 2>&1 | tail -50"}"#
+            }
+        })];
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(2, None);
+            assert!(
+                matches!(
+                    pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+                    HeadlessPipelineStage::ShortCircuit
+                ),
+                "third same-prefix validation in one epoch should be policy-blocked"
+            );
+        }
+        assert!(
+            harness.tool_results.last().is_some_and(|result| result
+                .to_string()
+                .contains("Redundant validation suppressed")),
+            "blocked validation should give an explicit model-facing reason"
+        );
+
+        {
+            let mut pipeline = harness.pipeline();
+            let args = json!({"path": "src/lib.rs", "old_str": "a", "new_str": "b"});
+            pipeline
+                .record_execution(ExecutedExecution {
+                    execution: HeadlessResolvedExecution {
+                        id: "call-edit".into(),
+                        name: "str_replace".into(),
+                        args: args.clone(),
+                        result_str: "mutation succeeded".into(),
+                        tool_result_fields: None,
+                        edge_duration_ms: 1,
+                        is_edge_tool: true,
+                        early_exit_ms: 0,
+                    },
+                    idem_key: IdempotencyKey::semantic("str_replace", &args),
+                    is_err: false,
+                    executed_ms: 1,
+                })
+                .await;
+        }
+
+        harness.tool_calls = vec![json!({
+            "id": "call-check-after-edit",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"cd rust && cargo check 2>&1 | head -50"}"#
+            }
+        })];
+        let mut pipeline = harness.pipeline_with_server_executor(3, None);
+        assert!(
+            matches!(
+                pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+                HeadlessPipelineStage::Continue(_)
+            ),
+            "workspace mutation must reset validation retry policy"
+        );
     }
 
     #[tokio::test]
@@ -1462,7 +1631,11 @@ mod tests {
             once: false,
             priority: 0,
         }]);
-        let idem_key = IdempotencyKey::semantic("grep", &json!({ "pattern": "headless" }));
+        let idem_key = IdempotencyKey::semantic("grep", &json!({ "pattern": "headless" }))
+            .with_context(ContextSignature {
+                workspace_version: Some("workspace_epoch:0".into()),
+                memory_snapshot_id: None,
+            });
         let mut pipeline = harness.pipeline();
         let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
             HeadlessPipelineStage::Continue(validated) => validated,

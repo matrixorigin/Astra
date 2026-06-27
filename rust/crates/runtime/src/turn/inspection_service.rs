@@ -469,7 +469,7 @@ mod tests {
             assert!((metrics.token_pressure - 0.0).abs() < f64::EPSILON);
             assert!((metrics.cache_hit_ratio - 0.0).abs() < f64::EPSILON);
             assert!((metrics.current_error_rate - 0.0).abs() < f64::EPSILON);
-            assert!((metrics.task_completion_ratio - 1.0).abs() < f64::EPSILON);
+            assert!((metrics.task_completion_ratio - 0.0).abs() < f64::EPSILON);
             assert_eq!(metrics.phase_label, "execution");
             assert_eq!(metrics.circuit_breaker_state, "monitoring");
             assert!(metrics.alerts.is_empty());
@@ -762,6 +762,7 @@ mod tests {
             state.observation_journal.record_turn(&m);
         }
         // Set up task board: 1 pending task → task_ratio = 0.0
+        state.hooks.task_board_snapshot.tracked_count = 1;
         state.hooks.task_board_snapshot.pending_count = 1;
         state.hooks.task_board_snapshot.in_progress_count = 0;
         state.hooks.task_board_snapshot.blocked_count = 0;
@@ -789,6 +790,7 @@ mod tests {
             m.mutation_count = 0;
             state.observation_journal.record_turn(&m);
         }
+        state.hooks.task_board_snapshot.tracked_count = 1;
         state.hooks.task_board_snapshot.pending_count = 1;
         with_inspection(&state, |svc| {
             let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
@@ -816,6 +818,7 @@ mod tests {
             m.mutation_count = 0;
             state.observation_journal.record_turn(&m);
         }
+        state.hooks.task_board_snapshot.tracked_count = 1;
         state.hooks.task_board_snapshot.pending_count = 1;
         with_inspection(&state, |svc| {
             let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());

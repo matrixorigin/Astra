@@ -173,6 +173,7 @@ pub struct HeadlessCacheableRecordCtx<'a> {
     pub result_str: &'a mut String,
     pub call_id: Option<&'a str>,
     pub turn_index: usize,
+    pub semantic_context_generation: u64,
     pub idempotency_cache: &'a mut InMemoryIdempotencyCache,
     pub step_recorder: &'a mut StepRecorder,
     pub semantic_dedup: &'a mut SemanticDedup,
@@ -206,7 +207,7 @@ pub fn record_headless_cacheable_success_and_semantic_hint(
         output: ctx.result_str.clone(),
         is_error: false,
         cached_at: epoch_ms(),
-        context_signature: None,
+        context_signature: idem_key.context_signature.clone(),
     };
     if let Some(call_id) = ctx.call_id {
         ctx.step_recorder
@@ -216,12 +217,14 @@ pub fn record_headless_cacheable_success_and_semantic_hint(
             .attach_cached_result(cached_result.clone());
     }
     ctx.idempotency_cache.record(idem_key, cached_result);
-    ctx.semantic_dedup.append_near_duplicate_hint_if_any(
-        ctx.result_str,
-        name,
-        args,
-        ctx.turn_index,
-    );
+    ctx.semantic_dedup
+        .append_near_duplicate_hint_if_any_with_generation(
+            ctx.result_str,
+            name,
+            args,
+            ctx.turn_index,
+            ctx.semantic_context_generation,
+        );
 }
 
 /// Best-effort light checkpoint after each tool (matches CLI headless path).

@@ -847,10 +847,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection
                 if suppress_nudges =>
             {
-                // Auto mode: drop the correction entirely. Abort path
-                // below still fires because it represents a real budget
-                // exhaustion, not a soft nudge.
-                state.stall.circuit_breaker.correction_injected();
+                // Auto mode suppresses the corrective message. Do not move
+                // the breaker to HalfOpen because no correction was actually
+                // delivered; otherwise a later Abort can appear without the
+                // promised prior warning.
             }
             astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection => {
                 state.stall.forced_round_budget_phase1 = true;
@@ -3001,15 +3001,13 @@ pub(crate) fn observe_turn_end_without_tools(
         metrics.rounds_completed = state.llm_rounds_completed;
         metrics.tokens_consumed = tokens;
 
+        state.observation_journal.record_turn(&metrics);
         let facts = state
             .observation_journal
             .extract_facts(state.remaining_turns as u32, state.max_turns as u32);
 
-        let mut dispatcher = crate::turn::observation_dispatcher::ObservationDispatcher::new();
-        dispatcher.register(crate::turn::observation_dispatcher::MemorySink::new(
-            &mut state.observation_journal,
-        ));
         if let Some(ref store) = state.observation_store {
+            let mut dispatcher = crate::turn::observation_dispatcher::ObservationDispatcher::new();
             dispatcher.register(crate::turn::observation_dispatcher::FileSink::new(
                 Some(store.clone()),
                 state
@@ -3018,13 +3016,13 @@ pub(crate) fn observe_turn_end_without_tools(
                     .unwrap_or_default()
                     .to_string(),
             ));
+            dispatcher.dispatch(
+                crate::turn::observation_dispatcher::ObservationEvent::TurnCompleted {
+                    metrics: Box::new(metrics),
+                    facts,
+                },
+            );
         }
-        dispatcher.dispatch(
-            crate::turn::observation_dispatcher::ObservationEvent::TurnCompleted {
-                metrics: Box::new(metrics),
-                facts,
-            },
-        );
     } // dispatcher dropped — releases &mut observation_journal
 }
 

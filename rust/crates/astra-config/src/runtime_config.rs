@@ -943,9 +943,9 @@ impl ToolPolicyConfig {
         resolve_threshold(self.circuit_breaker_half_open_patience, 2, 1)
     }
 
-    /// Resolved circuit breaker absolute max rounds (0 → default 300, floor 20).
+    /// Resolved circuit breaker absolute max rounds (0 → default 1000, floor 20).
     pub fn effective_circuit_breaker_absolute_max_rounds(&self) -> u32 {
-        resolve_threshold(self.circuit_breaker_absolute_max_rounds, 300, 20)
+        resolve_threshold(self.circuit_breaker_absolute_max_rounds, 1000, 20)
     }
 
     pub fn effective_circuit_breaker_read_only_stall_threshold(&self) -> u32 {
