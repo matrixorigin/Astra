@@ -571,6 +571,28 @@ fn server_session_state_mutator_in_round(tool_calls: &[Value]) -> bool {
     })
 }
 
+/// Extract a strategy change description from a memory tool call's
+/// `args_preview`. The agent marks strategy changes with
+/// `memory(action='remember', tags=['strategy_change'], content='...')`.
+///
+/// Returns the `content` value if extractable, otherwise a default
+/// description.
+fn extract_strategy_change_desc(args_preview: &str) -> String {
+    // Simple extraction: find "content" key and grab its string value.
+    // The args_preview JSON is truncated to ~80 chars, but the content
+    // field is usually near the beginning for memory calls.
+    if let Some(start) = args_preview.find("\"content\":\"") {
+        let after_key = &args_preview[start + "\"content\":\"".len()..];
+        if let Some(end) = after_key.find('"') {
+            let desc = &after_key[..end];
+            if !desc.is_empty() {
+                return desc.to_string();
+            }
+        }
+    }
+    "Strategy changed".to_string()
+}
+
 fn append_session_journal_event(
     session_id: &str,
     event: astra_services::session_journal::JournalEvent,
@@ -1486,6 +1508,22 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         let metrics =
             astra_core::TurnMetrics::from_samples(&samples, state.llm_rounds_completed, tokens);
         state.observation_journal.record_turn(&metrics);
+
+        // ── Agent-marked strategy change ──
+        // Scan memory tool calls for `strategy_change` tag so the agent
+        // can explicitly signal "I changed my approach" and later see
+        // before/after verification in the self-status block.
+        for record in &state.stall.tool_call_records {
+            if record.name == "memory" {
+                if let Some(ref args) = record.args_preview {
+                    if args.contains("strategy_change") {
+                        let desc = extract_strategy_change_desc(args);
+                        state.observation_journal.mark_strategy_change(desc);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     if let Some(ref mut buf) = state.turn_event_buffer {

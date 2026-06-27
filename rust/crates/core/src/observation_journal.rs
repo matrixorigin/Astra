@@ -8,8 +8,11 @@
 //!
 //! - Ring buffer of [`JournalEntry`] — cheap per-turn snapshots of key metrics.
 //! - Trend computation: compares recent windows to detect direction and magnitude.
-//! - Strategy verification: records a "strategy delta" when tool usage patterns shift
-//!   and compares pre/post metrics to verify effect.
+//! - Strategy verification: the agent explicitly marks strategy changes via
+//!   [`ObservationJournal::mark_strategy_change`] (through `memory` tool calls with
+//!   `tags=["strategy_change"]`). The journal captures pre-change metrics and
+//!   compares them against post-change averages to verify effect.
+//!   **No auto-detection from metrics patterns** — the agent is the decision-maker.
 
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
@@ -122,17 +125,19 @@ pub struct StrategyVerification {
 ///    [`TurnMetrics`].
 /// 2. Before the next LLM round, call [`compute_trends`] to get trend summaries and
 ///    [`strategy_verification`] to get feedback on the last strategy adjustment.
-/// 3. The journal auto-detects strategy changes when the top-tools vector shifts
-///    significantly between turns.
+/// 3. The agent explicitly marks strategy changes via
+///    [`mark_strategy_change`], never auto-detected from metrics patterns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationJournal {
     /// Ring buffer of recent turn entries. Newest at the end.
     entries: Vec<JournalEntry>,
-    /// Index into `entries` where the last detected strategy change occurred,
+    /// Index into `entries` where the last agent-marked strategy change occurred,
     /// or usize::MAX if none.
     strategy_change_at: usize,
     /// Snapshot of metrics before the strategy change (for verification).
     pre_strategy_metrics: Option<JournalEntry>,
+    /// Agent-provided description of the strategy change (e.g. "switched to batch editing").
+    strategy_change_description: Option<String>,
 }
 
 impl Default for ObservationJournal {
@@ -141,12 +146,16 @@ impl Default for ObservationJournal {
             entries: Vec::with_capacity(JOURNAL_CAPACITY),
             strategy_change_at: usize::MAX,
             pre_strategy_metrics: None,
+            strategy_change_description: None,
         }
     }
 }
 
 impl ObservationJournal {
-    /// Record a turn's metrics into the journal. Auto-detects strategy changes.
+    /// Record a turn's metrics into the journal.
+    ///
+    /// Strategy changes are marked explicitly by the agent via
+    /// [`mark_strategy_change`], not auto-detected from metrics patterns.
     pub fn record_turn(&mut self, metrics: &TurnMetrics) {
         // Skip turns with zero tool calls (no data to analyze).
         if metrics.tool_calls_total == 0 {
@@ -154,16 +163,8 @@ impl ObservationJournal {
         }
 
         let entry = JournalEntry::from(metrics);
-
-        // Detect strategy change: significant shift in top tools vs last entry.
-        if let Some(last) = self.entries.last() {
-            if self.is_strategy_change(last, &entry) && self.pre_strategy_metrics.is_none() {
-                self.strategy_change_at = self.entries.len();
-                self.pre_strategy_metrics = Some(last.clone());
-            }
-        }
-
         self.entries.push(entry);
+
         if self.entries.len() > JOURNAL_CAPACITY {
             // Shift indices to keep strategy_change_at consistent.
             let removed = self.entries.remove(0);
@@ -186,38 +187,26 @@ impl ObservationJournal {
         }
     }
 
-    /// Detect whether the agent's tool-usage pattern shifted significantly.
-    fn is_strategy_change(&self, before: &JournalEntry, after: &JournalEntry) -> bool {
-        // Strategy change criteria:
-        // 1. Top tools vector changed (different tool names in top 3)
-        // 2. OR significant shift in read/write ratio (>30% change)
-        // 3. OR tool diversity changed significantly
-
-        let before_tools: std::collections::HashSet<&str> =
-            before.top_tools.iter().map(|(n, _)| n.as_str()).collect();
-        let after_tools: std::collections::HashSet<&str> =
-            after.top_tools.iter().map(|(n, _)| n.as_str()).collect();
-
-        // Criterion 1: tool set changed by >= 2 tools
-        let tool_overlap = before_tools.intersection(&after_tools).count();
-        let total_unique = before_tools.union(&after_tools).count();
-        if total_unique > 0 && (tool_overlap as f64 / total_unique as f64) < 0.5 {
-            return true;
+    /// Mark an explicit strategy change, set by the agent when it
+    /// consciously shifts approach (e.g. exploration → implementation).
+    ///
+    /// The journal captures the pre-change entry as a baseline so
+    /// [`strategy_verification`] can compare before/after metrics.
+    pub fn mark_strategy_change(&mut self, description: String) {
+        if let Some(last) = self.entries.last() {
+            self.strategy_change_at = self.entries.len().saturating_sub(1);
+            self.pre_strategy_metrics = Some(last.clone());
+            self.strategy_change_description = Some(description);
         }
+    }
 
-        // Criterion 2: read/write ratio shifted > 30%
-        let read_delta = (after.read_ratio - before.read_ratio).abs();
-        if read_delta > 0.3 {
-            return true;
+    /// Returns true if a strategy change has been marked and not yet
+    /// verified (i.e. at least one post-change entry exists).
+    pub fn has_pending_strategy_change(&self) -> bool {
+        if self.strategy_change_at == usize::MAX || self.pre_strategy_metrics.is_none() {
+            return false;
         }
-
-        // Criterion 3: tool diversity jumped > 0.25
-        let diversity_delta = (after.tool_diversity - before.tool_diversity).abs();
-        if diversity_delta > 0.25 {
-            return true;
-        }
-
-        false
+        self.entries.len() > self.strategy_change_at
     }
 
     /// Compute trends for key metrics across the journal window.
@@ -315,9 +304,9 @@ impl ObservationJournal {
         })
     }
 
-    /// Get strategy verification — shows whether the last detected strategy
+    /// Get strategy verification — shows whether the last agent-marked strategy
     /// change improved or worsened key metrics.
-    pub fn strategy_verification(&mut self) -> Option<StrategyVerification> {
+    pub fn strategy_verification(&self) -> Option<StrategyVerification> {
         if self.strategy_change_at == usize::MAX || self.pre_strategy_metrics.is_none() {
             return None;
         }
@@ -339,26 +328,27 @@ impl ObservationJournal {
         let post_diversity: f64 =
             post_entries.iter().map(|e| e.tool_diversity).sum::<f64>() / post_count as f64;
 
-        // Build change description.
-        let pre_tools: Vec<&str> = pre.top_tools.iter().map(|(n, _)| n.as_str()).collect();
-        let post_top_tools: Vec<&str> = post_entries
-            .last()
-            .map(|e| e.top_tools.iter().map(|(n, _)| n.as_str()).collect())
-            .unwrap_or_default();
-
-        let change_desc = if pre_tools != post_top_tools {
-            format!(
-                "Tool shift: [{}] → [{}]",
-                pre_tools.join(", "),
-                post_top_tools.join(", ")
-            )
-        } else {
-            format!(
-                "Strategy adjusted (turns {}→{})",
-                pre.turn,
-                post_entries.last().map(|e| e.turn).unwrap_or(pre.turn)
-            )
-        };
+        // Use the agent-provided description if available; fall back to tool-shift summary.
+        let change_desc = self.strategy_change_description.clone().unwrap_or_else(|| {
+            let pre_tools: Vec<&str> = pre.top_tools.iter().map(|(n, _)| n.as_str()).collect();
+            let post_top_tools: Vec<&str> = post_entries
+                .last()
+                .map(|e| e.top_tools.iter().map(|(n, _)| n.as_str()).collect())
+                .unwrap_or_default();
+            if pre_tools != post_top_tools {
+                format!(
+                    "Tool shift: [{}] → [{}]",
+                    pre_tools.join(", "),
+                    post_top_tools.join(", ")
+                )
+            } else {
+                format!(
+                    "Strategy adjusted (turns {}→{})",
+                    pre.turn,
+                    post_entries.last().map(|e| e.turn).unwrap_or(pre.turn)
+                )
+            }
+        });
 
         Some(StrategyVerification {
             change_description: change_desc,
@@ -388,6 +378,7 @@ impl ObservationJournal {
         self.entries.clear();
         self.strategy_change_at = usize::MAX;
         self.pre_strategy_metrics = None;
+        self.strategy_change_description = None;
     }
 }
 
@@ -465,9 +456,29 @@ pub fn render_compact_status(
     }
 
     // ── Strategy verification ──
-    // NOTE: journal is `&ObservationJournal`, but strategy_verification needs `&mut`.
-    // We consume a clone for the compact status — the real journal gets verified elsewhere.
-    // For now, skip strategy verification in the compact render.
+    if let Some(verif) = journal.strategy_verification() {
+        s.push_str("Strategy: ");
+        let _ = write!(s, "{} | ", verif.change_description);
+        let _ = write!(
+            s,
+            "error {:.0}%→{:.0}% | cache {:.0}%→{:.0}%",
+            verif.error_rate_before * 100.0,
+            verif.error_rate_after * 100.0,
+            verif.cache_before * 100.0,
+            verif.cache_after * 100.0,
+        );
+        // Signal whether the change helped.
+        let error_improved = verif.error_rate_after < verif.error_rate_before;
+        let cache_improved = verif.cache_after > verif.cache_before;
+        if error_improved && cache_improved {
+            s.push_str(" ✅ effective");
+        } else if error_improved || cache_improved {
+            s.push_str(" ⚡ mixed");
+        } else {
+            s.push_str(" ⚠ check");
+        }
+        s.push('\n');
+    }
 
     s
 }
@@ -546,21 +557,44 @@ mod tests {
     }
 
     #[test]
-    fn detects_strategy_change_on_tool_shift() {
+    fn explicit_mark_strategy_change_is_recorded() {
         let mut journal = ObservationJournal::default();
         journal.record_turn(&make_metrics(0, 6, 0, 1, 1000, vec![("read_file", 5)]));
-        journal.record_turn(&make_metrics(1, 6, 0, 1, 1000, vec![("str_replace", 5)]));
-        // Should detect strategy change
+        journal.mark_strategy_change("switched to write-heavy editing".into());
         assert!(journal.strategy_change_at != usize::MAX);
+        assert!(journal.pre_strategy_metrics.is_some());
+        assert_eq!(
+            journal.strategy_change_description.as_deref(),
+            Some("switched to write-heavy editing")
+        );
     }
 
     #[test]
-    fn no_strategy_change_on_similar_pattern() {
+    fn no_strategy_change_without_explicit_mark() {
         let mut journal = ObservationJournal::default();
         journal.record_turn(&make_metrics(0, 6, 0, 1, 1000, vec![("read_file", 5)]));
-        journal.record_turn(&make_metrics(1, 5, 0, 1, 1000, vec![("read_file", 4)]));
-        // Should NOT detect strategy change — same tools
+        journal.record_turn(&make_metrics(1, 5, 0, 1, 1000, vec![("str_replace", 4)]));
+        // Should NOT auto-detect — the agent must explicitly mark strategy changes.
         assert!(journal.strategy_change_at == usize::MAX);
+    }
+
+    #[test]
+    fn strategy_verification_compares_pre_post_metrics() {
+        let mut journal = ObservationJournal::default();
+        // Pre-change: low error, high cache
+        journal.record_turn(&make_metrics(0, 10, 1, 8, 1000, vec![("read_file", 8)]));
+        journal.mark_strategy_change("switched to batch editing".into());
+        // Post-change: even lower error
+        journal.record_turn(&make_metrics(1, 10, 0, 9, 1200, vec![("str_replace", 5)]));
+        journal.record_turn(&make_metrics(2, 10, 0, 9, 1100, vec![("str_replace", 6)]));
+
+        let verif = journal.strategy_verification();
+        assert!(verif.is_some());
+        let v = verif.unwrap();
+        assert!(v.change_description.contains("batch editing"));
+        assert!(v.error_rate_before > 0.0); // had errors before
+        assert!(v.error_rate_after < v.error_rate_before); // improved
+        assert!(v.turns_since_change >= 2);
     }
 
     #[test]
