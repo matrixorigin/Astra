@@ -666,6 +666,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         // Stall reason from the unified stall diagnosis.
         facts.stall_reason = interruption_diagnosis_summary(state);
 
+        // Populate cache pressure from authoritative token pressure.
+        facts.cache_pressure = super::host::introspect_token_pressure(state);
+
+        // Populate task completion ratio from the task board snapshot.
+        let snapshot = &state.hooks.task_board_snapshot;
+        if !snapshot.has_unfinished_tasks() {
+            facts.task_completion_ratio = 1.0;
+        }
+
         let actions = state
             .budget_policy
             .as_ref()
@@ -711,6 +720,93 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         target: "astra::policy",
                         signal = %message,
                         "Policy injected signal into agent context"
+                    );
+                }
+                FrameworkAction::TriggerCompaction { urgency } => {
+                    let kind = match urgency {
+                        crate::turn::runtime_policy::CompactionUrgency::Normal => {
+                            CompactionKind::ProactiveDefault
+                        }
+                        crate::turn::runtime_policy::CompactionUrgency::Aggressive => {
+                            CompactionKind::ProactiveAggressive
+                        }
+                    };
+                    let pressure = facts.cache_pressure;
+                    // Estimate: we pass approximate values; host will refine.
+                    let event = CompactionEvent::new(
+                        kind,
+                        pressure,
+                        0,       // tokens_freed (unknown until after)
+                        0,       // tokens_before (host will measure)
+                        128_000, // max_tokens (approximate)
+                        0,       // messages_removed (unknown)
+                        0,       // messages_after (unknown)
+                        vec![format!(
+                            "Policy-driven compaction ({}) at {:.0}% cache pressure",
+                            urgency,
+                            pressure * 100.0,
+                        )],
+                    );
+                    host.on_compaction(event);
+                    let msg = format!(
+                        "[Framework action] Triggering {urgency} compaction — cache pressure at {:.0}%.",
+                        pressure * 100.0,
+                        urgency = urgency,
+                    );
+                    state.push_volatile(super::host::VolatileKind::BudgetReview, msg);
+                    tracing::info!(
+                        target: "astra::policy",
+                        %urgency,
+                        pressure,
+                        "Policy-driven compaction triggered"
+                    );
+                }
+                FrameworkAction::AdjustCircuitBreaker { max_rounds } => {
+                    let old_max = state.max_turns;
+                    state.max_turns = state.max_turns.min(max_rounds as usize);
+                    if state.remaining_turns > state.max_turns {
+                        state.remaining_turns = state.max_turns;
+                    }
+                    let msg = format!(
+                        "[Framework action] Circuit breaker adjusted: max turns {old_max} → {new_max} (error rate: {error_rate:.0}%, read-only streak: {read_only}).",
+                        new_max = state.max_turns,
+                        error_rate = facts.current_error_rate * 100.0,
+                        read_only = facts.consecutive_read_only,
+                    );
+                    state.push_volatile(super::host::VolatileKind::BudgetReview, msg);
+                    tracing::info!(
+                        target: "astra::policy",
+                        old_max,
+                        new_max = state.max_turns,
+                        max_rounds,
+                        error_rate = facts.current_error_rate,
+                        "Policy-driven circuit breaker adjustment"
+                    );
+                }
+                FrameworkAction::TransitionPhase { target } => {
+                    let phase_label = match target {
+                        crate::turn::runtime_policy::PhaseTarget::Reflection => "reflection",
+                        crate::turn::runtime_policy::PhaseTarget::Summarization => "summarization",
+                        crate::turn::runtime_policy::PhaseTarget::Planning => "planning",
+                        crate::turn::runtime_policy::PhaseTarget::Completion => "completion",
+                    };
+                    let msg = format!(
+                        "[Framework action] Phase transition requested: {phase_label}. Consider wrapping up and preparing to transition."
+                    );
+                    state.push_volatile(super::host::VolatileKind::Corrective, msg);
+                    if target == crate::turn::runtime_policy::PhaseTarget::Completion {
+                        // Signal completion — inject a stronger nudge when all tasks are done.
+                        let completion_msg = format!(
+                            "[Framework action] All tasks completed (ratio: {:.0}%). Consider finalizing the turn.",
+                            facts.task_completion_ratio * 100.0,
+                        );
+                        state.push_volatile(super::host::VolatileKind::Corrective, completion_msg);
+                    }
+                    tracing::info!(
+                        target: "astra::policy",
+                        %target,
+                        completion_ratio = facts.task_completion_ratio,
+                        "Policy-driven phase transition"
                     );
                 }
                 FrameworkAction::Continue => {}

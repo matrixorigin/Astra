@@ -62,6 +62,23 @@ pub struct JournalFacts {
     /// e.g. "Same tools called 3 times in a row: [read_file, grep]".
     /// This is an objective fact from the framework, not a judgment.
     pub stall_reason: Option<String>,
+    /// Cache pressure (0.0–1.0): how full the context window is.
+    /// Derived from token usage vs. context window budget.
+    /// 0.0 = empty, 1.0 = full / overflow imminent.
+    /// Populated by the execution phase (not computed in the journal).
+    #[serde(default)]
+    pub cache_pressure: f64,
+    /// Error rate (0.0–1.0) across the journal window.
+    /// failed_calls / total_calls, aggregated from recent turns.
+    pub current_error_rate: f64,
+    /// Task completion ratio (0.0–1.0): fraction of the task board's
+    /// tasks that are completed. 1.0 = all done.
+    /// Populated by the execution phase (not computed in the journal).
+    #[serde(default)]
+    pub task_completion_ratio: f64,
+    /// Cache hit ratio (0.0–1.0): cache_hits / total_calls.
+    /// Higher means the agent is reusing cached results efficiently.
+    pub cache_hit_ratio: f64,
 }
 
 /// A single turn's worth of key metrics stored in the journal.
@@ -471,6 +488,22 @@ impl ObservationJournal {
             }
         }
         facts.consecutive_rounds_without_outcome = zero_streak;
+
+        // Compute aggregated error rate and cache hit ratio from recent entries.
+        // These are averages across the journal window for stable signals.
+        if !self.entries.is_empty() {
+            let total_entries = self.entries.len() as f64;
+            let avg_error_rate: f64 =
+                self.entries.iter().map(|e| e.error_rate).sum::<f64>() / total_entries;
+            let avg_cache_hit: f64 =
+                self.entries.iter().map(|e| e.cache_hit_ratio).sum::<f64>() / total_entries;
+            facts.current_error_rate = avg_error_rate;
+            facts.cache_hit_ratio = avg_cache_hit;
+        }
+
+        // Note: cache_pressure and task_completion_ratio are populated by
+        // the execution phase from authoritative state (token pressure and
+        // task board), not computed from journal entries.
 
         facts
     }

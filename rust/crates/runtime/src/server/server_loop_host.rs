@@ -7555,6 +7555,8 @@ mod tests {
                         expand_factor: cfg.expand_factor,
                         max_ceiling: cfg.max_ceiling,
                         reflect_after_consecutive_zero: cfg.reflect_after_consecutive_zero,
+                        compact: Default::default(),
+                        circuit: Default::default(),
                     }
                 }),
             policy_expanded_this_turn: false,
