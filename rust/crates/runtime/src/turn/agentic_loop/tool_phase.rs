@@ -1471,7 +1471,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         model,
         prompt_tokens: turn_result.accum.prompt_tokens,
         cache_read_tokens: turn_result.accum.cache_read_tokens,
-        cache_creation_tokens: 0,
+        cache_creation_tokens: turn_result.accum.cache_creation_tokens,
         completion_tokens: turn_result.accum.completion_tokens,
         tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
         tool_call_names: tool_names.clone(),
@@ -1605,7 +1605,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             prompt_tokens: turn_result.accum.prompt_tokens,
             completion_tokens: turn_result.accum.completion_tokens,
             cache_read_tokens: turn_result.accum.cache_read_tokens,
-            cache_creation_tokens: 0,
+            cache_creation_tokens: turn_result.accum.cache_creation_tokens,
             tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
             tool_call_names: tool_names,
             // Synthesise per OpenAI protocol when upstream leaves the field
@@ -3295,7 +3295,7 @@ esac
         // Empty board → fully complete (nothing to do)
         assert_eq!(provider.task_completion_ratio(), 1.0);
         assert_eq!(provider.current_phase_label(), "execution");
-        assert_eq!(provider.circuit_breaker_state(), "armed");
+        assert_eq!(provider.circuit_breaker_state(), "monitoring");
         assert_eq!(provider.remaining_turns(), 10);
         assert_eq!(provider.max_turns(), 10);
     }

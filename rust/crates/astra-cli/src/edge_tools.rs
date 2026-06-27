@@ -3509,6 +3509,13 @@ impl ToolExecutor {
                 s.turn_number,
             );
             snap.current_round = s.turn_number;
+            for advisory in astra_turn_core::injection_tracking::stale_channel_advisories(
+                &snap.injection_freshness,
+            ) {
+                if !snap.alerts.iter().any(|existing| existing == &advisory) {
+                    snap.alerts.push(advisory);
+                }
+            }
         }
 
         astra_turn_core::introspect::render_introspect_request(&snap, &request)
@@ -3960,19 +3967,34 @@ impl ToolExecutor {
         }
     }
 
-    /// `introspect(facet="cache")` — scan recent `llm_capture_*.json`
-    /// files for the current session and run the four cache-diagnosis
-    /// rules over them. Returns a markdown report.
+    /// `introspect(facet="cache")` — prefer recent `llm_capture_*.json`
+    /// files for full cache-diagnosis rules, then fall back to the live
+    /// in-memory recent-round ring for per-round token/cache trend.
     ///
-    /// Requires `full_llm_capture=true` in session metadata; otherwise
-    /// the renderer explains why no data is available so the LLM knows
-    /// how to enable it. A future task (#17) adds an in-memory per-turn
-    /// ring so diagnosis also works without full capture.
+    /// Full cache-control marker diagnosis requires `full_llm_capture=true`.
+    /// The lightweight fallback is still useful for identifying prompt/cache
+    /// growth, cache-hit collapse, and cache-creation churn without disk I/O.
     fn handle_introspect_cache(&self) -> String {
         use astra_turn_core::introspect::cache_diagnosis;
+        let live_snapshot = self
+            .introspect_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| {
+                astra_core::agent_warn!("introspect", "recovering from poisoned RwLock");
+                poisoned.into_inner()
+            })
+            .clone();
+
         let session_id = match self.active_session_id() {
             Some(s) if !s.trim().is_empty() => s,
             _ => {
+                if let Some(snapshot) = live_snapshot.as_ref()
+                    && !snapshot.recent_rounds.is_empty()
+                {
+                    return cache_diagnosis::render_recent_round_history_markdown(
+                        &snapshot.recent_rounds,
+                    );
+                }
                 return cache_diagnosis::render_findings_markdown(&[], &[]);
             }
         };
@@ -3996,6 +4018,12 @@ impl ToolExecutor {
                 Vec::new()
             }
         };
+        if rounds.is_empty()
+            && let Some(snapshot) = live_snapshot.as_ref()
+            && !snapshot.recent_rounds.is_empty()
+        {
+            return cache_diagnosis::render_recent_round_history_markdown(&snapshot.recent_rounds);
+        }
         let findings = cache_diagnosis::evaluate_all(&rounds);
         cache_diagnosis::render_findings_markdown(&rounds, &findings)
     }
@@ -5313,6 +5341,12 @@ impl ToolExecutor {
         };
         let scenario_opt = session.active_scenario.as_ref();
         let signals_slice: &[_] = &session.last_feedback_signals;
+        let injection_freshness = astra_turn_core::injection_tracking::freshness_report(
+            &session.injection_history,
+            session.turn_number,
+        );
+        let stale_runtime_signals =
+            astra_turn_core::injection_tracking::stale_channel_advisories(&injection_freshness);
 
         let mut snapshot = astra_runtime::self_model::SelfModel::snapshot_with_strategy(
             &tool_name_refs,
@@ -5348,6 +5382,9 @@ impl ToolExecutor {
         }
         if !session.outcome_bias.is_empty() {
             snapshot = snapshot.with_outcome_bias(session.outcome_bias.clone());
+        }
+        if !stale_runtime_signals.is_empty() {
+            snapshot = snapshot.with_stale_runtime_signals(stale_runtime_signals);
         }
         if !session.low_confidence_tools.is_empty() {
             snapshot = snapshot.with_low_confidence_tools(
@@ -7016,6 +7053,46 @@ mod tests {
         assert!(out.contains("resume pending"), "got: {out}");
     }
 
+    #[test]
+    fn stale_outcome_bias_surfaces_in_summary_and_self_model() {
+        let mut session = astra_runtime::observability::ObservabilitySession::new_simple("s1");
+        session.turn_number = 17;
+        session.outcome_bias.insert(
+            "bash".to_string(),
+            astra_turn_core::tool_health::OutcomeBiasEntry {
+                score: -0.1,
+                last_failure_tag: Some("timeout".to_string()),
+            },
+        );
+        let fingerprint =
+            astra_turn_core::injection_tracking::InjectionFingerprint::from_content("bash=-0.100");
+        for round in 0..=17 {
+            session.injection_history.observe(
+                round,
+                astra_turn_core::injection_tracking::InjectionChannel::OutcomeBias,
+                fingerprint.clone(),
+            );
+        }
+
+        let executor =
+            test_executor().with_observability_session(Arc::new(std::sync::RwLock::new(session)));
+        let summary = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
+        assert!(
+            summary.contains("stale_injection: outcome_bias unchanged for 17 rounds"),
+            "summary must surface stale outcome_bias alert: {summary}",
+        );
+
+        let self_model = executor
+            .build_self_model_snapshot()
+            .expect("observability session should produce self model");
+        let rendered = self_model.to_system_prompt_section();
+        assert!(
+            rendered.contains("Stale runtime signals: stale_injection: outcome_bias"),
+            "SelfModel must demote stale outcome_bias in prompt context: {rendered}",
+        );
+        assert!(rendered.contains("weak prior"), "got: {rendered}");
+    }
+
     #[tokio::test]
     async fn get_agent_info_reports_current_model_without_observability_session() {
         let executor = test_executor();
@@ -7052,6 +7129,42 @@ mod tests {
         assert!(
             out.contains("No per-round cache snapshots"),
             "without a session / captures, the renderer must explain why: {out}",
+        );
+    }
+
+    #[test]
+    fn introspect_cache_facet_falls_back_to_live_recent_rounds() {
+        let executor = test_executor();
+        executor.update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
+            recent_rounds: vec![astra_turn_core::introspect::RoundSnapshotEntry {
+                turn: 3,
+                round: 1,
+                provider: "deepseek".to_string(),
+                model: "deepseek-chat".to_string(),
+                prompt_tokens: 2_000,
+                cache_read_tokens: 1_200,
+                cache_creation_tokens: 300,
+                completion_tokens: 150,
+                tool_calls_returned: 2,
+                tool_call_names: vec!["rg".to_string(), "read_file".to_string()],
+                duration_ms: 77,
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            ..Default::default()
+        });
+
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "cache"}));
+
+        assert!(out.contains("live `recent_rounds` ring"), "got: {out}");
+        assert!(out.contains("| t3_r1 |"), "live round missing: {out}");
+        assert!(
+            out.contains("cache_create=300") || out.contains("| 300 |"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("Cache-control marker placement diagnosis")
+                || out.contains("cache-control marker placement diagnosis"),
+            "fallback must state full-capture limitation: {out}",
         );
     }
 

@@ -425,6 +425,45 @@ pub fn freshness_report_with_threshold(
         .collect()
 }
 
+/// Build compact, LLM-visible advisories for stale injected prompt signals.
+/// This is policy-neutral: callers decide whether to surface the strings in
+/// summary alerts, self-model context, logs, or all of the above.
+#[must_use]
+pub fn stale_channel_advisories(report: &[ChannelFreshness]) -> Vec<String> {
+    report
+        .iter()
+        .filter_map(|entry| {
+            let ChannelStatus::Stale { rounds_alive } = entry.status else {
+                return None;
+            };
+            Some(format!(
+                "stale_injection: {} unchanged for {} rounds; {}",
+                entry.channel.tag(),
+                rounds_alive,
+                stale_channel_guidance(entry.channel),
+            ))
+        })
+        .collect()
+}
+
+fn stale_channel_guidance(channel: InjectionChannel) -> &'static str {
+    match channel {
+        InjectionChannel::OutcomeBias => {
+            "treat tool outcome bias as a weak prior and prefer current tool results until it changes"
+        }
+        InjectionChannel::RecentFailingTests => {
+            "recheck the failing test or error source before using it as current evidence"
+        }
+        InjectionChannel::VolatilePending => {
+            "verify pending runtime nudges still apply before following them"
+        }
+        InjectionChannel::Lessons => {
+            "apply only if it still matches the current task and repository state"
+        }
+        _ => "verify against current state before acting on this signal",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +767,26 @@ mod tests {
             entry.status
         );
         assert!(entry.preview.contains("new different"));
+    }
+
+    #[test]
+    fn stale_advisories_demote_long_unchanged_outcome_bias() {
+        let mut h = InjectionHistory::new();
+        let fp = InjectionFingerprint::from_content("bash=-0.100");
+        for round in 0..=17 {
+            h.observe(round, InjectionChannel::OutcomeBias, fp.clone());
+        }
+
+        let report = freshness_report(&h, 17);
+        let advisories = stale_channel_advisories(&report);
+
+        assert!(
+            advisories
+                .iter()
+                .any(|a| a.contains("outcome_bias unchanged for 17 rounds")
+                    && a.contains("weak prior")),
+            "stale outcome_bias must produce a demotion advisory: {advisories:?}",
+        );
     }
 
     #[test]

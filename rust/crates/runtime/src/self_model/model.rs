@@ -88,6 +88,11 @@ pub struct SelfModel {
     #[serde(default)]
     pub outcome_bias:
         std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
+    /// Runtime-injection freshness advisories. These demote prompt signals
+    /// whose bytes have stayed unchanged for many rounds, without deleting
+    /// the underlying historical evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_runtime_signals: Vec<String>,
     /// High-failure tools surfaced for the model to reason about — the
     /// runtime provides the signal; the model decides whether to avoid
     /// them or try anyway.
@@ -499,6 +504,7 @@ impl SelfModel {
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
+            stale_runtime_signals: Vec::new(),
             low_confidence_tools: Vec::new(),
             skill_diagnosis: None,
             turn_quality_feedback: None,
@@ -550,6 +556,14 @@ impl SelfModel {
         bias: std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
     ) -> Self {
         self.outcome_bias = bias;
+        self
+    }
+
+    /// Attach freshness advisories for runtime-injected prompt signals.
+    /// These are deliberately separate from the signal payloads so the model
+    /// can demote stale guidance without losing the historical context.
+    pub fn with_stale_runtime_signals(mut self, advisories: Vec<String>) -> Self {
+        self.stale_runtime_signals = advisories;
         self
     }
 
@@ -862,6 +876,16 @@ impl SelfModel {
             }
         }
 
+        if !self.stale_runtime_signals.is_empty() {
+            let rendered: Vec<String> = self
+                .stale_runtime_signals
+                .iter()
+                .take(4)
+                .map(|s| s.replace('\n', " "))
+                .collect();
+            let _ = writeln!(s, "Stale runtime signals: {}", rendered.join(" · "));
+        }
+
         // ── Recent signals ──
         if !self.recent_signals.is_empty() {
             s.push_str("Recent signals: ");
@@ -1086,6 +1110,9 @@ impl SelfModel {
             return true;
         }
         if !self.outcome_bias.is_empty() {
+            return true;
+        }
+        if !self.stale_runtime_signals.is_empty() {
             return true;
         }
         if !self.low_confidence_tools.is_empty() {
@@ -2119,6 +2146,23 @@ mod tests {
         let model = minimal_model();
         let rendered = model.to_system_prompt_section();
         assert!(!rendered.contains("Tool outcome bias"), "got: {rendered}");
+    }
+
+    #[test]
+    fn stale_runtime_signals_render_as_demotion_advisory() {
+        let model = minimal_model().with_stale_runtime_signals(vec![
+            "stale_injection: outcome_bias unchanged for 17 rounds; treat tool outcome bias as a weak prior".into(),
+        ]);
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            rendered.contains("Stale runtime signals: stale_injection: outcome_bias"),
+            "got: {rendered}",
+        );
+        assert!(
+            rendered.contains("weak prior"),
+            "stale advisory should preserve demotion guidance: {rendered}",
+        );
+        assert!(model.has_meaningful_self_awareness());
     }
 
     #[test]

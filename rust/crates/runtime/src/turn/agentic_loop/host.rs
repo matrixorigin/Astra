@@ -579,7 +579,7 @@ pub(crate) fn build_introspect_snapshot(
     let circuit_breaker = {
         let cb = &state.stall.circuit_breaker;
         Some(astra_turn_core::introspect::CircuitBreakerSnapshot {
-            state: format!("{:?}", cb.state()).to_lowercase(),
+            state: cb.state().operator_label().to_string(),
             failure_count: cb.rounds_completed() as u64,
             success_count: 0, // LoopCircuitBreaker does not expose success count
             consecutive_failures: cb.consecutive_read_only() as u64,
@@ -1344,6 +1344,10 @@ pub enum VolatileKind {
     DeferredUserInput,
     /// Budget-review acknowledgment.
     BudgetReview,
+    /// Context-pressure guidance from [`RuntimePolicy`]. Singleton so repeated
+    /// pressure checks replace the prior guidance instead of stacking prompt
+    /// noise inside the same LLM call.
+    ContextPressure,
     /// Open-ended exploration budget reminder.
     ExplorationBudget,
     /// Execution retry with corrective reason.
@@ -1392,6 +1396,7 @@ impl VolatileKind {
             Self::WorkingSet
                 | Self::AlreadyFetched
                 | Self::ExplorationBudget
+                | Self::ContextPressure
                 | Self::Mailbox
                 | Self::CompactResume
                 | Self::TaskBoardCompletionGate
@@ -1421,6 +1426,7 @@ impl VolatileKind {
             | Self::TaskBoardStartGate
             | Self::ExecutionRetry
             | Self::ExplorationBudget
+            | Self::ContextPressure
             | Self::DeferredUserInput
             | Self::BudgetReview
             | Self::IntentDrift => "user",
@@ -8875,15 +8881,34 @@ mod parallel_execution_tests {
         let mut state = make_state();
         state.push_volatile(VolatileKind::IntentDrift, "first correction");
         state.push_volatile(VolatileKind::IntentDrift, "second correction");
+        state.push_volatile(VolatileKind::ContextPressure, "pressure 70");
+        state.push_volatile(VolatileKind::ContextPressure, "pressure 71");
         assert_eq!(
             state.volatile_pending.len(),
-            1,
+            2,
             "singleton kind must replace, not append — cache invariant violated"
         );
-        let content = state.volatile_pending[0].content.as_str();
+        let content = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::IntentDrift)
+            .expect("intent drift singleton")
+            .content
+            .as_str();
         assert!(
             content.contains("second"),
             "replacement must keep the LATEST correction, got: {content}"
+        );
+        let pressure_content = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::ContextPressure)
+            .expect("context pressure singleton")
+            .content
+            .as_str();
+        assert!(
+            pressure_content.contains("71"),
+            "context pressure singleton must keep the latest guidance, got: {pressure_content}"
         );
     }
 

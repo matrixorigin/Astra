@@ -38,6 +38,19 @@ pub enum BreakerState {
     HalfOpen,
 }
 
+impl BreakerState {
+    /// Stable operator-facing label. These labels describe runtime behavior
+    /// without exposing the electrical circuit metaphor used internally.
+    #[must_use]
+    pub const fn operator_label(self) -> &'static str {
+        match self {
+            Self::Closed => "monitoring",
+            Self::Open => "tripped",
+            Self::HalfOpen => "recovering",
+        }
+    }
+}
+
 /// Action the loop should take after consulting the circuit breaker.
 ///
 /// Marked `#[non_exhaustive]` so future soft-intervention variants can be

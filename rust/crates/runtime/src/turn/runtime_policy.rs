@@ -18,23 +18,22 @@ use serde::{Deserialize, Serialize};
 
 // ─── Framework Actions ────────────────────────────────────────────────────────
 
-/// Urgency level for context compaction requests.
+/// Urgency level for context-pressure guidance.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum CompactionUrgency {
-    /// Standard compaction: trim older entries in the ring buffer.
+pub enum ContextPressureUrgency {
+    /// Elevated token pressure: conserve context, but continue normally.
     Normal,
-    /// Aggressive compaction: clear the ring buffer and force a summarization
-    /// of the session so far.
+    /// Critical token pressure: strongly prefer synthesis or a narrow next action.
     Aggressive,
 }
 
-impl Default for CompactionUrgency {
+impl Default for ContextPressureUrgency {
     fn default() -> Self {
         Self::Normal
     }
 }
 
-impl std::fmt::Display for CompactionUrgency {
+impl std::fmt::Display for ContextPressureUrgency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Normal => write!(f, "normal"),
@@ -87,8 +86,12 @@ pub enum FrameworkAction {
         /// Absolute ceiling — never exceed this regardless of factor.
         max_ceiling: u32,
     },
-    /// Request context compaction to reduce token pressure.
-    TriggerCompaction { urgency: CompactionUrgency },
+    /// Signal high token pressure to the agent.
+    ///
+    /// This is intentionally not a compaction event. Real compaction events are
+    /// emitted only by the lifecycle/retry compression pipelines after they
+    /// actually free tokens.
+    SignalContextPressure { urgency: ContextPressureUrgency },
     /// Transition to a different turn phase.
     TransitionPhase { target: PhaseTarget },
     /// Inject a signal into the agent's context for the next round.
@@ -104,23 +107,22 @@ pub struct PendingSignal {
     pub injected_at_round: u32,
 }
 
-// ─── Context Compaction Policy ───────────────────────────────────────────────
+// ─── Context Pressure Policy ─────────────────────────────────────────────────
 
-/// Policy for context compaction triggered by cache pressure.
+/// Policy for agent-visible guidance under token pressure.
 ///
-/// When `cache_pressure` (from `JournalFacts`) exceeds the threshold, the
-/// policy engine requests `FrameworkAction::TriggerCompaction` with the
+/// When `token_pressure` (from `JournalFacts`) exceeds the threshold, the
+/// policy engine requests `FrameworkAction::SignalContextPressure` with the
 /// configured urgency level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactPolicy {
-    /// Cache pressure threshold (0.0–1.0) above which Normal compaction fires.
-    /// Measures how full the context window is.
+pub struct ContextPressurePolicy {
+    /// Token pressure threshold (0.0–1.0) above which Normal guidance fires.
     pub pressure_threshold: f64,
-    /// Cache pressure threshold (0.0–1.0) above which Aggressive compaction fires.
+    /// Token pressure threshold (0.0–1.0) above which Aggressive guidance fires.
     pub aggressive_pressure_threshold: f64,
 }
 
-impl Default for CompactPolicy {
+impl Default for ContextPressurePolicy {
     fn default() -> Self {
         Self {
             pressure_threshold: 0.70,
@@ -198,7 +200,7 @@ impl Default for TextlessPolicy {
 ///
 /// Composes three sub-policies:
 /// - `RuntimePolicy` core: budget expansion, signal injection for streaks
-/// - `CompactPolicy`: compaction under cache pressure
+/// - `ContextPressurePolicy`: guidance under token pressure
 /// - `CircuitPolicy`: diagnostic guidance under errors / read-only streaks
 ///
 /// This lives in the runtime crate (not core) because it makes **decisions**.
@@ -214,9 +216,9 @@ pub struct RuntimePolicy {
     pub max_ceiling: u32,
     /// Transition to reflection after this many consecutive rounds with zero outcome.
     pub reflect_after_consecutive_zero: u32,
-    /// Compaction sub-policy.
+    /// Context-pressure sub-policy.
     #[serde(default)]
-    pub compact: CompactPolicy,
+    pub context_pressure: ContextPressurePolicy,
     /// Circuit breaker sub-policy.
     #[serde(default)]
     pub circuit: CircuitPolicy,
@@ -232,7 +234,7 @@ impl Default for RuntimePolicy {
             expand_factor: 1.5,
             max_ceiling: 1000,
             reflect_after_consecutive_zero: 3,
-            compact: CompactPolicy::default(),
+            context_pressure: ContextPressurePolicy::default(),
             circuit: CircuitPolicy::default(),
             textless: TextlessPolicy::default(),
         }
@@ -243,9 +245,9 @@ impl RuntimePolicy {
     /// Evaluate `facts` and return the set of actions the runtime should take.
     ///
     /// Actions are determined in priority order. Stall is the highest-priority
-    /// signal (returns immediately); after that, compaction, diagnostic guidance,
+    /// signal (returns immediately); after that, pressure guidance, diagnostic guidance,
     /// phase transition, and expansion/signal are evaluated. Multiple actions may
-    /// be returned (e.g. compaction + diagnostic signal).
+    /// be returned (e.g. pressure guidance + diagnostic signal).
     ///
     /// This is **not** auto-applied — the caller receives the actions and
     /// decides how to execute them. The policy only reads the pure factual
@@ -266,15 +268,15 @@ impl RuntimePolicy {
             return actions;
         }
 
-        // ── Priority 2: Context Compaction ───────────────────────────────
+        // ── Priority 2: Context Pressure Guidance ────────────────────────
         // Aggressive first (higher severity); Normal fallback.
-        if facts.cache_pressure >= self.compact.aggressive_pressure_threshold {
-            actions.push(FrameworkAction::TriggerCompaction {
-                urgency: CompactionUrgency::Aggressive,
+        if facts.token_pressure >= self.context_pressure.aggressive_pressure_threshold {
+            actions.push(FrameworkAction::SignalContextPressure {
+                urgency: ContextPressureUrgency::Aggressive,
             });
-        } else if facts.cache_pressure >= self.compact.pressure_threshold {
-            actions.push(FrameworkAction::TriggerCompaction {
-                urgency: CompactionUrgency::Normal,
+        } else if facts.token_pressure >= self.context_pressure.pressure_threshold {
+            actions.push(FrameworkAction::SignalContextPressure {
+                urgency: ContextPressureUrgency::Normal,
             });
         }
 
@@ -388,9 +390,7 @@ impl RuntimePolicy {
                 retry_count,
                 max = self.textless.max_retries,
                 total_tool_calls,
-                "textless_stop_retries_exhausted: {} tools, {} retries",
-                total_tool_calls,
-                retry_count,
+                "textless_stop_retries_exhausted: {total_tool_calls} tools, {retry_count} retries"
             );
             return None;
         }
@@ -438,7 +438,7 @@ mod tests {
     use super::*;
 
     /// Build a minimal `JournalFacts` with only the legacy fields set.
-    /// New fields (cache_pressure, etc.) default to 0.0.
+    /// New fields (token_pressure, etc.) default to 0.0.
     fn facts(
         outcome_streak: u32,
         zero_streak: u32,
@@ -456,7 +456,7 @@ mod tests {
             consecutive_read_only: 0,
             total_tool_calls: 0,
             stall_reason: None,
-            cache_pressure: 0.0,
+            token_pressure: 0.0,
             current_error_rate: 0.0,
             task_completion_ratio: 0.0,
             cache_hit_ratio: 0.0,
@@ -566,7 +566,7 @@ mod tests {
             expand_factor: 2.0,
             max_ceiling: 200,
             reflect_after_consecutive_zero: 5,
-            compact: CompactPolicy::default(),
+            context_pressure: ContextPressurePolicy::default(),
             circuit: CircuitPolicy::default(),
             textless: TextlessPolicy::default(),
         };
@@ -588,7 +588,7 @@ mod tests {
             expand_factor: 100.0,
             max_ceiling: 100,
             reflect_after_consecutive_zero: 3,
-            compact: CompactPolicy::default(),
+            context_pressure: ContextPressurePolicy::default(),
             circuit: CircuitPolicy::default(),
             textless: TextlessPolicy::default(),
         };
@@ -614,14 +614,14 @@ mod tests {
             consecutive_rounds_without_outcome: 3,
             budget_remaining: 2,
             budget_max: 10,
-            cache_pressure: 0.95,
+            token_pressure: 0.95,
             current_error_rate: 0.5,
             task_completion_ratio: 1.0,
             ..facts(3, 3, 2, 10)
         };
         let actions = policy.decide(&f);
         // Stall signal takes priority; only one action returned even though
-        // cache pressure, error rate, and completion ratio all suggest other actions.
+        // token pressure, error rate, and completion ratio all suggest other actions.
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], FrameworkAction::InjectSignal { .. }));
     }
@@ -700,92 +700,92 @@ mod tests {
     // NEW: Compaction, Circuit Breaker, Phase Transition tests
     // ══════════════════════════════════════════════════════════════════════════
 
-    // ── Compaction (14 tests) ──────────────────────────────────────────────
+    // ── Context pressure guidance ─────────────────────────────────────────
 
     #[test]
-    fn compaction_normal_on_pressure() {
+    fn context_pressure_signal_normal_on_pressure() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 10);
-        f.cache_pressure = 0.75;
+        f.token_pressure = 0.75;
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::TriggerCompaction {
-                urgency: CompactionUrgency::Normal,
+            FrameworkAction::SignalContextPressure {
+                urgency: ContextPressureUrgency::Normal,
             }
         )));
     }
 
     #[test]
-    fn compaction_aggressive_on_high_pressure() {
+    fn context_pressure_signal_aggressive_on_high_pressure() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 10);
-        f.cache_pressure = 0.95;
+        f.token_pressure = 0.95;
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::TriggerCompaction {
-                urgency: CompactionUrgency::Aggressive,
+            FrameworkAction::SignalContextPressure {
+                urgency: ContextPressureUrgency::Aggressive,
             }
         )));
     }
 
     #[test]
-    fn compaction_not_triggered_low_pressure() {
+    fn context_pressure_signal_not_triggered_low_pressure() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 10);
-        f.cache_pressure = 0.60;
+        f.token_pressure = 0.60;
         let actions = policy.decide(&f);
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::TriggerCompaction { .. }))
+                .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. }))
         );
     }
 
     #[test]
-    fn compaction_boundary_exact_threshold() {
+    fn context_pressure_signal_boundary_exact_threshold() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 10);
-        f.cache_pressure = 0.70; // exactly at pressure_threshold
+        f.token_pressure = 0.70; // exactly at pressure_threshold
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::TriggerCompaction {
-                urgency: CompactionUrgency::Normal,
+            FrameworkAction::SignalContextPressure {
+                urgency: ContextPressureUrgency::Normal,
             }
         )));
     }
 
     #[test]
-    fn compaction_boundary_just_below_aggressive() {
+    fn context_pressure_signal_boundary_just_below_aggressive() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 10);
-        f.cache_pressure = 0.89; // below aggressive_pressure_threshold (0.90)
+        f.token_pressure = 0.89; // below aggressive_pressure_threshold (0.90)
         let actions = policy.decide(&f);
         // Should get Normal, not Aggressive
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::TriggerCompaction {
-                urgency: CompactionUrgency::Normal,
+            FrameworkAction::SignalContextPressure {
+                urgency: ContextPressureUrgency::Normal,
             }
         )));
         assert!(!actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::TriggerCompaction {
-                urgency: CompactionUrgency::Aggressive,
+            FrameworkAction::SignalContextPressure {
+                urgency: ContextPressureUrgency::Aggressive,
             }
         )));
     }
 
     #[test]
-    fn compaction_custom_thresholds() {
+    fn context_pressure_signal_custom_thresholds() {
         let policy = RuntimePolicy {
             expand_after_consecutive_outcomes: 2,
             expand_factor: 1.5,
             max_ceiling: 1000,
             reflect_after_consecutive_zero: 3,
-            compact: CompactPolicy {
+            context_pressure: ContextPressurePolicy {
                 pressure_threshold: 0.50,
                 aggressive_pressure_threshold: 0.80,
             },
@@ -793,12 +793,12 @@ mod tests {
             textless: TextlessPolicy::default(),
         };
         let mut f = facts(0, 0, 8, 10);
-        f.cache_pressure = 0.55; // above custom threshold of 0.50
+        f.token_pressure = 0.55; // above custom threshold of 0.50
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::TriggerCompaction {
-                urgency: CompactionUrgency::Normal,
+            FrameworkAction::SignalContextPressure {
+                urgency: ContextPressureUrgency::Normal,
             }
         )));
     }
@@ -838,7 +838,8 @@ mod tests {
         assert!(
             actions.iter().all(|a| !matches!(
                 a,
-                FrameworkAction::ExpandBudget { .. } | FrameworkAction::TriggerCompaction { .. }
+                FrameworkAction::ExpandBudget { .. }
+                    | FrameworkAction::SignalContextPressure { .. }
             )),
             "large read-only investigations should get guidance, not runtime budget mutation"
         );
@@ -910,7 +911,7 @@ mod tests {
             expand_factor: 1.5,
             max_ceiling: 1000,
             reflect_after_consecutive_zero: 3,
-            compact: CompactPolicy::default(),
+            context_pressure: ContextPressurePolicy::default(),
             circuit: CircuitPolicy {
                 max_consecutive_errors: 3,
                 max_consecutive_reads: 5,
@@ -976,7 +977,7 @@ mod tests {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 20);
         f.current_error_rate = 0.40;
-        f.cache_pressure = 0.75;
+        f.token_pressure = 0.75;
         let actions = policy.decide(&f);
         assert!(actions.len() >= 2);
         assert!(
@@ -987,7 +988,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::TriggerCompaction { .. }))
+                .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. }))
         );
     }
 
@@ -1026,7 +1027,7 @@ mod tests {
             consecutive_read_only: 0,
             total_tool_calls: 0,
             stall_reason: None,
-            cache_pressure: 0.0,
+            token_pressure: 0.0,
             current_error_rate: 0.0,
             task_completion_ratio: 0.0,
             cache_hit_ratio: 0.0,
@@ -1039,15 +1040,15 @@ mod tests {
     // ── Extreme values (unhappy path) ──────────────────────────────────────
 
     #[test]
-    fn full_cache_pressure_triggers_aggressive() {
+    fn full_token_pressure_triggers_aggressive() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 10);
-        f.cache_pressure = 1.0;
+        f.token_pressure = 1.0;
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::TriggerCompaction {
-                urgency: CompactionUrgency::Aggressive,
+            FrameworkAction::SignalContextPressure {
+                urgency: ContextPressureUrgency::Aggressive,
             }
         )));
     }
@@ -1081,6 +1082,145 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })),
             "circuit guidance must not backdoor a computed budget floor: {actions:?}"
+        );
+    }
+
+    // ���═════════════════════════════════════════════════════════════════════════
+    // Textless Stop Policy — unhappy path coverage
+    // ══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn textless_stop_retries_exhausted_returns_none() {
+        let policy = RuntimePolicy::default();
+        // retry_count (2) >= max_retries (2) → no retry
+        let result = policy.decide_textless_stop(2, 5, false, false);
+        assert!(result.is_none(), "exhausted retries must return None");
+    }
+
+    #[test]
+    fn textless_stop_retry_succeeds_below_limit() {
+        let policy = RuntimePolicy::default();
+        // retry_count (0) < max_retries (2), tool_calls > 0 → inject nudge
+        let result = policy.decide_textless_stop(0, 3, false, false);
+        assert!(result.is_some(), "below retry limit should inject nudge");
+        match result.unwrap() {
+            FrameworkAction::InjectSignal { message } => {
+                assert!(message.contains("NO summary text"));
+                assert!(message.contains("1/2"), "should show attempt 1 of 2");
+            }
+            other => panic!("expected InjectSignal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn textless_stop_second_retry_shows_correct_count() {
+        let policy = RuntimePolicy::default();
+        let result = policy.decide_textless_stop(1, 7, false, false);
+        assert!(result.is_some());
+        match result.unwrap() {
+            FrameworkAction::InjectSignal { message } => {
+                assert!(message.contains("2/2"), "should show attempt 2 of 2");
+            }
+            other => panic!("expected InjectSignal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn textless_stop_suppress_nudges_returns_none() {
+        let policy = RuntimePolicy::default();
+        let result = policy.decide_textless_stop(0, 5, false, true);
+        assert!(result.is_none(), "suppress_nudges must skip retry");
+    }
+
+    #[test]
+    fn textless_stop_exploratory_excluded_returns_none() {
+        let policy = RuntimePolicy::default();
+        // is_exploratory=true, exclude_exploratory=true (default)
+        let result = policy.decide_textless_stop(0, 5, true, false);
+        assert!(result.is_none(), "exploratory tasks must skip retry");
+    }
+
+    #[test]
+    fn textless_stop_exploratory_not_excluded_retries() {
+        let policy = RuntimePolicy {
+            textless: TextlessPolicy {
+                exclude_exploratory: false,
+                ..TextlessPolicy::default()
+            },
+            ..RuntimePolicy::default()
+        };
+        let result = policy.decide_textless_stop(0, 5, true, false);
+        assert!(
+            result.is_some(),
+            "when exclude_exploratory=false, should retry"
+        );
+    }
+
+    #[test]
+    fn textless_stop_no_tool_calls_returns_none() {
+        let policy = RuntimePolicy::default();
+        let result = policy.decide_textless_stop(0, 0, false, false);
+        assert!(result.is_none(), "no tool calls must skip retry");
+    }
+
+    #[test]
+    fn textless_stop_max_retries_zero_disables() {
+        let policy = RuntimePolicy {
+            textless: TextlessPolicy {
+                max_retries: 0,
+                ..TextlessPolicy::default()
+            },
+            ..RuntimePolicy::default()
+        };
+        let result = policy.decide_textless_stop(0, 5, false, false);
+        assert!(
+            result.is_none(),
+            "max_retries=0 must disable retry entirely"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Truncation Marker — unhappy path coverage
+    // ══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn truncation_marker_on_length_finish_reason() {
+        let policy = RuntimePolicy::default();
+        let result = policy.truncation_marker(Some("length"));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn truncation_marker_not_triggered_on_stop() {
+        let policy = RuntimePolicy::default();
+        assert!(policy.truncation_marker(Some("stop")).is_none());
+    }
+
+    #[test]
+    fn truncation_marker_not_triggered_on_tool_calls() {
+        let policy = RuntimePolicy::default();
+        assert!(policy.truncation_marker(Some("tool_calls")).is_none());
+    }
+
+    #[test]
+    fn truncation_marker_not_triggered_on_none() {
+        let policy = RuntimePolicy::default();
+        assert!(policy.truncation_marker(None).is_none());
+    }
+
+    #[test]
+    fn truncation_marker_disabled_returns_none() {
+        let policy = RuntimePolicy {
+            textless: TextlessPolicy {
+                mark_truncated_text: false,
+                ..TextlessPolicy::default()
+            },
+            ..RuntimePolicy::default()
+        };
+        assert!(
+            policy.truncation_marker(Some("length")).is_none(),
+            "disabled policy must not emit marker"
         );
     }
 }

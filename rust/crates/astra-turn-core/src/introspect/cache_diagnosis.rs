@@ -27,6 +27,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::RoundSnapshotEntry;
+
 /// One cache snapshot per LLM round. Populated by the runtime from the
 /// per-turn cache ring and/or `llm_capture_*.json` files.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -787,8 +789,8 @@ pub fn render_findings_markdown(rounds: &[RoundSnapshot], findings: &[CacheFindi
             "_No per-round cache snapshots available in this session._ \
              Enable `full_llm_capture=true` in the session metadata to \
              populate `~/.astra/sessions/{sid}/llm_capture_t{N}_r{M}_*.json`, \
-             or wait for the in-memory per-turn ring (runtime wiring \
-             pending) to accumulate rounds.\n",
+             or wait for the live in-memory recent-round ring to accumulate \
+             rounds.\n",
         );
         return out;
     }
@@ -845,6 +847,126 @@ pub fn render_findings_markdown(rounds: &[RoundSnapshot], findings: &[CacheFindi
         ));
     }
     out
+}
+
+/// Render the live in-memory recent-round ring as a cache/token history
+/// fallback. This intentionally does not run cache-control marker rules:
+/// the lightweight ring carries token counters and finish/tool summaries, but
+/// not full request message/tool marker positions. Full marker diagnosis still
+/// requires `llm_capture_*.json`.
+#[must_use]
+pub fn render_recent_round_history_markdown(rounds: &[RoundSnapshotEntry]) -> String {
+    let mut out = String::new();
+    out.push_str("## Cache Diagnosis\n\n");
+
+    if rounds.is_empty() {
+        out.push_str(
+            "_No per-round cache snapshots or live recent-round summaries are available yet._ \
+             Enable `full_llm_capture=true` for full cache-control marker diagnosis, \
+             or wait for the live recent-round ring to accumulate at least one LLM round.\n",
+        );
+        return out;
+    }
+
+    out.push_str(
+        "_No full LLM captures found; using the live `recent_rounds` ring._ \
+         Token/cache trend is available. Cache-control marker placement diagnosis \
+         still requires `full_llm_capture=true`.\n\n",
+    );
+
+    out.push_str(
+        "| t_r | provider | model | prompt | cache_read | cache_create | completion | cache_hit | tools | finish |\n",
+    );
+    out.push_str(
+        "|-----|----------|-------|--------|------------|--------------|------------|-----------|-------|--------|\n",
+    );
+
+    for r in rounds {
+        let provider = markdown_cell_or_dash(&r.provider);
+        let model = markdown_cell_or_dash(&r.model);
+        let finish = markdown_cell_or_dash(r.finish_reason.as_deref().unwrap_or(""));
+        let tools = if r.tool_call_names.is_empty() {
+            if r.tool_calls_returned == 0 {
+                "-".to_string()
+            } else {
+                r.tool_calls_returned.to_string()
+            }
+        } else {
+            markdown_cell_or_dash(&r.tool_call_names.join(","))
+        };
+        let input_total = r.prompt_tokens + r.cache_read_tokens + r.cache_creation_tokens;
+        let cache_hit = if input_total > 0 {
+            (r.cache_read_tokens as f64 / input_total as f64) * 100.0
+        } else {
+            0.0
+        };
+        out.push_str(&format!(
+            "| t{}_r{} | {} | {} | {} | {} | {} | {} | {:.0}% | {} | {} |\n",
+            r.turn,
+            r.round,
+            provider,
+            model,
+            r.prompt_tokens,
+            r.cache_read_tokens,
+            r.cache_creation_tokens,
+            r.completion_tokens,
+            cache_hit,
+            tools,
+            finish,
+        ));
+    }
+
+    let total_prompt: u64 = rounds.iter().map(|r| r.prompt_tokens).sum();
+    let total_cache_read: u64 = rounds.iter().map(|r| r.cache_read_tokens).sum();
+    let total_cache_create: u64 = rounds.iter().map(|r| r.cache_creation_tokens).sum();
+    let total_completion: u64 = rounds.iter().map(|r| r.completion_tokens).sum();
+    let total_input = total_prompt + total_cache_read + total_cache_create;
+    let cache_hit = if total_input > 0 {
+        (total_cache_read as f64 / total_input as f64) * 100.0
+    } else {
+        0.0
+    };
+    let peak_prompt = rounds.iter().map(|r| r.prompt_tokens).max().unwrap_or(0);
+    let (first_prompt, last_prompt) = rounds
+        .first()
+        .zip(rounds.last())
+        .map(|(first, last)| (first.prompt_tokens, last.prompt_tokens))
+        .unwrap_or((0, 0));
+
+    out.push_str(&format!(
+        "\nHistory: {} rounds, prompt {} -> {} (delta {}), peak_prompt={}, aggregate_cache_hit={:.0}%.\n",
+        rounds.len(),
+        first_prompt,
+        last_prompt,
+        signed_delta(last_prompt, first_prompt),
+        peak_prompt,
+        cache_hit,
+    ));
+    out.push_str(&format!(
+        "Totals: prompt={} cache_read={} cache_create={} completion={} input_total={}.\n",
+        total_prompt, total_cache_read, total_cache_create, total_completion, total_input,
+    ));
+    out.push_str(
+        "Coverage: live ring is enough for per-round token/cache trend; full capture is required for message/tool cache marker positions.\n",
+    );
+    out
+}
+
+fn markdown_cell_or_dash(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "-".to_string()
+    } else {
+        trimmed.replace('|', "\\|")
+    }
+}
+
+fn signed_delta(newer: u64, older: u64) -> String {
+    if newer >= older {
+        format!("+{}", newer - older)
+    } else {
+        format!("-{}", older - newer)
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1290,6 +1412,57 @@ mod tests {
         assert!(
             out.contains("No per-round cache snapshots"),
             "must say why no data: {out}",
+        );
+    }
+
+    #[test]
+    fn render_recent_round_history_uses_live_ring_without_full_capture() {
+        let rounds = vec![
+            RoundSnapshotEntry {
+                turn: 2,
+                round: 0,
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+                prompt_tokens: 1_000,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 600,
+                completion_tokens: 120,
+                tool_calls_returned: 1,
+                tool_call_names: vec!["rg".into()],
+                duration_ms: 40,
+                finish_reason: Some("tool_calls".into()),
+            },
+            RoundSnapshotEntry {
+                turn: 2,
+                round: 1,
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+                prompt_tokens: 1_250,
+                cache_read_tokens: 500,
+                cache_creation_tokens: 50,
+                completion_tokens: 90,
+                tool_calls_returned: 0,
+                tool_call_names: Vec::new(),
+                duration_ms: 35,
+                finish_reason: Some("stop".into()),
+            },
+        ];
+
+        let out = render_recent_round_history_markdown(&rounds);
+
+        assert!(out.contains("live `recent_rounds` ring"), "got: {out}");
+        assert!(out.contains("| t2_r0 |"), "round table missing: {out}");
+        assert!(
+            out.contains("| 1000 | 0 | 600 |"),
+            "cache_create missing: {out}"
+        );
+        assert!(
+            out.contains("prompt 1000 -> 1250 (delta +250)"),
+            "prompt trend missing: {out}",
+        );
+        assert!(
+            out.contains("full capture is required"),
+            "coverage caveat missing: {out}",
         );
     }
 

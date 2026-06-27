@@ -673,8 +673,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         // Stall reason from the unified stall diagnosis.
         facts.stall_reason = interruption_diagnosis_summary(state);
 
-        // Populate cache pressure from the LiveRuntimeProvider.
-        facts.cache_pressure = provider.token_pressure();
+        // Populate token pressure from the LiveRuntimeProvider.
+        facts.token_pressure = provider.token_pressure();
 
         // Populate task completion ratio from the SessionStateProvider.
         facts.task_completion_ratio = provider.task_completion_ratio();
@@ -722,43 +722,19 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         "Policy injected signal into agent context"
                     );
                 }
-                FrameworkAction::TriggerCompaction { urgency } => {
-                    let kind = match urgency {
-                        crate::turn::runtime_policy::CompactionUrgency::Normal => {
-                            CompactionKind::ProactiveDefault
-                        }
-                        crate::turn::runtime_policy::CompactionUrgency::Aggressive => {
-                            CompactionKind::ProactiveAggressive
-                        }
-                    };
-                    let pressure = facts.cache_pressure;
-                    // Estimate: we pass approximate values; host will refine.
-                    let event = CompactionEvent::new(
-                        kind,
-                        pressure,
-                        0,       // tokens_freed (unknown until after)
-                        0,       // tokens_before (host will measure)
-                        128_000, // max_tokens (approximate)
-                        0,       // messages_removed (unknown)
-                        0,       // messages_after (unknown)
-                        vec![format!(
-                            "Policy-driven compaction ({}) at {:.0}% cache pressure",
-                            urgency,
-                            pressure * 100.0,
-                        )],
-                    );
-                    host.on_compaction(event);
+                FrameworkAction::SignalContextPressure { urgency } => {
+                    let pressure = facts.token_pressure;
                     let msg = format!(
-                        "[Framework action] Triggering {urgency} compaction — cache pressure at {:.0}%.",
+                        "[Context pressure] Token pressure is {:.0}% ({urgency}). Conserve context: reuse prior tool results, avoid duplicate reads, summarize current evidence briefly, and prefer targeted next actions.",
                         pressure * 100.0,
                         urgency = urgency,
                     );
-                    state.push_volatile(super::host::VolatileKind::BudgetReview, msg);
+                    state.push_volatile(super::host::VolatileKind::ContextPressure, msg);
                     tracing::info!(
                         target: "astra::policy",
                         %urgency,
-                        pressure,
-                        "Policy-driven compaction triggered"
+                        token_pressure = pressure,
+                        "Policy context-pressure guidance injected"
                     );
                 }
                 FrameworkAction::TransitionPhase { target } => {

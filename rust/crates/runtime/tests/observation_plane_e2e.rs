@@ -312,10 +312,10 @@ fn e2e_inspection_produces_non_empty_alerts_on_high_pressure() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn e2e_policy_decide_triggers_compaction_on_high_cache_pressure() {
-    // Test decide() directly with explicit facts — cache_pressure > 0.70 threshold
+fn e2e_policy_decide_signals_context_pressure_on_high_token_pressure() {
+    // Test decide() directly with explicit facts — token_pressure > 0.70 threshold
     let facts = JournalFacts {
-        cache_pressure: 0.85,
+        token_pressure: 0.85,
         budget_remaining: 10,
         budget_max: 10,
         ..Default::default()
@@ -323,20 +323,20 @@ fn e2e_policy_decide_triggers_compaction_on_high_cache_pressure() {
     let policy = RuntimePolicy::default();
     let decisions = policy.decide(&facts);
 
-    let has_compaction = decisions
+    let has_pressure_signal = decisions
         .iter()
-        .any(|d| matches!(d, FrameworkAction::TriggerCompaction { .. }));
+        .any(|d| matches!(d, FrameworkAction::SignalContextPressure { .. }));
     assert!(
-        has_compaction,
-        "expected TriggerCompaction at 85% pressure, got: {:?}",
+        has_pressure_signal,
+        "expected SignalContextPressure at 85% pressure, got: {:?}",
         decisions
     );
 }
 
 #[test]
-fn e2e_policy_decide_aggressive_compaction_on_critical_pressure() {
+fn e2e_policy_decide_aggressive_context_pressure_on_critical_pressure() {
     let facts = JournalFacts {
-        cache_pressure: 0.92,
+        token_pressure: 0.92,
         budget_remaining: 10,
         budget_max: 10,
         ..Default::default()
@@ -347,14 +347,14 @@ fn e2e_policy_decide_aggressive_compaction_on_critical_pressure() {
     let has_aggressive = decisions.iter().any(|d| {
         matches!(
             d,
-            FrameworkAction::TriggerCompaction {
-                urgency: astra_runtime::turn::runtime_policy::CompactionUrgency::Aggressive
+            FrameworkAction::SignalContextPressure {
+                urgency: astra_runtime::turn::runtime_policy::ContextPressureUrgency::Aggressive
             }
         )
     });
     assert!(
         has_aggressive,
-        "expected Aggressive compaction at 92% pressure, got: {:?}",
+        "expected aggressive context-pressure signal at 92% pressure, got: {:?}",
         decisions
     );
 }
@@ -371,7 +371,7 @@ fn e2e_policy_decide_continue_when_healthy() {
 
     let has_aggressive = decisions
         .iter()
-        .any(|d| matches!(d, FrameworkAction::TriggerCompaction { .. }));
+        .any(|d| matches!(d, FrameworkAction::SignalContextPressure { .. }));
     assert!(
         !has_aggressive,
         "healthy state should not trigger aggressive actions: {:?}",
@@ -851,24 +851,24 @@ fn e2e_inspection_without_tool_calls_produces_zero_error_rate() {
 }
 
 #[test]
-fn e2e_policy_respects_compact_policy_thresholds() {
-    // Use explicit facts — cache_pressure=0.60 with custom threshold 0.50
+fn e2e_policy_respects_context_pressure_policy_thresholds() {
+    // Use explicit facts — token_pressure=0.60 with custom threshold 0.50
     let facts = JournalFacts {
-        cache_pressure: 0.60,
+        token_pressure: 0.60,
         budget_remaining: 10,
         budget_max: 10,
         ..Default::default()
     };
 
     let mut policy = RuntimePolicy::default();
-    policy.compact.pressure_threshold = 0.5;
+    policy.context_pressure.pressure_threshold = 0.5;
 
     let decisions = policy.decide(&facts);
-    let has_compaction = decisions
+    let has_pressure_signal = decisions
         .iter()
-        .any(|d| matches!(d, FrameworkAction::TriggerCompaction { .. }));
+        .any(|d| matches!(d, FrameworkAction::SignalContextPressure { .. }));
     assert!(
-        has_compaction,
+        has_pressure_signal,
         "custom threshold 0.5 should trigger at 60%: {:?}",
         decisions
     );
@@ -893,7 +893,7 @@ fn e2e_policy_circuit_breaker_respects_custom_max_errors() {
 
     let provider = make_provider(&state, &policy);
     let mut facts = provider.extract_facts();
-    facts.cache_pressure = provider.token_pressure();
+    facts.token_pressure = provider.token_pressure();
 
     let decisions = policy.decide(&facts);
     let has_adjustment = decisions.iter().any(|d| {

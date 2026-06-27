@@ -953,6 +953,10 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.budget_wrapup_injected = false;
     state.budget_wrapup_ignored_rounds = 0;
     state.textless_stop_retries = 0;
+    // Defensive reset: last_finish_reason is rewritten before every LLM call
+    // in execution_phase.rs, but resetting here prevents stale leakage if a
+    // future early-exit path reads it before the next LLM invocation.
+    state.last_finish_reason = None;
 }
 
 /// Build a synthetic JournalEvent from the current turn's tool_call_records

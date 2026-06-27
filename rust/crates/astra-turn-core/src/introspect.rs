@@ -595,6 +595,16 @@ pub fn render_injection_freshness(s: &IntrospectSnapshot) -> String {
         out.push_str(&format!(
             "Summary: {stale_count}/{tracked_count} channels unchanged beyond stale threshold — these signals may no longer reflect current state; verify before acting on them.\n",
         ));
+        let advisories =
+            crate::injection_tracking::stale_channel_advisories(&s.injection_freshness);
+        if !advisories.is_empty() {
+            out.push_str("Advisories:\n");
+            for advisory in advisories.iter().take(5) {
+                out.push_str("- ");
+                out.push_str(advisory);
+                out.push('\n');
+            }
+        }
     }
     out
 }
@@ -1342,7 +1352,7 @@ mod tests {
                 ..Default::default()
             },
             circuit_breaker: Some(CircuitBreakerSnapshot {
-                state: "half_open".into(),
+                state: "recovering".into(),
                 failure_count: 5,
                 success_count: 20,
                 consecutive_failures: 3,
@@ -1350,7 +1360,7 @@ mod tests {
             ..Default::default()
         };
         let out = render_stall_state(&snap);
-        assert!(out.contains("half_open"), "CB state missing: {out}");
+        assert!(out.contains("recovering"), "CB state missing: {out}");
         assert!(
             out.contains("consecutive_failures=3"),
             "CB consecutive missing: {out}"

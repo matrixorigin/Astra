@@ -68,12 +68,12 @@ pub struct JournalFacts {
     /// e.g. "Same tools called 3 times in a row: [read_file, grep]".
     /// This is an objective fact from the framework, not a judgment.
     pub stall_reason: Option<String>,
-    /// Cache pressure (0.0–1.0): how full the context window is.
+    /// Token pressure (0.0–1.0): how full the context window is.
     /// Derived from token usage vs. context window budget.
     /// 0.0 = empty, 1.0 = full / overflow imminent.
     /// Populated by the execution phase (not computed in the journal).
     #[serde(default)]
-    pub cache_pressure: f64,
+    pub token_pressure: f64,
     /// Error rate (0.0–1.0) across the journal window.
     /// failed_calls / total_calls, aggregated from recent turns.
     pub current_error_rate: f64,
@@ -507,7 +507,7 @@ impl ObservationJournal {
             facts.cache_hit_ratio = avg_cache_hit;
         }
 
-        // Note: cache_pressure and task_completion_ratio are populated by
+        // Note: token_pressure and task_completion_ratio are populated by
         // the execution phase from authoritative state (token pressure and
         // task board), not computed from journal entries.
 

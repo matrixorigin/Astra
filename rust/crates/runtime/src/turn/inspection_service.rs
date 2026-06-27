@@ -467,7 +467,7 @@ mod tests {
             assert!((metrics.current_error_rate - 0.0).abs() < f64::EPSILON);
             assert!((metrics.task_completion_ratio - 1.0).abs() < f64::EPSILON);
             assert_eq!(metrics.phase_label, "execution");
-            assert_eq!(metrics.circuit_breaker_state, "armed");
+            assert_eq!(metrics.circuit_breaker_state, "monitoring");
             assert!(metrics.alerts.is_empty());
         });
     }
@@ -559,7 +559,7 @@ mod tests {
             compaction_tier: "light".to_string(),
             alerts: vec!["test_alert".to_string()],
             circuit_breaker: Some(CircuitBreakerSnapshot {
-                state: "armed".to_string(),
+                state: "monitoring".to_string(),
                 failure_count: 0,
                 success_count: 5,
                 consecutive_failures: 0,
@@ -574,7 +574,7 @@ mod tests {
         assert!(summary.contains("remaining=7"));
         assert!(summary.contains("compaction: light"));
         assert!(summary.contains("test_alert"));
-        assert!(summary.contains("circuit_breaker: armed"));
+        assert!(summary.contains("circuit_breaker: monitoring"));
     }
 
     #[test]

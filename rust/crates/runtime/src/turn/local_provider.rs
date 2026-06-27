@@ -12,7 +12,7 @@
 //! ```ignore
 //! let provider = LocalSessionProvider::new(&state, &policy);
 //! let mut facts = provider.extract_facts();
-//! facts.cache_pressure = provider.token_pressure();
+//! facts.token_pressure = provider.token_pressure();
 //! facts.task_completion_ratio = provider.task_completion_ratio();
 //! let actions = policy.decide(&facts);
 //! ```
@@ -132,12 +132,7 @@ impl SessionStateProvider for LocalSessionProvider<'_> {
     }
 
     fn circuit_breaker_state(&self) -> &'static str {
-        use astra_turn_core::loop_circuit_breaker::BreakerState;
-        match self.state.stall.circuit_breaker.state() {
-            BreakerState::Closed => "armed",
-            BreakerState::Open => "tripped",
-            BreakerState::HalfOpen => "disabled",
-        }
+        self.state.stall.circuit_breaker.state().operator_label()
     }
 
     fn remaining_turns(&self) -> u32 {
@@ -270,11 +265,11 @@ mod tests {
     }
 
     #[test]
-    fn session_provider_circuit_breaker_armed() {
+    fn session_provider_circuit_breaker_monitoring() {
         let state = make_state();
         let p = make_provider(&state);
-        // Default circuit breaker should be armed
-        assert_eq!(p.circuit_breaker_state(), "armed");
+        // Default circuit breaker is passively monitoring normal operation.
+        assert_eq!(p.circuit_breaker_state(), "monitoring");
     }
 
     // ── Composition test ────────────────────────────────────────────────

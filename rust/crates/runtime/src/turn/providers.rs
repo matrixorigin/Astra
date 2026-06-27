@@ -51,7 +51,7 @@ pub trait ObservationProvider: Send + Sync {
     /// Extract a factual snapshot from the journal.
     ///
     /// The returned `JournalFacts` includes outcome streaks, budget data,
-    /// and read-only streaks. **Does not** include live metrics (cache
+    /// and read-only streaks. **Does not** include live metrics (token
     /// pressure, error rate, task completion) — those come from the other
     /// provider traits.
     fn extract_facts(&self) -> JournalFacts;
@@ -79,7 +79,7 @@ pub trait SessionStateProvider: Send + Sync {
     /// Human-readable label for the current turn phase.
     fn current_phase_label(&self) -> &'static str;
 
-    /// Circuit breaker state as a lowercase string: "armed", "tripped", or "disabled".
+    /// Circuit breaker state as a lowercase string: "monitoring", "tripped", or "recovering".
     fn circuit_breaker_state(&self) -> &'static str;
 
     /// Rounds remaining in the turn budget.
