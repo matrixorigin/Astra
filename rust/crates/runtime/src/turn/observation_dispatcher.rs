@@ -54,14 +54,6 @@ pub enum ObservationEvent {
         /// The action decided by [`RuntimePolicy::decide`].
         action: FrameworkAction,
     },
-
-    /// Emitted when the agentic loop transitions between phases.
-    PhaseTransition {
-        /// Phase label before the transition.
-        from: &'static str,
-        /// Phase label after the transition.
-        to: &'static str,
-    },
 }
 
 // ── Sink trait ───────────────────────────────────────────────────────────────
@@ -326,9 +318,6 @@ mod tests {
                 ObservationEvent::PolicyDecision { .. } => {
                     self.events.push("policy_decision".to_string());
                 }
-                ObservationEvent::PhaseTransition { .. } => {
-                    self.events.push("phase_transition".to_string());
-                }
             }
             Ok(())
         }
@@ -373,9 +362,9 @@ mod tests {
         dispatcher.register(FailingSink);
         dispatcher.register(RecordingSink::new());
 
-        dispatcher.dispatch(ObservationEvent::PhaseTransition {
-            from: "planning",
-            to: "execution",
+        dispatcher.dispatch(ObservationEvent::TurnCompleted {
+            metrics: TurnMetrics::default(),
+            facts: JournalFacts::default(),
         });
 
         // The failing sink failed, but the other two succeeded.
@@ -413,7 +402,6 @@ mod tests {
                 let label = match event {
                     ObservationEvent::TurnCompleted { .. } => "turn_completed",
                     ObservationEvent::PolicyDecision { .. } => "policy_decision",
-                    ObservationEvent::PhaseTransition { .. } => "phase_transition",
                 };
                 self.events.lock().unwrap().push(label.to_string());
                 Ok(())
@@ -432,17 +420,10 @@ mod tests {
         dispatcher.dispatch(ObservationEvent::PolicyDecision {
             action: FrameworkAction::Continue,
         });
-        dispatcher.dispatch(ObservationEvent::PhaseTransition {
-            from: "tool_phase",
-            to: "execution_phase",
-        });
 
         let captured = events.lock().unwrap();
-        assert_eq!(
-            *captured,
-            vec!["turn_completed", "policy_decision", "phase_transition"]
-        );
-        assert_eq!(dispatcher.event_count(), 3);
+        assert_eq!(*captured, vec!["turn_completed", "policy_decision"]);
+        assert_eq!(dispatcher.event_count(), 2);
     }
 
     #[test]

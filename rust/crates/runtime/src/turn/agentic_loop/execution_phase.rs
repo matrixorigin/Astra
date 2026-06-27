@@ -22,6 +22,10 @@ use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, Resume
 use astra_turn_core::stall::IntentDrift;
 use uuid::Uuid;
 
+use crate::turn::observation_dispatcher::{
+    FileSink, MemorySink, ObservationDispatcher, ObservationEvent,
+};
+
 /// Lazily-initialized process-wide alert dispatcher.
 ///
 /// Reads `ASTRA_ALERT_WEBHOOK_URL` (and optional `ASTRA_ALERT_WEBHOOK_MIN_SEVERITY`)
@@ -679,6 +683,28 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
         let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
         let actions = policy.decide(&facts);
+
+        // ── Observation pipeline: dispatch PolicyDecision events ──
+        {
+            let mut dispatcher = ObservationDispatcher::new();
+            dispatcher.register(MemorySink::new(&mut state.observation_journal));
+            if let Some(ref store) = state.observation_store {
+                dispatcher.register(FileSink::new(
+                    Some(store.clone()),
+                    state
+                        .current_session_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
+            }
+            for action in &actions {
+                dispatcher.dispatch(ObservationEvent::PolicyDecision {
+                    action: action.clone(),
+                });
+            }
+        } // dispatcher dropped — releases &mut observation_journal
+
         for action in actions {
             match action {
                 FrameworkAction::ExpandBudget {

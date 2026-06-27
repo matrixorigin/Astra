@@ -779,16 +779,16 @@ fn e2e_dispatcher_all_event_variants_flow_to_sinks() {
             metrics: make_turn_metrics(1, 3, 0),
             facts: JournalFacts::default(),
         });
-        dispatcher.dispatch(ObservationEvent::PhaseTransition {
-            from: "execution",
-            to: "reflection",
+        dispatcher.dispatch(ObservationEvent::TurnCompleted {
+            metrics: make_turn_metrics(2, 4, 1),
+            facts: JournalFacts::default(),
         });
 
         assert_eq!(dispatcher.event_count(), 3);
         assert_eq!(dispatcher.failure_count(), 0);
     } // drop dispatcher
 
-    assert_eq!(journal.len(), 2);
+    assert_eq!(journal.len(), 3);
 }
 
 #[test]
