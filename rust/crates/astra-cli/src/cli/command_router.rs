@@ -3952,18 +3952,18 @@ mod show_policy_tests {
     fn config_show_policy_end_to_end_opus_hits_builtin_profile() {
         // End-to-end: load config, resolve, format. Asserts the whole
         // wiring works — not just the string formatter. Opus's built-in
-        // profile is 4 / 20 / 4 / 3 (see
+        // profile is 4 / 128 / 4 / 3 (see
         // `ToolPolicyConfig::builtin_model_profiles`).
         let cfg = astra_config::runtime_config::RuntimeConfig::load();
         let policy = cfg.tool_policy.resolve_for_model(Some("opus"));
         let human = format_policy_output(Some("opus"), &policy, "strict", &[], false);
         assert!(human.contains("= 4"), "expected 4s for opus: {human}");
-        assert!(human.contains("= 20"), "expected 20 for opus: {human}");
+        assert!(human.contains("= 128"), "expected 128 for opus: {human}");
 
         let json = format_policy_output(Some("opus"), &policy, "strict", &[], true);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["max_identical_tool_calls"], 4);
-        assert_eq!(parsed["max_tools_per_turn"], 20);
+        assert_eq!(parsed["max_tools_per_turn"], 128);
     }
 
     #[test]

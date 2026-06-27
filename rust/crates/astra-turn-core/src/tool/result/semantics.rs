@@ -467,6 +467,45 @@ pub fn tool_dedup_signature(name: &str, args: &Value) -> String {
 }
 
 fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(String, Value)> {
+    if name == "git_diff" {
+        let mut canonical = serde_json::Map::new();
+        canonical.insert("action".to_string(), Value::String("diff".to_string()));
+        if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
+            canonical.insert("staged".to_string(), Value::Bool(true));
+        }
+        if args
+            .get("stat_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            canonical.insert("stat_only".to_string(), Value::Bool(true));
+        }
+        if let Some(base_ref) = args
+            .get("base_ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            canonical.insert("base_ref".to_string(), Value::String(base_ref.to_string()));
+        }
+        if let Some(git_ref) = args
+            .get("ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "HEAD")
+        {
+            canonical.insert("ref".to_string(), Value::String(git_ref.to_string()));
+        }
+        if let Some(path) = args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| path.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty())
+        {
+            canonical.insert("path".to_string(), Value::String(path));
+        }
+        return Some(("git".to_string(), Value::Object(canonical)));
+    }
     if name == "git"
         && args
             .get("action")
@@ -960,6 +999,24 @@ if let Err(e) = writeln!(file, "{line}") {
             tool_dedup_signature(
                 "git",
                 &json!({"action": "diff", "path": "src", "ref": "HEAD"})
+            )
+        );
+    }
+
+    #[test]
+    fn tool_dedup_signature_canonicalizes_structured_git_diff_tool() {
+        assert_eq!(
+            tool_dedup_signature("git_diff", &json!({"path": "src/", "ref": "HEAD"})),
+            tool_dedup_signature(
+                "git",
+                &json!({"action": "diff", "path": "src", "ref": "HEAD"})
+            )
+        );
+        assert_eq!(
+            tool_dedup_signature("git_diff", &json!({"path": "src", "ref": "main"})),
+            tool_dedup_signature(
+                "git",
+                &json!({"action": "diff", "path": "src", "ref": "main"})
             )
         );
     }

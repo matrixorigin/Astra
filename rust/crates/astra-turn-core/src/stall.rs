@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::tool::args::shape::{tool_call_arguments_value, tool_call_name};
 use crate::tool::categories::registry;
+use crate::tool::result::semantics::tool_dedup_signature;
 
 /// Errors from stall / divergence / reward-hacking heuristics (invalid configuration or inputs).
 #[derive(Debug, Clone, Error, PartialEq)]
@@ -160,11 +161,7 @@ pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>,
         .map(|tc| {
             let name = tool_call_name(tc).unwrap_or("");
             let args = tool_call_arguments_value(tc);
-            format!(
-                "{}:{}",
-                name,
-                serde_json::to_string(&args).unwrap_or_default()
-            )
+            tool_dedup_signature(name, &args)
         })
         .collect();
     let name_set: HashSet<String> = tool_calls
@@ -808,6 +805,33 @@ mod tests {
                 .any(|s| s.contains("read_file") && s.contains("a.rs"))
         );
         assert!(names.contains("read_file"));
+    }
+
+    #[test]
+    fn round_tool_call_sig_canonicalizes_equivalent_diff_tools() {
+        let bash = vec![serde_json::json!({
+            "id": "call_bash",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": "{\"command\":\"git diff -- src/\"}"
+            }
+        })];
+        let structured = vec![serde_json::json!({
+            "id": "call_git_diff",
+            "type": "function",
+            "function": {
+                "name": "git_diff",
+                "arguments": "{\"path\":\"src\",\"ref\":\"HEAD\"}"
+            }
+        })];
+
+        let (bash_sigs, bash_names) = round_tool_call_sig_and_names(&bash);
+        let (structured_sigs, structured_names) = round_tool_call_sig_and_names(&structured);
+
+        assert_eq!(bash_sigs, structured_sigs);
+        assert!(bash_names.contains("bash"));
+        assert!(structured_names.contains("git_diff"));
     }
 
     // ── assess_progress (general progress-aware stall) ──

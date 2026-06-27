@@ -754,7 +754,7 @@ impl ExplorationFamily {
 fn classify_exploration_family(record: &ToolCallRecord) -> Option<ExplorationFamily> {
     let args = record.args_full.as_deref().unwrap_or("");
     match record.name.as_str() {
-        "git" if tool_action_is(args, "diff") => Some(ExplorationFamily::Diff),
+        name if is_diff_like_tool_call(name, args) => Some(ExplorationFamily::Diff),
         "read_file" => Some(ExplorationFamily::Read),
         "grep" | "rg" | "glob" => Some(ExplorationFamily::Search),
         "bash" if is_search_like_tool_call(&record.name, args) => Some(ExplorationFamily::Search),
@@ -771,6 +771,23 @@ fn tool_action_is(args: &str, expected: &str) -> bool {
         .is_some_and(|value| {
             value.get("action").and_then(serde_json::Value::as_str) == Some(expected)
         })
+}
+
+fn is_diff_like_tool_call(name: &str, args: &str) -> bool {
+    if name == "git_diff" || (name == "git" && tool_action_is(args, "diff")) {
+        return true;
+    }
+    if name != "bash" {
+        return false;
+    }
+
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static DIFF_CMD: OnceLock<Regex> = OnceLock::new();
+    let diff_re =
+        DIFF_CMD.get_or_init(|| Regex::new(r#"(^|[;&|]\s*)git\s+(--no-pager\s+)?diff\b"#).unwrap());
+    diff_re.is_match(&bash_command_text(args))
 }
 
 fn longest_exploration_family_round_streak(
@@ -2466,6 +2483,18 @@ mod tests {
             ..Default::default()
         }
     }
+
+    fn record_in_round_with_args(
+        name: &str,
+        round: u32,
+        batch: Option<&str>,
+        args: serde_json::Value,
+    ) -> ToolCallRecord {
+        let mut record = record_in_round(name, round, batch);
+        record.args_full = Some(args.to_string());
+        record
+    }
+
     #[test]
     fn exploration_family_churn_flags_repeated_git_action_diff_rounds() {
         let mut records = vec![record_in_round("git", 0, None)];
@@ -2505,6 +2534,62 @@ mod tests {
             "exploration-family churn quality={} should be below baseline={}",
             eval.quality,
             baseline.quality
+        );
+    }
+
+    #[test]
+    fn exploration_family_churn_flags_bash_and_structured_diff_rounds() {
+        let records = vec![
+            record_in_round_with_args(
+                "bash",
+                0,
+                Some("b-0"),
+                serde_json::json!({"command": "git diff -- src/"}),
+            ),
+            record_in_round_with_args(
+                "git_diff",
+                0,
+                Some("b-0"),
+                serde_json::json!({"path": "src", "ref": "HEAD"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                1,
+                Some("b-1"),
+                serde_json::json!({"command": "git --no-pager diff -- src/"}),
+            ),
+            record_in_round_with_args(
+                "git_diff",
+                1,
+                Some("b-1"),
+                serde_json::json!({"path": "src", "ref": "HEAD"}),
+            ),
+            record_in_round_with_args(
+                "bash",
+                2,
+                Some("b-2"),
+                serde_json::json!({"command": "git diff -- src/"}),
+            ),
+            record_in_round_with_args(
+                "git_diff",
+                2,
+                Some("b-2"),
+                serde_json::json!({"path": "src", "ref": "HEAD"}),
+            ),
+        ];
+
+        let eval = evaluate_tool_call_records("review local changes", &[], &records, 0, false, 0.3);
+        let streak = eval.signals.iter().find_map(|signal| match signal {
+            EvalSignal::ExplorationFamilyChurn { family, streak } => {
+                Some((family.as_str(), *streak))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            streak,
+            Some(("diff", 3)),
+            "expected mixed diff tools to count as diff-family churn, got {:?}",
+            eval.signals
         );
     }
 

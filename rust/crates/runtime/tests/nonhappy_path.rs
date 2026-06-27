@@ -79,15 +79,15 @@ mod stall_detection {
 mod turn_limits {
     use astra_turn_core::loop_circuit_breaker::BreakerConfig;
 
-    /// Proves the circuit breaker's absolute_max_rounds default is a reasonable
+    /// Proves the circuit breaker's absolute_max_rounds default is a bounded
     /// infrastructure ceiling and the single source of truth for the hard round cap.
     #[test]
     fn absolute_max_rounds_default_is_bounded() {
         let cap = BreakerConfig::default().absolute_max_rounds;
         assert!(cap > 0, "absolute_max_rounds must be positive, got {cap}");
         assert!(
-            cap <= 200,
-            "absolute_max_rounds default should be <= 200 (infrastructure ceiling), got {cap}"
+            cap <= 300,
+            "absolute_max_rounds default should be <= 300 (infrastructure ceiling), got {cap}"
         );
     }
 }

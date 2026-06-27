@@ -810,7 +810,9 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                     astra_turn_core::interruption::InterruptionKind::EmptyCompletion
                 ) =>
             {
-                format!(" Interruption: {}.", i.kind.label())
+                let mut note = format!(" Interruption: {}.", i.kind.label());
+                append_interruption_detail(&mut note, i);
+                note
             }
             _ => String::new(),
         };
