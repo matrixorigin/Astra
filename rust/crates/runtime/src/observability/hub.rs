@@ -213,7 +213,13 @@ impl ObservabilityHub {
     pub fn record_delegation_outcome(&self, scenario: &str, pattern: &str, succeeded: bool) {
         self.delegation_outcomes
             .record(scenario, pattern, succeeded);
-        self.delegation_outcomes.persist();
+        if let Err(err) = self.delegation_outcomes.persist() {
+            tracing::warn!(
+                target: "astra.observability",
+                error = %err,
+                "delegation_outcomes persist failed"
+            );
+        }
     }
 
     /// Get the historically preferred coordination pattern for a scenario.

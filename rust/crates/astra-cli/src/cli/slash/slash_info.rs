@@ -2438,7 +2438,7 @@ pub(crate) fn render_cognition(state: &SessionState) -> String {
     let _ = writeln!(out, "  turn             : {}", state.turn);
     let _ = writeln!(
         out,
-        "  note             : boosted_tools/widen_surface_pending are applied per-turn on the server loop; inspect per-turn via /turn trace or runtime logs."
+        "  note             : boosted_tools/widen_selection_pending are applied per-turn on the server loop; inspect per-turn via /turn trace or runtime logs."
     );
     out
 }

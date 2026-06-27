@@ -1,5 +1,5 @@
 use super::{fanout_test_context, test_executor, test_spawner};
-use crate::edge_tools::{ToolExecutor, all_tool_schemas, truncate_output};
+use crate::edge_tools::{all_tool_schemas, truncate_output, ToolExecutor};
 use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
 use chrono::Utc;
@@ -131,12 +131,10 @@ async fn consolidated_github_create_issue_error_does_not_leak_helper_style_name(
     let parsed: serde_json::Value = serde_json::from_str(&result).expect("github error json");
     assert_eq!(parsed["ok"], false);
     assert_eq!(parsed["tool"], "github");
-    assert!(
-        parsed["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("create_issue")
-    );
+    assert!(parsed["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("create_issue"));
 }
 
 /// Standalone `delegate` is not a CLI executor tool. Server/runtime
@@ -1439,8 +1437,14 @@ async fn execute_reflect_uses_local_surface_with_session() {
             .len(),
         1
     );
-    assert_eq!(value["overview"]["total_events"], 2);
-    assert_eq!(value["overview"]["error_count"], 1);
+    assert_eq!(value["data_coverage"]["events"], 2);
+    // error information now lives in observations, not a separate overview.error_count field
+    assert!(
+        value["observations"]
+            .as_array()
+            .is_some_and(|obs| !obs.is_empty()),
+        "expected at least one observation"
+    );
 }
 
 #[test]

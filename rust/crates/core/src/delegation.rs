@@ -107,6 +107,9 @@ impl DelegationOutcomeTracker {
     }
 
     /// Record a delegation outcome. Auto-persists and enforces capacity bounds.
+    ///
+    /// Persistence errors are logged to stderr but do not propagate — delegation
+    /// outcomes are best-effort observability, not transactional state.
     pub fn record(&self, scenario: &str, pattern: &str, succeeded: bool) {
         {
             let mut map = self.data.write().unwrap_or_else(|e| e.into_inner());
@@ -125,7 +128,9 @@ impl DelegationOutcomeTracker {
                 Self::evict_least_observed(&mut map);
             }
         }
-        self.persist();
+        if let Err(err) = self.persist() {
+            eprintln!("[delegation-outcomes] persist failed: {err}");
+        }
     }
 
     /// Get outcome stats for a specific scenario/pattern pair.
@@ -157,32 +162,24 @@ impl DelegationOutcomeTracker {
     }
 
     /// Persist data to storage using an atomic rename.
-    pub fn persist(&self) {
+    ///
+    /// Returns `Ok(())` on success or the first I/O error encountered.
+    /// Errors are not silently swallowed; callers decide whether to log or propagate.
+    pub fn persist(&self) -> std::io::Result<()> {
         let Some(path) = &self.storage_path else {
-            return;
+            return Ok(());
         };
-        if let Some(parent) = path.parent()
-            && let Err(err) = std::fs::create_dir_all(parent)
-        {
-            eprintln!("[delegation-outcomes] failed to create storage directory: {err}");
-            return;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
         let data = {
             let map = self.data.read().unwrap_or_else(|e| e.into_inner());
-            let Ok(data) = serde_json::to_vec_pretty(&*map) else {
-                return;
-            };
-            data
+            serde_json::to_vec_pretty(&*map).map_err(std::io::Error::other)?
         };
         let tmp = path.with_extension("tmp");
-        if let Err(err) = std::fs::write(&tmp, data) {
-            eprintln!("[delegation-outcomes] failed to write temp file: {err}");
-            return;
-        }
-        if let Err(err) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            eprintln!("[delegation-outcomes] failed to rename temp file: {err}");
-        }
+        std::fs::write(&tmp, data)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 }
 

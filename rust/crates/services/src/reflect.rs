@@ -49,18 +49,12 @@ pub struct ReflectReport {
     pub graph_slice: ObservationGraphSlice,
     #[serde(default)]
     pub budget_result: ObservationBudgetResult,
-    pub overview: SessionOverview,
-    /// Root-cause diagnoses from actual error content analysis
-    pub diagnoses: Vec<Diagnosis>,
-    /// Statistical insights (secondary)
-    pub insights: Vec<Insight>,
-    pub recommendations: Vec<String>,
 }
 
 // Type aliases removed — use Observation* types from astra_core directly
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SessionOverview {
+pub(crate) struct SessionOverview {
     pub total_events: i64,
     pub total_decisions: i64,
     pub duration_minutes: Option<f64>,
@@ -82,7 +76,7 @@ pub struct SessionOverview {
 /// (`"resource_limit"`) instead of the old `PascalCase` (`"ResourceLimit"`).
 /// This is intentional — all enum tags in the codebase use snake_case.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Diagnosis {
+pub(crate) struct Diagnosis {
     pub category: astra_core::ErrorKind,
     pub severity: String,
     pub summary: String,
@@ -94,7 +88,7 @@ pub struct Diagnosis {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Insight {
+pub(crate) struct Insight {
     pub severity: String,
     pub category: String,
     pub message: String,
@@ -265,30 +259,6 @@ fn build_evidence_graph(
         budget_result: ObservationBudgetResult::default(),
     })
 }
-/// Request for LLM-powered single-turn analysis.
-#[derive(Debug, Clone)]
-pub struct TurnAnalysisRequest {
-    pub session_id: String,
-    pub turn: u32,
-    pub question: String,
-}
-
-/// Result of LLM-powered turn analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnAnalysisReport {
-    pub session_id: String,
-    pub turn: u32,
-    pub question: String,
-    /// LLM-generated root cause analysis.
-    pub diagnosis: String,
-    /// Specific recommendations from the LLM.
-    pub recommendations: Vec<String>,
-    /// Tool surface quality assessment.
-    pub tool_surface_quality: Option<String>,
-    /// Data sources used for the analysis.
-    pub data_sources: Vec<String>,
-}
-
 pub type ServiceResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -317,7 +287,7 @@ pub fn classify_error(content: &str, event_type: &str) -> astra_core::ErrorKind 
 }
 
 /// Build diagnoses from raw error records by classifying and grouping.
-pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
+pub(crate) fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
     use astra_core::ErrorKind;
     use std::collections::HashMap;
 
@@ -446,7 +416,7 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
 
 // ── Statistical insights (secondary) ─────────────────────────────────────────
 
-pub fn generate_insights(
+pub(crate) fn generate_insights(
     overview: &SessionOverview,
     error_patterns: &[ErrorPattern],
     decision_aggs: &[DecisionAgg],
@@ -526,7 +496,7 @@ pub fn generate_insights(
     insights
 }
 
-pub fn generate_recommendations(
+pub(crate) fn generate_recommendations(
     overview: &SessionOverview,
     diagnoses: &[Diagnosis],
     insights: &[Insight],
@@ -957,20 +927,21 @@ impl ReflectService for DatabaseReflectService {
             )
             .await?;
         let (evidence_graph, budget_result) = budget_reflect_evidence_graph(raw_evidence_graph);
-        let envelope = build_observation_envelope(
-            session_id,
-            &request,
-            &overview,
-            &diagnoses,
-            &insights,
-            &recommendations,
-            evidence_graph.as_ref(),
-        );
+        let (summary, observations, evidence, action_hints, failure_clusters) =
+            build_observation_envelope(
+                session_id,
+                &request,
+                &overview,
+                &diagnoses,
+                &insights,
+                &recommendations,
+                evidence_graph.as_ref(),
+            );
         let graph_slice = build_reflect_graph_slice(
-            evidence_graph.as_ref(),
-            &envelope.observations,
-            &envelope.evidence,
-            &envelope.failure_clusters,
+            evidence_graph,
+            &observations,
+            &evidence,
+            &failure_clusters,
             &budget_result,
         );
         let view = request.view(overview.total_events, overview.total_decisions);
@@ -981,25 +952,21 @@ impl ReflectService for DatabaseReflectService {
             tool: "reflect".to_string(),
             session_id: session_id.to_string(),
             analysis_view: request.analysis_view,
-            topic: request.topic,
-            facet: request.facet,
-            depth: request.depth,
-            horizon: request.horizon,
-            source_policy: request.source_policy,
+            topic: request.topic.as_str().to_string(),
+            facet: request.facet.as_str().to_string(),
+            depth: request.depth.as_str().to_string(),
+            horizon: request.horizon.as_str().to_string(),
+            source_policy: request.source_policy.as_str().to_string(),
             include_context: request.include_context,
             data_coverage,
             view: Some(view),
-            summary: envelope.summary,
-            observations: envelope.observations,
-            evidence: envelope.evidence,
-            action_hints: envelope.action_hints,
-            failure_clusters: envelope.failure_clusters,
+            summary,
+            observations,
+            evidence,
+            action_hints,
+            failure_clusters,
             graph_slice,
             budget_result,
-            overview,
-            diagnoses,
-            insights,
-            recommendations,
         })
     }
 }
@@ -1044,7 +1011,7 @@ fn budget_reflect_evidence_graph(
 }
 
 fn build_reflect_graph_slice(
-    evidence_graph: Option<&ObservationGraphSlice>,
+    evidence_graph: Option<ObservationGraphSlice>,
     observations: &[ObservationRecord],
     evidence: &[ObservationEvidence],
     failure_clusters: &[ObservationFailureCluster],
@@ -1056,26 +1023,19 @@ fn build_reflect_graph_slice(
     let mut edge_keys = BTreeSet::new();
 
     if let Some(graph) = evidence_graph {
-        for node in &graph.nodes {
+        for node in graph.nodes {
             push_graph_node(
                 &mut nodes,
                 &mut node_refs,
-                ObservationGraphNode {
-                    ref_id: node.ref_id.clone(),
-                    layer: node.layer,
-                    kind: node.kind,
-                    label: node.label.clone(),
-                    summary: node.summary.clone(),
-                    metadata: node.metadata.clone(),
-                },
+                node,
             );
         }
-        for edge in &graph.edges {
+        for edge in graph.edges {
             push_graph_edge(
                 &mut edges,
                 &mut edge_keys,
-                edge.from.clone(),
-                edge.to.clone(),
+                edge.from,
+                edge.to,
                 edge.kind,
             );
         }
@@ -1461,21 +1421,15 @@ mod tests {
         }];
         let recommendations = vec![" narrow   command scope ".to_string()];
 
-        let envelope = build_observation_envelope(
-            "sess/with spaces",
-            &request,
-            &overview,
-            &diagnoses,
-            &[],
-            &recommendations,
-            None,
-        );
-
-        let summary = envelope.summary;
-        let observations = envelope.observations;
-        let evidence = envelope.evidence;
-        let action_hints = envelope.action_hints;
-        let failure_clusters = envelope.failure_clusters;
+    let (summary, observations, evidence, action_hints, failure_clusters) = build_observation_envelope(
+        "sess/with spaces",
+        &request,
+        &overview,
+        &diagnoses,
+        &[],
+        &recommendations,
+        None,
+    );
 
         assert!(summary.contains("Timeout (bash)"));
         assert_eq!(observations.len(), 1);
@@ -1528,16 +1482,15 @@ mod tests {
             fix_hint: "check ulimit".into(),
         }];
 
-        let envelope = build_observation_envelope(
-            "sess-overview",
-            &request,
-            &overview,
-            &diagnoses,
-            &[],
-            &[],
-            None,
-        );
-        let observations = envelope.observations;
+    let (_, observations, _, _, _) = build_observation_envelope(
+        "sess-overview",
+        &request,
+        &overview,
+        &diagnoses,
+        &[],
+        &[],
+        None,
+    );
 
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].topic, "execution");
@@ -1575,18 +1528,15 @@ mod tests {
             "Consider using more DIVERSE TOOLS for better coverage".to_string(),
         ];
 
-        let envelope = build_observation_envelope(
-            "sess-insights",
-            &request,
-            &overview,
-            &[],
-            &insights,
-            &recommendations,
-            None,
-        );
-        let observations = envelope.observations;
-        let action_hints = envelope.action_hints;
-        let failure_clusters = envelope.failure_clusters;
+    let (_, observations, _, action_hints, failure_clusters) = build_observation_envelope(
+        "sess-insights",
+        &request,
+        &overview,
+        &[],
+        &insights,
+        &recommendations,
+        None,
+    );
 
         assert_eq!(observations[0].topic, "execution");
         assert_eq!(observations[0].facet, "stall");
@@ -1660,13 +1610,8 @@ mod tests {
         let request = ReflectRequest::from_observation_params(None, None, None, None, 20, "");
         let overview = make_overview(8, 0, vec![("bash".into(), 3)], 2, Some(1.0));
 
-        let envelope =
+        let (summary, observations, evidence, action_hints, failure_clusters) =
             build_observation_envelope("sess-healthy", &request, &overview, &[], &[], &[], None);
-        let summary = envelope.summary;
-        let observations = envelope.observations;
-        let evidence = envelope.evidence;
-        let action_hints = envelope.action_hints;
-        let failure_clusters = envelope.failure_clusters;
 
         assert!(summary.contains("Session healthy"));
         assert_eq!(observations.len(), 1);
@@ -1705,16 +1650,15 @@ mod tests {
             budget_result: ObservationBudgetResult::default(),
         };
 
-        let envelope = build_observation_envelope(
-            "sess-graph",
-            &request,
-            &overview,
-            &[],
-            &[],
-            &[],
-            Some(&graph),
-        );
-        let evidence = envelope.evidence;
+    let (_, _, evidence, _, _) = build_observation_envelope(
+        "sess-graph",
+        &request,
+        &overview,
+        &[],
+        &[],
+        &[],
+        Some(&graph),
+    );
 
         assert!(
             evidence
@@ -1775,22 +1719,22 @@ mod tests {
             }],
             budget_result: ObservationBudgetResult::default(),
         };
-        let envelope = build_observation_envelope(
-            "sess-graph-slice",
-            &request,
-            &overview,
-            &diagnoses,
-            &[],
-            &["narrow command scope".to_string()],
-            Some(&graph),
-        );
-        let graph_slice = build_reflect_graph_slice(
-            Some(&graph),
-            &envelope.observations,
-            &envelope.evidence,
-            &envelope.failure_clusters,
-            &ObservationBudgetResult::default(),
-        );
+    let (_, observations, evidence, _, failure_clusters) = build_observation_envelope(
+        "sess-graph-slice",
+        &request,
+        &overview,
+        &diagnoses,
+        &[],
+        &["narrow command scope".to_string()],
+        Some(&graph),
+    );
+    let graph_slice = build_reflect_graph_slice(
+        Some(graph),
+        &observations,
+        &evidence,
+        &failure_clusters,
+        &ObservationBudgetResult::default(),
+    );
 
         assert!(graph_slice.nodes.iter().any(|node| {
             node.ref_id == "urn:astra:event:cloud:evt-1"
@@ -1798,19 +1742,19 @@ mod tests {
                 && node.kind == ObservationGraphNodeKind::Event
         }));
         assert!(graph_slice.nodes.iter().any(|node| {
-            node.ref_id == envelope.observations[0].ref_id
+            node.ref_id == observations[0].ref_id
                 && node.layer == ObservationGraphLayer::Observation
                 && node.kind == ObservationGraphNodeKind::Observation
         }));
         assert!(graph_slice.nodes.iter().any(|node| {
-            node.ref_id == envelope.failure_clusters[0].cluster_ref
+            node.ref_id == failure_clusters[0].cluster_ref
                 && node.kind == ObservationGraphNodeKind::FailureCluster
         }));
         assert!(
             graph_slice
                 .nodes
                 .iter()
-                .any(|node| node.ref_id == envelope.evidence[0].ref_id
+                .any(|node| node.ref_id == evidence[0].ref_id
                     && node.kind == ObservationGraphNodeKind::Evidence),
             "materialized evidence previews must be nodes so observation edges are not dangling"
         );
@@ -2000,23 +1944,6 @@ mod tests {
             }],
             graph_slice: ObservationGraphSlice::default(),
             budget_result: ObservationBudgetResult::default(),
-            overview: make_overview(10, 1, vec![("bash".into(), 8)], 2, Some(5.0)),
-            diagnoses: vec![Diagnosis {
-                category: astra_core::ErrorKind::ResourceLimit,
-                severity: "critical".into(),
-                summary: "fork failed".into(),
-                samples: vec!["fork: Resource temporarily unavailable".into()],
-                occurrences: 3,
-                affected_tool: "bash".into(),
-                fix_hint: "check ulimit -u".into(),
-            }],
-            insights: vec![Insight {
-                severity: "info".into(),
-                category: "performance".into(),
-                message: "test".into(),
-                evidence: "test evidence".into(),
-            }],
-            recommendations: vec!["do something".into()],
         };
         assert_refs_are_valid(
             &report.observations,

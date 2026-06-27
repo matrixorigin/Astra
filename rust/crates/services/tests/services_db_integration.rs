@@ -18,16 +18,16 @@ use astra_services::replay::ReplaySessionRequestData;
 use astra_services::session_audit::TurnListParams;
 use astra_services::session_audit::{
     AuditSessionListParams, CrossSessionRuntimePromotionListParams, CrossSessionStatsParams,
-    DatabaseSessionAuditService, RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionController,
-    RuntimePromotionOutcome, RuntimePromotionRecommendation, SessionAuditService,
+    DatabaseSessionAuditService, RuntimePromotionController, RuntimePromotionOutcome,
+    RuntimePromotionRecommendation, SessionAuditService, RUNTIME_PROMOTION_EVENT_TYPE,
 };
 use astra_services::session_restore::{
-    COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND, HybridRestoreService, SessionRestoreService,
-    persist_remote_composite_snapshot_index, pull_step_checkpoint_from_cloud,
+    persist_remote_composite_snapshot_index, pull_step_checkpoint_from_cloud, HybridRestoreService,
+    SessionRestoreService, COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND,
 };
 use astra_services::session_workspace::{
-    ContextTraceSignal, ContextTraceToolSurface, WORKSPACE_METADATA_ARTIFACT_KIND,
-    WorkspaceMetadata, persist_remote_workspace,
+    persist_remote_workspace, ContextTraceSignal, ContextTraceToolSurface, WorkspaceMetadata,
+    WORKSPACE_METADATA_ARTIFACT_KIND,
 };
 use astra_services::{
     AdminAuditFilter, AdminAuditReader, ContextService, DatabaseAdminAuditReader,
@@ -36,11 +36,11 @@ use astra_services::{
     DatabaseReflectService, DatabaseReplayService, DatabaseSessionArtifactStore,
     DatabaseSessionService, DatabaseSkillService, DecisionCreateRequestData, DecisionListFilter,
     DecisionService, DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
-    IntrospectionService, MAX_API_LIST_LIMIT, MAX_MARKETPLACE_SEARCH_OFFSET, MarketplaceService,
-    MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService,
-    ReplayService, SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
-    SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
-    SnapshotListFilter,
+    IntrospectionService, MarketplaceService, MarketplaceStatsService,
+    MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService, ReplayService,
+    SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError, SessionListFilter,
+    SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData, SnapshotListFilter,
+    MAX_API_LIST_LIMIT, MAX_MARKETPLACE_SEARCH_OFFSET,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -4800,8 +4800,8 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         )
         .await
         .expect("owner reflect report");
-    assert_eq!(report.overview.total_events, 2);
-    assert_eq!(report.overview.total_decisions, 1);
+    assert_eq!(report.data_coverage.events, 2);
+    assert_eq!(report.data_coverage.decisions, 1);
     let view = report.view.as_ref().expect("reflect report includes view");
     assert_eq!(view.topic, "overview");
     assert_eq!(view.facet, "overview");
@@ -4823,20 +4823,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             })
         }),
         "reflect report should include standardized evidence refs"
-    );
-    assert!(
-        report
-            .overview
-            .top_skills
-            .iter()
-            .any(|(skill, _)| skill == "owner_skill")
-    );
-    assert!(
-        !report
-            .overview
-            .top_skills
-            .iter()
-            .any(|(skill, _)| skill == "other_skill")
     );
     let graph_slice_json =
         serde_json::to_string(&report.graph_slice).expect("serialize graph slice");

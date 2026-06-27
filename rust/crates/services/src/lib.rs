@@ -255,7 +255,7 @@ pub use prompt_delta::{
     persist_prompt_request, plan_prompt_request,
 };
 pub use reflect::{
-    DatabaseReflectService, Diagnosis, ReflectReport, ReflectService, UnconfiguredReflectService,
+    DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService,
 };
 pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{

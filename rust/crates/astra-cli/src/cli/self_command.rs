@@ -1,6 +1,6 @@
 use chrono::Utc;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
 use crate::cli::cli_config::cli_args::{
     SelfCmd, SelfJournalArgs, SelfMutateCmd, SelfMutateConfigArgs, SelfReflectArgs,
@@ -16,7 +16,8 @@ use astra_core::{
 };
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
-use astra_services::reflect::{Diagnosis, Insight, ReflectReport, ReflectRequest, SessionOverview};
+use astra_core::observation::SourcePolicy;
+use astra_services::reflect::{ReflectReport, ReflectRequest};
 use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, WorkspaceMetadata};
@@ -391,21 +392,56 @@ async fn build_reflect_response(
     if let Some(warning) = persistence_warning {
         warnings.push(warning);
     }
-    let overview = local_reflect_overview(artifacts.journal_events.len(), &recent_events);
+    let total_events = if artifacts.journal_events.len() > 0 {
+        artifacts.journal_events.len() as i64
+    } else {
+        recent_events.len() as i64
+    };
+    let mut error_count = 0i64;
+    for event in &recent_events {
+        if event.error.is_some()
+            || event.event_type.contains("error")
+            || event.event_type.contains("stall")
+        {
+            error_count += 1;
+        }
+    }
     let data_coverage = local_reflect_data_coverage(
         &request,
-        overview.total_events,
+        total_events,
         warnings.clone(),
         &recent_events,
     );
-    let summary = local_reflect_summary(&overview, &data_coverage);
+    let summary = if total_events == 0 {
+        "No local session observations are available yet.".to_string()
+    } else if error_count > 0 {
+        format!(
+            "Local session artifacts show {} recent error/stall event{} across {} observed event{}.",
+            error_count,
+            if error_count == 1 { "" } else { "s" },
+            total_events,
+            if total_events == 1 { "" } else { "s" }
+        )
+    } else if data_coverage.overall == "partial" {
+        format!(
+            "Local session artifacts are available with partial provider coverage: {} event{} observed.",
+            total_events,
+            if total_events == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "Local session artifacts show {} observed event{} with no local errors detected.",
+            total_events,
+            if total_events == 1 { "" } else { "s" }
+        )
+    };
     let (observations, evidence, graph_slice) =
         local_reflect_observation_graph(&artifacts.session_id, &request, &summary, &recent_events);
     let view = ObservationView {
-        topic: request.topic.clone(),
-        facet: request.facet.clone(),
-        depth: request.depth.clone(),
-        horizon: request.horizon.clone(),
+        topic: request.topic.as_str().to_string(),
+        facet: request.facet.as_str().to_string(),
+        depth: request.depth.as_str().to_string(),
+        horizon: request.horizon.as_str().to_string(),
         data_coverage: data_coverage.clone(),
     };
 
@@ -414,11 +450,11 @@ async fn build_reflect_response(
         tool: "reflect".to_string(),
         session_id: artifacts.session_id.clone(),
         analysis_view,
-        topic: request.topic,
-        facet: request.facet,
-        depth: request.depth,
-        horizon: request.horizon,
-        source_policy: request.source_policy,
+        topic: request.topic.as_str().to_string(),
+        facet: request.facet.as_str().to_string(),
+        depth: request.depth.as_str().to_string(),
+        horizon: request.horizon.as_str().to_string(),
+        source_policy: request.source_policy.as_str().to_string(),
         include_context: request.include_context,
         data_coverage,
         view: Some(view),
@@ -429,10 +465,6 @@ async fn build_reflect_response(
         failure_clusters: Vec::new(),
         graph_slice,
         budget_result: ObservationBudgetResult::default(),
-        overview,
-        diagnoses: Vec::<Diagnosis>::new(),
-        insights: local_reflect_insights(&warnings),
-        recommendations: Vec::new(),
     }
 }
 
@@ -444,11 +476,11 @@ fn local_reflect_warnings(request: &ReflectRequest) -> Vec<String> {
                 .to_string(),
         );
     }
-    if matches!(request.source_policy.as_str(), "cloud_only") {
+    if matches!(request.source_policy, SourcePolicy::CloudOnly) {
         warnings
             .push("cloud_only source policy is not available from local CLI artifacts".to_string());
     }
-    if matches!(request.source_policy.as_str(), "live_only") {
+    if matches!(request.source_policy, SourcePolicy::LiveOnly) {
         warnings.push(
             "live_only source policy is bounded to persisted local turn artifacts in CLI mode"
                 .to_string(),
@@ -496,7 +528,7 @@ fn local_reflect_data_coverage(
             },
         );
     }
-    if matches!(request.source_policy.as_str(), "cloud_only") {
+    if matches!(request.source_policy, SourcePolicy::CloudOnly) {
         providers.insert(
             "cloud_events".to_string(),
             ObservationProviderCoverage {
@@ -531,101 +563,6 @@ fn local_reflect_data_coverage(
     }
 }
 
-fn local_reflect_overview(
-    journal_event_count: usize,
-    recent_events: &[EventPreview],
-) -> SessionOverview {
-    let total_events = if journal_event_count > 0 {
-        journal_event_count as i64
-    } else {
-        recent_events.len() as i64
-    };
-    let mut event_counts: HashMap<String, i64> = HashMap::new();
-    let mut skill_counts: HashMap<String, i64> = HashMap::new();
-    let mut unique_skills: HashSet<String> = HashSet::new();
-    let mut error_count = 0i64;
-
-    for event in recent_events {
-        *event_counts.entry(event.event_type.clone()).or_default() += 1;
-        if event.error.is_some()
-            || event.event_type.contains("error")
-            || event.event_type.contains("stall")
-        {
-            error_count += 1;
-        }
-        if let Some(tools) = &event.tools_used {
-            for tool in tools {
-                unique_skills.insert(tool.clone());
-                *skill_counts.entry(tool.clone()).or_default() += 1;
-            }
-        }
-    }
-
-    let mut top_event_types: Vec<(String, i64)> = event_counts.into_iter().collect();
-    top_event_types.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    top_event_types.truncate(5);
-    let mut top_skills: Vec<(String, i64)> = skill_counts.into_iter().collect();
-    top_skills.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    top_skills.truncate(5);
-
-    SessionOverview {
-        total_events,
-        total_decisions: 0,
-        duration_minutes: None,
-        unique_skills_used: unique_skills.len() as i64,
-        error_count,
-        error_rate_pct: if total_events > 0 {
-            error_count as f64 / total_events as f64 * 100.0
-        } else {
-            0.0
-        },
-        top_event_types,
-        top_skills,
-    }
-}
-
-fn local_reflect_summary(
-    overview: &SessionOverview,
-    data_coverage: &ObservationDataCoverage,
-) -> String {
-    if overview.total_events == 0 {
-        return "No local session observations are available yet.".to_string();
-    }
-    if overview.error_count > 0 {
-        format!(
-            "Local session artifacts show {} recent error/stall event{} across {} observed event{}.",
-            overview.error_count,
-            if overview.error_count == 1 { "" } else { "s" },
-            overview.total_events,
-            if overview.total_events == 1 { "" } else { "s" }
-        )
-    } else if data_coverage.overall == "partial" {
-        format!(
-            "Local session artifacts are available with partial provider coverage: {} event{} observed.",
-            overview.total_events,
-            if overview.total_events == 1 { "" } else { "s" }
-        )
-    } else {
-        format!(
-            "Local session artifacts show {} observed event{} with no local errors detected.",
-            overview.total_events,
-            if overview.total_events == 1 { "" } else { "s" }
-        )
-    }
-}
-
-fn local_reflect_insights(warnings: &[String]) -> Vec<Insight> {
-    warnings
-        .iter()
-        .map(|warning| Insight {
-            severity: "warning".to_string(),
-            category: "provider_coverage".to_string(),
-            message: warning.clone(),
-            evidence: "local reflect data coverage warning".to_string(),
-        })
-        .collect()
-}
-
 fn local_reflect_observation_graph(
     session_id: &str,
     request: &ReflectRequest,
@@ -638,8 +575,8 @@ fn local_reflect_observation_graph(
 ) {
     let observation_ref = Urn::new("observation", "local", "reflect")
         .seg(session_id)
-        .seg(&request.topic)
-        .seg(&request.facet)
+        .seg(request.topic.as_str())
+        .seg(request.facet.as_str())
         .build();
     let mut evidence = Vec::new();
     let mut nodes = vec![ObservationGraphNode {
@@ -649,11 +586,11 @@ fn local_reflect_observation_graph(
         label: "local_reflect_summary".to_string(),
         summary: Some(summary.to_string()),
         metadata: Some(serde_json::json!({
-            "topic": request.topic,
-            "facet": request.facet,
-            "depth": request.depth,
-            "horizon": request.horizon,
-            "source_policy": request.source_policy,
+            "topic": request.topic.as_str(),
+            "facet": request.facet.as_str(),
+            "depth": request.depth.as_str(),
+            "horizon": request.horizon.as_str(),
+            "source_policy": request.source_policy.as_str(),
         })),
     }];
     let mut edges = Vec::new();
@@ -700,8 +637,8 @@ fn local_reflect_observation_graph(
 
     let observation = ObservationRecord {
         ref_id: observation_ref,
-        topic: request.topic.clone(),
-        facet: request.facet.clone(),
+        topic: request.topic.as_str().to_string(),
+        facet: request.facet.as_str().to_string(),
         kind: "local_session_summary".to_string(),
         severity: if recent_events.iter().any(|event| {
             event.error.is_some()
@@ -1822,7 +1759,7 @@ mod tests {
         assert_eq!(value["session_id"], session_id);
         assert!(value.get("reflection_context").is_none());
         assert!(value.get("recent_turns").is_none());
-        assert_eq!(value["overview"]["total_events"], 1);
+        assert_eq!(value["data_coverage"]["events"], 1);
         assert_eq!(value["data_coverage"]["source"], "local_session_artifacts");
         let evidence = value["evidence"].as_array().unwrap();
         assert_eq!(evidence.len(), 1);
@@ -1900,7 +1837,7 @@ mod tests {
             "{:?}",
             response.evidence[0]
         );
-        assert_eq!(response.overview.unique_skills_used, 1);
+        assert_eq!(response.observations.len(), 1);
     }
 
     #[tokio::test]

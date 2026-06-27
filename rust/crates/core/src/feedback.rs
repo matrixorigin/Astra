@@ -212,7 +212,9 @@ impl FeedbackSignalStore {
             buffer.signals.push_back(signal);
             trim_buffer(&mut buffer, self.max_signals);
         }
-        let _ = self.persist();
+        if let Err(err) = self.persist() {
+            eprintln!("[feedback] persist failed: {err}");
+        }
     }
 
     /// Return retained signals from oldest to newest.
