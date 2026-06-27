@@ -482,14 +482,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         if state.remaining_turns > 0
             && (state.llm_rounds_completed > 0 || !state.observation_journal.is_empty())
         {
-            let cb_state = format!("{:?}", state.stall.circuit_breaker.state()).to_lowercase();
-            let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
-            let cache_ratio = if total_in > 0 {
-                state.total_cache_read as f64 / total_in as f64
-            } else {
-                0.0
-            };
-            let token_pressure = super::host::introspect_token_pressure(state);
+            // Construct a lightweight provider for live metrics.
+            use crate::turn::providers::{LiveRuntimeProvider, SessionStateProvider};
+            let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
+            let status_provider =
+                crate::turn::local_provider::LocalSessionProvider::new(state, &default_policy);
+            let cb_state = status_provider.circuit_breaker_state().to_string();
+            let cache_ratio = status_provider.cache_hit_ratio();
+            let token_pressure = status_provider.token_pressure();
             let alerts: Vec<String> = {
                 let mut a = Vec::new();
                 if state.stall.forced_execution_escalation {
@@ -648,12 +648,19 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // This runs after the guard pipeline so it sees the latest tool-call
     // records and circuit-breaker state.
     {
+        use crate::turn::local_provider::LocalSessionProvider;
+        use crate::turn::providers::{
+            LiveRuntimeProvider, ObservationProvider, SessionStateProvider,
+        };
         use crate::turn::runtime_policy::{FrameworkAction, RuntimePolicy};
         use astra_core::observation_journal::JournalFacts;
 
-        let mut facts = state
-            .observation_journal
-            .extract_facts(state.remaining_turns as u32, state.max_turns as u32);
+        let default_policy = RuntimePolicy::default();
+        let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
+        let provider = LocalSessionProvider::new(state, policy);
+
+        // Extract journal facts from the ObservationProvider trait.
+        let mut facts = provider.extract_facts();
 
         // Populate session-wide fields from authoritative state.
         // extract_facts provides streak and budget data from the journal
@@ -666,20 +673,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         // Stall reason from the unified stall diagnosis.
         facts.stall_reason = interruption_diagnosis_summary(state);
 
-        // Populate cache pressure from authoritative token pressure.
-        facts.cache_pressure = super::host::introspect_token_pressure(state);
+        // Populate cache pressure from the LiveRuntimeProvider.
+        facts.cache_pressure = provider.token_pressure();
 
-        // Populate task completion ratio from the task board snapshot.
-        let snapshot = &state.hooks.task_board_snapshot;
-        if !snapshot.has_unfinished_tasks() {
-            facts.task_completion_ratio = 1.0;
-        }
+        // Populate task completion ratio from the SessionStateProvider.
+        facts.task_completion_ratio = provider.task_completion_ratio();
 
-        let actions = state
-            .budget_policy
-            .as_ref()
-            .unwrap_or(&RuntimePolicy::default())
-            .decide(&facts);
+        let actions = policy.decide(&facts);
         for action in actions {
             match action {
                 FrameworkAction::ExpandBudget {
