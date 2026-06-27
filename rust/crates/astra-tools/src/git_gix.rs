@@ -2802,6 +2802,20 @@ mod tests {
         dir
     }
 
+    fn init_temp_repo_with_linear_diff_history(total_commits: usize) -> TempDir {
+        assert!(total_commits >= 1);
+        let dir = init_temp_repo();
+        let root = dir.path();
+        for commit_index in 2..=total_commits {
+            std::fs::write(root.join("tracked.txt"), format!("commit {commit_index}\n"))
+                .expect("write tracked file");
+            run_git(root, &["add", "tracked.txt"]);
+            let message = format!("update tracked {commit_index}");
+            run_git(root, &["commit", "-m", &message]);
+        }
+        dir
+    }
+
     #[test]
     fn git_action_status_returns_output() {
         let root = repo_root();
@@ -3034,9 +3048,9 @@ mod tests {
 
     #[test]
     fn git_action_diff_ref_range_with_dotdot() {
-        let root = repo_root();
+        let dir = init_temp_repo_with_linear_diff_history(3);
         // "HEAD~2..HEAD" range syntax in ref param must not error
-        let result = diff(&root, &json!({"ref": "HEAD~2..HEAD"}), 0.0, 0);
+        let result = diff(dir.path(), &json!({"ref": "HEAD~2..HEAD"}), 0.0, 0);
         assert!(
             !result.starts_with("Error:"),
             "ref with range A..B should not error: {result}"
@@ -3127,8 +3141,13 @@ mod tests {
 
     #[test]
     fn git_action_diff_base_ref_range() {
-        let root = repo_root();
-        let result = diff(&root, &json!({"base_ref": "HEAD~3", "ref": "HEAD"}), 0.0, 0);
+        let dir = init_temp_repo_with_linear_diff_history(4);
+        let result = diff(
+            dir.path(),
+            &json!({"base_ref": "HEAD~3", "ref": "HEAD"}),
+            0.0,
+            0,
+        );
         assert!(
             result.contains("diff --git") || result == "No changes",
             "range diff should produce output: {result}"
@@ -3137,8 +3156,8 @@ mod tests {
 
     #[test]
     fn git_action_diff_base_ref_defaults_tip_to_head() {
-        let root = repo_root();
-        let result = diff(&root, &json!({"base_ref": "HEAD~1"}), 0.0, 0);
+        let dir = init_temp_repo_with_linear_diff_history(2);
+        let result = diff(dir.path(), &json!({"base_ref": "HEAD~1"}), 0.0, 0);
         assert!(
             !result.starts_with("Error:"),
             "base_ref without ref should default tip to HEAD: {result}"
@@ -3147,10 +3166,10 @@ mod tests {
 
     #[test]
     fn git_action_diff_base_ref_with_path() {
-        let root = repo_root();
+        let dir = init_temp_repo_with_linear_diff_history(3);
         let result = diff(
-            &root,
-            &json!({"base_ref": "HEAD~2", "ref": "HEAD", "path": "Cargo.toml"}),
+            dir.path(),
+            &json!({"base_ref": "HEAD~2", "ref": "HEAD", "path": "tracked.txt"}),
             0.0,
             0,
         );
@@ -3162,9 +3181,9 @@ mod tests {
 
     #[test]
     fn git_action_diff_base_ref_stat_only() {
-        let root = repo_root();
+        let dir = init_temp_repo_with_linear_diff_history(4);
         let result = diff(
-            &root,
+            dir.path(),
             &json!({"base_ref": "HEAD~3", "ref": "HEAD", "stat_only": true}),
             0.0,
             0,
