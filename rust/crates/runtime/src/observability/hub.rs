@@ -281,6 +281,11 @@ impl ObservabilityHub {
         self.feedback_signals.recent_signals()
     }
 
+    /// Flush buffered feedback signals to persistent storage.
+    pub fn flush_feedback(&self) -> std::io::Result<()> {
+        self.feedback_signals.flush()
+    }
+
     /// Get the profile manager.
     pub fn profiles(&self) -> &UserProfileManager {
         &self.profile_manager
@@ -523,6 +528,9 @@ mod tests {
 
         let hub = ObservabilityHub::with_storage(dir.path().to_path_buf());
         hub.record_feedback(FeedbackSignal::new(SignalType::Correction).with_turn("turn-1"));
+        // Batch persist defers writes every BATCH_PERSIST_INTERVAL signals;
+        // flush before dropping so the signal is visible on reload.
+        hub.flush_feedback().expect("flush feedback signals");
         drop(hub);
 
         let reloaded = ObservabilityHub::with_storage(dir.path().to_path_buf());

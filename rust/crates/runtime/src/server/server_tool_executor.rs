@@ -2419,7 +2419,7 @@ esac
                 "reflect",
                 &json!({
                     "topic": "runtime",
-                    "facet": "performance",
+                    "facet": "errors",
                     "last_n": -5
                 }),
             )
@@ -2431,7 +2431,7 @@ esac
         assert_eq!(value["status"], "reflect_unavailable");
         assert_eq!(value["session_id"], "test-session");
         assert_eq!(value["topic"], "runtime");
-        assert_eq!(value["facet"], "performance");
+        assert_eq!(value["facet"], "errors");
         assert_eq!(
             value["last_n"], 1,
             "tool path must clamp invalid evidence budgets"
