@@ -12,37 +12,37 @@ use astra_runtime::turn::agentic_loop::host::make_test_loop_state_for_model;
 
 #[test]
 fn opus_model_picks_up_builtin_profile_thresholds() {
-    // Built-in profile for "opus" is 4 / 20 (see
+    // Built-in profile for "opus" is 4 / 128 (see
     // `ToolPolicyConfig::builtin_model_profiles`). If this test fails,
     // the state builder is no longer threading model_id through
     // `resolve_for_model` — the per-model policy is silently dead code.
     let state = make_test_loop_state_for_model(Some("us.anthropic.claude-opus-4-7"));
     assert_eq!(state.max_identical_tool_calls, 4);
-    assert_eq!(state.max_tools_per_turn, 20);
+    assert_eq!(state.max_tools_per_turn, 128);
 }
 
 #[test]
 fn haiku_model_stays_conservative() {
-    // Built-in "haiku" profile is 2 / 12.
+    // Built-in "haiku" profile is 2 / 48.
     let state = make_test_loop_state_for_model(Some("claude-haiku-4-5-20251001"));
     assert_eq!(state.max_identical_tool_calls, 2);
-    assert_eq!(state.max_tools_per_turn, 12);
+    assert_eq!(state.max_tools_per_turn, 48);
 }
 
 #[test]
 fn none_model_falls_back_to_global_defaults() {
     // With no builtin/user profile match, should fall back to the global
-    // defaults (3 / 15 — see `effective_max_identical_calls` / `_tools_per_turn`).
+    // defaults (3 / 100 — see `effective_max_identical_calls` / `_tools_per_turn`).
     let state = make_test_loop_state_for_model(None);
     assert_eq!(state.max_identical_tool_calls, 3);
-    assert_eq!(state.max_tools_per_turn, 15);
+    assert_eq!(state.max_tools_per_turn, 100);
 }
 
 #[test]
 fn unknown_model_falls_back_to_global_defaults() {
     let state = make_test_loop_state_for_model(Some("some-obscure-model"));
     assert_eq!(state.max_identical_tool_calls, 3);
-    assert_eq!(state.max_tools_per_turn, 15);
+    assert_eq!(state.max_tools_per_turn, 100);
 }
 
 #[test]

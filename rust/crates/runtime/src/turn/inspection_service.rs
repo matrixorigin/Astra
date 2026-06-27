@@ -750,7 +750,7 @@ mod tests {
         // Set up stalled journal: multiple turns with zero outcomes.
         // record_turn skips entries with 0 tool calls, so we must set tool_calls_total > 0.
         use astra_core::observation::TurnMetrics;
-        for i in 0..6 {
+        for _ in 0..6 {
             let mut m = TurnMetrics::default();
             m.tool_calls_total = 5; // non-zero to ensure entry is recorded
             m.mutation_count = 0; // zero mutations → write_ratio = 0.0 → stalled

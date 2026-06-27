@@ -25,9 +25,7 @@ use astra_runtime::turn::observation_dispatcher::{
     TuningSink,
 };
 use astra_runtime::turn::observation_store::FileObservationStore;
-use astra_runtime::turn::providers::{
-    LiveRuntimeProvider, ObservationProvider, SessionStateProvider,
-};
+use astra_runtime::turn::providers::{LiveRuntimeProvider, ObservationProvider};
 use astra_runtime::turn::runtime_policy::{FrameworkAction, RuntimePolicy};
 use astra_turn_core::introspect::{IntrospectSnapshot, StallSnapshotSummary};
 
@@ -371,13 +369,9 @@ fn e2e_policy_decide_continue_when_healthy() {
     let policy = RuntimePolicy::default();
     let decisions = policy.decide(&facts);
 
-    let has_aggressive = decisions.iter().any(|d| {
-        matches!(
-            d,
-            FrameworkAction::TriggerCompaction { .. }
-                | FrameworkAction::AdjustCircuitBreaker { .. }
-        )
-    });
+    let has_aggressive = decisions
+        .iter()
+        .any(|d| matches!(d, FrameworkAction::TriggerCompaction { .. }));
     assert!(
         !has_aggressive,
         "healthy state should not trigger aggressive actions: {:?}",
@@ -386,7 +380,7 @@ fn e2e_policy_decide_continue_when_healthy() {
 }
 
 #[test]
-fn e2e_policy_decide_circuit_breaker_on_high_error_rate() {
+fn e2e_policy_decide_guidance_on_high_error_rate() {
     let facts = JournalFacts {
         current_error_rate: 0.45,
         budget_remaining: 10,
@@ -396,18 +390,18 @@ fn e2e_policy_decide_circuit_breaker_on_high_error_rate() {
     let policy = RuntimePolicy::default();
     let decisions = policy.decide(&facts);
 
-    let has_adjustment = decisions
+    let has_guidance = decisions
         .iter()
-        .any(|d| matches!(d, FrameworkAction::AdjustCircuitBreaker { .. }));
+        .any(|d| matches!(d, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")));
     assert!(
-        has_adjustment,
-        "expected AdjustCircuitBreaker for 45% error rate, got: {:?}",
+        has_guidance,
+        "expected guidance signal for 45% error rate, got: {:?}",
         decisions
     );
 }
 
 #[test]
-fn e2e_policy_decide_circuit_breaker_on_read_only_streak() {
+fn e2e_policy_decide_guidance_on_read_only_streak() {
     let facts = JournalFacts {
         consecutive_read_only: 9,
         budget_remaining: 10,
@@ -417,12 +411,12 @@ fn e2e_policy_decide_circuit_breaker_on_read_only_streak() {
     let policy = RuntimePolicy::default();
     let decisions = policy.decide(&facts);
 
-    let has_adjustment = decisions
-        .iter()
-        .any(|d| matches!(d, FrameworkAction::AdjustCircuitBreaker { .. }));
+    let has_guidance = decisions.iter().any(
+        |d| matches!(d, FrameworkAction::InjectSignal { message } if message.contains("read-only")),
+    );
     assert!(
-        has_adjustment,
-        "expected AdjustCircuitBreaker for read-only streak, got: {:?}",
+        has_guidance,
+        "expected guidance signal for read-only streak, got: {:?}",
         decisions
     );
 }
@@ -505,7 +499,7 @@ fn e2e_tuning_jobs_persist_through_store() {
     let sid = "e2e-dispatch-tuning";
     let (dir, _store, arc) = temp_store();
 
-    let mut state = make_high_pressure_state();
+    let state = make_high_pressure_state();
 
     let policy = RuntimePolicy::default();
     let provider = make_provider(&state, &policy);
@@ -903,8 +897,7 @@ fn e2e_policy_circuit_breaker_respects_custom_max_errors() {
 
     let decisions = policy.decide(&facts);
     let has_adjustment = decisions.iter().any(|d| {
-        matches!(d, FrameworkAction::AdjustCircuitBreaker { .. })
-            || matches!(d, FrameworkAction::InjectSignal { message } if message.contains("circuit") || message.contains("error"))
+        matches!(d, FrameworkAction::InjectSignal { message } if message.contains("Circuit-breaker risk") || message.contains("error"))
     });
     assert!(
         has_adjustment,

@@ -85,7 +85,7 @@ pub fn apply_agentic_post_tool_policy(
         current_user_id,
         current_session_id,
         max_turns,
-        loop_turn,
+        loop_turn: _,
         recent_tools,
         last_heavy_checkpoint,
         interaction_mode,
@@ -214,7 +214,7 @@ pub fn apply_agentic_post_tool_policy(
             && let Some(heavy) = step_recorder.build_heavy_checkpoint(
                 messages,
                 0,
-                max_turns.saturating_sub(loop_turn) as u32,
+                (*remaining_turns).min(max_turns) as u32,
                 &checkpoint_blocked_tools,
                 recent_tools,
             )
@@ -365,6 +365,67 @@ mod tests {
         );
         assert_eq!(verdict_events.len(), 1);
         assert_eq!(verdict_events[0].severity, "warning");
+    }
+
+    #[test]
+    fn warning_checkpoint_records_actual_remaining_turns_after_policy_penalty() {
+        let mut intent_tool_turns = Vec::new();
+        let mut messages = vec![json!({"role": "user", "content": "inspect the code"})];
+        let mut stall_events = Vec::new();
+        let mut verdict_events = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut remaining_turns = 10usize;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let user_id = format!("uid-{suffix}");
+        let session_id = format!("post-tool-policy-{suffix}");
+        let mut step_recorder = StepRecorder::with_persistence(&user_id, &session_id, "tid");
+        step_recorder.begin_turn(0);
+        let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
+        let mut turn_guard = TurnGuard::new();
+        let tool_calls = vec![
+            json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
+            json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
+        ];
+        turn_guard.record_tool_calls(&tool_calls);
+        turn_guard.record_tool_result("read_file", "fn main() {}");
+        turn_guard.record_tool_result("read_file", "fn main() {}");
+
+        let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            turn_index: 0,
+            message: "inspect the code",
+            tool_calls_for_guard: &tool_calls,
+            intent_tool_turns: &mut intent_tool_turns,
+            messages: &mut messages,
+            stall_events: &mut stall_events,
+            turn_guard: &mut turn_guard,
+            verdict_events: &mut verdict_events,
+            restricted_tools: &mut restricted_tools,
+            remaining_turns: &mut remaining_turns,
+            step_recorder: &mut step_recorder,
+            current_user_id: Some(&user_id),
+            current_session_id: Some(&session_id),
+            max_turns: 20,
+            loop_turn: 5,
+            recent_tools: &["read_file".to_string()],
+            last_heavy_checkpoint: &mut last_heavy_checkpoint,
+            interaction_mode: TurnInteractionMode::Prompt,
+        });
+
+        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
+        assert_eq!(remaining_turns, 8);
+        let checkpoint = last_heavy_checkpoint
+            .as_ref()
+            .expect("warning verdict should write a heavy checkpoint");
+        let StepCheckpoint::Heavy(heavy) = checkpoint else {
+            panic!("expected heavy checkpoint");
+        };
+        assert_eq!(
+            heavy.budget_remaining_rounds, 8,
+            "checkpoint must record actual remaining_turns, not max_turns - loop_turn"
+        );
     }
 
     #[test]

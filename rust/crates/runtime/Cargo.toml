@@ -82,8 +82,9 @@ uuid.workspace = true
 thiserror.workspace = true
 astra-harness = { workspace = true, optional = true }
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
-	dashmap = "6.1.0"
-	fs2 = "0.4"
+dashmap = "6.1.0"
+fs2 = "0.4"
+tempfile = "3"
 
 [dev-dependencies]
 astra-core = { workspace = true, features = ["dev-defaults"] }
@@ -91,7 +92,6 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 futures-util.workspace = true
 serial_test = "3"
 sqlx.workspace = true
-tempfile = "3"
 # `test-util` enables `#[tokio::test(start_paused = true)]` and `tokio::time::pause`
 # so timeout-enforcement tests can use virtual time.
 tokio = { workspace = true, features = ["test-util"] }

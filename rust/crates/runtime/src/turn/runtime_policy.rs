@@ -89,11 +89,6 @@ pub enum FrameworkAction {
     },
     /// Request context compaction to reduce token pressure.
     TriggerCompaction { urgency: CompactionUrgency },
-    /// Adjust the circuit breaker threshold (max rounds before forced abort).
-    AdjustCircuitBreaker {
-        /// New max rounds for the circuit breaker.
-        max_rounds: u32,
-    },
     /// Transition to a different turn phase.
     TransitionPhase { target: PhaseTarget },
     /// Inject a signal into the agent's context for the next round.
@@ -136,19 +131,20 @@ impl Default for CompactPolicy {
 
 // ─── Circuit Breaker Policy ──────────────────────────────────────────────────
 
-/// Policy for adjusting the circuit breaker based on error rate and read-only
+/// Policy for surfacing circuit-breaker risk based on error rate and read-only
 /// streaks.
 ///
-/// The circuit breaker forces an abort after too many error-spiraling or
-/// read-only-no-progress rounds. This policy adjusts the threshold up (to
-/// give more room) or down (to fail faster) based on objective facts.
+/// Read-only investigation is often a valid phase of large tasks. These
+/// thresholds therefore drive diagnostic signals to the model instead of
+/// reducing the turn budget. Hard stops remain the job of explicit guard and
+/// tool-execution failures, not passive exploration alone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitPolicy {
-    /// Max consecutive errors before circuit breaker adjustment.
+    /// Max consecutive zero-outcome rounds before a diagnostic signal.
     pub max_consecutive_errors: u32,
-    /// Max consecutive read-only rounds before circuit breaker adjustment.
+    /// Max consecutive read-only rounds before a diagnostic signal.
     pub max_consecutive_reads: u32,
-    /// Error rate (0.0–1.0) above which circuit breaker threshold decreases.
+    /// Error rate (0.0–1.0) above which a diagnostic signal is emitted.
     pub error_rate_threshold: f64,
 }
 
@@ -203,7 +199,7 @@ impl Default for TextlessPolicy {
 /// Composes three sub-policies:
 /// - `RuntimePolicy` core: budget expansion, signal injection for streaks
 /// - `CompactPolicy`: compaction under cache pressure
-/// - `CircuitPolicy`: circuit breaker adjustment under errors / read-only streaks
+/// - `CircuitPolicy`: diagnostic guidance under errors / read-only streaks
 ///
 /// This lives in the runtime crate (not core) because it makes **decisions**.
 /// Core only collects data (`ObservationJournal`) and exposes pure facts
@@ -247,9 +243,9 @@ impl RuntimePolicy {
     /// Evaluate `facts` and return the set of actions the runtime should take.
     ///
     /// Actions are determined in priority order. Stall is the highest-priority
-    /// interrupt (returns immediately); after that, compaction, circuit breaker,
+    /// signal (returns immediately); after that, compaction, diagnostic guidance,
     /// phase transition, and expansion/signal are evaluated. Multiple actions may
-    /// be returned (e.g. `AdjustCircuitBreaker` + `InjectSignal`).
+    /// be returned (e.g. compaction + diagnostic signal).
     ///
     /// This is **not** auto-applied — the caller receives the actions and
     /// decides how to execute them. The policy only reads the pure factual
@@ -282,26 +278,40 @@ impl RuntimePolicy {
             });
         }
 
-        // ── Priority 3: Circuit Breaker Adjustment ───────────────────────
-        let mut circuit_adjust = false;
+        // ── Priority 3: Circuit Breaker Guidance ─────────────────────────
+        //
+        // First principle: a large task can spend many rounds gathering
+        // evidence. Read-only streaks and zero-outcome streaks are risks to
+        // manage, not proof that the runtime should shrink the hard budget.
+        // Shrinking `max_turns` here caused long investigations to cliff into
+        // empty_completion after the model kept using tools. Emit an actionable
+        // adjustment signal instead and let the existing hard-stop paths handle
+        // true runaway failures.
+        let mut circuit_reasons = Vec::new();
         if facts.current_error_rate > self.circuit.error_rate_threshold {
-            circuit_adjust = true;
+            circuit_reasons.push(format!(
+                "tool error rate is {:.0}%",
+                facts.current_error_rate * 100.0
+            ));
         }
         if facts.consecutive_read_only > self.circuit.max_consecutive_reads {
-            circuit_adjust = true;
+            circuit_reasons.push(format!(
+                "{} consecutive read-only rounds",
+                facts.consecutive_read_only
+            ));
         }
         if facts.consecutive_rounds_without_outcome > self.circuit.max_consecutive_errors {
-            circuit_adjust = true;
+            circuit_reasons.push(format!(
+                "{} consecutive rounds without observable outcome",
+                facts.consecutive_rounds_without_outcome
+            ));
         }
-        if circuit_adjust {
-            // Reduce max rounds to fail faster: use half of current budget_max
-            // or a floor of 3, whichever is larger.
-            let new_max = (facts.budget_max / 2).max(3);
-            actions.push(FrameworkAction::AdjustCircuitBreaker {
-                max_rounds: new_max,
-            });
+        if !circuit_reasons.is_empty() {
             actions.push(FrameworkAction::InjectSignal {
-                message: "Circuit breaker activated due to elevated error rate or read-only streak. Consider reviewing your approach and making concrete progress.".into(),
+                message: format!(
+                    "Circuit-breaker risk detected ({}). Do not stop solely because of this. Adjust strategy: summarize evidence gathered so far, state the next hypothesis, and either run one targeted experiment or produce a direct answer if enough evidence is available.",
+                    circuit_reasons.join(", ")
+                ),
             });
         }
 
@@ -314,9 +324,13 @@ impl RuntimePolicy {
         }
 
         // ── Priority 5: Budget Expansion ─────────────────────────────────
-        // Agent consistently producing outcomes and budget is tight.
+        // Agent consistently producing outcomes and budget is getting tight.
+        // Do not wait for the halfway cliff: the model has shown useful
+        // progress, so framework budget should create room before it starts
+        // self-pacing around scarcity instead of solving the task.
+        let expansion_threshold = facts.budget_max.saturating_mul(3) / 4;
         if facts.consecutive_rounds_with_outcome >= self.expand_after_consecutive_outcomes
-            && facts.budget_remaining <= facts.budget_max / 2
+            && facts.budget_remaining <= expansion_threshold
         {
             actions.push(FrameworkAction::ExpandBudget {
                 factor: self.expand_factor,
@@ -488,12 +502,12 @@ mod tests {
     }
 
     #[test]
-    fn no_expand_one_above_half_budget() {
+    fn expands_before_half_budget_when_progress_is_clear() {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 6, 10);
         let actions = policy.decide(&f);
         assert!(
-            !actions
+            actions
                 .iter()
                 .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
         );
@@ -789,10 +803,10 @@ mod tests {
         )));
     }
 
-    // ── Circuit breaker (13 tests) ─────────────────────────────────────────
+    // ── Circuit-breaker guidance (13 tests) ────────────────────────────────
 
     #[test]
-    fn circuit_breaker_on_high_error_rate() {
+    fn circuit_breaker_guidance_on_high_error_rate() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 20);
         f.current_error_rate = 0.40;
@@ -800,17 +814,18 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::AdjustCircuitBreaker { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
         );
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+                .all(|a| !matches!(a, FrameworkAction::ExpandBudget { .. })),
+            "diagnostic risk should not be converted into budget mutation: {actions:?}"
         );
     }
 
     #[test]
-    fn circuit_breaker_on_read_only_streak() {
+    fn circuit_breaker_guidance_on_read_only_streak() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 20);
         f.consecutive_read_only = 10; // above default max_consecutive_reads (8)
@@ -818,12 +833,19 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::AdjustCircuitBreaker { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("read-only")))
+        );
+        assert!(
+            actions.iter().all(|a| !matches!(
+                a,
+                FrameworkAction::ExpandBudget { .. } | FrameworkAction::TriggerCompaction { .. }
+            )),
+            "large read-only investigations should get guidance, not runtime budget mutation"
         );
     }
 
     #[test]
-    fn circuit_breaker_on_consecutive_error_streak() {
+    fn circuit_breaker_guidance_on_zero_outcome_streak() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 20);
         f.consecutive_rounds_without_outcome = 6; // above default max_consecutive_errors (5)
@@ -831,7 +853,12 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::AdjustCircuitBreaker { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("without observable outcome")))
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, FrameworkAction::ExpandBudget { .. }))
         );
     }
 
@@ -846,7 +873,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::AdjustCircuitBreaker { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("Circuit-breaker risk")))
         );
     }
 
@@ -859,12 +886,12 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::AdjustCircuitBreaker { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("Circuit-breaker risk")))
         );
     }
 
     #[test]
-    fn circuit_breaker_boundary_error_rate_just_above() {
+    fn circuit_breaker_boundary_error_rate_just_above_signals() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 20);
         f.current_error_rate = 0.31; // just above threshold — triggered
@@ -872,12 +899,12 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::AdjustCircuitBreaker { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
         );
     }
 
     #[test]
-    fn circuit_breaker_custom_thresholds() {
+    fn circuit_breaker_custom_thresholds_signal() {
         let policy = RuntimePolicy {
             expand_after_consecutive_outcomes: 2,
             expand_factor: 1.5,
@@ -897,7 +924,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::AdjustCircuitBreaker { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
         );
     }
 
@@ -955,7 +982,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::AdjustCircuitBreaker { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
         );
         assert!(
             actions
@@ -1026,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn full_error_rate_triggers_circuit_breaker() {
+    fn full_error_rate_triggers_guidance_signal() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 20);
         f.current_error_rate = 1.0;
@@ -1034,22 +1061,26 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::AdjustCircuitBreaker { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
         );
     }
 
     #[test]
-    fn circuit_breaker_computes_floor_of_three() {
+    fn circuit_guidance_does_not_compute_budget_floor() {
         let policy = RuntimePolicy::default();
-        let mut f = facts(0, 0, 8, 5); // budget_max = 5, half = 2, floor = 3
+        let mut f = facts(0, 0, 8, 5);
         f.current_error_rate = 0.40;
         let actions = policy.decide(&f);
-        let circuit_action = actions
-            .iter()
-            .find(|a| matches!(a, FrameworkAction::AdjustCircuitBreaker { .. }));
-        assert!(circuit_action.is_some());
-        if let Some(FrameworkAction::AdjustCircuitBreaker { max_rounds }) = circuit_action {
-            assert_eq!(*max_rounds, 3);
-        }
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })),
+            "circuit guidance must not backdoor a computed budget floor: {actions:?}"
+        );
     }
 }

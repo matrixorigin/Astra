@@ -814,17 +814,42 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
             }
             _ => String::new(),
         };
+        let textless_note = if state.last_finish_reason.as_deref() == Some("tool_calls") {
+            " The model was still requesting tools and did not produce final text."
+        } else {
+            " The loop ended without final text."
+        };
+        let rounds_completed = state.max_turns.saturating_sub(state.remaining_turns);
+        let budget_note = if state.max_turns > 0 {
+            format!(
+                " Rounds: {rounds_completed}/{} completed, {} remaining.",
+                state.max_turns, state.remaining_turns
+            )
+        } else {
+            String::new()
+        };
+        let next_step_note = " Continue to resume from the preserved state; first summarize the evidence already gathered, then choose the next targeted action or provide the final answer.";
         // Set final_text BEFORE interruption so settlement_interruption_summary
         // sees the populated value (avoid coupling trap).
         state.final_text = format!(
-            "[turn_interrupted] {} tool call(s) completed.{} Work preserved above.{}{} You can continue in the next message.",
-            state.total_tool_calls, reason_note, checkpoint_note, tool_summary,
+            "[turn_interrupted] {} tool call(s) completed.{}{}{} Work preserved above.{}{}{}",
+            state.total_tool_calls,
+            reason_note,
+            textless_note,
+            budget_note,
+            checkpoint_note,
+            tool_summary,
+            next_step_note,
         );
         state.final_text_streamed = false;
 
         let detail = format!(
-            "turn ended while working: {} tool call(s) completed, work preserved above",
+            "turn ended while working: {} tool call(s) completed, last_finish_reason={}, rounds_completed={}, remaining_turns={}, max_turns={}",
             state.total_tool_calls,
+            state.last_finish_reason.as_deref().unwrap_or("unknown"),
+            rounds_completed,
+            state.remaining_turns,
+            state.max_turns,
         );
         if state.interruption.is_none() {
             state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
@@ -1443,6 +1468,8 @@ mod tests {
         );
         assert!(state.final_text.contains("[turn_interrupted]"));
         assert!(state.final_text.contains("tool call(s) completed"));
+        assert!(state.final_text.contains("Rounds:"));
+        assert!(state.final_text.contains("Continue to resume"));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 

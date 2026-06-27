@@ -8,7 +8,7 @@
 //! variables, allowing production tuning without recompilation.
 //!
 //! ```text
-//! ASTRA_MAX_TURNS=150             # conversation turns per session
+//! ASTRA_MAX_TURNS=300             # conversation turns per session
 //! ASTRA_PLAN_SUBTASK_MAX_TURNS=0  # per-subtask turn budget (0 = use ASTRA_MAX_TURNS)
 //! ASTRA_TURN_TIMEOUT_S=300        # seconds before a turn is force-completed
 //! ASTRA_GLOBAL_OUTPUT_LIMIT=200000 # combined tool output bytes
@@ -19,7 +19,7 @@
 //! ASTRA_MAX_TURN_INPUT_TOKENS=200000 # max LLM input tokens per turn (0 = use model ceiling only)
 //! ```
 
-pub(crate) const DEFAULT_MAX_TURNS: usize = 150;
+pub(crate) const DEFAULT_MAX_TURNS: usize = 300;
 pub(crate) const DEFAULT_PLAN_SUBTASK_MAX_TURNS: usize = 0;
 pub(crate) const DEFAULT_TURN_TIMEOUT_S: u64 = 300;
 pub(crate) const DEFAULT_GLOBAL_OUTPUT_LIMIT: usize = 200_000;

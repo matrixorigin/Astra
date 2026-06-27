@@ -761,28 +761,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         "Policy-driven compaction triggered"
                     );
                 }
-                FrameworkAction::AdjustCircuitBreaker { max_rounds } => {
-                    let old_max = state.max_turns;
-                    state.max_turns = state.max_turns.min(max_rounds as usize);
-                    if state.remaining_turns > state.max_turns {
-                        state.remaining_turns = state.max_turns;
-                    }
-                    let msg = format!(
-                        "[Framework action] Circuit breaker adjusted: max turns {old_max} → {new_max} (error rate: {error_rate:.0}%, read-only streak: {read_only}).",
-                        new_max = state.max_turns,
-                        error_rate = facts.current_error_rate * 100.0,
-                        read_only = facts.consecutive_read_only,
-                    );
-                    state.push_volatile(super::host::VolatileKind::BudgetReview, msg);
-                    tracing::info!(
-                        target: "astra::policy",
-                        old_max,
-                        new_max = state.max_turns,
-                        max_rounds,
-                        error_rate = facts.current_error_rate,
-                        "Policy-driven circuit breaker adjustment"
-                    );
-                }
                 FrameworkAction::TransitionPhase { target } => {
                     let phase_label = match target {
                         crate::turn::runtime_policy::PhaseTarget::Reflection => "reflection",

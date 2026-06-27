@@ -1425,13 +1425,13 @@ mod tests {
     fn runtime_config_validate_plan_turns_exceeds_max_turns_with_defaults() {
         let config = ServerRuntimeConfig {
             max_turns: None,
-            plan_subtask_max_turns: Some(200),
+            plan_subtask_max_turns: Some(400),
             ..Default::default()
         };
         let err = config.validate().unwrap_err();
         assert!(
-            err.contains("plan_subtask_max_turns (200) exceeds max_turns (150)"),
-            "should reject when default max_turns=150 is exceeded: {err}"
+            err.contains("plan_subtask_max_turns (400) exceeds max_turns (300)"),
+            "should reject when default max_turns=300 is exceeded: {err}"
         );
     }
 

@@ -183,13 +183,13 @@ impl Default for AgentBindingRegistryConfig {
 /// Per-turn agentic-loop budget knobs editable via `/config`.
 ///
 /// Defaults of 0 mean "fall through to [`astra_core::RuntimeLimits`]"
-/// (which itself defaults to 150/0). Setting a positive value here
+/// (which itself defaults to 300/0). Setting a positive value here
 /// overrides the env-driven default for the CLI without requiring a
 /// process restart with new `ASTRA_*` exports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RuntimeLimitsConfig {
     /// Max tool calls per user message (regular chat turn).
-    /// 0 = inherit from `RuntimeLimits::max_turns` (env / built-in 150).
+    /// 0 = inherit from `RuntimeLimits::max_turns` (env / built-in 300).
     #[serde(default)]
     pub max_turns: u32,
 
@@ -622,8 +622,9 @@ pub struct ToolPolicyConfig {
     pub max_identical_tool_calls: u32,
 
     /// Max tool calls to execute in a single LLM turn (headless round).
-    /// 0 = use default (15). Excess calls are skipped with a budget stub.
-    /// Prevents pathological turns where the agent requests 50+ tool calls.
+    /// 0 = use default (100). Excess calls are skipped with a budget stub.
+    /// This is a throughput guard, not a strategy policy: large tasks may batch
+    /// many read/search calls in one LLM round.
     #[serde(default)]
     pub max_tools_per_turn: u32,
 
@@ -881,7 +882,7 @@ impl ToolPolicyConfig {
                 ModelPolicyProfile {
                     model_match: "opus".to_string(),
                     max_identical_tool_calls: 4,
-                    max_tools_per_turn: 20,
+                    max_tools_per_turn: 128,
                     repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
                     parallel_batching_force_streak: 0,
@@ -890,16 +891,16 @@ impl ToolPolicyConfig {
                 ModelPolicyProfile {
                     model_match: "sonnet-4".to_string(),
                     max_identical_tool_calls: 4,
-                    max_tools_per_turn: 18,
+                    max_tools_per_turn: 100,
                     repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
                     parallel_batching_force_streak: 0,
                 },
-                // Haiku — fast tier, keep conservative to catch derps early.
+                // Haiku — fast tier, still lower than strong models but not starved.
                 ModelPolicyProfile {
                     model_match: "haiku".to_string(),
                     max_identical_tool_calls: 2,
-                    max_tools_per_turn: 12,
+                    max_tools_per_turn: 48,
                     repeated_cache_hit_suppression: 2,
                     max_consecutive_empty_name: 2,
                     parallel_batching_force_streak: 0,
@@ -908,7 +909,7 @@ impl ToolPolicyConfig {
                 ModelPolicyProfile {
                     model_match: "gpt-5".to_string(),
                     max_identical_tool_calls: 4,
-                    max_tools_per_turn: 20,
+                    max_tools_per_turn: 128,
                     repeated_cache_hit_suppression: 4,
                     max_consecutive_empty_name: 3,
                     parallel_batching_force_streak: 0,
@@ -917,13 +918,13 @@ impl ToolPolicyConfig {
         })
     }
 
-    /// Resolved max tools per turn (0 → default of 15, floor of 5).
+    /// Resolved max tools per turn (0 → default of 100, floor of 5).
     pub fn effective_max_tools_per_turn(&self) -> u32 {
         if self.max_tools_per_turn > 0 {
             // Floor of 5 prevents pathological starvation from aggressive scenarios.
             self.max_tools_per_turn.max(5)
         } else {
-            15
+            100
         }
     }
 
@@ -942,9 +943,9 @@ impl ToolPolicyConfig {
         resolve_threshold(self.circuit_breaker_half_open_patience, 2, 1)
     }
 
-    /// Resolved circuit breaker absolute max rounds (0 → default 200, floor 20).
+    /// Resolved circuit breaker absolute max rounds (0 → default 300, floor 20).
     pub fn effective_circuit_breaker_absolute_max_rounds(&self) -> u32 {
-        resolve_threshold(self.circuit_breaker_absolute_max_rounds, 200, 20)
+        resolve_threshold(self.circuit_breaker_absolute_max_rounds, 300, 20)
     }
 
     pub fn effective_circuit_breaker_read_only_stall_threshold(&self) -> u32 {
@@ -2319,7 +2320,7 @@ mod tests {
     #[test]
     fn test_effective_max_tools_per_turn() {
         let mut config = ToolPolicyConfig::default();
-        assert_eq!(config.effective_max_tools_per_turn(), 15);
+        assert_eq!(config.effective_max_tools_per_turn(), 100);
 
         config.max_tools_per_turn = 10;
         assert_eq!(config.effective_max_tools_per_turn(), 10);
@@ -2864,7 +2865,7 @@ mod tests {
         let cfg = ToolPolicyConfig::default();
         let policy = cfg.resolve_for_model(None);
         assert_eq!(policy.max_identical_tool_calls, 3);
-        assert_eq!(policy.max_tools_per_turn, 15);
+        assert_eq!(policy.max_tools_per_turn, 100);
     }
 
     #[test]
@@ -2873,7 +2874,7 @@ mod tests {
         // Full Bedrock-style id with "opus" embedded.
         let policy = cfg.resolve_for_model(Some("us.anthropic.claude-opus-4-7-v1"));
         assert_eq!(policy.max_identical_tool_calls, 4);
-        assert_eq!(policy.max_tools_per_turn, 20);
+        assert_eq!(policy.max_tools_per_turn, 128);
     }
 
     #[test]
@@ -2881,16 +2882,16 @@ mod tests {
         let cfg = ToolPolicyConfig::default();
         let policy = cfg.resolve_for_model(Some("claude-haiku-4-5-20251001"));
         assert_eq!(policy.max_identical_tool_calls, 2);
-        assert_eq!(policy.max_tools_per_turn, 12);
+        assert_eq!(policy.max_tools_per_turn, 48);
     }
 
     #[test]
     fn resolve_for_model_unknown_falls_back_to_global() {
         let cfg = ToolPolicyConfig::default();
         let policy = cfg.resolve_for_model(Some("some-obscure-model-id"));
-        // No built-in match → global defaults (3 / 15).
+        // No built-in match → global defaults (3 / 100).
         assert_eq!(policy.max_identical_tool_calls, 3);
-        assert_eq!(policy.max_tools_per_turn, 15);
+        assert_eq!(policy.max_tools_per_turn, 100);
     }
 
     #[test]
@@ -2905,8 +2906,8 @@ mod tests {
         let policy = cfg.resolve_for_model(Some("claude-opus-4-7"));
         // User override wins over built-in.
         assert_eq!(policy.max_identical_tool_calls, 8);
-        // Field left at 0 inherits the global default (not the built-in 20).
-        assert_eq!(policy.max_tools_per_turn, 15);
+        // Field left at 0 inherits the global default (not the built-in 128).
+        assert_eq!(policy.max_tools_per_turn, 100);
     }
 
     #[test]
@@ -3226,7 +3227,7 @@ mod tests {
         assert_eq!(policy.max_consecutive_empty_name, 4);
         // …while the zero-valued fields inherit the global default.
         assert_eq!(policy.max_identical_tool_calls, 3);
-        assert_eq!(policy.max_tools_per_turn, 15);
+        assert_eq!(policy.max_tools_per_turn, 100);
     }
 
     // ─── Fork-prefix config ─────────────────────────────────────────

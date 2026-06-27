@@ -16,17 +16,18 @@ const DEFAULT_EXPLORATION_ROUND_WINDOW: usize = 5;
 const EXPLORATORY_STALL_WINDOW: usize = 4;
 const EXPLORATORY_ROUND_WINDOW: usize = 8;
 
-const STANDARD_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(24, 36, 6, 2);
-const COMPLEX_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(30, 54, 12, 2);
+const STANDARD_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(60, 120, 20, 3);
+const COMPLEX_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(90, 180, 30, 3);
 const STANDARD_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget =
-    AgenticTurnBudget::new(36, 60, 12, 2);
-const COMPLEX_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(48, 96, 12, 4);
-const STANDARD_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(36, 72, 12, 3);
-const COMPLEX_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(48, 108, 15, 4);
+    AgenticTurnBudget::new(80, 160, 20, 4);
+const COMPLEX_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget =
+    AgenticTurnBudget::new(120, 240, 30, 4);
+const STANDARD_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(90, 180, 30, 3);
+const COMPLEX_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(120, 240, 30, 4);
 const STANDARD_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
-    AgenticTurnBudget::new(42, 84, 12, 3);
+    AgenticTurnBudget::new(100, 200, 25, 4);
 const COMPLEX_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
-    AgenticTurnBudget::new(54, 120, 18, 4);
+    AgenticTurnBudget::new(140, 280, 35, 4);
 
 const MUTATING_TERMS: &[&str] = &[
     "fix",

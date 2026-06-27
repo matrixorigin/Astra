@@ -573,22 +573,7 @@ fn recent_turns_are_repetitive(state: &AgenticLoopState) -> bool {
         .is_some_and(|previous| previous == last)
 }
 
-fn recent_progress_is_real(state: &AgenticLoopState) -> bool {
-    if is_open_ended_file_exploration(&state.message) {
-        return state
-            .stall
-            .tool_call_records
-            .iter()
-            .rev()
-            .take(6)
-            .any(tool_record_is_workspace_mutation);
-    }
-
-    // Note: `tool_record_is_workspace_mutation` no longer treats every `bash`
-    // call as mutating — only commands that actually modify state qualify.
-    // This is intentional: a loop that only runs `grep`/`cat`/`ls` should not
-    // earn budget extensions, since "spinning on read-only inspection without
-    // committing changes" is exactly the failure mode we are trying to break.
+fn recent_activity_supports_budget_extension(state: &AgenticLoopState) -> bool {
     let recent_records: Vec<_> = state
         .stall
         .tool_call_records
@@ -631,69 +616,7 @@ fn recent_progress_is_real(state: &AgenticLoopState) -> bool {
         return false;
     }
 
-    if state.task_profile.mutates_workspace {
-        return mutating_progress;
-    }
-
-    if state.task_profile.exploratory_task
-        || state.task_profile.complexity
-            == astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex
-    {
-        return mutating_progress || distinct_recent_turns >= 2;
-    }
-
-    false
-}
-
-const OPEN_ENDED_EXPLORATION_MAX_TURNS: usize = 4;
-const OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN: u32 = 2;
-const OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE: &str = "Open-ended file exploration budget is active: do at most one bounded useful pass with no more than two tool calls per turn, then summarize. Do not keep listing/reading files recursively.";
-
-fn is_open_ended_file_exploration(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    let has_list_operation =
-        lower.contains("list") || lower.contains("ls ") || lower.contains("directory");
-    let has_read_operation = lower.contains("read") || lower.contains("cat ");
-    let asks_for_many_files = lower.contains("as many files") || lower.contains("many files as");
-    let repeated_file_loop = has_list_operation
-        && has_read_operation
-        && (lower.contains("keep going")
-            || lower.contains("as many")
-            || lower.contains("list again")
-            || lower.contains("read again"));
-    let explicit_file_loop = asks_for_many_files
-        || lower.contains("as many")
-            && lower.contains("files")
-            && (has_read_operation || has_list_operation);
-    repeated_file_loop || explicit_file_loop
-}
-
-fn apply_open_ended_exploration_budget(state: &mut AgenticLoopState) -> bool {
-    if !is_open_ended_file_exploration(&state.message) {
-        return false;
-    }
-
-    state.max_turns = state.max_turns.min(OPEN_ENDED_EXPLORATION_MAX_TURNS);
-    state.remaining_turns = state.remaining_turns.min(state.max_turns);
-    state.max_tools_per_turn = state
-        .max_tools_per_turn
-        .min(OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN);
-    // Previously-pushed exploration-budget messages lived in
-    // state.messages; no-op today because the structured lane drains
-    // per-call and the old `any(|m| content == MSG)` guard never finds
-    // them. Keep the single-push-per-turn semantics via the lane: if
-    // any prior injection this turn already queued the message, skip.
-    let already_queued = state
-        .volatile_pending
-        .iter()
-        .any(|inj| inj.content == OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE);
-    if !already_queued {
-        state.push_volatile(
-            super::host::VolatileKind::ExplorationBudget,
-            OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE,
-        );
-    }
-    true
+    mutating_progress || distinct_recent_turns >= 2
 }
 
 const TASK_BOARD_START_GATE_MESSAGE: &str = "[task-board:start] This is broad multi-step or delegated work. Before broad analysis, file exploration, or spawning agents, create 3-7 concrete leaf tasks with task(action='create'), then mark exactly one first task in_progress with task(action='update', new_status='in_progress'). Keep the task board current as tasks complete, fail, pause, or are no longer needed.";
@@ -820,7 +743,7 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
         || state.max_turns >= budget.hard_turn_limit
         || used_budget_extensions(state) >= budget.max_extensions
         || crate::server::run::lifecycle::has_turn_verdict_warning(&state.stall.verdict_events)
-        || !recent_progress_is_real(state)
+        || !recent_activity_supports_budget_extension(state)
     {
         return None;
     }
@@ -842,7 +765,7 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
     state.turn_budget_hint_emitted_20 = false;
     state.turn_budget_hint_emitted_90 = false;
     let review_message = format!(
-        "[Budget review] Recent progress looks real for this {}task, so continuing with {} extra turn(s). Hard limit: {} total turns.",
+        "[Budget review] Recent tool activity passed the continuation policy for this {}task, so continuing with {} extra turn(s). Hard limit: {} total turns.",
         if state.task_profile.exploratory_task {
             "exploratory "
         } else if state.task_profile.mutates_workspace {
@@ -1045,7 +968,6 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
-    apply_open_ended_exploration_budget(state);
     apply_user_correction_reanchor(state);
     maybe_inject_task_board_start_gate(host, state).await;
 
@@ -2038,6 +1960,51 @@ mod tests {
         }
     }
 
+    fn turn_sig(signature: &str) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::from([signature.to_string()])
+    }
+
+    #[test]
+    fn budget_extension_accepts_successful_read_only_analysis_with_distinct_turns() {
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("分析session");
+        state.stall.tool_call_records = vec![read_record(0, 1, 80), read_record(1, 81, 160)];
+        state.stall.turn_sigs = vec![turn_sig("read_file:1-80"), turn_sig("read_file:81-160")];
+
+        assert!(
+            recent_activity_supports_budget_extension(&state),
+            "successful non-repetitive read-only analysis should be eligible for continuation"
+        );
+    }
+
+    #[test]
+    fn budget_extension_rejects_repetitive_read_only_loop() {
+        let mut state = make_state();
+        state.stall.tool_call_records = vec![read_record(0, 1, 80), read_record(1, 1, 80)];
+        state.stall.turn_sigs = vec![turn_sig("read_file:1-80"), turn_sig("read_file:1-80")];
+
+        assert!(
+            !recent_activity_supports_budget_extension(&state),
+            "repeating the same tool signature should not earn more budget"
+        );
+    }
+
+    #[test]
+    fn budget_extension_rejects_all_failed_activity() {
+        let mut state = make_state();
+        let mut failed = read_record(0, 1, 80);
+        failed.ok = false;
+        failed.error = Some("file not found".into());
+        state.stall.tool_call_records = vec![failed];
+        state.stall.turn_sigs = vec![turn_sig("read_file:missing")];
+
+        assert!(
+            !recent_activity_supports_budget_extension(&state),
+            "failed-only activity should not extend the turn"
+        );
+    }
+
     struct AutoRouteResolver;
 
     impl SkillResolver for AutoRouteResolver {
@@ -2082,67 +2049,6 @@ mod tests {
                 },
             ]
         }
-    }
-
-    #[test]
-    fn open_ended_file_exploration_detection_requires_file_and_loop_signal() {
-        assert!(is_open_ended_file_exploration(
-            "List files, read one, list again, then read again. Keep going."
-        ));
-        assert!(!is_open_ended_file_exploration(
-            "Read README.md and summarize it."
-        ));
-        assert!(!is_open_ended_file_exploration(
-            "Keep going on the implementation plan."
-        ));
-        assert!(!is_open_ended_file_exploration(
-            "Read the failing tests, keep going with the refactor until they pass."
-        ));
-        assert!(!is_open_ended_file_exploration(
-            "Read the design doc again, then write the implementation."
-        ));
-    }
-
-    #[test]
-    fn open_ended_file_exploration_budget_caps_turns_and_tools() {
-        let mut state = make_state();
-        state.message =
-            "List files using bash, read one, list again, then read again. Keep going.".into();
-        state.max_turns = 10;
-        state.remaining_turns = 10;
-        state.max_tools_per_turn = 15;
-
-        assert!(apply_open_ended_exploration_budget(&mut state));
-
-        assert_eq!(state.max_turns, OPEN_ENDED_EXPLORATION_MAX_TURNS);
-        assert_eq!(state.remaining_turns, OPEN_ENDED_EXPLORATION_MAX_TURNS);
-        assert_eq!(
-            state.max_tools_per_turn,
-            OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN
-        );
-        // Post-Task #45: exploration-budget message goes into the
-        // structured volatile lane, not state.messages. The singleton
-        // dedup in `push_volatile` enforces idempotence.
-        assert!(
-            state
-                .volatile_pending
-                .iter()
-                .any(|inj| inj.content.contains("Open-ended file exploration budget")),
-            "expected exploration-budget injection in volatile lane; got {:?}",
-            state.volatile_pending,
-        );
-
-        assert!(apply_open_ended_exploration_budget(&mut state));
-        let budget_entries = state
-            .volatile_pending
-            .iter()
-            .filter(|inj| inj.content == OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE)
-            .count();
-        assert_eq!(
-            budget_entries, 1,
-            "budget injection must be idempotent (singleton dedup); pending={:?}",
-            state.volatile_pending,
-        );
     }
 
     #[tokio::test]
