@@ -1997,7 +1997,7 @@ mod tests {
         record_recent_read_file_path(
             &mut reads,
             "read_file",
-            &json!({"path": "src/lib.rs", "start_line": 10, "end_line": 20}),
+            &json!({"path": "src/lib.rs", "offset": 10, "limit": 11}),
             2,
         );
 

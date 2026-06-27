@@ -1,7 +1,7 @@
 # Introspect and Reflect Observation Plane
 
-**Date**: 2026-06-24
-**Status**: Foundation Implemented; Provider and Persistence Phases Pending
+**Date**: 2026-06-24 (updated 2026-06-26)
+**Status**: Foundation Implemented; Agent-Decision Boundary Enforced; Provider, Persistence, and FrameworkAction Phases Pending
 **Audience**: Astra runtime, CLI, server, observability, learning, and SDK maintainers
 
 ## Executive Summary
@@ -62,35 +62,61 @@ Current implementation status:
 
 ## Design Principles
 
-1. **Read-only by construction**
+1. **LLM decides, framework executes**
+   The LLM agent is the sole decision-maker. The framework provides observation
+   primitives, execution primitives, and data exposure — never heuristic
+   judgment. There is no "stall detection," no "behavior rule," no automatic
+   nudge injection. The agent observes its own state through `introspect` and
+   decides its own course correction.
+
+2. **Framework as primitive provider, not as judge**
+   The framework owns runtime mechanics (budget, compaction, circuit breaking,
+   tool orchestration). It provides:
+   - **Observation primitives**: `TurnMetrics` (pure counts), `ObservationJournal`
+     (per-round entries, trends, strategy verification)
+   - **Execution primitives**: `FrameworkAction` (ExpandBudget, TriggerCompaction,
+     AdjustCircuitBreaker, TransitionPhase, etc.) — atomic operations the agent
+     or policy can invoke
+   - **Exposure primitives**: `introspect` (pull) and `render_compact_status` (push)
+     The framework never infers "the agent is stuck," "the agent is reading too
+     much," or "the agent should change strategy."
+
+3. **Policy is user-configurable, not hardcoded**
+   When the framework needs structural decisions (budget expansion, compaction
+   urgency, circuit-breaker thresholds), the _policy_ (when, by how much) is
+   declared by the user or scene configuration. The framework only provides
+   objective facts (consecutive rounds with outcome, error rate, cache pressure)
+   and executes the resulting actions. No magic numbers.
+
+4. **Read-only by construction**
    `introspect` and `reflect` never apply adaptation. They only return
    observations and evidence.
 
-2. **Same semantics across runtime modes**
+5. **Same semantics across runtime modes**
    CLI/Edge and pure Server modes may have different available data, but the
    same request should return the same conceptual schema. Missing data is
    represented as coverage, not as a different behavior.
 
-3. **Runtime errors are first-class data**
+6. **Runtime errors are first-class data**
    Errors are not just counters. They are classified observations linked to
    tool calls, decisions, context state, traces, and causal chains.
 
-4. **Evidence beats advice**
+7. **Evidence beats advice**
    The tools may include read-only action hints, but their primary output is
    evidence and structured signals that another tool can consume.
 
-5. **Depth controls cost and blast radius**
+8. **Depth controls cost and blast radius**
    Agent-initiated calls default to compact live summaries. User-triggered or
    explicit forensic calls can return deeper evidence.
 
-6. **Data provenance is always visible**
+9. **Data provenance is always visible**
    Every response declares which providers contributed data, how fresh they
    are, and which expected providers were missing or stale.
 
-7. **Graph first, views second**
-   Debug UI, Timeline UI, Memory Analysis, Feedback Training, Session Replay,
-   and the Tuning Control Plane should consume the same Observation Graph
-   instead of each building a private interpretation of events.
+10. **Graph first, views second**
+    Debug UI, Timeline UI, Memory Analysis, Feedback Training, Session Replay,
+    and the Tuning Control Plane should consume the same Observation Graph
+    instead of each building a private interpretation of events.
 
 ## Non-Goals
 
@@ -101,20 +127,127 @@ Current implementation status:
 - Changing model routing, retry policy, prompt policy, or context policy.
 - Scanning arbitrary workspace files outside already observed facts.
 - Hiding Edge/Server data differences behind silent fallback.
+- **Auto-detecting agent "stuckness" or injecting behavioral nudges.**
+  The framework never infers "the agent is reading too much," "the agent is in
+  a failure loop," or "the agent should change strategy." All behavioral
+  judgment belongs to the LLM agent via `introspect`. There is no
+  `BehaviorRule`, no `OutcomeTracker`, no automatic nudge injection.
+- **Hardcoding heuristic thresholds for pipeline decisions.**
+  Budget expansion, compaction urgency, and circuit-breaker adjustments use
+  _objective facts_ (consecutive rounds with outcome, error counts, cache
+  pressure) combined with _user-configurable policy_ — never weighted scoring
+  formulas with magic numbers.
 
 ## Why Two Tools?
 
 The tools should be separated by time horizon and usage pattern, not by data
 source.
 
-| Tool | Primary Question | Default Horizon | Default Caller | Cost Profile |
-| --- | --- | --- | --- | --- |
-| `introspect` | What is happening now, and what active problems affect my next step? | `current_turn` | Agent | Low |
-| `reflect` | What happened over a historical window, why, and with what evidence? | `session` | User or agent | Medium to high |
+| Tool         | Primary Question                                                     | Default Horizon | Default Caller | Cost Profile   |
+| ------------ | -------------------------------------------------------------------- | --------------- | -------------- | -------------- |
+| `introspect` | What is happening now, and what active problems affect my next step? | `current_turn`  | Agent          | Low            |
+| `reflect`    | What happened over a historical window, why, and with what evidence? | `session`       | User or agent  | Medium to high |
 
 The implementation should share a common inspection service and provider layer.
 The tools are facades with different defaults, budgets, and presentation
 policies.
+
+## Agent-Decision Boundary
+
+This is the most important architectural principle in the observation plane.
+It defines what belongs to the framework and what belongs to the LLM agent.
+
+### Framework Provides Primitives, Not Judgment
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   FRAMEWORK (never judges)                │
+│                                                          │
+│  Observation Primitives:                                 │
+│    TurnMetrics — per-round tool call counts              │
+│    ObservationJournal — per-round entries, trends        │
+│    render_compact_status — push self-status to agent      │
+│    introspect — pull observation data                     │
+│                                                          │
+│  Execution Primitives (FrameworkAction):                  │
+│    ExpandBudget { factor, reason }                        │
+│    TriggerCompaction { urgency }                          │
+│    AdjustCircuitBreaker { max_rounds }                    │
+│    TransitionPhase { target }                            │
+│    InjectSignal { signal }                               │
+│                                                          │
+│  Framework only exposes WHAT IS, not WHAT TO DO.          │
+└─────────────────────────────────────────────────────────┘
+         │                              ▲
+         │ facts                        │ actions
+         ▼                              │
+┌─────────────────────────────────────────────────────────┐
+│                   LLM AGENT (sole decision-maker)         │
+│                                                          │
+│  Observes state via introspect                            │
+│  Reasons about progress, errors, strategy                 │
+│  Decides to call FrameworkAction or adjust behavior       │
+│  Marks strategy changes explicitly (mark_strategy_change) │
+│                                                          │
+│  The agent is the ONLY entity that decides:               │
+│    "Am I stuck?" "Should I change approach?"              │
+│    "Do I need more budget?" "Should I compact?"           │
+└─────────────────────────────────────────────────────────┘
+```
+
+### What Was Removed (and Why)
+
+| Removed Component                          | Problem                                                              | Replacement                                               |
+| ------------------------------------------ | -------------------------------------------------------------------- | --------------------------------------------------------- |
+| `BehaviorRule` + thresholds                | Heuristic pattern matching — "read_family_ratio > 0.8" is a guess    | Agent observes TurnMetrics via introspect, decides itself |
+| `OutcomeTracker`                           | Single-signal heuristic — "3 rounds without file mutation = stalled" | Agent sees consecutive-round data via ObservationJournal  |
+| `BehaviorNudge` volatile injection         | Framework telling agent "you are doing X wrong"                      | `render_compact_status` shows facts; agent decides        |
+| `TaskType::infer_from_message`             | Keyword matching — `msg.contains("review")` is fragile               | Agent explicitly marks strategy changes                   |
+| `EntityDag` constraint propagation         | Cross-rule threshold tuning — premature optimization                 | Policy is user-configurable, not self-tuning              |
+| Hardcoded budget expansion (1.25x, cap 2x) | Magic numbers in evaluate.rs                                         | `FrameworkAction::ExpandBudget` + user `BudgetPolicy`     |
+
+### The Feedback Loop: Agent as the Central Hub
+
+```
+1. Agent calls tools → TurnMetrics records counts
+2. Round completes → ObservationJournal records entry
+3. Next round starts → render_compact_status pushes facts to agent
+4. Agent introspects → full observation data
+5. Agent reasons → adjusts behavior or invokes FrameworkAction
+6. Agent marks strategy_change → journal records pre/post snapshots
+7. Later rounds → strategy_verification shows "was that change effective?"
+```
+
+The agent owns the entire decision cycle. The framework is a passive but
+complete data plane + execution plane.
+
+### Policy Configuration (User/Scene-Declared)
+
+Framework structural decisions (budget, compaction, circuit-breaking) are
+driven by policy, not by hardcoded constants:
+
+```rust
+struct BudgetPolicy {
+    expand_after_consecutive_outcomes: u32,  // e.g. 3
+    expand_factor: f64,                      // e.g. 1.5 (+50%) or 2.0 (+100%)
+    max_ceiling: u32,                        // e.g. 1000 — can be very large
+    contract_after_consecutive_zero: u32,    // e.g. 3
+}
+
+struct CompactPolicy {
+    pressure_threshold: f64,                 // e.g. 0.8
+    aggressive_factor: f64,                  // e.g. 2.0
+}
+```
+
+The framework collects objective facts (from `ObservationJournal`):
+
+- `consecutive_rounds_with_outcome: u32` — not a judgment, a count
+- `current_error_rate: f64` — not a judgment, a ratio
+- `cache_pressure: f64` — not a judgment, a measurement
+
+The policy declares thresholds and factors. The framework executes.
+No component in the middle infers "good" or "bad."
 
 ## Conceptual API
 
@@ -177,14 +310,14 @@ Use `horizon` rather than overloading `scope` with multiple meanings.
 `horizon` is only a time/window selector. It must not describe observation
 content.
 
-| Horizon | Meaning | Typical Tool |
-| --- | --- | --- |
-| `now` | Current runtime snapshot only | `introspect` |
-| `current_turn` | Current turn and recent in-memory rounds | `introspect` |
-| `recent` | Recent N turns or events | Both |
-| `turn` | One explicit turn | `reflect` |
-| `session` | Full active or selected session | `reflect` |
-| `cross_session` | Explicitly authorized multi-session window | `reflect` |
+| Horizon         | Meaning                                    | Typical Tool |
+| --------------- | ------------------------------------------ | ------------ |
+| `now`           | Current runtime snapshot only              | `introspect` |
+| `current_turn`  | Current turn and recent in-memory rounds   | `introspect` |
+| `recent`        | Recent N turns or events                   | Both         |
+| `turn`          | One explicit turn                          | `reflect`    |
+| `session`       | Full active or selected session            | `reflect`    |
+| `cross_session` | Explicitly authorized multi-session window | `reflect`    |
 
 `cross_session` must never be implicit. It requires an explicit user request,
 policy approval, or a narrowly bounded learning workflow.
@@ -209,12 +342,13 @@ Specific traces or chains are selected with `selector`, not `horizon`:
 Use a small top-level topic vocabulary. Detailed views are expressed through
 `facet`.
 
-| Topic | Meaning |
-| --- | --- |
-| `overview` | Summary of the selected horizon and graph slice |
-| `runtime` | Live model, turn, execution binding, budget, cache, compaction, capability |
-| `execution` | Actions, errors, tools, traces, metrics, progress, loops |
-| `knowledge` | Context, memory, retrieval, facts, drift |
+| Topic       | Meaning                                                                    |
+| ----------- | -------------------------------------------------------------------------- |
+| `overview`  | Summary of the selected horizon and graph slice                            |
+| `runtime`   | Live model, turn, execution binding, budget, cache, compaction, capability |
+| `execution` | Actions, errors, tools, traces, metrics, progress, loops                   |
+| `knowledge` | Context, memory, retrieval, facts, drift                                   |
+
 Current tool schemas expose only `overview`, `runtime`, `execution`, and
 `knowledge`. Read-only adaptation signal views are a future provider surface;
 they should be added only when the signal provider, schema, slash parser, and
@@ -224,12 +358,12 @@ service routing are implemented end to end.
 
 `facet` narrows a top-level topic.
 
-| Topic | Common Facets |
-| --- | --- |
-| `runtime` | `budget`, `cache`, `capability`, `binding`, `model` |
+| Topic       | Common Facets                                                 |
+| ----------- | ------------------------------------------------------------- |
+| `runtime`   | `budget`, `cache`, `capability`, `binding`, `model`           |
 | `execution` | `progress`, `errors`, `tools`, `trace`, `performance`, `loop` |
-| `knowledge` | `context`, `memory`, `retrieval`, `facts`, `drift` |
-| `overview` | `summary`, `question` |
+| `knowledge` | `context`, `memory`, `retrieval`, `facts`, `drift`            |
+| `overview`  | `summary`, `question`                                         |
 
 For CLI ergonomics, slash commands may accept path-like aliases such as
 `execution/errors`, `knowledge/memory`, or `runtime/budget`. Internally these
@@ -237,10 +371,10 @@ normalize to `{topic, facet}`.
 
 ### Recommended Defaults
 
-| Tool | Default Topic | Default Facet |
-| --- | --- | --- |
-| `introspect` | `runtime` | `summary` |
-| `reflect` | `overview` | `summary` |
+| Tool         | Default Topic | Default Facet |
+| ------------ | ------------- | ------------- |
+| `introspect` | `runtime`     | `summary`     |
+| `reflect`    | `overview`    | `summary`     |
 
 Aliases are useful for CLI compatibility and user ergonomics, but internal
 storage should normalize to canonical topic and facet values.
@@ -249,12 +383,12 @@ storage should normalize to canonical topic and facet values.
 
 Depth controls output volume and evidence detail.
 
-| Depth | Intended Use | Output |
-| --- | --- | --- |
-| `hint` | Agent needs a tiny live nudge | Top 1-3 observations, no heavy queries |
-| `summary` | Normal live self-check | Status, active problems, compact evidence refs |
-| `diagnostic` | Root-cause analysis | Classified observations, causal summaries, metrics |
-| `forensic` | User/debug deep dive | Evidence graph, timeline, provider details |
+| Depth        | Intended Use                  | Output                                             |
+| ------------ | ----------------------------- | -------------------------------------------------- |
+| `hint`       | Agent needs a tiny live nudge | Top 1-3 observations, no heavy queries             |
+| `summary`    | Normal live self-check        | Status, active problems, compact evidence refs     |
+| `diagnostic` | Root-cause analysis           | Classified observations, causal summaries, metrics |
+| `forensic`   | User/debug deep dive          | Evidence graph, timeline, provider details         |
 
 Defaults:
 
@@ -306,14 +440,14 @@ should never be required to render an unbounded evidence graph.
 
 ## Source Policies
 
-| Policy | Meaning |
-| --- | --- |
-| `auto` | Tool-specific default |
-| `live_only` | Runtime state only; no durable reads |
-| `live_first` | Prefer live/local state, merge durable data if available |
-| `durable_first` | Prefer cloud/event-store data, merge live/local deltas |
-| `local_only` | CLI/Edge local artifacts only; no cloud reads |
-| `cloud_only` | Cloud/server durable data only; no local artifacts |
+| Policy          | Meaning                                                  |
+| --------------- | -------------------------------------------------------- |
+| `auto`          | Tool-specific default                                    |
+| `live_only`     | Runtime state only; no durable reads                     |
+| `live_first`    | Prefer live/local state, merge durable data if available |
+| `durable_first` | Prefer cloud/event-store data, merge live/local deltas   |
+| `local_only`    | CLI/Edge local artifacts only; no cloud reads            |
+| `cloud_only`    | Cloud/server durable data only; no local artifacts       |
 
 Default expansion:
 
@@ -330,19 +464,19 @@ truth.
 The observation plane is implemented as provider fusion. Each provider returns
 typed observations, evidence refs, freshness, and limitations.
 
-| Provider | CLI/Edge | Pure Server | Notes |
-| --- | --- | --- | --- |
-| `live_runtime` | Yes | Yes | Authoritative for current runtime state |
-| `visible_context` | Yes | Sometimes | Available only when the prompt/context surface is accessible |
-| `local_journal` | Yes | Usually no | May be fresher than cloud but local-only |
-| `local_workspace_metadata` | Yes | Usually no | Session config, persistence errors, workspace hints |
-| `llm_capture` | Yes if enabled | Sometimes | Useful for cache and prompt forensics |
-| `cloud_events` | When authenticated | Yes | Durable session/event source |
-| `decision_audits` | When authenticated | Yes | Tool/model/context decision evidence |
-| `session_activity` | When authenticated | Yes | Durable activity timeline |
-| `memory_backend` | Via local/cloud proxy | Yes | Cross-session memory and lessons |
-| `trace_store` | When present | Yes | Causal chains and graph reconstruction |
-| `tuning_control_plane` | When local job store exists | Yes | `TuningJob` resources, reconcile events, status conditions, evaluations, measurements |
+| Provider                   | CLI/Edge                    | Pure Server | Notes                                                                                 |
+| -------------------------- | --------------------------- | ----------- | ------------------------------------------------------------------------------------- |
+| `live_runtime`             | Yes                         | Yes         | Authoritative for current runtime state                                               |
+| `visible_context`          | Yes                         | Sometimes   | Available only when the prompt/context surface is accessible                          |
+| `local_journal`            | Yes                         | Usually no  | May be fresher than cloud but local-only                                              |
+| `local_workspace_metadata` | Yes                         | Usually no  | Session config, persistence errors, workspace hints                                   |
+| `llm_capture`              | Yes if enabled              | Sometimes   | Useful for cache and prompt forensics                                                 |
+| `cloud_events`             | When authenticated          | Yes         | Durable session/event source                                                          |
+| `decision_audits`          | When authenticated          | Yes         | Tool/model/context decision evidence                                                  |
+| `session_activity`         | When authenticated          | Yes         | Durable activity timeline                                                             |
+| `memory_backend`           | Via local/cloud proxy       | Yes         | Cross-session memory and lessons                                                      |
+| `trace_store`              | When present                | Yes         | Causal chains and graph reconstruction                                                |
+| `tuning_control_plane`     | When local job store exists | Yes         | `TuningJob` resources, reconcile events, status conditions, evaluations, measurements |
 
 CLI/Edge may be a superset of Server data, but only when it is authenticated
 and local artifacts exist. The response must describe the actual provider set.
@@ -353,11 +487,11 @@ The Inspection Service fuses provider outputs into graph-backed evidence, but it
 should not create one unbounded "everything graph." The logical model has three
 layers with different ownership, query patterns, and permissions.
 
-| Layer | Primary Entities | Meaning |
-| --- | --- | --- |
-| Runtime Graph | `Event`, `Trace`, `Decision` | What happened during execution |
-| Observation Graph | `Observation`, `Signal`, `CausalChain`, `FailureCluster` | What the system inferred from runtime evidence |
-| Adaptation Graph | `Candidate`, `EvaluationRun`, `Intervention`, `MeasurementRun` | What experiments or interventions were tried and measured |
+| Layer             | Primary Entities                                               | Meaning                                                   |
+| ----------------- | -------------------------------------------------------------- | --------------------------------------------------------- |
+| Runtime Graph     | `Event`, `Trace`, `Decision`                                   | What happened during execution                            |
+| Observation Graph | `Observation`, `Signal`, `CausalChain`, `FailureCluster`       | What the system inferred from runtime evidence            |
+| Adaptation Graph  | `Candidate`, `EvaluationRun`, `Intervention`, `MeasurementRun` | What experiments or interventions were tried and measured |
 
 External callers still receive a unified `GraphSlice` view. Internally, the
 layers keep runtime evidence, observations, and experimental evidence from
@@ -375,16 +509,16 @@ ProviderObservation
 
 ### Graph Model
 
-| Entity | Meaning |
-| --- | --- |
-| `RuntimeNode` | Event, trace, decision, runtime signal |
-| `ObservationNode` | Observation, causal chain, failure cluster, adaptation signal |
-| `AdaptationNode` | Candidate, evaluation run, intervention, measurement run, tuning job/status |
-| `GraphEdge` | Causal, temporal, support, contradiction, derived-from, duplicate-of, measured-by, reconcile relation |
-| `Observation` | Classified finding over one or more graph nodes |
-| `FailureCluster` | Group of related failures that should be diagnosed together |
-| `EvidenceRef` | Stable reference to source evidence or graph node |
-| `GraphSlice` | Bounded subset returned to a tool, UI, replay, or training consumer |
+| Entity            | Meaning                                                                                               |
+| ----------------- | ----------------------------------------------------------------------------------------------------- |
+| `RuntimeNode`     | Event, trace, decision, runtime signal                                                                |
+| `ObservationNode` | Observation, causal chain, failure cluster, adaptation signal                                         |
+| `AdaptationNode`  | Candidate, evaluation run, intervention, measurement run, tuning job/status                           |
+| `GraphEdge`       | Causal, temporal, support, contradiction, derived-from, duplicate-of, measured-by, reconcile relation |
+| `Observation`     | Classified finding over one or more graph nodes                                                       |
+| `FailureCluster`  | Group of related failures that should be diagnosed together                                           |
+| `EvidenceRef`     | Stable reference to source evidence or graph node                                                     |
+| `GraphSlice`      | Bounded subset returned to a tool, UI, replay, or training consumer                                   |
 
 Consumers should ask for bounded graph slices, not the whole graph. Slices may
 join across layers, but permissions and retention should remain layer-aware.
@@ -474,9 +608,7 @@ Structured evidence refs should include parsed fields:
   "namespace": "edge",
   "source_provider": "local_journal",
   "stable": false,
-  "aliases": [
-    "urn:astra:event:cloud:event_01H00000000000000000000001"
-  ]
+  "aliases": ["urn:astra:event:cloud:event_01H00000000000000000000001"]
 }
 ```
 
@@ -488,12 +620,12 @@ graph should preserve an alias edge so old local refs remain resolvable.
 Evidence refs identify source material, but callers also need to know what kind
 of evidence they are looking at.
 
-| Evidence Class | Examples | Meaning |
-| --- | --- | --- |
-| `observed_evidence` | Runtime event, trace, decision, context fact | Something that happened or was present |
-| `inferred_evidence` | Observation, causal chain, failure cluster, signal | A classified or inferred finding over observed evidence |
-| `experimental_evidence` | Evaluation run, candidate result, measurement run | Result of a controlled or semi-controlled experiment |
-| `audit_evidence` | Reconcile event, condition, apply decision | Control-plane or write-side decision record |
+| Evidence Class          | Examples                                           | Meaning                                                 |
+| ----------------------- | -------------------------------------------------- | ------------------------------------------------------- |
+| `observed_evidence`     | Runtime event, trace, decision, context fact       | Something that happened or was present                  |
+| `inferred_evidence`     | Observation, causal chain, failure cluster, signal | A classified or inferred finding over observed evidence |
+| `experimental_evidence` | Evaluation run, candidate result, measurement run  | Result of a controlled or semi-controlled experiment    |
+| `audit_evidence`        | Reconcile event, condition, apply decision         | Control-plane or write-side decision record             |
 
 `Observation` should not be overloaded to mean `EvaluationRun`. Evaluation and
 measurement results belong to experimental evidence. They may support or refute
@@ -526,10 +658,7 @@ Every response includes coverage.
         "reason": "not_configured"
       }
     },
-    "warnings": [
-      "local_journal_ahead_of_cloud",
-      "memory_backend_unavailable"
-    ]
+    "warnings": ["local_journal_ahead_of_cloud", "memory_backend_unavailable"]
   }
 }
 ```
@@ -620,22 +749,22 @@ derived convenience fields. Legacy blobs such as `reflection_context` and
 
 ### Field Semantics
 
-| Field | Meaning |
-| --- | --- |
-| `schema_version` | Observation-plane response schema version |
-| `tool` | Producing facade, usually `introspect` or `reflect` |
-| `topic`, `facet`, `depth`, `horizon`, `source_policy`, `include_context` | Normalized request scope |
-| `data_coverage` | Root coverage summary; must match `view.data_coverage` |
-| `view` | Normalized view descriptor repeated for consumers that already read nested view metadata |
-| `summary` | Human/agent-readable compact result string |
-| `graph_slice` | Bounded Observation Graph subset used to render the view |
-| `observations` | Classified read-only findings |
-| `failure_clusters` | Optional groups of related failures used for diagnosis and tuning |
-| `causal_chains` | Decision/action/outcome chains |
-| `evidence` | Materialized evidence refs and previews |
-| `adaptation_signals` | Read-only inputs for the Tuning Control Plane and write-side feedback/adaptation tools |
-| `action_hints` | Optional read-only hints, not commands |
-| `budget_result` | Truncation and cursor metadata for bounded responses |
+| Field                                                                    | Meaning                                                                                  |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `schema_version`                                                         | Observation-plane response schema version                                                |
+| `tool`                                                                   | Producing facade, usually `introspect` or `reflect`                                      |
+| `topic`, `facet`, `depth`, `horizon`, `source_policy`, `include_context` | Normalized request scope                                                                 |
+| `data_coverage`                                                          | Root coverage summary; must match `view.data_coverage`                                   |
+| `view`                                                                   | Normalized view descriptor repeated for consumers that already read nested view metadata |
+| `summary`                                                                | Human/agent-readable compact result string                                               |
+| `graph_slice`                                                            | Bounded Observation Graph subset used to render the view                                 |
+| `observations`                                                           | Classified read-only findings                                                            |
+| `failure_clusters`                                                       | Optional groups of related failures used for diagnosis and tuning                        |
+| `causal_chains`                                                          | Decision/action/outcome chains                                                           |
+| `evidence`                                                               | Materialized evidence refs and previews                                                  |
+| `adaptation_signals`                                                     | Read-only inputs for the Tuning Control Plane and write-side feedback/adaptation tools   |
+| `action_hints`                                                           | Optional read-only hints, not commands                                                   |
+| `budget_result`                                                          | Truncation and cursor metadata for bounded responses                                     |
 
 ## Confidence Model
 
@@ -654,11 +783,11 @@ Use this shape where confidence is needed:
 }
 ```
 
-| Field | Meaning |
-| --- | --- |
-| `classification` | Confidence that the observation category is correct |
-| `evidence` | Confidence that the cited evidence is complete and reliable |
-| `causal` | Confidence that the proposed causal relation is correct |
+| Field            | Meaning                                                     |
+| ---------------- | ----------------------------------------------------------- |
+| `classification` | Confidence that the observation category is correct         |
+| `evidence`       | Confidence that the cited evidence is complete and reliable |
+| `causal`         | Confidence that the proposed causal relation is correct     |
 
 Providers may omit dimensions they cannot estimate. The Inspection Service may
 aggregate provider-level confidence, but it must preserve provenance so scores
@@ -668,8 +797,8 @@ remain explainable.
 
 The agent needs to answer "what am I doing?" as well as "what failed?".
 
-This is a provider-phase target, not part of the current foundation contract.
-Once implemented, `topic=execution, facet=progress` should expose:
+This is partially implemented with `TurnMetrics` and `ObservationJournal`.
+`topic=execution, facet=progress` currently exposes:
 
 ```json
 {
@@ -689,6 +818,20 @@ Once implemented, `topic=execution, facet=progress` should expose:
   }
 }
 ```
+
+The `ObservationJournal` provides per-round entries with:
+
+- Tool call counts and top tools used
+- Error counts and error rate trend
+- Cache hit ratio
+- Read/write ratio
+- Strategy change markers (agent-initiated)
+- Strategy verification (pre/post comparison after a marked change)
+- Trend computation (stable, improving, degrading, rapidly\_\*)
+
+The push channel (`render_compact_status`) injects a compact self-status block
+at the start of each round. The pull channel (`introspect facet=metrics`)
+returns the full journal state on demand.
 
 Allowed `phase` values should be coarse and stable:
 
@@ -1188,9 +1331,59 @@ Implemented foundation:
    - public `reflect.evidence_graph`
    - implicit tuning control-loop runtime code
 
+**Observation Plane — Agent Self-Awareness (Implemented):**
+
+7. `TurnMetrics` in `astra_core::observation`:
+   - Per-round tool call counts (total, read family, write/edit family,
+     build/test, network, memory, errors, cache hits, by-tool breakdown)
+   - Derived ratios: `read_write_ratio()`, `error_rate()`, `cache_hit_ratio()`,
+     `repetition_ratio()`
+   - Sliding-window construction: `from_tool_records()` counts only recent N
+     rounds (default 3), with `round=None` records always included
+   - Pure data — no heuristic thresholds, no "spiral" detection, no judgments
+
+8. `ObservationJournal` in `astra_core::observation_journal`:
+   - Per-round entries with tool counts, error counts, cache ratio, read/write
+     ratio, top tools
+   - Trend computation across entries: stable, improving, degrading,
+     rapidly_improving, rapidly_degrading
+   - Agent-initiated strategy change markers: `mark_strategy_change(desc)`
+     records pre/post snapshots
+   - Strategy verification: `strategy_verification()` compares pre vs post
+     metrics, returns effective/ineffective/worsened
+   - Push channel: `render_compact_status()` — injects "## ⚡ Self-Status" at
+     round start with compact metrics, trends, and strategy verification
+   - Pull channel: exposed via `introspect facet=metrics`
+   - Purge support: `purge_state()` trims entries to bounded window
+
+9. **Agent-Decision Boundary — Clean Slate:**
+   - `BehaviorRule`, `MetricSelector`, `MetricThreshold`, `ComparisonOp` —
+     **deleted**. No heuristic pattern matching.
+   - `OutcomeTracker`, `StallRecord`, `StallNudge` — **deleted**. No single-
+     signal stuckness detection.
+   - `BehaviorNudge` volatile kind — **deleted**. No automatic injection into
+     agent context.
+   - `TaskType`, `infer_from_message` — **deleted**. No keyword-based intent
+     classification.
+   - `EntityDag`, `TunableEntity`, `EntityPropagation` — **deleted**. No
+     premature cross-rule optimization.
+   - `ObservationBus`, `TurnObserver` trait, `ObserverAction` — **deleted**.
+     No observer pattern for automatic behavior monitoring.
+   - Pipeline `evaluate.rs` hardcoded budget expansion (1.25x, cap 2x, Good
+     progress threshold > 0.5) — **pending replacement** with policy-driven
+     `FrameworkAction` system.
+
 Next phases:
 
-1. Define provider traits:
+1. **FrameworkAction primitives**: Define and implement `ExpandBudget`,
+   `TriggerCompaction`, `AdjustCircuitBreaker`, `TransitionPhase`, and
+   `InjectSignal` as atomic operations exposed to the agent or policy layer.
+2. **Policy configuration**: Move budget/compaction/circuit thresholds from
+   hardcoded pipeline constants to user-configurable `BudgetPolicy`,
+   `CompactPolicy`, `CircuitPolicy` structs driven by objective
+   `ObservationJournal` facts (consecutive rounds with/without outcome, error
+   rate, cache pressure).
+3. Define provider traits:
    - `LiveRuntimeProvider`
    - `ContextProvider`
    - `LocalSessionProvider`
@@ -1199,16 +1392,16 @@ Next phases:
    - `TraceProvider`
    - `MemoryObservationProvider`
    - `TuningControlPlaneProvider`
-2. Build an `InspectionService` that normalizes topic, facet, depth, horizon,
+4. Build an `InspectionService` that normalizes topic, facet, depth, horizon,
    selector, budget, and source policy before calling providers.
-3. Move CLI local reflect self-surface behind `LocalSessionProvider`.
-4. Add persistent Observation Graph storage with logical runtime, observation,
+5. Move CLI local reflect self-surface behind `LocalSessionProvider`.
+6. Add persistent Observation Graph storage with logical runtime, observation,
    and adaptation layers.
-5. Ingest tuning job status, reconcile events, evaluations, and measurements as
+7. Ingest tuning job status, reconcile events, evaluations, and measurements as
    Observation Graph evidence once the write-side tuning control plane exists.
-6. Update SDK bindings and richer slash-command renderers to consume the shared
+8. Update SDK bindings and richer slash-command renderers to consume the shared
    envelope directly.
-7. Keep `last_n` only as a bounded evidence limit, not as a horizon alias.
+9. Keep `last_n` only as a bounded evidence limit, not as a horizon alias.
 
 ## Open Questions
 
@@ -1227,3 +1420,10 @@ Next phases:
 7. Which `TuningJob` status conditions, reconcile events, and measurement
    reports should be retained as long-lived graph evidence versus short-lived
    operator status?
+8. Should `FrameworkAction` be exposed as agent-callable tools (e.g.
+   `request_budget_expansion`) or as internal events triggered by policy
+   evaluation?
+9. How should user/scene `BudgetPolicy` configuration surface — as a session
+   config file, a CLI flag, a runtime tool call, or all three?
+10. Should `ObservationJournal` strategy verification feed back into
+    `FrameworkAction` decisions automatically, or only inform the agent?

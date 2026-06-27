@@ -5029,13 +5029,13 @@ esac
     }
 
     #[tokio::test]
-    async fn read_file_respects_start_and_end_line() {
+    async fn read_file_respects_offset_and_limit() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("f.txt"), "a\nb\nc\nd\ne\n").unwrap();
         let result = exec
             .execute(
                 "read_file",
-                &json!({"path": "f.txt", "start_line": 2, "end_line": 4}),
+                &json!({"path": "f.txt", "offset": 2, "limit": 3}),
             )
             .await;
         assert!(!result.contains("1\ta"));
@@ -5074,7 +5074,7 @@ esac
         std::fs::write(dir.path().join("big.txt"), &large).unwrap();
         let result = exec.execute("read_file", &json!({"path": "big.txt"})).await;
         assert!(result.contains("Large file preview"), "got: {result}");
-        assert!(result.contains("start_line"), "got: {result}");
+        assert!(result.contains("offset"), "got: {result}");
     }
 
     #[tokio::test]

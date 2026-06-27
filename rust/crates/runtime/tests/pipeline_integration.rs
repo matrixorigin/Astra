@@ -6,10 +6,12 @@
 use astra_pipeline::{
     engine::{ExecutionEngine, PipelineStage, StageAction, StageRegistry},
     event::{EventKind, EventLog, TraceLevel},
+    feedback_store::FeedbackStore,
     stages::{evaluate::EvaluateStage, reflect::ReflectStage},
     state::{AgentPhase, TurnOutcome, TurnState, TurnStatus},
 };
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ─── Mock Stages ─────────────────────────────────────────────────────────────
@@ -130,7 +132,10 @@ async fn full_loop_stall_triggers_reflect_then_recovers() {
         }),
     );
     registry.register(AgentPhase::Evaluate, Box::new(EvaluateStage));
-    registry.register(AgentPhase::Reflect, Box::new(ReflectStage));
+    registry.register(
+        AgentPhase::Reflect,
+        Box::new(ReflectStage::new(Arc::new(FeedbackStore::new()))),
+    );
 
     let engine = ExecutionEngine::new(registry);
     let mut state = TurnState::new("test stall recovery", vec![], 20, 1_000_000, 300_000);
@@ -212,7 +217,10 @@ async fn budget_exhaustion_terminates_cleanly() {
     registry.register(AgentPhase::Plan, Box::new(SimplePlan));
     registry.register(AgentPhase::Execute, Box::new(NoProgressExecute));
     registry.register(AgentPhase::Evaluate, Box::new(EvaluateStage));
-    registry.register(AgentPhase::Reflect, Box::new(ReflectStage));
+    registry.register(
+        AgentPhase::Reflect,
+        Box::new(ReflectStage::new(Arc::new(FeedbackStore::new()))),
+    );
 
     let engine = ExecutionEngine::new(registry);
     // Only 2 rounds budget
@@ -277,7 +285,10 @@ async fn max_reflections_then_fail() {
     registry.register(AgentPhase::Plan, Box::new(AlwaysPlan));
     registry.register(AgentPhase::Execute, Box::new(ZeroProgressExecute));
     registry.register(AgentPhase::Evaluate, Box::new(EvaluateStage));
-    registry.register(AgentPhase::Reflect, Box::new(ReflectStage));
+    registry.register(
+        AgentPhase::Reflect,
+        Box::new(ReflectStage::new(Arc::new(FeedbackStore::new()))),
+    );
 
     let engine = ExecutionEngine::new(registry);
     let mut state = TurnState::new("test max reflect", vec![], 50, 1_000_000, 300_000);
@@ -374,7 +385,10 @@ async fn reflection_injects_context_into_messages() {
         }),
     );
     registry.register(AgentPhase::Evaluate, Box::new(EvaluateStage));
-    registry.register(AgentPhase::Reflect, Box::new(ReflectStage));
+    registry.register(
+        AgentPhase::Reflect,
+        Box::new(ReflectStage::new(Arc::new(FeedbackStore::new()))),
+    );
 
     let engine = ExecutionEngine::new(registry);
     let mut state = TurnState::new("test context injection", vec![], 20, 1_000_000, 300_000);

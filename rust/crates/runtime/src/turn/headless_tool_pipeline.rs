@@ -1714,7 +1714,7 @@ mod tests {
             executed.execution.result_str
         );
         assert!(
-            executed.execution.result_str.contains("start_line"),
+            executed.execution.result_str.contains("offset"),
             "got: {}",
             executed.execution.result_str
         );

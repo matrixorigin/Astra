@@ -363,6 +363,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         );
 
         let mut state = AgenticLoopState {
+            observation_journal: Default::default(),
             messages,
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),

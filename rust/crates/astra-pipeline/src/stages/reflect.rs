@@ -13,8 +13,12 @@
 //! This is the core mechanism for requirement #4 (non-happy path). Instead of
 //! generic retry, the agent understands WHY it's stuck and adjusts strategy.
 
+use std::sync::Arc;
+
 use crate::engine::{PipelineStage, StageAction};
 use crate::event::{EventKind, EventLog};
+use crate::feedback_store::FeedbackStore;
+use crate::reflection_feedback::reflection_to_feedback;
 use crate::state::{AgentPhase, Reflection, StrategyDelta, TurnOutcome, TurnState, TurnStatus};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -157,7 +161,21 @@ fn apply_strategy_delta(state: &mut TurnState, delta: &StrategyDelta) {
 ///
 /// Runs when the agent is stalled or regressing. Produces a [`Reflection`]
 /// with diagnosis, prescription, and strategy adjustments.
-pub struct ReflectStage;
+///
+/// Optionally persists [`StructuredFeedback`](astra_turn_types::StructuredFeedback)
+/// via a shared [`FeedbackStore`] so that patterns learned during reflection
+/// survive across sessions.
+pub struct ReflectStage {
+    feedback_store: Arc<FeedbackStore>,
+}
+
+impl ReflectStage {
+    pub fn new(store: Arc<FeedbackStore>) -> Self {
+        Self {
+            feedback_store: store,
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl PipelineStage for ReflectStage {
@@ -199,6 +217,12 @@ impl PipelineStage for ReflectStage {
             confidence,
             strategy_delta: strategy_delta.clone(),
         };
+
+        // 4a. Persist structured feedback for cross-session learning
+        if let Some(fb) = reflection_to_feedback(&reflection, category) {
+            let sid = state.session_id.as_deref().unwrap_or("unknown");
+            self.feedback_store.add(sid, fb).await;
+        }
 
         // 5. Apply strategy delta to TurnState
         apply_strategy_delta(state, &strategy_delta);
@@ -246,9 +270,13 @@ mod tests {
         TurnState::new("test query", vec![], 10, 100_000, 300_000)
     }
 
+    fn make_store() -> Arc<FeedbackStore> {
+        Arc::new(FeedbackStore::new())
+    }
+
     #[tokio::test]
     async fn reflect_on_tool_failures_blocks_tools() {
-        let stage = ReflectStage;
+        let stage = ReflectStage::new(make_store());
         let mut state = make_state();
         let mut log = EventLog::new();
 
@@ -272,7 +300,7 @@ mod tests {
 
     #[tokio::test]
     async fn reflect_on_stall_widens_selection() {
-        let stage = ReflectStage;
+        let stage = ReflectStage::new(make_store());
         let mut state = make_state();
         let mut log = EventLog::new();
 
@@ -293,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn reflect_on_no_progress_injects_context() {
-        let stage = ReflectStage;
+        let stage = ReflectStage::new(make_store());
         let mut state = make_state();
         let mut log = EventLog::new();
 
@@ -317,7 +345,7 @@ mod tests {
 
     #[tokio::test]
     async fn reflect_general_case() {
-        let stage = ReflectStage;
+        let stage = ReflectStage::new(make_store());
         let mut state = make_state();
         let mut log = EventLog::new();
         state.phase = AgentPhase::Reflect;
@@ -331,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn reflect_max_reflections_transitions_to_failed() {
-        let stage = ReflectStage;
+        let stage = ReflectStage::new(make_store());
         let mut state = make_state();
         let mut log = EventLog::new();
 
@@ -356,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn reflect_confidence_decreases_with_attempts() {
-        let stage = ReflectStage;
+        let stage = ReflectStage::new(make_store());
         let mut state = make_state();
         let mut log = EventLog::new();
 
@@ -391,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn reflect_emits_event() {
-        let stage = ReflectStage;
+        let stage = ReflectStage::new(make_store());
         let mut state = make_state();
         let mut log = EventLog::with_min_level(TraceLevel::Trace);
         state.phase = AgentPhase::Reflect;
@@ -408,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn reflect_injects_self_correction_message() {
-        let stage = ReflectStage;
+        let stage = ReflectStage::new(make_store());
         let mut state = make_state();
         let mut log = EventLog::new();
 
@@ -498,5 +526,41 @@ mod tests {
         assert!((reflection_confidence(2) - 0.2).abs() < f64::EPSILON);
         assert!((reflection_confidence(3) - 0.1).abs() < f64::EPSILON);
         assert!((reflection_confidence(10) - 0.1).abs() < f64::EPSILON);
+    }
+
+    // ── feedback persistence ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reflect_persists_feedback_when_store_configured() {
+        use std::sync::Arc;
+
+        let store = Arc::new(FeedbackStore::new());
+        let stage = ReflectStage::new(store.clone());
+        let mut state = make_state();
+        let mut log = EventLog::new();
+
+        // Simulate tool failures so reflection generates ToolFailures category
+        state.record_tool_failure("github_api", "404 Not Found");
+        state.record_tool_failure("github_api", "404 Not Found");
+        state.record_tool_failure("github_api", "404 Not Found");
+        state.phase = AgentPhase::Reflect;
+        state.session_id = Some("test-session".into());
+
+        let action = stage.execute(&mut state, &mut log).await.unwrap();
+        assert_eq!(action, StageAction::Transition(AgentPhase::Plan));
+        assert_eq!(state.reflections.len(), 1);
+
+        // Feedback should have been persisted
+        let rules = store.rules("test-session").await;
+        assert!(
+            !rules.is_empty(),
+            "feedback store should contain a rule after reflection"
+        );
+        let fb = &rules[0];
+        assert!(
+            fb.rule.contains("github_api"),
+            "rule should mention the failing tool, got: {}",
+            fb.rule
+        );
     }
 }

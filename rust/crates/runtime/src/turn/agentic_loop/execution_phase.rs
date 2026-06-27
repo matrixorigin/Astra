@@ -1,6 +1,5 @@
 use std::time::Instant;
 
-use astra_core::render_compact_status;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, DeferredInputState, HostTurnResult,
@@ -10,6 +9,7 @@ use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
     interruption_state_summary, session_turn_number, tool_record_is_workspace_mutation,
 };
+use astra_core::render_compact_status;
 use astra_services::{ContextManifestWrite, DatabaseContextManifestStore};
 use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
@@ -462,13 +462,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         if m.get("role").and_then(|r| r.as_str()) != Some("user") {
             return false;
         }
-        m.get("content")
-            .and_then(|c| c.as_str())
-            .is_some_and(|s| {
-                s.contains("## ⚡ Round Budget")
-                    || s.contains("## ⚠ Round Budget")
-                    || s.contains("## ⚡ Self-Status")
-            })
+        m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
+            s.contains("## ⚡ Round Budget")
+                || s.contains("## ⚠ Round Budget")
+                || s.contains("## ⚡ Self-Status")
+        })
     }
 
     if !host.injects_round_guidance() {
@@ -482,15 +480,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         // Skip when budget is exhausted — the agent should produce final
         // output, not introspect.
         if state.remaining_turns > 0
-            && (state.llm_rounds_completed > 0 || !state.observation_journal.is_empty()) {
-            let cb_state = format!(
-                "{:?}",
-                state.stall.circuit_breaker.state()
-            )
-            .to_lowercase();
-            let total_in = state.total_prompt
-                + state.total_cache_read
-                + state.total_cache_creation;
+            && (state.llm_rounds_completed > 0 || !state.observation_journal.is_empty())
+        {
+            let cb_state = format!("{:?}", state.stall.circuit_breaker.state()).to_lowercase();
+            let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
             let cache_ratio = if total_in > 0 {
                 state.total_cache_read as f64 / total_in as f64
             } else {

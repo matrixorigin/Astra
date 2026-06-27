@@ -25,6 +25,143 @@ const JOURNAL_CAPACITY: usize = 16;
 /// Minimum entries needed to compute a meaningful trend.
 const MIN_TREND_ENTRIES: usize = 3;
 
+// ─── Framework primitive actions ─────────────────────────────────────────────
+
+/// Atomic action the framework can execute against the runtime.
+///
+/// Policies produce these; the pipeline executes them. The framework itself
+/// makes no judgment about *when* to act — it only provides primitives.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FrameworkAction {
+    /// Expand the turn budget by multiplying current max rounds.
+    ExpandBudget {
+        factor: f64,
+        /// Absolute ceiling — never exceed this regardless of factor.
+        max_ceiling: u32,
+    },
+    /// Transition to another pipeline phase (name is opaque to core).
+    TransitionPhase { target: String },
+    /// Inject a signal into the agent's context for the next round.
+    InjectSignal { message: String },
+    /// No action required.
+    Continue,
+}
+
+/// A signal injected by a policy decision, queued for the next round.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSignal {
+    pub message: String,
+    pub injected_at_round: u32,
+}
+
+/// Pure factual snapshot of the current state, extracted from the
+/// [`ObservationJournal`]. No scores, no judgments — only counts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JournalFacts {
+    /// Total rounds completed so far.
+    pub rounds_completed: u32,
+    /// Consecutive rounds where the agent produced at least one observable
+    /// outcome (mutation, test pass, build success).
+    pub consecutive_rounds_with_outcome: u32,
+    /// Consecutive rounds with zero observable outcome.
+    pub consecutive_rounds_without_outcome: u32,
+    /// Rounds remaining before budget exhaustion.
+    pub budget_remaining: u32,
+    /// Maximum rounds allowed.
+    pub budget_max: u32,
+    /// Total mutations (file edits / writes) across the journal window.
+    pub total_mutations: u32,
+    /// Total errors across the journal window.
+    pub total_errors: u32,
+    /// Consecutive read-only rounds (no writes / edits).
+    pub consecutive_read_only: u32,
+    /// Total tool calls in the journal window.
+    pub total_tool_calls: u32,
+    /// Framework-detected tool signature stall, if any.
+    /// e.g. "Same tools called 3 times in a row: [read_file, grep]".
+    /// This is an objective fact from the framework, not a judgment.
+    pub stall_reason: Option<String>,
+
+    // ── Raw delta facts (framework-neutral, policy-interpretable) ──
+    /// Text growth in this round (bytes added).
+    pub text_growth: usize,
+    /// New tool calls in this round.
+    pub new_tool_calls: u32,
+    /// New failures in this round.
+    pub new_failures: usize,
+}
+
+/// Policy that decides what actions the framework should take based on
+// ─── Default budget policy ───────────────────────────────────────────────────
+
+/// Budget policy that uses purely factual thresholds — consecutive outcomes
+/// or non-outcomes — rather than scored "progress" heuristics.
+///
+/// Every parameter is user-configurable; nothing is hardcoded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetPolicy {
+    /// Expand budget after this many consecutive rounds with observable outcome.
+    pub expand_after_consecutive_outcomes: u32,
+    /// Multiply current max rounds by this factor on expansion.
+    pub expand_factor: f64,
+    /// Absolute ceiling: budget never exceeds this regardless of expansions.
+    pub max_ceiling: u32,
+    /// Transition to reflection after this many consecutive rounds with zero outcome.
+    pub reflect_after_consecutive_zero: u32,
+    /// Maximum reflections before failing the turn.
+    pub max_reflections: u32,
+}
+
+impl Default for BudgetPolicy {
+    fn default() -> Self {
+        Self {
+            expand_after_consecutive_outcomes: 2,
+            expand_factor: 1.5,
+            max_ceiling: 1000,
+            reflect_after_consecutive_zero: 3,
+            max_reflections: 3,
+        }
+    }
+}
+
+impl BudgetPolicy {
+    pub fn decide(&self, facts: &JournalFacts) -> Vec<FrameworkAction> {
+        let mut actions = Vec::new();
+
+        // Stall detection: framework-detected tool-signature repetition
+        // takes priority over all other decisions.
+        if facts.stall_reason.is_some() {
+            actions.push(FrameworkAction::TransitionPhase {
+                target: "reflect".to_string(),
+            });
+            return actions;
+        }
+
+        // Expand: agent consistently producing outcomes and budget is tight
+        if facts.consecutive_rounds_with_outcome >= self.expand_after_consecutive_outcomes
+            && facts.budget_remaining <= facts.budget_max / 2
+        {
+            actions.push(FrameworkAction::ExpandBudget {
+                factor: self.expand_factor,
+                max_ceiling: self.max_ceiling,
+            });
+        }
+
+        // Reflect: agent stuck with zero outcomes too long
+        if facts.consecutive_rounds_without_outcome >= self.reflect_after_consecutive_zero {
+            actions.push(FrameworkAction::TransitionPhase {
+                target: "reflect".to_string(),
+            });
+        }
+
+        if actions.is_empty() {
+            actions.push(FrameworkAction::Continue);
+        }
+
+        actions
+    }
+}
+
 /// A single turn's worth of key metrics stored in the journal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
@@ -363,6 +500,66 @@ impl ObservationJournal {
         })
     }
 
+    /// Extract pure factual counts from the journal for policy consumption.
+    ///
+    /// Returns a [`JournalFacts`] struct containing only objective counts:
+    /// consecutive rounds with/without outcome, total mutations, errors,
+    /// read-only streaks, etc. No scores or judgments.
+    ///
+    /// "Outcome" = at least one of: file mutation, test pass, build success.
+    pub fn extract_facts(&self, budget_remaining: u32, budget_max: u32) -> JournalFacts {
+        let mut facts = JournalFacts {
+            rounds_completed: self.entries.last().map(|e| e.turn + 1).unwrap_or(0),
+            budget_remaining,
+            budget_max,
+            total_errors: self.entries.iter().map(|e| e.error_count).sum(),
+            total_tool_calls: self.entries.iter().map(|e| e.total_tool_calls).sum(),
+            ..Default::default()
+        };
+
+        // Compute streaks by scanning backwards from the newest entry.
+        let mut counting_outcome = true;
+        let mut counting_read_only = true;
+
+        for entry in self.entries.iter().rev() {
+            let has_outcome = entry.write_ratio > 0.0;
+            let is_read_only =
+                entry.write_ratio == 0.0 && entry.read_ratio > 0.0 && entry.total_tool_calls > 0;
+
+            // Outcome streak: count consecutive rounds with outcome.
+            if counting_outcome && has_outcome {
+                facts.consecutive_rounds_with_outcome += 1;
+            } else {
+                counting_outcome = false;
+            }
+
+            // Zero-outcome streak: count consecutive rounds without outcome.
+            // This is the inverse — we can compute it from the outcome streak.
+            // If the newest round has no outcome, count backwards until we
+            // hit one that does.
+
+            // Read-only streak: count consecutive read-only rounds.
+            if counting_read_only && is_read_only {
+                facts.consecutive_read_only += 1;
+            } else {
+                counting_read_only = false;
+            }
+        }
+
+        // Zero-outcome streak: compute from the most recent entries.
+        let mut zero_streak = 0u32;
+        for entry in self.entries.iter().rev() {
+            if entry.write_ratio == 0.0 {
+                zero_streak += 1;
+            } else {
+                break;
+            }
+        }
+        facts.consecutive_rounds_without_outcome = zero_streak;
+
+        facts
+    }
+
     /// Number of entries in the journal.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -616,5 +813,214 @@ mod tests {
         assert!(status.contains("Self-Status"));
         assert!(status.contains("Turn 3/13"));
         assert!(status.contains("test_alert"));
+    }
+
+    // ─── extract_facts tests ───────────────────────────────────────────
+
+    fn make_write_metrics(rounds: u32, total_calls: u32, tokens: u64) -> TurnMetrics {
+        let mut samples = Vec::new();
+        for _ in 0..total_calls {
+            samples.push(ToolCallSample {
+                name: "str_replace",
+                ok: true,
+                round: Some(rounds),
+                file_path: Some("src/lib.rs"),
+                error: None,
+            });
+        }
+        TurnMetrics::from_samples(&samples, rounds, tokens)
+    }
+
+    #[test]
+    fn empty_journal_extracts_zero_facts() {
+        let journal = ObservationJournal::default();
+        let facts = journal.extract_facts(10, 10);
+        assert_eq!(facts.rounds_completed, 0);
+        assert_eq!(facts.consecutive_rounds_with_outcome, 0);
+        assert_eq!(facts.consecutive_rounds_without_outcome, 0);
+    }
+
+    #[test]
+    fn extract_facts_counts_consecutive_outcomes() {
+        let mut journal = ObservationJournal::default();
+        // 3 rounds, all with writes (outcome)
+        journal.record_turn(&make_write_metrics(0, 3, 1000));
+        journal.record_turn(&make_write_metrics(1, 4, 1200));
+        journal.record_turn(&make_write_metrics(2, 5, 1100));
+
+        let facts = journal.extract_facts(7, 10);
+        assert_eq!(facts.consecutive_rounds_with_outcome, 3);
+        assert_eq!(facts.consecutive_rounds_without_outcome, 0);
+    }
+
+    #[test]
+    fn extract_facts_breaks_outcome_streak_on_read_only() {
+        let mut journal = ObservationJournal::default();
+        // write → write → read-only
+        journal.record_turn(&make_write_metrics(0, 3, 1000));
+        journal.record_turn(&make_write_metrics(1, 4, 1200));
+        journal.record_turn(&make_metrics(2, 5, 0, 1, 1100, vec![("read_file", 5)]));
+
+        let facts = journal.extract_facts(7, 10);
+        // Last round is read-only → outcome streak should be 0
+        assert_eq!(facts.consecutive_rounds_with_outcome, 0);
+        assert_eq!(facts.consecutive_rounds_without_outcome, 1);
+    }
+
+    #[test]
+    fn extract_facts_counts_zero_outcome_streak() {
+        let mut journal = ObservationJournal::default();
+        // 3 rounds, all read-only (no outcome)
+        journal.record_turn(&make_metrics(0, 5, 0, 1, 1000, vec![("read_file", 5)]));
+        journal.record_turn(&make_metrics(1, 4, 0, 1, 1100, vec![("read_file", 4)]));
+        journal.record_turn(&make_metrics(2, 6, 0, 2, 1200, vec![("grep", 6)]));
+
+        let facts = journal.extract_facts(7, 10);
+        assert_eq!(facts.consecutive_rounds_without_outcome, 3);
+        assert_eq!(facts.consecutive_rounds_with_outcome, 0);
+    }
+
+    #[test]
+    fn extract_facts_read_only_streak() {
+        let mut journal = ObservationJournal::default();
+        journal.record_turn(&make_metrics(0, 5, 0, 1, 1000, vec![("read_file", 5)]));
+        journal.record_turn(&make_metrics(1, 4, 0, 1, 1100, vec![("glob", 4)]));
+
+        let facts = journal.extract_facts(8, 10);
+        assert_eq!(facts.consecutive_read_only, 2);
+    }
+
+    #[test]
+    fn extract_facts_read_only_streak_broken_by_write() {
+        let mut journal = ObservationJournal::default();
+        journal.record_turn(&make_metrics(0, 5, 0, 1, 1000, vec![("read_file", 5)]));
+        journal.record_turn(&make_write_metrics(1, 3, 1100));
+        journal.record_turn(&make_metrics(2, 4, 0, 1, 1200, vec![("read_file", 4)]));
+
+        let facts = journal.extract_facts(7, 10);
+        // Last round is read_only → streak is 1 (broken by write at turn 1)
+        assert_eq!(facts.consecutive_read_only, 1);
+    }
+
+    // ─── BudgetPolicy tests ────────────────────────────────────────────
+
+    #[test]
+    fn budget_policy_expands_on_consecutive_outcomes() {
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            consecutive_rounds_with_outcome: 2,
+            budget_remaining: 2,
+            budget_max: 10,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+    }
+
+    #[test]
+    fn budget_policy_no_expand_when_budget_plenty() {
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            consecutive_rounds_with_outcome: 3,
+            budget_remaining: 8,
+            budget_max: 10,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        // Budget is > 50% remaining → no expansion
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
+    }
+
+    #[test]
+    fn budget_policy_reflects_on_zero_outcomes() {
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            consecutive_rounds_without_outcome: 3,
+            budget_remaining: 7,
+            budget_max: 10,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. })));
+    }
+
+    #[test]
+    fn budget_policy_no_reflect_below_threshold() {
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            consecutive_rounds_without_outcome: 2,
+            budget_remaining: 8,
+            budget_max: 10,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. })));
+    }
+
+    #[test]
+    fn budget_policy_continues_when_nothing_triggers() {
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            consecutive_rounds_with_outcome: 0,
+            budget_remaining: 8,
+            budget_max: 10,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], FrameworkAction::Continue));
+    }
+
+    #[test]
+    fn budget_policy_custom_params_work() {
+        let policy = BudgetPolicy {
+            expand_after_consecutive_outcomes: 1,
+            expand_factor: 2.0,
+            max_ceiling: 50,
+            reflect_after_consecutive_zero: 5,
+            max_reflections: 2,
+        };
+        let facts = JournalFacts {
+            consecutive_rounds_with_outcome: 1,
+            budget_remaining: 2,
+            budget_max: 10,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            FrameworkAction::ExpandBudget {
+                factor: 2.0,
+                max_ceiling: 50
+            }
+        )));
+    }
+
+    #[test]
+    fn budget_policy_stall_overrides_all() {
+        let policy = BudgetPolicy::default();
+        // Even with consecutive outcomes (which would normally trigger expand),
+        // stall reason takes priority.
+        let facts = JournalFacts {
+            consecutive_rounds_with_outcome: 5,
+            budget_remaining: 1,
+            budget_max: 10,
+            stall_reason: Some("Same tools called 3 times in a row".into()),
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            FrameworkAction::TransitionPhase { target } if target == "reflect"
+        ));
     }
 }

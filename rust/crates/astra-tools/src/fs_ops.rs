@@ -132,7 +132,9 @@ pub struct ReadLineRange {
 /// these are semantically distinct types — impossible to generate a reversed range.
 /// Internally, all code continues to use `start_line`/`end_line` inclusive ranges.
 pub fn convert_read_file_args(args: &Value) -> Value {
-    let Some(obj) = args.as_object() else { return args.clone(); };
+    let Some(obj) = args.as_object() else {
+        return args.clone();
+    };
     let offset = obj.get("offset").and_then(|v| v.as_u64());
     let limit = obj.get("limit").and_then(|v| v.as_u64());
     if offset.is_none() && limit.is_none() {
@@ -160,7 +162,11 @@ pub fn normalize_read_file_line_range(
     let end = end_line.unwrap_or(total_lines);
     // offset+limit always produce start <= end; swap kept for internal
     // callers that construct start/end directly.
-    let (start_line, end_line) = if start <= end { (start, end) } else { (end, start) };
+    let (start_line, end_line) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
     ReadLineRange {
         start_line,
         end_line,
@@ -2686,11 +2692,7 @@ mod tests {
             result.output
         );
         // Should have tip about using start_line/end_line
-        assert!(
-            result.output.contains("offset"),
-            "got: {}",
-            result.output
-        );
+        assert!(result.output.contains("offset"), "got: {}", result.output);
     }
 
     #[test]
@@ -2857,7 +2859,11 @@ mod tests {
             &serde_json::json!({"path": "test.txt", "offset": 2, "limit": 2}),
         );
 
-        assert!(!result.is_error, "expected success, got error: {}", result.output);
+        assert!(
+            !result.is_error,
+            "expected success, got error: {}",
+            result.output
+        );
         assert!(
             result.output.contains("b") && result.output.contains("c"),
             "expected lines 2-3, got: {}",
@@ -2884,7 +2890,11 @@ mod tests {
         );
 
         // offset=300, limit=500 → lines 300-799
-        assert!(!result.is_error, "expected success, got error: {}", result.output);
+        assert!(
+            !result.is_error,
+            "expected success, got error: {}",
+            result.output
+        );
         assert!(
             result.output.contains("line 300"),
             "expected line 300 after offset+limit, got: {}",

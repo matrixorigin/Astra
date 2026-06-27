@@ -1,76 +1,39 @@
-//! EvaluateStage: goal-gradient budget control and progress evaluation.
+//! EvaluateStage: policy-driven progress evaluation and budget control.
 //!
-//! Runs after each Execute phase. Measures delta progress, adjusts budget,
-//! and decides: continue (Plan), self-correct (Reflect), or terminate.
+//! Runs after each Execute phase. The stage itself only performs two
+//! framework-primitive checks (budget exhaustion, tool-signature stall).
+//! All other decisions — whether to expand budget, transition to reflection,
+//! or continue — are delegated to a user-configurable [`BudgetPolicy`].
 //!
-//! # Goal-gradient budget algorithm
+//! # Design
 //!
 //! ```text
-//! rate > 0.5  → expand budget (if under pressure), continue
-//! 0.1 < rate ≤ 0.5 → continue without expansion
-//! rate ≤ 0.1 (2+ rounds) → stalled → trigger Reflect
-//! strictly decreasing + last < 0.15 → regressing → trigger Reflect or Fail
-//! budget.is_exhausted() → Failed (highest priority check)
+//! EvaluateStage::execute()
+//!   ├── compute delta facts (text_growth, new_tool_calls, failures)
+//!   ├── record round outcome → round_outcomes
+//!   ├── advance round
+//!   ├── emit progress / budget events
+//!   ├── detect tool stall (framework primitive)
+//!   ├── budget exhaustion check (framework primitive)
+//!   └── BudgetPolicy::decide(facts) → actions
+//!         ├── ExpandBudget(factor, ceiling) → budget.expand_with_ceiling()
+//!         ├── TransitionPhase("reflect")   → AgentPhase::Reflect
+//!         └── Continue                     → AgentPhase::Plan
 //! ```
+//!
+//! No hardcoded heuristics. The policy gets pure facts; the framework
+//! executes the policy's decisions.
 
 use crate::engine::{PipelineStage, StageAction};
 use crate::event::{EventKind, EventLog};
-use crate::state::{AgentPhase, ProgressTracker, TurnOutcome, TurnState, TurnStatus};
+use crate::state::{AgentPhase, TurnOutcome, TurnState, TurnStatus};
+use astra_core::observation_journal::{FrameworkAction, JournalFacts};
 
-// ─── Constants ───────────────────────────────────────────────────────────────
-
-/// Budget expansion factor when progress is good and budget is under pressure.
-const GOOD_PROGRESS_EXPANSION: f64 = 1.25;
-
-/// Maximum reflections before the Evaluate stage stops retrying.
-pub const MAX_REFLECTIONS_BEFORE_FAIL: usize = 3;
-
-/// Budget usage ratio at or above which expansion is considered.
-const EXPANSION_PRESSURE_THRESHOLD: f64 = 0.6;
-
-// ─── Progress categorization ─────────────────────────────────────────────────
-
-/// Categorized progress state for budget decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressCategory {
-    /// rate > 0.5: strong forward motion.
-    Good,
-    /// 0.1 < rate ≤ 0.5: some progress.
-    Moderate,
-    /// rate ≤ 0.1 for 2+ rounds: stuck.
-    Stalled,
-    /// Strictly decreasing scores with last < 0.15: getting worse.
-    Regressing,
-}
-
-/// Determine the progress category from the tracker.
-pub fn categorize_progress(progress: &ProgressTracker) -> ProgressCategory {
-    if progress.is_regressing() {
-        return ProgressCategory::Regressing;
-    }
-    if progress.is_stalled() {
-        return ProgressCategory::Stalled;
-    }
-    match progress.rate() {
-        Some(rate) if rate > 0.5 => ProgressCategory::Good,
-        Some(rate) if rate > 0.1 => ProgressCategory::Moderate,
-        Some(_) => {
-            // Low rate but not yet flagged as stalled (< 2 rounds of data)
-            // Give benefit of doubt on first round
-            if progress.round_scores.len() < 2 {
-                ProgressCategory::Moderate
-            } else {
-                ProgressCategory::Stalled
-            }
-        }
-        // No data yet (first round) — benefit of doubt
-        None => ProgressCategory::Moderate,
-    }
-}
+use serde_json;
 
 // ─── EvaluateStage ───────────────────────────────────────────────────────────
 
-/// Evaluates round progress and makes goal-gradient budget decisions.
+/// Evaluates round progress and delegates to the policy for action decisions.
 pub struct EvaluateStage;
 
 #[async_trait::async_trait]
@@ -84,18 +47,33 @@ impl PipelineStage for EvaluateStage {
         state: &mut TurnState,
         event_log: &mut EventLog,
     ) -> Result<StageAction, String> {
-        // 1. Compute delta progress for this round
-        let score = state.compute_round_delta_progress();
-        state.progress.record(score);
+        // 1. Compute delta facts for this round
+        let text_growth = state.final_text.len().saturating_sub(state.prev_text_len);
+        let new_tool_calls = state.total_tool_calls.saturating_sub(state.prev_tool_calls);
+        let current_failures: usize = state.tool_failures.values().map(|v| v.len()).sum();
+        let new_failures = current_failures.saturating_sub(state.prev_failure_count);
+
+        // Update snapshots for next round
+        state.prev_text_len = state.final_text.len();
+        state.prev_tool_calls = state.total_tool_calls;
+        state.prev_failure_count = current_failures;
+
+        // Record outcome fact: this round had an observable outcome if it
+        // produced text growth or executed tools without failures.
+        let had_outcome = text_growth > 0 || (new_tool_calls > 0 && new_failures == 0);
+        state.round_outcomes.push(had_outcome);
 
         // 2. Advance round counter
         state.budget.advance_round();
 
-        // 3. Emit progress event
-        let rate = state.progress.rate();
-        event_log.emit(EventKind::ProgressRecorded { score, rate }, None);
-
-        // 4. Emit budget update
+        // 3. Emit events (observability, not decision-making)
+        event_log.emit(
+            EventKind::ProgressRecorded {
+                score: if had_outcome { 1.0 } else { 0.0 },
+                rate: None,
+            },
+            None,
+        );
         event_log.emit(
             EventKind::BudgetUpdate {
                 tokens_consumed: state.budget.tokens_consumed,
@@ -105,7 +83,7 @@ impl PipelineStage for EvaluateStage {
             None,
         );
 
-        // 5. Check stall via tool signature repetition
+        // 4. Tool-stall detection (framework primitive — pure pattern matching)
         let tool_stall = state.detect_stall();
         if let Some(ref reason) = tool_stall {
             event_log.emit(
@@ -117,7 +95,7 @@ impl PipelineStage for EvaluateStage {
             );
         }
 
-        // 6. Budget exhaustion check (highest priority)
+        // 5. Budget exhaustion check (framework primitive — highest priority)
         if state.budget.is_exhausted() {
             state.outcome = Some(TurnOutcome {
                 status: TurnStatus::Exhausted,
@@ -132,44 +110,96 @@ impl PipelineStage for EvaluateStage {
             return Ok(StageAction::Transition(AgentPhase::Failed));
         }
 
-        // 7. Goal-gradient budget decision
-        // Tool signature stall overrides progress-based category
-        let category = if tool_stall.is_some() {
-            ProgressCategory::Stalled
-        } else {
-            categorize_progress(&state.progress)
+        // 6. Compute outcome streaks from round_outcomes
+        let consecutive_with_outcome = state
+            .round_outcomes
+            .iter()
+            .rev()
+            .take_while(|&&o| o)
+            .count() as u32;
+        let consecutive_without_outcome = state
+            .round_outcomes
+            .iter()
+            .rev()
+            .take_while(|&&o| !o)
+            .count() as u32;
+
+        // 7. Build pure facts — no scores, no judgments
+        let facts = JournalFacts {
+            rounds_completed: state.budget.round,
+            consecutive_rounds_with_outcome: consecutive_with_outcome,
+            consecutive_rounds_without_outcome: consecutive_without_outcome,
+            budget_remaining: state.budget.max_rounds.saturating_sub(state.budget.round),
+            budget_max: state.budget.max_rounds,
+            stall_reason: tool_stall,
+            text_growth,
+            new_tool_calls,
+            new_failures,
+            ..Default::default()
         };
 
-        match category {
-            ProgressCategory::Good => {
-                // Expand budget if under pressure (>60% used)
-                let usage_ratio = state.budget.round as f64 / state.budget.max_rounds.max(1) as f64;
-                if usage_ratio >= EXPANSION_PRESSURE_THRESHOLD {
+        // 8. Policy decides; framework executes
+        let actions = state.budget_policy.decide(&facts);
+
+        for action in actions {
+            match action {
+                FrameworkAction::ExpandBudget {
+                    factor,
+                    max_ceiling,
+                } => {
                     let old_max = state.budget.max_rounds;
-                    state.budget.expand(GOOD_PROGRESS_EXPANSION);
+                    state.budget.expand_with_ceiling(factor, max_ceiling);
                     if state.budget.max_rounds > old_max {
                         event_log.emit(
                             EventKind::BudgetExpanded {
                                 new_max_rounds: state.budget.max_rounds,
-                                factor: GOOD_PROGRESS_EXPANSION,
+                                factor,
                             },
                             None,
                         );
                     }
                 }
-                Ok(StageAction::Transition(AgentPhase::Plan))
+
+                FrameworkAction::TransitionPhase { ref target } => {
+                    return Self::handle_phase_transition(state, target);
+                }
+
+                FrameworkAction::InjectSignal { ref message } => {
+                    state
+                        .pending_signals
+                        .push(astra_core::observation_journal::PendingSignal {
+                            message: message.clone(),
+                            injected_at_round: state.budget.round,
+                        });
+                    // Continue after injecting — don't change phase
+                }
+
+                FrameworkAction::Continue => {
+                    Self::drain_pending_signals(state);
+                    return Ok(StageAction::Transition(AgentPhase::Plan));
+                }
             }
+        }
 
-            ProgressCategory::Moderate => Ok(StageAction::Transition(AgentPhase::Plan)),
+        // Fallthrough: if policy returned nothing → continue
+        Self::drain_pending_signals(state);
+        Ok(StageAction::Transition(AgentPhase::Plan))
+    }
+}
 
-            ProgressCategory::Stalled => {
-                if state.reflections.len() >= MAX_REFLECTIONS_BEFORE_FAIL {
+impl EvaluateStage {
+    /// Translate a policy-named phase to an AgentPhase + reflection limit check.
+    fn handle_phase_transition(state: &mut TurnState, target: &str) -> Result<StageAction, String> {
+        match target {
+            "reflect" => {
+                let max = state.budget_policy.max_reflections;
+                if state.reflections.len() >= max as usize {
                     state.outcome = Some(TurnOutcome {
                         status: TurnStatus::Failure,
                         content: "Agent stalled after maximum reflections".into(),
                         failure_reason: Some(format!(
                             "Stall not recoverable after {} reflections",
-                            MAX_REFLECTIONS_BEFORE_FAIL,
+                            max,
                         )),
                         failed_tools: state.tool_failures.keys().cloned().collect(),
                     });
@@ -178,22 +208,29 @@ impl PipelineStage for EvaluateStage {
                     Ok(StageAction::Transition(AgentPhase::Reflect))
                 }
             }
-
-            ProgressCategory::Regressing => {
-                // Regression is more serious — one fewer reflection allowed
-                let regression_limit = MAX_REFLECTIONS_BEFORE_FAIL.saturating_sub(1);
-                if state.reflections.len() >= regression_limit {
-                    state.outcome = Some(TurnOutcome {
-                        status: TurnStatus::Failure,
-                        content: "Agent regressing — approach not working".into(),
-                        failure_reason: Some("Performance regression detected".into()),
-                        failed_tools: state.tool_failures.keys().cloned().collect(),
-                    });
-                    Ok(StageAction::Transition(AgentPhase::Failed))
-                } else {
-                    Ok(StageAction::Transition(AgentPhase::Reflect))
-                }
+            "plan" => {
+                Self::drain_pending_signals(state);
+                Ok(StageAction::Transition(AgentPhase::Plan))
             }
+            _ => {
+                Self::drain_pending_signals(state);
+                Ok(StageAction::Transition(AgentPhase::Plan))
+            }
+        }
+    }
+
+    /// Drain all pending signals (from policy [`FrameworkAction::InjectSignal`])
+    /// and inject them as user messages so the LLM sees them in the next
+    /// Plan-phase call.
+    fn drain_pending_signals(state: &mut TurnState) {
+        for signal in state.pending_signals.drain(..) {
+            state.messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "[Framework signal (round {})] {}",
+                    signal.injected_at_round, signal.message
+                )
+            }));
         }
     }
 }
@@ -205,6 +242,8 @@ mod tests {
     use super::*;
     use crate::event::EventLog;
     use crate::state::TurnState;
+    use astra_core::observation_journal::PendingSignal;
+    use std::collections::HashSet;
 
     /// Create a TurnState with budget of 10 rounds.
     fn make_state() -> TurnState {
@@ -225,118 +264,83 @@ mod tests {
             state.record_tool_failure(tool, err);
         }
         // Unique tool names per round to avoid triggering stall detection
-        let tools: std::collections::HashSet<String> = (0..tool_calls)
+        let tools: HashSet<String> = (0..tool_calls)
             .map(|i| format!("tool_r{}_i{}", round, i))
             .collect();
         state.record_round_tools(tools);
     }
 
     #[tokio::test]
-    async fn evaluate_good_progress_continues_to_plan() {
+    async fn evaluate_round_with_outcome_continues() {
         let stage = EvaluateStage;
         let mut state = make_state();
         let mut log = EventLog::new();
 
-        // Simulate a good round: lots of text + tool calls + no failures
         simulate_round(&mut state, &"x".repeat(200), 3, &[]);
         state.phase = AgentPhase::Evaluate;
 
         let action = stage.execute(&mut state, &mut log).await.unwrap();
         assert_eq!(action, StageAction::Transition(AgentPhase::Plan));
 
-        // Progress was recorded
-        assert_eq!(state.progress.round_scores.len(), 1);
-        assert!(state.progress.round_scores[0] > 0.5);
-
-        // Round advanced
+        assert_eq!(state.round_outcomes.len(), 1);
+        assert!(state.round_outcomes[0]);
         assert_eq!(state.budget.round, 1);
     }
 
     #[tokio::test]
-    async fn evaluate_good_progress_expands_budget_under_pressure() {
+    async fn evaluate_multiple_outcome_rounds_expands_budget() {
         let stage = EvaluateStage;
-        // Small budget (5 rounds) so we can easily reach >60% usage
         let mut state = TurnState::new("test", vec![], 5, 100_000, 300_000);
         let mut log = EventLog::new();
 
-        // Run 3 good rounds to get to 60%+ usage
         for _ in 0..3 {
             simulate_round(&mut state, &"x".repeat(200), 2, &[]);
             state.phase = AgentPhase::Evaluate;
             let _ = stage.execute(&mut state, &mut log).await.unwrap();
         }
 
-        // Budget should have been expanded
         assert!(state.budget.max_rounds > 5, "Budget should expand from 5");
     }
 
     #[tokio::test]
-    async fn evaluate_budget_expansion_capped_at_2x() {
+    async fn evaluate_budget_expansion_capped_by_ceiling() {
         let stage = EvaluateStage;
         let mut state = TurnState::new("test", vec![], 5, 100_000, 300_000);
+        state.budget_policy.max_ceiling = 20;
         let mut log = EventLog::new();
 
-        // Run many good rounds to push expansion to max
-        for _ in 0..8 {
+        for _ in 0..15 {
             simulate_round(&mut state, &"x".repeat(200), 2, &[]);
             state.phase = AgentPhase::Evaluate;
             let _ = stage.execute(&mut state, &mut log).await;
         }
 
-        // Max is 2x base = 10
-        assert!(state.budget.max_rounds <= 10);
-    }
-
-    #[tokio::test]
-    async fn evaluate_stall_triggers_reflect() {
-        let stage = EvaluateStage;
-        let mut state = make_state();
-        let mut log = EventLog::new();
-
-        // Simulate 3 rounds of zero progress (no text, no tools)
-        for _ in 0..3 {
-            state.phase = AgentPhase::Evaluate;
-            let _ = stage.execute(&mut state, &mut log).await.unwrap();
-        }
-
-        // After 3 zero-progress rounds, should be stalled
-        let category = categorize_progress(&state.progress);
-        assert_eq!(category, ProgressCategory::Stalled);
-    }
-
-    #[tokio::test]
-    async fn evaluate_regression_triggers_reflect_or_fail() {
-        let stage = EvaluateStage;
-        let mut state = make_state();
-        let mut log = EventLog::new();
-
-        // Round 1: good progress
-        simulate_round(&mut state, &"x".repeat(300), 5, &[]);
-        state.phase = AgentPhase::Evaluate;
-        let _ = stage.execute(&mut state, &mut log).await.unwrap();
-
-        // Round 2: moderate progress
-        simulate_round(&mut state, &"x".repeat(50), 2, &[]);
-        state.phase = AgentPhase::Evaluate;
-        let _ = stage.execute(&mut state, &mut log).await.unwrap();
-
-        // Round 3: zero progress
-        state.phase = AgentPhase::Evaluate;
-        let action = stage.execute(&mut state, &mut log).await.unwrap();
-
-        // Should trigger Reflect (regression or stall)
         assert!(
-            action == StageAction::Transition(AgentPhase::Reflect)
-                || action == StageAction::Transition(AgentPhase::Plan),
-            "Expected Reflect or Plan, got {:?}",
-            action
+            state.budget.max_rounds <= 20,
+            "Budget should not exceed ceiling 20, got {}",
+            state.budget.max_rounds
         );
+    }
+
+    #[tokio::test]
+    async fn evaluate_zero_outcome_triggers_reflect() {
+        let stage = EvaluateStage;
+        let mut state = make_state();
+        state.budget_policy.reflect_after_consecutive_zero = 2;
+        let mut log = EventLog::new();
+
+        state.phase = AgentPhase::Evaluate;
+        let action1 = stage.execute(&mut state, &mut log).await.unwrap();
+        assert_eq!(action1, StageAction::Transition(AgentPhase::Plan));
+
+        state.phase = AgentPhase::Evaluate;
+        let action2 = stage.execute(&mut state, &mut log).await.unwrap();
+        assert_eq!(action2, StageAction::Transition(AgentPhase::Reflect));
     }
 
     #[tokio::test]
     async fn evaluate_budget_exhausted_fails() {
         let stage = EvaluateStage;
-        // Budget of only 1 round
         let mut state = TurnState::new("test", vec![], 1, 100_000, 300_000);
         let mut log = EventLog::new();
 
@@ -353,14 +357,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_max_reflections_then_stall_fails() {
+    async fn evaluate_max_reflections_then_fails() {
         let stage = EvaluateStage;
         let mut state = make_state();
+        state.budget_policy.max_reflections = 3;
+        state.budget_policy.reflect_after_consecutive_zero = 1;
         let mut log = EventLog::new();
 
-        // Pre-fill 3 reflections (max)
         use crate::state::{Reflection, StrategyDelta};
-        for _ in 0..MAX_REFLECTIONS_BEFORE_FAIL {
+        for _ in 0..3 {
             state.reflections.push(Reflection {
                 what_happened: "stall".into(),
                 why: "repeated".into(),
@@ -370,9 +375,6 @@ mod tests {
             });
         }
 
-        // Two zero-progress rounds to trigger stall
-        state.phase = AgentPhase::Evaluate;
-        let _ = stage.execute(&mut state, &mut log).await.unwrap();
         state.phase = AgentPhase::Evaluate;
         let action = stage.execute(&mut state, &mut log).await.unwrap();
 
@@ -381,20 +383,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_moderate_progress_no_expansion() {
+    async fn evaluate_tool_stall_triggers_reflect() {
         let stage = EvaluateStage;
-        let mut state = TurnState::new("test", vec![], 5, 100_000, 300_000);
+        let mut state = make_state();
         let mut log = EventLog::new();
 
-        // Round with small text (moderate progress)
-        simulate_round(&mut state, "short", 1, &[]);
-        state.phase = AgentPhase::Evaluate;
+        let tools: HashSet<String> = ["bash".to_string()].into();
+        for round_idx in 0..3 {
+            state.final_text.push_str(&format!("round{round_idx}"));
+            state.total_tool_calls += 1;
+            state.record_round_tools(tools.clone());
+            state.phase = AgentPhase::Evaluate;
+
+            if round_idx < 2 {
+                stage.execute(&mut state, &mut log).await.unwrap();
+            }
+        }
 
         let action = stage.execute(&mut state, &mut log).await.unwrap();
-        assert_eq!(action, StageAction::Transition(AgentPhase::Plan));
-
-        // Budget NOT expanded (not under pressure + only moderate)
-        assert_eq!(state.budget.max_rounds, 5);
+        assert_eq!(action, StageAction::Transition(AgentPhase::Reflect));
     }
 
     #[tokio::test]
@@ -407,50 +414,85 @@ mod tests {
         state.phase = AgentPhase::Evaluate;
         let _ = stage.execute(&mut state, &mut log).await.unwrap();
 
-        // ProgressRecorded event emitted
+        assert!(log
+            .events()
+            .iter()
+            .any(|e| { matches!(e.kind, EventKind::ProgressRecorded { .. }) }));
+        assert!(log
+            .events()
+            .iter()
+            .any(|e| { matches!(e.kind, EventKind::BudgetUpdate { .. }) }));
+    }
+
+    #[tokio::test]
+    async fn evaluate_with_aggressive_policy() {
+        let stage = EvaluateStage;
+        let mut state = make_state();
+        state.budget_policy.reflect_after_consecutive_zero = 1;
+        state.budget_policy.expand_after_consecutive_outcomes = 999;
+        let mut log = EventLog::new();
+
+        // First round with no outcome → immediately triggers reflect
+        state.phase = AgentPhase::Evaluate;
+        let action = stage.execute(&mut state, &mut log).await.unwrap();
+        assert_eq!(action, StageAction::Transition(AgentPhase::Reflect));
+    }
+
+    // ── pending_signals drain ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn evaluate_drains_pending_signals_into_messages() {
+        let stage = EvaluateStage;
+        let mut state = make_state();
+        let mut log = EventLog::new();
+
+        // Pre-populate two pending signals (simulating prior InjectSignal actions)
+        state.pending_signals.push(PendingSignal {
+            message: "signal one".into(),
+            injected_at_round: 1,
+        });
+        state.pending_signals.push(PendingSignal {
+            message: "signal two".into(),
+            injected_at_round: 2,
+        });
+        let msg_count_before = state.messages.len();
+
+        state.phase = AgentPhase::Evaluate;
+        let _ = stage.execute(&mut state, &mut log).await.unwrap();
+
+        // Signals must be drained
         assert!(
-            log.events()
-                .iter()
-                .any(|e| { matches!(e.kind, EventKind::ProgressRecorded { .. }) })
+            state.pending_signals.is_empty(),
+            "pending_signals should be drained"
         );
-        // BudgetUpdate event emitted
-        assert!(
-            log.events()
-                .iter()
-                .any(|e| { matches!(e.kind, EventKind::BudgetUpdate { .. }) })
-        );
+        // Two new messages injected
+        assert_eq!(state.messages.len(), msg_count_before + 2);
+        // Content includes signal messages
+        let all_content: String = state
+            .messages
+            .iter()
+            .filter_map(|v| v["content"].as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(all_content.contains("signal one"));
+        assert!(all_content.contains("signal two"));
+        assert!(all_content.contains("Framework signal"));
     }
 
-    #[test]
-    fn categorize_first_round_is_moderate() {
-        let progress = ProgressTracker::new();
-        assert_eq!(categorize_progress(&progress), ProgressCategory::Moderate);
-    }
+    #[tokio::test]
+    async fn evaluate_drains_empty_pending_signals_is_noop() {
+        let stage = EvaluateStage;
+        let mut state = make_state();
+        let mut log = EventLog::new();
 
-    #[test]
-    fn categorize_good_progress() {
-        let mut progress = ProgressTracker::new();
-        progress.record(0.8);
-        progress.record(0.9);
-        assert_eq!(categorize_progress(&progress), ProgressCategory::Good);
-    }
+        assert!(state.pending_signals.is_empty());
+        let msg_count_before = state.messages.len();
 
-    #[test]
-    fn categorize_stalled() {
-        let mut progress = ProgressTracker::new();
-        // Not strictly decreasing (avoids triggering Regressing)
-        progress.record(0.05);
-        progress.record(0.03);
-        progress.record(0.05);
-        assert_eq!(categorize_progress(&progress), ProgressCategory::Stalled);
-    }
+        state.phase = AgentPhase::Evaluate;
+        let _ = stage.execute(&mut state, &mut log).await.unwrap();
 
-    #[test]
-    fn categorize_regressing() {
-        let mut progress = ProgressTracker::new();
-        progress.record(0.5);
-        progress.record(0.3);
-        progress.record(0.1);
-        assert_eq!(categorize_progress(&progress), ProgressCategory::Regressing);
+        // No crash, no spurious messages
+        assert!(state.pending_signals.is_empty());
+        assert_eq!(state.messages.len(), msg_count_before);
     }
 }
