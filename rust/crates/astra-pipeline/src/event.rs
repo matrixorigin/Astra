@@ -243,7 +243,6 @@ pub struct EventLog {
     start: Instant,
     pub min_level: TraceLevel,
     enabled_categories: Vec<TraceCategory>,
-    enabled: bool,
 }
 
 impl EventLog {
@@ -254,7 +253,6 @@ impl EventLog {
             start: Instant::now(),
             min_level: TraceLevel::Info,
             enabled_categories: Vec::new(),
-            enabled: true,
         }
     }
 
@@ -265,7 +263,6 @@ impl EventLog {
             start: Instant::now(),
             min_level,
             enabled_categories: Vec::new(),
-            enabled: true,
         }
     }
 

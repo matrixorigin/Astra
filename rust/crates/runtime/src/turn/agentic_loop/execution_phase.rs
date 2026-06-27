@@ -654,7 +654,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             .observation_journal
             .extract_facts(state.remaining_turns as u32, state.max_turns as u32);
 
-        // Override with canonical state values (journal may lag).
+        // Populate session-wide fields from authoritative state.
+        // extract_facts provides streak and budget data from the journal
+        // window; these fields come from the full session state.
         facts.rounds_completed = state.llm_rounds_completed;
         facts.total_evidence_calls = state.total_evidence_tool_calls;
         facts.total_errors = state.turn_guard.health.recent_errors(10).len() as u32;

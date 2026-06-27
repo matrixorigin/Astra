@@ -111,39 +111,50 @@ pub struct RuntimeConfig {
 
 /// User-configurable budget policy parameters.
 ///
-/// All fields are `Option` — when `None`, the corresponding
-/// [`astra_core::observation_journal::BudgetPolicy::default()`] value is used.
-/// Set a field to `Some(value)` to override the default.
+/// All fields have sensible defaults matching
+/// [`astra_core::observation_journal::BudgetPolicy::default()`].
+/// Users may set only the fields they wish to override; omitted
+/// fields fall back to their default via `#[serde(default)]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetPolicyConfig {
     /// Expand budget after this many consecutive rounds with observable outcome.
-    /// Default: 2
-    #[serde(default)]
-    pub expand_after_consecutive_outcomes: Option<u32>,
+    #[serde(default = "default_expand_after_consecutive_outcomes")]
+    pub expand_after_consecutive_outcomes: u32,
 
     /// Multiply current max rounds by this factor on expansion.
-    /// Default: 1.5
-    #[serde(default)]
-    pub expand_factor: Option<f64>,
+    #[serde(default = "default_expand_factor")]
+    pub expand_factor: f64,
 
     /// Absolute ceiling: budget never exceeds this regardless of expansions.
-    /// Default: 1000
-    #[serde(default)]
-    pub max_ceiling: Option<u32>,
+    #[serde(default = "default_max_ceiling")]
+    pub max_ceiling: u32,
 
     /// Inject a corrective signal after this many consecutive rounds with
-    /// zero observable outcome. Default: 3
-    #[serde(default)]
-    pub reflect_after_consecutive_zero: Option<u32>,
+    /// zero observable outcome.
+    #[serde(default = "default_reflect_after_consecutive_zero")]
+    pub reflect_after_consecutive_zero: u32,
+}
+
+fn default_expand_after_consecutive_outcomes() -> u32 {
+    2
+}
+fn default_expand_factor() -> f64 {
+    1.5
+}
+fn default_max_ceiling() -> u32 {
+    1000
+}
+fn default_reflect_after_consecutive_zero() -> u32 {
+    3
 }
 
 impl Default for BudgetPolicyConfig {
     fn default() -> Self {
         Self {
-            expand_after_consecutive_outcomes: None,
-            expand_factor: None,
-            max_ceiling: None,
-            reflect_after_consecutive_zero: None,
+            expand_after_consecutive_outcomes: default_expand_after_consecutive_outcomes(),
+            expand_factor: default_expand_factor(),
+            max_ceiling: default_max_ceiling(),
+            reflect_after_consecutive_zero: default_reflect_after_consecutive_zero(),
         }
     }
 }
@@ -3408,6 +3419,103 @@ mod tests {
         assert_eq!(
             cfg.enabled_categories,
             TraceCategory::individual_categories().to_vec()
+        );
+    }
+
+    // ─── BudgetPolicyConfig tests ────────────────────────────────────────
+
+    /// BudgetPolicyConfig::default() must produce values identical to
+    /// BudgetPolicy::default() so that a user who writes no config gets
+    /// the same behaviour as a caller who passes `None`.
+    #[test]
+    fn budget_policy_config_default_matches_policy_default() {
+        let cfg = BudgetPolicyConfig::default();
+        let policy = astra_core::observation_journal::BudgetPolicy::default();
+        assert_eq!(
+            cfg.expand_after_consecutive_outcomes,
+            policy.expand_after_consecutive_outcomes
+        );
+        assert!((cfg.expand_factor - policy.expand_factor).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_ceiling, policy.max_ceiling);
+        assert_eq!(
+            cfg.reflect_after_consecutive_zero,
+            policy.reflect_after_consecutive_zero
+        );
+    }
+
+    /// BudgetPolicyConfig round-trips through TOML serialization with all
+    /// fields explicitly set.
+    #[test]
+    fn budget_policy_config_toml_round_trip() {
+        let cfg = BudgetPolicyConfig {
+            expand_after_consecutive_outcomes: 4,
+            expand_factor: 2.0,
+            max_ceiling: 500,
+            reflect_after_consecutive_zero: 5,
+        };
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        let restored: BudgetPolicyConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            restored.expand_after_consecutive_outcomes,
+            cfg.expand_after_consecutive_outcomes
+        );
+        assert!((restored.expand_factor - cfg.expand_factor).abs() < f64::EPSILON);
+        assert_eq!(restored.max_ceiling, cfg.max_ceiling);
+        assert_eq!(
+            restored.reflect_after_consecutive_zero,
+            cfg.reflect_after_consecutive_zero
+        );
+    }
+
+    /// When a TOML `[budget_policy]` section is partially populated,
+    /// missing fields must fall back to their serde defaults — not zero.
+    #[test]
+    fn budget_policy_config_partial_toml_uses_defaults() {
+        let toml_str = r#"
+[budget_policy]
+expand_factor = 2.0
+"#;
+        // Wrap in a minimal struct so we can deserialize only the subsection.
+        #[derive(Deserialize)]
+        struct Wrapper {
+            budget_policy: BudgetPolicyConfig,
+        }
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        assert!((w.budget_policy.expand_factor - 2.0).abs() < f64::EPSILON);
+        // Unspecified fields → serde defaults, not zero.
+        assert_eq!(
+            w.budget_policy.expand_after_consecutive_outcomes,
+            default_expand_after_consecutive_outcomes()
+        );
+        assert_eq!(w.budget_policy.max_ceiling, default_max_ceiling());
+        assert_eq!(
+            w.budget_policy.reflect_after_consecutive_zero,
+            default_reflect_after_consecutive_zero()
+        );
+    }
+
+    /// An empty `[budget_policy]` section deserialized as part of
+    /// RuntimeConfig must produce the default BudgetPolicyConfig (all
+    /// fields at their serde-default values) — not a deserialization
+    /// error or zero-filled struct.
+    #[test]
+    fn budget_policy_config_empty_section_uses_all_defaults() {
+        let toml_str = "[budget_policy]\n";
+        #[derive(Deserialize)]
+        struct Wrapper {
+            budget_policy: BudgetPolicyConfig,
+        }
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        let def = BudgetPolicyConfig::default();
+        assert_eq!(
+            w.budget_policy.expand_after_consecutive_outcomes,
+            def.expand_after_consecutive_outcomes
+        );
+        assert!((w.budget_policy.expand_factor - def.expand_factor).abs() < f64::EPSILON);
+        assert_eq!(w.budget_policy.max_ceiling, def.max_ceiling);
+        assert_eq!(
+            w.budget_policy.reflect_after_consecutive_zero,
+            def.reflect_after_consecutive_zero
         );
     }
 }

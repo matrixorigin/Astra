@@ -137,16 +137,11 @@ const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domai
 fn load_budget_policy_from_config() -> Option<astra_core::observation_journal::BudgetPolicy> {
     use astra_core::observation_journal::BudgetPolicy;
     let cfg = astra_config::runtime_config::RuntimeConfig::load().budget_policy?;
-    let default = BudgetPolicy::default();
     Some(BudgetPolicy {
-        expand_after_consecutive_outcomes: cfg
-            .expand_after_consecutive_outcomes
-            .unwrap_or(default.expand_after_consecutive_outcomes),
-        expand_factor: cfg.expand_factor.unwrap_or(default.expand_factor),
-        max_ceiling: cfg.max_ceiling.unwrap_or(default.max_ceiling),
-        reflect_after_consecutive_zero: cfg
-            .reflect_after_consecutive_zero
-            .unwrap_or(default.reflect_after_consecutive_zero),
+        expand_after_consecutive_outcomes: cfg.expand_after_consecutive_outcomes,
+        expand_factor: cfg.expand_factor,
+        max_ceiling: cfg.max_ceiling,
+        reflect_after_consecutive_zero: cfg.reflect_after_consecutive_zero,
     })
 }
 

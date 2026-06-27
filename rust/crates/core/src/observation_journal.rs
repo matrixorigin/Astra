@@ -502,12 +502,13 @@ impl ObservationJournal {
     ///
     /// "Outcome" = at least one of: file mutation, test pass, build success.
     pub fn extract_facts(&self, budget_remaining: u32, budget_max: u32) -> JournalFacts {
+        // total_tool_calls, total_errors, total_evidence_calls are populated
+        // by the execution phase from authoritative state, not from the journal
+        // (they track entire-session counts, not just the sliding window).
         let mut facts = JournalFacts {
             rounds_completed: self.entries.last().map(|e| e.turn + 1).unwrap_or(0),
             budget_remaining,
             budget_max,
-            total_errors: self.entries.iter().map(|e| e.error_count).sum(),
-            total_tool_calls: self.entries.iter().map(|e| e.total_tool_calls).sum(),
             ..Default::default()
         };
 
@@ -1345,5 +1346,60 @@ mod tests {
         let normal = JournalFacts::default();
         let actions = policy.decide(&normal);
         assert!(matches!(actions[0], FrameworkAction::Continue));
+    }
+
+    // ─── extract_facts edge cases ────────────────────────────────────────
+
+    /// extract_facts must NOT compute total_tool_calls or total_errors
+    /// from the journal window. These fields track entire-session counts
+    /// and are set by the execution phase from authoritative state.
+    #[test]
+    fn extract_facts_does_not_set_session_wide_fields() {
+        let mut journal = ObservationJournal::default();
+        journal.record_turn(&make_write_metrics(0, 10, 1000));
+        journal.record_turn(&make_write_metrics(1, 20, 2000));
+
+        let facts = journal.extract_facts(5, 10);
+        // Session-wide fields are NOT populated by extract_facts;
+        // the execution phase owns them.
+        assert_eq!(
+            facts.total_tool_calls, 0,
+            "extract_facts must not set total_tool_calls"
+        );
+        assert_eq!(
+            facts.total_errors, 0,
+            "extract_facts must not set total_errors"
+        );
+        assert_eq!(
+            facts.total_evidence_calls, 0,
+            "extract_facts must not set total_evidence_calls"
+        );
+        // Streak fields ARE computed correctly.
+        assert_eq!(facts.consecutive_rounds_with_outcome, 2);
+        assert_eq!(facts.rounds_completed, 2);
+    }
+
+    /// Zero budget edge case: budget_remaining == 0, budget_max > 0.
+    /// extract_facts must not panic and must report remaining correctly.
+    #[test]
+    fn extract_facts_zero_budget_remaining() {
+        let mut journal = ObservationJournal::default();
+        journal.record_turn(&make_write_metrics(0, 5, 500));
+
+        let facts = journal.extract_facts(0, 10);
+        assert_eq!(facts.budget_remaining, 0);
+        assert_eq!(facts.budget_max, 10);
+        assert_eq!(facts.rounds_completed, 1);
+    }
+
+    /// budget_remaining > budget_max is logically invalid but must not
+    /// panic. Callers are expected to enforce this invariant upstream.
+    #[test]
+    fn extract_facts_remaining_exceeds_max() {
+        let mut journal = ObservationJournal::default();
+
+        let facts = journal.extract_facts(20, 10);
+        assert_eq!(facts.budget_remaining, 20);
+        assert_eq!(facts.budget_max, 10);
     }
 }
