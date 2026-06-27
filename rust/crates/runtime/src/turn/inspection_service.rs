@@ -597,4 +597,271 @@ mod tests {
         assert!(summary.contains("consecutive_failures=5"));
         assert!(summary.contains("stall_nudge_count=3"));
     }
+
+    // ── generate_tuning_signals tests ────────────────────────────────────
+
+    #[test]
+    fn tuning_aggressive_compaction_when_pressure_critical() {
+        let mut state = host::make_test_loop_state();
+        // estimate_tokens ≈ DEFAULT_SYSTEM_PROMPT_TOKENS (14_000) + pinned + 300
+        // With pinned=0: ≈14_300 / 14_500 ≈ 0.986 > 0.95
+        state.max_turn_input_tokens = 14_500;
+        state.pinned_tool_schema_tokens = 0;
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            assert_eq!(jobs.len(), 1, "expected 1 signal, got: {:?}", jobs);
+            assert_eq!(jobs[0].signal, TuningSignalType::AggressiveCompaction);
+            assert_eq!(jobs[0].priority, 10);
+            assert!(jobs[0].reason.contains("critical"));
+            assert!(jobs[0].trigger_value > 0.95);
+        });
+    }
+
+    #[test]
+    fn tuning_prompt_compaction_when_pressure_high() {
+        let mut state = host::make_test_loop_state();
+        // 14_300 / 16_500 ≈ 0.867 — between 0.80 and 0.95
+        state.max_turn_input_tokens = 16_500;
+        state.pinned_tool_schema_tokens = 0;
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            assert_eq!(jobs.len(), 1, "expected 1 signal, got: {:?}", jobs);
+            assert_eq!(jobs[0].signal, TuningSignalType::PromptCompaction);
+            assert_eq!(jobs[0].priority, 7);
+            assert!(jobs[0].trigger_value > 0.80);
+            assert!(jobs[0].trigger_value <= 0.95);
+        });
+    }
+
+    #[test]
+    fn tuning_no_compaction_when_pressure_low() {
+        let mut state = host::make_test_loop_state();
+        // 14_300 / 20_000 ≈ 0.715 — below 0.80
+        state.max_turn_input_tokens = 20_000;
+        state.pinned_tool_schema_tokens = 0;
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            // No compaction signals when pressure ≤ 0.80
+            assert!(jobs
+                .iter()
+                .all(|j| j.signal != TuningSignalType::PromptCompaction
+                    && j.signal != TuningSignalType::AggressiveCompaction));
+        });
+    }
+
+    #[test]
+    fn tuning_empty_when_healthy() {
+        let state = host::make_test_loop_state();
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            // All default values → healthy → no tuning signals
+            assert!(jobs.is_empty());
+        });
+    }
+
+    #[test]
+    fn tuning_circuit_breaker_when_error_rate_high() {
+        let mut state = host::make_test_loop_state();
+        // Inject tool errors to raise error rate above 0.30
+        state.turn_guard.health.record_outcome(
+            "bash",
+            astra_turn_core::tool::health::ToolOutcome::new(false, 0, "error"),
+        );
+        state.turn_guard.health.record_outcome(
+            "read",
+            astra_turn_core::tool::health::ToolOutcome::new(false, 0, "error"),
+        );
+        // Add some tool call records for normalization
+        state.stall.tool_call_records = vec![
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        ];
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            let cb: Vec<_> = jobs
+                .iter()
+                .filter(|j| j.signal == TuningSignalType::CircuitBreakerTuning)
+                .collect();
+            assert_eq!(cb.len(), 1);
+            assert_eq!(cb[0].priority, 6);
+            assert!(cb[0].trigger_value > 0.30);
+            assert!(cb[0].reason.contains("circuit breaker"));
+        });
+    }
+
+    #[test]
+    fn tuning_circuit_breaker_not_triggered_when_error_rate_low() {
+        let mut state = host::make_test_loop_state();
+        // Inject just one error — rate stays low with many calls
+        state.turn_guard.health.record_outcome(
+            "bash",
+            astra_turn_core::tool::health::ToolOutcome::new(false, 0, "error"),
+        );
+        state.stall.tool_call_records = vec![Default::default(); 10];
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            assert!(jobs
+                .iter()
+                .all(|j| j.signal != TuningSignalType::CircuitBreakerTuning));
+        });
+    }
+
+    #[test]
+    fn tuning_cache_warming_when_hit_ratio_low_after_many_turns() {
+        let mut state = host::make_test_loop_state();
+        // turns_completed = max_turns - remaining_turns = 30 - 15 = 15 > 10
+        state.max_turns = 30;
+        state.remaining_turns = 15;
+        // cache_hit_ratio = 0 (all zeros) < 0.30
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            let cw: Vec<_> = jobs
+                .iter()
+                .filter(|j| j.signal == TuningSignalType::CacheWarming)
+                .collect();
+            assert_eq!(cw.len(), 1);
+            assert_eq!(cw[0].priority, 4);
+            assert!(cw[0].reason.contains("cache warming"));
+        });
+    }
+
+    #[test]
+    fn tuning_cache_warming_not_triggered_when_few_turns() {
+        let mut state = host::make_test_loop_state();
+        // turns_completed = 10 - 5 = 5, not > 10
+        state.max_turns = 10;
+        state.remaining_turns = 5;
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            assert!(jobs
+                .iter()
+                .all(|j| j.signal != TuningSignalType::CacheWarming));
+        });
+    }
+
+    #[test]
+    fn tuning_task_decomposition_when_stalled() {
+        let mut state = host::make_test_loop_state();
+        // Set up stalled journal: multiple turns with zero outcomes.
+        // record_turn skips entries with 0 tool calls, so we must set tool_calls_total > 0.
+        use astra_core::observation::TurnMetrics;
+        for i in 0..6 {
+            let mut m = TurnMetrics::default();
+            m.tool_calls_total = 5; // non-zero to ensure entry is recorded
+            m.mutation_count = 0; // zero mutations → write_ratio = 0.0 → stalled
+            m.error_count = 0;
+            state.observation_journal.record_turn(&m);
+        }
+        // Set up task board: 1 pending task → task_ratio = 0.0
+        state.hooks.task_board_snapshot.pending_count = 1;
+        state.hooks.task_board_snapshot.in_progress_count = 0;
+        state.hooks.task_board_snapshot.blocked_count = 0;
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            let td: Vec<_> = jobs
+                .iter()
+                .filter(|j| j.signal == TuningSignalType::TaskDecomposition)
+                .collect();
+            assert_eq!(td.len(), 1, "expected 1 TaskDecomposition, got {jobs:?}");
+            assert_eq!(td[0].priority, 3);
+            assert!(td[0].reason.contains("stalled"));
+            assert!(td[0].reason.contains("decomposition"));
+        });
+    }
+
+    #[test]
+    fn tuning_task_decomposition_not_triggered_when_progressing() {
+        let mut state = host::make_test_loop_state();
+        // Only 2 stalled turns (< 5 threshold)
+        use astra_core::observation::TurnMetrics;
+        for _ in 0..2 {
+            let mut m = TurnMetrics::default();
+            m.tool_calls_total = 5;
+            m.mutation_count = 0;
+            state.observation_journal.record_turn(&m);
+        }
+        state.hooks.task_board_snapshot.pending_count = 1;
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            assert!(jobs
+                .iter()
+                .all(|j| j.signal != TuningSignalType::TaskDecomposition));
+        });
+    }
+
+    #[test]
+    fn tuning_multiple_signals_fire_simultaneously() {
+        let mut state = host::make_test_loop_state();
+        // High pressure → AggressiveCompaction
+        state.max_turn_input_tokens = 14_500;
+        state.pinned_tool_schema_tokens = 0;
+        // Many turns → CacheWarming
+        state.max_turns = 30;
+        state.remaining_turns = 15; // 15 turns > 10
+                                    // Stalled journal → TaskDecomposition
+        use astra_core::observation::TurnMetrics;
+        for _ in 0..6 {
+            let mut m = TurnMetrics::default();
+            m.tool_calls_total = 5;
+            m.mutation_count = 0;
+            state.observation_journal.record_turn(&m);
+        }
+        state.hooks.task_board_snapshot.pending_count = 1;
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            // Should have at least 3 signals: AggressiveCompaction + CacheWarming + TaskDecomposition
+            assert!(jobs.len() >= 3, "got {} jobs: {jobs:?}", jobs.len());
+            let signals: Vec<_> = jobs.iter().map(|j| j.signal).collect();
+            assert!(
+                signals.contains(&TuningSignalType::AggressiveCompaction),
+                "missing AggressiveCompaction in {signals:?}"
+            );
+            assert!(
+                signals.contains(&TuningSignalType::CacheWarming),
+                "missing CacheWarming in {signals:?}"
+            );
+            assert!(
+                signals.contains(&TuningSignalType::TaskDecomposition),
+                "missing TaskDecomposition in {signals:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn tuning_signals_have_correct_session_and_turn() {
+        let mut state = host::make_test_loop_state();
+        state.max_turn_input_tokens = 1000;
+        state.pinned_tool_schema_tokens = 970;
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(42, "my-session-id");
+            for job in &jobs {
+                assert_eq!(job.turn_index, 42);
+                assert_eq!(job.session_id, "my-session-id");
+            }
+        });
+    }
+
+    #[test]
+    fn tuning_signals_have_valid_timestamps() {
+        let mut state = host::make_test_loop_state();
+        state.max_turn_input_tokens = 1000;
+        state.pinned_tool_schema_tokens = 970;
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        with_inspection(&state, |svc| {
+            let jobs = svc.generate_tuning_signals(5, "test-session");
+            let after_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            for job in &jobs {
+                assert!(job.created_at_ms >= before_ms);
+                assert!(job.created_at_ms <= after_ms + 100); // +100ms tolerance
+            }
+        });
+    }
 }

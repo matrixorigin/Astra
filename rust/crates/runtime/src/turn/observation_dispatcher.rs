@@ -453,4 +453,91 @@ mod tests {
         assert_eq!(dispatcher.event_count(), 1);
         assert_eq!(dispatcher.failure_count(), 0);
     }
+
+    // ── FileTuningSink tests ────────────────────────────────────────────
+
+    use astra_core::observation::TuningSignalType;
+
+    fn make_tuning_job(signal: TuningSignalType, turn: u32) -> TuningJob {
+        TuningJob {
+            signal,
+            trigger_value: 0.85,
+            reason: "test tuning signal".to_string(),
+            created_at_ms: 1_700_000_000_000,
+            turn_index: turn,
+            session_id: "test-session".to_string(),
+            priority: 5,
+        }
+    }
+
+    #[test]
+    fn file_tuning_sink_none_store_skips_silently() {
+        let mut sink = FileTuningSink::new(None, "test-session".to_string());
+        let jobs = vec![make_tuning_job(TuningSignalType::PromptCompaction, 1)];
+        let result = sink.consume_batch(&jobs);
+        assert!(
+            result.is_ok(),
+            "None store should skip silently: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn file_tuning_sink_empty_batch_is_noop() {
+        let mut sink = FileTuningSink::new(None, "test-session".to_string());
+        let result = sink.consume_batch(&[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn file_tuning_sink_name_is_file_tuning() {
+        let sink = FileTuningSink::new(None, "test-session".to_string());
+        assert_eq!(sink.name(), "file_tuning");
+    }
+
+    #[test]
+    fn file_tuning_sink_debug_shows_session_and_store() {
+        let sink_none = FileTuningSink::new(None, "s1".to_string());
+        let dbg_none = format!("{:?}", sink_none);
+        assert!(dbg_none.contains("s1"));
+        assert!(dbg_none.contains("has_store: false"));
+
+        let store = crate::turn::observation_store::test_store();
+        let sink_some = FileTuningSink::new(store, "s2".to_string());
+        let dbg_some = format!("{:?}", sink_some);
+        assert!(dbg_some.contains("s2"));
+        assert!(dbg_some.contains("has_store: true"));
+    }
+
+    #[test]
+    fn file_tuning_sink_writes_jobs_to_temp_store() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store: Arc<dyn ObservationStore> = Arc::new(
+            crate::turn::observation_store::FileObservationStore::new(dir.path().to_path_buf()),
+        );
+        let mut sink = FileTuningSink::new(Some(store.clone()), "tsink-session".to_string());
+
+        let jobs = vec![
+            make_tuning_job(TuningSignalType::PromptCompaction, 1),
+            make_tuning_job(TuningSignalType::CacheWarming, 3),
+        ];
+        sink.consume_batch(&jobs).expect("write should succeed");
+
+        // Verify file persistence — tuning entries go to .tuning.jsonl, not .jsonl
+        let tuning_path = dir.path().join("tsink-session.tuning.jsonl");
+        assert!(
+            tuning_path.exists(),
+            "tuning file should exist at {tuning_path:?}"
+        );
+        let raw = std::fs::read_to_string(&tuning_path).expect("read tuning file");
+        assert!(
+            raw.contains("PromptCompaction"),
+            "missing PromptCompaction in {raw}"
+        );
+        assert!(
+            raw.contains("CacheWarming"),
+            "missing CacheWarming in {raw}"
+        );
+        assert_eq!(raw.lines().count(), 2, "should have 2 lines, got: {raw}");
+    }
 }

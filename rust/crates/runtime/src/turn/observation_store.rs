@@ -216,6 +216,20 @@ pub fn default_observation_store() -> Option<Arc<dyn ObservationStore>> {
     Some(Arc::new(FileObservationStore::new(root)))
 }
 
+/// Create a test store backed by a temporary directory.
+///
+/// This is used by sibling test modules (e.g. `observation_dispatcher`) that
+/// need a real `FileObservationStore` without depending on the home directory.
+#[cfg(any(test, feature = "bridge-e2e-hooks"))]
+pub fn test_store() -> Option<Arc<dyn ObservationStore>> {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let dir = DIR.get_or_init(|| tempfile::TempDir::new().expect("tempdir for test_store"));
+    Some(Arc::new(FileObservationStore::new(
+        dir.path().to_path_buf(),
+    )))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -339,5 +353,149 @@ mod tests {
         let store = default_observation_store();
         // In any reasonable test environment, HOME is set.
         assert!(store.is_some(), "HOME should be set in test environment");
+    }
+
+    // ── save_tuning_entry tests ────────────────────────────────────────
+
+    #[test]
+    fn save_and_load_tuning_entry_persists_to_separate_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileObservationStore::new(dir.path().to_path_buf());
+
+        let json = r#"{"signal":"prompt_compaction","trigger_value":0.85,"reason":"test","created_at_ms":1700000000000,"turn_index":1,"session_id":"tune-sess","priority":7}"#;
+        store
+            .save_tuning_entry("tune-sess", 1, json)
+            .expect("save tuning entry");
+
+        // Verify file exists and is separate from observation entries
+        let tuning_path = dir.path().join("tune-sess.tuning.jsonl");
+        let obs_path = dir.path().join("tune-sess.jsonl");
+
+        assert!(
+            tuning_path.exists(),
+            "tuning file should exist: {:?}",
+            tuning_path
+        );
+        assert!(
+            !obs_path.exists(),
+            "observation file should NOT exist: {:?}",
+            obs_path
+        );
+
+        let raw = std::fs::read_to_string(&tuning_path).expect("read tuning file");
+        assert!(raw.contains("prompt_compaction"));
+        assert!(raw.contains("0.85"));
+    }
+
+    #[test]
+    fn save_tuning_entry_multiple_jobs_are_appended() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileObservationStore::new(dir.path().to_path_buf());
+
+        store
+            .save_tuning_entry(
+                "multi-tune",
+                1,
+                r#"{"signal":"prompt_compaction","trigger_value":0.80}"#,
+            )
+            .expect("save 1");
+        store
+            .save_tuning_entry(
+                "multi-tune",
+                3,
+                r#"{"signal":"cache_warming","trigger_value":0.20}"#,
+            )
+            .expect("save 2");
+        store
+            .save_tuning_entry(
+                "multi-tune",
+                5,
+                r#"{"signal":"circuit_breaker_tuning","trigger_value":0.40}"#,
+            )
+            .expect("save 3");
+
+        let tuning_path = dir.path().join("multi-tune.tuning.jsonl");
+        let raw = std::fs::read_to_string(&tuning_path).expect("read tuning file");
+        let lines: Vec<_> = raw.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(raw.contains("prompt_compaction"));
+        assert!(raw.contains("cache_warming"));
+        assert!(raw.contains("circuit_breaker_tuning"));
+    }
+
+    #[test]
+    fn save_tuning_entry_adds_trailing_newline() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileObservationStore::new(dir.path().to_path_buf());
+
+        store
+            .save_tuning_entry(
+                "nl-sess",
+                1,
+                r#"{"signal":"prompt_compaction","trigger_value":0.85}"#,
+            )
+            .expect("save");
+        // Verify trailing newline
+        let raw = std::fs::read_to_string(dir.path().join("nl-sess.tuning.jsonl")).expect("read");
+        assert!(raw.ends_with('\n'));
+    }
+
+    #[test]
+    fn save_tuning_entry_creates_directory_if_missing() {
+        let dir = TempDir::new().expect("tempdir");
+        let nested = dir.path().join("subdir").join("deep");
+        let store = FileObservationStore::new(nested);
+
+        store
+            .save_tuning_entry(
+                "auto-create",
+                1,
+                r#"{"signal":"prompt_compaction","trigger_value":0.85}"#,
+            )
+            .expect("save should auto-create dirs");
+
+        assert!(dir
+            .path()
+            .join("subdir")
+            .join("deep")
+            .join("auto-create.tuning.jsonl")
+            .exists());
+    }
+
+    #[test]
+    fn test_store_returns_some_and_persists() {
+        let store = test_store().expect("test_store should return Some");
+        store
+            .save_tuning_entry(
+                "teststore",
+                1,
+                r#"{"signal":"cache_warming","trigger_value":0.15}"#,
+            )
+            .expect("save");
+    }
+
+    #[test]
+    fn save_tuning_entry_session_id_is_sanitized() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileObservationStore::new(dir.path().to_path_buf());
+
+        // Session id with special characters
+        store
+            .save_tuning_entry(
+                "a/b../c",
+                1,
+                r#"{"signal":"prompt_compaction","trigger_value":0.85}"#,
+            )
+            .expect("save");
+
+        // Should NOT create subdirectories from path traversal
+        let path = dir.path().join("a_b__c.tuning.jsonl");
+        assert!(path.exists(), "expect sanitized path {:?}", path);
+
+        // Should NOT have created original traversal paths
+        assert!(
+            !dir.path().join("a").exists(),
+            "traversal dir should not exist"
+        );
     }
 }
