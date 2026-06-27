@@ -12,18 +12,19 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
 
+use crate::turn::agentic_loop::host::{
+    run_agentic_loop_with_host, runtime_manifest_for_model, AgenticLoopHost as _, AgenticLoopState,
+    CancellationState, RequestConstraints, SkillState, StopHookState, TurnInteractionPolicy,
+};
+use crate::turn::observation_store::default_observation_store;
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
-use crate::turn::agentic_loop::host::{
-    AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
-    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host, runtime_manifest_for_model,
-};
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
@@ -543,6 +544,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 }
             },
             observation_journal: Default::default(),
+            observation_store: default_observation_store(),
         };
 
         // ── Wire ServerToolExecutor for skill sub-run tool execution ────

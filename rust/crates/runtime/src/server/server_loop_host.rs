@@ -7641,6 +7641,7 @@ mod tests {
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
             observation_journal: Default::default(),
+            observation_store: None,
         }
     }
 

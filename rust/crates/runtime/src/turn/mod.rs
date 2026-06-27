@@ -31,6 +31,8 @@ pub mod providers;
 pub mod run_control;
 pub mod runtime_policy;
 pub mod inspection_service;
+pub mod observation_store;
+pub mod observation_dispatcher;
 pub mod session_current_date;
 pub mod session_end_debounce;
 /// Re-exported from astra-turn-types

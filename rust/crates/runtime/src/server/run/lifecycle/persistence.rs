@@ -6,15 +6,15 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tracing;
 use uuid::Uuid;
 
-use astra_core::{ErrorResponse, SharedPool, connect_matrixone};
+use astra_core::{connect_matrixone, ErrorResponse, SharedPool};
 use astra_services::coordination::AgentProfile;
-use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
+use astra_services::session_audit::{RuntimePromotionEventData, RUNTIME_PROMOTION_EVENT_TYPE};
 use astra_services::skills::SkillService;
 use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
@@ -32,8 +32,8 @@ use astra_turn_core::contracts::{
 };
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
-use crate::MatrixOneSettings;
 use crate::turn::agentic_loop::host::AgenticLoopState;
+use crate::MatrixOneSettings;
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
     EventCreateRequestData, EventService,
@@ -1895,16 +1895,12 @@ mod tests {
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["content"], "不要review啊！");
         assert_eq!(messages[2]["content"], "ok");
-        assert!(
-            messages
-                .iter()
-                .all(|msg| msg["role"] != "tool" && msg.get("reasoning_content").is_none())
-        );
-        assert!(
-            messages
-                .iter()
-                .all(|msg| !msg["content"].as_str().unwrap_or("").contains("old review"))
-        );
+        assert!(messages
+            .iter()
+            .all(|msg| msg["role"] != "tool" && msg.get("reasoning_content").is_none()));
+        assert!(messages
+            .iter()
+            .all(|msg| !msg["content"].as_str().unwrap_or("").contains("old review")));
         assert!(messages.iter().all(|msg| {
             !msg["content"]
                 .as_str()

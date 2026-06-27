@@ -24,7 +24,7 @@ use astra_core::observation_journal::{JournalFacts, MetricTrend};
 // ─── LiveRuntimeProvider ─────────────────────────────────────────────────────
 
 /// Real-time metrics from the running turn loop.
-pub trait LiveRuntimeProvider {
+pub trait LiveRuntimeProvider: Send + Sync {
     /// Token pressure in the current context window, 0.0–1.0.
     /// Returns 0.0 when the budget is unlimited (max_turns == 0).
     fn token_pressure(&self) -> f64;
@@ -47,7 +47,7 @@ pub trait LiveRuntimeProvider {
 // ─── ObservationProvider ─────────────────────────────────────────────────────
 
 /// Historical observation data from the turn journal.
-pub trait ObservationProvider {
+pub trait ObservationProvider: Send + Sync {
     /// Extract a factual snapshot from the journal.
     ///
     /// The returned `JournalFacts` includes outcome streaks, budget data,
@@ -69,7 +69,7 @@ pub trait ObservationProvider {
 // ─── SessionStateProvider ────────────────────────────────────────────────────
 
 /// Session-level state: task progress, phase, and circuit breaker.
-pub trait SessionStateProvider {
+pub trait SessionStateProvider: Send + Sync {
     /// Ratio of completed tasks, 0.0–1.0.
     ///
     /// Returns 1.0 when no unfinished tasks remain on the board.

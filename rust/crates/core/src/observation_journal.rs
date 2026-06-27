@@ -1,13 +1,16 @@
 //! Cross-turn observation journal for trend tracking and strategy verification.
 //!
 //! The [`ObservationJournal`] maintains a sliding window of per-turn metrics so the
-//! runtime (not core) can make informed budget and signal decisions.
+//! runtime (not core) can make informed budget and signal decisions. The companion
+//! [`ObservationStore`] trait provides an optional persistence layer; the in-memory
+//! journal remains the primary source of truth during a session.
 //!
 //! # Separation of concerns
 //!
 //! * **Data layer** (`astra_core`): [`JournalFacts`] (pure factual snapshot —
 //!   counts, streaks, no judgments), [`ObservationJournal`] (ring buffer of
-//!   [`JournalEntry`] entries, trend computation, strategy verification).
+//!   [`JournalEntry`] entries, trend computation, strategy verification),
+//!   [`ObservationStore`] (optional persistence trait).
 //! * **Policy layer** (`astra_runtime::turn::runtime_policy`): [`RuntimePolicy`]
 //!   reads [`JournalFacts`] and produces [`FrameworkAction`]s. The core data
 //!   layer never decides — it only reports facts.
@@ -23,6 +26,9 @@
 //! 3. Before the next LLM round, the runtime calls
 //!    [`ObservationJournal::extract_facts`] to get a pure factual snapshot,
 //!    then passes it to the runtime policy layer for decision-making.
+//! 4. Optionally, after each turn the runtime may call
+//!    [`ObservationStore::save_entry`] to persist the turn's data beyond the
+//!    in-memory journal window.
 
 use std::fmt::Write;
 
@@ -631,6 +637,96 @@ pub fn render_compact_status(
     }
 
     s
+}
+
+// ── ObservationStore ─────────────────────────────────────────────────────────
+
+/// Optional persistence trait for the observation plane.
+///
+/// Implementations serialize per-turn observation data (metrics + journal facts)
+/// to a durable backend so the observation graph can be reconstructed across
+/// session boundaries. The in-memory [`ObservationJournal`] remains the primary
+/// source of truth during a session; the store is a write-through cache.
+///
+/// # Design
+///
+/// * **Write-through, not write-back**: entries are persisted *after* the
+///   in-memory journal has been updated. The journal is always consistent;
+///   store failures are logged but never block the session.
+/// * **Session-scoped**: every entry is tagged with a `session_id` so multiple
+///   concurrent or historical sessions can coexist in the same backend.
+/// * **Read-back is optional**: the store is primarily a sink. Query methods
+///   exist for cross-session analysis (via `reflect`), but the runtime never
+///   depends on historical data from the store to make decisions.
+///
+/// # Unhappy-path
+///
+/// All methods tolerate I/O failures. Backends must not panic on disk-full,
+/// permission-denied, or corrupt-file conditions. Callers should treat
+/// `save_entry` failures as non-fatal and never retry in a tight loop.
+pub trait ObservationStore: Send + Sync {
+    /// Persist a turn's metrics and journal facts under `session_id`.
+    ///
+    /// `turn_index` is the 0-based turn number within the session.
+    /// `metrics` and `facts` are serialized atomically as a single record.
+    ///
+    /// Returns `Ok(())` on success, or an error message on failure.
+    /// The error is informational; callers must not unwind.
+    fn save_entry(
+        &self,
+        session_id: &str,
+        turn_index: u32,
+        metrics: &TurnMetrics,
+        facts: &JournalFacts,
+    ) -> Result<(), String>;
+
+    /// Load all persisted entries for `session_id`, ordered by turn index.
+    ///
+    /// Returns an empty `Vec` if the session has no persisted data or the
+    /// backend cannot be read (e.g. file not found).
+    fn load_entries(
+        &self,
+        session_id: &str,
+    ) -> Vec<StoredEntry>;
+
+    /// Return the number of persisted entries for `session_id`.
+    ///
+    /// Returns `0` if the session is unknown or the backend is unavailable.
+    fn entry_count(&self, session_id: &str) -> usize;
+
+    /// Delete all persisted entries for `session_id`.
+    ///
+    /// Returns `Ok(())` even if no entries existed (idempotent delete).
+    fn delete_session(&self, session_id: &str) -> Result<(), String>;
+}
+
+/// A single persisted observation record, reconstructed from storage.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredEntry {
+    pub session_id: String,
+    pub turn_index: u32,
+    /// Unix timestamp in milliseconds when the entry was persisted.
+    pub timestamp_unix_ms: u64,
+    /// Serialized [`TurnMetrics`] payload.
+    pub metrics_json: String,
+    /// Serialized [`JournalFacts`] payload.
+    pub facts_json: String,
+}
+
+impl StoredEntry {
+    /// Deserialize the metrics payload back into [`TurnMetrics`].
+    ///
+    /// Returns `None` if the stored JSON is corrupt (never panics).
+    pub fn metrics(&self) -> Option<TurnMetrics> {
+        serde_json::from_str(&self.metrics_json).ok()
+    }
+
+    /// Deserialize the facts payload back into [`JournalFacts`].
+    ///
+    /// Returns `None` if the stored JSON is corrupt (never panics).
+    pub fn facts(&self) -> Option<JournalFacts> {
+        serde_json::from_str(&self.facts_json).ok()
+    }
 }
 
 #[cfg(test)]

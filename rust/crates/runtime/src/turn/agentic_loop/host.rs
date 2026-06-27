@@ -1823,6 +1823,13 @@ pub struct AgenticLoopState {
     /// verification. Updated after each tool phase; read before each LLM
     /// round to auto-inject a compact self-status block into the prompt.
     pub observation_journal: ObservationJournal,
+
+    // ── Observation store (persistent cross-session storage) ──
+    /// Optional persistence backend. When set, each turn's metrics and
+    /// journal facts are write-through persisted after the in-memory
+    /// journal is updated. `None` disables persistence (default).
+    pub observation_store:
+        Option<std::sync::Arc<dyn astra_core::observation_journal::ObservationStore>>,
 }
 
 /// Build the stable runtime manifest carried through context metadata.
@@ -2814,6 +2821,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         turn_event_buffer: None,
         harness: super::super::harness_adapter::HarnessSlot::empty(),
         observation_journal: Default::default(),
+        observation_store: None,
     }
 }
 
@@ -3298,6 +3306,7 @@ pub(crate) mod tests {
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
             observation_journal: Default::default(),
+            observation_store: None,
         }
     }
 
