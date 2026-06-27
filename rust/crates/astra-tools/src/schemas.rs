@@ -165,14 +165,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents. Use exact fields only: path, start_line, end_line, outline. Do not use limit/offset/length. For the first N lines, use start_line=1 and end_line=N. For a range, start_line/end_line are inclusive line numbers; prefer start_line <= end_line. If a read-only reversed range is sent, the tool normalizes it and explains the resolved range. Set outline=true for function/class signatures only.",
+                "description": "Read file contents. Use exact fields only: path, offset, limit, outline. `offset` is the 1-based starting line number. `limit` is the number of lines to read (default: read to end). For the first 50 lines: offset=1, limit=50. For line 130 with 30 lines around it: offset=100, limit=60. Set outline=true for function/class signatures only.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based). Prefer <= end_line when end_line is provided."},
-                        "end_line": {"type": "integer", "minimum": 1, "description": "Last line to read (inclusive). Use this instead of limit/count."},
+                        "offset": {"type": "integer", "minimum": 1, "description": "1-based line number to start reading."},
+                        "limit": {"type": "integer", "minimum": 1, "description": "Number of lines to read."},
                         "outline": {"type": "boolean", "description": "Return only function/class/struct signatures with line numbers"}
                     },
                     "required": ["path"]
@@ -2216,10 +2216,8 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            desc.contains("Do not use limit/offset/length")
-                && desc.contains("start_line=1")
-                && desc.contains("end_line=N"),
-            "read_file description must advertise the current line-range contract: {desc}"
+            desc.contains("offset") && desc.contains("limit"),
+            "read_file description must advertise offset+limit contract: {desc}"
         );
 
         let params = func
@@ -2235,16 +2233,16 @@ mod tests {
             .get("properties")
             .and_then(Value::as_object)
             .expect("read_file schema properties must be an object");
-        for name in ["path", "start_line", "end_line", "outline"] {
+        for name in ["path", "offset", "limit", "outline"] {
             assert!(
                 properties.contains_key(name),
                 "read_file schema should expose `{name}`"
             );
         }
-        for removed_arg in ["offset", "limit", "length", "count"] {
+        for removed_arg in ["start_line", "end_line", "length", "count"] {
             assert!(
                 !properties.contains_key(removed_arg),
-                "read_file schema must not expose removed/count field `{removed_arg}`"
+                "read_file schema must not expose old/removed field `{removed_arg}`"
             );
         }
     }

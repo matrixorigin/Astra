@@ -33,6 +33,8 @@ const BINARY_EXTS: &[&str] = &[
 
 const READ_FILE_ALLOWED_FIELDS: &[&str] = &[
     "path",
+    "offset",
+    "limit",
     "start_line",
     "end_line",
     "outline",
@@ -67,30 +69,23 @@ pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
     match object.get("path") {
         Some(Value::String(path)) if !path.trim().is_empty() => Ok(()),
         Some(_) => Err(
-            "Error: field `path` for read_file must be a non-empty string. Valid fields: path, start_line, end_line, outline."
+            "Error: field `path` for read_file must be a non-empty string. Valid fields: path, offset, limit, outline."
                 .to_string(),
         ),
         None => Err(
-            "Error: missing required field `path` for read_file. Valid fields: path, start_line, end_line, outline."
+            "Error: missing required field `path` for read_file. Valid fields: path, offset, limit, outline."
                 .to_string(),
         ),
     }?;
+    validate_read_file_line_arg(object, "offset")?;
+    validate_read_file_line_arg(object, "limit")?;
     validate_read_file_line_arg(object, "start_line")?;
     validate_read_file_line_arg(object, "end_line")?;
-    if let (Some(start), Some(end)) = (
-        object.get("start_line").and_then(Value::as_u64),
-        object.get("end_line").and_then(Value::as_u64),
-    ) && start > end
-    {
-        return Err(format!(
-            "Error: invalid read_file line range: start_line ({start}) must be <= end_line ({end}). Valid fields: path, start_line, end_line, outline."
-        ));
-    }
     if let Some(value) = object.get("outline")
         && !value.is_boolean()
     {
         return Err(
-            "Error: field `outline` for read_file must be a boolean. Valid fields: path, start_line, end_line, outline."
+            "Error: field `outline` for read_file must be a boolean. Valid fields: path, offset, limit, outline."
                 .to_string(),
         );
     }
@@ -100,9 +95,11 @@ pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
 fn read_file_unknown_field_hint(key: &str) -> &'static str {
     match key {
         "file" | "filename" => " Use `path` for the file path.",
-        "offset" => " `read_file` uses line numbers, not byte offsets; use `start_line`.",
-        "limit" | "length" | "count" => {
-            " `read_file` does not support count-style ranges; use `start_line` and `end_line`."
+        "start_line" | "end_line" => {
+            " `read_file` uses `offset` + `limit`; use `offset` for the starting line and `limit` for the number of lines."
+        }
+        "length" | "count" => {
+            " `read_file` uses `offset` + `limit`; `limit` specifies the number of lines to read."
         }
         _ => "",
     }
@@ -118,7 +115,7 @@ fn validate_read_file_line_arg(
     match value.as_u64() {
         Some(value) if value > 0 => Ok(()),
         _ => Err(format!(
-            "Error: field `{field}` for read_file must be a positive integer. Valid fields: path, start_line, end_line, outline."
+            "Error: field `{field}` for read_file must be a positive integer. Valid fields: path, offset, limit, outline."
         )),
     }
 }
@@ -129,16 +126,44 @@ pub struct ReadLineRange {
     pub end_line: usize,
 }
 
+/// Convert LLM-facing `offset`+`limit` args to internal `start_line`+`end_line`.
+///
+/// The LLM schema uses `offset` (1-based line) and `limit` (line count) because
+/// these are semantically distinct types — impossible to generate a reversed range.
+/// Internally, all code continues to use `start_line`/`end_line` inclusive ranges.
+pub fn convert_read_file_args(args: &Value) -> Value {
+    let Some(obj) = args.as_object() else { return args.clone(); };
+    let offset = obj.get("offset").and_then(|v| v.as_u64());
+    let limit = obj.get("limit").and_then(|v| v.as_u64());
+    if offset.is_none() && limit.is_none() {
+        return args.clone();
+    }
+    let mut out = obj.clone();
+    out.remove("offset");
+    out.remove("limit");
+    if let Some(off) = offset {
+        out.insert("start_line".to_string(), Value::from(off));
+        if let Some(lim) = limit {
+            let end = off + lim.saturating_sub(1);
+            out.insert("end_line".to_string(), Value::from(end));
+        }
+    }
+    Value::Object(out)
+}
+
 pub fn normalize_read_file_line_range(
     start_line: Option<usize>,
     end_line: Option<usize>,
     total_lines: usize,
 ) -> ReadLineRange {
-    let requested_start = start_line.unwrap_or(1);
-    let requested_end = end_line.unwrap_or(total_lines);
+    let start = start_line.unwrap_or(1);
+    let end = end_line.unwrap_or(total_lines);
+    // offset+limit always produce start <= end; swap kept for internal
+    // callers that construct start/end directly.
+    let (start_line, end_line) = if start <= end { (start, end) } else { (end, start) };
     ReadLineRange {
-        start_line: requested_start,
-        end_line: requested_end,
+        start_line,
+        end_line,
     }
 }
 
@@ -345,14 +370,15 @@ pub fn resolve_path_sandboxed(
 }
 
 pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
-    if let Err(error) = validate_read_file_args(args) {
+    let args = convert_read_file_args(args);
+    if let Err(error) = validate_read_file_args(&args) {
         return ToolResult::error(error);
     }
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => {
             return ToolResult::error(
-                "Error: missing required field `path` for read_file. Valid fields: path, start_line, end_line, outline."
+                "Error: missing required field `path` for read_file. Valid fields: path, offset, limit, outline."
                     .into(),
             );
         }
@@ -433,7 +459,7 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     // but produce bounded output, and 10MB is still manageable for a single read_to_string.
     if !has_range && !outline && metadata.len() as usize > READ_FILE_HARD_LIMIT {
         return ToolResult::error(format!(
-            "Error: file is too large ({} bytes). Use start_line/end_line to read a specific range, or outline=true.",
+            "Error: file is too large ({} bytes). Use offset/limit to read a specific range, or outline=true.",
             metadata.len()
         ));
     }
@@ -548,7 +574,7 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         // Gap indicator if there's a gap
         if tail_start > head_count {
             preview.push_str(&format!(
-                "... ({} lines omitted, use start_line/end_line to read specific ranges) ...\n\n",
+                "... ({} lines omitted, use offset/limit to read specific ranges) ...\n\n",
                 tail_start - head_count
             ));
         }
@@ -578,7 +604,7 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
 
         // Truncate before appending tip so the tip is always intact when within limit.
         let limit = per_tool_output_limit("read_file");
-        let tip = "\n**Tip**: Use `start_line`/`end_line` to read specific sections, or `outline=true` for definitions only.";
+        let tip = "\n**Tip**: Use `offset`/`limit` to read specific sections, or `outline=true` for definitions only.";
         if preview.len() + tip.len() > limit {
             preview = truncate_output(preview, limit.saturating_sub(tip.len()));
         }
@@ -605,7 +631,7 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         if numbered.len() > limit {
             let mut truncated = truncate_output(numbered, limit);
             truncated.push_str(&format!(
-                "\n[file has {total_lines} lines — use start_line/end_line or outline=true]"
+                "\n[file has {total_lines} lines — use offset/limit or outline=true]"
             ));
             return ToolResult::text(truncated);
         }
@@ -2563,7 +2589,7 @@ mod tests {
     fn read_file_with_range() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
-        let args = serde_json::json!({"path": "test.txt", "start_line": 2, "end_line": 3});
+        let args = serde_json::json!({"path": "test.txt", "offset": 2, "limit": 2});
         let result = read_file(tmp.path(), &args);
         assert!(result.output.contains("2\tb"));
         assert!(result.output.contains("3\tc"));
@@ -2661,7 +2687,7 @@ mod tests {
         );
         // Should have tip about using start_line/end_line
         assert!(
-            result.output.contains("start_line"),
+            result.output.contains("offset"),
             "got: {}",
             result.output
         );
@@ -2821,27 +2847,30 @@ mod tests {
     }
 
     #[test]
-    fn read_file_rejects_reversed_line_ranges() {
+    fn read_file_offset_limit_reads_correct_range() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
 
+        // offset=2, limit=2 → lines 2-3
         let result = read_file(
             tmp.path(),
-            &serde_json::json!({"path": "test.txt", "start_line": 4, "end_line": 2}),
+            &serde_json::json!({"path": "test.txt", "offset": 2, "limit": 2}),
         );
 
-        assert!(result.is_error, "got: {}", result.output);
+        assert!(!result.is_error, "expected success, got error: {}", result.output);
         assert!(
-            result
-                .output
-                .contains("start_line (4) must be <= end_line (2)"),
-            "got: {}",
+            result.output.contains("b") && result.output.contains("c"),
+            "expected lines 2-3, got: {}",
             result.output
         );
     }
 
     #[test]
-    fn read_file_rejects_legacy_start_plus_count_shape_from_real_trace() {
+    /// offset+limit makes reversed ranges impossible — the LLM cannot express
+    /// start=2782,limit=300 in a way that means "read 300 lines starting from 2782"
+    /// which is always valid. This test verifies a large offset+limit range.
+    #[test]
+    fn read_file_offset_limit_large_range() {
         let tmp = TempDir::new().unwrap();
         let mut content = String::new();
         for line in 1..=3_200 {
@@ -2851,21 +2880,25 @@ mod tests {
 
         let result = read_file(
             tmp.path(),
-            &serde_json::json!({"path": "tool-result.txt", "start_line": 2782, "end_line": 300}),
+            &serde_json::json!({"path": "tool-result.txt", "offset": 300, "limit": 500}),
         );
 
-        assert!(result.is_error, "got: {}", result.output);
+        // offset=300, limit=500 → lines 300-799
+        assert!(!result.is_error, "expected success, got error: {}", result.output);
         assert!(
-            result
-                .output
-                .contains("start_line (2782) must be <= end_line (300)"),
-            "legacy count-style ranges must fail instead of being repaired: {}",
+            result.output.contains("line 300"),
+            "expected line 300 after offset+limit, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("line 799"),
+            "expected line 799 (offset 300 + limit 500 - 1), got: {}",
             result.output
         );
     }
 
     #[test]
-    fn read_file_rejects_bad_range_on_single_line_json_tool_result() {
+    fn read_file_offset_beyond_file_gives_error() {
         let tmp = TempDir::new().unwrap();
         let json = serde_json::json!({
             "status": "completed",
@@ -2881,17 +2914,16 @@ mod tests {
             tmp.path(),
             &serde_json::json!({
                 "path": "fanout-result.txt",
-                "start_line": 2782,
-                "end_line": 300
+                "offset": 300,
+                "limit": 10
             }),
         );
 
+        // offset 300 on a single-line file → exceeds file length
         assert!(result.is_error, "got: {}", result.output);
         assert!(
-            result
-                .output
-                .contains("start_line (2782) must be <= end_line (300)"),
-            "got: {}",
+            result.output.contains("exceeds"),
+            "expected range-exceeds-file error, got: {}",
             result.output
         );
     }
@@ -2903,11 +2935,11 @@ mod tests {
 
         let result = read_file(
             tmp.path(),
-            &serde_json::json!({"path": "test.txt", "start_line": "2"}),
+            &serde_json::json!({"path": "test.txt", "offset": "2"}),
         );
         assert!(result.is_error);
         assert!(
-            result.output.contains("`start_line`") && result.output.contains("positive integer"),
+            result.output.contains("`offset`") && result.output.contains("positive integer"),
             "got: {}",
             result.output
         );
