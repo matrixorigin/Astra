@@ -7546,7 +7546,22 @@ mod tests {
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
-            budget_policy: None,
+            budget_policy: astra_config::runtime_config::RuntimeConfig::load()
+                .budget_policy
+                .map(|cfg| {
+                    use astra_core::observation_journal::BudgetPolicy;
+                    let d = BudgetPolicy::default();
+                    BudgetPolicy {
+                        expand_after_consecutive_outcomes: cfg
+                            .expand_after_consecutive_outcomes
+                            .unwrap_or(d.expand_after_consecutive_outcomes),
+                        expand_factor: cfg.expand_factor.unwrap_or(d.expand_factor),
+                        max_ceiling: cfg.max_ceiling.unwrap_or(d.max_ceiling),
+                        reflect_after_consecutive_zero: cfg
+                            .reflect_after_consecutive_zero
+                            .unwrap_or(d.reflect_after_consecutive_zero),
+                    }
+                }),
             policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,

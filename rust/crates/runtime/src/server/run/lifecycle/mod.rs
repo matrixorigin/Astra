@@ -131,6 +131,25 @@ const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 #[cfg(test)]
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
 
+/// Load BudgetPolicy from RuntimeConfig, converting BudgetPolicyConfig into the
+/// runtime BudgetPolicy type. Returns None when the config section is absent,
+/// causing the caller to fall back to BudgetPolicy::default().
+fn load_budget_policy_from_config() -> Option<astra_core::observation_journal::BudgetPolicy> {
+    use astra_core::observation_journal::BudgetPolicy;
+    let cfg = astra_config::runtime_config::RuntimeConfig::load().budget_policy?;
+    let default = BudgetPolicy::default();
+    Some(BudgetPolicy {
+        expand_after_consecutive_outcomes: cfg
+            .expand_after_consecutive_outcomes
+            .unwrap_or(default.expand_after_consecutive_outcomes),
+        expand_factor: cfg.expand_factor.unwrap_or(default.expand_factor),
+        max_ceiling: cfg.max_ceiling.unwrap_or(default.max_ceiling),
+        reflect_after_consecutive_zero: cfg
+            .reflect_after_consecutive_zero
+            .unwrap_or(default.reflect_after_consecutive_zero),
+    })
+}
+
 /// Lazily load deployment-disabled tools from server config.
 /// Reads `[deployment].disabled_tools` from TOML + `ASTRA_DISABLED_TOOLS` env override.
 fn load_deployment_disabled_tools() -> Vec<String> {
@@ -3286,7 +3305,7 @@ impl AgenticRunLifecycleService {
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget,
-            budget_policy: None,
+            budget_policy: load_budget_policy_from_config(),
             policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,
@@ -7181,7 +7200,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget,
-            budget_policy: None,
+            budget_policy: load_budget_policy_from_config(),
             policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,

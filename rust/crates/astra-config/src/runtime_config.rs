@@ -96,6 +96,56 @@ pub struct RuntimeConfig {
     /// Agent Binding registry limits.
     #[serde(default)]
     pub agent_binding_registry: AgentBindingRegistryConfig,
+
+    /// Budget policy for auto-expansion based on outcome streaks.
+    ///
+    /// Controls when the framework automatically extends the turn budget
+    /// (expand after consecutive productive rounds) and when it injects
+    /// corrective signals (nudge after consecutive unproductive rounds).
+    /// Uses BudgetPolicy::default() when left unset.
+    #[serde(default)]
+    pub budget_policy: Option<BudgetPolicyConfig>,
+}
+
+// ─── Budget Policy Configuration ────────────────────────────────────────────
+
+/// User-configurable budget policy parameters.
+///
+/// All fields are `Option` — when `None`, the corresponding
+/// [`astra_core::observation_journal::BudgetPolicy::default()`] value is used.
+/// Set a field to `Some(value)` to override the default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetPolicyConfig {
+    /// Expand budget after this many consecutive rounds with observable outcome.
+    /// Default: 2
+    #[serde(default)]
+    pub expand_after_consecutive_outcomes: Option<u32>,
+
+    /// Multiply current max rounds by this factor on expansion.
+    /// Default: 1.5
+    #[serde(default)]
+    pub expand_factor: Option<f64>,
+
+    /// Absolute ceiling: budget never exceeds this regardless of expansions.
+    /// Default: 1000
+    #[serde(default)]
+    pub max_ceiling: Option<u32>,
+
+    /// Inject a corrective signal after this many consecutive rounds with
+    /// zero observable outcome. Default: 3
+    #[serde(default)]
+    pub reflect_after_consecutive_zero: Option<u32>,
+}
+
+impl Default for BudgetPolicyConfig {
+    fn default() -> Self {
+        Self {
+            expand_after_consecutive_outcomes: None,
+            expand_factor: None,
+            max_ceiling: None,
+            reflect_after_consecutive_zero: None,
+        }
+    }
 }
 
 // ─── Runtime Limits Configuration ────────────────────────────────────────────
@@ -316,6 +366,7 @@ impl Default for RuntimeConfig {
             tool_surface: ToolSurfaceConfig::default(),
             runtime_limits: RuntimeLimitsConfig::default(),
             agent_binding_registry: AgentBindingRegistryConfig::default(),
+            budget_policy: None,
         }
     }
 }
@@ -1718,6 +1769,7 @@ impl RuntimeConfig {
             tool_surface,
             runtime_limits,
             agent_binding_registry,
+            budget_policy,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -2130,6 +2182,13 @@ impl RuntimeConfig {
             default_agent_binding_max_agent_md_bytes(),
         );
 
+        // BudgetPolicyConfig: whole-struct replacement when `other` is
+        // Some. This follows the same pattern as SafetyConfig — a set
+        // value wins outright.
+        if budget_policy.is_some() {
+            self.budget_policy = budget_policy;
+        }
+
         self
     }
 
@@ -2436,6 +2495,7 @@ mod tests {
             agent_binding_registry: AgentBindingRegistryConfig {
                 max_agent_md_bytes: 4096,
             },
+            budget_policy: None,
         });
 
         assert_eq!(merged.version, "2.0");

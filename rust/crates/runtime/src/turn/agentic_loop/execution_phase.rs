@@ -663,13 +663,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         // Stall reason from the unified stall diagnosis.
         facts.stall_reason = interruption_diagnosis_summary(state);
 
-        // Per-round delta facts from the most recent journal entry.
-        if let Some(last) = state.observation_journal.last_entry() {
-            facts.new_tool_calls = last.total_tool_calls;
-            facts.new_failures = last.error_count as usize;
-            facts.text_growth = last.tokens_consumed as usize;
-        }
-
         let actions = state
             .budget_policy
             .as_ref()

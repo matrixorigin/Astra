@@ -79,14 +79,6 @@ pub struct JournalFacts {
     /// e.g. "Same tools called 3 times in a row: [read_file, grep]".
     /// This is an objective fact from the framework, not a judgment.
     pub stall_reason: Option<String>,
-
-    // ── Raw delta facts (framework-neutral, policy-interpretable) ──
-    /// Text growth in this round (bytes added).
-    pub text_growth: usize,
-    /// New tool calls in this round.
-    pub new_tool_calls: u32,
-    /// New failures in this round.
-    pub new_failures: usize,
 }
 
 /// Policy that decides what actions the framework should take based on
@@ -1149,30 +1141,6 @@ mod tests {
     }
 
     #[test]
-    fn policy_delta_facts_preserved_in_output() {
-        // Verify that delta facts (text_growth, new_tool_calls, new_failures)
-        // pass through unchanged — the Policy does not interpret them,
-        // it only uses outcome/consecutive fields.
-        let policy = BudgetPolicy::default();
-        let facts = JournalFacts {
-            consecutive_rounds_with_outcome: 2,
-            budget_remaining: 4,
-            budget_max: 10,
-            text_growth: 1500,
-            new_tool_calls: 5,
-            new_failures: 2,
-            ..Default::default()
-        };
-        let actions = policy.decide(&facts);
-        // Delta facts don't affect this Policy, but they must not break it
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
-        );
-    }
-
-    #[test]
     fn policy_zero_rounds_safe_defaults() {
         let policy = BudgetPolicy::default();
         // First round — all zeros, no history. Must not crash.
@@ -1209,5 +1177,173 @@ mod tests {
         } else {
             panic!("Expected ExpandBudget action");
         }
+    }
+
+    // ── End-to-end integration tests ────────────────────────────────────
+    // These simulate production data shapes: the JournalFacts that the
+    // execution_phase constructs from AgenticLoopState + ObservationJournal
+    // and feeds into BudgetPolicy::decide().
+
+    #[test]
+    fn policy_e2e_outcome_streak_expands_budget() {
+        // Scenario: agent has 2 consecutive productive rounds, budget is
+        // tight (3/10 remaining). Should trigger ExpandBudget.
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            rounds_completed: 7,
+            consecutive_rounds_with_outcome: 2,
+            consecutive_rounds_without_outcome: 0,
+            budget_remaining: 3,
+            budget_max: 10,
+            total_evidence_calls: 15,
+            total_errors: 0,
+            total_tool_calls: 20,
+            stall_reason: None,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
+        // Should NOT inject a stall signal when there's no stall
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+        );
+    }
+
+    #[test]
+    fn policy_e2e_stall_injects_signal_and_skips_expand() {
+        // Scenario: framework detects tool repetition. Stall takes
+        // priority over expansion — agent can't both be "productive"
+        // and "stalled".
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            rounds_completed: 5,
+            consecutive_rounds_with_outcome: 2,
+            consecutive_rounds_without_outcome: 0,
+            budget_remaining: 3,
+            budget_max: 10,
+            stall_reason: Some("Same tools called 3 times in a row: [read_file, grep]".into()),
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        // Stall overrides expansion
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
+    }
+
+    #[test]
+    fn policy_e2e_zero_streak_injects_signal() {
+        // Scenario: agent has 3 consecutive rounds without observable
+        // outcome. Default threshold is 3.
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            rounds_completed: 10,
+            consecutive_rounds_with_outcome: 0,
+            consecutive_rounds_without_outcome: 3,
+            budget_remaining: 8,
+            budget_max: 18,
+            total_evidence_calls: 5,
+            total_errors: 2,
+            consecutive_read_only: 3,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+        );
+        // No expansion: outcome streak is zero
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
+    }
+
+    #[test]
+    fn policy_e2e_normal_state_returns_continue() {
+        // Scenario: normal mid-run state with no triggers.
+        let policy = BudgetPolicy::default();
+        let facts = JournalFacts {
+            rounds_completed: 3,
+            consecutive_rounds_with_outcome: 1,
+            consecutive_rounds_without_outcome: 0,
+            budget_remaining: 15,
+            budget_max: 18,
+            total_evidence_calls: 8,
+            total_errors: 1,
+            total_tool_calls: 12,
+            stall_reason: None,
+            ..Default::default()
+        };
+        let actions = policy.decide(&facts);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], FrameworkAction::Continue));
+    }
+
+    /// Verify that the full data pipeline (as close to production as
+    /// unit tests allow) passes through correctly: JournalFacts with
+    /// realistic values → BudgetPolicy::decide() → actionable output.
+    #[test]
+    fn policy_e2e_full_pipeline_all_paths_exercised() {
+        let policy = BudgetPolicy::default();
+
+        // ── Path 1: Expand (productivity + budget pressure) ──
+        let productive = JournalFacts {
+            rounds_completed: 6,
+            consecutive_rounds_with_outcome: 2,
+            budget_remaining: 4,
+            budget_max: 10,
+            ..Default::default()
+        };
+        assert!(
+            policy
+                .decide(&productive)
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+        );
+
+        // ── Path 2: Stall (framework-detected repetition) ──
+        let stalled = JournalFacts {
+            stall_reason: Some("Same tools 3x: [bash, grep]".into()),
+            ..Default::default()
+        };
+        let actions = policy.decide(&stalled);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+        );
+
+        // ── Path 3: Zero streak (no observable progress) ──
+        let stuck = JournalFacts {
+            consecutive_rounds_without_outcome: 3,
+            ..Default::default()
+        };
+        let actions = policy.decide(&stuck);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+        );
+
+        // ── Path 4: Continue (no triggers) ──
+        let normal = JournalFacts::default();
+        let actions = policy.decide(&normal);
+        assert!(matches!(actions[0], FrameworkAction::Continue));
     }
 }
