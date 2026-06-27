@@ -17,10 +17,114 @@ use crate::microcompact::ProviderCacheStrategy;
 use crate::pipeline_config::ProviderCachePolicy;
 use crate::pipeline_stats::PipelineStats;
 use crate::recovery_state::RecoveryState;
-use crate::section_types::PromptSection;
+use crate::section_types::{CacheScope, PromptSection, PromptTokenBucket};
 use crate::session_latches::SessionLatches;
 use crate::token_accounting::TokenAccounting;
 use crate::working_memory::WorkingMemoryState;
+
+// ── ContextChannelProvider: framework+policy trait for prompt-section injection ──
+
+/// A typed context channel that produces prompt sections for LLM injection.
+///
+/// Replaces the ad-hoc `edge_profile` string-key pattern with a trait-based
+/// framework, modelled after the [`SkillProvider`] trait in `astra-skills`.
+/// Each channel (lessons, feedback rules, memoria insights, etc.) implements
+/// this trait; the [`ChannelAssembler`] collects from all registered providers
+/// and routes output according to each provider's cache scope.
+///
+/// This eliminates the "forgotten channel" bug where a new channel is loaded
+/// but never injected — the compiler guarantees every registered provider is
+/// iterated.
+pub trait ContextChannelProvider: Send + Sync {
+    /// Unique channel identifier for policy filtering and observability.
+    fn channel_id(&self) -> &'static str;
+
+    /// Cache scope for this channel's output.
+    /// - `Session` → routed to `extra_stable_sections` (cached prefix)
+    /// - `None`   → routed to `extra_dynamic_sections` (per-turn volatile)
+    fn cache_scope(&self) -> CacheScope;
+
+    /// Optional token bucket override. Defaults to `Environment`.
+    fn token_bucket(&self) -> PromptTokenBucket {
+        PromptTokenBucket::Environment
+    }
+
+    /// Produce the prompt section for this turn.
+    /// Returns `None` when this channel has nothing to contribute.
+    fn provide(&self, turn_index: u32) -> Option<PromptSection>;
+}
+
+/// Policy controlling which context channels are active.
+///
+/// Analogous to `SkillSurfacingPolicy` — filters channels by id and
+/// enforces activation conditions (e.g. minimum turn index).
+#[derive(Clone, Debug, Default)]
+pub struct ContextChannelPolicy {
+    /// Channels to suppress even if they produce content.
+    pub suppressed: std::collections::HashSet<&'static str>,
+    /// Minimum turn index before any channel activates (global gate).
+    pub min_turn: Option<u32>,
+}
+
+impl ContextChannelPolicy {
+    #[must_use]
+    pub fn allows(&self, channel_id: &str, turn_index: u32) -> bool {
+        if self.suppressed.contains(channel_id) {
+            return false;
+        }
+        if let Some(min_turn) = self.min_turn {
+            if turn_index < min_turn {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Assembles prompt sections from registered [`ContextChannelProvider`]s,
+/// respecting the [`ContextChannelPolicy`].
+///
+/// This is the single extraction point — analogous to `PolicyScopedSkillResolver`
+/// in the skill framework. Callers register providers and call `assemble()`
+/// to collect all active channel outputs.
+pub struct ChannelAssembler {
+    providers: Vec<Box<dyn ContextChannelProvider>>,
+    policy: ContextChannelPolicy,
+}
+
+impl ChannelAssembler {
+    #[must_use]
+    pub fn new(
+        providers: Vec<Box<dyn ContextChannelProvider>>,
+        policy: ContextChannelPolicy,
+    ) -> Self {
+        Self { providers, policy }
+    }
+
+    /// Collect sections from all allowed providers.
+    ///
+    /// Returns `(stable_sections, dynamic_sections)` partitioned by cache scope.
+    #[must_use]
+    pub fn assemble(&self, turn_index: u32) -> (Vec<PromptSection>, Vec<PromptSection>) {
+        let mut stable = Vec::new();
+        let mut dynamic = Vec::new();
+        for provider in &self.providers {
+            if !self.policy.allows(provider.channel_id(), turn_index) {
+                continue;
+            }
+            if let Some(mut section) = provider.provide(turn_index) {
+                // Provider declares scope; override section's scope + bucket
+                section.scope = provider.cache_scope();
+                section.token_bucket = provider.token_bucket();
+                match provider.cache_scope() {
+                    CacheScope::Global | CacheScope::Session => stable.push(section),
+                    CacheScope::None => dynamic.push(section),
+                }
+            }
+        }
+        (stable, dynamic)
+    }
+}
 
 /// A structured memory item retrieved before entering the pure core pipeline.
 ///

@@ -1261,6 +1261,7 @@ mod tests {
 
     // ─── IntentDrift and format_drift_correction tests ─────────────────────
 
+    #[allow(dead_code)]
     fn make_intent_turns(turns: &[(&[&str], &str)]) -> Vec<(Vec<String>, String)> {
         turns
             .iter()

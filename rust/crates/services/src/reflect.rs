@@ -1205,6 +1205,9 @@ impl ReflectService for UnconfiguredReflectService {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+use astra_core::ObservationGraphEdge;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use astra_core::EvidenceRef;

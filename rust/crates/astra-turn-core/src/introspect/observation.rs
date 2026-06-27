@@ -175,7 +175,7 @@ fn build_edge_local_unavailable_report(request: &IntrospectRequest) -> Introspec
     let observations = vec![ObservationRecord {
         ref_id: Urn::new("observation", "local", "introspect")
             .seg("data_surface")
-            .seg(&facet.to_string())
+            .seg(facet)
             .build(),
         topic: request.topic.as_str().to_string(),
         facet: facet.to_string(),

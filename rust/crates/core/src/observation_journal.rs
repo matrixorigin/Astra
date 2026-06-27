@@ -81,9 +81,6 @@ pub struct JournalFacts {
     pub stall_reason: Option<String>,
 }
 
-/// Policy that decides what actions the framework should take based on
-// ─── Default budget policy ───────────────────────────────────────────────────
-
 /// Budget policy that uses purely factual thresholds — consecutive outcomes
 /// or non-outcomes — rather than scored "progress" heuristics.
 ///
@@ -309,11 +306,11 @@ impl ObservationJournal {
                 }
             }
             // If pre_strategy was the removed entry, clear it.
-            if let Some(ref pre) = self.pre_strategy_metrics {
-                if pre.turn == removed.turn {
-                    self.pre_strategy_metrics = None;
-                    self.strategy_change_at = usize::MAX;
-                }
+            if let Some(ref pre) = self.pre_strategy_metrics
+                && pre.turn == removed.turn
+            {
+                self.pre_strategy_metrics = None;
+                self.strategy_change_at = usize::MAX;
             }
         }
     }
@@ -1396,7 +1393,7 @@ mod tests {
     /// panic. Callers are expected to enforce this invariant upstream.
     #[test]
     fn extract_facts_remaining_exceeds_max() {
-        let mut journal = ObservationJournal::default();
+        let journal = ObservationJournal::default();
 
         let facts = journal.extract_facts(20, 10);
         assert_eq!(facts.budget_remaining, 20);

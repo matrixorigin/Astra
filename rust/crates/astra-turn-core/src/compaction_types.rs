@@ -184,6 +184,7 @@ pub struct CompactionEvent {
 
 impl CompactionEvent {
     /// Build a compaction event from the raw numbers.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         kind: CompactionKind,
         pressure: f64,

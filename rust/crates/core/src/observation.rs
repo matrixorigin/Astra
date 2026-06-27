@@ -194,19 +194,19 @@ impl TurnMetrics {
                 last_tool = Some(lower);
             } else {
                 // Success resets streak for this tool
-                if let Some(ref last) = last_tool {
-                    if *last == lower {
-                        streak_map.remove(&lower);
-                    }
+                if let Some(ref last) = last_tool
+                    && *last == lower
+                {
+                    streak_map.remove(&lower);
                 }
                 last_tool = Some(lower);
             }
 
             // Track file access for read/write tools
-            if matches!(family, ToolFamily::Read | ToolFamily::Write) {
-                if let Some(path) = sample.file_path {
-                    *file_access_counts.entry(path.to_string()).or_insert(0) += 1;
-                }
+            if matches!(family, ToolFamily::Read | ToolFamily::Write)
+                && let Some(path) = sample.file_path
+            {
+                *file_access_counts.entry(path.to_string()).or_insert(0) += 1;
             }
         }
 
@@ -226,7 +226,7 @@ impl TurnMetrics {
                 (name.clone(), count)
             })
             .collect();
-        tool_freq.sort_by(|a, b| b.1.cmp(&a.1));
+        tool_freq.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
         let top_tools: Vec<(String, u32)> = tool_freq.into_iter().take(5).collect();
 
         // Convert streak map to sorted list
@@ -238,7 +238,7 @@ impl TurnMetrics {
                 first_error,
             })
             .collect();
-        error_streaks.sort_by(|a, b| b.count.cmp(&a.count));
+        error_streaks.sort_by_key(|b| std::cmp::Reverse(b.count));
 
         Self {
             rounds_completed,
@@ -273,7 +273,7 @@ impl TurnMetrics {
         let window_start = rounds_completed.saturating_sub(DEFAULT_WINDOW.saturating_sub(1));
         let filtered: Vec<&(_, _, _, _)> = records
             .iter()
-            .filter(|r| r.2.map_or(true, |round| round >= window_start))
+            .filter(|r| r.2.is_none_or(|round| round >= window_start))
             .collect();
         let samples: Vec<ToolCallSample<'_>> = filtered
             .iter()
@@ -428,8 +428,10 @@ impl fmt::Display for ObservationFacet {
 /// Normalized top-level observation topic for both `introspect` and `reflect`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ObservationTopic {
     Overview,
+    #[default]
     Runtime,
     Execution,
     Knowledge,
@@ -456,12 +458,6 @@ impl ObservationTopic {
     }
 }
 
-impl Default for ObservationTopic {
-    fn default() -> Self {
-        Self::Runtime
-    }
-}
-
 impl fmt::Display for ObservationTopic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
@@ -471,8 +467,10 @@ impl fmt::Display for ObservationTopic {
 /// Output depth for observation requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ObservationDepth {
     Hint,
+    #[default]
     Summary,
     Diagnostic,
     Forensic,
@@ -499,17 +497,13 @@ impl ObservationDepth {
     }
 }
 
-impl Default for ObservationDepth {
-    fn default() -> Self {
-        Self::Summary
-    }
-}
-
 /// Time horizon for the observation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ObservationHorizon {
     Now,
+    #[default]
     CurrentTurn,
     Recent,
     Turn,
@@ -542,16 +536,12 @@ impl ObservationHorizon {
     }
 }
 
-impl Default for ObservationHorizon {
-    fn default() -> Self {
-        Self::CurrentTurn
-    }
-}
-
 /// Data source policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SourcePolicy {
+    #[default]
     Auto,
     LiveOnly,
     LiveFirst,
@@ -589,12 +579,6 @@ impl SourcePolicy {
             self,
             Self::Auto | Self::LiveFirst | Self::DurableFirst | Self::LocalOnly
         )
-    }
-}
-
-impl Default for SourcePolicy {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 

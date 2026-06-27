@@ -2875,7 +2875,6 @@ mod tests {
     /// offset+limit makes reversed ranges impossible — the LLM cannot express
     /// start=2782,limit=300 in a way that means "read 300 lines starting from 2782"
     /// which is always valid. This test verifies a large offset+limit range.
-    #[test]
     fn read_file_offset_limit_large_range() {
         let tmp = TempDir::new().unwrap();
         let mut content = String::new();

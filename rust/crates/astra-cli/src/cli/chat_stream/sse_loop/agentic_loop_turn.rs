@@ -249,6 +249,9 @@ struct PrepareChatTurnRequest<'a> {
     /// preparation step adds every mutating tool to `restricted_tools` so the
     /// model only sees read-only + plan-control tools (`exit_plan_mode` etc.).
     plan_mode_active: bool,
+    /// Pre-formatted lessons text from `session_lessons_snapshot()`.
+    /// Injected into `edge_profile` as `lessons_text` for the bridge/assembler.
+    pub lessons_text: Option<&'a str>,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -905,6 +908,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     {
         ep_obj.insert("memoria_insights_text".to_string(), json!(insights));
     }
+    // ─── Lessons: inject bootstrapped session lessons into edge_profile ───
+    // Fixes the "signal channel blank" bug where lessons were loaded from
+    // Memoria by `ensure_bootstrapped_lessons()` but never injected into the
+    // prompt. Previously lessons only flowed into observability, not into
+    // the LLM context.
+    if let Some(ref lessons) = ctx.lessons_text
+        && let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        ep_obj.insert("lessons_text".to_string(), json!(lessons));
+    }
     // ─── Gateway context: inject as system message at start of conversation ───
     if let Some(extra) = ctx.append_system_prompt {
         if let Some(arr) = payload.get_mut("messages").and_then(Value::as_array_mut) {
@@ -1262,6 +1277,25 @@ pub(crate) async fn fetch_chat_turn_sse(
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
 
+    // Compute lessons text from Memoria-bootstrapped session lessons.
+    // Format: "kind:trigger_signal:action" per lesson, pipe-joined.
+    // Mirrors the format used in cli_loop_host's observability path.
+    let lessons_text: Option<String> = {
+        let lessons = executor.session_lessons_snapshot();
+        if lessons.is_empty() {
+            None
+        } else {
+            Some(
+                lessons
+                    .iter()
+                    .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            )
+        }
+    };
+    let lessons_text_ref: Option<&str> = lessons_text.as_deref();
+
     let (resp, prep_line) = chat_turn_post_payload_after_prepare(
         api,
         token,
@@ -1315,6 +1349,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             append_system_prompt,
             plan_mode_active: perm_manager.mode()
                 == crate::cli::permission_manager::PermissionMode::Plan,
+            lessons_text: lessons_text_ref,
         },
     )
     .await?;
@@ -1965,6 +2000,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: true,
+            lessons_text: None,
         })
         .await;
 
@@ -2142,6 +2178,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2260,6 +2297,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2374,6 +2412,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2467,6 +2506,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2577,6 +2617,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2688,6 +2729,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2810,6 +2852,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2932,6 +2975,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -3040,6 +3084,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -3141,6 +3186,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -3250,6 +3296,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -3355,6 +3402,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -3417,6 +3465,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
