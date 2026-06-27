@@ -454,12 +454,13 @@ mod tests {
             )
             .expect("save should auto-create dirs");
 
-        assert!(dir
-            .path()
-            .join("subdir")
-            .join("deep")
-            .join("auto-create.tuning.jsonl")
-            .exists());
+        assert!(
+            dir.path()
+                .join("subdir")
+                .join("deep")
+                .join("auto-create.tuning.jsonl")
+                .exists()
+        );
     }
 
     #[test]

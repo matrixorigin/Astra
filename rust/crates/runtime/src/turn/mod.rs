@@ -20,19 +20,19 @@ pub mod implicit_feedback {
         implicit_feedback_context_injection, implicit_feedback_rating,
     };
 }
+pub mod inspection_service;
 pub(crate) mod llm;
 pub mod local_provider;
 pub mod loop_dispatcher;
 pub mod memory_prefetch;
+pub mod observation_dispatcher;
+pub mod observation_store;
 pub mod permission_gate;
 pub(crate) mod plan_mode_guard;
 pub mod prompt_cache;
 pub mod providers;
 pub mod run_control;
 pub mod runtime_policy;
-pub mod inspection_service;
-pub mod observation_store;
-pub mod observation_dispatcher;
 pub mod session_current_date;
 pub mod session_end_debounce;
 /// Re-exported from astra-turn-types

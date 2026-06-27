@@ -684,10 +684,7 @@ pub trait ObservationStore: Send + Sync {
     ///
     /// Returns an empty `Vec` if the session has no persisted data or the
     /// backend cannot be read (e.g. file not found).
-    fn load_entries(
-        &self,
-        session_id: &str,
-    ) -> Vec<StoredEntry>;
+    fn load_entries(&self, session_id: &str) -> Vec<StoredEntry>;
 
     /// Return the number of persisted entries for `session_id`.
     ///

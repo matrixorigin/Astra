@@ -1525,13 +1525,10 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .extract_facts(state.remaining_turns as u32, state.max_turns as u32);
 
         {
-            let mut dispatcher =
-                crate::turn::observation_dispatcher::ObservationDispatcher::new();
-            dispatcher.register(
-                crate::turn::observation_dispatcher::MemorySink::new(
-                    &mut state.observation_journal,
-                ),
-            );
+            let mut dispatcher = crate::turn::observation_dispatcher::ObservationDispatcher::new();
+            dispatcher.register(crate::turn::observation_dispatcher::MemorySink::new(
+                &mut state.observation_journal,
+            ));
             if let Some(ref store) = state.observation_store {
                 dispatcher.register(crate::turn::observation_dispatcher::FileSink::new(
                     Some(store.clone()),
@@ -1543,7 +1540,10 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 ));
             }
             dispatcher.dispatch(
-                crate::turn::observation_dispatcher::ObservationEvent::TurnCompleted { metrics, facts },
+                crate::turn::observation_dispatcher::ObservationEvent::TurnCompleted {
+                    metrics,
+                    facts,
+                },
             );
         } // dispatcher dropped here — releases &mut observation_journal
 
@@ -1562,15 +1562,14 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             );
             if !tuning_jobs.is_empty() {
                 if let Some(ref store) = state.observation_store {
-                    let mut tuning_sink =
-                        crate::turn::observation_dispatcher::FileTuningSink::new(
-                            Some(store.clone()),
-                            state
-                                .current_session_id
-                                .as_deref()
-                                .unwrap_or_default()
-                                .to_string(),
-                        );
+                    let mut tuning_sink = crate::turn::observation_dispatcher::FileTuningSink::new(
+                        Some(store.clone()),
+                        state
+                            .current_session_id
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
                     if let Err(e) = tuning_sink.consume_batch(&tuning_jobs) {
                         tracing::warn!(
                             error = %e,
@@ -3164,9 +3163,7 @@ esac
 
     use crate::turn::inspection_service::InspectionService;
     use crate::turn::local_provider::LocalSessionProvider;
-    use crate::turn::providers::{
-        LiveRuntimeProvider, ObservationProvider, SessionStateProvider,
-    };
+    use crate::turn::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
     use crate::turn::runtime_policy::RuntimePolicy;
 
     /// Verify that InspectionService enriches snapshot with live metrics.
@@ -3178,15 +3175,15 @@ esac
         state.total_completion = 200;
         state.remaining_turns = 8;
         state.max_turns = 10;
-        state.stall.circuit_breaker.observe(
-            astra_turn_core::loop_circuit_breaker::RoundSignal {
-                tool_signatures: std::iter::once("read_file:/tmp/test".to_string())
-                    .collect(),
+        state
+            .stall
+            .circuit_breaker
+            .observe(astra_turn_core::loop_circuit_breaker::RoundSignal {
+                tool_signatures: std::iter::once("read_file:/tmp/test".to_string()).collect(),
                 produced_mutation: false,
                 task_completed: false,
                 tool_count: 1,
-            },
-        );
+            });
 
         let policy = RuntimePolicy::default();
         let provider = LocalSessionProvider::new(&state, &policy);
@@ -3251,9 +3248,9 @@ esac
     /// Verify ObservationDispatcher writes to memory sink.
     #[test]
     fn observation_dispatcher_writes_to_memory_sink() {
+        use crate::turn::observation_dispatcher::MemorySink;
         use crate::turn::observation_dispatcher::ObservationDispatcher;
         use crate::turn::observation_dispatcher::ObservationEvent;
-        use crate::turn::observation_dispatcher::MemorySink;
 
         let mut metrics = astra_core::TurnMetrics::default();
         metrics.tool_calls_total = 3; // record_turn skips when tool_calls_total == 0
@@ -3264,13 +3261,13 @@ esac
 
         let mut dispatcher = ObservationDispatcher::new();
         dispatcher.register(MemorySink::new(&mut journal));
-        dispatcher.dispatch(ObservationEvent::TurnCompleted {
-            metrics,
-            facts,
-        });
+        dispatcher.dispatch(ObservationEvent::TurnCompleted { metrics, facts });
         drop(dispatcher); // release &mut journal borrow
 
-        assert!(!journal.is_empty(), "journal should have entries after dispatch");
+        assert!(
+            !journal.is_empty(),
+            "journal should have entries after dispatch"
+        );
     }
 
     /// Verify provider trait methods return safe defaults for empty state.
@@ -3314,10 +3311,11 @@ esac
         // Record a failed tool outcome (record_failure only updates counters,
         // not the outcome_cache that recent_errors() reads).
         let failed = ToolOutcome::new(false, 100, "command not found: bash");
-        state
-            .turn_guard
-            .health
-            .record_outcome_with_preview("bash:{}", failed, Some("command not found: bash"));
+        state.turn_guard.health.record_outcome_with_preview(
+            "bash:{}",
+            failed,
+            Some("command not found: bash"),
+        );
         state.turn_guard.health.record_failure("bash");
         // Record a successful outcome
         let success = ToolOutcome::new(true, 50, "file content here");
@@ -3335,10 +3333,7 @@ esac
             build_introspect_snapshot(&state, "errors-test".to_string(), Some(&inspection));
 
         // Should have error alert
-        let has_error_alert = snapshot
-            .alerts
-            .iter()
-            .any(|a| a.contains("error_rate"));
+        let has_error_alert = snapshot.alerts.iter().any(|a| a.contains("error_rate"));
         assert!(
             has_error_alert,
             "alerts should contain error_rate when errors exist, got: {:?}",
