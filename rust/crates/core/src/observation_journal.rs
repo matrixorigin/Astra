@@ -709,6 +709,23 @@ pub trait ObservationStore: Send + Sync {
     ) -> Result<(), String> {
         Ok(()) // default no-op
     }
+
+    /// Load all tuning job entries for `session_id`.
+    ///
+    /// Each returned string is a raw JSON line (a serialized [`TuningJob`]).
+    /// Returns an empty `Vec` if the session has no tuning data.
+    /// Default: empty (most stores don't support tuning reads).
+    fn load_tuning_entries(&self, _session_id: &str) -> Vec<String> {
+        Vec::new() // default no-op
+    }
+
+    /// List all session IDs that have tuning data.
+    ///
+    /// Returns a sorted list of session IDs. The default implementation returns
+    /// an empty list — backends that support directory scanning should override.
+    fn list_tuning_sessions(&self) -> Vec<String> {
+        Vec::new() // default: no scanning
+    }
 }
 
 /// A single persisted observation record, reconstructed from storage.

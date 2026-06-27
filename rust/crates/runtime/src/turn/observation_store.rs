@@ -194,6 +194,48 @@ impl ObservationStore for FileObservationStore {
         file.flush()
             .map_err(|e| format!("flush failed for tuning {:?}: {e}", path))
     }
+
+    fn load_tuning_entries(&self, session_id: &str) -> Vec<String> {
+        let path = self.session_path_tuning(session_id);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+
+        let reader = BufReader::new(file);
+        reader
+            .lines()
+            .filter_map(|line_result| {
+                let line = match line_result {
+                    Ok(l) => l,
+                    Err(_) => return None,
+                };
+                if line.trim().is_empty() {
+                    return None;
+                }
+                Some(line)
+            })
+            .collect()
+    }
+
+    fn list_tuning_sessions(&self) -> Vec<String> {
+        // Scan for *.tuning.jsonl files in the root directory.
+        let dir_entries = match fs::read_dir(&self.root_dir) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut sessions: Vec<String> = dir_entries
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // Match "*.tuning.jsonl" and extract session id.
+                name.strip_suffix(".tuning.jsonl").map(|s| s.to_string())
+            })
+            .collect();
+        sessions.sort();
+        sessions
+    }
 }
 
 // ── Default store factory ─────────────────────────────────────────────────
@@ -454,13 +496,12 @@ mod tests {
             )
             .expect("save should auto-create dirs");
 
-        assert!(
-            dir.path()
-                .join("subdir")
-                .join("deep")
-                .join("auto-create.tuning.jsonl")
-                .exists()
-        );
+        assert!(dir
+            .path()
+            .join("subdir")
+            .join("deep")
+            .join("auto-create.tuning.jsonl")
+            .exists());
     }
 
     #[test]
@@ -498,5 +539,166 @@ mod tests {
             !dir.path().join("a").exists(),
             "traversal dir should not exist"
         );
+    }
+
+    // ── load_tuning_entries tests ──────────────────────────────────────
+
+    #[test]
+    fn load_tuning_entries_returns_persisted_lines() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileObservationStore::new(dir.path().to_path_buf());
+        let sid = "load-tune-test";
+
+        store
+            .save_tuning_entry(
+                sid,
+                1,
+                r#"{"signal":"prompt_compaction","trigger_value":0.82}"#,
+            )
+            .expect("save 1");
+        store
+            .save_tuning_entry(sid, 3, r#"{"signal":"cache_warming","trigger_value":0.25}"#)
+            .expect("save 2");
+
+        let entries = store.load_tuning_entries(sid);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].contains("prompt_compaction"));
+        assert!(entries[1].contains("cache_warming"));
+    }
+
+    #[test]
+    fn load_tuning_entries_empty_for_missing_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileObservationStore::new(dir.path().to_path_buf());
+        let entries = store.load_tuning_entries("no-such-session");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn load_tuning_entries_skips_empty_lines() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileObservationStore::new(dir.path().to_path_buf());
+        let sid = "skip-empty";
+
+        store
+            .save_tuning_entry(
+                sid,
+                1,
+                r#"{"signal":"task_decomposition","trigger_value":0.55}"#,
+            )
+            .expect("save");
+
+        // Append a blank line manually
+        let path = dir.path().join("skip-empty.tuning.jsonl");
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        writeln!(file).expect("write blank line");
+
+        let entries = store.load_tuning_entries(sid);
+        assert_eq!(entries.len(), 1, "blank line should be skipped");
+    }
+
+    #[test]
+    fn load_tuning_entries_handles_corrupt_json() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileObservationStore::new(dir.path().to_path_buf());
+        let sid = "corrupt-lines";
+
+        // Save a valid entry
+        store
+            .save_tuning_entry(
+                sid,
+                1,
+                r#"{"signal":"prompt_compaction","trigger_value":0.82}"#,
+            )
+            .expect("save valid");
+
+        // Append a malformed line manually (cannot happen through save_tuning_entry
+        // since it takes raw_json, but we simulate corruption)
+        let path = dir.path().join("corrupt-lines.tuning.jsonl");
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        writeln!(file, "{{not valid json}}").expect("write corrupt");
+
+        // load_tuning_entries returns raw lines (no JSON parsing), so all 2 lines
+        // are returned. Corruption tolerance is handled by TuningConsumer.
+        let entries = store.load_tuning_entries(sid);
+        assert_eq!(entries.len(), 2);
+    }
+
+    // ── list_tuning_sessions tests ──────────────────────────────────────
+
+    #[test]
+    fn list_tuning_sessions_finds_written_sessions() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileObservationStore::new(dir.path().to_path_buf());
+
+        store
+            .save_tuning_entry(
+                "list-sess-a",
+                1,
+                r#"{"signal":"prompt_compaction","trigger_value":0.82}"#,
+            )
+            .expect("save a");
+        store
+            .save_tuning_entry(
+                "list-sess-b",
+                1,
+                r#"{"signal":"cache_warming","trigger_value":0.25}"#,
+            )
+            .expect("save b");
+
+        let sessions = store.list_tuning_sessions();
+        assert!(sessions.contains(&"list-sess-a".to_string()));
+        assert!(sessions.contains(&"list-sess-b".to_string()));
+        assert!(
+            sessions[..].windows(2).all(|w| w[0] <= w[1]),
+            "sessions should be sorted"
+        );
+    }
+
+    #[test]
+    fn list_tuning_sessions_returns_empty_for_empty_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        let empty_subdir = dir.path().join("empty-dir");
+        std::fs::create_dir(&empty_subdir).expect("create empty dir");
+        let store = FileObservationStore::new(empty_subdir);
+        let sessions = store.list_tuning_sessions();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn list_tuning_sessions_skips_non_tuning_files() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileObservationStore::new(dir.path().to_path_buf());
+
+        // Write a tuning file
+        store
+            .save_tuning_entry(
+                "only-tune",
+                1,
+                r#"{"signal":"prompt_compaction","trigger_value":0.82}"#,
+            )
+            .expect("save tuning");
+
+        // Write a regular observation file (not .tuning.jsonl)
+        use std::io::Write;
+        let mut obs_file =
+            std::fs::File::create(dir.path().join("not-tune.jsonl")).expect("create obs file");
+        writeln!(obs_file, r#"{{"session_id":"not-tune"}}"#).expect("write obs");
+
+        // Write a random text file
+        let mut txt_file =
+            std::fs::File::create(dir.path().join("readme.txt")).expect("create txt");
+        writeln!(txt_file, "not a tuning file").expect("write txt");
+
+        let sessions = store.list_tuning_sessions();
+        assert_eq!(sessions, vec!["only-tune"]);
     }
 }

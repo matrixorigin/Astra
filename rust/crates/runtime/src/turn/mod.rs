@@ -43,6 +43,7 @@ pub(crate) mod services;
 pub mod skill_tool;
 pub mod token_usage;
 pub mod tool_side_effects;
+pub mod tuning_consumer;
 pub mod turn_trace_collector;
 pub(crate) mod wire_assembly;
 

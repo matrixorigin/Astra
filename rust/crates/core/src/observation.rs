@@ -1072,7 +1072,7 @@ pub struct TuningJob {
     pub priority: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TuningSignalType {
     /// Token pressure crossed normal threshold → suggest compaction.
     PromptCompaction,
@@ -1099,6 +1099,75 @@ impl std::fmt::Display for TuningSignalType {
             Self::TaskDecomposition => write!(f, "task_decomposition"),
         }
     }
+}
+
+// ── Tuning Consumer Types ──────────────────────────────────────────────────
+
+/// Aggregated statistics for a single [`TuningSignalType`] across sessions.
+///
+/// Produced by [`TuningConsumer::aggregate`]; consumed to generate
+/// [`OptimizationSuggestion`] entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuningAggregation {
+    /// The signal type being aggregated.
+    pub signal_type: TuningSignalType,
+    /// Total count of this signal across all sessions.
+    pub total_count: u64,
+    /// Number of distinct sessions where this signal appeared.
+    pub session_count: u32,
+    /// Average priority (0-10) across occurrences.
+    pub avg_priority: f64,
+    /// Average trigger value across occurrences.
+    pub avg_trigger_value: f64,
+    /// Most recent timestamp (unix ms) when this signal was emitted.
+    pub latest_at_ms: u64,
+    /// Sample reasons (up to 3, for diagnostic display).
+    pub sample_reasons: Vec<String>,
+}
+
+/// A concrete optimization recommendation produced by [`TuningConsumer`].
+///
+/// Suggestions are advisory and human-readable; they describe *what* to change
+/// and *why*, but do not apply changes automatically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizationSuggestion {
+    /// Human-readable title (e.g. "Increase compaction pressure threshold").
+    pub title: String,
+    /// The signal type that triggered this suggestion.
+    pub source_signal: TuningSignalType,
+    /// What parameter or behavior to change.
+    pub target: String,
+    /// Recommended new value (as a human-readable string).
+    pub recommended_value: String,
+    /// Current observed value (if measurable).
+    pub current_value: Option<String>,
+    /// Evidence summary — why this change is recommended.
+    pub reason: String,
+    /// Confidence in this recommendation (0.0–1.0).
+    pub confidence: f64,
+    /// Priority: 0 (advisory) to 10 (critical).
+    pub priority: u8,
+    /// Number of tuning signals backing this suggestion.
+    pub signal_count: u64,
+}
+
+/// Overall summary of tuning data across all sessions.
+///
+/// The top-level output of [`TuningConsumer::summarize`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuningSummary {
+    /// Number of sessions scanned.
+    pub sessions_scanned: u32,
+    /// Total tuning job entries found.
+    pub total_jobs: u64,
+    /// Per-signal-type aggregations.
+    pub aggregations: Vec<TuningAggregation>,
+    /// Generated optimization suggestions.
+    pub suggestions: Vec<OptimizationSuggestion>,
+    /// Human-readable summary text.
+    pub summary_text: String,
+    /// Unix timestamp when this summary was produced.
+    pub generated_at_ms: u64,
 }
 
 #[cfg(test)]
