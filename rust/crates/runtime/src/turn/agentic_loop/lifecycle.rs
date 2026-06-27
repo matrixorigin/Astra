@@ -814,7 +814,8 @@ async fn maybe_inject_task_board_start_gate<H: AgenticLoopHost>(
 
 fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
     let budget = state.agentic_turn_budget;
-    if budget.extension_turns == 0
+    if state.policy_expanded_this_turn
+        || budget.extension_turns == 0
         || budget.max_extensions == 0
         || state.max_turns >= budget.hard_turn_limit
         || used_budget_extensions(state) >= budget.max_extensions

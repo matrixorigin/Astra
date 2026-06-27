@@ -39,8 +39,6 @@ pub enum FrameworkAction {
         /// Absolute ceiling — never exceed this regardless of factor.
         max_ceiling: u32,
     },
-    /// Transition to another pipeline phase (name is opaque to core).
-    TransitionPhase { target: String },
     /// Inject a signal into the agent's context for the next round.
     InjectSignal { message: String },
     /// No action required.
@@ -69,8 +67,8 @@ pub struct JournalFacts {
     pub budget_remaining: u32,
     /// Maximum rounds allowed.
     pub budget_max: u32,
-    /// Total mutations (file edits / writes) across the journal window.
-    pub total_mutations: u32,
+    /// Total evidence-gathering tool calls across the journal window.
+    pub total_evidence_calls: u32,
     /// Total errors across the journal window.
     pub total_errors: u32,
     /// Consecutive read-only rounds (no writes / edits).
@@ -108,8 +106,6 @@ pub struct BudgetPolicy {
     pub max_ceiling: u32,
     /// Transition to reflection after this many consecutive rounds with zero outcome.
     pub reflect_after_consecutive_zero: u32,
-    /// Maximum reflections before failing the turn.
-    pub max_reflections: u32,
 }
 
 impl Default for BudgetPolicy {
@@ -119,7 +115,6 @@ impl Default for BudgetPolicy {
             expand_factor: 1.5,
             max_ceiling: 1000,
             reflect_after_consecutive_zero: 3,
-            max_reflections: 3,
         }
     }
 }
@@ -128,11 +123,14 @@ impl BudgetPolicy {
     pub fn decide(&self, facts: &JournalFacts) -> Vec<FrameworkAction> {
         let mut actions = Vec::new();
 
-        // Stall detection: framework-detected tool-signature repetition
-        // takes priority over all other decisions.
-        if facts.stall_reason.is_some() {
-            actions.push(FrameworkAction::TransitionPhase {
-                target: "reflect".to_string(),
+        // Stall: framework-detected tool-signature repetition.
+        // Inject a corrective signal so the agent can self-correct.
+        if let Some(ref reason) = facts.stall_reason {
+            actions.push(FrameworkAction::InjectSignal {
+                message: format!(
+                    "Stall detected: {}. Consider changing your approach or using a different tool.",
+                    reason
+                ),
             });
             return actions;
         }
@@ -147,10 +145,14 @@ impl BudgetPolicy {
             });
         }
 
-        // Reflect: agent stuck with zero outcomes too long
+        // Zero-streak: agent stuck with zero outcomes too long.
+        // Inject a nudge to encourage self-reflection.
         if facts.consecutive_rounds_without_outcome >= self.reflect_after_consecutive_zero {
-            actions.push(FrameworkAction::TransitionPhase {
-                target: "reflect".to_string(),
+            actions.push(FrameworkAction::InjectSignal {
+                message: format!(
+                    "{} consecutive rounds without observable progress. Consider pausing to reflect on whether your approach is effective.",
+                    facts.consecutive_rounds_without_outcome
+                ),
             });
         }
 
@@ -927,20 +929,19 @@ mod tests {
     }
 
     #[test]
-    fn budget_policy_no_expand_when_budget_plenty() {
+    fn budget_policy_injects_signal_on_zero_outcomes() {
         let policy = BudgetPolicy::default();
         let facts = JournalFacts {
-            consecutive_rounds_with_outcome: 3,
-            budget_remaining: 8,
+            consecutive_rounds_without_outcome: 3,
+            budget_remaining: 7,
             budget_max: 10,
             ..Default::default()
         };
         let actions = policy.decide(&facts);
-        // Budget is > 50% remaining → no expansion
         assert!(
-            !actions
+            actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
         );
     }
 
@@ -957,12 +958,12 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
         );
     }
 
     #[test]
-    fn budget_policy_no_reflect_below_threshold() {
+    fn budget_policy_no_signal_below_threshold() {
         let policy = BudgetPolicy::default();
         let facts = JournalFacts {
             consecutive_rounds_without_outcome: 2,
@@ -974,7 +975,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
         );
     }
 
@@ -999,7 +1000,6 @@ mod tests {
             expand_factor: 2.0,
             max_ceiling: 50,
             reflect_after_consecutive_zero: 5,
-            max_reflections: 2,
         };
         let facts = JournalFacts {
             consecutive_rounds_with_outcome: 1,
@@ -1031,10 +1031,7 @@ mod tests {
         };
         let actions = policy.decide(&facts);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
-            FrameworkAction::TransitionPhase { target } if target == "reflect"
-        ));
+        assert!(matches!(&actions[0], FrameworkAction::InjectSignal { .. }));
     }
 
     // ─── Production-integration tests ──────────────────────────────────
@@ -1118,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_reflect_at_exact_threshold() {
+    fn policy_zero_streak_injects_signal() {
         let policy = BudgetPolicy::default();
         let facts = JournalFacts {
             consecutive_rounds_without_outcome: 3,
@@ -1127,13 +1124,15 @@ mod tests {
             ..Default::default()
         };
         let actions = policy.decide(&facts);
-        assert!(actions.iter().any(
-            |a| matches!(a, FrameworkAction::TransitionPhase { target } if target == "reflect")
-        ));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+        );
     }
 
     #[test]
-    fn policy_reflect_below_threshold_skipped() {
+    fn policy_zero_streak_below_threshold_skipped() {
         let policy = BudgetPolicy::default();
         let facts = JournalFacts {
             consecutive_rounds_without_outcome: 2,
@@ -1145,7 +1144,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
         );
     }
 
@@ -1190,7 +1189,6 @@ mod tests {
             expand_factor: 3.0,
             max_ceiling: 30,
             reflect_after_consecutive_zero: 3,
-            max_reflections: 3,
         };
         let facts = JournalFacts {
             consecutive_rounds_with_outcome: 1,

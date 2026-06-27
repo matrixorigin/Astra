@@ -656,7 +656,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
         // Override with canonical state values (journal may lag).
         facts.rounds_completed = state.llm_rounds_completed;
-        facts.total_mutations = state.total_evidence_tool_calls;
+        facts.total_evidence_calls = state.total_evidence_tool_calls;
         facts.total_errors = state.turn_guard.health.recent_errors(10).len() as u32;
         facts.total_tool_calls = state.total_tool_calls;
 
@@ -670,7 +670,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             facts.text_growth = last.tokens_consumed as usize;
         }
 
-        let actions = BudgetPolicy::default().decide(&facts);
+        let actions = state
+            .budget_policy
+            .as_ref()
+            .unwrap_or(&BudgetPolicy::default())
+            .decide(&facts);
         for action in actions {
             match action {
                 FrameworkAction::ExpandBudget {
@@ -684,6 +688,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         let added = capped - state.max_turns;
                         state.max_turns = capped;
                         state.remaining_turns += added;
+                        state.policy_expanded_this_turn = true;
                         // Reset self-pacing hint flags so the new budget gets fresh hints
                         state.turn_budget_hint_emitted_90 = false;
                         state.turn_budget_hint_emitted_50 = false;
@@ -700,15 +705,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             "Policy-driven budget expansion"
                         );
                     }
-                }
-                FrameworkAction::TransitionPhase { target } => {
-                    tracing::info!(
-                        target: "astra::policy",
-                        target_phase = %target,
-                        "Policy requested phase transition"
-                    );
-                    // Phase transitions (e.g. "reflect") are advisory in the
-                    // production loop — the circuit breaker owns termination.
                 }
                 FrameworkAction::InjectSignal { message } => {
                     state.push_volatile(
