@@ -1403,6 +1403,576 @@ Next phases:
    envelope directly.
 9. Keep `last_n` only as a bounded evidence limit, not as a horizon alias.
 
+10. **ObservationDispatcher** — unified event-to-action pipeline (see below).
+
+## Observation Dispatcher — Unified Event-to-Action Pipeline
+
+### Problem: Fragmented Observation Channels
+
+The observation plane types (`ObservationRecord`, `ObservationFailureCluster`,
+`ObservationActionHint`, `SourcePolicy`) are fully defined in `astra_core`, but
+only `reflect.rs` consumes them. Every other observation source in the system
+writes to its own target through an independent channel:
+
+```
+stall.rs ──────→ turn_guard.rs ──────→ nudge prompt (bypasses observation plane)
+stall.rs ──────→ loop_dispatcher.rs ─→ abort          (bypasses observation plane)
+error_recovery → finalization.rs ────→ gate trigger   (bypasses observation plane)
+post_tool_policy→ observability hub ─→ journal         (bypasses observation plane)
+runner.rs ─────→ Memoria [@session/active]             (bypasses observation plane)
+memory_orchestrator → Memoria feedback API             (bypasses observation plane)
+learning/extractor → Memoria procedural                 (bypasses observation plane)
+session_end_governance → Memoria episodic               (bypasses observation plane)
+```
+
+**17+ independent channels. One shared type system. Zero integration.**
+
+### First-Principles Redesign
+
+The previous design conflated **observation** (what happened) with **intent** (what to do). This violates separation of concerns: if a source already decides the action via `action_hint`, the dispatcher adds no value.
+
+**Core principle**: Sources produce facts. The router decides actions. Executors perform actions. Sinks persist.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Layer 1: Sources (Detection)                                │
+│  stall.rs, error_recovery.rs, runner.rs, ...                 │
+│  Output: ObservationEvent (no action intent)                 │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Layer 2: Router (Routing Decision)                          │
+│  Maps event.kind + severity + system_policy                  │
+│  Output: Vec<ObservationAction> (parameterized)              │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Layer 3: Executor (Action Execution)                        │
+│  Dispatches each action to the appropriate sink              │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Layer 4: Sinks (Persistence)                                │
+│  JournalSink, MemoriaSink, TelemetrySink, NotificationSink   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Layer 1: `ObservationEvent` (Pure Fact)
+
+Replaces the current `ObservationRecord`. Contains **no action hint** — only facts.
+
+```rust
+pub struct ObservationEvent {
+    pub severity: ObservationSeverity,
+    pub kind: ObservationKind,
+    pub description: String,
+    pub evidence: Vec<ObservationEvidence>,
+    pub timestamp: SystemTime,
+    pub source: ObservationSource,
+}
+
+pub enum ObservationSource {
+    StallDetection,
+    ErrorRecovery,
+    MemoryExtraction,
+    MemoryOrchestrator,
+    LearningExtractor,
+    SessionEndGovernance,
+    PostToolPolicy,
+    // ...
+}
+```
+
+### Layer 2: `ObservationAction` (Parameterized Intent)
+
+Each variant carries all parameters needed to execute — no inference required.
+
+```rust
+pub enum ObservationAction {
+    StoreInMemory {
+        key: String,
+        content: String,
+        ttl: Option<Duration>,
+    },
+    FeedbackWrong {
+        memory_id: String,
+        reason: String,
+    },
+    FeedbackOutdated {
+        memory_id: String,
+    },
+    AdjustBudget {
+        delta: i64,  // positive = expansion, negative = contraction
+    },
+    EvictStaleState {
+        session_id: String,
+    },
+    NotifyUser {
+        message: String,
+        severity: NotificationSeverity,
+    },
+    NoAction,
+}
+```
+
+### Layer 2: Router (Decision, Not Execution)
+
+```rust
+pub struct ObservationRouter {
+    // No sinks — pure decision logic
+}
+
+impl ObservationRouter {
+    pub fn route(
+        &self,
+        event: &ObservationEvent,
+        system_policy: &SystemPolicy,
+    ) -> Vec<ObservationAction> {
+        let mut actions = vec![];
+
+        match (&event.kind, &event.severity) {
+            (ObservationKind::StallLoop, ObservationSeverity::Critical) => {
+                actions.push(ObservationAction::AdjustBudget { delta: 1000 });
+                actions.push(ObservationAction::NotifyUser {
+                    message: "Agent appears stuck, expanding budget".into(),
+                    severity: NotificationSeverity::Warning,
+                });
+            },
+            (ObservationKind::ToolFailure, _) => {
+                if let Some(memory_id) = event.evidence.iter()
+                    .find_map(|e| e.get("memory_id").map(|s| s.to_string()))
+                {
+                    actions.push(ObservationAction::FeedbackWrong {
+                        memory_id,
+                        reason: event.description.clone(),
+                    });
+                }
+            },
+            _ => {}
+        }
+
+        if system_policy.cloud_write_enabled {
+            actions.extend(self.memoria_actions(event));
+        }
+
+        actions
+    }
+}
+```
+
+### Layer 3: Executor (Action Execution)
+
+```rust
+pub struct ObservationExecutor {
+    router: ObservationRouter,
+    journal: ObservationJournal,   // stateful — not just a sink
+    memoria: Option<MemoriaSink>,
+    telemetry: TelemetrySink,
+    notification: NotificationSink,
+}
+
+impl ObservationExecutor {
+    pub async fn dispatch(
+        &self,
+        event: ObservationEvent,
+        system_policy: &SystemPolicy,
+    ) -> Result<()> {
+        // 1. All events enter the journal (stateful: indexes + lifecycle)
+        self.journal.ingest(event.clone()).await?;
+
+        // 2. Router decides actions
+        let actions = self.router.route(&event, system_policy);
+
+        // 3. Execute each action
+        for action in actions {
+            match action {
+                ObservationAction::StoreInMemory { key, content, ttl } => {
+                    if let Some(ref memoria) = self.memoria {
+                        memoria.store(&key, &content, ttl).await?;
+                    }
+                },
+                ObservationAction::FeedbackWrong { memory_id, reason } => {
+                    if let Some(ref memoria) = self.memoria {
+                        memoria.feedback(&memory_id, "wrong", &reason).await?;
+                    }
+                },
+                ObservationAction::AdjustBudget { delta } => {
+                    self.budget_controller.adjust(delta).await?;
+                },
+                ObservationAction::NotifyUser { message, severity } => {
+                    self.notification.send(&message, severity).await?;
+                },
+                ObservationAction::NoAction => {},
+            }
+        }
+
+        Ok(())
+    }
+}
+```
+
+### Layer 3b: `ObservationJournal` (Stateful Persistence)
+
+The journal is not a dumb write sink — it is the **cross-turn state layer** that enables:
+
+- `reflect` queries (evidence aggregation across turns)
+- Lifecycle state transitions (Active → Recurring → Resolved)
+- URN generation (deferred from sources)
+
+```rust
+pub struct ObservationJournal {
+    events_by_session: HashMap<SessionId, Vec<IndexedEvent>>,
+    events_by_kind: HashMap<ObservationKind, Vec<IndexedEvent>>,
+    lifecycle: ObservationLifecycle,
+}
+
+struct IndexedEvent {
+    urn: Urn,               // generated here, not at source
+    event: ObservationEvent,
+    turn_number: u64,
+    ingested_at: SystemTime,
+}
+
+impl ObservationJournal {
+    pub async fn ingest(&mut self, event: ObservationEvent) -> Result<Urn> {
+        let urn = self.generate_urn(&event);
+        let indexed = IndexedEvent {
+            urn: urn.clone(),
+            event: event.clone(),
+            turn_number: self.current_turn(),
+            ingested_at: SystemTime::now(),
+        };
+
+        // Index by session and kind
+        self.events_by_session
+            .entry(self.current_session())
+            .or_default()
+            .push(indexed.clone());
+        self.events_by_kind
+            .entry(event.kind.clone())
+            .or_default()
+            .push(indexed.clone());
+
+        // Lifecycle transitions
+        self.lifecycle.update(&indexed, &self.events_by_kind);
+
+        Ok(urn)
+    }
+
+    // Query API for reflect subsystem
+    pub fn query(&self, query: &ObservationQuery) -> Vec<IndexedEvent> {
+        // ...
+    }
+
+    pub fn lifecycle_status(&self, kind: &ObservationKind) -> LifecycleStatus {
+        self.lifecycle.status(kind)
+    }
+}
+```
+
+**URN is generated here**, not at sources. Sources produce `ObservationEvent` with no ID burden. The journal assigns a stable URN on ingestion, enabling cross-turn correlation without coupling sources to ID generation.
+
+### Layer 3c: `ObservationLifecycle` (State Machine)
+
+Lifecycle states track whether an observation pattern is currently active, recurring, resolved, or stale. This is **not source responsibility** — sources only see the current turn. The lifecycle manager sees history.
+
+```rust
+pub struct ObservationLifecycle {
+    states: HashMap<ObservationKind, LifecycleEntry>,
+}
+
+pub enum LifecycleStatus {
+    Active,       // first occurrence this session
+    Recurring,    // same kind appeared in ≥2 recent turns
+    Resolved,     // N consecutive turns without this kind
+    Stale,        // Active but no follow-up action taken
+}
+
+struct LifecycleEntry {
+    status: LifecycleStatus,
+    first_seen: SystemTime,
+    last_seen: SystemTime,
+    occurrences: u32,
+    turns_since_last: u64,
+}
+
+impl ObservationLifecycle {
+    pub fn update(
+        &mut self,
+        indexed: &IndexedEvent,
+        events_by_kind: &HashMap<ObservationKind, Vec<IndexedEvent>>,
+    ) {
+        let kind = &indexed.event.kind;
+        let entry = self.states.entry(kind.clone()).or_insert_with(|| {
+            LifecycleEntry {
+                status: LifecycleStatus::Active,
+                first_seen: indexed.ingested_at,
+                last_seen: indexed.ingested_at,
+                occurrences: 0,
+                turns_since_last: 0,
+            }
+        });
+
+        entry.last_seen = indexed.ingested_at;
+        entry.occurrences += 1;
+        entry.turns_since_last = 0;
+
+        // Active → Recurring: same kind in ≥2 recent turns
+        if entry.occurrences >= 2 {
+            entry.status = LifecycleStatus::Recurring;
+        }
+
+        // Tick all other kinds: turns_since_last++
+        for (other_kind, other_entry) in self.states.iter_mut() {
+            if other_kind != kind {
+                other_entry.turns_since_last += 1;
+                // Resolved: 5 consecutive turns without this kind
+                if other_entry.turns_since_last >= 5
+                    && matches!(other_entry.status,
+                        LifecycleStatus::Active | LifecycleStatus::Recurring)
+                {
+                    other_entry.status = LifecycleStatus::Resolved;
+                }
+                // Stale: Active for >10 turns with no action
+                if other_entry.turns_since_last >= 10
+                    && matches!(other_entry.status, LifecycleStatus::Active)
+                {
+                    other_entry.status = LifecycleStatus::Stale;
+                }
+            }
+        }
+    }
+
+    pub fn status(&self, kind: &ObservationKind) -> LifecycleStatus {
+        self.states.get(kind)
+            .map(|e| e.status.clone())
+            .unwrap_or(LifecycleStatus::Resolved)
+    }
+}
+```
+
+**Lifecycle transitions drive actions:**
+
+| Transition           | Triggered By                    | Router Action                   |
+| -------------------- | ------------------------------- | ------------------------------- |
+| Active → Recurring   | Same kind in ≥2 turns           | `AdjustBudget` (expand)         |
+| Recurring → Resolved | 5 turns without recurrence      | `NotifyUser` ("issue resolved") |
+| Active → Stale       | 10 turns no follow-up           | `NotifyUser` ("unaddressed")    |
+| Resolved → Active    | Kind reappears after resolution | `StoreInMemory` (corrective)    |
+
+### Layer 3d: Lifecycle Storage, Eviction & Concurrency
+
+**Storage**: In-memory `HashMap<ObservationKind, LifecycleEntry>` scoped to the session. No disk persistence — lifecycle is ephemeral per-session state, reconstructed from `ObservationJournal` events on session resume if needed.
+
+**Capacity**: Max 64 `ObservationKind` entries. When exceeded, evict `Stale` entries first (oldest `last_seen`), then `Resolved` entries. Never evict `Active` or `Recurring`.
+
+**Concurrent merge** (multiple observations of same kind in one turn):
+
+```rust
+fn merge_same_turn(events: &[IndexedEvent]) -> LifecycleEntry {
+    // Take the highest severity as representative
+    let severity = events.iter()
+        .map(|e| e.event.severity)
+        .max()
+        .unwrap_or(ObservationSeverity::Info);
+
+    // Sum occurrences, take latest timestamp
+    LifecycleEntry {
+        status: LifecycleStatus::Active,
+        first_seen: events.first().unwrap().ingested_at,
+        last_seen: events.last().unwrap().ingested_at,
+        occurrences: events.len() as u32,
+        turns_since_last: 0,
+    }
+}
+```
+
+**Threshold constants** (centralized, not magic numbers):
+
+```rust
+pub mod lifecycle {
+    pub const RECURRING_THRESHOLD: u32 = 2;      // occurrences
+    pub const RESOLVED_THRESHOLD: u64 = 5;       // turns since last
+    pub const STALE_THRESHOLD: u64 = 10;         // turns since last (Active only)
+    pub const MAX_ENTRIES: usize = 64;           // HashMap capacity
+}
+```
+
+### Layer 3e: Session Memory Feedback Path
+
+**Problem**: `[@session/active]` entries have no feedback mechanism. When session memory contains incorrect guidance, Memoria never receives a "wrong" signal.
+
+**Solution**: `IntentDrift` observations trigger `FeedbackWrong` for session memory.
+
+```rust
+// In Router::route()
+if event.kind == ObservationKind::IntentDrift {
+    actions.push(Action::MemoriaFeedback {
+        memory_id: session_active_memory_id(),  // [@session/active]
+        signal: FeedbackSignal::Wrong,
+    });
+}
+```
+
+**Trigger chain**:
+
+```
+User correction detected (is_correction_signal)
+  → turn_guard emits IntentDrift observation
+    → Router sees IntentDrift
+      → Action::MemoriaFeedback(Wrong) for [@session/active]
+        → memoria.feedback(session_active_id, "wrong")
+          → Memoria downweights this entry in future retrievals
+```
+
+**Why this closes the gap**: Previously, `memory_orchestrator.feedback()` only applied to profile/episodic/scenes types. Now, `IntentDrift` (produced by `stall.rs` when user corrects the agent) routes through the dispatcher to `MemoriaFeedback`, which targets the session-active entry specifically.
+
+**Reanchor + Feedback are complementary, not redundant**:
+
+- **Reanchor** (prompt-level): immediate correction for current turn, ephemeral
+- **Feedback** (Memoria-level): persistent signal that downweights the entry for future sessions
+
+### Migration Strategy
+
+**Incremental, not big-bang.** Each source migrates independently behind a feature flag.
+
+```rust
+// Per-source feature flag
+pub enum SourceMigration {
+    Legacy,      // old path only
+    DualWrite,   // both old and new paths (validation period)
+    NewOnly,     // new path only, old path removed
+}
+
+pub struct MigrationConfig {
+    pub stall: SourceMigration,
+    pub error_recovery: SourceMigration,
+    pub memory_extraction: SourceMigration,
+    // ... one per source
+}
+```
+
+**Migration phases per source**:
+
+| Phase       | Behavior                                                  | Duration  | Verification                                                                                       |
+| ----------- | --------------------------------------------------------- | --------- | -------------------------------------------------------------------------------------------------- |
+| `Legacy`    | Source uses old path only                                 | baseline  | n/a                                                                                                |
+| `DualWrite` | Source emits to both old path and `ObservationEvent`      | 1-2 weeks | Compare outputs: old handler result vs dispatcher actions. Log divergences.                        |
+| `NewOnly`   | Source emits only `ObservationEvent`, old handler deleted | permanent | Dispatcher actions produce equivalent side effects (Memoria writes, journal events, notifications) |
+
+**Deduplication during DualWrite**:
+
+```rust
+// Journal tracks which events came from dual-write
+pub struct IndexedEvent {
+    pub event: ObservationEvent,
+    pub source_migration: SourceMigration,  // Legacy | DualWrite | NewOnly
+    pub ingested_at: SystemTime,
+}
+
+// Dispatcher skips DualWrite events if legacy handler already processed them
+fn should_dispatch(event: &IndexedEvent) -> bool {
+    match event.source_migration {
+        SourceMigration::Legacy => false,      // old path handles it
+        SourceMigration::DualWrite => false,   // legacy path is authoritative during validation
+        SourceMigration::NewOnly => true,      // dispatcher is authoritative
+    }
+}
+```
+
+**Verification strategy**:
+
+During `DualWrite`, both paths produce side effects. Compare:
+
+- Memoria writes: same `memory_id`, same `content` hash?
+- Journal events: same `event_type`, same `session_id`, same `turn`?
+- Notifications: same `message`, same `recipient`?
+
+Log divergences as `ObservationKind::MigrationDivergence` events. When divergence rate < 1% over 1000 events, promote to `NewOnly`.
+
+**Old path deletion**: Only after source reaches `NewOnly` and divergence rate is 0 for 1 week. Delete in a single commit per source, not bulk.
+
+### Layer 4: Sink Trait
+
+```rust
+#[async_trait]
+pub trait ObservationSink {
+    async fn write(&self, event: &ObservationEvent) -> Result<()>;
+}
+
+pub struct MemoriaSink { memoria: Arc<dyn MemoriaClient> }
+pub struct TelemetrySink { hub: Arc<dyn ObservabilityHub> }
+pub struct NotificationSink { queue: NotificationQueue }
+```
+
+Note: `JournalSink` is not a trait implementation — it is `ObservationJournal` itself (Layer 3b), a stateful component, not a dumb sink.
+
+### `SourcePolicy` Corrected Usage
+
+`SourcePolicy` governs **read preference** (edge vs cloud), not write permissions:
+
+```rust
+pub enum SourcePolicy {
+    LiveOnly,     // prefer edge reads
+    CloudOnly,    // prefer cloud reads
+    LiveFirst,    // edge first, fallback cloud
+    CloudFirst,   // cloud first, fallback edge
+    Auto,
+}
+
+impl SourcePolicy {
+    pub fn prefers_edge(&self) -> bool {
+        matches!(self, LiveOnly | LiveFirst)
+    }
+}
+
+// Write permissions are governed by SystemPolicy
+pub struct SystemPolicy {
+    pub cloud_write_enabled: bool,
+    pub edge_write_enabled: bool,
+}
+```
+
+### Source Migration Map
+
+Every source migrates to produce `ObservationEvent` (not `ObservationRecord`):
+
+| Source                          | Event Kind                  | Router → Actions                    |
+| ------------------------------- | --------------------------- | ----------------------------------- |
+| `stall.rs` stall detection      | `StallLoop, Critical`       | `AdjustBudget(1000)`, `NotifyUser`  |
+| `stall.rs` divergence           | `DivergentBehavior`         | `EvictStaleState`                   |
+| `stall.rs` reward hacking       | `RewardHacking`             | `FeedbackWrong`                     |
+| `stall.rs` intent drift         | `IntentDrift`               | `StoreInMemory` (corrective)        |
+| `error_recovery.rs`             | `ToolFailure × N`           | `AdjustBudget`                      |
+| `error_recovery.rs` summary     | `ObservationFailureCluster` | batch dispatch                      |
+| `post_tool_policy.rs`           | `PolicyViolation`           | `AdjustBudget`                      |
+| `headless/postprocess.rs`       | `ResourceExhaustion`        | `AdjustBudget`                      |
+| `runner.rs` (memory extraction) | `MemoryFact × N`            | `StoreInMemory`                     |
+| `memory_orchestrator.rs`        | `MemoryFeedback`            | `FeedbackWrong`, `FeedbackOutdated` |
+| `learning/extractor.rs`         | `CrossSessionLesson`        | `StoreInMemory`                     |
+| `session_end_governance.rs`     | `CoverageGap`               | `NotifyUser`                        |
+| `reflect.rs`                    | `ReflectReport`             | `NoAction` (read-only path)         |
+
+### Key Improvements
+
+| Original Design                        | Refactored                                      | Improvement                |
+| -------------------------------------- | ----------------------------------------------- | -------------------------- |
+| `ObservationRecord` with `action_hint` | `ObservationEvent` + `ObservationAction`        | Separates fact from intent |
+| `action_hint` as label                 | `ObservationAction` with parameters             | Directly executable        |
+| `SourcePolicy` as route gate           | `SourcePolicy` read-only, `SystemPolicy` writes | Clear semantics            |
+| Dispatcher executes actions            | Router returns actions, Executor runs           | Responsibility separation  |
+| Journal/Memoria parallel sinks         | Sink trait layer                                | Extensible                 |
+
+### What This Does NOT Change
+
+- **LLM agent decision boundary**: the agent uses `introspect` to observe data;
+  the dispatcher only routes framework-produced records.
+- **Read-only guarantee**: `introspect` and `reflect` remain read-only views.
+  The dispatcher is a write path, not a view.
+- **`FrameworkAction` ownership**: `AdjustBudget` from the dispatcher triggers
+  `FrameworkAction::ExpandBudget` — but the policy that decides _how much_ is
+  still user/scene-configured, not hardcoded.
+
 ## Open Questions
 
 1. Should large `forensic` graph slices be returned only by cursor pagination,
