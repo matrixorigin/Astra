@@ -41,50 +41,97 @@ const JOURNAL_CAPACITY: usize = 16;
 /// Minimum entries before we compute trends (avoid noise from small samples).
 const MIN_TREND_ENTRIES: usize = 3;
 
-/// Pure factual snapshot of the current state, extracted from the
-/// [`ObservationJournal`]. No scores, no judgments — only counts.
+/// Budget-related facts: rounds and budget limits.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct JournalFacts {
+pub struct BudgetSnapshot {
     /// Total rounds completed so far.
     pub rounds_completed: u32,
+    /// Rounds remaining before budget exhaustion.
+    pub budget_remaining: u32,
+    /// Maximum rounds allowed.
+    pub budget_max: u32,
+}
+
+/// Streak-related facts: consecutive outcome/non-outcome/read-only rounds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreakSnapshot {
     /// Consecutive rounds where the agent produced at least one observable
     /// outcome (mutation, test pass, build success).
     pub consecutive_rounds_with_outcome: u32,
     /// Consecutive rounds with zero observable outcome.
     pub consecutive_rounds_without_outcome: u32,
-    /// Rounds remaining before budget exhaustion.
-    pub budget_remaining: u32,
-    /// Maximum rounds allowed.
-    pub budget_max: u32,
+    /// Consecutive read-only rounds (no writes / edits).
+    pub consecutive_read_only: u32,
+}
+
+/// Performance metrics: tool calls, errors, cache, token pressure.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PerformanceSnapshot {
     /// Total evidence-gathering tool calls across the journal window.
     pub total_evidence_calls: u32,
     /// Total errors across the journal window.
     pub total_errors: u32,
-    /// Consecutive read-only rounds (no writes / edits).
-    pub consecutive_read_only: u32,
     /// Total tool calls in the journal window.
     pub total_tool_calls: u32,
-    /// Framework-detected tool signature stall, if any.
-    /// e.g. "Same tools called 3 times in a row: [read_file, grep]".
-    /// This is an objective fact from the framework, not a judgment.
-    pub stall_reason: Option<String>,
+    /// Error rate (0.0–1.0) across the journal window.
+    /// failed_calls / total_calls, aggregated from recent turns.
+    pub current_error_rate: f64,
+    /// Cache hit ratio (0.0–1.0): cache_hits / total_calls.
+    /// Higher means the agent is reusing cached results efficiently.
+    pub cache_hit_ratio: f64,
     /// Token pressure (0.0–1.0): how full the context window is.
     /// Derived from token usage vs. context window budget.
     /// 0.0 = empty, 1.0 = full / overflow imminent.
     /// Populated by the execution phase (not computed in the journal).
     #[serde(default)]
     pub token_pressure: f64,
-    /// Error rate (0.0–1.0) across the journal window.
-    /// failed_calls / total_calls, aggregated from recent turns.
-    pub current_error_rate: f64,
+}
+
+/// Stall detection facts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StallSnapshot {
+    /// Framework-detected tool signature stall, if any.
+    /// e.g. "Same tools called 3 times in a row: [read_file, grep]".
+    /// This is an objective fact from the framework, not a judgment.
+    pub stall_reason: Option<String>,
+}
+
+/// Task completion facts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskSnapshot {
     /// Task completion ratio (0.0–1.0): fraction of the task board's
     /// tasks that are completed. 1.0 = all done.
     /// Populated by the execution phase (not computed in the journal).
     #[serde(default)]
     pub task_completion_ratio: f64,
-    /// Cache hit ratio (0.0–1.0): cache_hits / total_calls.
-    /// Higher means the agent is reusing cached results efficiently.
-    pub cache_hit_ratio: f64,
+}
+
+/// Pure factual snapshot of the current state, extracted from the
+/// [`ObservationJournal`]. No scores, no judgments — only counts.
+///
+/// Composed of five focused sub-structs for better separation of concerns:
+/// - [`BudgetSnapshot`]: rounds and budget limits
+/// - [`StreakSnapshot`]: consecutive outcome/non-outcome/read-only rounds
+/// - [`PerformanceSnapshot`]: tool calls, errors, cache, token pressure
+/// - [`StallSnapshot`]: stall detection
+/// - [`TaskSnapshot`]: task completion
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JournalFacts {
+    /// Budget-related facts.
+    #[serde(default)]
+    pub budget: BudgetSnapshot,
+    /// Streak-related facts.
+    #[serde(default)]
+    pub streaks: StreakSnapshot,
+    /// Performance metrics.
+    #[serde(default)]
+    pub performance: PerformanceSnapshot,
+    /// Stall detection facts.
+    #[serde(default)]
+    pub stall: StallSnapshot,
+    /// Task completion facts.
+    #[serde(default)]
+    pub task: TaskSnapshot,
 }
 
 /// A single turn's worth of key metrics stored in the journal.
@@ -371,7 +418,7 @@ impl ObservationJournal {
             return None;
         }
 
-        let pre = self.pre_strategy_metrics.as_ref().unwrap();
+        let pre = self.pre_strategy_metrics.as_ref()?;
         let post_entries: Vec<&JournalEntry> =
             self.entries[self.strategy_change_at..].iter().collect();
 
@@ -434,9 +481,11 @@ impl ObservationJournal {
         // by the execution phase from authoritative state, not from the journal
         // (they track entire-session counts, not just the sliding window).
         let mut facts = JournalFacts {
-            rounds_completed: self.entries.last().map(|e| e.turn + 1).unwrap_or(0),
-            budget_remaining,
-            budget_max,
+            budget: BudgetSnapshot {
+                rounds_completed: self.entries.last().map(|e| e.turn + 1).unwrap_or(0),
+                budget_remaining,
+                budget_max,
+            },
             ..Default::default()
         };
 
@@ -466,14 +515,14 @@ impl ObservationJournal {
             // Outcome streak: count consecutive rounds with outcome.
             // Break on non-outcome OR on strategy change boundary.
             if counting_outcome && has_outcome && !past_strategy_boundary {
-                facts.consecutive_rounds_with_outcome += 1;
+                facts.streaks.consecutive_rounds_with_outcome += 1;
             } else {
                 counting_outcome = false;
             }
 
             // Read-only streak: count consecutive read-only rounds.
             if counting_read_only && is_read_only && !past_strategy_boundary {
-                facts.consecutive_read_only += 1;
+                facts.streaks.consecutive_read_only += 1;
             } else {
                 counting_read_only = false;
             }
@@ -493,7 +542,7 @@ impl ObservationJournal {
                 break;
             }
         }
-        facts.consecutive_rounds_without_outcome = zero_streak;
+        facts.streaks.consecutive_rounds_without_outcome = zero_streak;
 
         // Compute aggregated error rate and cache hit ratio from recent entries.
         // These are averages across the journal window for stable signals.
@@ -503,8 +552,8 @@ impl ObservationJournal {
                 self.entries.iter().map(|e| e.error_rate).sum::<f64>() / total_entries;
             let avg_cache_hit: f64 =
                 self.entries.iter().map(|e| e.cache_hit_ratio).sum::<f64>() / total_entries;
-            facts.current_error_rate = avg_error_rate;
-            facts.cache_hit_ratio = avg_cache_hit;
+            facts.performance.current_error_rate = avg_error_rate;
+            facts.performance.cache_hit_ratio = avg_cache_hit;
         }
 
         // Note: token_pressure and task_completion_ratio are populated by
@@ -695,37 +744,34 @@ pub trait ObservationStore: Send + Sync {
     ///
     /// Returns `Ok(())` even if no entries existed (idempotent delete).
     fn delete_session(&self, session_id: &str) -> Result<(), String>;
+}
 
+/// Tuning signal persistence backend — separate from observation CRUD.
+///
+/// Handles advisory tuning jobs (cache warming hints, context pressure signals, etc.)
+/// that are derived from analysis, not direct turn metrics.
+pub trait TuningStore: Send + Sync {
     /// Save a tuning job entry as a raw JSON line.
     ///
     /// Tuning jobs are advisory and separate from turn metrics.
     /// The `raw_json` is a pre-serialized [`TuningJob`] line.
-    /// Default: no-op (most stores don't support tuning persistence).
     fn save_tuning_entry(
         &self,
-        _session_id: &str,
-        _turn_index: u32,
-        _raw_json: &str,
-    ) -> Result<(), String> {
-        Ok(()) // default no-op
-    }
+        session_id: &str,
+        turn_index: u32,
+        raw_json: &str,
+    ) -> Result<(), String>;
 
     /// Load all tuning job entries for `session_id`.
     ///
     /// Each returned string is a raw JSON line (a serialized [`TuningJob`]).
     /// Returns an empty `Vec` if the session has no tuning data.
-    /// Default: empty (most stores don't support tuning reads).
-    fn load_tuning_entries(&self, _session_id: &str) -> Vec<String> {
-        Vec::new() // default no-op
-    }
+    fn load_tuning_entries(&self, session_id: &str) -> Vec<String>;
 
     /// List all session IDs that have tuning data.
     ///
-    /// Returns a sorted list of session IDs. The default implementation returns
-    /// an empty list — backends that support directory scanning should override.
-    fn list_tuning_sessions(&self) -> Vec<String> {
-        Vec::new() // default: no scanning
-    }
+    /// Returns a sorted list of session IDs.
+    fn list_tuning_sessions(&self) -> Vec<String>;
 }
 
 /// A single persisted observation record, reconstructed from storage.
@@ -912,9 +958,9 @@ mod tests {
     fn empty_journal_extracts_zero_facts() {
         let journal = ObservationJournal::default();
         let facts = journal.extract_facts(10, 10);
-        assert_eq!(facts.rounds_completed, 0);
-        assert_eq!(facts.consecutive_rounds_with_outcome, 0);
-        assert_eq!(facts.consecutive_rounds_without_outcome, 0);
+        assert_eq!(facts.budget.rounds_completed, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
     }
 
     #[test]
@@ -926,8 +972,8 @@ mod tests {
         journal.record_turn(&make_write_metrics(2, 5, 1100));
 
         let facts = journal.extract_facts(7, 10);
-        assert_eq!(facts.consecutive_rounds_with_outcome, 3);
-        assert_eq!(facts.consecutive_rounds_without_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 3);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
     }
 
     #[test]
@@ -940,8 +986,8 @@ mod tests {
 
         let facts = journal.extract_facts(7, 10);
         // Last round is read-only → outcome streak should be 0
-        assert_eq!(facts.consecutive_rounds_with_outcome, 0);
-        assert_eq!(facts.consecutive_rounds_without_outcome, 1);
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 1);
     }
 
     #[test]
@@ -953,8 +999,8 @@ mod tests {
         journal.record_turn(&make_metrics(2, 6, 0, 2, 1200, vec![("grep", 6)]));
 
         let facts = journal.extract_facts(7, 10);
-        assert_eq!(facts.consecutive_rounds_without_outcome, 3);
-        assert_eq!(facts.consecutive_rounds_with_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 3);
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
     }
 
     #[test]
@@ -964,7 +1010,7 @@ mod tests {
         journal.record_turn(&make_metrics(1, 4, 0, 1, 1100, vec![("glob", 4)]));
 
         let facts = journal.extract_facts(8, 10);
-        assert_eq!(facts.consecutive_read_only, 2);
+        assert_eq!(facts.streaks.consecutive_read_only, 2);
     }
 
     #[test]
@@ -976,7 +1022,7 @@ mod tests {
 
         let facts = journal.extract_facts(7, 10);
         // Last round is read_only → streak is 1 (broken by write at turn 1)
-        assert_eq!(facts.consecutive_read_only, 1);
+        assert_eq!(facts.streaks.consecutive_read_only, 1);
     }
 
     // ─── extract_facts edge cases ────────────────────────────────────────
@@ -994,20 +1040,20 @@ mod tests {
         // Session-wide fields are NOT populated by extract_facts;
         // the execution phase owns them.
         assert_eq!(
-            facts.total_tool_calls, 0,
+            facts.performance.total_tool_calls, 0,
             "extract_facts must not set total_tool_calls"
         );
         assert_eq!(
-            facts.total_errors, 0,
+            facts.performance.total_errors, 0,
             "extract_facts must not set total_errors"
         );
         assert_eq!(
-            facts.total_evidence_calls, 0,
+            facts.performance.total_evidence_calls, 0,
             "extract_facts must not set total_evidence_calls"
         );
         // Streak fields ARE computed correctly.
-        assert_eq!(facts.consecutive_rounds_with_outcome, 2);
-        assert_eq!(facts.rounds_completed, 2);
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 2);
+        assert_eq!(facts.budget.rounds_completed, 2);
     }
 
     /// Zero budget edge case: budget_remaining == 0, budget_max > 0.
@@ -1018,9 +1064,9 @@ mod tests {
         journal.record_turn(&make_write_metrics(0, 5, 500));
 
         let facts = journal.extract_facts(0, 10);
-        assert_eq!(facts.budget_remaining, 0);
-        assert_eq!(facts.budget_max, 10);
-        assert_eq!(facts.rounds_completed, 1);
+        assert_eq!(facts.budget.budget_remaining, 0);
+        assert_eq!(facts.budget.budget_max, 10);
+        assert_eq!(facts.budget.rounds_completed, 1);
     }
 
     /// budget_remaining > budget_max is logically invalid but must not
@@ -1030,7 +1076,7 @@ mod tests {
         let journal = ObservationJournal::default();
 
         let facts = journal.extract_facts(20, 10);
-        assert_eq!(facts.budget_remaining, 20);
-        assert_eq!(facts.budget_max, 10);
+        assert_eq!(facts.budget.budget_remaining, 20);
+        assert_eq!(facts.budget.budget_max, 10);
     }
 }

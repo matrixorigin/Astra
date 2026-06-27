@@ -7558,6 +7558,7 @@ mod tests {
                         context_pressure: Default::default(),
                         circuit: Default::default(),
                         textless: Default::default(),
+                        tuning: Default::default(),
                     }
                 }),
             policy_expanded_this_turn: false,

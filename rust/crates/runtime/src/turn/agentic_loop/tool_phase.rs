@@ -1488,9 +1488,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     // mutable observation_journal access below.
     {
         let lifecycle_summary = host.turn_start_lifecycle_summary(state);
-        let default_policy = RuntimePolicy::default();
-        let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
-        let provider = LocalSessionProvider::new(state, policy);
+        let provider = LocalSessionProvider::new(state);
         let inspection = InspectionService::new(&provider, &provider, &provider);
         publish_introspect_snapshot(host, state, lifecycle_summary, Some(&inspection));
     } // provider + inspection dropped — releases immutable borrow of state
@@ -1552,13 +1550,14 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         // them via the TuningSink. Non-blocking: failures are logged only.
         // Re-create provider + inspection now that the mutable borrow is released.
         {
-            let default_policy = RuntimePolicy::default();
-            let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
-            let provider = LocalSessionProvider::new(state, policy);
+            let provider = LocalSessionProvider::new(state);
             let inspection = InspectionService::new(&provider, &provider, &provider);
+            let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
+            let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
             let tuning_jobs = inspection.generate_tuning_signals(
                 state.llm_rounds_completed,
                 state.current_session_id.as_deref().unwrap_or_default(),
+                &policy.tuning,
             );
             if !tuning_jobs.is_empty() {
                 if let Some(ref store) = state.observation_store {
@@ -3185,8 +3184,8 @@ esac
                 tool_count: 1,
             });
 
-        let policy = RuntimePolicy::default();
-        let provider = LocalSessionProvider::new(&state, &policy);
+        let _policy = RuntimePolicy::default();
+        let provider = LocalSessionProvider::new(&state);
         let inspection = InspectionService::new(&provider, &provider, &provider);
 
         let snapshot =
@@ -3213,8 +3212,8 @@ esac
     #[test]
     fn inspection_service_zero_state_returns_safe_defaults() {
         let state = make_state();
-        let policy = RuntimePolicy::default();
-        let provider = LocalSessionProvider::new(&state, &policy);
+        let _policy = RuntimePolicy::default();
+        let provider = LocalSessionProvider::new(&state);
         let inspection = InspectionService::new(&provider, &provider, &provider);
 
         let snapshot =
@@ -3235,8 +3234,8 @@ esac
     #[test]
     fn inspection_service_uses_default_policy_when_none() {
         let state = make_state();
-        let policy = RuntimePolicy::default();
-        let provider = LocalSessionProvider::new(&state, &policy);
+        let _policy = RuntimePolicy::default();
+        let provider = LocalSessionProvider::new(&state);
         let inspection = InspectionService::new(&provider, &provider, &provider);
 
         let snapshot =
@@ -3274,8 +3273,8 @@ esac
     #[test]
     fn provider_traits_return_safe_defaults_for_empty_state() {
         let state = make_state();
-        let policy = RuntimePolicy::default();
-        let provider = LocalSessionProvider::new(&state, &policy);
+        let _policy = RuntimePolicy::default();
+        let provider = LocalSessionProvider::new(&state);
 
         // LiveRuntimeProvider
         assert_eq!(provider.token_pressure(), 0.0);
@@ -3288,8 +3287,8 @@ esac
         assert!(provider.journal_is_empty());
         assert_eq!(provider.journal_len(), 0);
         let facts = provider.extract_facts();
-        assert_eq!(facts.consecutive_rounds_with_outcome, 0);
-        assert_eq!(facts.consecutive_rounds_without_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
 
         // SessionStateProvider
         // Empty board → fully complete (nothing to do)
@@ -3325,8 +3324,8 @@ esac
             .record_outcome_with_preview("read_file:/tmp/test", success, None);
         state.turn_guard.health.record_success("read_file");
 
-        let policy = RuntimePolicy::default();
-        let provider = LocalSessionProvider::new(&state, &policy);
+        let _policy = RuntimePolicy::default();
+        let provider = LocalSessionProvider::new(&state);
         let inspection = InspectionService::new(&provider, &provider, &provider);
 
         let snapshot =

@@ -10,7 +10,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! let provider = LocalSessionProvider::new(&state, &policy);
+//! let provider = LocalSessionProvider::new(&state);
 //! let mut facts = provider.extract_facts();
 //! facts.token_pressure = provider.token_pressure();
 //! facts.task_completion_ratio = provider.task_completion_ratio();
@@ -21,7 +21,6 @@ use astra_core::observation_journal::{JournalFacts, MetricTrend};
 
 use super::agentic_loop::host::{self, AgenticLoopState};
 use super::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
-use super::runtime_policy::RuntimePolicy;
 
 // ─── LocalSessionProvider ────────────────────────────────────────────────────
 
@@ -29,16 +28,11 @@ use super::runtime_policy::RuntimePolicy;
 /// in-memory [`AgenticLoopState`] reference.
 pub struct LocalSessionProvider<'a> {
     state: &'a AgenticLoopState,
-    /// The policy reference is held so that future provider methods that need
-    /// policy-aware computation (e.g. budget ceilings) can access it without
-    /// threading it separately.
-    #[allow(dead_code)]
-    policy: &'a RuntimePolicy,
 }
 
 impl<'a> LocalSessionProvider<'a> {
-    pub fn new(state: &'a AgenticLoopState, policy: &'a RuntimePolicy) -> Self {
-        Self { state, policy }
+    pub fn new(state: &'a AgenticLoopState) -> Self {
+        Self { state }
     }
 }
 
@@ -160,10 +154,7 @@ mod tests {
     }
 
     fn make_provider(state: &AgenticLoopState) -> LocalSessionProvider<'_> {
-        // Use a static policy to avoid lifetime issues
-        static DEFAULT_POLICY: std::sync::LazyLock<RuntimePolicy> =
-            std::sync::LazyLock::new(RuntimePolicy::default);
-        LocalSessionProvider::new(state, &DEFAULT_POLICY)
+        LocalSessionProvider::new(state)
     }
 
     // ── LiveRuntimeProvider tests ───────────────────────────────────────
@@ -222,8 +213,8 @@ mod tests {
         assert_eq!(p.journal_len(), 0);
         let facts = p.extract_facts();
         // All streaks should be zero for empty journal
-        assert_eq!(facts.consecutive_rounds_with_outcome, 0);
-        assert_eq!(facts.consecutive_rounds_without_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
     }
 
     #[test]

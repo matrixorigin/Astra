@@ -13,7 +13,9 @@
 //! snapshot. It is the runtime's responsibility — not the core data layer's —
 //! to decide what actions to take based on observed facts.
 
-use astra_core::observation_journal::JournalFacts;
+use astra_core::observation_journal::{
+    BudgetSnapshot, JournalFacts, PerformanceSnapshot, StallSnapshot, StreakSnapshot, TaskSnapshot,
+};
 use serde::{Deserialize, Serialize};
 
 // ─── Framework Actions ────────────────────────────────────────────────────────
@@ -191,17 +193,53 @@ impl Default for TextlessPolicy {
     }
 }
 
-// ─── Runtime Policy ──────────────────────────────────────────────────────────
+// ─── Tuning Signal Policy ─────────────────────────────────────────────────────
+
+/// Policy for generating tuning signals based on observation metrics.
+///
+/// Each threshold controls when a specific type of tuning job is emitted.
+/// All values are user-configurable; nothing is hardcoded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuningPolicy {
+    /// Token pressure threshold (0.0–1.0) above which aggressive compaction fires.
+    pub token_pressure_critical: f64,
+    /// Token pressure threshold (0.0–1.0) above which prompt compaction fires.
+    pub token_pressure_high: f64,
+    /// Error rate threshold (0.0–1.0) above which circuit breaker tuning fires.
+    pub error_rate_high: f64,
+    /// Minimum turns completed before cache warming signals fire.
+    pub cache_warming_min_turns: u32,
+    /// Cache hit ratio threshold (0.0–1.0) below which cache warming fires.
+    pub cache_hit_low: f64,
+    /// Consecutive rounds without outcome before task decomposition fires.
+    pub stall_threshold: u32,
+}
+
+impl Default for TuningPolicy {
+    fn default() -> Self {
+        Self {
+            token_pressure_critical: 0.95,
+            token_pressure_high: 0.80,
+            error_rate_high: 0.30,
+            cache_warming_min_turns: 10,
+            cache_hit_low: 0.30,
+            stall_threshold: 5,
+        }
+    }
+}
+
+// ─── Runtime Policy ──────────────────────────────────────────────────────��───
 
 /// Runtime policy that uses purely factual thresholds — consecutive outcomes
 /// or non-outcomes — rather than scored "progress" heuristics.
 ///
 /// Every parameter is user-configurable; nothing is hardcoded.
 ///
-/// Composes three sub-policies:
+/// Composes four sub-policies:
 /// - `RuntimePolicy` core: budget expansion, signal injection for streaks
 /// - `ContextPressurePolicy`: guidance under token pressure
 /// - `CircuitPolicy`: diagnostic guidance under errors / read-only streaks
+/// - `TuningPolicy`: thresholds for generating tuning signals
 ///
 /// This lives in the runtime crate (not core) because it makes **decisions**.
 /// Core only collects data (`ObservationJournal`) and exposes pure facts
@@ -225,6 +263,9 @@ pub struct RuntimePolicy {
     /// Textless-stop retry sub-policy.
     #[serde(default)]
     pub textless: TextlessPolicy,
+    /// Tuning signal generation sub-policy.
+    #[serde(default)]
+    pub tuning: TuningPolicy,
 }
 
 impl Default for RuntimePolicy {
@@ -237,6 +278,7 @@ impl Default for RuntimePolicy {
             context_pressure: ContextPressurePolicy::default(),
             circuit: CircuitPolicy::default(),
             textless: TextlessPolicy::default(),
+            tuning: TuningPolicy::default(),
         }
     }
 }
@@ -258,7 +300,7 @@ impl RuntimePolicy {
         // ── Priority 1: Stall Interrupt ──────────────────────────────────
         // Framework-detected tool-signature repetition. Short-circuit
         // immediately — stall overrides all other decisions.
-        if let Some(ref reason) = facts.stall_reason {
+        if let Some(ref reason) = facts.stall.stall_reason {
             actions.push(FrameworkAction::InjectSignal {
                 message: format!(
                     "Stall detected: {}. Consider changing your approach or using a different tool.",
@@ -270,11 +312,11 @@ impl RuntimePolicy {
 
         // ── Priority 2: Context Pressure Guidance ────────────────────────
         // Aggressive first (higher severity); Normal fallback.
-        if facts.token_pressure >= self.context_pressure.aggressive_pressure_threshold {
+        if facts.performance.token_pressure >= self.context_pressure.aggressive_pressure_threshold {
             actions.push(FrameworkAction::SignalContextPressure {
                 urgency: ContextPressureUrgency::Aggressive,
             });
-        } else if facts.token_pressure >= self.context_pressure.pressure_threshold {
+        } else if facts.performance.token_pressure >= self.context_pressure.pressure_threshold {
             actions.push(FrameworkAction::SignalContextPressure {
                 urgency: ContextPressureUrgency::Normal,
             });
@@ -290,22 +332,22 @@ impl RuntimePolicy {
         // adjustment signal instead and let the existing hard-stop paths handle
         // true runaway failures.
         let mut circuit_reasons = Vec::new();
-        if facts.current_error_rate > self.circuit.error_rate_threshold {
+        if facts.performance.current_error_rate > self.circuit.error_rate_threshold {
             circuit_reasons.push(format!(
                 "tool error rate is {:.0}%",
-                facts.current_error_rate * 100.0
+                facts.performance.current_error_rate * 100.0
             ));
         }
-        if facts.consecutive_read_only > self.circuit.max_consecutive_reads {
+        if facts.streaks.consecutive_read_only > self.circuit.max_consecutive_reads {
             circuit_reasons.push(format!(
                 "{} consecutive read-only rounds",
-                facts.consecutive_read_only
+                facts.streaks.consecutive_read_only
             ));
         }
-        if facts.consecutive_rounds_without_outcome > self.circuit.max_consecutive_errors {
+        if facts.streaks.consecutive_rounds_without_outcome > self.circuit.max_consecutive_errors {
             circuit_reasons.push(format!(
                 "{} consecutive rounds without observable outcome",
-                facts.consecutive_rounds_without_outcome
+                facts.streaks.consecutive_rounds_without_outcome
             ));
         }
         if !circuit_reasons.is_empty() {
@@ -319,7 +361,7 @@ impl RuntimePolicy {
 
         // ── Priority 4: Phase Transition ─────────────────────────────────
         // All tasks complete → graceful completion signal.
-        if facts.task_completion_ratio >= 1.0 {
+        if facts.task.task_completion_ratio >= 1.0 {
             actions.push(FrameworkAction::TransitionPhase {
                 target: PhaseTarget::Completion,
             });
@@ -330,9 +372,9 @@ impl RuntimePolicy {
         // Do not wait for the halfway cliff: the model has shown useful
         // progress, so framework budget should create room before it starts
         // self-pacing around scarcity instead of solving the task.
-        let expansion_threshold = facts.budget_max.saturating_mul(3) / 4;
-        if facts.consecutive_rounds_with_outcome >= self.expand_after_consecutive_outcomes
-            && facts.budget_remaining <= expansion_threshold
+        let expansion_threshold = facts.budget.budget_max.saturating_mul(3) / 4;
+        if facts.streaks.consecutive_rounds_with_outcome >= self.expand_after_consecutive_outcomes
+            && facts.budget.budget_remaining <= expansion_threshold
         {
             actions.push(FrameworkAction::ExpandBudget {
                 factor: self.expand_factor,
@@ -342,11 +384,11 @@ impl RuntimePolicy {
 
         // ── Priority 6: Zero-streak Signal ───────────────────────────────
         // Agent stuck with zero outcomes too long.
-        if facts.consecutive_rounds_without_outcome >= self.reflect_after_consecutive_zero {
+        if facts.streaks.consecutive_rounds_without_outcome >= self.reflect_after_consecutive_zero {
             actions.push(FrameworkAction::InjectSignal {
                 message: format!(
                     "{} consecutive rounds without observable progress. Consider pausing to reflect on whether your approach is effective.",
-                    facts.consecutive_rounds_without_outcome
+                    facts.streaks.consecutive_rounds_without_outcome
                 ),
             });
         }
@@ -446,20 +488,28 @@ mod tests {
         budget_max: u32,
     ) -> JournalFacts {
         JournalFacts {
-            rounds_completed: 5,
-            consecutive_rounds_with_outcome: outcome_streak,
-            consecutive_rounds_without_outcome: zero_streak,
-            budget_remaining,
-            budget_max,
-            total_evidence_calls: 0,
-            total_errors: 0,
-            consecutive_read_only: 0,
-            total_tool_calls: 0,
-            stall_reason: None,
-            token_pressure: 0.0,
-            current_error_rate: 0.0,
-            task_completion_ratio: 0.0,
-            cache_hit_ratio: 0.0,
+            budget: BudgetSnapshot {
+                rounds_completed: 5,
+                budget_remaining,
+                budget_max,
+            },
+            streaks: StreakSnapshot {
+                consecutive_rounds_with_outcome: outcome_streak,
+                consecutive_rounds_without_outcome: zero_streak,
+                consecutive_read_only: 0,
+            },
+            performance: PerformanceSnapshot {
+                total_evidence_calls: 0,
+                total_errors: 0,
+                total_tool_calls: 0,
+                current_error_rate: 0.0,
+                cache_hit_ratio: 0.0,
+                token_pressure: 0.0,
+            },
+            stall: StallSnapshot { stall_reason: None },
+            task: TaskSnapshot {
+                task_completion_ratio: 0.0,
+            },
         }
     }
 
@@ -470,11 +520,9 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 4, 10);
         let actions = policy.decide(&f);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
     }
 
     #[test]
@@ -482,11 +530,9 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 8, 10);
         let actions = policy.decide(&f);
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
-        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
     }
 
     #[test]
@@ -494,11 +540,9 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 5, 10);
         let actions = policy.decide(&f);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
     }
 
     #[test]
@@ -506,11 +550,9 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 6, 10);
         let actions = policy.decide(&f);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
     }
 
     // ── Zero-streak signal (existing) ───────────────────────────────────────
@@ -520,11 +562,9 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 3, 7, 10);
         let actions = policy.decide(&f);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::InjectSignal { .. })));
     }
 
     #[test]
@@ -532,11 +572,9 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 2, 7, 10);
         let actions = policy.decide(&f);
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
-        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::InjectSignal { .. })));
     }
 
     // ── Continue default (existing) ─────────────────────────────────────────
@@ -569,6 +607,7 @@ mod tests {
             context_pressure: ContextPressurePolicy::default(),
             circuit: CircuitPolicy::default(),
             textless: TextlessPolicy::default(),
+            tuning: TuningPolicy::default(),
         };
         let f = facts(4, 0, 3, 10);
         let actions = policy.decide(&f);
@@ -591,6 +630,7 @@ mod tests {
             context_pressure: ContextPressurePolicy::default(),
             circuit: CircuitPolicy::default(),
             textless: TextlessPolicy::default(),
+            tuning: TuningPolicy::default(),
         };
         let f = facts(1, 0, 5, 10);
         let actions = policy.decide(&f);
@@ -609,15 +649,30 @@ mod tests {
     fn stall_overrides_all() {
         let policy = RuntimePolicy::default();
         let f = JournalFacts {
-            stall_reason: Some("Same tools called 3 times in a row".into()),
-            consecutive_rounds_with_outcome: 3,
-            consecutive_rounds_without_outcome: 3,
-            budget_remaining: 2,
-            budget_max: 10,
-            token_pressure: 0.95,
-            current_error_rate: 0.5,
-            task_completion_ratio: 1.0,
-            ..facts(3, 3, 2, 10)
+            stall: StallSnapshot {
+                stall_reason: Some("Same tools called 3 times in a row".into()),
+            },
+            streaks: StreakSnapshot {
+                consecutive_rounds_with_outcome: 3,
+                consecutive_rounds_without_outcome: 3,
+                consecutive_read_only: 0,
+            },
+            budget: BudgetSnapshot {
+                rounds_completed: 5,
+                budget_remaining: 2,
+                budget_max: 10,
+            },
+            performance: PerformanceSnapshot {
+                total_evidence_calls: 0,
+                total_errors: 0,
+                total_tool_calls: 0,
+                current_error_rate: 0.5,
+                cache_hit_ratio: 0.0,
+                token_pressure: 0.95,
+            },
+            task: TaskSnapshot {
+                task_completion_ratio: 1.0,
+            },
         };
         let actions = policy.decide(&f);
         // Stall signal takes priority; only one action returned even though
@@ -633,11 +688,9 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(2, 0, 3, 10);
         let actions = policy.decide(&f);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
     }
 
     #[test]
@@ -645,11 +698,9 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 3, 7, 10);
         let actions = policy.decide(&f);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::InjectSignal { .. })));
     }
 
     #[test]
@@ -670,23 +721,19 @@ mod tests {
 
         // State 2: outcome streak + tight budget → ExpandBudget
         let actions = policy.decide(&facts(2, 0, 3, 10));
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
 
         // State 3: zero streak → InjectSignal
         let actions = policy.decide(&facts(0, 3, 7, 10));
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::InjectSignal { .. })));
 
         // State 4: stall → InjectSignal only
         let mut stall_facts = facts(2, 0, 3, 10);
-        stall_facts.stall_reason = Some("stall".into());
+        stall_facts.stall.stall_reason = Some("stall".into());
         let actions = policy.decide(&stall_facts);
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], FrameworkAction::InjectSignal { .. }));
@@ -706,7 +753,7 @@ mod tests {
     fn context_pressure_signal_normal_on_pressure() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 10);
-        f.token_pressure = 0.75;
+        f.performance.token_pressure = 0.75;
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
@@ -720,7 +767,7 @@ mod tests {
     fn context_pressure_signal_aggressive_on_high_pressure() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 10);
-        f.token_pressure = 0.95;
+        f.performance.token_pressure = 0.95;
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
@@ -734,20 +781,18 @@ mod tests {
     fn context_pressure_signal_not_triggered_low_pressure() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 10);
-        f.token_pressure = 0.60;
+        f.performance.token_pressure = 0.60;
         let actions = policy.decide(&f);
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. }))
-        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. })));
     }
 
     #[test]
     fn context_pressure_signal_boundary_exact_threshold() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 10);
-        f.token_pressure = 0.70; // exactly at pressure_threshold
+        f.performance.token_pressure = 0.70; // exactly at pressure_threshold
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
@@ -761,7 +806,7 @@ mod tests {
     fn context_pressure_signal_boundary_just_below_aggressive() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 10);
-        f.token_pressure = 0.89; // below aggressive_pressure_threshold (0.90)
+        f.performance.token_pressure = 0.89; // below aggressive_pressure_threshold (0.90)
         let actions = policy.decide(&f);
         // Should get Normal, not Aggressive
         assert!(actions.iter().any(|a| matches!(
@@ -791,9 +836,10 @@ mod tests {
             },
             circuit: CircuitPolicy::default(),
             textless: TextlessPolicy::default(),
+            tuning: TuningPolicy::default(),
         };
         let mut f = facts(0, 0, 8, 10);
-        f.token_pressure = 0.55; // above custom threshold of 0.50
+        f.performance.token_pressure = 0.55; // above custom threshold of 0.50
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
@@ -809,7 +855,7 @@ mod tests {
     fn circuit_breaker_guidance_on_high_error_rate() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 20);
-        f.current_error_rate = 0.40;
+        f.performance.current_error_rate = 0.40;
         let actions = policy.decide(&f);
         assert!(
             actions
@@ -828,7 +874,7 @@ mod tests {
     fn circuit_breaker_guidance_on_read_only_streak() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 20);
-        f.consecutive_read_only = 10; // above default max_consecutive_reads (8)
+        f.streaks.consecutive_read_only = 10; // above default max_consecutive_reads (8)
         let actions = policy.decide(&f);
         assert!(
             actions
@@ -849,27 +895,25 @@ mod tests {
     fn circuit_breaker_guidance_on_zero_outcome_streak() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 20);
-        f.consecutive_rounds_without_outcome = 6; // above default max_consecutive_errors (5)
+        f.streaks.consecutive_rounds_without_outcome = 6; // above default max_consecutive_errors (5)
         let actions = policy.decide(&f);
         assert!(
             actions
                 .iter()
                 .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("without observable outcome")))
         );
-        assert!(
-            actions
-                .iter()
-                .all(|a| !matches!(a, FrameworkAction::ExpandBudget { .. }))
-        );
+        assert!(actions
+            .iter()
+            .all(|a| !matches!(a, FrameworkAction::ExpandBudget { .. })));
     }
 
     #[test]
     fn circuit_breaker_not_triggered_normal() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 20);
-        f.current_error_rate = 0.10;
-        f.consecutive_read_only = 2;
-        f.consecutive_rounds_without_outcome = 1;
+        f.performance.current_error_rate = 0.10;
+        f.streaks.consecutive_read_only = 2;
+        f.streaks.consecutive_rounds_without_outcome = 1;
         let actions = policy.decide(&f);
         assert!(
             !actions
@@ -882,7 +926,7 @@ mod tests {
     fn circuit_breaker_boundary_error_rate_exact() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 20);
-        f.current_error_rate = 0.30; // exactly at threshold — NOT triggered (strict >)
+        f.performance.current_error_rate = 0.30; // exactly at threshold — NOT triggered (strict >)
         let actions = policy.decide(&f);
         assert!(
             !actions
@@ -895,7 +939,7 @@ mod tests {
     fn circuit_breaker_boundary_error_rate_just_above_signals() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 20);
-        f.current_error_rate = 0.31; // just above threshold — triggered
+        f.performance.current_error_rate = 0.31; // just above threshold — triggered
         let actions = policy.decide(&f);
         assert!(
             actions
@@ -918,9 +962,10 @@ mod tests {
                 error_rate_threshold: 0.10,
             },
             textless: TextlessPolicy::default(),
+            tuning: TuningPolicy::default(),
         };
         let mut f = facts(0, 0, 8, 20);
-        f.current_error_rate = 0.15;
+        f.performance.current_error_rate = 0.15;
         let actions = policy.decide(&f);
         assert!(
             actions
@@ -935,7 +980,7 @@ mod tests {
     fn transition_completion_all_done() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 10);
-        f.task_completion_ratio = 1.0;
+        f.task.task_completion_ratio = 1.0;
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
@@ -949,13 +994,11 @@ mod tests {
     fn transition_not_triggered_incomplete() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 10);
-        f.task_completion_ratio = 0.5;
+        f.task.task_completion_ratio = 0.5;
         let actions = policy.decide(&f);
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
-        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. })));
     }
 
     #[test]
@@ -963,11 +1006,9 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 0, 10, 10); // task_completion_ratio = 0.0 (default)
         let actions = policy.decide(&f);
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
-        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. })));
     }
 
     // ── Multiple actions same turn (14 tests) ──────────────────────────────
@@ -976,8 +1017,8 @@ mod tests {
     fn multiple_actions_error_rate_and_pressure() {
         let policy = RuntimePolicy::default();
         let mut f = facts(1, 0, 8, 20);
-        f.current_error_rate = 0.40;
-        f.token_pressure = 0.75;
+        f.performance.current_error_rate = 0.40;
+        f.performance.token_pressure = 0.75;
         let actions = policy.decide(&f);
         assert!(actions.len() >= 2);
         assert!(
@@ -985,29 +1026,23 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
         );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. })));
     }
 
     #[test]
     fn multiple_actions_completion_and_expand() {
         let policy = RuntimePolicy::default();
         let mut f = facts(2, 0, 3, 10);
-        f.task_completion_ratio = 1.0;
+        f.task.task_completion_ratio = 1.0;
         let actions = policy.decide(&f);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
-        );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })));
     }
 
     // ── Zero all facts → Continue (unhappy path) ───────────────────────────
@@ -1017,20 +1052,28 @@ mod tests {
         let policy = RuntimePolicy::default();
         // All fields at their zero/default values.
         let f = JournalFacts {
-            rounds_completed: 0,
-            consecutive_rounds_with_outcome: 0,
-            consecutive_rounds_without_outcome: 0,
-            budget_remaining: 10,
-            budget_max: 10,
-            total_evidence_calls: 0,
-            total_errors: 0,
-            consecutive_read_only: 0,
-            total_tool_calls: 0,
-            stall_reason: None,
-            token_pressure: 0.0,
-            current_error_rate: 0.0,
-            task_completion_ratio: 0.0,
-            cache_hit_ratio: 0.0,
+            budget: BudgetSnapshot {
+                rounds_completed: 0,
+                budget_remaining: 10,
+                budget_max: 10,
+            },
+            streaks: StreakSnapshot {
+                consecutive_rounds_with_outcome: 0,
+                consecutive_rounds_without_outcome: 0,
+                consecutive_read_only: 0,
+            },
+            performance: PerformanceSnapshot {
+                total_evidence_calls: 0,
+                total_errors: 0,
+                total_tool_calls: 0,
+                current_error_rate: 0.0,
+                cache_hit_ratio: 0.0,
+                token_pressure: 0.0,
+            },
+            stall: StallSnapshot { stall_reason: None },
+            task: TaskSnapshot {
+                task_completion_ratio: 0.0,
+            },
         };
         let actions = policy.decide(&f);
         assert_eq!(actions.len(), 1);
@@ -1043,7 +1086,7 @@ mod tests {
     fn full_token_pressure_triggers_aggressive() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 10);
-        f.token_pressure = 1.0;
+        f.performance.token_pressure = 1.0;
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
@@ -1057,7 +1100,7 @@ mod tests {
     fn full_error_rate_triggers_guidance_signal() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 20);
-        f.current_error_rate = 1.0;
+        f.performance.current_error_rate = 1.0;
         let actions = policy.decide(&f);
         assert!(
             actions
@@ -1070,7 +1113,7 @@ mod tests {
     fn circuit_guidance_does_not_compute_budget_floor() {
         let policy = RuntimePolicy::default();
         let mut f = facts(0, 0, 8, 5);
-        f.current_error_rate = 0.40;
+        f.performance.current_error_rate = 0.40;
         let actions = policy.decide(&f);
         assert!(
             actions

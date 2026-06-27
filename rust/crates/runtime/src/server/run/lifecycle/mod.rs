@@ -146,6 +146,7 @@ fn load_budget_policy_from_config() -> Option<crate::turn::runtime_policy::Runti
         context_pressure: Default::default(),
         circuit: Default::default(),
         textless: Default::default(),
+        tuning: Default::default(),
     })
 }
 

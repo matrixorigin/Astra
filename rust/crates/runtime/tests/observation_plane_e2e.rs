@@ -15,10 +15,11 @@ use std::sync::Arc;
 
 use astra_core::observation::{ObservationFacet, TuningJob, TuningSignalType, TurnMetrics};
 use astra_core::observation_journal::{
-    JournalFacts, ObservationJournal, ObservationStore, StoredEntry,
+    BudgetSnapshot, JournalFacts, ObservationJournal, ObservationStore, PerformanceSnapshot,
+    StoredEntry, StreakSnapshot, TaskSnapshot, TuningStore,
 };
 use astra_runtime::turn::agentic_loop::host;
-use astra_runtime::turn::inspection_service::{InspectionService, local_reflect_from_snapshot};
+use astra_runtime::turn::inspection_service::{local_reflect_from_snapshot, InspectionService};
 use astra_runtime::turn::local_provider::LocalSessionProvider;
 use astra_runtime::turn::observation_dispatcher::{
     FileSink, FileTuningSink, MemorySink, ObservationDispatcher, ObservationEvent, ObservationSink,
@@ -26,7 +27,7 @@ use astra_runtime::turn::observation_dispatcher::{
 };
 use astra_runtime::turn::observation_store::FileObservationStore;
 use astra_runtime::turn::providers::{LiveRuntimeProvider, ObservationProvider};
-use astra_runtime::turn::runtime_policy::{FrameworkAction, RuntimePolicy};
+use astra_runtime::turn::runtime_policy::{FrameworkAction, RuntimePolicy, TuningPolicy};
 use astra_turn_core::introspect::{IntrospectSnapshot, StallSnapshotSummary};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -34,20 +35,17 @@ use astra_turn_core::introspect::{IntrospectSnapshot, StallSnapshotSummary};
 fn temp_store() -> (
     tempfile::TempDir,
     FileObservationStore,
-    Arc<dyn ObservationStore>,
+    Arc<FileObservationStore>,
 ) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = FileObservationStore::new(dir.path().to_path_buf());
-    let arc: Arc<dyn ObservationStore> =
+    let arc: Arc<FileObservationStore> =
         Arc::new(FileObservationStore::new(dir.path().to_path_buf()));
     (dir, store, arc)
 }
 
-fn make_provider<'a>(
-    state: &'a host::AgenticLoopState,
-    policy: &'a RuntimePolicy,
-) -> LocalSessionProvider<'a> {
-    LocalSessionProvider::new(state, policy)
+fn make_provider<'a>(state: &'a host::AgenticLoopState) -> LocalSessionProvider<'a> {
+    LocalSessionProvider::new(state)
 }
 
 fn make_turn_metrics(errors: u32, tools: u32, mutations: u32) -> TurnMetrics {
@@ -226,8 +224,7 @@ fn e2e_inspection_enriches_snapshot_with_live_metrics() {
     state.total_prompt = 200;
     state.total_cache_creation = 50;
 
-    let policy = RuntimePolicy::default();
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
     let service = InspectionService::new(&provider, &provider, &provider);
 
     let mut snapshot = IntrospectSnapshot::default();
@@ -259,8 +256,7 @@ fn e2e_inspection_live_metrics_reflects_error_rate() {
         state.observation_journal.record_turn(&metrics);
     }
 
-    let policy = RuntimePolicy::default();
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
     let metrics = InspectionService::new(&provider, &provider, &provider).build_live_metrics();
 
     assert!(!metrics.current_error_rate.is_nan());
@@ -270,8 +266,7 @@ fn e2e_inspection_live_metrics_reflects_error_rate() {
 #[test]
 fn e2e_inspection_enrich_preserves_existing_snapshot_fields() {
     let state = host::make_test_loop_state();
-    let policy = RuntimePolicy::default();
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
     let service = InspectionService::new(&provider, &provider, &provider);
 
     let mut snapshot = IntrospectSnapshot {
@@ -289,8 +284,7 @@ fn e2e_inspection_enrich_preserves_existing_snapshot_fields() {
 fn e2e_inspection_produces_non_empty_alerts_on_high_pressure() {
     let state = make_high_pressure_state();
 
-    let policy = RuntimePolicy::default();
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
     let metrics = InspectionService::new(&provider, &provider, &provider).build_live_metrics();
 
     assert!(
@@ -315,9 +309,15 @@ fn e2e_inspection_produces_non_empty_alerts_on_high_pressure() {
 fn e2e_policy_decide_signals_context_pressure_on_high_token_pressure() {
     // Test decide() directly with explicit facts — token_pressure > 0.70 threshold
     let facts = JournalFacts {
-        token_pressure: 0.85,
-        budget_remaining: 10,
-        budget_max: 10,
+        performance: PerformanceSnapshot {
+            token_pressure: 0.85,
+            ..Default::default()
+        },
+        budget: BudgetSnapshot {
+            budget_remaining: 10,
+            budget_max: 10,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let policy = RuntimePolicy::default();
@@ -336,9 +336,15 @@ fn e2e_policy_decide_signals_context_pressure_on_high_token_pressure() {
 #[test]
 fn e2e_policy_decide_aggressive_context_pressure_on_critical_pressure() {
     let facts = JournalFacts {
-        token_pressure: 0.92,
-        budget_remaining: 10,
-        budget_max: 10,
+        performance: PerformanceSnapshot {
+            token_pressure: 0.92,
+            ..Default::default()
+        },
+        budget: BudgetSnapshot {
+            budget_remaining: 10,
+            budget_max: 10,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let policy = RuntimePolicy::default();
@@ -362,8 +368,11 @@ fn e2e_policy_decide_aggressive_context_pressure_on_critical_pressure() {
 #[test]
 fn e2e_policy_decide_continue_when_healthy() {
     let facts = JournalFacts {
-        budget_remaining: 10,
-        budget_max: 10,
+        budget: BudgetSnapshot {
+            budget_remaining: 10,
+            budget_max: 10,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let policy = RuntimePolicy::default();
@@ -382,9 +391,15 @@ fn e2e_policy_decide_continue_when_healthy() {
 #[test]
 fn e2e_policy_decide_guidance_on_high_error_rate() {
     let facts = JournalFacts {
-        current_error_rate: 0.45,
-        budget_remaining: 10,
-        budget_max: 10,
+        performance: PerformanceSnapshot {
+            current_error_rate: 0.45,
+            ..Default::default()
+        },
+        budget: BudgetSnapshot {
+            budget_remaining: 10,
+            budget_max: 10,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let policy = RuntimePolicy::default();
@@ -403,9 +418,15 @@ fn e2e_policy_decide_guidance_on_high_error_rate() {
 #[test]
 fn e2e_policy_decide_guidance_on_read_only_streak() {
     let facts = JournalFacts {
-        consecutive_read_only: 9,
-        budget_remaining: 10,
-        budget_max: 10,
+        streaks: StreakSnapshot {
+            consecutive_read_only: 9,
+            ..Default::default()
+        },
+        budget: BudgetSnapshot {
+            budget_remaining: 10,
+            budget_max: 10,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let policy = RuntimePolicy::default();
@@ -424,9 +445,15 @@ fn e2e_policy_decide_guidance_on_read_only_streak() {
 #[test]
 fn e2e_policy_decide_transition_phase_on_completion() {
     let facts = JournalFacts {
-        task_completion_ratio: 1.0,
-        budget_remaining: 5,
-        budget_max: 10,
+        task: TaskSnapshot {
+            task_completion_ratio: 1.0,
+            ..Default::default()
+        },
+        budget: BudgetSnapshot {
+            budget_remaining: 5,
+            budget_max: 10,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let policy = RuntimePolicy::default();
@@ -450,9 +477,15 @@ fn e2e_policy_decide_transition_phase_on_completion() {
 #[test]
 fn e2e_policy_decide_expand_budget_on_outcome_streak() {
     let facts = JournalFacts {
-        consecutive_rounds_with_outcome: 3,
-        budget_remaining: 2,
-        budget_max: 10,
+        streaks: StreakSnapshot {
+            consecutive_rounds_with_outcome: 3,
+            ..Default::default()
+        },
+        budget: BudgetSnapshot {
+            budget_remaining: 2,
+            budget_max: 10,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let policy = RuntimePolicy::default();
@@ -472,11 +505,10 @@ fn e2e_policy_decide_expand_budget_on_outcome_streak() {
 fn e2e_inspection_generates_tuning_jobs_from_signals() {
     let state = make_high_pressure_state();
 
-    let policy = RuntimePolicy::default();
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
     let service = InspectionService::new(&provider, &provider, &provider);
 
-    let jobs = service.generate_tuning_signals(10, "e2e-tuning-test");
+    let jobs = service.generate_tuning_signals(10, "e2e-tuning-test", &TuningPolicy::default());
     assert!(
         !jobs.is_empty(),
         "should generate at least one tuning signal, got 0"
@@ -501,10 +533,9 @@ fn e2e_tuning_jobs_persist_through_store() {
 
     let state = make_high_pressure_state();
 
-    let policy = RuntimePolicy::default();
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
     let service = InspectionService::new(&provider, &provider, &provider);
-    let jobs = service.generate_tuning_signals(5, sid);
+    let jobs = service.generate_tuning_signals(5, sid, &TuningPolicy::default());
 
     if !jobs.is_empty() {
         let raw_json = serde_json::to_string(&jobs).expect("serialize");
@@ -528,8 +559,7 @@ fn e2e_reflect_local_session_summary() {
     state.observation_journal = ObservationJournal::default();
     populate_journal(&mut state.observation_journal, 8);
 
-    let policy = RuntimePolicy::default();
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
     let service = InspectionService::new(&provider, &provider, &provider);
 
     let summary = service.local_reflect_summary(ObservationFacet::Session, 10);
@@ -554,8 +584,7 @@ fn e2e_reflect_local_errors_summary() {
         state.observation_journal.record_turn(&metrics);
     }
 
-    let policy = RuntimePolicy::default();
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
     let service = InspectionService::new(&provider, &provider, &provider);
 
     let summary = service.local_reflect_summary(ObservationFacet::Errors, 10);
@@ -615,17 +644,16 @@ fn e2e_reflect_from_snapshot_stall_facet() {
 #[test]
 fn e2e_empty_journal_produces_safe_defaults() {
     let state = host::make_test_loop_state();
-    let policy = RuntimePolicy::default();
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
 
     assert!(provider.journal_is_empty());
     assert_eq!(provider.journal_len(), 0);
 
     let facts = provider.extract_facts();
-    assert_eq!(facts.consecutive_rounds_with_outcome, 0);
-    assert_eq!(facts.consecutive_rounds_without_outcome, 0);
-    assert!((facts.current_error_rate - 0.0).abs() < f64::EPSILON);
-    assert!((facts.cache_hit_ratio - 0.0).abs() < f64::EPSILON);
+    assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
+    assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
+    assert!((facts.performance.current_error_rate - 0.0).abs() < f64::EPSILON);
+    assert!((facts.performance.cache_hit_ratio - 0.0).abs() < f64::EPSILON);
 
     let service = InspectionService::new(&provider, &provider, &provider);
     let metrics = service.build_live_metrics();
@@ -843,20 +871,25 @@ fn e2e_inspection_without_tool_calls_produces_zero_error_rate() {
         state.observation_journal.record_turn(&metrics);
     }
 
-    let policy = RuntimePolicy::default();
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
     let facts = provider.extract_facts();
-    assert!(!facts.current_error_rate.is_nan());
-    assert!((facts.current_error_rate - 0.0).abs() < f64::EPSILON);
+    assert!(!facts.performance.current_error_rate.is_nan());
+    assert!((facts.performance.current_error_rate - 0.0).abs() < f64::EPSILON);
 }
 
 #[test]
 fn e2e_policy_respects_context_pressure_policy_thresholds() {
     // Use explicit facts — token_pressure=0.60 with custom threshold 0.50
     let facts = JournalFacts {
-        token_pressure: 0.60,
-        budget_remaining: 10,
-        budget_max: 10,
+        performance: PerformanceSnapshot {
+            token_pressure: 0.60,
+            ..Default::default()
+        },
+        budget: BudgetSnapshot {
+            budget_remaining: 10,
+            budget_max: 10,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -891,9 +924,9 @@ fn e2e_policy_circuit_breaker_respects_custom_max_errors() {
     let mut policy = RuntimePolicy::default();
     policy.circuit.max_consecutive_errors = 2;
 
-    let provider = make_provider(&state, &policy);
+    let provider = make_provider(&state);
     let mut facts = provider.extract_facts();
-    facts.token_pressure = provider.token_pressure();
+    facts.performance.token_pressure = provider.token_pressure();
 
     let decisions = policy.decide(&facts);
     let has_adjustment = decisions.iter().any(|d| {

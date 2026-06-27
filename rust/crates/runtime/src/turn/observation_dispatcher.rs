@@ -27,7 +27,9 @@
 use std::sync::Arc;
 
 use astra_core::observation::{TuningJob, TurnMetrics};
-use astra_core::observation_journal::{JournalFacts, ObservationJournal, ObservationStore};
+use astra_core::observation_journal::{
+    JournalFacts, ObservationJournal, ObservationStore, TuningStore,
+};
 
 use super::runtime_policy::FrameworkAction;
 
@@ -172,7 +174,7 @@ pub trait TuningSink {
 /// The file path follows the same convention as [`FileObservationStore`]:
 /// `~/.astra/observations/{session_id}.tuning.jsonl`
 pub struct FileTuningSink {
-    store: Option<Arc<dyn ObservationStore>>,
+    store: Option<Arc<dyn TuningStore>>,
     session_id: String,
 }
 
@@ -186,7 +188,7 @@ impl std::fmt::Debug for FileTuningSink {
 }
 
 impl FileTuningSink {
-    pub fn new(store: Option<Arc<dyn ObservationStore>>, session_id: String) -> Self {
+    pub fn new(store: Option<Arc<dyn TuningStore>>, session_id: String) -> Self {
         Self { store, session_id }
     }
 }
@@ -503,7 +505,8 @@ mod tests {
         assert!(dbg_none.contains("has_store: false"));
 
         let store = crate::turn::observation_store::test_store();
-        let sink_some = FileTuningSink::new(store, "s2".to_string());
+        let store_tuning: Option<Arc<dyn TuningStore>> = store.map(|s| s as Arc<dyn TuningStore>);
+        let sink_some = FileTuningSink::new(store_tuning, "s2".to_string());
         let dbg_some = format!("{:?}", sink_some);
         assert!(dbg_some.contains("s2"));
         assert!(dbg_some.contains("has_store: true"));
@@ -512,7 +515,7 @@ mod tests {
     #[test]
     fn file_tuning_sink_writes_jobs_to_temp_store() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let store: Arc<dyn ObservationStore> = Arc::new(
+        let store: Arc<dyn TuningStore> = Arc::new(
             crate::turn::observation_store::FileObservationStore::new(dir.path().to_path_buf()),
         );
         let mut sink = FileTuningSink::new(Some(store.clone()), "tsink-session".to_string());

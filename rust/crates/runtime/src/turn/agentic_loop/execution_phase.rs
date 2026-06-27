@@ -484,9 +484,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         {
             // Construct a lightweight provider for live metrics.
             use crate::turn::providers::{LiveRuntimeProvider, SessionStateProvider};
-            let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
             let status_provider =
-                crate::turn::local_provider::LocalSessionProvider::new(state, &default_policy);
+                crate::turn::local_provider::LocalSessionProvider::new(state);
             let cb_state = status_provider.circuit_breaker_state().to_string();
             let cache_ratio = status_provider.cache_hit_ratio();
             let token_pressure = status_provider.token_pressure();
@@ -652,12 +651,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         use crate::turn::providers::{
             LiveRuntimeProvider, ObservationProvider, SessionStateProvider,
         };
-        use crate::turn::runtime_policy::{FrameworkAction, RuntimePolicy};
+        use crate::turn::runtime_policy::FrameworkAction;
         use astra_core::observation_journal::JournalFacts;
 
-        let default_policy = RuntimePolicy::default();
-        let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
-        let provider = LocalSessionProvider::new(state, policy);
+        let provider = LocalSessionProvider::new(state);
 
         // Extract journal facts from the ObservationProvider trait.
         let mut facts = provider.extract_facts();
@@ -665,20 +662,22 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         // Populate session-wide fields from authoritative state.
         // extract_facts provides streak and budget data from the journal
         // window; these fields come from the full session state.
-        facts.rounds_completed = state.llm_rounds_completed;
-        facts.total_evidence_calls = state.total_evidence_tool_calls;
-        facts.total_errors = state.turn_guard.health.recent_errors(10).len() as u32;
-        facts.total_tool_calls = state.total_tool_calls;
+        facts.budget.rounds_completed = state.llm_rounds_completed;
+        facts.performance.total_evidence_calls = state.total_evidence_tool_calls;
+        facts.performance.total_errors = state.turn_guard.health.recent_errors(10).len() as u32;
+        facts.performance.total_tool_calls = state.total_tool_calls;
 
         // Stall reason from the unified stall diagnosis.
-        facts.stall_reason = interruption_diagnosis_summary(state);
+        facts.stall.stall_reason = interruption_diagnosis_summary(state);
 
         // Populate token pressure from the LiveRuntimeProvider.
-        facts.token_pressure = provider.token_pressure();
+        facts.performance.token_pressure = provider.token_pressure();
 
         // Populate task completion ratio from the SessionStateProvider.
-        facts.task_completion_ratio = provider.task_completion_ratio();
+        facts.task.task_completion_ratio = provider.task_completion_ratio();
 
+        let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
+        let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
         let actions = policy.decide(&facts);
         for action in actions {
             match action {
@@ -723,7 +722,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                 }
                 FrameworkAction::SignalContextPressure { urgency } => {
-                    let pressure = facts.token_pressure;
+                    let pressure = facts.performance.token_pressure;
                     let msg = format!(
                         "[Context pressure] Token pressure is {:.0}% ({urgency}). Conserve context: reuse prior tool results, avoid duplicate reads, summarize current evidence briefly, and prefer targeted next actions.",
                         pressure * 100.0,
@@ -752,14 +751,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         // Signal completion — inject a stronger nudge when all tasks are done.
                         let completion_msg = format!(
                             "[Framework action] All tasks completed (ratio: {:.0}%). Consider finalizing the turn.",
-                            facts.task_completion_ratio * 100.0,
+                            facts.task.task_completion_ratio * 100.0,
                         );
                         state.push_volatile(super::host::VolatileKind::Corrective, completion_msg);
                     }
                     tracing::info!(
                         target: "astra::policy",
                         %target,
-                        completion_ratio = facts.task_completion_ratio,
+                        completion_ratio = facts.task.task_completion_ratio,
                         "Policy-driven phase transition"
                     );
                 }

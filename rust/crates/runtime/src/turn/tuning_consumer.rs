@@ -28,7 +28,7 @@ use std::sync::Arc;
 use astra_core::observation::{
     OptimizationSuggestion, TuningAggregation, TuningJob, TuningSignalType, TuningSummary,
 };
-use astra_core::observation_journal::ObservationStore;
+use astra_core::observation_journal::TuningStore;
 
 // ── TuningConsumer ────────────────────────────────────────────────────────
 
@@ -44,12 +44,12 @@ use astra_core::observation_journal::ObservationStore;
 /// }
 /// ```
 pub struct TuningConsumer {
-    store: Arc<dyn ObservationStore>,
+    store: Arc<dyn TuningStore>,
 }
 
 impl TuningConsumer {
-    /// Create a new consumer backed by the given observation store.
-    pub fn new(store: Arc<dyn ObservationStore>) -> Self {
+    /// Create a new consumer backed by the given tuning store.
+    pub fn new(store: Arc<dyn TuningStore>) -> Self {
         Self { store }
     }
 
@@ -72,7 +72,7 @@ impl TuningConsumer {
                         // in case the serialized value differs.
                         let mut job = job;
                         if job.session_id != *sid {
-                            tracing::debug!(
+                            tracing::warn!(
                                 stored_sid = %job.session_id,
                                 file_sid = %sid,
                                 "tuning job session_id mismatch; using file-level"
@@ -444,16 +444,12 @@ mod tests {
 
         let session_jobs: Vec<_> = jobs.iter().filter(|(sid, _)| *sid == sess).collect();
         assert_eq!(session_jobs.len(), 2);
-        assert!(
-            session_jobs
-                .iter()
-                .any(|(_, j)| j.signal == TuningSignalType::PromptCompaction)
-        );
-        assert!(
-            session_jobs
-                .iter()
-                .any(|(_, j)| j.signal == TuningSignalType::CacheWarming)
-        );
+        assert!(session_jobs
+            .iter()
+            .any(|(_, j)| j.signal == TuningSignalType::PromptCompaction));
+        assert!(session_jobs
+            .iter()
+            .any(|(_, j)| j.signal == TuningSignalType::CacheWarming));
     }
 
     // ── aggregate ────────────────────────────────────────────────────────

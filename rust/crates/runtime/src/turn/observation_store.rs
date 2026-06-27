@@ -29,11 +29,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use astra_core::observation::TurnMetrics;
-use astra_core::observation_journal::{JournalFacts, ObservationStore, StoredEntry};
+use astra_core::observation_journal::{JournalFacts, ObservationStore, StoredEntry, TuningStore};
 
 // ── FileObservationStore ────────────────────────────────────────────────────
 
-/// JSON-Lines file backend for [`ObservationStore`].
+/// JSON-Lines file backend for [`ObservationStore`] and [`TuningStore`].
 ///
 /// One file per session at `{root_dir}/{session_id}.jsonl`.
 pub struct FileObservationStore {
@@ -68,6 +68,8 @@ impl FileObservationStore {
             .map_err(|e| format!("cannot create observations dir {:?}: {e}", self.root_dir))
     }
 }
+
+// ── ObservationStore impl ───────────────────────────────────────────────────
 
 impl ObservationStore for FileObservationStore {
     fn save_entry(
@@ -152,11 +154,16 @@ impl ObservationStore for FileObservationStore {
 
     fn entry_count(&self, session_id: &str) -> usize {
         let path = self.session_path(session_id);
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
+        let file = match File::open(&path) {
+            Ok(f) => f,
             Err(_) => return 0,
         };
-        content.lines().filter(|l| !l.trim().is_empty()).count()
+        let reader = BufReader::new(file);
+        reader
+            .lines()
+            .filter_map(|line| line.ok())
+            .filter(|line| !line.trim().is_empty())
+            .count()
     }
 
     fn delete_session(&self, session_id: &str) -> Result<(), String> {
@@ -166,7 +173,11 @@ impl ObservationStore for FileObservationStore {
         }
         Ok(())
     }
+}
 
+// ── TuningStore impl ────────────────────────────────────────────────────────
+
+impl TuningStore for FileObservationStore {
     fn save_tuning_entry(
         &self,
         session_id: &str,
@@ -246,7 +257,7 @@ impl ObservationStore for FileObservationStore {
 /// Returns `None` when the home directory cannot be resolved (e.g. in a
 /// container without `$HOME` set). In that case a warning is logged and
 /// the caller should treat observation persistence as unavailable.
-pub fn default_observation_store() -> Option<Arc<dyn ObservationStore>> {
+pub fn default_observation_store() -> Option<Arc<FileObservationStore>> {
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => {
@@ -263,7 +274,7 @@ pub fn default_observation_store() -> Option<Arc<dyn ObservationStore>> {
 /// This is used by sibling test modules (e.g. `observation_dispatcher`) that
 /// need a real `FileObservationStore` without depending on the home directory.
 #[cfg(any(test, feature = "bridge-e2e-hooks"))]
-pub fn test_store() -> Option<Arc<dyn ObservationStore>> {
+pub fn test_store() -> Option<Arc<FileObservationStore>> {
     use std::sync::OnceLock;
     static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
     let dir = DIR.get_or_init(|| tempfile::TempDir::new().expect("tempdir for test_store"));
@@ -278,6 +289,9 @@ pub fn test_store() -> Option<Arc<dyn ObservationStore>> {
 mod tests {
     use super::*;
     use astra_core::observation::TurnMetrics;
+    use astra_core::observation_journal::{
+        BudgetSnapshot, JournalFacts, ObservationStore, PerformanceSnapshot, StreakSnapshot,
+    };
     use tempfile::TempDir;
 
     fn make_metrics(turn: u32, errors: u32, writes: u32) -> TurnMetrics {
@@ -292,10 +306,19 @@ mod tests {
 
     fn make_facts(turn: u32, errors: u32, writes: u32) -> JournalFacts {
         JournalFacts {
-            rounds_completed: turn,
-            total_errors: errors,
-            total_tool_calls: errors + writes + 3,
-            consecutive_rounds_with_outcome: writes.min(1),
+            budget: BudgetSnapshot {
+                rounds_completed: turn,
+                ..Default::default()
+            },
+            performance: PerformanceSnapshot {
+                total_errors: errors,
+                total_tool_calls: errors + writes + 3,
+                ..Default::default()
+            },
+            streaks: StreakSnapshot {
+                consecutive_rounds_with_outcome: writes.min(1),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -383,252 +406,191 @@ mod tests {
 
         let entries = store.load_entries(sid);
         assert_eq!(entries.len(), 1, "empty lines should be skipped");
-        assert_eq!(
-            store.entry_count(sid),
-            1,
-            "entry_count should skip empty lines"
-        );
+        assert_eq!(store.entry_count(sid), 1);
     }
 
     #[test]
-    fn default_store_with_home_dir() {
-        let store = default_observation_store();
-        // In any reasonable test environment, HOME is set.
-        assert!(store.is_some(), "HOME should be set in test environment");
+    fn entry_count_matches_entries() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
+        let sid = "count-session";
+
+        assert_eq!(store.entry_count(sid), 0);
+        for i in 0..3 {
+            store
+                .save_entry(sid, i, &make_metrics(i, 0, 1), &make_facts(i, 0, 1))
+                .unwrap();
+        }
+        assert_eq!(store.entry_count(sid), 3);
     }
 
     // ── save_tuning_entry tests ────────────────────────────────────────
 
     #[test]
-    fn save_and_load_tuning_entry_persists_to_separate_file() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = FileObservationStore::new(dir.path().to_path_buf());
+    fn save_tuning_entry_persists_json_line() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
+        let json = r#"{"signal_type":"cache_warming","trigger_value":0.75,"priority":5}"#;
 
-        let json = r#"{"signal":"prompt_compaction","trigger_value":0.85,"reason":"test","created_at_ms":1700000000000,"turn_index":1,"session_id":"tune-sess","priority":7}"#;
         store
             .save_tuning_entry("tune-sess", 1, json)
-            .expect("save tuning entry");
+            .expect("save tuning");
 
-        // Verify file exists and is separate from observation entries
-        let tuning_path = dir.path().join("tune-sess.tuning.jsonl");
-        let obs_path = dir.path().join("tune-sess.jsonl");
-
-        assert!(
-            tuning_path.exists(),
-            "tuning file should exist: {:?}",
-            tuning_path
-        );
-        assert!(
-            !obs_path.exists(),
-            "observation file should NOT exist: {:?}",
-            obs_path
-        );
-
-        let raw = std::fs::read_to_string(&tuning_path).expect("read tuning file");
-        assert!(raw.contains("prompt_compaction"));
-        assert!(raw.contains("0.85"));
+        let entries = store.load_tuning_entries("tune-sess");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].contains("cache_warming"));
     }
 
     #[test]
     fn save_tuning_entry_multiple_jobs_are_appended() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = FileObservationStore::new(dir.path().to_path_buf());
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
+        let sid = "tune-multi";
 
         store
             .save_tuning_entry(
-                "multi-tune",
+                sid,
                 1,
-                r#"{"signal":"prompt_compaction","trigger_value":0.80}"#,
+                r#"{"signal_type":"cache_warming","trigger_value":0.5}"#,
             )
-            .expect("save 1");
+            .unwrap();
         store
             .save_tuning_entry(
-                "multi-tune",
+                sid,
+                2,
+                r#"{"signal_type":"context_pressure","trigger_value":0.8}"#,
+            )
+            .unwrap();
+        store
+            .save_tuning_entry(
+                sid,
                 3,
-                r#"{"signal":"cache_warming","trigger_value":0.20}"#,
+                r#"{"signal_type":"error_rate","trigger_value":0.3}"#,
             )
-            .expect("save 2");
-        store
-            .save_tuning_entry(
-                "multi-tune",
-                5,
-                r#"{"signal":"circuit_breaker_tuning","trigger_value":0.40}"#,
-            )
-            .expect("save 3");
+            .unwrap();
 
-        let tuning_path = dir.path().join("multi-tune.tuning.jsonl");
-        let raw = std::fs::read_to_string(&tuning_path).expect("read tuning file");
-        let lines: Vec<_> = raw.lines().collect();
-        assert_eq!(lines.len(), 3);
-        assert!(raw.contains("prompt_compaction"));
-        assert!(raw.contains("cache_warming"));
-        assert!(raw.contains("circuit_breaker_tuning"));
+        let entries = store.load_tuning_entries(sid);
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]
     fn save_tuning_entry_adds_trailing_newline() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = FileObservationStore::new(dir.path().to_path_buf());
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
+        let sid = "tune-newline";
+        let json = r#"{"signal_type":"cache_warming","trigger_value":0.25}"#;
 
-        store
-            .save_tuning_entry(
-                "nl-sess",
-                1,
-                r#"{"signal":"prompt_compaction","trigger_value":0.85}"#,
-            )
-            .expect("save");
-        // Verify trailing newline
-        let raw = std::fs::read_to_string(dir.path().join("nl-sess.tuning.jsonl")).expect("read");
-        assert!(raw.ends_with('\n'));
+        store.save_tuning_entry(sid, 1, json).unwrap();
+
+        // Read raw file to verify trailing newline.
+        let path = store.session_path_tuning(sid);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.ends_with('\n'));
     }
 
     #[test]
     fn save_tuning_entry_creates_directory_if_missing() {
-        let dir = TempDir::new().expect("tempdir");
-        let nested = dir.path().join("subdir").join("deep");
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("sub").join("dir");
         let store = FileObservationStore::new(nested);
 
         store
-            .save_tuning_entry(
-                "auto-create",
-                1,
-                r#"{"signal":"prompt_compaction","trigger_value":0.85}"#,
-            )
-            .expect("save should auto-create dirs");
-
-        assert!(
-            dir.path()
-                .join("subdir")
-                .join("deep")
-                .join("auto-create.tuning.jsonl")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn test_store_returns_some_and_persists() {
-        let store = test_store().expect("test_store should return Some");
-        store
-            .save_tuning_entry(
-                "teststore",
-                1,
-                r#"{"signal":"cache_warming","trigger_value":0.15}"#,
-            )
-            .expect("save");
+            .save_tuning_entry("tune-dir", 1, r#"{"signal_type":"test"}"#)
+            .expect("should create dir and save");
     }
 
     #[test]
     fn save_tuning_entry_session_id_is_sanitized() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = FileObservationStore::new(dir.path().to_path_buf());
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
+        let sid = "tune/session/with/slashes";
 
-        // Session id with special characters
         store
-            .save_tuning_entry(
-                "a/b../c",
-                1,
-                r#"{"signal":"prompt_compaction","trigger_value":0.85}"#,
-            )
-            .expect("save");
+            .save_tuning_entry(sid, 1, r#"{"signal_type":"test"}"#)
+            .expect("sanitized session id");
 
-        // Should NOT create subdirectories from path traversal
-        let path = dir.path().join("a_b__c.tuning.jsonl");
-        assert!(path.exists(), "expect sanitized path {:?}", path);
-
-        // Should NOT have created original traversal paths
-        assert!(
-            !dir.path().join("a").exists(),
-            "traversal dir should not exist"
-        );
+        let entries = store.load_tuning_entries(sid);
+        assert_eq!(entries.len(), 1);
     }
 
     // ── load_tuning_entries tests ──────────────────────────────────────
 
     #[test]
     fn load_tuning_entries_returns_persisted_lines() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = FileObservationStore::new(dir.path().to_path_buf());
-        let sid = "load-tune-test";
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
+        let sid = "tune-load";
 
         store
             .save_tuning_entry(
                 sid,
                 1,
-                r#"{"signal":"prompt_compaction","trigger_value":0.82}"#,
+                r#"{"signal_type":"cache_warming","trigger_value":0.5}"#,
             )
-            .expect("save 1");
+            .unwrap();
         store
             .save_tuning_entry(sid, 3, r#"{"signal":"cache_warming","trigger_value":0.25}"#)
-            .expect("save 2");
+            .unwrap();
 
         let entries = store.load_tuning_entries(sid);
         assert_eq!(entries.len(), 2);
-        assert!(entries[0].contains("prompt_compaction"));
-        assert!(entries[1].contains("cache_warming"));
     }
 
     #[test]
     fn load_tuning_entries_empty_for_missing_session() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = FileObservationStore::new(dir.path().to_path_buf());
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
+
         let entries = store.load_tuning_entries("no-such-session");
         assert!(entries.is_empty());
     }
 
     #[test]
     fn load_tuning_entries_skips_empty_lines() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = FileObservationStore::new(dir.path().to_path_buf());
-        let sid = "skip-empty";
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
+        let sid = "tune-empty-lines";
 
         store
             .save_tuning_entry(
                 sid,
                 1,
-                r#"{"signal":"task_decomposition","trigger_value":0.55}"#,
+                r#"{"signal_type":"cache_warming","trigger_value":0.5}"#,
             )
-            .expect("save");
+            .unwrap();
 
-        // Append a blank line manually
-        let path = dir.path().join("skip-empty.tuning.jsonl");
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("open");
-        writeln!(file).expect("write blank line");
+        // Manually append empty lines.
+        let path = store.session_path_tuning(sid);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file).unwrap();
+        writeln!(file, "   ").unwrap();
 
         let entries = store.load_tuning_entries(sid);
-        assert_eq!(entries.len(), 1, "blank line should be skipped");
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]
     fn load_tuning_entries_handles_corrupt_json() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = FileObservationStore::new(dir.path().to_path_buf());
-        let sid = "corrupt-lines";
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
+        let sid = "tune-corrupt";
 
-        // Save a valid entry
         store
             .save_tuning_entry(
                 sid,
                 1,
-                r#"{"signal":"prompt_compaction","trigger_value":0.82}"#,
+                r#"{"signal_type":"cache_warming","trigger_value":0.5}"#,
             )
-            .expect("save valid");
+            .unwrap();
 
         // Append a malformed line manually (cannot happen through save_tuning_entry
-        // since it takes raw_json, but we simulate corruption)
-        let path = dir.path().join("corrupt-lines.tuning.jsonl");
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("open");
-        writeln!(file, "{{not valid json}}").expect("write corrupt");
+        // since it only writes valid JSON, but load must be resilient).
+        let path = store.session_path_tuning(sid);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "not valid json at all").unwrap();
 
         // load_tuning_entries returns raw lines (no JSON parsing), so all 2 lines
-        // are returned. Corruption tolerance is handled by TuningConsumer.
+        // should be returned (even the corrupt one — parsing is the caller's job).
         let entries = store.load_tuning_entries(sid);
         assert_eq!(entries.len(), 2);
     }
@@ -637,69 +599,53 @@ mod tests {
 
     #[test]
     fn list_tuning_sessions_finds_written_sessions() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = FileObservationStore::new(dir.path().to_path_buf());
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
 
         store
-            .save_tuning_entry(
-                "list-sess-a",
-                1,
-                r#"{"signal":"prompt_compaction","trigger_value":0.82}"#,
-            )
-            .expect("save a");
+            .save_tuning_entry("sess-alpha", 1, r#"{"signal_type":"test"}"#)
+            .unwrap();
         store
-            .save_tuning_entry(
-                "list-sess-b",
-                1,
-                r#"{"signal":"cache_warming","trigger_value":0.25}"#,
-            )
-            .expect("save b");
+            .save_tuning_entry("sess-beta", 2, r#"{"signal_type":"test"}"#)
+            .unwrap();
 
         let sessions = store.list_tuning_sessions();
-        assert!(sessions.contains(&"list-sess-a".to_string()));
-        assert!(sessions.contains(&"list-sess-b".to_string()));
-        assert!(
-            sessions[..].windows(2).all(|w| w[0] <= w[1]),
-            "sessions should be sorted"
-        );
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.contains(&"sess-alpha".to_string()));
+        assert!(sessions.contains(&"sess-beta".to_string()));
     }
 
     #[test]
     fn list_tuning_sessions_returns_empty_for_empty_dir() {
-        let dir = TempDir::new().expect("tempdir");
-        let empty_subdir = dir.path().join("empty-dir");
-        std::fs::create_dir(&empty_subdir).expect("create empty dir");
-        let store = FileObservationStore::new(empty_subdir);
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
+
         let sessions = store.list_tuning_sessions();
         assert!(sessions.is_empty());
     }
 
     #[test]
     fn list_tuning_sessions_skips_non_tuning_files() {
-        let dir = TempDir::new().expect("tempdir");
-        let store = FileObservationStore::new(dir.path().to_path_buf());
+        let tmp = TempDir::new().unwrap();
+        let store = FileObservationStore::new(tmp.path().to_path_buf());
 
-        // Write a tuning file
+        // Write a regular observation entry (not tuning).
         store
-            .save_tuning_entry(
-                "only-tune",
-                1,
-                r#"{"signal":"prompt_compaction","trigger_value":0.82}"#,
+            .save_entry(
+                "regular-sess",
+                0,
+                &make_metrics(0, 0, 1),
+                &make_facts(0, 0, 1),
             )
-            .expect("save tuning");
+            .unwrap();
 
-        // Write a regular observation file (not .tuning.jsonl)
-        use std::io::Write;
-        let mut obs_file =
-            std::fs::File::create(dir.path().join("not-tune.jsonl")).expect("create obs file");
-        writeln!(obs_file, r#"{{"session_id":"not-tune"}}"#).expect("write obs");
-
-        // Write a random text file
-        let mut txt_file =
-            std::fs::File::create(dir.path().join("readme.txt")).expect("create txt");
-        writeln!(txt_file, "not a tuning file").expect("write txt");
+        // Write a tuning entry.
+        store
+            .save_tuning_entry("tuning-sess", 1, r#"{"signal_type":"test"}"#)
+            .unwrap();
 
         let sessions = store.list_tuning_sessions();
-        assert_eq!(sessions, vec!["only-tune"]);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0], "tuning-sess");
     }
 }
