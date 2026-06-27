@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use astra_core::render_compact_status;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, DeferredInputState, HostTurnResult,
@@ -463,12 +464,75 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
         m.get("content")
             .and_then(|c| c.as_str())
-            .is_some_and(|s| s.contains("## ⚡ Round Budget") || s.contains("## ⚠ Round Budget"))
+            .is_some_and(|s| {
+                s.contains("## ⚡ Round Budget")
+                    || s.contains("## ⚠ Round Budget")
+                    || s.contains("## ⚡ Self-Status")
+            })
     }
 
     if !host.injects_round_guidance() {
-        // Drop any stale guidance message(s) from prior rounds before this call.
+        // Drop any stale guidance/status messages from prior rounds.
         state.messages.retain(|m| !is_ephemeral_round_budget_msg(m));
+
+        // ── Self-Status injection (push-mode observation) ─────────────────
+        // Always inject a compact self-status block so the agent sees its
+        // current health (token pressure, trends, alerts, circuit breaker)
+        // without needing to call `introspect`. This closes the pull→push gap.
+        // Skip when budget is exhausted — the agent should produce final
+        // output, not introspect.
+        if state.remaining_turns > 0
+            && (state.llm_rounds_completed > 0 || !state.observation_journal.is_empty()) {
+            let cb_state = format!(
+                "{:?}",
+                state.stall.circuit_breaker.state()
+            )
+            .to_lowercase();
+            let total_in = state.total_prompt
+                + state.total_cache_read
+                + state.total_cache_creation;
+            let cache_ratio = if total_in > 0 {
+                state.total_cache_read as f64 / total_in as f64
+            } else {
+                0.0
+            };
+            let token_pressure = super::host::introspect_token_pressure(state);
+            let alerts: Vec<String> = {
+                let mut a = Vec::new();
+                if state.stall.forced_execution_escalation {
+                    a.push("execution_escalation".to_string());
+                }
+                if state.stall.drift_nudge_count > 0 {
+                    a.push(format!("drift_nudges={}", state.stall.drift_nudge_count));
+                }
+                if state.stall.nudge_count > 0 {
+                    a.push(format!("stall_nudges={}", state.stall.nudge_count));
+                }
+                if !state.turn_guard.health.recent_errors(10).is_empty() {
+                    a.push(format!(
+                        "tool_errors={}",
+                        state.turn_guard.health.recent_errors(10).len()
+                    ));
+                }
+                a
+            };
+            let status = render_compact_status(
+                &state.observation_journal,
+                &alerts,
+                &cb_state,
+                token_pressure,
+                cache_ratio,
+                state.llm_rounds_completed,
+                state.remaining_turns as u32,
+            );
+            if !status.is_empty() {
+                astra_turn_core::chat_history_openai::append_openai_user_content_messages(
+                    &mut state.messages,
+                    &[status],
+                );
+            }
+        }
+
         if !suppress_nudges {
             let guidance =
                 crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);

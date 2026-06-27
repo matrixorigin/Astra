@@ -53,6 +53,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use astra_core::ObservationJournal;
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::{ToolCallRecord, TraceSpanBuilder};
 use astra_services::{DatabaseEvaluationService, DatabaseEventService};
@@ -550,6 +551,38 @@ pub(crate) fn build_introspect_snapshot(
         })
         .collect();
 
+    // ── Build live alerts from stall / drift / error state ──
+    let mut alerts: Vec<String> = Vec::new();
+    let forced = &stall_state.forced_corrections;
+    if !forced.is_empty() {
+        alerts.push(format!("forced_corrections: {}", forced.join(", ")));
+    }
+    if stall_state.drift_nudge_count > 0 {
+        alerts.push(format!(
+            "drift_nudge_count={} drift_nudge_count_last_round={}",
+            stall_state.drift_nudge_count, stall_state.last_drift_correction_round,
+        ));
+    }
+    if stall_state.nudge_count > 0 {
+        alerts.push(format!("stall_nudge_count={}", stall_state.nudge_count));
+    }
+    if !state.turn_guard.health.recent_errors(10).is_empty() {
+        alerts.push(format!(
+            "recent_tool_errors={}",
+            state.turn_guard.health.recent_errors(10).len()
+        ));
+    }
+
+    let circuit_breaker = {
+        let cb = &state.stall.circuit_breaker;
+        Some(astra_turn_core::introspect::CircuitBreakerSnapshot {
+            state: format!("{:?}", cb.state()).to_lowercase(),
+            failure_count: cb.rounds_completed() as u64,
+            success_count: 0, // LoopCircuitBreaker does not expose success count
+            consecutive_failures: cb.consecutive_read_only() as u64,
+        })
+    };
+
     astra_turn_core::introspect::IntrospectSnapshot {
         current_model: state.current_model_identity().map(str::to_string),
         token_pressure: introspect_token_pressure(state),
@@ -557,7 +590,7 @@ pub(crate) fn build_introspect_snapshot(
         turns_completed: state.llm_rounds_completed,
         turns_remaining: state.remaining_turns as u32,
         compaction_tier: format!("{:?}", state.compact_tier_applied),
-        alerts: Vec::new(),
+        alerts,
         tool_health,
         working_memory_summary: working_mem,
         lifecycle_summary,
@@ -571,7 +604,7 @@ pub(crate) fn build_introspect_snapshot(
         injection_freshness: Vec::new(),
         current_round,
         tool_errors: state.turn_guard.health.recent_errors(10),
-        circuit_breaker: None,
+        circuit_breaker,
     }
 }
 
@@ -1768,6 +1801,12 @@ pub struct AgenticLoopState {
 
     // ── Harness (observation + verification layer) ──
     pub harness: super::super::harness_adapter::HarnessSlot,
+
+    // ── Observation journal (cross-turn trend tracking) ──
+    /// Sliding window of per-turn metrics for trend analysis and strategy
+    /// verification. Updated after each tool phase; read before each LLM
+    /// round to auto-inject a compact self-status block into the prompt.
+    pub observation_journal: ObservationJournal,
 }
 
 /// Build the stable runtime manifest carried through context metadata.
@@ -2756,6 +2795,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         bridge_user_query_event_id: None,
         turn_event_buffer: None,
         harness: super::super::harness_adapter::HarnessSlot::empty(),
+        observation_journal: Default::default(),
     }
 }
 
@@ -3237,6 +3277,7 @@ pub(crate) mod tests {
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
+            observation_journal: Default::default(),
         }
     }
 

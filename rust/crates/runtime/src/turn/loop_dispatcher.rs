@@ -61,7 +61,7 @@
 use std::collections::HashSet;
 
 use super::agentic_loop::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host,
+    run_agentic_loop_with_host, AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState,
 };
 
 // ─── Wait reason ─────────────────────────────────────────────────────────────
@@ -196,8 +196,8 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
     // ── Test host ────────────────────────────────────────────────────────────
@@ -370,6 +370,7 @@ mod tests {
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
+            observation_journal: Default::default(),
         }
     }
 

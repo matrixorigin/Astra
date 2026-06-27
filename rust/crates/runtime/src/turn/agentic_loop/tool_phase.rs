@@ -1462,6 +1462,32 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     let lifecycle_summary = host.turn_start_lifecycle_summary(state);
     publish_introspect_snapshot(host, state, lifecycle_summary);
 
+    // ── Record turn metrics into observation journal ──
+    // Feed the sliding window so the next round's auto-injected self-status
+    // block can show trends and strategy verification.
+    {
+        let samples: Vec<astra_core::ToolCallSample<'_>> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .map(|r| astra_core::ToolCallSample {
+                name: &r.name,
+                ok: r.ok,
+                round: Some(state.llm_rounds_completed),
+                file_path: r.file_path.as_deref(),
+                error: r.error.as_deref(),
+            })
+            .collect();
+        let tokens = state.total_prompt
+            + state.total_completion
+            + state.total_cache_read
+            + state.total_cache_creation;
+        let metrics =
+            astra_core::TurnMetrics::from_samples(&samples, state.llm_rounds_completed, tokens);
+        state.observation_journal.record_turn(&metrics);
+    }
+
     if let Some(ref mut buf) = state.turn_event_buffer {
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
             ttft_ms: turn_result.ttft_ms,

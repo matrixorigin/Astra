@@ -12,7 +12,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use serde_json::{Map, Value, json};
+    use serde_json::{json, Map, Value};
 
     use crate::orchestration::permission_sync::{
         InheritedPermissions, PermissionMode, PermissionRequest, PermissionRequestMessaging,
@@ -20,11 +20,11 @@ mod tests {
     };
     use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
     use crate::turn::agentic::headless_round::{
-        HeadlessStderrStyle, HeadlessToolRoundCtx, NoopHeadlessTerminal,
-        run_agentic_headless_tool_round,
+        run_agentic_headless_tool_round, HeadlessStderrStyle, HeadlessToolRoundCtx,
+        NoopHeadlessTerminal,
     };
     use crate::turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, HostTurnResult, run_agentic_loop_with_host,
+        run_agentic_loop_with_host, AgenticLoopHost, AgenticLoopState, HostTurnResult,
     };
     use astra_messaging::in_process::InProcessTransport;
     use astra_messaging::router::AgentMailboxRouter;
@@ -258,6 +258,7 @@ mod tests {
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
+            observation_journal: Default::default(),
         }
     }
 

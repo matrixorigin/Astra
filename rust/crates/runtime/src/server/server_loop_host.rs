@@ -7626,6 +7626,7 @@ mod tests {
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
+            observation_journal: Default::default(),
         }
     }
 

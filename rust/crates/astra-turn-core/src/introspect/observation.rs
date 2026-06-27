@@ -555,35 +555,134 @@ fn build_introspect_action_hints(
     snapshot: &IntrospectSnapshot,
     observations: &[ObservationRecord],
 ) -> Vec<ObservationActionHint> {
-    snapshot
+    let mut hints: Vec<ObservationActionHint> = Vec::new();
+    let evidence_ref = RUNTIME_SNAPSHOT_REF.to_string();
+
+    // ── 1. Tool policy hints (existing) ──
+    for tool in snapshot
         .tool_health
         .iter()
-        .filter(|tool| tool.avoidance_advised)
+        .filter(|t| t.avoidance_advised)
         .take(5)
-        .filter_map(|tool| {
-            let tool_ref = Urn::new("observation", "local", "introspect")
-                .seg("execution")
-                .seg("tool")
-                .seg(&tool.name)
-                .build();
-            let observation_refs: Vec<String> = observations
-                .iter()
-                .filter(|observation| observation.ref_id == tool_ref)
-                .map(|observation| observation.ref_id.clone())
-                .collect();
-
-            if observation_refs.is_empty() {
-                return None;
-            }
-
-            Some(ObservationActionHint {
+    {
+        let tool_ref = Urn::new("observation", "local", "introspect")
+            .seg("execution")
+            .seg("tool")
+            .seg(&tool.name)
+            .build();
+        let observation_refs: Vec<String> = observations
+            .iter()
+            .filter(|obs| obs.ref_id == tool_ref)
+            .map(|obs| obs.ref_id.clone())
+            .collect();
+        if !observation_refs.is_empty() {
+            hints.push(ObservationActionHint {
                 target_type: "tool_policy".to_string(),
                 summary: format!("Avoid or verify {} until health recovers", tool.name),
                 confidence: ObservationConfidence::classification_evidence(0.70, 0.75),
                 observation_refs,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+
+    // ── 2. Strategy change hint ──
+    let stall = &snapshot.stall_state;
+    let has_active_corrections = !stall.forced_corrections.is_empty();
+    let nudge_pressure = stall.nudge_count >= 2 || stall.drift_nudge_count >= 2;
+    if has_active_corrections || nudge_pressure {
+        let mut parts: Vec<String> = Vec::new();
+        if has_active_corrections {
+            parts.push(format!(
+                "{} forced correction(s): {}",
+                stall.forced_corrections.len(),
+                stall.forced_corrections.join(", ")
+            ));
+        }
+        if nudge_pressure {
+            parts.push(format!(
+                "nudges={} drift={}",
+                stall.nudge_count, stall.drift_nudge_count
+            ));
+        }
+        hints.push(ObservationActionHint {
+            target_type: "strategy_change".to_string(),
+            summary: format!(
+                "Multiple stall interventions — {}; consider strategy change or user clarification",
+                parts.join("; ")
+            ),
+            confidence: ObservationConfidence::classification_evidence(0.65, 0.80),
+            observation_refs: vec![evidence_ref.clone()],
+        });
+    }
+
+    // ── 3. Token pressure hint ──
+    if snapshot.token_pressure > 0.80 {
+        hints.push(ObservationActionHint {
+            target_type: "pressure_mitigation".to_string(),
+            summary: format!(
+                "Token pressure {:.0}% — prefer targeted reads (line ranges) over full files; batch independent calls",
+                snapshot.token_pressure * 100.0
+            ),
+            confidence: ObservationConfidence::classification_evidence(0.60, 0.90),
+            observation_refs: vec![evidence_ref.clone()],
+        });
+    }
+
+    // ── 4. Error escalation hint ──
+    let err_count = snapshot.tool_errors.len();
+    if err_count >= 5 {
+        hints.push(ObservationActionHint {
+            target_type: "error_escalation".to_string(),
+            summary: format!(
+                "{err_count} recent tool errors — verify environment/tool availability; consider reporting to user"
+            ),
+            confidence: ObservationConfidence::classification_evidence(0.80, 0.85),
+            observation_refs: vec![evidence_ref.clone()],
+        });
+    }
+
+    // ── 5. Batching advice ──
+    let single_tool_streak = snapshot
+        .recent_rounds
+        .iter()
+        .rev()
+        .take_while(|r| r.tool_call_names.len() == 1)
+        .count();
+    if single_tool_streak >= 3 {
+        hints.push(ObservationActionHint {
+            target_type: "batching_advice".to_string(),
+            summary: format!(
+                "{single_tool_streak} consecutive rounds with single tool calls — batch independent reads for efficiency"
+            ),
+            confidence: ObservationConfidence::classification_evidence(0.55, 0.65),
+            observation_refs: vec![evidence_ref.clone()],
+        });
+    }
+
+    // ── 6. Loop guard hint ──
+    let recent_names: Vec<&[String]> = snapshot
+        .recent_rounds
+        .iter()
+        .rev()
+        .take(6)
+        .map(|r| r.tool_call_names.as_slice())
+        .collect();
+    if recent_names.len() >= 3 {
+        let last = recent_names[0];
+        if !last.is_empty() && recent_names[1..].iter().take(2).all(|r| *r == last) {
+            hints.push(ObservationActionHint {
+                target_type: "loop_guard".to_string(),
+                summary: format!(
+                    "3+ consecutive rounds with identical tool pattern [{}] — may be stuck in exploration loop",
+                    last.join(", ")
+                ),
+                confidence: ObservationConfidence::classification_evidence(0.50, 0.60),
+                observation_refs: vec![evidence_ref],
+            });
+        }
+    }
+
+    hints
 }
 
 /// Build an observation graph slice from the introspect snapshot and

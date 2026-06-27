@@ -382,6 +382,7 @@ pub mod log;
 pub mod model_override;
 pub mod net;
 pub mod observation;
+pub mod observation_journal;
 pub mod runtime_limits;
 pub mod tool_schema;
 
@@ -402,9 +403,12 @@ pub use observation::{
     ObservationGraphEdge, ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
     ObservationGraphNodeKind, ObservationGraphSlice, ObservationHorizon,
     ObservationProviderCoverage, ObservationRecord, ObservationTopic, ObservationView,
-    SourcePolicy, ToolFamily, TurnMetrics,
+    SourcePolicy, ToolCallSample, ToolFamily, TurnMetrics,
     Urn, classify_event_kind, classify_tool_family, normalize_observation_arg,
     push_graph_edge, push_graph_node, truncate_graph_summary, urn_component,
+};
+pub use observation_journal::{
+    JournalEntry, MetricTrend, ObservationJournal, StrategyVerification, render_compact_status,
 };
 pub use runtime_limits::RuntimeLimits;
 #[cfg(any(test, feature = "dev-defaults"))]

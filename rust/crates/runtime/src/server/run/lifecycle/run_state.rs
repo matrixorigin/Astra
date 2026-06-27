@@ -5,8 +5,8 @@
 //! classify persisted and streaming events, merge terminal events, and enforce
 //! the active-run live-event budget.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
@@ -17,7 +17,7 @@ use astra_core::{
     STATUS_RUNNING, STATUS_WAITING,
 };
 use astra_runtime_env::CleanupReason as RuntimeCleanupReason;
-use astra_services::runs::{DurableRunStatusKind, durable_run_status_kind};
+use astra_services::runs::{durable_run_status_kind, DurableRunStatusKind};
 
 use super::MAX_ACTIVE_RUN_LIVE_EVENTS;
 use crate::server::run::engine::RunEngine;
