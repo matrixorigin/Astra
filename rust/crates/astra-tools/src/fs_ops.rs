@@ -2237,7 +2237,7 @@ fn str_replace_not_found_hint_with_what(what: String, content: &str, old_str: &s
     let mut msg = str_replace_fail(
         &what,
         "The exact byte sequence does not appear in the current file content (whitespace, indentation, or quote style may differ; or the file changed since you last read it).",
-        "Refer to the prior read_file tool_result for the current file content; copy the exact bytes into old_str and retry. If the file has changed, re-read it first.",
+        "Do NOT blindly retry with the same old_str. Re-read the file first with read_file (targeted range if the file is large), then copy the exact current bytes into old_str and retry str_replace.",
     );
     msg.push('\n');
 
@@ -3598,7 +3598,7 @@ mod tests {
             "something completely unrelated",
         );
         assert!(msg.contains("no_partial_match: true"), "got: {msg}");
-        assert!(msg.contains("prior read_file tool_result"), "got: {msg}");
+        assert!(msg.contains("Do NOT blindly retry"), "got: {msg}");
     }
 
     #[test]

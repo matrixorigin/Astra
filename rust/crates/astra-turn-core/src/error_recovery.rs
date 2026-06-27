@@ -242,6 +242,21 @@ pub fn build_recovery_message(
         );
     }
 
+    // When str_replace fails because old_str wasn't found, the model MUST re-read
+    // the file before retrying. Blind retries with stale content are the #1 source
+    // of wasted turns in str_replace error recovery (≈80% of failures).
+    if tool_name == "str_replace"
+        && (error_lower.contains("str_replace failed") || error_lower.contains("old_str not found"))
+    {
+        msg = format!(
+            "⚠ {tool_name} failed: old_str not found in the current file content. \
+             The file likely changed since you last read it. \
+             Do NOT retry str_replace with the same old_str. \
+             Immediately call read_file on the target file (use a targeted line range for large files), \
+             copy the exact bytes from the current file, then retry str_replace.",
+        );
+    }
+
     if !alternatives.is_empty() {
         const SHELL_TOOLS: &[&str] = &["bash", "powershell"];
         let filtered: Vec<&str> = if write_file_missing_args {
