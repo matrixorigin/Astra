@@ -395,7 +395,9 @@ pub mod sync_poison;
 pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
-pub use error_kind::{ClassifiedError, ErrorKind, classify_tool_output};
+pub use error_kind::{
+    ClassifiedError, ErrorKind, classify_llm_error, classify_tool_output, is_context_window_error,
+};
 pub use observation::{
     ErrorStreak, EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,
     ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationDepth,

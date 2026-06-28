@@ -223,61 +223,6 @@ pub(crate) fn cached_system_prompt(
 ///
 /// Used only for legacy callers that still have string errors. New code should
 /// construct [`ClassifiedError`] at the source.
-pub(crate) fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
-    let lower = msg.to_lowercase();
-    if is_context_window_error(&lower) {
-        astra_core::ErrorKind::ContextWindow
-    } else if lower.contains("rate") || lower.contains("429") {
-        astra_core::ErrorKind::RateLimit
-    } else if lower.contains("connection pool timed out")
-        || lower.contains("pool timed out while waiting for an open connection")
-        || lower.contains("pool timed out waiting for an open connection")
-        || lower.contains("pool timed out") && lower.contains("open connection")
-    {
-        astra_core::ErrorKind::DatabaseError
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        astra_core::ErrorKind::StreamIdle
-    } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
-    {
-        astra_core::ErrorKind::StreamTransport
-    } else if lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
-        || lower.contains("unauthorized")
-        || lower.contains("api key")
-        // astra-server JWT middleware shape (regression: session b4cef5bb).
-        || lower.contains("could not validate credentials")
-        // Generic credential / token shapes that don't carry a 401 anchor —
-        // mirror `astra_core::classify_tool_output`'s Auth branch so the
-        // bridge classifier does not silently downgrade these to Unknown.
-        || lower.contains("invalid credentials")
-        || lower.contains("bad credentials")
-        || lower.contains("authentication failed")
-        || lower.contains("token expired")
-        || lower.contains("invalid token")
-        // AWS STS shape — surfaces when Bedrock session tokens roll mid-run.
-        || lower.contains("security token included in the request is expired")
-    {
-        astra_core::ErrorKind::Auth
-    } else if lower.contains("cancelled") || lower.contains("canceled") {
-        astra_core::ErrorKind::Cancelled
-    } else {
-        astra_core::ErrorKind::Unknown
-    }
-}
-
-/// Detect context-window / prompt-too-long errors in API responses.
-pub(crate) fn is_context_window_error(lower: &str) -> bool {
-    lower.contains("context_length_exceeded")
-        || lower.contains("maximum context length")
-        || lower.contains("prompt is too long")
-        || lower.contains("too many tokens")
-        || lower.contains("input is too long")
-        || lower.contains("context window")
-        || lower.contains("max_tokens") && (lower.contains("exceed") || lower.contains("limit"))
-}
-
 /// Detect TPM (tokens per minute) exhaustion errors.
 ///
 /// TPM errors require longer wait times because they indicate the account-level
@@ -2987,7 +2932,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
         }
 
         // Context-window errors — classified at source, no string prefix needed.
-        if status == 400 && is_context_window_error(&text.to_lowercase()) {
+        if status == 400 && astra_core::is_context_window_error(&text.to_lowercase()) {
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContextWindow,
                 format!("LLM error {status}: {text}"),
@@ -3789,7 +3734,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
             astra_core::ErrorKind::RateLimit
         } else if status >= 500 {
             astra_core::ErrorKind::ServerError
-        } else if status == 400 && is_context_window_error(&text.to_lowercase()) {
+        } else if status == 400 && astra_core::is_context_window_error(&text.to_lowercase()) {
             astra_core::ErrorKind::ContextWindow
         } else if status == 400 {
             astra_core::ErrorKind::InvalidRequest
@@ -4480,98 +4425,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_llm_error_categories() {
-        use astra_core::ErrorKind;
-        assert_eq!(
-            classify_llm_error("rate limit exceeded"),
-            ErrorKind::RateLimit
-        );
-        assert_eq!(
-            classify_llm_error("error 429: too many requests"),
-            ErrorKind::RateLimit
-        );
-        assert_eq!(
-            classify_llm_error("request timed out"),
-            ErrorKind::StreamIdle
-        );
-        assert_eq!(
-            classify_llm_error("Error: pool timed out while waiting for an open connection"),
-            ErrorKind::DatabaseError
-        );
-        assert_eq!(
-            classify_llm_error("connection refused"),
-            ErrorKind::StreamTransport
-        );
-        assert_eq!(classify_llm_error("401 unauthorized"), ErrorKind::Auth);
-        assert_eq!(
-            classify_llm_error("something went wrong"),
-            ErrorKind::Unknown
-        );
-        assert_eq!(
-            classify_llm_error("LLM stream transport error: connection reset"),
-            ErrorKind::StreamTransport
-        );
-        assert_eq!(
-            classify_llm_error("LLM call cancelled"),
-            ErrorKind::Cancelled
-        );
-    }
-
-    /// Regression: session b4cef5bb-9549-... (2026-05-16, Haiku 4.5).
-    /// astra-server's JWT middleware emitted "Error: Could not validate
-    /// credentials" mid-stream during a token-refresh race. The bridge's
-    /// `classify_llm_error` did not match any branch and fell through
-    /// to `Unknown`, producing a journal entry with
-    /// `error_kind=unknown, retryable=false, guidance=An unexpected
-    /// error occurred`. The user had to re-issue the turn manually
-    /// (it would have succeeded on the very next attempt). Pinned
-    /// patterns must classify these as `Auth` so retry policy and
-    /// telemetry both reflect what actually happened.
-    #[test]
-    fn classify_llm_error_recognizes_credential_validation_failures() {
-        use astra_core::ErrorKind;
-        // Exact wire shape from the regression session.
-        assert_eq!(
-            classify_llm_error("Error: Could not validate credentials"),
-            ErrorKind::Auth,
-            "astra-server JWT middleware shape must classify as Auth"
-        );
-        // Lower-case variant — matchers must be case-insensitive.
-        assert_eq!(
-            classify_llm_error("could not validate credentials for user xyz"),
-            ErrorKind::Auth
-        );
-        // Generic credential-shaped failures the existing matcher missed
-        // (no "401" or "api key" anchor).
-        assert_eq!(classify_llm_error("invalid credentials"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("bad credentials"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("token expired"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("invalid token"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("authentication failed"), ErrorKind::Auth);
-        // AWS/Bedrock STS shape that surfaces during session expiry.
-        assert_eq!(
-            classify_llm_error("The security token included in the request is expired"),
-            ErrorKind::Auth
-        );
-    }
-
-    #[test]
-    fn is_context_window_error_detects_all_patterns() {
-        // These are the actual API response patterns from various providers
-        assert!(is_context_window_error("context_length_exceeded"));
-        assert!(is_context_window_error("maximum context length is 128000"));
-        assert!(is_context_window_error("prompt is too long"));
-        assert!(is_context_window_error("too many tokens in the input"));
-        assert!(is_context_window_error("input is too long for this model"));
-        assert!(is_context_window_error("context window exceeded"));
-        assert!(is_context_window_error("max_tokens limit exceeded"));
-        // Negative cases
-        assert!(!is_context_window_error("rate limit exceeded"));
-        assert!(!is_context_window_error("internal server error"));
-        assert!(!is_context_window_error(""));
-    }
-
-    #[test]
     fn is_tpm_exhaustion_detects_patterns() {
         // TPM (tokens per minute) exhaustion patterns
         assert!(is_tpm_exhaustion("endpoint TPM exceeded"));
@@ -4585,15 +4438,6 @@ mod tests {
         assert!(!is_tpm_exhaustion("too many requests"));
         assert!(!is_tpm_exhaustion("429 quota exceeded"));
         assert!(!is_tpm_exhaustion(""));
-    }
-
-    #[test]
-    fn context_window_error_detected_in_llm_error_format() {
-        // Verify that is_context_window_error works on the format produced by
-        // call_llm_stream: "LLM error 400: {api_response_body}"
-        let api_body = r#"{"error":{"message":"This model's maximum context length is 128000 tokens","type":"invalid_request_error"}}"#;
-        let err = format!("LLM error 400: {api_body}");
-        assert!(is_context_window_error(&err.to_lowercase()));
     }
 
     #[test]

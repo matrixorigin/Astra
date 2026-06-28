@@ -3020,7 +3020,7 @@ impl InProcessChatTurnBridge {
                         .await
                         {
                             Ok(s) => s.boxed(),
-                            Err(e) if crate::turn::llm::client::is_context_window_error(&e.to_lowercase()) => {
+                            Err(e) if astra_core::is_context_window_error(&e.to_lowercase()) => {
                             record_full_llm_response_event(
                                 &mut turn_event_buffer,
                                 full_llm_capture,
@@ -3216,7 +3216,7 @@ impl InProcessChatTurnBridge {
                                             "kind": "context_window",
                                         }),
                                     );
-                                    let kind = classify_llm_error(&e2);
+                                    let kind = astra_core::classify_llm_error(&e2);
                                     let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
                                         &session_id, agent_id.as_deref(), &model_name, &provider,
                                         &e2, &llm_messages, &pruned_tools,
@@ -3282,10 +3282,10 @@ impl InProcessChatTurnBridge {
                                 "error",
                                 json!({
                                     "error": e.clone(),
-                                    "kind": classify_llm_error(&e).as_str(),
+                                    "kind": astra_core::classify_llm_error(&e).as_str(),
                                 }),
                             );
-                            let kind = classify_llm_error(&e);
+                            let kind = astra_core::classify_llm_error(&e);
                             let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
                                 &session_id, agent_id.as_deref(), &model_name, &provider,
                                 &e, &llm_messages, &pruned_tools,
@@ -4572,11 +4572,6 @@ fn explain_requested(payload: &Value) -> bool {
         Some(Value::String(mode)) => mode.eq_ignore_ascii_case("verbose"),
         _ => false,
     }
-}
-
-fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
-    // Delegate to the canonical classifier in llm_client.
-    crate::turn::llm::client::classify_llm_error(msg)
 }
 
 fn forwarded_sse_error_event(bytes: &Bytes) -> Option<Value> {
@@ -6097,76 +6092,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Unhappy-path / edge-case tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn classify_llm_error_rate_limit_variants() {
-        use astra_core::ErrorKind;
-        assert_eq!(
-            classify_llm_error("rate limit exceeded"),
-            ErrorKind::RateLimit
-        );
-        assert_eq!(
-            classify_llm_error("HTTP 429 Too Many Requests"),
-            ErrorKind::RateLimit
-        );
-        assert_eq!(
-            classify_llm_error("Rate limiting active"),
-            ErrorKind::RateLimit
-        );
-    }
-
-    #[test]
-    fn classify_llm_error_timeout_variants() {
-        use astra_core::ErrorKind;
-        assert_eq!(classify_llm_error("request timeout"), ErrorKind::StreamIdle);
-        assert_eq!(
-            classify_llm_error("connection timed out"),
-            ErrorKind::StreamIdle
-        );
-    }
-
-    #[test]
-    fn classify_llm_error_transport_variants() {
-        use astra_core::ErrorKind;
-        assert_eq!(
-            classify_llm_error("connection refused"),
-            ErrorKind::StreamTransport
-        );
-        assert_eq!(
-            classify_llm_error("transport error"),
-            ErrorKind::StreamTransport
-        );
-        assert_eq!(
-            classify_llm_error("network unreachable"),
-            ErrorKind::StreamTransport
-        );
-    }
-
-    #[test]
-    fn classify_llm_error_permission_variants() {
-        use astra_core::ErrorKind;
-        assert_eq!(classify_llm_error("HTTP 401"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("unauthorized access"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("invalid api key"), ErrorKind::Auth);
-    }
-
-    #[test]
-    fn classify_llm_error_unknown_defaults_to_unknown() {
-        use astra_core::ErrorKind;
-        assert_eq!(
-            classify_llm_error("something went wrong"),
-            ErrorKind::Unknown
-        );
-        assert_eq!(classify_llm_error(""), ErrorKind::Unknown);
-    }
-
-    #[test]
-    fn classify_llm_error_case_insensitive() {
-        use astra_core::ErrorKind;
-        assert_eq!(classify_llm_error("RATE LIMIT"), ErrorKind::RateLimit);
-        assert_eq!(classify_llm_error("Timeout"), ErrorKind::StreamIdle);
-        assert_eq!(classify_llm_error("UNAUTHORIZED"), ErrorKind::Auth);
-    }
 
     #[test]
     fn header_str_missing_header_returns_none() {

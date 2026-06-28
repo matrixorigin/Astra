@@ -18,44 +18,6 @@ use crate::response_guard::apply_response_guards;
 use crate::tool::args::shape::tool_call_name;
 use astra_pipeline::step_recorder::StepRecorder;
 
-/// Detect context-window / prompt-too-long errors in API responses.
-fn is_context_window_error(lower: &str) -> bool {
-    lower.contains("context_length_exceeded")
-        || lower.contains("maximum context length")
-        || lower.contains("prompt is too long")
-        || lower.contains("too many tokens")
-        || lower.contains("input is too long")
-        || lower.contains("context window")
-        || lower.contains("max_tokens") && (lower.contains("exceed") || lower.contains("limit"))
-}
-
-/// Classify an LLM error message into an ErrorKind.
-fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
-    let lower = msg.to_lowercase();
-    if is_context_window_error(&lower) {
-        astra_core::ErrorKind::ContextWindow
-    } else if lower.contains("rate") || lower.contains("429") {
-        astra_core::ErrorKind::RateLimit
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        astra_core::ErrorKind::StreamIdle
-    } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
-    {
-        astra_core::ErrorKind::StreamTransport
-    } else if lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
-        || lower.contains("unauthorized")
-        || lower.contains("api key")
-    {
-        astra_core::ErrorKind::Auth
-    } else if lower.contains("cancelled") || lower.contains("canceled") {
-        astra_core::ErrorKind::Cancelled
-    } else {
-        astra_core::ErrorKind::Unknown
-    }
-}
-
 /// Read-only slice of [`crate::chat_turn_sse_dispatch::ChatTurnSseAccum`] fields needed for ingest.
 #[derive(Debug, Clone)]
 pub struct AgenticTurnStreamSnapshot<'a> {
@@ -276,13 +238,13 @@ pub fn ingest_agentic_turn_stream(
             k
         } else {
             let lower = err.to_lowercase();
-            if is_context_window_error(&lower) {
+            if astra_core::is_context_window_error(&lower) {
                 *st.consecutive_context_window_errors =
                     st.consecutive_context_window_errors.saturating_add(1);
                 astra_core::ErrorKind::ContextWindow
             } else {
                 *st.consecutive_context_window_errors = 0;
-                classify_llm_error(err)
+                astra_core::classify_llm_error(err)
             }
         };
         return AgenticTurnIngestOutcome::Fatal(astra_core::ClassifiedError::new(

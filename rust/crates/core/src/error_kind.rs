@@ -773,6 +773,59 @@ fn is_database_pool_timeout(lower: &str) -> bool {
         || (lower.contains("pool timed out") && lower.contains("open connection"))
 }
 
+/// Classify an LLM error message into an [`ErrorKind`].
+///
+/// Canonical classifier used by the bridge, turn ingest, and any path that
+/// needs to map LLM-provider error strings to retry/recovery policy.  Keep
+/// this in sync with the actual provider error patterns observed in production.
+pub fn classify_llm_error(msg: &str) -> ErrorKind {
+    let lower = msg.to_lowercase();
+    if is_context_window_error(&lower) {
+        ErrorKind::ContextWindow
+    } else if lower.contains("rate") || lower.contains("429") {
+        ErrorKind::RateLimit
+    } else if is_database_pool_timeout(&lower) {
+        ErrorKind::DatabaseError
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        ErrorKind::StreamIdle
+    } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
+    {
+        ErrorKind::StreamTransport
+    } else if lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
+        || lower.contains("unauthorized")
+        || lower.contains("api key")
+        || lower.contains("could not validate credentials")
+        || lower.contains("invalid credentials")
+        || lower.contains("bad credentials")
+        || lower.contains("authentication failed")
+        || lower.contains("token expired")
+        || lower.contains("invalid token")
+        || lower.contains("security token included in the request is expired")
+    {
+        ErrorKind::Auth
+    } else if lower.contains("cancelled") || lower.contains("canceled") {
+        ErrorKind::Cancelled
+    } else {
+        ErrorKind::Unknown
+    }
+}
+
+/// Detect context-window / prompt-too-long errors in API response text.
+///
+/// The caller should already lower-case the input.
+pub fn is_context_window_error(lower: &str) -> bool {
+    lower.contains("context_length_exceeded")
+        || lower.contains("maximum context length")
+        || lower.contains("prompt is too long")
+        || lower.contains("too many tokens")
+        || lower.contains("input is too long")
+        || lower.contains("context window")
+        || lower.contains("max_tokens") && (lower.contains("exceed") || lower.contains("limit"))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1195,5 +1248,141 @@ mod tests {
         ] {
             assert_ne!(kind.diagnosis_hint(), kind.guidance());
         }
+    }
+
+    // ── classify_llm_error ──────────────────────────────────────────────────
+
+    #[test]
+    fn classify_llm_error_rate_limit() {
+        assert_eq!(
+            classify_llm_error("rate limit exceeded"),
+            ErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_llm_error("error 429: too many requests"),
+            ErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_llm_error("Rate limiting active"),
+            ErrorKind::RateLimit
+        );
+    }
+
+    #[test]
+    fn classify_llm_error_pool_timeout_is_database_error() {
+        assert_eq!(
+            classify_llm_error("Error: pool timed out while waiting for an open connection"),
+            ErrorKind::DatabaseError
+        );
+        assert_eq!(
+            classify_llm_error("connection pool timed out"),
+            ErrorKind::DatabaseError
+        );
+        assert_eq!(
+            classify_llm_error("pool timed out waiting for an open connection"),
+            ErrorKind::DatabaseError
+        );
+    }
+
+    #[test]
+    fn classify_llm_error_timeout_is_stream_idle() {
+        assert_eq!(
+            classify_llm_error("request timed out"),
+            ErrorKind::StreamIdle
+        );
+        assert_eq!(
+            classify_llm_error("connection timed out"),
+            ErrorKind::StreamIdle
+        );
+    }
+
+    #[test]
+    fn classify_llm_error_transport() {
+        assert_eq!(
+            classify_llm_error("connection refused"),
+            ErrorKind::StreamTransport
+        );
+        assert_eq!(
+            classify_llm_error("transport error"),
+            ErrorKind::StreamTransport
+        );
+        assert_eq!(
+            classify_llm_error("network unreachable"),
+            ErrorKind::StreamTransport
+        );
+    }
+
+    #[test]
+    fn classify_llm_error_auth() {
+        assert_eq!(classify_llm_error("401 unauthorized"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("HTTP 401"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("unauthorized access"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("invalid api key"), ErrorKind::Auth);
+        assert_eq!(
+            classify_llm_error("Error: Could not validate credentials"),
+            ErrorKind::Auth
+        );
+        assert_eq!(
+            classify_llm_error("could not validate credentials for user xyz"),
+            ErrorKind::Auth
+        );
+        assert_eq!(classify_llm_error("invalid credentials"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("bad credentials"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("token expired"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("invalid token"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("authentication failed"), ErrorKind::Auth);
+        assert_eq!(
+            classify_llm_error("The security token included in the request is expired"),
+            ErrorKind::Auth
+        );
+    }
+
+    #[test]
+    fn classify_llm_error_cancelled() {
+        assert_eq!(
+            classify_llm_error("LLM call cancelled"),
+            ErrorKind::Cancelled
+        );
+        assert_eq!(classify_llm_error("request canceled"), ErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn classify_llm_error_unknown() {
+        assert_eq!(
+            classify_llm_error("something went wrong"),
+            ErrorKind::Unknown
+        );
+        assert_eq!(classify_llm_error(""), ErrorKind::Unknown);
+    }
+
+    #[test]
+    fn classify_llm_error_case_insensitive() {
+        assert_eq!(classify_llm_error("RATE LIMIT"), ErrorKind::RateLimit);
+        assert_eq!(classify_llm_error("Timeout"), ErrorKind::StreamIdle);
+        assert_eq!(classify_llm_error("UNAUTHORIZED"), ErrorKind::Auth);
+    }
+
+    // ── is_context_window_error ─────────────────────────────────────────────
+
+    #[test]
+    fn is_context_window_error_detects_all_patterns() {
+        assert!(is_context_window_error("context_length_exceeded"));
+        assert!(is_context_window_error("maximum context length is 128000"));
+        assert!(is_context_window_error("prompt is too long"));
+        assert!(is_context_window_error("too many tokens in the input"));
+        assert!(is_context_window_error("input is too long for this model"));
+        assert!(is_context_window_error("context window exceeded"));
+        assert!(is_context_window_error("max_tokens limit exceeded"));
+        // Negative cases
+        assert!(!is_context_window_error("rate limit exceeded"));
+        assert!(!is_context_window_error("internal server error"));
+        assert!(!is_context_window_error(""));
+    }
+
+    #[test]
+    fn context_window_error_detected_in_llm_error_format() {
+        let api_body = r#"{"error":{"message":"This model's maximum context length is 128000 tokens","type":"invalid_request_error"}}"#;
+        let err = format!("LLM error 400: {api_body}");
+        assert!(is_context_window_error(&err.to_lowercase()));
     }
 }
