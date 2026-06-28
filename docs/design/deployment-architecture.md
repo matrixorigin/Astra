@@ -13,7 +13,7 @@ astra-engine consists of these runtime components:
 |-----------|---------|-----------|-----------|-------------|
 | **API Server** | `astra-server` | ✅ Yes | Horizontal | REST API, JWT auth, rate limiting |
 | **CLI (astra)** | `astra chat` | ✅ Yes | Per-user | Interactive chat, skill execution |
-| **CLI (astra-admin)** | `astra-admin init/prompt/...` | ✅ Yes | Single | Admin operations |
+| **CLI (astra admin)** | `astra admin init/prompt/...` | ✅ Yes | Single | Admin operations |
 | **MatrixOne** | `mo-service` | ❌ Stateful | Cluster | HTAP database, time-travel, branching |
 | **Redis** | `redis-server` | ❌ Stateful | Cluster/Sentinel | Cache, rate limiting, pub/sub |
 | **Skill Workers** | Skill execution processes | ✅ Yes | Horizontal | Heavy skill execution (training, etc.) |
@@ -223,7 +223,7 @@ Sync model:
    → CLI auto-refreshes: POST /auth/refresh
    → Retry original request
 
-4. astra-admin (admin operations):
+4. astra admin (admin operations):
    → Same JWT flow, but API checks role == admin
    → Non-admin users get 403
 ```
@@ -238,10 +238,10 @@ Sync model:
 | `astra replay` | `stream_replay` + DB query | `POST /sessions/{id}/replay` |
 | `astra skill list` | `SkillRegistry` + DB query | `GET /skills` |
 | `astra model list` | DB query | `GET /models` |
-| `astra-admin init` | DDL execution via `get_db_session()` | `POST /admin/init` (admin-only) |
-| `astra-admin token create` | Direct DB insert | `POST /admin/tokens` (admin-only) |
-| `astra-admin audit logs` | Direct DB query | `GET /admin/audit` (admin-only) |
-| `astra-admin prompt optimize` | `PromptOptimizer` + DB | `POST /admin/prompts/optimize` (admin-only) |
+| `astra admin init` | DDL execution via `get_db_session()` | `POST /admin/init` (admin-only) |
+| `astra admin token create` | Direct DB insert | `POST /admin/tokens` (admin-only) |
+| `astra admin audit logs` | Direct DB query | `GET /admin/audit` (admin-only) |
+| `astra admin prompt optimize` | `PromptOptimizer` + DB | `POST /admin/prompts/optimize` (admin-only) |
 
 ### Design Principles
 
@@ -294,7 +294,7 @@ Sync model:
 conda activate agent-engine
 make dev-start                       # MatrixOne + Redis in Docker
 ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=17001 astra-server  # API server (required, unless --local)
-astra-admin init                        # Init DB (via API after migration)
+astra admin init                        # Init DB (via API after migration)
 astra chat                        # CLI → API Server → DB
 # OR: astra --local chat          # Dev shortcut: CLI → DB directly
 ```
@@ -1228,7 +1228,7 @@ class DeploymentDetector:
 ```bash
 # Before: 手动启动各组件
 make dev-start       # MatrixOne + Redis
-astra-admin init        # Init DB
+astra admin init        # Init DB
 ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=17001 astra-server # API
 
 # After: 一键全部拉起

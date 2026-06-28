@@ -134,7 +134,7 @@ rust/crates/
 │   └── task_orchestrator.rs # TaskRecord lifecycle with checkpoint/resume
 │
 ├── core/            # Shared config, logging, runtime limits
-└── astra-admin/        # Admin CLI: credentials, model config, roles
+└── astra-cli/        # Admin CLI: credentials, model config, roles
 ```
 
 ### 3.2 State Model: What Exists Today
@@ -647,7 +647,7 @@ Shared crate: `rust/crates/astra-thin-client` (dependency of `astra-cli` and any
 | Bodies | [`protocol.rs`](../../rust/crates/astra-thin-client/src/protocol.rs) | `ChatStreamRequest` (§5.5 `edge_executor_id`, `capabilities`), `ToolResultRequest`, `ApprovalRespondRequest`, `EdgeRegisterRequest`, `EdgeHeartbeatRequest`, `TaskLeaseMutationRequest`, `StreamEvent`, session DTOs. |
 | Light edge | [`edge.rs`](../../rust/crates/astra-thin-client/src/edge.rs) | §5.5.2: `advertise_executor`, `builtin_capability_preset`, `edge_register_with_capabilities`, `ASTRA_EDGE_ID_HEADER`. |
 | Transport | [`ThinClient`](../../rust/crates/astra-thin-client/src/client.rs) | `reqwest`-based HTTP + SSE (`chat_stream` / `post_chat_turn`), auth, sessions, skills, memory, tasks (incl. lease helpers), context snapshots, `get_url` for off-origin probes (e.g. Memoria health). |
-| Admin CLI | [`astra-admin-cli`](../../rust/crates/astra-admin/) | Same crate: **only** [`ThinClient`](../../rust/crates/astra-thin-client/src/client.rs) for server calls (no standalone `reqwest` client). |
+| Admin CLI | [`astra-cli`](../../rust/crates/astra-cli/) | Same crate: **only** [`ThinClient`](../../rust/crates/astra-thin-client/src/client.rs) for server calls (no standalone `reqwest` client). |
 
 **Chat endpoints (two surfaces, same SSE framing):**
 

@@ -51,7 +51,7 @@ confirm() {
 }
 
 # ── Proxy helper ─────────────────────────────────────────────────
-# CLI tools (astra, astra-admin) now auto-bypass proxy for localhost.
+# CLI tools (astra, astra admin) now auto-bypass proxy for localhost.
 # Only curl still needs NO_PROXY.
 export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1"
 
@@ -192,7 +192,7 @@ step_admin() {
 
     if [ "$admin_count" -gt 0 ]; then
         ok "Admin user already exists — skipping"
-        dim "  (To manage admins: astra-admin user grant-role <user> astra_admin)"
+        dim "  (To manage admins: astra admin user grant-role <user> astra_admin)"
         # Try to detect admin profile from saved credentials
         ADMIN_PROFILE=${ADMIN_PROFILE:-admin}
         return 0
@@ -240,10 +240,10 @@ step_admin() {
     esac
 
     info "Logging in as $username (admin profile)..."
-    if do_login "$username" "$password" "astra-admin"; then
+    if do_login "$username" "$password" "astra admin"; then
         ok "Logged in as admin"
     else
-        warn "Auto-login failed — you can login later: astra-admin login"
+        warn "Auto-login failed — you can login later: astra admin login"
     fi
 }
 
@@ -395,7 +395,7 @@ for r in rows:
                 ask "Base URL (OpenAI-compatible)"
                 base_url=$REPLY
                 break ;;
-            5|skip) info "Skipping — register models later with: astra-admin model add"; return 0 ;;
+            5|skip) info "Skipping — register models later with: astra admin model add"; return 0 ;;
             *) warn "Invalid choice '$provider_choice' — please enter 1-5" ;;
         esac
     done
@@ -411,8 +411,8 @@ for r in rows:
         return 0
     fi
 
-    # Ensure astra-admin is authenticated before registering
-    if ! astra-admin --profile "$ADMIN_PROFILE" model list >/dev/null 2>&1; then
+    # Ensure astra admin is authenticated before registering
+    if ! astra admin --profile "$ADMIN_PROFILE" model list >/dev/null 2>&1; then
         warn "Admin session expired or not logged in"
         info "Please login as admin to register models:"
         local admin_user admin_pass
@@ -420,8 +420,8 @@ for r in rows:
         admin_user=$REPLY
         ask_secret "Admin password"
         admin_pass=$REPLY
-        if ! do_login "$admin_user" "$admin_pass" "astra-admin"; then
-            err "Admin login failed — register models later with: astra-admin login && astra-admin model add"
+        if ! do_login "$admin_user" "$admin_pass" "astra admin"; then
+            err "Admin login failed — register models later with: astra admin login && astra admin model add"
             return 1
         fi
         ADMIN_PROFILE="$admin_user"
@@ -431,7 +431,7 @@ for r in rows:
     info "Registering $model_name ($provider) and validating connectivity..."
     local output base_url_args=()
     [[ -n "$base_url" ]] && base_url_args=(--base-url "$base_url")
-    output=$(astra-admin --profile "$ADMIN_PROFILE" model add "$model_name" "$provider" --api-key "$api_key" "${base_url_args[@]}" 2>&1) || true
+    output=$(astra admin --profile "$ADMIN_PROFILE" model add "$model_name" "$provider" --api-key "$api_key" "${base_url_args[@]}" 2>&1) || true
     echo "$output"
 
     if echo "$output" | grep -q "INACTIVE"; then
@@ -454,7 +454,7 @@ summary() {
     echo "  Quick start:"
     echo "    astra chat                    # start chatting"
     echo "    astra chat --model gpt-4o     # use specific model"
-    echo "    astra-admin model list              # list available models"
+    echo "    astra admin model list              # list available models"
     echo ""
 }
 

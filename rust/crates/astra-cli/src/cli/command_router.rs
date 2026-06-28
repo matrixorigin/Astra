@@ -1272,6 +1272,12 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Admin(args)) => {
+            let inherited_api_url = api.api_origin();
+            crate::admin_cli::run(args, Some(&inherited_api_url), profile.as_deref()).await?;
+            Ok(ExitCode::Success)
+        }
+
         // Inline message: astra "what is the answer to life?"
         Some(Command::Message(words)) => {
             let raw_message = words.join(" ");

@@ -22,6 +22,7 @@ use crossterm::style::Stylize;
 // resolves identically in both the lib-compiled and binary-compiled copies of cli/tui modules.
 pub(crate) use astra_cli::DEFERRED_INPUT_FINGERPRINT_SEP;
 
+mod admin_cli;
 mod edge_tools;
 mod git_branch_cache;
 mod manifest_loader;
@@ -2317,6 +2318,24 @@ total_tokens_out: 500
                 assert_eq!(args.value, "gpt-4o");
             }
             _ => panic!("expected Config Set command"),
+        }
+    }
+
+    #[test]
+    fn cli_admin_subcommand() {
+        let cli =
+            Cli::try_parse_from(["astra", "admin", "--profile", "ops", "model", "list"]).unwrap();
+        match cli.command {
+            Some(Command::Admin(args)) => {
+                assert_eq!(args.profile.as_deref(), Some("ops"));
+                assert!(matches!(
+                    args.command,
+                    Some(crate::admin_cli::cli_args::Command::Model(
+                        crate::admin_cli::cli_args::ModelCmd::List
+                    ))
+                ));
+            }
+            _ => panic!("expected Admin command"),
         }
     }
 

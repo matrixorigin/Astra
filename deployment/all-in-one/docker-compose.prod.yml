@@ -82,7 +82,7 @@ services:
       - ASTRA_BRIDGE_SECRET=${ASTRA_BRIDGE_SECRET}
 
       # LLM models are configured server-side (infra_llm_models table) via
-      # `astra-admin model add/check`; no env vars needed.
+      # `astra admin model add/check`; no env vars needed.
 
       # Memoria
       - MEMORIA_BASE_URL=${MEMORIA_BASE_URL:-http://memoria:8100}

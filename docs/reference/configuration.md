@@ -48,10 +48,10 @@ host-facing published port; the API container listens on port `17001`.
 LLM models are **not** configured via env vars. Use the admin CLI:
 
 ```bash
-astra-admin model add <name> <provider> --api-key ... --base-url ...
-astra-admin model check <name>                    # probe + activate
-astra-admin model list                            # see all configured models
-astra-admin config set reasoning_model_name <n>   # optional: pin the judge/summary model
+astra admin model add <name> <provider> --api-key ... --base-url ...
+astra admin model check <name>                    # probe + activate
+astra admin model list                            # see all configured models
+astra admin config set reasoning_model_name <n>   # optional: pin the judge/summary model
 ```
 
 If `reasoning_model_name` is not set, the server falls back to the cheapest active model by `pricing.completion`.

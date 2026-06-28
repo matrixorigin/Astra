@@ -658,6 +658,6 @@ and their migration status towards TUI-native panels.
 
 ## See Also
 
-- [CLI Commands Reference](./cli-commands.md) — `astra` and `astra-admin` CLI commands
+- [CLI Commands Reference](./cli-commands.md) — `astra` and `astra admin` CLI commands
 - [Skill Development Guide](../guides/skill-development.md) — Creating custom skills
 - [MCP Integration](../guides/mcp-integration.md) — Adding MCP servers

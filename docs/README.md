@@ -26,7 +26,7 @@ Welcome to astra documentation! This guide will help you find the information yo
 
 - [API Reference](reference/api-reference.md) - Complete API endpoint documentation
 - [Makefile Commands](reference/makefile-commands.md) - All available make commands
-- [CLI Commands](reference/cli-commands.md) - astra and astra-admin CLI reference
+- [CLI Commands](reference/cli-commands.md) - single astra CLI reference
 - [Configuration](reference/configuration.md) - Environment variables and configuration
 - [Dependencies](reference/dependencies.md) - Dependency groups, installation, and optional extras
 

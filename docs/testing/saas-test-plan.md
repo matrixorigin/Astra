@@ -39,7 +39,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 | 工具执行 | 本地 | **Edge 本地** + Cloud 编排 |
 | 多租户 | 不适用 | MatrixOne Multi-Account + API 用户隔离 |
 | 配额 | 无 | ResourceGovernor（Token/Session/并发） |
-| 运维 | 开发者自管 | Admin API、`astra-admin`、K8s HPA |
+| 运维 | 开发者自管 | Admin API、`astra admin`、K8s HPA |
 | 审计 | 不完整 | 100% Turn 经 API 写入 audit chain |
 
 ---
@@ -312,8 +312,8 @@ AstraClient.login → createSession → createRun → SSE/WS 收流
 
 ```
 docker compose --profile app up -d
-astra-admin init
-astra-admin model load ...
+astra admin init
+astra admin model load ...
 curl /health → ok
 注册用户 → Chat 成功
 ```

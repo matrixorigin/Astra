@@ -49,9 +49,9 @@ astra serve stdio                   # stdio JSON-RPC app-server mode
 ### 4. Load Models & Login
 
 ```bash
-astra-admin register
-astra-admin login
-astra-admin model load .models.yaml
+astra admin register
+astra admin login
+astra admin model load .models.yaml
 
 astra chat -m "hello"   # prompts login/register on first run
 ```
@@ -133,8 +133,7 @@ rust/crates/
   core/        shared types and config
   services/    sessions, journals, durable tasks
   runtime/     Axum HTTP server + contract tests
-  astra-cli/   CLI, plan executor, code intel
-  astra-admin/ admin CLI
+  astra-cli/   single CLI, admin commands, plan executor, code intel
 deployment/
   all-in-one/  Docker Compose (deps + app)
 skills/        Agent skill definitions

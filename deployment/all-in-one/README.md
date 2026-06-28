@@ -27,20 +27,20 @@ make stack-up
 
 ## Admin Accounts
 
-Use `astra-admin register` to create an administrator account. On a fresh MatrixOne
+Use `astra admin register` to create an administrator account. On a fresh MatrixOne
 data volume this performs the initial admin bootstrap. After an admin exists,
-`astra-admin register` must be run while logged in as an existing admin.
+`astra admin register` must be run while logged in as an existing admin.
 
 ```bash
-./rust/target/debug/astra-admin --api-url http://127.0.0.1:17001 register \
+./rust/target/debug/astra admin --api-url http://127.0.0.1:17001 register \
   --username admin \
   --email admin@example.com \
   --password '<password>'
 
-./rust/target/debug/astra-admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
+./rust/target/debug/astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
 ```
 
-`astra-admin register` stores the returned admin credentials locally. It prints
+`astra admin register` stores the returned admin credentials locally. It prints
 `registered and logged in (initial admin)` for the first admin, and
 `registered and logged in (admin)` when an existing admin creates another admin.
 

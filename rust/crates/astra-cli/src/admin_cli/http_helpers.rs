@@ -9,7 +9,7 @@ fn append_model_not_found_hint(status: u16, body: &str, message: &mut String) {
         message.push_str(
             "\n  hint: `model_name` must match the server row exactly (case-sensitive). \
              MiniMax IDs look like `MiniMax-M2.5` / `MiniMax-M2.7` (note the `M` before the version). \
-             Run: astra-admin model list",
+             Run: astra admin model list",
         );
     }
 }

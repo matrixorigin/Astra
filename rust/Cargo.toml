@@ -6,7 +6,6 @@ members = [
     "crates/runtime",
     "crates/astra-tools",
     "crates/astra-cli",
-    "crates/astra-admin",
     "crates/astra-thin-client",
     "crates/astra-edge",
     "crates/astra-pipeline",

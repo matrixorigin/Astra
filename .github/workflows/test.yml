@@ -151,7 +151,7 @@ jobs:
       - name: Test core crates
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml
-          -p astra-core -p astra-thin-client -p astra-admin-cli
+          -p astra-core -p astra-thin-client
           -p astra-tools -p astra-pipeline -p astra-turn-types
           -p astra-skills -p astra-sandbox -p astra-server-types
           -p astra-messaging -p astra-text-utils

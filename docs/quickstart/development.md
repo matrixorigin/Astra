@@ -18,8 +18,7 @@ rust/crates/
   core/          shared types, config, error types
   services/      sessions, journals, durable tasks, storage DDL
   runtime/       Axum HTTP server, handlers, pipeline, contract tests
-  astra-cli/     interactive CLI, slash commands, edge tools
-  astra-admin/   admin CLI (register, model load, init, audit)
+  astra-cli/     single CLI, admin commands, slash commands, edge tools
 ```
 
 ## Development Workflow

@@ -60,8 +60,8 @@ help:
 	@echo "  make build-debug        - Build entire Rust workspace (debug, fast)"
 	@echo "  make build-server       - Build astra-server (release)"
 	@echo "  make build-server-debug - Build astra-server (debug, fast)"
-	@echo "  make build-cli          - Build astra + astra-admin (release)"
-	@echo "  make build-cli-debug    - Build astra + astra-admin (debug, fast)"
+	@echo "  make build-cli          - Build astra CLI (release)"
+	@echo "  make build-cli-debug    - Build astra CLI (debug, fast)"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean              - Remove ALL Rust build artifacts (target/)"
@@ -102,7 +102,7 @@ RUST_TARGET_DIR := rust/target
 RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
 RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
 API_SERVER_BIN := astra-server
-CLI_BINS := astra astra-admin
+CLI_BINS := astra
 IMAGE_NAME ?= matrixorigin/astra
 DOCKER_BUILD_ARGS ?=
 DOCKER_PROXY_BUILD_ARGS := --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
@@ -597,13 +597,13 @@ dev-seed:
 	@$(MAKE) dev-api-restart-debug build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
-	@NO_PROXY=localhost ./rust/target/debug/astra-admin register \
+	@NO_PROXY=localhost ./rust/target/debug/astra admin register \
 		--username admin --password 11111111 --email admin@mo.com
 	@echo "Logging in as admin..."
-	@NO_PROXY=localhost ./rust/target/debug/astra-admin login \
+	@NO_PROXY=localhost ./rust/target/debug/astra admin login \
 		--username admin --password 11111111
 	@echo "Loading models from .models.yaml..."
-	@NO_PROXY=localhost ./rust/target/debug/astra-admin model load .models.yaml
+	@NO_PROXY=localhost ./rust/target/debug/astra admin model load .models.yaml
 	@echo ""
 	@echo "✅ Seed complete — admin@mo.com / 11111111"
 
@@ -625,8 +625,8 @@ build-cli: build-cli-release
 
 .PHONY: build-cli-release
 build-cli-release: sweep
-	@echo "Building astra + astra-admin (release)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli --release
+	@echo "Building astra CLI (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --release
 	@echo "Binaries:"
 	@for bin in $(CLI_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
 
@@ -649,8 +649,8 @@ build-debug:
 
 .PHONY: build-cli-debug
 build-cli-debug:
-	@echo "Building astra + astra-admin (debug)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli
+	@echo "Building astra CLI (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli
 	@echo "Binaries:"
 	@for bin in $(CLI_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
 

@@ -206,6 +206,8 @@ pub(crate) enum Command {
     /// Manage settings: astra config list/get/set
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// Administrative operations
+    Admin(crate::admin_cli::AdminArgs),
     /// Generate shell completion script
     Completion(CompletionArgs),
     /// Diagnose installation, config, and connectivity

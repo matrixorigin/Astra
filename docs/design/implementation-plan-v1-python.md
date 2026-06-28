@@ -16,7 +16,7 @@ Workstream A: Write Path (性能)          Workstream B: CLI Edge-Cloud (SaaS)
 A1: EventPipeline core                  B1: Edge tools + API client
 A2: Wire into ChatLoop/RunEngine        B2: /chat/turn API + server refactor
 A3: Embedding decoupling                B3: EdgeChatLoop (edge agentic loop)
-A4: Async snapshot + firewall           B4: Admin API + astra-admin migration
+A4: Async snapshot + firewall           B4: Admin API + astra admin migration
 A5: Replay migration                    B5: Remove direct DB path + packaging
          │                                        │
          └──────────── Integration ───────────────┘
@@ -212,9 +212,9 @@ The server-side ChatLoop must be refactored to support per-turn execution (edge 
 
 ---
 
-### B4: Admin API endpoints + astra-admin migration
+### B4: Admin API endpoints + astra admin migration
 
-**Modified file**: `api/routers/admin.py` (already exists); admin CLI is `rust/crates/astra-admin`
+**Modified file**: `api/routers/admin.py` (already exists); admin CLI is `rust/crates/astra-cli`
 
 | Endpoint | What it does | Auth |
 |---|---|---|
@@ -224,7 +224,7 @@ The server-side ChatLoop must be refactored to support per-turn execution (edge 
 | `GET /admin/audit` | Query audit logs | admin role |
 | `POST /admin/prompts/optimize` | Trigger prompt optimization | admin role |
 
-Migrate astra-admin commands to use API client instead of direct DB.
+Migrate astra admin commands to use API client instead of direct DB.
 
 **Validation**: API tests for each endpoint with admin/non-admin JWT.
 
@@ -232,7 +232,7 @@ Migrate astra-admin commands to use API client instead of direct DB.
 
 ### B5: Remove direct DB path + CLI packaging
 
-**Modified files** (historical Python layout; current code: `rust/crates/astra-cli`, `rust/crates/astra-admin`)
+**Modified files** (historical Python layout; current code: `rust/crates/astra-cli`, `rust/crates/astra-cli`)
 
 | Item | Detail |
 |---|---|
@@ -258,7 +258,7 @@ Week 4:    A3 (Embedding decoupling)    ←── depends on A2
 
 Week 5:    A4 (Async snapshot/firewall) ←── depends on A2
            A5 (Replay migration)        ←── depends on A2
-           B4 (Admin API + astra-admin)    ←── depends on B1
+           B4 (Admin API + astra admin)    ←── depends on B1
 
 Week 6:    B5 (Remove direct DB path)   ←── depends on B3 + B4
            Integration testing + acceptance criteria validation

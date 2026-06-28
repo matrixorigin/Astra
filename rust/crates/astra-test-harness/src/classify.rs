@@ -166,10 +166,10 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
 /// Returns a one-line suggested action for the failure class.
 pub fn suggested_action(class: &FailureClass) -> &'static str {
     match class {
-        FailureClass::InfraAuth => "Check credentials: run `astra-admin login` or verify API keys",
+        FailureClass::InfraAuth => "Check credentials: run `astra admin login` or verify API keys",
         FailureClass::InfraTimeout => "Increase timeout or check network connectivity to provider",
         FailureClass::InfraModelInactive => {
-            "Model is inactive on the server; run `astra-admin model check <model>` or load an active model"
+            "Model is inactive on the server; run `astra admin model check <model>` or load an active model"
         }
         FailureClass::InfraProviderError { .. } => {
             "Provider returned an error; check provider status page or retry later"

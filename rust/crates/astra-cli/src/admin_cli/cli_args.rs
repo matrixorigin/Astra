@@ -1,9 +1,15 @@
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "astra-admin")]
-#[command(about = "Admin CLI — run `astra-admin` for interactive mode")]
-pub(crate) struct Cli {
+#[command(name = "admin")]
+#[command(about = "Admin commands — run `astra admin` for interactive mode")]
+pub struct Cli {
+    #[command(flatten)]
+    pub args: AdminArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct AdminArgs {
     /// API server base URL (flag > env > config > default) [env: ASTRA_API_URL]
     #[arg(long)]
     pub api_url: Option<String>,
@@ -14,7 +20,7 @@ pub(crate) struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum Command {
+pub enum Command {
     Interactive,
     Login(LoginArgs),
     /// Create an admin account. Bootstraps the first admin, or requires an existing admin login.
@@ -42,7 +48,7 @@ pub(crate) enum Command {
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum ConfigCmd {
+pub enum ConfigCmd {
     /// List all admin config keys and values.
     List,
     /// Read a single admin config value (e.g. `get reasoning_model`).
@@ -55,18 +61,18 @@ pub(crate) enum ConfigCmd {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ConfigKeyArgs {
+pub struct ConfigKeyArgs {
     pub key: String,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ConfigSetArgs {
+pub struct ConfigSetArgs {
     pub key: String,
     pub value: String,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct LoginArgs {
+pub struct LoginArgs {
     #[arg(long)]
     pub username: Option<String>,
     #[arg(long)]
@@ -74,7 +80,7 @@ pub(crate) struct LoginArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct RegisterArgs {
+pub struct RegisterArgs {
     #[arg(long)]
     pub username: Option<String>,
     #[arg(long)]
@@ -84,7 +90,7 @@ pub(crate) struct RegisterArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct AuditArgs {
+pub struct AuditArgs {
     #[arg(long)]
     pub user_id: Option<String>,
     #[arg(long)]
@@ -94,19 +100,19 @@ pub(crate) struct AuditArgs {
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum UserCmd {
+pub enum UserCmd {
     GrantRole(UserRoleArgs),
     RevokeRole(UserRoleArgs),
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct UserRoleArgs {
+pub struct UserRoleArgs {
     pub username: String,
     pub role_name: String,
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum ModelCmd {
+pub enum ModelCmd {
     List,
     Add(ModelAddArgs),
     Show(ModelShowArgs),
@@ -121,7 +127,7 @@ pub(crate) enum ModelCmd {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ModelAddArgs {
+pub struct ModelAddArgs {
     pub name: String,
     pub provider: String,
     #[arg(long)]
@@ -131,7 +137,7 @@ pub(crate) struct ModelAddArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ModelUpdateArgs {
+pub struct ModelUpdateArgs {
     pub model_name: String,
     #[arg(long)]
     pub api_key: Option<String>,
@@ -146,17 +152,17 @@ pub(crate) struct ModelUpdateArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ModelShowArgs {
+pub struct ModelShowArgs {
     pub model_name: String,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ModelDeleteArgs {
+pub struct ModelDeleteArgs {
     pub model_name: String,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ModelLoadArgs {
+pub struct ModelLoadArgs {
     pub path: String,
     /// When the server already has this model name, `POST /models` is skipped. With this flag,
     /// push `api_key` and optional `base_url` from the YAML via `PUT /models/{name}` so the
@@ -166,13 +172,13 @@ pub(crate) struct ModelLoadArgs {
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum TokenCmd {
+pub enum TokenCmd {
     List(TokenListArgs),
     Create(TokenCreateArgs),
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TokenListArgs {
+pub struct TokenListArgs {
     #[arg(long)]
     pub token_type: Option<String>,
     #[arg(long)]
@@ -180,7 +186,7 @@ pub(crate) struct TokenListArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TokenCreateArgs {
+pub struct TokenCreateArgs {
     #[arg(long = "type")]
     pub token_type: String,
     #[arg(long)]
@@ -194,14 +200,14 @@ pub(crate) struct TokenCreateArgs {
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum SkillCmd {
+pub enum SkillCmd {
     List(SkillListArgs),
     Show(SkillShowArgs),
     Versions(SkillNameArgs),
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct SkillListArgs {
+pub struct SkillListArgs {
     #[arg(long, default_value_t = 50)]
     pub limit: u32,
     #[arg(long, default_value_t = 0)]
@@ -209,24 +215,24 @@ pub(crate) struct SkillListArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct SkillShowArgs {
+pub struct SkillShowArgs {
     pub skill_id: String,
     #[arg(long)]
     pub version: Option<String>,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct SkillNameArgs {
+pub struct SkillNameArgs {
     pub skill_name: String,
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum PromptCmd {
+pub enum PromptCmd {
     Optimize(PromptOptimizeArgs),
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct PromptOptimizeArgs {
+pub struct PromptOptimizeArgs {
     #[arg(long)]
     pub agent_id: String,
     #[arg(long, default_value = "quality")]
@@ -234,13 +240,13 @@ pub(crate) struct PromptOptimizeArgs {
 }
 
 #[derive(Subcommand, Debug)]
-pub(crate) enum FeedbackCmd {
+pub enum FeedbackCmd {
     Stats(FeedbackStatsArgs),
     Export(FeedbackExportArgs),
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct FeedbackStatsArgs {
+pub struct FeedbackStatsArgs {
     #[arg(long)]
     pub agent_id: Option<String>,
     #[arg(long)]
@@ -248,7 +254,7 @@ pub(crate) struct FeedbackStatsArgs {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct FeedbackExportArgs {
+pub struct FeedbackExportArgs {
     #[arg(long)]
     pub agent_id: Option<String>,
     #[arg(long, default_value = "jsonl")]
@@ -264,20 +270,20 @@ mod tests {
     fn parse_simple_commands() {
         // Basic command parsing
         assert!(matches!(
-            Cli::try_parse_from(["astra-admin", "login"])
+            Cli::try_parse_from(["admin", "login"])
                 .unwrap()
+                .args
                 .command,
             Some(Command::Login(_))
         ));
         assert!(matches!(
-            Cli::try_parse_from(["astra-admin", "init"])
-                .unwrap()
-                .command,
+            Cli::try_parse_from(["admin", "init"]).unwrap().args.command,
             Some(Command::Init)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["astra-admin", "model", "list"])
+            Cli::try_parse_from(["admin", "model", "list"])
                 .unwrap()
+                .args
                 .command,
             Some(Command::Model(ModelCmd::List))
         ));
@@ -285,8 +291,8 @@ mod tests {
 
     #[test]
     fn parse_audit_with_limit() {
-        let cli = Cli::try_parse_from(["astra-admin", "audit", "--limit", "50"]).unwrap();
-        if let Some(Command::Audit(args)) = cli.command {
+        let cli = Cli::try_parse_from(["admin", "audit", "--limit", "50"]).unwrap();
+        if let Some(Command::Audit(args)) = cli.args.command {
             assert_eq!(args.limit, 50);
         } else {
             panic!("expected Audit command");
@@ -297,25 +303,25 @@ mod tests {
     fn parse_flag_options() {
         // --profile flag
         assert_eq!(
-            Cli::try_parse_from(["astra-admin", "--profile", "staging", "init"])
+            Cli::try_parse_from(["admin", "--profile", "staging", "init"])
                 .unwrap()
+                .args
                 .profile
                 .as_deref(),
             Some("staging")
         );
         // --api-url flag
         assert_eq!(
-            Cli::try_parse_from(["astra-admin", "--api-url", "http://localhost:9000", "init"])
+            Cli::try_parse_from(["admin", "--api-url", "http://localhost:9000", "init"])
                 .unwrap()
+                .args
                 .api_url
                 .as_deref(),
             Some("http://localhost:9000")
         );
         // Default api_url is None
         assert_eq!(
-            Cli::try_parse_from(["astra-admin", "init"])
-                .unwrap()
-                .api_url,
+            Cli::try_parse_from(["admin", "init"]).unwrap().args.api_url,
             None
         );
     }

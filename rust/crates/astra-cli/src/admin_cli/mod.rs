@@ -4,13 +4,14 @@ use astra_thin_client::ThinClient;
 use astra_thin_client::paths;
 use clap::Parser;
 
-mod cli_args;
+pub mod cli_args;
 mod config;
 mod credentials;
 mod http_helpers;
 mod input;
 mod interactive;
 
+pub use cli_args::AdminArgs;
 use cli_args::*;
 use config::resolve_api_url;
 use credentials::*;
@@ -35,7 +36,7 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
     {
         println!("  connectivity: {c}");
     } else if !active {
-        println!("  connectivity: (not in response; run: astra-admin model check {model_name})");
+        println!("  connectivity: (not in response; run: astra admin model check {model_name})");
     }
     let thinking_cap = value
         .get("thinking_capability")
@@ -51,7 +52,7 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
     }
     if !active {
         eprintln!(
-            "  warning: model is inactive — server probe failed or was skipped; fix YAML then `astra-admin model load <file> --update-existing`, or `astra-admin model check {model_name}`"
+            "  warning: model is inactive — server probe failed or was skipped; fix YAML then `astra admin model load <file> --update-existing`, or `astra admin model check {model_name}`"
         );
     }
 }
@@ -212,16 +213,27 @@ fn build_model_create_payload(
     payload
 }
 
-#[tokio::main]
-async fn main() -> Result<(), String> {
+pub async fn run_from_env() -> Result<(), String> {
     let cli = Cli::parse();
+    run(cli.args, None, None).await
+}
+
+pub async fn run(
+    args: AdminArgs,
+    inherited_api_url: Option<&str>,
+    inherited_profile: Option<&str>,
+) -> Result<(), String> {
     // Resolve API URL: --api-url flag > ASTRA_API_URL env > config file > default
-    let base = resolve_api_url(cli.api_url.as_deref());
+    let base = resolve_api_url(args.api_url.as_deref().or(inherited_api_url));
     let api = ThinClient::new(&base, None).map_err(|e| e.to_string())?;
-    let command = cli.command.unwrap_or(Command::Interactive);
+    let profile = args
+        .profile
+        .clone()
+        .or_else(|| inherited_profile.map(ToString::to_string));
+    let command = args.command.unwrap_or(Command::Interactive);
 
     match command {
-        Command::Interactive => run_interactive(&api, cli.profile.as_deref()).await,
+        Command::Interactive => run_interactive(&api, profile.as_deref()).await,
         Command::Login(args) => {
             let username = prompt_or("Username", args.username)?;
             let password = prompt_or("Password", args.password)?;
@@ -244,7 +256,7 @@ async fn main() -> Result<(), String> {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| "missing refresh_token".to_string())?
                 .to_string();
-            let cli_profile = cli.profile.clone();
+            let cli_profile = profile.clone();
             credentials::store()
                 .mutate(|creds| {
                     let name = profile_name(cli_profile.as_deref(), creds);
@@ -270,7 +282,7 @@ async fn main() -> Result<(), String> {
                 .email
                 .unwrap_or_else(|| format!("{username}@example.com"));
             let existing_token = load_credentials();
-            let existing_profile_name = profile_name(cli.profile.as_deref(), &existing_token);
+            let existing_profile_name = profile_name(profile.as_deref(), &existing_token);
             let existing_token = existing_token
                 .profiles
                 .get(&existing_profile_name)
@@ -307,7 +319,7 @@ async fn main() -> Result<(), String> {
             if !is_admin {
                 return Err("admin registration did not return an admin account".to_string());
             }
-            let cli_profile = cli.profile.clone();
+            let cli_profile = profile.clone();
             credentials::store()
                 .mutate(|creds| {
                     let name = profile_name(cli_profile.as_deref(), creds);
@@ -331,20 +343,20 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Whoami => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api.get_auth_me_text(&token).await.map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Refresh => {
             let creds = load_credentials();
-            let name = profile_name(cli.profile.as_deref(), &creds);
-            let profile = creds
+            let name = profile_name(profile.as_deref(), &creds);
+            let saved_profile = creds
                 .profiles
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = profile
+            let refresh_token = saved_profile
                 .refresh_token
                 .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
             let body = api
@@ -363,7 +375,7 @@ async fn main() -> Result<(), String> {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| "missing refresh_token".to_string())?
                 .to_string();
-            let cli_profile = cli.profile.clone();
+            let cli_profile = profile.clone();
             credentials::store()
                 .mutate(|creds| {
                     let name = profile_name(cli_profile.as_deref(), creds);
@@ -377,20 +389,20 @@ async fn main() -> Result<(), String> {
         }
         Command::Logout => {
             let creds = load_credentials();
-            let name = profile_name(cli.profile.as_deref(), &creds);
-            let profile = creds
+            let name = profile_name(profile.as_deref(), &creds);
+            let saved_profile = creds
                 .profiles
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = profile
+            let refresh_token = saved_profile
                 .refresh_token
                 .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
             let body = api
                 .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
-            let cli_profile = cli.profile.clone();
+            let cli_profile = profile.clone();
             credentials::store()
                 .mutate(|creds| {
                     let name = profile_name(cli_profile.as_deref(), creds);
@@ -404,7 +416,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Init => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .post_bearer_path_empty_text(&token, paths::ADMIN_INIT)
                 .await
@@ -413,7 +425,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Audit(args) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let mut q: Vec<(&str, String)> = vec![("limit", args.limit.to_string())];
             if let Some(user_id) = args.user_id {
                 q.push(("user_id", user_id));
@@ -429,7 +441,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::User(UserCmd::GrantRole(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .post_bearer_path_json_text(
                     &token,
@@ -445,7 +457,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::User(UserCmd::RevokeRole(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .post_bearer_path_json_text(
                     &token,
@@ -461,13 +473,13 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Model(ModelCmd::List) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api.get_models_text(&token).await.map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Model(ModelCmd::Add(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .post_bearer_path_json_text(
                     &token,
@@ -485,7 +497,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Model(ModelCmd::Show(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .get_model_text(&token, &args.model_name)
                 .await
@@ -494,7 +506,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Model(ModelCmd::Delete(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .delete_bearer_path_text(&token, &paths::model(&args.model_name))
                 .await
@@ -507,7 +519,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Model(ModelCmd::Check(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .post_bearer_path_empty_text(&token, &paths::model_check(&args.model_name))
                 .await
@@ -527,7 +539,7 @@ async fn main() -> Result<(), String> {
                     .ok_or_else(|| "missing models list in yaml".to_string())?
             };
 
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             for entry in models {
                 let model_name = entry
                     .get("name")
@@ -591,7 +603,7 @@ async fn main() -> Result<(), String> {
                             }
                         } else {
                             println!(
-                                "skipped (already exists): {model_name} — use `astra-admin model load {} --update-existing` to push YAML credentials and re-run connectivity",
+                                "skipped (already exists): {model_name} — use `astra admin model load {} --update-existing` to push YAML credentials and re-run connectivity",
                                 args.path
                             );
                             false
@@ -634,7 +646,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Model(ModelCmd::Update(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let mut payload = serde_json::Map::new();
             if let Some(key) = args.api_key {
                 payload.insert("api_key".into(), serde_json::json!(key));
@@ -667,7 +679,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Token(TokenCmd::List(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let mut q: Vec<(&str, String)> = Vec::new();
             if let Some(token_type) = args.token_type {
                 q.push(("token_type", token_type));
@@ -683,7 +695,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Token(TokenCmd::Create(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .post_bearer_path_json_text(
                     &token,
@@ -702,7 +714,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Skill(SkillCmd::List(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let q = vec![
                 ("limit", args.limit.to_string()),
                 ("offset", args.offset.to_string()),
@@ -715,7 +727,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Skill(SkillCmd::Show(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let q: Vec<(&str, String)> = if let Some(version) = args.version {
                 vec![("version", version)]
             } else {
@@ -729,7 +741,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Skill(SkillCmd::Versions(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .get_bearer_path_query_text(&token, &paths::skill_versions(&args.skill_name), &[])
                 .await
@@ -738,7 +750,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Prompt(PromptCmd::Optimize(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .post_bearer_path_json_text(
                     &token,
@@ -754,7 +766,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Feedback(FeedbackCmd::Stats(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let mut q: Vec<(&str, String)> = Vec::new();
             if let Some(agent_id) = args.agent_id {
                 q.push(("agent_id", agent_id));
@@ -770,7 +782,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Feedback(FeedbackCmd::Export(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .post_bearer_path_json_text(
                     &token,
@@ -786,7 +798,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Config(ConfigCmd::List) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .get_bearer_path_query_text(&token, paths::ADMIN_CONFIG, &[])
                 .await
@@ -795,7 +807,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Config(ConfigCmd::Get(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .get_bearer_path_query_text(&token, &paths::admin_config_key(&args.key), &[])
                 .await
@@ -804,7 +816,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Config(ConfigCmd::Set(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .put_bearer_path_json_text(
                     &token,
@@ -817,7 +829,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Config(ConfigCmd::Unset(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .delete_bearer_path_text(&token, &paths::admin_config_key(&args.key))
                 .await

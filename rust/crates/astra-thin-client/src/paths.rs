@@ -255,7 +255,7 @@ pub const CHAT_ROUTE: &str = "/chat/route";
 /// Lightweight LLM proxy for verification judge / edge components.
 pub const COMPLETIONS: &str = "/v1/chat/completions";
 
-// ── Admin API (`astra-admin-cli` → same server) ───────────────────────────────
+// ── Admin API (`astra-cli` → same server) ───────────────────────────────
 
 pub const ADMIN_INIT: &str = "/admin/init";
 pub const ADMIN_REGISTER: &str = "/admin/register";

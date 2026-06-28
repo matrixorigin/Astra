@@ -153,7 +153,7 @@ async fn check_model(astra_bin: &Path, model: &str) -> Result<(), PreflightError
             }
         }
         return Err(PreflightError::AuthFailed {
-            detail: "credentials invalid and auto-register failed. Run: astra-admin register && astra-admin login".to_string(),
+            detail: "credentials invalid and auto-register failed. Run: astra admin register && astra admin login".to_string(),
         });
     }
 
@@ -172,18 +172,17 @@ async fn check_model(astra_bin: &Path, model: &str) -> Result<(), PreflightError
     Ok(())
 }
 
-/// Try to register a test user via astra-admin and login via astra CLI.
+/// Try to register a test user via `astra admin` and login via astra CLI.
 /// Returns true if credentials are now valid.
 async fn try_auto_register(astra_bin: &Path) -> bool {
-    // Locate astra-admin next to astra binary.
-    let admin_bin = astra_bin.with_file_name("astra-admin");
-    if !admin_bin.exists() {
+    if !astra_bin.exists() {
         return false;
     }
 
     // Register (may fail if user already exists — that's fine).
-    let _ = Command::new(&admin_bin)
+    let _ = Command::new(astra_bin)
         .args([
+            "admin",
             "register",
             "--username",
             "harness-auto",
@@ -196,8 +195,9 @@ async fn try_auto_register(astra_bin: &Path) -> bool {
         .await;
 
     // Login to get fresh tokens.
-    let login_out = Command::new(&admin_bin)
+    let login_out = Command::new(astra_bin)
         .args([
+            "admin",
             "login",
             "--username",
             "harness-auto",

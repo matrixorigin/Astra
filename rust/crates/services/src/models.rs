@@ -708,13 +708,13 @@ pub fn format_inactive_model_error(requested: &str, canonical: &str) -> String {
     if requested == canonical {
         format!(
             "Model '{canonical}' is inactive (connectivity failed or disabled). \
-             Run `astra-admin model check {canonical}` or pick an active model; \
+             Run `astra admin model check {canonical}` or pick an active model; \
              the server will not substitute another model."
         )
     } else {
         format!(
             "Model '{requested}' (resolved to canonical '{canonical}') is inactive \
-             (connectivity failed or disabled). Run `astra-admin model check {canonical}` \
+             (connectivity failed or disabled). Run `astra admin model check {canonical}` \
              or pick an active model; the server will not substitute another model."
         )
     }
@@ -872,8 +872,8 @@ pub async fn resolve_reasoning_model(
 
     if rows.is_empty() {
         return Err(
-            "No active LLM model configured. Run `astra-admin model add` then \
-             `astra-admin model check`, or `astra-admin config set reasoning_model <name>`."
+            "No active LLM model configured. Run `astra admin model add` then \
+             `astra admin model check`, or `astra admin config set reasoning_model <name>`."
                 .to_string(),
         );
     }
@@ -2694,7 +2694,7 @@ mod tests {
             "msg explains the failure mode: {msg}"
         );
         assert!(
-            msg.contains("astra-admin model check"),
+            msg.contains("astra admin model check"),
             "msg points at the diagnostic command: {msg}"
         );
     }
@@ -2710,7 +2710,7 @@ mod tests {
         let n = msg.matches(name).count();
         assert_eq!(
             n, 2,
-            "expected name twice (in the 'Model X' and 'astra-admin model check X' parts), \
+            "expected name twice (in the 'Model X' and 'astra admin model check X' parts), \
              got {n}: {msg}"
         );
         assert!(

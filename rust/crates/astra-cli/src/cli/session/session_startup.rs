@@ -794,7 +794,7 @@ pub(crate) async fn complete_session_startup(
         eprintln!(
             "  {}  {}",
             theme::icon_warn(),
-            "No LLM model configured on server. Run: astra-admin model add".yellow()
+            "No LLM model configured on server. Run: astra admin model add".yellow()
         );
         eprintln!();
         state.model = None;

@@ -199,7 +199,7 @@ The platform automatically improves prompts based on accumulated feedback:
 6. Auto-activate new version via upsert into prompt_templates
 ```
 
-**CLI**: `astra-admin prompt optimize --template system_general [--dry-run]`
+**CLI**: `astra admin prompt optimize --template system_general [--dry-run]`
 
 **Verified result**: system_general v1.0 → v1.1 automatically. Diagnosis identified "prompt too vague, lacks behavioral instructions." New prompt added "Be Specific & Direct", "Use Tools Proactively" — measurably more direct responses.
 
@@ -214,7 +214,7 @@ Users rarely give explicit feedback. But their next message is rich with implici
 | Layer | When | Cost | How |
 |-------|------|------|-----|
 | Heuristic detector | Every turn, inline | Zero | Regex patterns for correction/frustration/rephrasing/clarification (CN+EN) |
-| LLM batch analyzer | Async, on-demand | Per-batch | `astra-admin prompt mine-feedback [--use-llm]` analyzes conversation triples |
+| LLM batch analyzer | Async, on-demand | Per-batch | `astra admin prompt mine-feedback [--use-llm]` analyzes conversation triples |
 
 **Taxonomy** (following Don-Yehiya et al. 2024):
 - `correction`: "不对" / "错了" / "wrong" — user says answer was wrong
@@ -228,9 +228,9 @@ Users rarely give explicit feedback. But their next message is rich with implici
 ```
 User conversation → implicit signal auto-detected → llm_feedback table
                                                          ↓
-                              astra-admin prompt mine-feedback (deep async analysis)
+                              astra admin prompt mine-feedback (deep async analysis)
                                                          ↓
-                              astra-admin prompt optimize (LLM diagnosis + improvement)
+                              astra admin prompt optimize (LLM diagnosis + improvement)
                                                          ↓
                               regression gate → new prompt activated → next chat uses it
 ```

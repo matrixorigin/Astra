@@ -55,15 +55,14 @@ FROM chef AS builder
 
 WORKDIR /app/rust
 COPY --from=planner /app/rust/recipe.json recipe.json
-# Runtime image intentionally ships the API server plus public user/admin CLIs.
+# Runtime image intentionally ships the API server plus the single public CLI.
 # Test-only mock_mcp_server and the standalone astra-edge daemon are excluded.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/rust/target \
     cargo chef cook --release --recipe-path recipe.json \
         -p astra-runtime --bin astra-server \
-        -p astra-cli --bin astra \
-        -p astra-admin-cli --bin astra-admin
+        -p astra-cli --bin astra
 
 COPY rust/ ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -71,10 +70,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/rust/target \
     cargo build --release \
         -p astra-runtime --bin astra-server \
-        -p astra-cli --bin astra \
-        -p astra-admin-cli --bin astra-admin && \
+        -p astra-cli --bin astra && \
     mkdir -p /out && \
-    cp target/release/astra-server target/release/astra target/release/astra-admin /out/
+    cp target/release/astra-server target/release/astra /out/
 
 FROM debian:bookworm-slim
 
@@ -131,7 +129,6 @@ RUN set -eux; \
     useradd --system --create-home --home-dir /home/appuser --shell /usr/sbin/nologin -g appgroup appuser
 COPY --from=builder /out/astra-server /usr/local/bin/astra-server
 COPY --from=builder /out/astra /usr/local/bin/astra
-COPY --from=builder /out/astra-admin /usr/local/bin/astra-admin
 # WORKDIR writable for appgroup; K8s runAsUser overrides should add supplementalGroups: [appgroup GID].
 # Prefer mounted volumes for real data rather than writing to /app at runtime.
 RUN chown root:appgroup /app && chmod 0770 /app

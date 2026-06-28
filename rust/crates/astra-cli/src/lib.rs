@@ -32,6 +32,7 @@
 pub const DEFERRED_INPUT_FINGERPRINT_SEP: &str = " ↩ ";
 
 // ═══════════════════════════ Top-level utility modules ═══════════════════
+pub mod admin_cli;
 pub mod diff_utils;
 pub mod edge_tools;
 pub mod explain_dag;

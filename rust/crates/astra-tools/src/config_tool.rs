@@ -2,8 +2,8 @@
 //! Config tool: show server-level output-limit settings.
 //!
 //! LLM model / API key / base URL are managed via the admin CLI against the server's
-//! `infra_llm_models` + `admin_config` tables. Use `astra-admin model list` and
-//! `astra-admin config list` to inspect them.
+//! `infra_llm_models` + `admin_config` tables. Use `astra admin model list` and
+//! `astra admin config list` to inspect them.
 
 use serde_json::{Value, json};
 
@@ -80,7 +80,7 @@ pub fn config_tool(global_limit: usize, tool_limit: usize, args: &Value) -> Stri
         _ => json!({
             "error": format!(
                 "Unknown setting: {}. Use setting='list' to see available settings. \
-                 LLM model settings live in the server DB — use `astra-admin model list` / `astra-admin config list`.",
+                 LLM model settings live in the server DB — use `astra admin model list` / `astra admin config list`.",
                 setting
             )
         })

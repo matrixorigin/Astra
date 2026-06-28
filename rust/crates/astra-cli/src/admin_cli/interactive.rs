@@ -132,13 +132,13 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
     eprintln!();
     eprintln!(
         "{}",
-        "astra-admin interactive mode  (type help for commands, Ctrl+D to exit)".dim()
+        "astra admin interactive mode  (type help for commands, Ctrl+D to exit)".dim()
     );
     eprintln!();
 
     loop {
         let readline_result = tokio::task::block_in_place(|| {
-            editor.readline(&format!("{} ", "astra-admin❯".yellow().bold()))
+            editor.readline(&format!("{} ", "astra admin❯".yellow().bold()))
         });
 
         let line = match readline_result {

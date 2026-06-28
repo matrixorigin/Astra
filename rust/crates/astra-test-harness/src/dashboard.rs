@@ -251,11 +251,11 @@ async fn config_handler(State(state): State<AppState>) -> Json<serde_json::Value
 }
 
 async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let admin_bin = state.config.astra_bin.with_file_name("astra-admin");
+    let admin_bin = &state.config.astra_bin;
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        tokio::process::Command::new(&admin_bin)
-            .args(["model", "list"])
+        tokio::process::Command::new(admin_bin)
+            .args(["admin", "model", "list"])
             .env("NO_PROXY", "localhost,127.0.0.1")
             .env("no_proxy", "localhost,127.0.0.1")
             .stdout(std::process::Stdio::piped())
@@ -466,9 +466,10 @@ async fn login_handler(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Json<serde_json::Value> {
-    let admin_bin = state.config.astra_bin.with_file_name("astra-admin");
-    let output = tokio::process::Command::new(&admin_bin)
+    let admin_bin = &state.config.astra_bin;
+    let output = tokio::process::Command::new(admin_bin)
         .args([
+            "admin",
             "login",
             "--username",
             &req.username,
@@ -684,11 +685,11 @@ async fn orchestrate_handler(
         })
         .unwrap_or_default();
 
-    let admin_bin = state.config.astra_bin.with_file_name("astra-admin");
+    let admin_bin = &state.config.astra_bin;
     let models_list = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        tokio::process::Command::new(&admin_bin)
-            .args(["model", "list"])
+        tokio::process::Command::new(admin_bin)
+            .args(["admin", "model", "list"])
             .env("NO_PROXY", "localhost,127.0.0.1")
             .env("no_proxy", "localhost,127.0.0.1")
             .stdout(std::process::Stdio::piped())
