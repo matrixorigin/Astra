@@ -80,6 +80,7 @@ help:
 	@echo "  make dev-start-docker   - Start deps + API in Docker"
 	@echo "  make dev-api-docker-up  - Start API server in Docker"
 	@echo "  make dev-api-docker-down - Stop API server Docker container"
+	@echo "  make release-docker     - Build and push Docker image (IMAGE_NAME=..., VERSION=...)"
 
 # ============================================================================
 # Variables
@@ -94,6 +95,7 @@ RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
 RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
 API_SERVER_BIN := astra-server
 CLI_BINS := astra astra-admin
+IMAGE_NAME ?= matrixorigin/astra
 
 # Per-test-case hard budget. Any case running longer than the budget is
 # killed and counted as FAIL. Nextest has no CLI override for slow-timeout
@@ -406,6 +408,15 @@ dev-api-docker-scale:
 	@echo "Scaling API server to $(REPLICAS) replicas..."
 	@cd deployment/all-in-one && docker compose --profile app up -d --scale api=$(REPLICAS)
 	@echo "✅ Scaled to $(REPLICAS) replicas"
+
+.PHONY: release-docker
+release-docker:
+	@echo "Building Docker image $(IMAGE_NAME):latest..."
+	@docker build -t $(IMAGE_NAME):latest .
+	@if [ -n "$(VERSION)" ]; then docker tag $(IMAGE_NAME):latest $(IMAGE_NAME):$(VERSION); fi
+	@docker push $(IMAGE_NAME):latest
+	@if [ -n "$(VERSION)" ]; then docker push $(IMAGE_NAME):$(VERSION); fi
+	@echo "✅ Pushed Docker image $(IMAGE_NAME)"
 
 # ============================================================================
 # Composite Commands
