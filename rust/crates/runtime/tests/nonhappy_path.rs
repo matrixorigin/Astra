@@ -1270,13 +1270,14 @@ mod chat_stream_turnguard_e2e {
 
     // ── Nudge-ignore detection ──
 
-    /// If stall nudge says "avoid bash" (after 3+ occurrences),
-    /// but next turn uses bash → warning injected.
+    /// If stall nudge says to change approach for bash (after 3+ occurrences),
+    /// but next turn uses bash again → retry-caution warning injected without
+    /// implying the tool is disabled.
     #[test]
     fn nudge_ignore_detection() {
         let mut guard = TurnGuard::new();
 
-        // Turn 1-3: stall on bash (3 identical calls → avoid_tools includes bash)
+        // Turn 1-3: stall on bash (3 identical calls → retry caution includes bash)
         let bash_call = tc("bash", r#"{"command":"ls"}"#);
         guard.record_tool_calls(std::slice::from_ref(&bash_call));
         guard.record_tool_calls(std::slice::from_ref(&bash_call));
@@ -1293,8 +1294,12 @@ mod chat_stream_turnguard_e2e {
         guard.record_tool_result("bash", "# README\ncontent");
         let v = guard.evaluate();
 
-        // Should detect nudge-ignore
-        let has_nudge_ignore_warning = v.injections.iter().any(|m| m.contains("told to avoid"));
+        // Should detect nudge-ignore while preserving the "not disabled" tool model.
+        let has_nudge_ignore_warning = v.injections.iter().any(|m| {
+            m.contains("prior correction asked you to change approach")
+                && m.contains("[bash]")
+                && m.contains("tools are not disabled unless a restricted_tool result says so")
+        });
         assert!(
             has_nudge_ignore_warning,
             "should warn when LLM ignores nudge advice"
