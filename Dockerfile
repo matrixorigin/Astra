@@ -78,9 +78,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 
+ARG IMAGE_VERSION=dev
+ARG IMAGE_REVISION=unknown
+
 LABEL org.opencontainers.image.title="Astra" \
       org.opencontainers.image.description="Astra API server and CLI runtime image" \
-      org.opencontainers.image.source="https://github.com/matrixorigin/astra"
+      org.opencontainers.image.source="https://github.com/matrixorigin/astra" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}"
 
 ARG DEBIAN_MIRROR
 ARG http_proxy

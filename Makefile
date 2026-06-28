@@ -106,6 +106,9 @@ CLI_BINS := astra astra-admin
 IMAGE_NAME ?= matrixorigin/astra
 DOCKER_BUILD_ARGS ?=
 DOCKER_PROXY_BUILD_ARGS := --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
+IMAGE_VERSION ?= $(if $(VERSION),$(VERSION),dev)
+IMAGE_REVISION ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build-arg IMAGE_REVISION=$(IMAGE_REVISION)
 # Project-wide default for every API server mode. Compose may remap the
 # host-facing port, but the container listens on this value.
 DEFAULT_API_PORT := 17001
@@ -398,7 +401,7 @@ dev-web-status:
 .PHONY: dev-api-docker-build
 dev-api-docker-build:
 	@echo "Building API server image..."
-	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):latest .
+	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):latest .
 	@echo "✅ Image built"
 
 .PHONY: dev-api-docker-up
@@ -430,7 +433,7 @@ dev-api-docker-scale:
 .PHONY: release-docker
 release-docker:
 	@echo "Building Docker image $(IMAGE_NAME):latest..."
-	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):latest .
+	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):latest .
 	@if [ -n "$(VERSION)" ]; then docker tag $(IMAGE_NAME):latest $(IMAGE_NAME):$(VERSION); fi
 	@docker push $(IMAGE_NAME):latest
 	@if [ -n "$(VERSION)" ]; then docker push $(IMAGE_NAME):$(VERSION); fi
