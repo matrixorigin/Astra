@@ -12,7 +12,8 @@ From the repo root:
 make stack-env
 ```
 
-Fill the required embedding configuration in `deployment/all-in-one/.env`:
+`make stack-env` creates `deployment/all-in-one/.env` and generates local
+stack secrets. Fill the required embedding configuration:
 
 - `MEMORIA_EMBEDDING_API_KEY`
 - `MEMORIA_EMBEDDING_BASE_URL`
@@ -23,7 +24,7 @@ Then start the stack:
 make stack-up
 ```
 
-`make stack-up` fails before starting containers if either required embedding value is empty.
+`make stack-up` fails before starting containers if any required value is empty.
 
 ## Admin Accounts
 
@@ -56,17 +57,16 @@ make stack-clean
 
 Required for startup:
 
-- `MEMORIA_EMBEDDING_API_KEY`
-- `MEMORIA_EMBEDDING_BASE_URL`
-
-The stack provides local-development defaults for these internal secrets:
-
 - `ASTRA_JWT_SECRET`
 - `ASTRA_TOKEN_ENCRYPTION_KEY`
 - `ASTRA_BRIDGE_SECRET`
 - `MEMORIA_MASTER_KEY`
+- `MEMORIA_EMBEDDING_API_KEY`
+- `MEMORIA_EMBEDDING_BASE_URL`
 
-Change those defaults before exposing the stack outside a trusted development environment.
+The Makefile generates the four secret values for local single-host bring-up.
+When using plain `docker compose`, generate and fill them yourself instead of
+leaving the template values empty.
 
 ## Start With Docker Compose
 
@@ -75,8 +75,12 @@ cd deployment/all-in-one
 cp .env.example .env
 ```
 
-Fill the required embedding configuration in `.env`:
+Fill the required configuration in `.env`:
 
+- `ASTRA_JWT_SECRET`
+- `ASTRA_TOKEN_ENCRYPTION_KEY`
+- `ASTRA_BRIDGE_SECRET`
+- `MEMORIA_MASTER_KEY`
 - `MEMORIA_EMBEDDING_API_KEY`
 - `MEMORIA_EMBEDDING_BASE_URL`
 

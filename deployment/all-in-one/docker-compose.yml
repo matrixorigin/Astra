@@ -14,7 +14,15 @@ services:
     entrypoint:
       - sh
       - -c
-      - chown -R ${UID:-1000}:${GID:-1000} /mo-data && mkdir -p /mo-logs && chown -R ${UID:-1000}:${GID:-1000} /mo-logs
+      - |
+        set -eu
+        if ! grep -qx "${UID:-1000}:${GID:-1000}" /mo-data/.astra-owner 2>/dev/null; then
+          chown -R "${UID:-1000}:${GID:-1000}" /mo-data
+          printf '%s\n' "${UID:-1000}:${GID:-1000}" > /mo-data/.astra-owner
+          chown "${UID:-1000}:${GID:-1000}" /mo-data/.astra-owner
+        fi
+        mkdir -p /mo-logs
+        chown "${UID:-1000}:${GID:-1000}" /mo-logs
     volumes:
       - matrixone-data:/mo-data
       - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
@@ -66,7 +74,7 @@ services:
     environment:
       RUST_LOG: ${MEMORIA_RUST_LOG:-info}
       DATABASE_URL: mysql://${MATRIXONE_USER:-root}:${MATRIXONE_PASSWORD:-111}@matrixone:6001/${MEMORIA_DB_NAME:-memoria}
-      MASTER_KEY: ${MEMORIA_MASTER_KEY:-astra-dev-memoria-master-key-change-me}
+      MASTER_KEY: ${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in deployment/all-in-one/.env}
       EMBEDDING_PROVIDER: ${MEMORIA_EMBEDDING_PROVIDER:-openai}
       EMBEDDING_MODEL: ${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3}
       EMBEDDING_DIM: ${MEMORIA_EMBEDDING_DIM:-1024}
@@ -128,14 +136,14 @@ services:
       MATRIXONE_PASSWORD: ${MATRIXONE_PASSWORD:-111}
       ASTRA_DATABASE: ${ASTRA_DATABASE:-astra_runtime}
       ASTRA_DATABASE_PREFIX: ${ASTRA_DATABASE_PREFIX:-}
-      ASTRA_JWT_SECRET: ${ASTRA_JWT_SECRET:-astra-dev-jwt-secret-change-me-at-least-32-chars}
+      ASTRA_JWT_SECRET: ${ASTRA_JWT_SECRET:?Set ASTRA_JWT_SECRET in deployment/all-in-one/.env}
       ASTRA_JWT_ALGORITHM: ${ASTRA_JWT_ALGORITHM:-HS256}
       ASTRA_JWT_ACCESS_TTL_MINUTES: ${ASTRA_JWT_ACCESS_TTL_MINUTES:-60}
       ASTRA_JWT_REFRESH_TTL_DAYS: ${ASTRA_JWT_REFRESH_TTL_DAYS:-7}
-      ASTRA_TOKEN_ENCRYPTION_KEY: ${ASTRA_TOKEN_ENCRYPTION_KEY:-astra-dev-token-encryption-key-change-me}
-      ASTRA_BRIDGE_SECRET: ${ASTRA_BRIDGE_SECRET:-astra-dev-bridge-secret-change-me-at-least-32-chars}
+      ASTRA_TOKEN_ENCRYPTION_KEY: ${ASTRA_TOKEN_ENCRYPTION_KEY:?Set ASTRA_TOKEN_ENCRYPTION_KEY in deployment/all-in-one/.env}
+      ASTRA_BRIDGE_SECRET: ${ASTRA_BRIDGE_SECRET:?Set ASTRA_BRIDGE_SECRET in deployment/all-in-one/.env}
       MEMORIA_BASE_URL: http://memoria:8100
-      MEMORIA_MASTER_KEY: ${MEMORIA_MASTER_KEY:-astra-dev-memoria-master-key-change-me}
+      MEMORIA_MASTER_KEY: ${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in deployment/all-in-one/.env}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     depends_on:
       matrixone:

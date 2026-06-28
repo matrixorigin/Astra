@@ -77,7 +77,7 @@ help:
 	@echo "  make memoria-clean      - Stop and remove Memoria data"
 	@echo ""
 	@echo "All-in-One Docker Deployment:"
-	@echo "  make stack-env          - Create deployment/all-in-one/.env from example"
+	@echo "  make stack-env          - Create .env and generate stack secrets"
 	@echo "  make stack-up           - Start MatrixOne + Memoria + API"
 	@echo "  make stack-down         - Stop compose stack"
 	@echo "  make stack-clean        - Stop compose stack and remove MatrixOne data"
@@ -88,7 +88,7 @@ help:
 	@echo "  make dev-start-docker   - Start deps + API in Docker"
 	@echo "  make dev-api-docker-up  - Start API server in Docker"
 	@echo "  make dev-api-docker-down - Stop API server Docker container"
-	@echo "  make release-docker     - Build and push Docker image (IMAGE_NAME=..., VERSION=...)"
+	@echo "  make release-docker     - Build and push Docker image (VERSION=..., CONFIRM=yes)"
 
 # ============================================================================
 # Variables
@@ -117,7 +117,8 @@ DEFAULT_API_PORT := 17001
 STACK_DIR := deployment/all-in-one
 STACK_ENV := $(STACK_DIR)/.env
 STACK_COMPOSE := cd $(STACK_DIR) && docker compose --env-file $(abspath $(STACK_ENV))
-STACK_REQUIRED_ENV := MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBEDDING_BASE_URL
+STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_BRIDGE_SECRET MEMORIA_MASTER_KEY
+STACK_REQUIRED_ENV := $(STACK_SECRET_ENV) MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBEDDING_BASE_URL
 
 # Per-test-case hard budget. Any case running longer than the budget is
 # killed and counted as FAIL. Nextest has no CLI override for slow-timeout
@@ -434,6 +435,15 @@ dev-api-docker-scale:
 
 .PHONY: release-docker
 release-docker:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ VERSION is required, for example: make release-docker VERSION=0.1.0 CONFIRM=yes"; \
+		exit 1; \
+	fi
+	@if [ "$(CONFIRM)" != "yes" ]; then \
+		echo "❌ Refusing to push Docker image without explicit confirmation."; \
+		echo "   Run: make release-docker VERSION=$(VERSION) CONFIRM=yes"; \
+		exit 1; \
+	fi
 	@echo "Building Docker image $(IMAGE_NAME):latest..."
 	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):latest .
 	@if [ -n "$(VERSION)" ]; then docker tag $(IMAGE_NAME):latest $(IMAGE_NAME):$(VERSION); fi
@@ -452,8 +462,63 @@ stack-env:
 	else \
 		cp $(STACK_DIR)/.env.example $(STACK_ENV); \
 		echo "✅ Created $(STACK_ENV)"; \
-		echo "Edit required embedding config before running: make stack-up"; \
-	fi
+	fi; \
+	if ! command -v openssl >/dev/null 2>&1; then \
+		echo "❌ openssl is required to generate stack secrets"; \
+		exit 1; \
+	fi; \
+	has_env_value() { \
+		key="$$1"; \
+		awk -v key="$$key" ' \
+			/^[[:space:]]*#/ { next } \
+			{ \
+				line = $$0; \
+				sub(/^[[:space:]]*/, "", line); \
+				if (line ~ "^" key "[[:space:]]*=") { \
+					sub(/^[^=]*=/, "", line); \
+					sub(/^[[:space:]]*/, "", line); \
+					lower = tolower(line); \
+					if (line != "" && lower !~ /(change[-_]?me|change-in-production|astra-dev-|dev-master-key|your-)/) found = 1; \
+				} \
+			} \
+			END { exit found ? 0 : 1 } \
+		' "$(STACK_ENV)"; \
+	}; \
+	set_env_value() { \
+		key="$$1"; \
+		value="$$2"; \
+		tmp="$$(mktemp)"; \
+		awk -v key="$$key" -v value="$$value" ' \
+			BEGIN { done = 0 } \
+			{ \
+				line = $$0; \
+				sub(/^[[:space:]]*/, "", line); \
+				if (line ~ "^" key "[[:space:]]*=") { \
+					print key "=" value; \
+					done = 1; \
+					next; \
+				} \
+				print; \
+			} \
+			END { if (!done) print key "=" value } \
+		' "$(STACK_ENV)" > "$$tmp"; \
+		mv "$$tmp" "$(STACK_ENV)"; \
+	}; \
+	ensure_secret() { \
+		key="$$1"; \
+		if has_env_value "$$key"; then \
+			echo "✅ $$key already configured"; \
+			return 0; \
+		fi; \
+		value="$$(openssl rand -hex 32)"; \
+		set_env_value "$$key" "$$value"; \
+		echo "✅ Generated $$key"; \
+	}; \
+	ensure_secret ASTRA_JWT_SECRET; \
+	ensure_secret ASTRA_TOKEN_ENCRYPTION_KEY; \
+	ensure_secret ASTRA_BRIDGE_SECRET; \
+	ensure_secret MEMORIA_MASTER_KEY; \
+	echo "Edit required embedding config before running: make stack-up"
 
 .PHONY: stack-check-env
 stack-check-env:
@@ -472,7 +537,8 @@ stack-check-env:
 				if (line ~ "^" key "[[:space:]]*=") { \
 					sub(/^[^=]*=/, "", line); \
 					sub(/^[[:space:]]*/, "", line); \
-					if (line != "") found = 1; \
+					lower = tolower(line); \
+					if (line != "" && lower !~ /(change[-_]?me|change-in-production|astra-dev-|dev-master-key|your-)/) found = 1; \
 				} \
 			} \
 			END { exit found ? 0 : 1 } \
@@ -481,8 +547,8 @@ stack-check-env:
 		fi; \
 	done; \
 	if [ -n "$$missing" ]; then \
-		echo "❌ Missing required config in $(STACK_ENV):$$missing"; \
-		echo "   Fill these values, then run: make stack-up"; \
+		echo "❌ Missing or insecure required config in $(STACK_ENV):$$missing"; \
+		echo "   Run make stack-env to generate secrets, then fill embedding config."; \
 		exit 1; \
 	fi
 

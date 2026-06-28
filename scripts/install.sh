@@ -3,6 +3,7 @@
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/matrixorigin/astra/main/scripts/install.sh | sh
+#   curl -sSL https://gh-proxy.com/https://raw.githubusercontent.com/matrixorigin/astra/main/scripts/install.sh | sh
 #   curl -sSL ... | sh -s -- -v v0.1.0 -y
 #   curl -sSL ... | sh -s -- -d "$HOME/.local/bin"
 
@@ -12,6 +13,11 @@ BINARY="astra"
 REPO="${ASTRA_REPO:-matrixorigin/astra}"
 VERSION="${ASTRA_VERSION:-latest}"
 INSTALL_DIR="${ASTRA_INSTALL_DIR:-/usr/local/bin}"
+if [ "${ASTRA_GHPROXY+x}" ]; then
+  GHPROXY="$ASTRA_GHPROXY"
+else
+  GHPROXY="https://gh-proxy.com"
+fi
 YES=false
 DRY_RUN=false
 
@@ -30,6 +36,8 @@ Environment:
   ASTRA_REPO          GitHub repo (default: matrixorigin/astra)
   ASTRA_VERSION       Version tag (default: latest)
   ASTRA_INSTALL_DIR   Install directory
+  ASTRA_GHPROXY       Space-separated GitHub proxy prefixes (default: https://gh-proxy.com;
+                      set to an empty string to disable proxy fallback)
 EOF
 }
 
@@ -100,11 +108,83 @@ detect_target() {
   esac
 }
 
+proxy_url() {
+  proxy="${1%/}"
+  raw_url="$2"
+
+  [ -n "$proxy" ] || return 1
+  case "$proxy" in
+    0|false|off|none) return 1 ;;
+  esac
+
+  printf '%s/%s\n' "$proxy" "$raw_url"
+}
+
+download_candidates() {
+  raw_url="$1"
+
+  printf '%s\n' "$raw_url"
+  for proxy in $GHPROXY; do
+    proxy_url "$proxy" "$raw_url" || true
+  done
+}
+
+curl_stdout() {
+  raw_url="$1"
+
+  for url in $(download_candidates "$raw_url"); do
+    if curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 "$url"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+curl_effective_url() {
+  raw_url="$1"
+
+  for url in $(download_candidates "$raw_url"); do
+    effective=$(
+      curl -fsSLI -o /dev/null -w '%{url_effective}' \
+        --retry 2 --connect-timeout 10 --max-time 60 "$url" 2>/dev/null || true
+    )
+    if [ -n "$effective" ]; then
+      printf '%s\n' "$effective"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+download_file() {
+  dest="$1"
+  raw_url="$2"
+  required="$3"
+  first=true
+
+  for url in $(download_candidates "$raw_url"); do
+    if [ "$first" = true ]; then
+      info "downloading $url"
+    else
+      warn "retrying through GitHub proxy: $url"
+    fi
+
+    if curl -fL --retry 3 --connect-timeout 15 --max-time 300 -o "$dest" "$url"; then
+      return 0
+    fi
+    first=false
+  done
+
+  [ "$required" = true ] && die "failed to download $raw_url"
+  return 1
+}
+
 resolve_tag() {
   if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
     tag=$(
-      curl -fsSLI -o /dev/null -w '%{url_effective}' \
-        "https://github.com/${REPO}/releases/latest" 2>/dev/null \
+      curl_effective_url "https://github.com/${REPO}/releases/latest" \
         | sed 's#.*/##'
     )
     if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
@@ -112,7 +192,7 @@ resolve_tag() {
       return
     fi
 
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" \
+    curl_stdout "https://api.github.com/repos/${REPO}/releases?per_page=1" \
       | sed -n 's|.*"tag_name": *"\([^"]*\)".*|\1|p' \
       | head -1
     return
@@ -168,6 +248,13 @@ if [ "$DRY_RUN" = true ]; then
   info "checksum: $SUM_URL"
   info "target:   $TARGET"
   info "binary:   $BINARY"
+  if [ -n "$GHPROXY" ]; then
+    info "proxy fallback:"
+    for url in $(download_candidates "$URL"); do
+      [ "$url" = "$URL" ] && continue
+      info "  $url"
+    done
+  fi
   exit 0
 fi
 
@@ -198,10 +285,9 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-info "downloading $URL"
-curl -fL --retry 3 --connect-timeout 15 --max-time 300 -o "$TMP/$ARCHIVE" "$URL"
+download_file "$TMP/$ARCHIVE" "$URL" true
 
-if curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 -o "$TMP/$ARCHIVE.sha256" "$SUM_URL"; then
+if download_file "$TMP/$ARCHIVE.sha256" "$SUM_URL" false; then
   expected=$(awk '{print $1; exit}' "$TMP/$ARCHIVE.sha256")
   actual=$(sha256_file "$TMP/$ARCHIVE" || true)
   [ -n "$actual" ] || die "sha256sum or shasum is required to verify $ARCHIVE"
