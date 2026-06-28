@@ -213,6 +213,41 @@ sha256_file() {
   return 1
 }
 
+writable_dir() {
+  dir="$1"
+  [ -d "$dir" ] || return 1
+
+  test_file="${dir}/.astra-install-test.$$"
+  if (umask 077 && : > "$test_file") 2>/dev/null; then
+    rm -f "$test_file"
+    return 0
+  fi
+  rm -f "$test_file" 2>/dev/null || true
+  return 1
+}
+
+prepare_install_dir() {
+  SUDO=""
+
+  if [ ! -d "$INSTALL_DIR" ]; then
+    if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+      command -v sudo >/dev/null 2>&1 || die "cannot create $INSTALL_DIR; choose a writable directory with --dir \$HOME/.local/bin or install sudo"
+      SUDO=sudo
+      info "$INSTALL_DIR requires elevated permissions; using sudo"
+      run_privileged mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR with sudo"
+    fi
+  fi
+
+  if writable_dir "$INSTALL_DIR"; then
+    return 0
+  fi
+
+  command -v sudo >/dev/null 2>&1 || die "$INSTALL_DIR is not writable; choose a writable directory with --dir \$HOME/.local/bin or install sudo"
+  SUDO=sudo
+  info "$INSTALL_DIR is not writable by the current user; using sudo"
+  run_privileged mkdir -p "$INSTALL_DIR" || die "cannot prepare $INSTALL_DIR with sudo"
+}
+
 confirm_install() {
   [ "$YES" = true ] && return 0
   [ -r /dev/tty ] || die "confirmation requires a terminal; rerun with --yes"
@@ -267,20 +302,7 @@ if command -v "$BINARY" >/dev/null 2>&1; then
 fi
 
 confirm_install
-
-SUDO=""
-if [ ! -d "$INSTALL_DIR" ]; then
-  if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
-    command -v sudo >/dev/null 2>&1 || die "cannot create $INSTALL_DIR and sudo is unavailable"
-    SUDO=sudo
-    run_privileged mkdir -p "$INSTALL_DIR"
-  fi
-fi
-
-if [ ! -w "$INSTALL_DIR" ]; then
-  command -v sudo >/dev/null 2>&1 || die "$INSTALL_DIR is not writable and sudo is unavailable"
-  SUDO=sudo
-fi
+prepare_install_dir
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
@@ -301,7 +323,7 @@ tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 BIN_PATH="$TMP/$BINARY"
 [ -f "$BIN_PATH" ] || die "$BINARY not found in $ARCHIVE"
 
-run_privileged install -m 755 "$BIN_PATH" "$INSTALL_DIR/$BINARY"
+run_privileged install -m 755 "$BIN_PATH" "$INSTALL_DIR/$BINARY" || die "failed to install $BINARY to $INSTALL_DIR"
 info "installed $INSTALL_DIR/$BINARY"
 
 case ":$PATH:" in
