@@ -108,7 +108,8 @@ DOCKER_BUILD_ARGS ?=
 DOCKER_PROXY_BUILD_ARGS := --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
 IMAGE_VERSION ?= $(if $(VERSION),$(VERSION),dev)
 IMAGE_REVISION ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
-DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build-arg IMAGE_REVISION=$(IMAGE_REVISION)
+IMAGE_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build-arg IMAGE_REVISION=$(IMAGE_REVISION) --build-arg IMAGE_BRANCH=$(IMAGE_BRANCH)
 # Project-wide default for every API server mode. Compose may remap the
 # host-facing port, but the container listens on this value.
 DEFAULT_API_PORT := 17001

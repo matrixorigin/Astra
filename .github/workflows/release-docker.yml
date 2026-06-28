@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version to publish, e.g. 0.1.0 or v0.1.0'
+        required: true
+        type: string
 
 env:
   IMAGE_NAME: matrixorigin/astra
@@ -25,14 +31,44 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Resolve release version
+        id: release
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "${version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: ${version}" >&2
+            echo "Expected format: 0.1.0, v0.1.0, or 0.1.0-rc.1" >&2
+            exit 1
+          fi
+
+          image_version="${version#v}"
+          latest=true
+          if [[ "${image_version}" == *-* ]]; then
+            latest=false
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "image_version=${image_version}" >> "${GITHUB_OUTPUT}"
+          echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
+
       - uses: docker/metadata-action@v5
         id: meta
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref, '-rc') && !contains(github.ref, '-beta') && !contains(github.ref, '-alpha') }}
+            type=semver,pattern={{version}},value=${{ steps.release.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.release.outputs.version }},enable=${{ steps.release.outputs.latest == 'true' }}
+            type=raw,value=latest,enable=${{ steps.release.outputs.latest == 'true' }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -43,7 +79,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            IMAGE_VERSION=${{ steps.meta.outputs.version }}
+            IMAGE_VERSION=${{ steps.release.outputs.image_version }}
             IMAGE_REVISION=${{ github.sha }}
+            IMAGE_BRANCH=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
