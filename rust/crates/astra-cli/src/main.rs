@@ -2116,6 +2116,13 @@ total_tokens_out: 500
     }
 
     #[test]
+    fn cli_version_flag_prints_package_version() {
+        let err = Cli::try_parse_from(["astra", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
     fn cli_model_flag_long() {
         let cli = Cli::try_parse_from(["astra", "--model", "gpt-4o"]).unwrap();
         assert_eq!(cli.model.as_deref(), Some("gpt-4o"));

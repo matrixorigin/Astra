@@ -60,7 +60,7 @@ COPY --from=planner /app/rust/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/rust/target \
-    cargo chef cook --release --recipe-path recipe.json \
+    cargo chef cook --release --no-default-features --recipe-path recipe.json \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra
 
@@ -68,7 +68,7 @@ COPY rust/ ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/rust/target \
-    cargo build --release \
+    cargo build --release --no-default-features \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra && \
     mkdir -p /out && \

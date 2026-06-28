@@ -103,6 +103,7 @@ RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
 RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
 API_SERVER_BIN := astra-server
 CLI_BINS := astra
+CLI_RELEASE_FLAGS ?= --no-default-features
 IMAGE_NAME ?= matrixorigin/astra
 DOCKER_BUILD_ARGS ?=
 DOCKER_PROXY_BUILD_ARGS := --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
@@ -626,7 +627,7 @@ build-cli: build-cli-release
 .PHONY: build-cli-release
 build-cli-release: sweep
 	@echo "Building astra CLI (release)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --release
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --release --bin astra $(CLI_RELEASE_FLAGS)
 	@echo "Binaries:"
 	@for bin in $(CLI_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
 
@@ -650,7 +651,7 @@ build-debug:
 .PHONY: build-cli-debug
 build-cli-debug:
 	@echo "Building astra CLI (debug)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --bin astra
 	@echo "Binaries:"
 	@for bin in $(CLI_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
 

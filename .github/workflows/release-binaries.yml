@@ -1,0 +1,186 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version to publish, e.g. 0.1.0 or v0.1.0'
+        required: true
+        type: string
+
+env:
+  BINARY: astra
+
+jobs:
+  # Build the public CLI for each supported desktop/server platform.
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-amd64
+
+          # Cross-compile from x86 to avoid depending on ARM runner availability.
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-arm64
+            use-cross: true
+
+          - os: macos-13
+            target: x86_64-apple-darwin
+            suffix: darwin-amd64
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            v="${INPUT_VERSION}"
+          else
+            v="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "${v}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: ${v}" >&2
+            echo "Expected format: 0.1.0, v0.1.0, or 0.1.0-rc.1" >&2
+            exit 1
+          fi
+          v="${v#v}"
+          echo "value=${v}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-${{ matrix.target }}-
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (linux-arm64 only)
+        if: ${{ matrix.use-cross }}
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: ${{ matrix.use-cross }}
+        run: |
+          cross build --release --no-default-features \
+            --manifest-path rust/Cargo.toml \
+            --target "${{ matrix.target }}" \
+            -p astra-cli \
+            --bin "${BINARY}"
+
+      - name: Build (native)
+        if: ${{ !matrix.use-cross }}
+        run: |
+          cargo build --release --no-default-features \
+            --manifest-path rust/Cargo.toml \
+            --target "${{ matrix.target }}" \
+            -p astra-cli \
+            --bin "${BINARY}"
+
+      - name: Package archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          checksum_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1"
+            else
+              shasum -a 256 "$1"
+            fi
+          }
+          mkdir -p dist
+          archive="${BINARY}-v${{ steps.version.outputs.value }}-${{ matrix.suffix }}.tar.gz"
+          tar -czf "dist/${archive}" \
+            -C "rust/target/${{ matrix.target }}/release" \
+            "${BINARY}"
+          (cd dist && checksum_file "${archive}" | tee "${archive}.sha256" > /dev/null)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bins-${{ matrix.suffix }}
+          path: dist/
+
+  # GitHub Release + checksums.
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bins-*
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            v="${INPUT_VERSION}"
+          else
+            v="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "${v}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: ${v}" >&2
+            echo "Expected format: 0.1.0, v0.1.0, or 0.1.0-rc.1" >&2
+            exit 1
+          fi
+          v="${v#v}"
+          prerelease=false
+          if [[ "${v}" == *-* ]]; then
+            prerelease=true
+          fi
+          echo "value=${v}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${v}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          cd dist
+          cat astra-v*.tar.gz.sha256 > checksums.txt
+          sha256sum checksums.txt | tee checksums.txt.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "v${{ steps.version.outputs.value }}"
+          tag_name: "${{ steps.version.outputs.tag }}"
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true

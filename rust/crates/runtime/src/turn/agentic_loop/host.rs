@@ -2208,8 +2208,10 @@ pub(crate) const MAX_TRACKED_FILE_READS: usize = 20;
 /// Maximum number of times the harness pause signal triggers checkpoint
 /// injection and loop continuation before forcing a text-only finalization
 /// turn.
+#[cfg(feature = "harness")]
 const MAX_HARNESS_PAUSE_RECOVERIES: u32 = 2;
 
+#[cfg(feature = "harness")]
 fn harness_pause_finalization_message(reason: &str, original_query: &str) -> String {
     format!(
         "Harness checkpoint: the run is still in a read-heavy stall after repeated recovery prompts.\n\n\
@@ -2224,6 +2226,7 @@ fn harness_pause_finalization_message(reason: &str, original_query: &str) -> Str
     )
 }
 
+#[cfg(feature = "harness")]
 fn force_text_only_harness_finalization<H: AgenticLoopHost>(
     host: &H,
     state: &mut AgenticLoopState,
@@ -2242,6 +2245,7 @@ fn force_text_only_harness_finalization<H: AgenticLoopHost>(
     }));
 }
 
+#[cfg(feature = "harness")]
 fn apply_harness_pause_recovery_threshold(
     state: &mut AgenticLoopState,
     recovery_threshold: Option<u32>,
@@ -2370,6 +2374,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
     let loop_start_time = Instant::now();
     let mut turn_index = 0usize;
+    #[cfg(feature = "harness")]
     let mut harness_pause_recovery_count: u32 = 0;
     while turn_index < state.max_turns || state.remaining_turns == 0 {
         state.current_round_index = turn_index as u32;

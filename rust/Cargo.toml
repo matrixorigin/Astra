@@ -50,7 +50,7 @@ astra-turn-types = { path = "crates/astra-turn-types" }
 astra-skills = { path = "crates/astra-skills" }
 astra-tools = { path = "crates/astra-tools" }
 astra-services = { path = "crates/services" }
-astra-runtime = { path = "crates/runtime" }
+astra-runtime = { path = "crates/runtime", default-features = false }
 astra-mcp = { path = "crates/astra-mcp" }
 astra-thin-client = { path = "crates/astra-thin-client" }
 async-stream = "0.3.6"
@@ -117,3 +117,6 @@ split-debuginfo = "unpacked"
 
 [profile.dev.package."*"]
 opt-level = 1
+
+[profile.release]
+strip = "symbols"

@@ -46,7 +46,7 @@ fn parse_benchmark_profile_arg(value: &str) -> Result<astra_harness::HarnessProf
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "astra")]
+#[command(name = "astra", version)]
 #[command(about = "AI agent CLI — run `astra` for interactive chat")]
 pub(crate) struct Cli {
     /// API server base URL [env: ASTRA_API_URL] [config: api_url] [default: http://127.0.0.1:17001]
