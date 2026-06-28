@@ -1,6 +1,9 @@
-use super::*;
-use crate::cli::cli_config::cli_args::{ServeMode, SessionCaptureCmd};
+use crate::cli::cli_config::cli_args::{
+    Cli, Command, ConfigCmd, McpCmd, PermissionsSubcommand, ServeMode, SessionCaptureCmd,
+    SessionCmd,
+};
 use crate::cli::session::session_state::ExplainMode;
+use clap::Parser;
 
 // ── CLI arg parsing tests ─────────────────────────────────────────────
 // 128 tests → 16 table-driven tests + 2 integration tests (+3 composite)
@@ -22,6 +25,13 @@ fn cli_no_args_gives_no_command() {
     assert!(!cli.yes);
     assert!(cli.model.is_none());
     assert!(cli.resume.is_none());
+}
+
+#[test]
+fn cli_version_flag_prints_package_version() {
+    let err = Cli::try_parse_from(["astra", "--version"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
 }
 
 // ── Flag tables ───────────────────────────────────────────────────────

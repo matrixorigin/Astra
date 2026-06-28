@@ -15,9 +15,47 @@ env:
   BINARY: astra
 
 jobs:
-  # Build the public CLI for each supported desktop/server platform.
+  version:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.resolve.outputs.value }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Resolve release version
+        id: resolve
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "${version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: ${version}" >&2
+            echo "Expected format: 0.1.0, v0.1.0, or 0.1.0-rc.1" >&2
+            exit 1
+          fi
+
+          value="${version#v}"
+          prerelease=false
+          if [[ "${value}" == *-* ]]; then
+            prerelease=true
+          fi
+
+          echo "value=${value}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${value}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -26,43 +64,22 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             suffix: linux-amd64
-
-          # Cross-compile from x86 to avoid depending on ARM runner availability.
+            use-cross: false
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             suffix: linux-arm64
             use-cross: true
-
           - os: macos-13
             target: x86_64-apple-darwin
             suffix: darwin-amd64
-
+            use-cross: false
           - os: macos-latest
             target: aarch64-apple-darwin
             suffix: darwin-arm64
+            use-cross: false
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Resolve version
-        id: version
-        shell: bash
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            v="${INPUT_VERSION}"
-          else
-            v="${GITHUB_REF_NAME}"
-          fi
-          if [[ ! "${v}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid release version: ${v}" >&2
-            echo "Expected format: 0.1.0, v0.1.0, or 0.1.0-rc.1" >&2
-            exit 1
-          fi
-          v="${v#v}"
-          echo "value=${v}" >> "${GITHUB_OUTPUT}"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -79,7 +96,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross (linux-arm64 only)
+      - name: Install cross
         if: ${{ matrix.use-cross }}
         run: cargo install cross --git https://github.com/cross-rs/cross
 
@@ -92,7 +109,7 @@ jobs:
             -p astra-cli \
             --bin "${BINARY}"
 
-      - name: Build (native)
+      - name: Build native
         if: ${{ !matrix.use-cross }}
         run: |
           cargo build --release --no-default-features \
@@ -101,10 +118,11 @@ jobs:
             -p astra-cli \
             --bin "${BINARY}"
 
-      - name: Package archives
+      - name: Package archive
         shell: bash
         run: |
           set -euo pipefail
+
           checksum_file() {
             if command -v sha256sum >/dev/null 2>&1; then
               sha256sum "$1"
@@ -112,23 +130,25 @@ jobs:
               shasum -a 256 "$1"
             fi
           }
+
           mkdir -p dist
-          archive="${BINARY}-v${{ steps.version.outputs.value }}-${{ matrix.suffix }}.tar.gz"
+          archive="${BINARY}-v${{ needs.version.outputs.value }}-${{ matrix.suffix }}.tar.gz"
           tar -czf "dist/${archive}" \
             -C "rust/target/${{ matrix.target }}/release" \
             "${BINARY}"
           (cd dist && checksum_file "${archive}" | tee "${archive}.sha256" > /dev/null)
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: bins-${{ matrix.suffix }}
           path: dist/
 
-  # GitHub Release + checksums.
   release:
     name: Create Release
-    needs: build
+    needs:
+      - version
+      - build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -140,32 +160,6 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Resolve version
-        id: version
-        shell: bash
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            v="${INPUT_VERSION}"
-          else
-            v="${GITHUB_REF_NAME}"
-          fi
-          if [[ ! "${v}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid release version: ${v}" >&2
-            echo "Expected format: 0.1.0, v0.1.0, or 0.1.0-rc.1" >&2
-            exit 1
-          fi
-          v="${v#v}"
-          prerelease=false
-          if [[ "${v}" == *-* ]]; then
-            prerelease=true
-          fi
-          echo "value=${v}" >> "${GITHUB_OUTPUT}"
-          echo "tag=v${v}" >> "${GITHUB_OUTPUT}"
-          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
-
       - name: Create checksums
         shell: bash
         run: |
@@ -176,11 +170,11 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "v${{ steps.version.outputs.value }}"
-          tag_name: "${{ steps.version.outputs.tag }}"
+          name: ${{ needs.version.outputs.tag }}
+          tag_name: ${{ needs.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
           draft: false
-          prerelease: ${{ steps.version.outputs.prerelease }}
+          prerelease: ${{ needs.version.outputs.prerelease }}
           generate_release_notes: true
           files: dist/*
           fail_on_unmatched_files: true
