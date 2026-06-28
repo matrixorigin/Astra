@@ -111,7 +111,7 @@ fn tab_walks_through_each_choice_in_order() {
     assert_eq!(
         rx.try_recv().unwrap(),
         PlanReviewDecision::Approve {
-            mode: PermissionMode::Edits
+            mode: PermissionMode::AcceptEdits
         }
     );
 
@@ -123,7 +123,7 @@ fn tab_walks_through_each_choice_in_order() {
     assert_eq!(
         rx.try_recv().unwrap(),
         PlanReviewDecision::Approve {
-            mode: PermissionMode::Ask
+            mode: PermissionMode::Prompt
         }
     );
 
@@ -157,7 +157,7 @@ fn number_keys_jump_directly_to_choice() {
     assert_eq!(
         rx.try_recv().unwrap(),
         PlanReviewDecision::Approve {
-            mode: PermissionMode::Ask
+            mode: PermissionMode::Prompt
         },
         "number 3 must select Approve · default"
     );

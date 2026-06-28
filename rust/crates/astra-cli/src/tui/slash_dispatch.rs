@@ -1196,14 +1196,14 @@ fn build_permission_mode_picker(
         SelectionItem {
             name: "Ask".into(),
             description: Some("Ask before write or execute tools".into()),
-            is_current: current == crate::cli::permission_manager::PermissionMode::Ask,
+            is_current: current == crate::cli::permission_manager::PermissionMode::Prompt,
         },
         SelectionItem {
             name: "Edits".into(),
             description: Some(
                 "Auto-approve workspace edits; still ask for shell and external writes".into(),
             ),
-            is_current: current == crate::cli::permission_manager::PermissionMode::Edits,
+            is_current: current == crate::cli::permission_manager::PermissionMode::AcceptEdits,
         },
         SelectionItem {
             name: "Plan".into(),
@@ -1218,9 +1218,9 @@ fn build_permission_mode_picker(
             is_current: current == crate::cli::permission_manager::PermissionMode::Auto,
         },
         SelectionItem {
-            name: "CI".into(),
-            description: Some("Reject writes and high-risk tools without prompting".into()),
-            is_current: current == crate::cli::permission_manager::PermissionMode::Ci,
+            name: "Deny".into(),
+            description: Some("Deny all tool calls".into()),
+            is_current: current == crate::cli::permission_manager::PermissionMode::Deny,
         },
     ];
     ListSelectionView::new(items, Some("Modes".into())).with_footer_hint(
@@ -1451,7 +1451,7 @@ pub(crate) fn handle_view_result(
             apply_permission_mode_selection(
                 state,
                 chat_widget,
-                crate::cli::permission_manager::PermissionMode::Edits,
+                crate::cli::permission_manager::PermissionMode::AcceptEdits,
             );
             return;
         }
@@ -1459,7 +1459,7 @@ pub(crate) fn handle_view_result(
             apply_permission_mode_selection(
                 state,
                 chat_widget,
-                crate::cli::permission_manager::PermissionMode::Ask,
+                crate::cli::permission_manager::PermissionMode::Prompt,
             );
             return;
         }
@@ -1471,11 +1471,11 @@ pub(crate) fn handle_view_result(
             );
             return;
         }
-        "CI" => {
+        "Deny" => {
             apply_permission_mode_selection(
                 state,
                 chat_widget,
-                crate::cli::permission_manager::PermissionMode::Ci,
+                crate::cli::permission_manager::PermissionMode::Deny,
             );
             return;
         }
@@ -4031,7 +4031,7 @@ mod view_result_tests {
 
         handle_view_result("Edits", &mut state, &mut bottom_pane, &mut chat_widget);
 
-        assert_eq!(state.perm_manager.mode(), PermissionMode::Edits);
+        assert_eq!(state.perm_manager.mode(), PermissionMode::AcceptEdits);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
             Some("Mode → Edits")
@@ -4062,7 +4062,7 @@ mod view_result_tests {
 
         handle_view_result("Ask", &mut state, &mut bottom_pane, &mut chat_widget);
 
-        assert_eq!(state.perm_manager.mode(), PermissionMode::Ask);
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Prompt);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
             Some("Mode → Ask")
@@ -4070,28 +4070,13 @@ mod view_result_tests {
     }
 
     #[test]
-    fn ci_selection_updates_state_and_commits_feedback() {
-        let mut state = SessionState::default();
-        let mut bottom_pane = BottomPane::new();
-        let mut chat_widget = ChatWidget::new("");
-
-        handle_view_result("CI", &mut state, &mut bottom_pane, &mut chat_widget);
-
-        assert_eq!(state.perm_manager.mode(), PermissionMode::Ci);
+    fn permission_mode_cycle_skips_deny_and_wraps() {
         assert_eq!(
-            last_system_message(&chat_widget).as_deref(),
-            Some("Mode → CI")
-        );
-    }
-
-    #[test]
-    fn permission_mode_cycle_keeps_ci_sticky_and_wraps() {
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Ask),
-            PermissionMode::Edits
+            next_permission_mode_for_cycle(PermissionMode::Prompt),
+            PermissionMode::AcceptEdits
         );
         assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Edits),
+            next_permission_mode_for_cycle(PermissionMode::AcceptEdits),
             PermissionMode::Plan
         );
         assert_eq!(
@@ -4100,13 +4085,13 @@ mod view_result_tests {
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Auto),
-            PermissionMode::Ask
+            PermissionMode::Prompt
         );
-        // `CI` is sticky under the cycle: it must only be exited by an
+        // `Deny` is sticky under the cycle: it must only be exited by an
         // explicit `/allow <mode>`, never by a bare `/allow`.
         assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Ci),
-            PermissionMode::Ci
+            next_permission_mode_for_cycle(PermissionMode::Deny),
+            PermissionMode::Deny
         );
     }
 

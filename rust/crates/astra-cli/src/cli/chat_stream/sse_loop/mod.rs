@@ -1426,7 +1426,7 @@ mod tests {
 
         // Mutate policy (mode flip) and refresh — the bug used to wipe the
         // telemetry + session deny above.
-        manager.set_mode(PermissionMode::Ask);
+        manager.set_mode(PermissionMode::Prompt);
         refresh_root_permission_context(&mut handle, &manager).await;
 
         let guard = handle.as_ref().unwrap().read().await;
@@ -1449,7 +1449,7 @@ mod tests {
         );
         assert_eq!(
             guard.mode(),
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             "refresh must still apply the fresh policy (mode flip)"
         );
     }
@@ -1457,7 +1457,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_mode_approval_refresh_allows_same_tool_call() {
         let mut manager = PermissionManager::new(false);
-        manager.set_mode(PermissionMode::Ask);
+        manager.set_mode(PermissionMode::Prompt);
         let mut handle = Some(root_permission_context_handle(&manager));
         let args = json!({"command": "cargo test"});
         let args_str = serde_json::to_string(&args).unwrap();
@@ -1472,7 +1472,7 @@ mod tests {
         .await;
         assert!(
             matches!(before, PermissionCheckResult::Denied { .. }),
-            "Ask mode should require approval before a bash execution, got {before:?}"
+            "prompt mode should require approval before a bash execution, got {before:?}"
         );
 
         manager.record_approval("bash", Some(&args), true);
@@ -1491,14 +1491,14 @@ mod tests {
                 after,
                 PermissionCheckResult::Allowed | PermissionCheckResult::AllowedImplicit { .. }
             ),
-            "Ask-mode approval must refresh into the runtime permission context, got {after:?}"
+            "prompt approval must refresh into the runtime permission context, got {after:?}"
         );
     }
 
     #[tokio::test]
-    async fn edits_root_context_allows_edits_but_not_bash() {
+    async fn accept_edits_root_context_allows_edits_but_not_bash() {
         let mut manager = PermissionManager::new(false);
-        manager.set_mode(PermissionMode::Edits);
+        manager.set_mode(PermissionMode::AcceptEdits);
         let handle = root_permission_context_handle(&manager);
 
         let write_args = serde_json::to_string(&json!({
@@ -1519,7 +1519,7 @@ mod tests {
                 write_result,
                 PermissionCheckResult::Allowed | PermissionCheckResult::AllowedImplicit { .. }
             ),
-            "edits mode should allow workspace file edits, got {write_result:?}"
+            "accept_edits should allow workspace file edits, got {write_result:?}"
         );
 
         let bash_args = serde_json::to_string(&json!({"command": "cargo test"})).unwrap();
@@ -1533,7 +1533,7 @@ mod tests {
         .await;
         assert!(
             matches!(bash_result, PermissionCheckResult::Denied { .. }),
-            "edits mode should still require approval for bash, got {bash_result:?}"
+            "accept_edits should still require approval for bash, got {bash_result:?}"
         );
     }
 

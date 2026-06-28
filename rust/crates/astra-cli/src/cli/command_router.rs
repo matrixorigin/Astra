@@ -401,7 +401,7 @@ fn effective_one_shot_permission_mode(
     Ok(if fallback_auto {
         PermissionMode::Auto
     } else {
-        PermissionMode::Ask
+        PermissionMode::Prompt
     })
 }
 
@@ -1094,34 +1094,27 @@ mod permission_mode_display_tests {
 
     #[test]
     fn labels_match_tui_status_chips() {
-        assert_eq!(permission_mode_display_label(PermissionMode::Ask), "Ask");
+        assert_eq!(permission_mode_display_label(PermissionMode::Prompt), "Ask");
         assert_eq!(permission_mode_display_label(PermissionMode::Auto), "Auto");
         assert_eq!(
-            permission_mode_display_label(PermissionMode::Edits),
+            permission_mode_display_label(PermissionMode::AcceptEdits),
             "Edits"
         );
         assert_eq!(permission_mode_display_label(PermissionMode::Plan), "Plan");
-        assert_eq!(permission_mode_display_label(PermissionMode::Ci), "CI");
+        assert_eq!(permission_mode_display_label(PermissionMode::Deny), "Deny");
     }
 
     #[test]
     fn removed_permission_aliases_do_not_change_mode() {
-        for alias in [
-            "all",
-            "default",
-            "accept-edits",
-            "accept_edits",
-            "prompt",
-            "deny",
-        ] {
+        for alias in ["all", "default", "ask", "accept-edits"] {
             let mut state = SessionState::default();
-            state.perm_manager.set_mode(PermissionMode::Ci);
+            state.perm_manager.set_mode(PermissionMode::Deny);
 
             handle_permission_command(alias, &mut state);
 
             assert_eq!(
                 state.perm_manager.mode(),
-                PermissionMode::Ci,
+                PermissionMode::Deny,
                 "removed alias must be rejected: {alias}"
             );
         }
@@ -3370,7 +3363,8 @@ mod one_shot_effective_settings_tests {
     #[test]
     fn effective_one_shot_permission_mode_prefers_explicit_then_auto_then_restored() {
         assert_eq!(
-            effective_one_shot_permission_mode(Some("plan"), true, Some("edits"), false).unwrap(),
+            effective_one_shot_permission_mode(Some("plan"), true, Some("accept_edits"), false)
+                .unwrap(),
             PermissionMode::Plan
         );
         assert_eq!(
@@ -3378,8 +3372,8 @@ mod one_shot_effective_settings_tests {
             PermissionMode::Auto
         );
         assert_eq!(
-            effective_one_shot_permission_mode(None, false, Some("edits"), false).unwrap(),
-            PermissionMode::Edits
+            effective_one_shot_permission_mode(None, false, Some("accept_edits"), false).unwrap(),
+            PermissionMode::AcceptEdits
         );
         assert_eq!(
             effective_one_shot_permission_mode(None, false, None, true).unwrap(),

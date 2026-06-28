@@ -1888,7 +1888,7 @@ impl AgenticRunLifecycleService {
 
     fn root_permission_mode_from_request(request: &ChatRequestData) -> PermissionMode {
         match request.interaction_mode {
-            Some(RequestedTurnInteractionMode::Ci) => PermissionMode::Ci,
+            Some(RequestedTurnInteractionMode::Deny) => PermissionMode::Deny,
             _ => PermissionMode::Auto,
         }
     }
@@ -9293,9 +9293,9 @@ mod tests {
     }
 
     #[test]
-    fn server_root_permissions_map_ci_and_preserve_tool_allowlist() {
+    fn server_root_permissions_map_deny_and_preserve_tool_allowlist() {
         let mut request = test_request("no tools");
-        request.interaction_mode = Some(RequestedTurnInteractionMode::Ci);
+        request.interaction_mode = Some(RequestedTurnInteractionMode::Deny);
         let constraints = RequestConstraints {
             allowed_tools: Some(["read_file".to_string()].into_iter().collect()),
             ..Default::default()
@@ -9304,7 +9304,7 @@ mod tests {
         let inherited =
             AgenticRunLifecycleService::inherited_permissions_from_request(&request, &constraints);
 
-        assert_eq!(inherited.mode, PermissionMode::Ci);
+        assert_eq!(inherited.mode, PermissionMode::Deny);
         assert!(
             inherited
                 .allowed_tools
@@ -9315,7 +9315,7 @@ mod tests {
 
     #[test]
     fn server_subrun_executor_keeps_inherited_permissions() {
-        let inherited_permissions = InheritedPermissions::new(PermissionMode::Ci);
+        let inherited_permissions = InheritedPermissions::new(PermissionMode::Deny);
         let executor = ServerSubRunExecutor::new(
             test_settings(),
             test_encryptor(),
@@ -9323,7 +9323,7 @@ mod tests {
         )
         .with_inherited_permissions(inherited_permissions);
 
-        assert_eq!(executor.inherited_permissions.mode, PermissionMode::Ci);
+        assert_eq!(executor.inherited_permissions.mode, PermissionMode::Deny);
     }
 
     struct FailingWorkspaceRecordStore;

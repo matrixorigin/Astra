@@ -475,7 +475,7 @@ mod tests {
             astra_services::session_restore::RestoredSession {
                 session_id: session_id.clone(),
                 model: Some("gpt-5-cloud".to_string()),
-                permission_mode: Some("edits".to_string()),
+                permission_mode: Some("accept_edits".to_string()),
                 conversation_messages: vec![
                     serde_json::json!({"role": "user", "content": "cloud question"}),
                     serde_json::json!({"role": "assistant", "content": "cloud answer"}),
@@ -493,7 +493,7 @@ mod tests {
                 .expect("explicit cloud resume should restore messages");
 
         assert_eq!(routing.restored_model(), Some("gpt-5-cloud"));
-        assert_eq!(routing.restored_permission_mode(), Some("edits"));
+        assert_eq!(routing.restored_permission_mode(), Some("accept_edits"));
         let continuation = routing
             .continuation_messages()
             .expect("cloud resume messages should feed one-shot continuation");

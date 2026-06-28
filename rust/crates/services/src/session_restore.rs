@@ -2467,7 +2467,7 @@ mod tests {
         let mut start =
             crate::session_journal::JournalEvent::session_start(Some(&sid), Some("test-model"));
         start.edge_policy = Some(crate::session_journal::EdgePolicySnapshot {
-            permission_mode: Some("edits".into()),
+            permission_mode: Some("accept_edits".into()),
             cloud_policy_version: None,
             rules_fingerprint: None,
         });
@@ -2478,7 +2478,7 @@ mod tests {
                 Some(1),
                 serde_json::json!({
                     "kind": "permission_mode_changed",
-                    "from_mode": "edits",
+                    "from_mode": "accept_edits",
                     "to_mode": "plan",
                     "source": "test",
                     "changed": true

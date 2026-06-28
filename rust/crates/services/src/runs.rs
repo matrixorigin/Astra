@@ -225,7 +225,7 @@ pub enum RequestedTurnInteractionMode {
     NonInteractive,
     Prompt,
     Auto,
-    Ci,
+    Deny,
     Headless,
 }
 

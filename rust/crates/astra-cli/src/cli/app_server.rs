@@ -1029,7 +1029,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            permission_mode_from_params(&serde_json::json!({"permissionMode": "ask"}), true)
+            permission_mode_from_params(&serde_json::json!({"permissionMode": "prompt"}), true)
                 .unwrap(),
             PermissionMode::Auto
         );

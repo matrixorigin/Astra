@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/approval.rs
-assertion_line: 1107
+assertion_line: 1123
 expression: "render_at(&cell, 80)"
 ---
 ╭─ Approval · Edit File
@@ -8,6 +8,7 @@ expression: "render_at(&cell, 80)"
 │ Risk · Outside workspace · Sensitive file
 │ /etc/hosts
 │ writes outside workspace
+│ Can't remember · outside workspace
 │
 │  Yes   Yes, and don't ask again   No
 ╰─ ←→ move · Enter select · Esc close

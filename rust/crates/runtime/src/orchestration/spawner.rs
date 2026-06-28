@@ -399,7 +399,7 @@ pub enum WaitForAgentOutcome {
 /// Permission summary for display purposes.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionSummary {
-    /// Permission mode (auto, edits, plan, ask, ci).
+    /// Permission mode (auto, plan, accept_edits, prompt, deny).
     pub mode: String,
     /// Number of explicit allow rules.
     pub allow_rules: u32,
@@ -2887,10 +2887,10 @@ fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
     let inherited = &context.inherited_permissions;
     summary.mode = match inherited.mode {
         super::permission_sync::PermissionMode::Auto => "auto".to_string(),
-        super::permission_sync::PermissionMode::Edits => "edits".to_string(),
         super::permission_sync::PermissionMode::Plan => "plan".to_string(),
-        super::permission_sync::PermissionMode::Ask => "ask".to_string(),
-        super::permission_sync::PermissionMode::Ci => "ci".to_string(),
+        super::permission_sync::PermissionMode::AcceptEdits => "accept_edits".to_string(),
+        super::permission_sync::PermissionMode::Prompt => "prompt".to_string(),
+        super::permission_sync::PermissionMode::Deny => "deny".to_string(),
     };
     summary.allow_rules = inherited.allow_rules.len() as u32;
     summary.deny_rules = inherited.deny_rules.len() as u32;
@@ -3047,7 +3047,7 @@ mod tests {
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: crate::orchestration::InheritedPermissions::new(
-                crate::orchestration::permission_sync::PermissionMode::Ci,
+                crate::orchestration::permission_sync::PermissionMode::Deny,
             ),
             inherited_skills: vec![],
             live_event_sink: None,
@@ -3063,7 +3063,7 @@ mod tests {
         let mode = executor.take_captured().expect("executor captured config");
         assert_eq!(
             mode,
-            crate::orchestration::permission_sync::PermissionMode::Ci
+            crate::orchestration::permission_sync::PermissionMode::Deny
         );
     }
 

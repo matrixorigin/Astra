@@ -272,9 +272,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_by_ci_mode() {
+    async fn denied_by_deny_mode() {
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ci,
+            mode: PermissionMode::Deny,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![],
@@ -386,13 +386,13 @@ mod tests {
     }
 
     /// `allowed_tools` is a tool-surface boundary, not consent to run
-    /// mutating or executing tools. In Ask mode, allowlisted bash
+    /// mutating or executing tools. In Prompt mode, allowlisted bash
     /// still needs a parent approval sink; without one, the gate denies
     /// instead of silently executing.
     #[tokio::test]
     async fn allowlisted_execute_tool_denies_in_prompt_mode_without_mailbox() {
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![],
@@ -422,7 +422,7 @@ mod tests {
         .await;
         assert!(
             matches!(result, PermissionCheckResult::Denied { .. }),
-            "allowlisted execute tools must still require approval in Ask mode; got {result:?}"
+            "allowlisted execute tools must still require approval in Prompt mode; got {result:?}"
         );
 
         let telemetry = ctx.read().await.telemetry();
@@ -450,7 +450,7 @@ mod tests {
             .find(|def| def.agent_type == "code-review")
             .expect("builtins must include code-review");
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![],
@@ -479,12 +479,12 @@ mod tests {
     }
 
     /// Companion test: a tool OUTSIDE the allowlist still gets blocked
-    /// in Ask mode without a mailbox. The fast-path doesn't widen
+    /// in Prompt mode without a mailbox. The fast-path doesn't widen
     /// the agent's surface beyond what `agent_type` declared.
     #[tokio::test]
     async fn non_allowlisted_tool_still_denied_in_prompt_without_mailbox() {
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![],
@@ -510,9 +510,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ci_mode_overrides_agent_type_allowlist() {
+    async fn deny_mode_overrides_agent_type_allowlist() {
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ci,
+            mode: PermissionMode::Deny,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![],
@@ -532,7 +532,7 @@ mod tests {
         .await;
         assert!(
             matches!(result, PermissionCheckResult::Denied { .. }),
-            "CI mode must not be bypassed by an agent_type allowlist; got {result:?}"
+            "Deny mode must not be bypassed by an agent_type allowlist; got {result:?}"
         );
     }
 
@@ -593,7 +593,7 @@ mod tests {
             .await;
 
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![PermissionRule::parse("git")],
             deny_rules: vec![],
             ask_rules: vec![],
@@ -673,12 +673,12 @@ mod tests {
             })
             .await;
 
-        // No allowlist set — Ask mode falls through to the
+        // No allowlist set — Prompt mode falls through to the
         // request-parent flow that this test is exercising. (When an
         // allowlist IS set, mutating/execute tools still need approval;
         // see `allowlisted_execute_tool_denies_in_prompt_mode_without_mailbox`.)
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![],
@@ -993,7 +993,7 @@ mod tests {
             .await;
 
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![PermissionRule::parse("bash(rm -rf:*)")],
             ask_rules: vec![],

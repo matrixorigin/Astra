@@ -1248,7 +1248,7 @@ mod tests {
     #[tokio::test]
     async fn cli_skill_subrun_rejects_when_recursion_depth_limit_reached() {
         let inherited_permissions =
-            astra_runtime::orchestration::InheritedPermissions::new(PermissionMode::Ci);
+            astra_runtime::orchestration::InheritedPermissions::new(PermissionMode::Deny);
         let executor = CliSkillSubRunExecutor::new(
             astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
             "token".to_string(),

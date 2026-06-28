@@ -4251,7 +4251,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         //                   approval, expand + retry; on rejection,
         //                   surface the reason
         //
-        // Interactive / Ask mode now reaches this branch too because
+        // Interactive / Prompt mode now reaches this branch too because
         // we no longer assume the parallel batch was pre-approved.
         let mut outputs = outputs;
         for pos in 0..outputs.len() {
@@ -7109,7 +7109,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn sandbox_preflight_ci_mode_returns_clean_error_without_expanding() {
+    async fn sandbox_preflight_deny_mode_returns_clean_error_without_expanding() {
         let server = MockServer::start().await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let base = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("tempdir");
@@ -7124,7 +7124,7 @@ mod tests {
         let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
-        pm.set_mode(crate::cli::permission_manager::PermissionMode::Ci);
+        pm.set_mode(crate::cli::permission_manager::PermissionMode::Deny);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -7155,7 +7155,7 @@ mod tests {
                 &serde_json::json!({"path": target.to_string_lossy()}),
             )
             .await
-            .expect_err("ci mode should reject sandbox expansion");
+            .expect_err("deny mode should reject sandbox expansion");
 
         assert!(error.starts_with("Error: "), "{error}");
         assert!(
