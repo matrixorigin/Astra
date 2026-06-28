@@ -99,14 +99,29 @@ WORKDIR /app
 RUN set -eux; \
     export http_proxy="${http_proxy:-}" https_proxy="${https_proxy:-}" no_proxy="${no_proxy:-}" \
         HTTP_PROXY="${HTTP_PROXY:-}" HTTPS_PROXY="${HTTPS_PROXY:-}" NO_PROXY="${NO_PROXY:-}"; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates; \
+    replace_apt_sources() { \
+        from_regex="$1"; \
+        to_base="$(printf '%s' "$2" | sed 's/[&]/\\&/g')"; \
+        find /etc/apt -type f \( -name 'sources.list' -o -name '*.sources' \) -print0 \
+            | xargs -0 -r sed -i -E "s#${from_regex}#${to_base}#g"; \
+    }; \
     if [ -n "${DEBIAN_MIRROR}" ]; then \
         mirror="${DEBIAN_MIRROR%/}"; \
         case "${mirror}" in http://*|https://*) ;; *) mirror="https://${mirror}" ;; esac; \
-        find /etc/apt -type f \( -name 'sources.list' -o -name '*.sources' \) -print0 \
-            | xargs -0 -r sed -i -E "s#https?://(deb.debian.org|security.debian.org)#${mirror}#g"; \
-        apt-get update; \
+        mirror_host="${mirror#http://}"; \
+        mirror_host="${mirror_host#https://}"; \
+        mirror_host_regex="$(printf '%s' "${mirror_host}" | sed 's/[.[\*^$()+?{}|]/\\&/g')"; \
+        bootstrap_mirror="${mirror}"; \
+        case "${bootstrap_mirror}" in https://*) bootstrap_mirror="http://${bootstrap_mirror#https://}" ;; esac; \
+        replace_apt_sources 'https?://(deb.debian.org|security.debian.org)' "${bootstrap_mirror}"; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates; \
+    if [ -n "${DEBIAN_MIRROR}" ]; then \
+        if [ "${mirror}" != "${bootstrap_mirror}" ]; then \
+            replace_apt_sources "https?://${mirror_host_regex}" "${mirror}"; \
+            apt-get update; \
+        fi; \
     fi; \
     apt-get install -y --no-install-recommends curl libssl3; \
     rm -rf /var/lib/apt/lists/*; \
