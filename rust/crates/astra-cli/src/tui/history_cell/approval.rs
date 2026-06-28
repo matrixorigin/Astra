@@ -265,44 +265,27 @@ impl ApprovalCell {
     }
 
     /// Issue #326 P3: returns the human-readable reason the
-    /// Always button cannot persist a Project/User rule for
-    /// this approval, or None when persistence is allowed.
+    /// Always button has no safe memory scope at all, or None when
+    /// it can still fall back to turn/session memory even if
+    /// Project/User persistence is unavailable.
     /// Mirrors the policy in
     /// [`astra_turn_core::permission::scope::permitted_scopes`]
     /// using only the labels we render in the cell — keeps the
     /// view layer free of the engine's `RiskTag` enum.
     pub fn always_disabled_reason(&self) -> Option<&'static str> {
-        // Sub-agent requests can never persist on the parent's
-        // permissions.json.
-        if self.source_agent.is_some() {
-            return Some("sub-agent request");
+        if self.scope_available(astra_turn_core::permission::scope::AllowScope::RestOfTurn)
+            || self.scope_available(astra_turn_core::permission::scope::AllowScope::RestOfSession)
+            || self.scope_available(astra_turn_core::permission::scope::AllowScope::Project)
+            || self.scope_available(astra_turn_core::permission::scope::AllowScope::User)
+        {
+            None
+        } else {
+            Some("no safe memory scope")
         }
-        for label in &self.risk_tag_labels {
-            match label.as_str() {
-                "WritesSensitiveFile" => return Some("sensitive path"),
-                "GitDestructive" => return Some("git destructive"),
-                "WritesOutsideWorkspace" => return Some("outside workspace"),
-                "CredentialAccess" => return Some("credential access"),
-                "MCPUnknownCapability" => return Some("MCP unknown"),
-                _ => {}
-            }
-        }
-        if self.has_dynamic_eval {
-            return Some("shell command built at runtime");
-        }
-        if self.is_compound_command {
-            return Some("multi-step shell command");
-        }
-        if self.unsafe_rule_shape {
-            return Some("command shape too broad to remember");
-        }
-        None
     }
 
     fn always_action_disabled(&self) -> bool {
         self.always_disabled_reason().is_some()
-            || (!self.workspace_untrusted
-                && !self.scope_available(astra_turn_core::permission::scope::AllowScope::Project))
     }
 
     fn risk_tags_for_scope(&self) -> Vec<astra_turn_core::permission::engine::RiskTag> {
@@ -862,7 +845,7 @@ mod tests {
     // ── Issue #326 P3 / R2 Major 1: scope-picker policy ──────
 
     #[test]
-    fn always_disabled_for_destructive_risk() {
+    fn always_enabled_for_destructive_risk_session_fallback() {
         let cell = ApprovalCell::new(
             1,
             "edit_file".into(),
@@ -872,11 +855,12 @@ mod tests {
             true,
         )
         .with_risk_tag_labels(vec!["WritesOutsideWorkspace".into()]);
-        assert_eq!(cell.always_disabled_reason(), Some("outside workspace"));
+        assert_eq!(cell.always_disabled_reason(), None);
+        assert!(!cell.always_action_disabled());
     }
 
     #[test]
-    fn always_disabled_for_sensitive_path() {
+    fn always_enabled_for_sensitive_path_session_fallback() {
         let cell = ApprovalCell::new(
             1,
             "write_file".into(),
@@ -886,11 +870,12 @@ mod tests {
             true,
         )
         .with_risk_tag_labels(vec!["WritesSensitiveFile".into()]);
-        assert_eq!(cell.always_disabled_reason(), Some("sensitive path"));
+        assert_eq!(cell.always_disabled_reason(), None);
+        assert!(!cell.always_action_disabled());
     }
 
     #[test]
-    fn always_disabled_for_sub_agent_request() {
+    fn always_enabled_for_sub_agent_request_session_fallback() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
@@ -900,11 +885,12 @@ mod tests {
             true,
         )
         .with_source_agent("review-subagent");
-        assert_eq!(cell.always_disabled_reason(), Some("sub-agent request"));
+        assert_eq!(cell.always_disabled_reason(), None);
+        assert!(!cell.always_action_disabled());
     }
 
     #[test]
-    fn always_disabled_reason_mentions_runtime_built_shell_command() {
+    fn always_enabled_for_runtime_built_shell_command_turn_fallback() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
@@ -914,10 +900,8 @@ mod tests {
             true,
         )
         .with_scope_context(false, false, true, false);
-        assert_eq!(
-            cell.always_disabled_reason(),
-            Some("shell command built at runtime")
-        );
+        assert_eq!(cell.always_disabled_reason(), None);
+        assert!(!cell.always_action_disabled());
     }
 
     #[test]
@@ -954,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn always_disabled_reason_mentions_multi_step_shell_command() {
+    fn always_keeps_button_for_multi_step_shell_command_turn_fallback() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
@@ -965,14 +949,12 @@ mod tests {
         )
         .with_risk_tag_labels(vec!["BashExecute".into()])
         .with_scope_context(false, true, false, false);
-        assert_eq!(
-            cell.always_disabled_reason(),
-            Some("multi-step shell command")
-        );
+        assert_eq!(cell.always_disabled_reason(), None);
+        assert!(!cell.always_action_disabled());
     }
 
     #[test]
-    fn always_disabled_reason_mentions_unsafe_rule_shape() {
+    fn always_keeps_button_for_unsafe_rule_shape_turn_fallback() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
@@ -983,19 +965,16 @@ mod tests {
         )
         .with_scope_context(false, false, false, true);
 
-        assert_eq!(
-            cell.always_disabled_reason(),
-            Some("command shape too broad to remember")
-        );
-        assert!(cell.always_action_disabled());
+        assert_eq!(cell.always_disabled_reason(), None);
+        assert!(!cell.always_action_disabled());
     }
 
     #[test]
-    fn always_disabled_renders_in_card() {
+    fn git_risk_keeps_always_button_without_cant_remember() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
-            "rm -rf /".into(),
+            "git diff".into(),
             None,
             "execute".into(),
             true,
@@ -1003,8 +982,12 @@ mod tests {
         .with_risk_tag_labels(vec!["GitDestructive".into()]);
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Can't remember · git destructive"),
-            "destructive cell must advertise the disabled-Always state, got:\n{rendered}"
+            !rendered.contains("Can't remember"),
+            "high-risk approvals should still allow session-local don't-ask-again, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Always×"),
+            "Always button must remain available for session fallback, got:\n{rendered}"
         );
     }
 
@@ -1105,9 +1088,10 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_destructive_card_disables_persistent_scopes_visually() {
+    fn snapshot_destructive_card_keeps_always_available_visually() {
         // Destructive risk + sensitive-path file: the card must
-        // make this read as RED-coded.
+        // make this read as RED-coded without disabling session-local
+        // "don't ask again".
         let cell = ApprovalCell::new(
             7,
             "edit_file".into(),

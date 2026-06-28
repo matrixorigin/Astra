@@ -137,10 +137,10 @@ pub(crate) fn render_permissions_args(args: &PermissionsArgs) -> String {
     match &args.command {
         None => String::new(),
         Some(PermissionsSubcommand::Auto) => "auto".to_string(),
-        Some(PermissionsSubcommand::AcceptEdits) => "accept_edits".to_string(),
+        Some(PermissionsSubcommand::Edits) => "edits".to_string(),
         Some(PermissionsSubcommand::Plan) => "plan".to_string(),
-        Some(PermissionsSubcommand::Prompt) => "prompt".to_string(),
-        Some(PermissionsSubcommand::Deny) => "deny".to_string(),
+        Some(PermissionsSubcommand::Ask) => "ask".to_string(),
+        Some(PermissionsSubcommand::Ci) => "ci".to_string(),
         Some(PermissionsSubcommand::Rules) => "rules".to_string(),
         Some(PermissionsSubcommand::Trust) => "trust".to_string(),
         Some(PermissionsSubcommand::Untrust) => "untrust".to_string(),

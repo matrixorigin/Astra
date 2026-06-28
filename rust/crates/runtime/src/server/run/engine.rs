@@ -79,7 +79,7 @@ fn requested_mode_label(mode: RequestedTurnInteractionMode) -> &'static str {
         RequestedTurnInteractionMode::NonInteractive => "non_interactive",
         RequestedTurnInteractionMode::Prompt => "prompt",
         RequestedTurnInteractionMode::Auto => "auto",
-        RequestedTurnInteractionMode::Deny => "deny",
+        RequestedTurnInteractionMode::Ci => "ci",
         RequestedTurnInteractionMode::Headless => "headless",
     }
 }

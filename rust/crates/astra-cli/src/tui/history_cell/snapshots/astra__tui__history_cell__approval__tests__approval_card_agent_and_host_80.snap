@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/approval.rs
-assertion_line: 1101
+assertion_line: 1082
 expression: "render_at(&cell, 80)"
 ---
 ╭─ Approval · Bash · agent review-subagent · ssh:bastion-prod
@@ -8,7 +8,6 @@ expression: "render_at(&cell, 80)"
 │ npm test --filter auth -- --verbose
 │ Needs approval before it runs.
 │ Remember · similar `npm test` commands in this workspace
-│ Can't remember · sub-agent request
 │
 │  Yes   Yes, and don't ask again   No
 ╰─ ←→ move · Enter select · Esc close

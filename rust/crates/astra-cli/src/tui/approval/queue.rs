@@ -326,35 +326,47 @@ impl PendingApproval {
             .any(|entry| entry.scope == scope && entry.available)
     }
 
-    fn always_action_disabled(&self) -> bool {
-        use astra_turn_core::permission::engine::RiskTag;
-
-        if self.source_agent.is_some()
-            || self.is_compound_command
-            || self.has_dynamic_eval
-            || self.unsafe_rule_shape
-            || self.risk_tags.contains(&RiskTag::WritesSensitiveFile)
-            || self.risk_tags.contains(&RiskTag::GitDestructive)
-            || self.risk_tags.contains(&RiskTag::WritesOutsideWorkspace)
-            || self.risk_tags.contains(&RiskTag::CredentialAccess)
-            || self.risk_tags.contains(&RiskTag::MCPUnknownCapability)
-        {
-            return true;
+    fn default_always_scope(&self) -> AllowScope {
+        if self.scope_available(AllowScope::Project) {
+            return AllowScope::Project;
         }
+        if self.scope_available(AllowScope::RestOfSession) {
+            return AllowScope::RestOfSession;
+        }
+        if self.scope_available(AllowScope::RestOfTurn) {
+            return AllowScope::RestOfTurn;
+        }
+        AllowScope::OnceThisCall
+    }
 
-        !self.workspace_untrusted && !self.scope_available(AllowScope::Project)
+    fn always_action_disabled(&self) -> bool {
+        self.default_always_scope() == AllowScope::OnceThisCall
     }
 
     fn always_uses_session_fallback(&self) -> bool {
-        self.workspace_untrusted
-            && !self.always_action_disabled()
-            && !self.scope_available(AllowScope::Project)
+        self.default_always_scope() == AllowScope::RestOfSession
+    }
+
+    fn always_uses_turn_fallback(&self) -> bool {
+        self.default_always_scope() == AllowScope::RestOfTurn
     }
 
     fn selection_hint(&self) -> Option<String> {
         if self.always_uses_session_fallback() {
+            if self.workspace_untrusted {
+                return Some(
+                    "Don't ask again stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
+                        .to_string(),
+                );
+            }
             return Some(
-                "Don't ask again stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
+                "Don't ask again stays session-only for this higher-risk request; no workspace rule will be saved."
+                    .to_string(),
+            );
+        }
+        if self.always_uses_turn_fallback() {
+            return Some(
+                "Don't ask again applies only to this turn because this request is too broad to save safely."
                     .to_string(),
             );
         }
@@ -1267,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_button_action_blocks_unavailable_workspace_always() {
+    fn focused_button_action_keeps_always_for_untrusted_workspace_session_fallback() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
         q.push_with_metadata(
@@ -1301,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_button_action_blocks_always_for_compound_commands() {
+    fn focused_button_action_keeps_always_for_compound_commands_turn_fallback() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
         q.push_with_metadata(
@@ -1315,14 +1327,23 @@ mod tests {
         );
 
         q.focused_button_move_right();
-        assert!(
-            q.focused_button_action().is_none(),
-            "compound shell commands must keep Always disabled"
+        assert_eq!(
+            q.focused_button_action(),
+            Some(super::super::button_row::ButtonAction::Respond(
+                ApprovalResponse::AlwaysAllow
+            )),
+            "compound shell commands should still allow turn-local don't-ask-again"
+        );
+        assert_eq!(
+            q.focused_view().unwrap().selection_hint.as_deref(),
+            Some(
+                "Don't ask again applies only to this turn because this request is too broad to save safely."
+            )
         );
     }
 
     #[test]
-    fn focused_button_action_blocks_always_for_unsafe_rule_shape() {
+    fn focused_button_action_keeps_always_for_unsafe_rule_shape_turn_fallback() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
         q.push_with_metadata(
@@ -1336,9 +1357,47 @@ mod tests {
         );
 
         q.focused_button_move_right();
-        assert!(
-            q.focused_button_action().is_none(),
-            "requests without a safe match target must not offer Always"
+        assert_eq!(
+            q.focused_button_action(),
+            Some(super::super::button_row::ButtonAction::Respond(
+                ApprovalResponse::AlwaysAllow
+            )),
+            "requests without a persistent match target should still allow turn-local don't-ask-again"
+        );
+    }
+
+    #[test]
+    fn focused_button_action_keeps_always_for_git_risk_session_fallback() {
+        use astra_turn_core::permission::engine::RiskTag;
+
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "git diff".into(),
+            Some("cd /Users/xupeng/github/astra && git diff origin/main...feature".into()),
+            "Git safety: cd + git compound command blocked (bare repo attack vector)".into(),
+            serde_json::json!({
+                "command": "cd /Users/xupeng/github/astra && git diff origin/main...feature"
+            }),
+            tx,
+            ApprovalMetadata::default()
+                .with_risk_tags(vec![RiskTag::BashExecute, RiskTag::GitDestructive]),
+        );
+
+        q.focused_button_move_right();
+        assert_eq!(
+            q.focused_button_action(),
+            Some(super::super::button_row::ButtonAction::Respond(
+                ApprovalResponse::AlwaysAllow
+            )),
+            "git safety risk should disable persistent rules, not session-local don't-ask-again"
+        );
+        assert_eq!(
+            q.focused_view().unwrap().selection_hint.as_deref(),
+            Some(
+                "Don't ask again stays session-only for this higher-risk request; no workspace rule will be saved."
+            )
         );
     }
 

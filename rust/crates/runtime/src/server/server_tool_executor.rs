@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,7 +32,9 @@ use astra_tools::task_mgmt::{
 };
 use astra_tools::tool_engine::ToolEngine;
 use astra_tools::{AskUserGate, ToolExecutor};
+use astra_turn_core::approval::request_key::canonical_args_json;
 use astra_turn_core::capability::Capability;
+use astra_turn_core::interaction_types::AskUserBehavior;
 use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
 use async_trait::async_trait;
 
@@ -95,6 +97,23 @@ fn resolved_server_tool_names(
         .iter()
         .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
         .collect()
+}
+
+fn encode_ask_user_behavior(behavior: AskUserBehavior) -> u8 {
+    match behavior {
+        AskUserBehavior::PromptUser => 0,
+        AskUserBehavior::AutoUnanswered => 1,
+        AskUserBehavior::Hidden => 2,
+    }
+}
+
+fn decode_ask_user_behavior(value: u8) -> AskUserBehavior {
+    match value {
+        0 => AskUserBehavior::PromptUser,
+        1 => AskUserBehavior::AutoUnanswered,
+        2 => AskUserBehavior::Hidden,
+        _ => AskUserBehavior::Hidden,
+    }
 }
 
 /// Per-turn mutation accounting for session config changes.
@@ -248,6 +267,10 @@ pub struct ServerToolExecutor {
     approval_gate: Option<Arc<dyn astra_tools::ToolApprovalGate>>,
     /// Optional ask_user gate for interactive client prompts.
     ask_user_gate: Option<Arc<dyn AskUserGate>>,
+    /// Current turn's ask_user behavior, synced from the loop interaction policy.
+    ask_user_behavior: AtomicU8,
+    /// Per-turn auto ask_user fingerprint guard.
+    ask_user_auto_fingerprints: Arc<Mutex<HashSet<String>>>,
     /// Optional progress callback for streaming tool output.
     progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
     /// Optional auxiliary event writer for ask_user-specific audit events.
@@ -302,6 +325,8 @@ impl ServerToolExecutor {
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             approval_gate: None,
             ask_user_gate: None,
+            ask_user_behavior: AtomicU8::new(encode_ask_user_behavior(AskUserBehavior::PromptUser)),
+            ask_user_auto_fingerprints: Arc::new(Mutex::new(HashSet::new())),
             progress_callback: None,
             auxiliary_event_writer: None,
             resource_governor: None,
@@ -884,6 +909,12 @@ impl ServerToolExecutor {
         self.ask_user_gate = Some(gate);
     }
 
+    /// Sync the current turn's ask_user interaction policy from the loop host.
+    pub fn set_ask_user_behavior(&self, behavior: AskUserBehavior) {
+        self.ask_user_behavior
+            .store(encode_ask_user_behavior(behavior), Ordering::Release);
+    }
+
     /// Set the progress callback for streaming tool output.
     pub fn set_progress_callback(&mut self, cb: Arc<dyn astra_tools::ToolProgressCallback>) {
         self.progress_callback = Some(cb);
@@ -1202,10 +1233,23 @@ impl ServerToolExecutor {
     }
 
     pub(super) async fn server_ask_user(&self, args: &Value) -> astra_tools::ToolResult {
+        let ask_user_behavior =
+            decode_ask_user_behavior(self.ask_user_behavior.load(Ordering::Acquire));
+        let auto_duplicate = if ask_user_behavior == AskUserBehavior::AutoUnanswered {
+            let fingerprint = canonical_args_json(args);
+            self.ask_user_auto_fingerprints
+                .lock()
+                .map(|mut seen| !seen.insert(fingerprint))
+                .unwrap_or(false)
+        } else {
+            false
+        };
         execute_ask_user(
             AskUserExecutionContext {
                 user_id: &self.user_id,
                 session_id: &self.session_id,
+                ask_user_behavior,
+                auto_duplicate,
                 gate: self.ask_user_gate.as_deref(),
                 progress_callback: self.progress_callback.as_deref(),
                 auxiliary_event_writer: self.auxiliary_event_writer.as_deref(),
@@ -1218,6 +1262,9 @@ impl ServerToolExecutor {
     /// Set the current turn index for journal entries.
     pub fn set_turn_index(&self, idx: u32) {
         self.journal_turn_index.store(idx, Ordering::Release);
+        if let Ok(mut seen) = self.ask_user_auto_fingerprints.lock() {
+            seen.clear();
+        }
     }
 
     /// Reset aggregate output counter at the start of a new turn.
@@ -4883,16 +4930,120 @@ esac
         assert_eq!(
             serde_json::from_str::<Value>(&result.output).unwrap(),
             json!({
+                "status": "user_answered",
+                "source": "user",
                 "answers": {
                     "Which option?": "first",
                     "Which features?": ["Beta", "Custom"]
                 },
-                "annotations": {
-                    "Which option?": {"notes": "preview matters", "preview": "preview-first"},
-                    "Which features?": {"notes": "ship both"}
+                "raw": {
+                    "answers": {
+                        "Which option?": "first",
+                        "Which features?": ["Beta", "Custom"]
+                    },
+                    "annotations": {
+                        "Which option?": {"notes": "preview matters", "preview": "preview-first"},
+                        "Which features?": {"notes": "ship both"}
+                    }
                 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn ask_user_auto_mode_returns_unanswered_without_gate() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_ask_user_behavior(AskUserBehavior::AutoUnanswered);
+        let progress = Arc::new(RecordingProgressCallback::default());
+        exec.set_progress_callback(progress.clone());
+        let auxiliary = Arc::new(RecordingAuxiliaryWriter::default());
+        exec.set_auxiliary_event_writer(auxiliary.clone());
+
+        let result = exec
+            .execute_with_metadata(
+                "ask_user",
+                &json!({
+                    "questions": [{
+                        "header": "Choice",
+                        "question": "Ship now?",
+                        "options": ["Yes", "No"]
+                    }]
+                }),
+            )
+            .await;
+
+        assert!(!result.is_error);
+        let output = serde_json::from_str::<Value>(&result.output).unwrap();
+        assert_eq!(output["status"], "auto_unanswered");
+        assert_eq!(output["source"], "runtime_policy");
+        assert_eq!(output["answers"], json!([]));
+        assert!(
+            output["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("best judgment")
+        );
+
+        let progress_events = progress.ask_user.lock().unwrap();
+        assert_eq!(progress_events.len(), 1);
+        assert_eq!(progress_events[0].outcome, "auto_unanswered");
+        assert!(progress_events[0].answers.is_empty());
+        assert_eq!(progress_events[0].was_custom, Some(false));
+
+        let aux_events = auxiliary.events.lock().unwrap();
+        assert_eq!(aux_events.len(), 1);
+        assert_eq!(aux_events[0].event_type, "ask_user_auto_unanswered");
+        assert_eq!(
+            aux_events[0].metadata.as_ref().unwrap()["ask_user"]["status"],
+            "auto_unanswered"
+        );
+        assert_eq!(
+            aux_events[0].metadata.as_ref().unwrap()["ask_user"]["response"]["outcome"],
+            "auto_unanswered"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_user_auto_mode_marks_duplicate_within_turn_and_resets_next_turn() {
+        let (exec, _dir) = test_executor();
+        exec.set_ask_user_behavior(AskUserBehavior::AutoUnanswered);
+
+        let args = json!({
+            "questions": [{
+                "header": "Choice",
+                "question": "Ship now?",
+                "options": ["Yes", "No"]
+            }]
+        });
+        let reordered_args: Value = serde_json::from_str(
+            r#"{"questions":[{"options":["Yes","No"],"question":"Ship now?","header":"Choice"}]}"#,
+        )
+        .unwrap();
+
+        let first = exec.execute_with_metadata("ask_user", &args).await;
+        let second = exec
+            .execute_with_metadata("ask_user", &reordered_args)
+            .await;
+        exec.set_turn_index(1);
+        let after_turn_reset = exec.execute_with_metadata("ask_user", &args).await;
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&first.output).unwrap()["status"],
+            "auto_unanswered"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&second.output).unwrap()["status"],
+            "auto_unanswered_duplicate"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&after_turn_reset.output).unwrap()["status"],
+            "auto_unanswered"
+        );
+    }
+
+    #[test]
+    fn ask_user_behavior_decode_unknown_is_hidden() {
+        assert_eq!(decode_ask_user_behavior(255), AskUserBehavior::Hidden);
     }
 
     #[tokio::test]
@@ -4913,6 +5064,63 @@ esac
 
         assert!(result.is_error);
         assert!(result.output.contains("interactive client connection"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_terminal_prompt_outcomes_return_structured_non_error_statuses() {
+        let args = json!({
+            "questions": [{
+                "header": "Confirm",
+                "question": "Continue?",
+                "options": ["Yes", "No"],
+                "allow_freeform": false
+            }]
+        });
+        let expected_prompt = json!({
+            "context": null,
+            "questions": [{
+                "header": "Confirm",
+                "question": "Continue?",
+                "options": [
+                    {"label": "Yes", "description": null, "preview": null},
+                    {"label": "No", "description": null, "preview": null}
+                ],
+                "multi_select": false,
+                "allow_freeform": false
+            }]
+        });
+
+        for (decision, status, source) in [
+            (AskUserDecision::Cancelled, "cancelled", "user"),
+            (AskUserDecision::Timeout, "timeout", "runtime_policy"),
+            (
+                AskUserDecision::Error("WebSocket connection closed".into()),
+                "interaction_error",
+                "runtime_policy",
+            ),
+        ] {
+            let (mut exec, _dir) = test_executor();
+            exec.set_ask_user_gate(Arc::new(StaticAskUserGate {
+                expected_prompt: expected_prompt.clone(),
+                decision,
+            }));
+
+            let result = exec.execute_with_metadata("ask_user", &args).await;
+            assert!(
+                !result.is_error,
+                "{status} should be a structured ask_user outcome, not a tool error: {result:?}"
+            );
+            let output = serde_json::from_str::<Value>(&result.output).unwrap();
+            assert_eq!(output["status"], status);
+            assert_eq!(output["source"], source);
+            assert_eq!(output["answers"], json!([]));
+            assert!(
+                output["instruction"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()),
+                "terminal ask_user outcomes must guide the model away from assuming a user answer"
+            );
+        }
     }
 
     #[tokio::test]

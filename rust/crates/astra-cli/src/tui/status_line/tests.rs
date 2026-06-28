@@ -204,9 +204,9 @@ fn auto_mode_renders_yellow_chip() {
 }
 
 #[test]
-fn accept_edits_mode_renders_cyan_chip() {
+fn edits_mode_renders_cyan_chip() {
     let c = StatusContext {
-        permission_mode: PermissionMode::AcceptEdits,
+        permission_mode: PermissionMode::Edits,
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
@@ -214,7 +214,7 @@ fn accept_edits_mode_renders_cyan_chip() {
         .left
         .iter()
         .find(|seg| seg.text == "Edits")
-        .expect("accept_edits chip segment");
+        .expect("edits chip segment");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
     assert!(
         chip.style
@@ -244,17 +244,13 @@ fn plan_mode_renders_blue_chip() {
 }
 
 #[test]
-fn deny_mode_renders_red_chip() {
+fn ci_mode_renders_red_chip() {
     let c = StatusContext {
-        permission_mode: PermissionMode::Deny,
+        permission_mode: PermissionMode::Ci,
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
-    let chip = s
-        .left
-        .iter()
-        .find(|seg| seg.text == "Deny")
-        .expect("deny chip");
+    let chip = s.left.iter().find(|seg| seg.text == "CI").expect("ci chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
     assert!(
         chip.style

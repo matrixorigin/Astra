@@ -68,10 +68,10 @@ impl PlanChoice {
                 mode: PermissionMode::Auto,
             },
             Self::ApproveEdit => PlanReviewDecision::Approve {
-                mode: PermissionMode::AcceptEdits,
+                mode: PermissionMode::Edits,
             },
             Self::ApproveDefault => PlanReviewDecision::Approve {
-                mode: PermissionMode::Prompt,
+                mode: PermissionMode::Ask,
             },
             Self::KeepPlanning => PlanReviewDecision::KeepPlanning,
         }
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(
             rx.try_recv().expect("decision sent"),
             PlanReviewDecision::Approve {
-                mode: PermissionMode::Prompt
+                mode: PermissionMode::Ask
             }
         );
     }

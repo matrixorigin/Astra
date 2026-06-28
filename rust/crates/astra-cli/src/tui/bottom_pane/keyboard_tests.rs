@@ -67,22 +67,21 @@ fn backtab_cycles_mode_when_composer_has_text() {
 }
 
 #[test]
-fn next_mode_cycle_full_loop_skips_deny() {
-    // Prompt → AcceptEdits → Plan → Auto → Prompt (wrap).
-    // `Deny` is sticky under the cycle: a bare `/allow` (or Shift+Tab) must
-    // never silently move a session out of the most restrictive mode — it
-    // is only exited by an explicit `/allow <mode>`. Likewise `Deny` is
-    // never a cycle *target*.
+fn next_mode_cycle_full_loop_keeps_ci_sticky() {
+    // Ask -> Edits -> Plan -> Auto -> Ask (wrap).
+    // `CI` is sticky under the cycle: a bare `/allow` (or Shift+Tab) must
+    // never silently move a session out of unattended CI behavior. It is
+    // only exited by an explicit `/allow <mode>`, and is never a cycle target.
     assert_eq!(
-        next_permission_mode_for_cycle(PermissionMode::Prompt),
-        PermissionMode::AcceptEdits
+        next_permission_mode_for_cycle(PermissionMode::Ask),
+        PermissionMode::Edits
     );
     assert_eq!(
-        next_permission_mode_for_cycle(PermissionMode::Deny),
-        PermissionMode::Deny
+        next_permission_mode_for_cycle(PermissionMode::Ci),
+        PermissionMode::Ci
     );
     assert_eq!(
-        next_permission_mode_for_cycle(PermissionMode::AcceptEdits),
+        next_permission_mode_for_cycle(PermissionMode::Edits),
         PermissionMode::Plan
     );
     assert_eq!(
@@ -91,17 +90,16 @@ fn next_mode_cycle_full_loop_skips_deny() {
     );
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Auto),
-        PermissionMode::Prompt
+        PermissionMode::Ask
     );
 }
 
 #[test]
 fn next_mode_cycle_starting_from_default() {
-    // Starting from Prompt (the default), verify the first Shift+Tab
-    // goes to Accept.
+    // Starting from Ask (the default), verify the first Shift+Tab goes to Edits.
     assert_eq!(
-        next_permission_mode_for_cycle(PermissionMode::Prompt),
-        PermissionMode::AcceptEdits
+        next_permission_mode_for_cycle(PermissionMode::Ask),
+        PermissionMode::Edits
     );
 }
 

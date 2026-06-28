@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn test_permission_sync_context() {
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Prompt,
+            mode: PermissionMode::Ask,
             allow_rules: vec![PermissionRule::parse(r#"Bash(argv_prefix="git")"#)],
             deny_rules: vec![],
             ..Default::default()
@@ -236,7 +236,7 @@ mod tests {
 
 // ─── Permission Request Handler ─────────────────────────────────────────────
 
-fn accept_edits_auto_allows_request(request: &PermissionRequest) -> bool {
+fn edits_auto_allows_request(request: &PermissionRequest) -> bool {
     matches!(
         (
             cloud_gated_tool_kind_with_args(&request.tool_name, Some(&request.args)),
@@ -313,7 +313,7 @@ impl PermissionRequestHandler {
 
                 response
             }
-            PermissionMode::AcceptEdits if accept_edits_auto_allows_request(request) => {
+            PermissionMode::Edits if edits_auto_allows_request(request) => {
                 let response = if let Some(ref rule_str) = request.suggested_rule {
                     PermissionResponse::approve()
                         .with_update(PermissionUpdate::allow(PermissionRule::parse(rule_str)))
@@ -329,9 +329,9 @@ impl PermissionRequestHandler {
 
                 response
             }
-            PermissionMode::Deny => {
-                // Deny mode: reject without escalation
-                PermissionResponse::deny("permission mode is deny")
+            PermissionMode::Ci => {
+                // CI mode: reject without escalation.
+                PermissionResponse::deny("permission mode is ci")
             }
             PermissionMode::Plan => {
                 if crate::tool::schema::prune::PLAN_MODE_REQUIRED_TOOLS
@@ -344,8 +344,8 @@ impl PermissionRequestHandler {
                     ))
                 }
             }
-            PermissionMode::AcceptEdits | PermissionMode::Prompt => {
-                // Prompt mode: use callback or default logic
+            PermissionMode::Edits | PermissionMode::Ask => {
+                // Ask-style modes use the callback or default logic.
                 drop(ctx);
 
                 if let Some(ref callback) = self.callback {
@@ -438,15 +438,15 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn handler_deny_mode_denies() {
+    async fn handler_ci_mode_denies() {
         let handler =
-            PermissionRequestHandler::new(PermissionSyncContext::shared_root(PermissionMode::Deny));
+            PermissionRequestHandler::new(PermissionSyncContext::shared_root(PermissionMode::Ci));
 
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "rm -rf /"}));
         let response = handler.handle_request(&request).await;
 
         assert!(!response.approved);
-        assert!(response.reason.as_ref().unwrap().contains("deny"));
+        assert!(response.reason.as_ref().unwrap().contains("ci"));
     }
 
     #[tokio::test]
@@ -490,11 +490,11 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn handler_accept_edits_auto_approves_workspace_write_without_callback() {
+    async fn handler_edits_auto_approves_workspace_write_without_callback() {
         let callback_calls = StdArc::new(AtomicUsize::new(0));
         let seen = StdArc::clone(&callback_calls);
         let handler = PermissionRequestHandler::new(PermissionSyncContext::shared_root(
-            PermissionMode::AcceptEdits,
+            PermissionMode::Edits,
         ))
         .with_callback(Box::new(move |_req, _ctx| {
             seen.fetch_add(1, Ordering::SeqCst);
@@ -512,8 +512,8 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn handler_accept_edits_background_denies_external_write_escalation() {
-        let mut inherited = InheritedPermissions::new(PermissionMode::AcceptEdits);
+    async fn handler_edits_background_denies_external_write_escalation() {
+        let mut inherited = InheritedPermissions::new(PermissionMode::Edits);
         inherited.is_background = true;
         let callback_calls = StdArc::new(AtomicUsize::new(0));
         let seen = StdArc::clone(&callback_calls);
@@ -538,11 +538,11 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn handler_accept_edits_still_asks_callback_for_bash() {
+    async fn handler_edits_still_asks_callback_for_bash() {
         let callback_calls = StdArc::new(AtomicUsize::new(0));
         let seen = StdArc::clone(&callback_calls);
         let handler = PermissionRequestHandler::new(PermissionSyncContext::shared_root(
-            PermissionMode::AcceptEdits,
+            PermissionMode::Edits,
         ))
         .with_callback(Box::new(move |_req, _ctx| {
             seen.fetch_add(1, Ordering::SeqCst);
@@ -562,9 +562,8 @@ mod handler_tests {
 
     #[tokio::test]
     async fn handler_prompt_without_callback_fails_closed_for_foreground_agent() {
-        let handler = PermissionRequestHandler::new(PermissionSyncContext::shared_root(
-            PermissionMode::Prompt,
-        ));
+        let handler =
+            PermissionRequestHandler::new(PermissionSyncContext::shared_root(PermissionMode::Ask));
 
         let request = PermissionRequest::new("write_file", serde_json::json!({"path": "out.txt"}));
         let response = handler.handle_request(&request).await;
@@ -580,9 +579,9 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn handler_accept_edits_without_callback_fails_closed_for_mutation() {
+    async fn handler_edits_without_callback_fails_closed_for_mutation() {
         let handler = PermissionRequestHandler::new(PermissionSyncContext::shared_root(
-            PermissionMode::AcceptEdits,
+            PermissionMode::Edits,
         ));
 
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "npm test"}));
@@ -600,7 +599,7 @@ mod handler_tests {
 
     #[tokio::test]
     async fn handler_respects_inherited_allow() {
-        let mut inherited = InheritedPermissions::new(PermissionMode::Prompt);
+        let mut inherited = InheritedPermissions::new(PermissionMode::Ask);
         inherited.add_allow(PermissionRule::parse(r#"Bash(argv_prefix="git")"#));
         let handler = PermissionRequestHandler::new(PermissionSyncContext::shared(inherited));
 
@@ -626,18 +625,17 @@ mod handler_tests {
 
     #[tokio::test]
     async fn handler_uses_callback() {
-        let handler = PermissionRequestHandler::new(PermissionSyncContext::shared_root(
-            PermissionMode::Prompt,
-        ))
-        .with_callback(Box::new(|req, _ctx| {
-            if req.tool_name == "bash" {
-                PermissionDecision::approve_with_rule(PermissionRule::parse(
-                    r#"Bash(argv_prefix="git")"#,
-                ))
-            } else {
-                PermissionDecision::deny("unknown tool")
-            }
-        }));
+        let handler =
+            PermissionRequestHandler::new(PermissionSyncContext::shared_root(PermissionMode::Ask))
+                .with_callback(Box::new(|req, _ctx| {
+                    if req.tool_name == "bash" {
+                        PermissionDecision::approve_with_rule(PermissionRule::parse(
+                            r#"Bash(argv_prefix="git")"#,
+                        ))
+                    } else {
+                        PermissionDecision::deny("unknown tool")
+                    }
+                }));
 
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}));
         let response = handler.handle_request(&request).await;

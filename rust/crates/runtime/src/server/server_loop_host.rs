@@ -156,7 +156,7 @@ fn server_requested_interaction_mode(mode: RequestedTurnInteractionMode) -> Turn
         RequestedTurnInteractionMode::NonInteractive => TurnInteractionMode::NonInteractive,
         RequestedTurnInteractionMode::Prompt => TurnInteractionMode::Prompt,
         RequestedTurnInteractionMode::Auto => TurnInteractionMode::Auto,
-        RequestedTurnInteractionMode::Deny => TurnInteractionMode::Deny,
+        RequestedTurnInteractionMode::Ci => TurnInteractionMode::Ci,
         RequestedTurnInteractionMode::Headless => TurnInteractionMode::Headless,
     }
 }
@@ -2725,6 +2725,7 @@ impl ServerAgenticLoopHost {
         self.current_server_tool_executor = state.server_tool_executor.clone();
         self.current_deferred_tool_names = activatable_deferred_tool_names.clone();
         if let Some(executor) = state.server_tool_executor.as_deref() {
+            executor.set_ask_user_behavior(self.turn_interaction_mode().ask_user_behavior());
             self.current_activatable_deferred_tool_names =
                 executor.set_current_tool_surface(wire_tools, activatable_deferred_tool_names);
         } else {

@@ -26,7 +26,7 @@ fn base_ctx() -> StatusContext {
     StatusContext {
         model: Some("sonnet-4.6".into()),
         cwd: Some("~/projects/astra".into()),
-        permission_mode: PermissionMode::Prompt,
+        permission_mode: PermissionMode::Ask,
         ..StatusContext::default()
     }
 }
@@ -58,12 +58,12 @@ fn snapshot_auto_mode() {
 }
 
 #[test]
-fn snapshot_deny_mode() {
+fn snapshot_ci_mode() {
     let ctx = StatusContext {
-        permission_mode: PermissionMode::Deny,
+        permission_mode: PermissionMode::Ci,
         ..base_ctx()
     };
-    crate::tui::testing::assert_tui_snapshot!("status_deny_mode_80", render_ctx(&ctx, 80));
+    crate::tui::testing::assert_tui_snapshot!("status_ci_mode_80", render_ctx(&ctx, 80));
 }
 
 #[test]

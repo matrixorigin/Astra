@@ -409,8 +409,10 @@ fn cli_chat_subcommand() {
     // Permission modes
     for (input, expected) in [
         ("auto", "auto"),
-        ("accept_edits", "accept_edits"),
+        ("edits", "edits"),
         ("plan", "plan"),
+        ("ask", "ask"),
+        ("ci", "ci"),
     ] {
         let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", input]).unwrap();
         match &cli.command {
@@ -420,7 +422,15 @@ fn cli_chat_subcommand() {
             _ => panic!("expected Chat perm={input}"),
         }
     }
-    for alias in ["accept-edits", "yolo", "bypass-safety", "bypass_safety"] {
+    for alias in [
+        "accept-edits",
+        "accept_edits",
+        "prompt",
+        "deny",
+        "yolo",
+        "bypass-safety",
+        "bypass_safety",
+    ] {
         assert!(Cli::try_parse_from(["astra", "chat", "--permission-mode", alias]).is_err());
     }
 }
@@ -428,10 +438,10 @@ fn cli_chat_subcommand() {
 #[test]
 fn cli_permissions_subcommand() {
     let cases: &[PermissionsCase] = &[
-        ("accept_edits", |s| {
-            matches!(s, PermissionsSubcommand::AcceptEdits)
-        }),
+        ("edits", |s| matches!(s, PermissionsSubcommand::Edits)),
         ("plan", |s| matches!(s, PermissionsSubcommand::Plan)),
+        ("ask", |s| matches!(s, PermissionsSubcommand::Ask)),
+        ("ci", |s| matches!(s, PermissionsSubcommand::Ci)),
     ];
     for (mode, check) in cases {
         let cli = Cli::try_parse_from(["astra", "permissions", mode]).unwrap();
@@ -592,7 +602,7 @@ fn cli_top_level_yes_does_not_conflict_with_chat_yes() {
 
 #[test]
 fn cli_chat_yes_with_permission_mode() {
-    for (perm, expect_auto) in [("deny", false), ("auto", true)] {
+    for (perm, expect_auto) in [("ci", false), ("auto", true)] {
         let cli = Cli::try_parse_from([
             "astra",
             "chat",

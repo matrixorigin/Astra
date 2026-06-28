@@ -218,16 +218,18 @@ fn derive_turn_interaction_mode(
         // opted into.
         PermissionMode::Auto => TurnInteractionMode::Auto,
         PermissionMode::Plan => {
-            if has_approval_request_tx || render_is_silent || !stdin_is_terminal {
+            if render_is_silent || !stdin_is_terminal {
                 TurnInteractionMode::NonInteractive
+            } else if has_ask_user_request_tx {
+                TurnInteractionMode::Prompt
             } else {
-                TurnInteractionMode::Deny
+                TurnInteractionMode::NonInteractive
             }
         }
-        // AcceptEdits still needs the native ask_user sink for clarifications.
+        // Edits still needs the native ask_user sink for clarifications.
         // The old stdin/raw-mode path was removed because it corrupts the TUI
         // and has no product parity with the overlay flow.
-        PermissionMode::AcceptEdits => {
+        PermissionMode::Edits => {
             if render_is_silent || !stdin_is_terminal {
                 TurnInteractionMode::NonInteractive
             } else if has_ask_user_request_tx {
@@ -240,7 +242,7 @@ fn derive_turn_interaction_mode(
         // orthogonal here: if the session can surface questionnaire prompts,
         // keep ask_user available even when tool approvals are handled through
         // a separate channel.
-        PermissionMode::Prompt => {
+        PermissionMode::Ask => {
             if render_is_silent || !stdin_is_terminal {
                 TurnInteractionMode::NonInteractive
             } else if has_ask_user_request_tx {
@@ -253,11 +255,11 @@ fn derive_turn_interaction_mode(
         // NonInteractive: there's nothing to refuse interactively and
         // Deny's deterministic-denial behaviour is already what
         // NonInteractive callers expect.
-        PermissionMode::Deny => {
+        PermissionMode::Ci => {
             if has_approval_request_tx || render_is_silent || !stdin_is_terminal {
                 TurnInteractionMode::NonInteractive
             } else {
-                TurnInteractionMode::Deny
+                TurnInteractionMode::Ci
             }
         }
     }
@@ -1293,18 +1295,11 @@ mod tests {
     #[test]
     fn derive_turn_interaction_mode_maps_permission_mode_with_native_prompt_sink() {
         assert_eq!(
-            derive_turn_interaction_mode(PermissionMode::Prompt, false, false, true, false, true),
+            derive_turn_interaction_mode(PermissionMode::Ask, false, false, true, false, true),
             TurnInteractionMode::Prompt
         );
         assert_eq!(
-            derive_turn_interaction_mode(
-                PermissionMode::AcceptEdits,
-                false,
-                false,
-                true,
-                false,
-                true,
-            ),
+            derive_turn_interaction_mode(PermissionMode::Edits, false, false, true, false, true,),
             TurnInteractionMode::Prompt
         );
         assert_eq!(
@@ -1312,19 +1307,19 @@ mod tests {
             TurnInteractionMode::Auto
         );
         assert_eq!(
-            derive_turn_interaction_mode(PermissionMode::Deny, false, false, false, false, true),
-            TurnInteractionMode::Deny
+            derive_turn_interaction_mode(PermissionMode::Ci, false, false, false, false, true),
+            TurnInteractionMode::Ci
         );
     }
 
     #[test]
     fn derive_turn_interaction_mode_forces_noninteractive_for_subtasks_and_silent_turns() {
         assert_eq!(
-            derive_turn_interaction_mode(PermissionMode::Prompt, true, false, false, false, true),
+            derive_turn_interaction_mode(PermissionMode::Ask, true, false, false, false, true),
             TurnInteractionMode::NonInteractive
         );
         assert_eq!(
-            derive_turn_interaction_mode(PermissionMode::Prompt, false, false, false, true, true),
+            derive_turn_interaction_mode(PermissionMode::Ask, false, false, false, true, true),
             TurnInteractionMode::NonInteractive
         );
     }
@@ -1342,15 +1337,15 @@ mod tests {
     #[test]
     fn derive_turn_interaction_mode_forces_noninteractive_without_tty_or_native_prompt_sink() {
         assert_eq!(
-            derive_turn_interaction_mode(PermissionMode::Prompt, false, false, false, false, false),
+            derive_turn_interaction_mode(PermissionMode::Ask, false, false, false, false, false),
             TurnInteractionMode::NonInteractive
         );
         assert_eq!(
-            derive_turn_interaction_mode(PermissionMode::Prompt, false, false, false, false, true),
+            derive_turn_interaction_mode(PermissionMode::Ask, false, false, false, false, true),
             TurnInteractionMode::NonInteractive
         );
         assert_eq!(
-            derive_turn_interaction_mode(PermissionMode::Prompt, false, true, true, false, true),
+            derive_turn_interaction_mode(PermissionMode::Ask, false, true, true, false, true),
             TurnInteractionMode::Prompt
         );
     }
@@ -1360,7 +1355,7 @@ mod tests {
     // The user's Auto-mode intent is "don't interrupt me, trust the
     // model". This must NOT be silently demoted to NonInteractive just
     // because the turn is happening in a piped-stdin / silent-render /
-    // approval-channel context — those only matter for Prompt mode (no
+    // approval-channel context — those only matter for Ask mode (no
     // stdin to prompt on → fall back to NonInteractive so nothing
     // blocks on a human). In Auto, there's nothing to prompt anyway,
     // so the structural non-interactivity is orthogonal.
@@ -1414,22 +1409,30 @@ mod tests {
     }
 
     #[test]
-    fn derive_turn_interaction_mode_demotes_deny_like_prompt() {
-        // Deny mode under non-interactive also falls back to
+    fn derive_turn_interaction_mode_demotes_ci_like_ask() {
+        // CI mode under non-interactive also falls back to
         // NonInteractive (no opportunity to refuse anything
-        // interactively — and Deny's behaviour is already deterministic
+        // interactively — and CI behaviour is already deterministic
         // denial, same as NonInteractive's restrictive default).
         assert_eq!(
-            derive_turn_interaction_mode(PermissionMode::Deny, false, false, false, false, false),
+            derive_turn_interaction_mode(PermissionMode::Ci, false, false, false, false, false),
             TurnInteractionMode::NonInteractive
         );
     }
 
     #[test]
-    fn derive_turn_interaction_mode_uses_deny_for_interactive_plan() {
+    fn derive_turn_interaction_mode_keeps_ask_user_for_interactive_plan() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Plan, false, false, true, false, true),
+            TurnInteractionMode::Prompt
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_hides_ask_user_for_plan_without_prompt_sink() {
         assert_eq!(
             derive_turn_interaction_mode(PermissionMode::Plan, false, false, false, false, true),
-            TurnInteractionMode::Deny
+            TurnInteractionMode::NonInteractive
         );
     }
 

@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn server_skill_subrun_executor_keeps_inherited_permissions() {
         let inherited_permissions = crate::orchestration::InheritedPermissions::new(
-            crate::orchestration::PermissionMode::Deny,
+            crate::orchestration::PermissionMode::Ci,
         );
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
@@ -686,7 +686,7 @@ mod tests {
 
         assert_eq!(
             executor.inherited_permissions.mode,
-            crate::orchestration::PermissionMode::Deny
+            crate::orchestration::PermissionMode::Ci
         );
     }
 

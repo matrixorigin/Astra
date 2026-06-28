@@ -204,7 +204,7 @@ pub(crate) const KNOWN_SETTINGS: &[(&str, &str)] = &[
     ("theme", "Color theme (auto/dark/light)"),
     (
         "permission_mode",
-        "Default permission mode (auto/plan/accept_edits/prompt/deny)",
+        "Default permission mode (auto/edits/plan/ask/ci)",
     ),
 ];
 

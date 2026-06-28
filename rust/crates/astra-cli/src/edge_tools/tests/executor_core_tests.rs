@@ -786,7 +786,7 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
     let overlay_task = tokio::spawn(async move {
         let request = rx.recv().await.expect("overlay request");
         let _ = request.response_tx.send(PlanReviewDecision::Approve {
-            mode: PermissionMode::Prompt,
+            mode: PermissionMode::Ask,
         });
     });
 
@@ -807,7 +807,7 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Prompt),
+        Some(crate::cli::permission_manager::PermissionMode::Ask),
         "Prompt approval must be staged for the next round"
     );
     assert_eq!(

@@ -360,7 +360,7 @@ mod tests {
                 last_measured_prompt_tokens: None,
                 consecutive_context_window_errors: 0,
                 turn_policy: TurnInteractionPolicy::from_visible_tool_names(
-                    TurnInteractionMode::Deny,
+                    TurnInteractionMode::Ci,
                     vec!["read_file".into()],
                 ),
             }

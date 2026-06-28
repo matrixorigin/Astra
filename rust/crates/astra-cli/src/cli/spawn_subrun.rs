@@ -800,10 +800,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let telemetry = ctx_guard.telemetry();
         let mode = match ctx_guard.mode() {
             astra_runtime::orchestration::PermissionMode::Auto => "auto".to_string(),
+            astra_runtime::orchestration::PermissionMode::Edits => "edits".to_string(),
             astra_runtime::orchestration::PermissionMode::Plan => "plan".to_string(),
-            astra_runtime::orchestration::PermissionMode::AcceptEdits => "accept_edits".to_string(),
-            astra_runtime::orchestration::PermissionMode::Prompt => "prompt".to_string(),
-            astra_runtime::orchestration::PermissionMode::Deny => "deny".to_string(),
+            astra_runtime::orchestration::PermissionMode::Ask => "ask".to_string(),
+            astra_runtime::orchestration::PermissionMode::Ci => "ci".to_string(),
         };
         let permission_summary = Some(PermissionSummary {
             mode,
@@ -1013,7 +1013,7 @@ mod tests {
         InheritedPermissions,
         astra_runtime::orchestration::PermissionSyncHandle,
     ) {
-        let inherited_permissions = InheritedPermissions::new(PermissionMode::Prompt);
+        let inherited_permissions = InheritedPermissions::new(PermissionMode::Ask);
         let permission_context = PermissionSyncContext::shared(inherited_permissions.clone());
         (inherited_permissions, permission_context)
     }
