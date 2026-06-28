@@ -2059,6 +2059,14 @@ impl ToolExecutor {
         self
     }
 
+    /// Build a task context hint by delegating to the data-layer TaskManager.
+    /// The result flows through the standard `plan_resume_hint` →
+    /// `ExternalSources.plan_context` pipeline instead of polluting
+    /// `append_system_prompt`.
+    pub async fn build_task_context_hint(&self) -> Option<String> {
+        self.task_manager.build_active_task_context().await
+    }
+
     pub fn with_task_notify_tx(mut self, tx: tokio::sync::broadcast::Sender<String>) -> Self {
         self.task_notify_tx = Some(tx);
         self
@@ -2738,8 +2746,45 @@ impl ToolExecutor {
     /// Local-only exit path (Shift+Tab / `/allow plan` entry). No
     /// cloud row, no server-side guard, no network calls — purely
     /// the overlay + `pending_permission_mode_change` slot. This is
+    /// Mirror an approved plan into the session task board so the user
+    /// sees actionable step-by-step work items in the dashboard.
+    ///
+    /// Parses the plan markdown into a [`TaskPlan`], then calls the shared
+    /// [`astra_tools::plan_task_mirror::mirror_approved_plan_to_task_board`].
+    /// Failures are logged but do not block exiting plan mode — the plan
+    /// text is always available in the model's result message.
+    async fn mirror_approved_plan_to_task_board(&self, plan_markdown: &str) {
+        let Some(plan) =
+            astra_tools::plan_task_mirror::parse_plan_markdown_to_task_plan(plan_markdown)
+        else {
+            tracing::debug!("plan markdown had no numbered steps — skipping task board mirror");
+            return;
+        };
+        let Some(session_id) = self.active_session_id() else {
+            tracing::debug!("no active session — skipping plan task board mirror");
+            return;
+        };
+        if let Err(error) = astra_tools::plan_task_mirror::mirror_approved_plan_to_task_board(
+            &self.task_manager,
+            "cli",
+            &session_id,
+            &session_id,     // plan_id == session_id in CLI context
+            "approved plan", // goal
+            &plan,
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %error,
+                step_count = plan.subtasks.len(),
+                "failed to mirror approved plan into task board"
+            );
+        }
+    }
+
     /// `exit_plan_mode` here is a permission-state pivot driven by
-    /// user choice — no cloud row is required for it to succeed.
+    /// the plan-review overlay. When the user approves, writes unlock
+    /// and the host advances to the chosen execution mode.
     async fn exit_plan_mode_local_path(&self, plan_markdown: Option<&str>) -> String {
         let (approved, follow_up_mode) =
             match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
@@ -2766,6 +2811,9 @@ impl ToolExecutor {
             ]);
             let plan_suffix = match plan_markdown {
                 Some(plan) if !plan.is_empty() => {
+                    // Mirror approved plan steps into the task board so the user
+                    // sees actionable step-by-step work items in the dashboard.
+                    let _mirror_result = self.mirror_approved_plan_to_task_board(plan).await;
                     format!(" Plan recorded:\n{plan}")
                 }
                 _ => String::new(),

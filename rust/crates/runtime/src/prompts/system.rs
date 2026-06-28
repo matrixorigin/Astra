@@ -762,6 +762,8 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str], _profile_desc: &str)
     }
     body.push_str(&tool_precedence_section(tool_names));
     body.push_str(&search_strategy_section(tool_names));
+    body.push_str(&task_lifecycle_section(tool_names));
+    body.push_str(&self_diagnosis_section(tool_names));
     body
 }
 
@@ -1202,6 +1204,65 @@ fn search_strategy_section(tool_names: &[&str]) -> String {
         }
         body
     }
+}
+
+/// When to use `task` tool for complex, multi-outcome work.
+fn task_lifecycle_section(tool_names: &[&str]) -> String {
+    if !tool_visible(tool_names, "task") {
+        return String::new();
+    }
+    "\n## Task Lifecycle\n\
+     - When facing 3+ distinct outcomes or work spanning multiple files, break it into subtasks with `task create`.\n\
+     - Claim before starting: `task update subtask_id=X new_status=in_progress`.\n\
+     - Mark done after verifying: `task update subtask_id=X new_status=completed`.\n\
+     - Check remaining: `task list` to see what is unfinished.\n\
+     - The task board is your working memory across turns — if the session resumes or you are interrupted, read it before acting.\n"
+        .to_string()
+}
+
+/// When to use `introspect` / `reflect` for self-diagnosis.
+fn self_diagnosis_section(tool_names: &[&str]) -> String {
+    let has_introspect = tool_visible(tool_names, "introspect");
+    let has_reflect = tool_visible(tool_names, "reflect");
+    if !has_introspect && !has_reflect {
+        return String::new();
+    }
+    let mut s = String::from("\n## Self-Diagnosis\n");
+    if has_introspect {
+        s.push_str("`introspect` — live runtime snapshot. Start cheap, escalate on signal:\n");
+        s.push_str("- `depth=hint` (default) — quick signal check: errors?, pressure?, stall?. Always start here.\n");
+        s.push_str(
+            "- `depth=summary` — moderate detail: recent errors, tool health, cache efficiency.\n",
+        );
+        s.push_str("  Escalate when hint shows 2+ errors or elevated stall risk.\n");
+        s.push_str("- `depth=diagnostic` — full error/trace detail.\n");
+        s.push_str("  Escalate when summary reveals non-obvious failure patterns.\n");
+        s.push_str("When:\n");
+        s.push_str("- After 3+ consecutive tool failures with the same pattern → start at hint.\n");
+        s.push_str("- When a file edit failed and you are about to retry with a guess → hint.\n");
+        s.push_str("- After 5+ rounds of exploration without a clear output → summary.\n");
+        s.push_str("- When the user questions your direction → summary (check session state).\n");
+    }
+    if has_reflect {
+        s.push_str(
+            "`reflect` — causal analysis across turns. Escalate only when ambiguity persists:\n",
+        );
+        s.push_str("- `depth=summary` (default) — pattern overview: what happened, tool accuracy, decision quality.\n");
+        s.push_str("- `depth=forensic` — deep causal analysis with full event replay.\n");
+        s.push_str(
+            "  Escalate ONLY when summary reveals non-obvious coupling or systemic issues.\n",
+        );
+        s.push_str("When:\n");
+        s.push_str("- After a tool error whose cause is not obvious from the output → summary.\n");
+        s.push_str("- When you want to understand WHY a pattern emerged → summary.\n");
+        s.push_str(
+            "- Before a major architectural decision that depends on session history → summary.\n",
+        );
+    }
+    s.push_str(
+        "Do NOT call every turn (wasteful) or when the answer is obvious from the tool output.\n",
+    );
+    s
 }
 
 // ── Public API ───────────────────────────────────────────────────────────
@@ -2304,14 +2365,42 @@ mod tests {
             "without memory tools, no rules"
         );
 
-        // Task lifecycle: task tool present → lifecycle stays in schema
+        // Task lifecycle: task tool present → lifecycle guidance
         let p_task = build_main_system_prompt(&["task", "bash"], "", None);
-        assert!(!p_task.contains("Task Lifecycle"));
-        assert!(!p_task.contains("Use the `task` tool automatically"));
+        assert!(p_task.contains("Task Lifecycle"));
+        assert!(p_task.contains("task create"));
 
         // Task lifecycle: no task tool → no lifecycle guidance
         let p_no_task = build_main_system_prompt(&["bash", "read_file"], "", None);
         assert!(!p_no_task.contains("Task Lifecycle"));
+
+        // Self-diagnosis: introspect tool present → diagnosis guidance with depth ladder
+        let p_intro = build_main_system_prompt(&["introspect", "bash"], "", None);
+        assert!(p_intro.contains("Self-Diagnosis"));
+        assert!(p_intro.contains("introspect"));
+        assert!(p_intro.contains("depth=hint"));
+        assert!(p_intro.contains("depth=summary"));
+        assert!(p_intro.contains("depth=diagnostic"));
+        assert!(p_intro.contains("escalate"));
+
+        // Self-diagnosis: reflect tool present → diagnosis guidance with depth ladder
+        let p_refl = build_main_system_prompt(&["reflect", "bash"], "", None);
+        assert!(p_refl.contains("Self-Diagnosis"));
+        assert!(p_refl.contains("reflect"));
+        assert!(p_refl.contains("depth=summary"));
+        assert!(p_refl.contains("depth=forensic"));
+
+        // Self-diagnosis: both tools present → both mentioned with depth guidance
+        let p_both = build_main_system_prompt(&["introspect", "reflect", "bash"], "", None);
+        assert!(p_both.contains("Self-Diagnosis"));
+        assert!(p_both.contains("introspect"));
+        assert!(p_both.contains("reflect"));
+        assert!(p_both.contains("depth=hint"));
+        assert!(p_both.contains("depth=forensic"));
+
+        // Self-diagnosis: no diagnosis tools → no diagnosis guidance
+        let p_no_diag = build_main_system_prompt(&["bash", "read_file"], "", None);
+        assert!(!p_no_diag.contains("Self-Diagnosis"));
 
         // Plan lifecycle: both plan tools → lifecycle stays in schema
         let p_plan =

@@ -1130,11 +1130,12 @@ async fn sync_task_board_subtask_status(
 ) -> Result<(), String> {
     let tasks = state.task_manager.snapshot().await.unwrap_or_default();
     let task = tasks.into_iter().find(|task| {
-        astra_tools::plan_task_mirror::approved_plan_step_task_matches(
+        astra_tools::plan_task_mirror::approved_plan_task_identity(
             task,
             goal, // plan_id == goal in CLI context
             plan_fingerprint,
-            subtask_id,
+            Some(subtask_id),
+            true,
         )
     });
 

@@ -552,6 +552,13 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 .or_else(|| self.root_send_message_context.clone()),
         );
 
+        // Inject task board context into the agent's system prompt so it
+        // stays aware of what it should be working on this turn.
+        // Flows through plan_resume_hint (separate from user-provided
+        // append_system_prompt), routed into the standard context pipeline.
+        let task_hint = self.executor.build_task_context_hint().await;
+        let append_system_prompt = self.append_system_prompt.as_deref();
+
         let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
             api: self.api,
             token: self.token.as_str(),
@@ -620,7 +627,8 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             user_query_event_id: state.bridge_user_query_event_id.as_deref(),
             observability_hub: state.telemetry.observability_hub.as_ref(),
             incremental_state: self.incremental_state.clone(),
-            append_system_prompt: self.append_system_prompt.as_deref(),
+            append_system_prompt,
+            plan_resume_hint: task_hint.as_deref(),
         })
         .await;
 

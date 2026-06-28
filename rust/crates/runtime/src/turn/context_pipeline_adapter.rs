@@ -62,7 +62,21 @@ pub(crate) fn build_external_sources(
         .filter(|s| !s.is_empty())
         .map(|s| format!("\n\n{s}"));
 
-    let plan_context = plan_resume_hint.filter(|s| !s.is_empty()).map(String::from);
+    let plan_context = {
+        let server_hint = plan_resume_hint.filter(|s| !s.is_empty());
+        // Merge CLI task-context from edge_profile (has its own token budget
+        // in ExternalSources.plan_context) with server-side plan resume hint.
+        let task_ctx = edge_profile
+            .get("task_context_text")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        match (server_hint, task_ctx) {
+            (Some(plan), Some(task)) => Some(format!("{plan}\n\n{task}")),
+            (Some(plan), None) => Some(plan.to_string()),
+            (None, Some(task)) => Some(task.to_string()),
+            (None, None) => None,
+        }
+    };
 
     let (tool_guidance_text, _signals) =
         crate::prompts::tool_round_guidance_trace(&state.messages, state.llm_rounds_completed);
@@ -2176,5 +2190,77 @@ mod tests {
                 .any(|s| s.text.contains("Execution Strategy")),
             "cache strategy NOT emitted when reuse_scope is not IntraTurnRounds"
         );
+    }
+
+    // ── plan_context merging: plan_resume_hint + task_context_text ─────
+
+    #[test]
+    fn external_sources_plan_context_merges_task_context_from_edge_profile() {
+        let mut ep = serde_json::Map::new();
+        ep.insert(
+            "task_context_text".into(),
+            Value::String(
+                "## Active Task Board\n- 🔄 In progress: Fix bug\n- ⏳ Pending (1): Add feature\n"
+                    .into(),
+            ),
+        );
+        let state = make_state();
+
+        // Both plan_resume_hint and task_context_text present
+        let sources = build_external_sources(
+            &ep,
+            &state,
+            "hi",
+            &[],
+            Some("Executing step 2: refactor"),
+            None,
+        );
+        let pc = sources.plan_context.unwrap();
+        assert!(pc.contains("Executing step 2: refactor"), "{pc}");
+        assert!(pc.contains("## Active Task Board"), "{pc}");
+        assert!(pc.contains("🔄 In progress: Fix bug"), "{pc}");
+    }
+
+    #[test]
+    fn external_sources_plan_context_task_context_only() {
+        let mut ep = serde_json::Map::new();
+        ep.insert(
+            "task_context_text".into(),
+            Value::String("## Active Task Board\n- 🔄 In progress: Refactor DB\n".into()),
+        );
+        let state = make_state();
+
+        let sources = build_external_sources(&ep, &state, "hi", &[], None, None);
+        let pc = sources.plan_context.unwrap();
+        assert!(pc.contains("Refactor DB"), "{pc}");
+        assert!(!pc.contains("Executing"), "no plan_resume_hint in output");
+    }
+
+    #[test]
+    fn external_sources_plan_context_edge_task_context_empty_skipped() {
+        let mut ep = serde_json::Map::new();
+        ep.insert("task_context_text".into(), Value::String("".into()));
+        let state = make_state();
+
+        let sources = build_external_sources(&ep, &state, "hi", &[], Some("Step 1"), None);
+        let pc = sources.plan_context.unwrap();
+        assert_eq!(pc, "Step 1", "empty task_context_text must be filtered");
+    }
+
+    #[test]
+    fn external_sources_plan_context_both_none_returns_none() {
+        let ep = serde_json::Map::new();
+        let state = make_state();
+        let sources = build_external_sources(&ep, &state, "hi", &[], None, None);
+        assert!(sources.plan_context.is_none());
+    }
+
+    #[test]
+    fn external_sources_plan_context_both_empty_string_returns_none() {
+        let mut ep = serde_json::Map::new();
+        ep.insert("task_context_text".into(), Value::String("".into()));
+        let state = make_state();
+        let sources = build_external_sources(&ep, &state, "hi", &[], Some(""), None);
+        assert!(sources.plan_context.is_none());
     }
 }

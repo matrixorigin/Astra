@@ -43,7 +43,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// during long turns — the in-turn `do_draw` path now also pumps
 /// `maybe_refresh`, so per-frame latency at 60fps stays under 17ms
 /// of the cap.
-const FAST_POLL: Duration = Duration::from_millis(50);
+const FAST_POLL: Duration = Duration::from_millis(15);
 /// How long the board stays painted after the last incomplete task
 /// closes out before `hidden` flips.
 const HIDE_DELAY: Duration = Duration::from_secs(5);
@@ -122,6 +122,9 @@ const EVENT_RING_CAP: usize = 32;
 /// short enough that a long agentic run doesn't accumulate dozens of
 /// completed rows above the spinner.
 pub(crate) const COMPLETED_TASK_TTL: Duration = Duration::from_secs(30);
+/// How long a `cancelled` task lingers before auto-fading from the board.
+/// Shorter than COMPLETED_TASK_TTL because the user explicitly discarded it.
+pub(crate) const CANCELLED_TASK_TTL: Duration = Duration::from_secs(10);
 
 struct ObserverState {
     session_id: String,
@@ -158,6 +161,10 @@ struct ObserverState {
     /// Keys for tasks that re-open (in_progress again) are dropped so
     /// the timer restarts on the next completion.
     completed_at: std::collections::HashMap<String, Instant>,
+    /// When each task transitioned to `cancelled`. Same fade-out pattern
+    /// as completed_at — entries older than CANCELLED_TASK_TTL are
+    /// dropped from the render snapshot so the board self-cleans.
+    cancelled_at: std::collections::HashMap<String, Instant>,
 }
 
 fn lock_state<'a>(
@@ -206,6 +213,7 @@ impl TaskBoardObserver {
                 fetch_in_flight: false,
                 event_ring: Vec::new(),
                 completed_at: std::collections::HashMap::new(),
+                cancelled_at: std::collections::HashMap::new(),
             }),
             dirty: AtomicBool::new(true),
         });
@@ -296,11 +304,25 @@ impl TaskBoardObserver {
         let now = Instant::now();
         let mut snap = st.snapshot.clone();
         snap.tasks.retain(|task| {
-            if !task.status.is_completed() {
+            if !task.status.is_completed() && !task.status.is_cancelled() {
+                // Open work is always visible.
                 return true;
             }
-            match st.completed_at.get(&task.id) {
-                Some(at) => now.saturating_duration_since(*at) < COMPLETED_TASK_TTL,
+            // Completed / cancelled tasks are visible only while still within
+            // their TTL window. This self-cleans the board: cancelled tasks
+            // fade after CANCELLED_TASK_TTL (10s), completed after COMPLETED_TASK_TTL (30s).
+            let ttl = if task.status.is_cancelled() {
+                CANCELLED_TASK_TTL
+            } else {
+                COMPLETED_TASK_TTL
+            };
+            let tracker = if task.status.is_cancelled() {
+                &st.cancelled_at
+            } else {
+                &st.completed_at
+            };
+            match tracker.get(&task.id) {
+                Some(at) => now.saturating_duration_since(*at) < ttl,
                 None => true, // unseen completion → safer to keep until next tick
             }
         });
@@ -419,6 +441,7 @@ impl TaskBoardObserver {
         st.manual_review_visible = false;
         st.event_ring.clear();
         st.completed_at.clear();
+        st.cancelled_at.clear();
         self.inner.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -603,6 +626,11 @@ impl TaskBoardObserver {
                                 } else {
                                     st.completed_at.remove(task_id);
                                 }
+                                if to.is_cancelled() {
+                                    st.cancelled_at.insert(task_id.clone(), at);
+                                } else {
+                                    st.cancelled_at.remove(task_id);
+                                }
                             }
                         }
                         // Garbage-collect entries for tasks that
@@ -638,7 +666,7 @@ impl TaskBoardObserver {
                             .snapshot
                             .tasks
                             .iter()
-                            .filter(|t| t.status.is_completed())
+                            .filter(|t| t.status.is_completed() || t.status.is_cancelled())
                             .filter(|t| !st.completed_at.contains_key(&t.id))
                             .map(|t| t.id.clone())
                             .collect();

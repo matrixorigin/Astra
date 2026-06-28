@@ -21,13 +21,14 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Paragraph, Widget},
 };
 use tokio::sync::oneshot;
 
 use super::view::{BottomPaneView, CancellationEvent};
 use crate::cli::chat_stream::PlanReviewDecision;
 use crate::cli::permission_manager::PermissionMode;
+use crate::tui::markdown_render::render_markdown_text_with_width;
 
 const CHOICES: &[(&str, PlanChoice, &str)] = &[
     (
@@ -78,7 +79,7 @@ impl PlanChoice {
 }
 
 pub(crate) struct PlanReviewView {
-    plan_lines: Vec<String>,
+    plan_markdown: String,
     scroll: u16,
     selected: usize,
     response_tx: Option<oneshot::Sender<PlanReviewDecision>>,
@@ -87,12 +88,8 @@ pub(crate) struct PlanReviewView {
 
 impl PlanReviewView {
     pub fn new(plan_markdown: String, response_tx: oneshot::Sender<PlanReviewDecision>) -> Self {
-        let plan_lines = plan_markdown
-            .split('\n')
-            .map(str::to_string)
-            .collect::<Vec<_>>();
         Self {
-            plan_lines,
+            plan_markdown,
             scroll: 0,
             selected: 0,
             response_tx: Some(response_tx),
@@ -100,7 +97,7 @@ impl PlanReviewView {
         }
     }
 
-    fn submit(&mut self, decision: PlanReviewDecision) {
+    pub fn submit(&mut self, decision: PlanReviewDecision) {
         if let Some(tx) = self.response_tx.take() {
             if tx.send(decision).is_err() {
                 tracing::warn!(
@@ -138,15 +135,16 @@ impl PlanReviewView {
     }
 
     fn max_scroll(&self) -> u16 {
-        // Conservative: each plan line counts as one row. Wrap blowup
-        // is handled by Paragraph's wrap; the user can keep pressing
-        // j to reach the bottom even if our estimate is short.
-        let len = self.plan_lines.len() as u16;
+        // Use character count as a conservative scroll bound.
+        // The markdown renderer may produce more visual lines,
+        // but scrolling by raw line count is fine for navigation.
+        let len = self.plan_markdown.lines().count() as u16;
         len.saturating_sub(1)
     }
 
     fn render_plan_body(&self, area: Rect, buf: &mut Buffer) {
-        let body = self.plan_lines.join("\n");
+        let md_body =
+            render_markdown_text_with_width(&self.plan_markdown, Some(area.width as usize));
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
@@ -156,9 +154,8 @@ impl PlanReviewView {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ));
-        Paragraph::new(body)
+        Paragraph::new(md_body)
             .block(block)
-            .wrap(Wrap { trim: false })
             .scroll((self.scroll, 0))
             .render(area, buf);
     }

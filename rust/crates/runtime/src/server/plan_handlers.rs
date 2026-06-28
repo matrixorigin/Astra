@@ -536,11 +536,12 @@ async fn sync_plan_task_board_subtask_status(
         .map_err(|error| format!("load task board before plan subtask sync: {error}"))?
         .into_iter()
         .find(|task| {
-            plan_task_mirror::approved_plan_step_task_identity_matches(
+            plan_task_mirror::approved_plan_task_identity(
                 task,
                 plan_id,
                 &plan_fingerprint,
-                subtask_id,
+                Some(subtask_id),
+                false,
             )
         });
 

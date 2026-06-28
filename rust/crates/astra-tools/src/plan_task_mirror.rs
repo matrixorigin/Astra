@@ -32,118 +32,54 @@ use crate::task_mgmt::{MAX_CREATE_SUBTASKS, SessionTask, SessionTaskStatusKind, 
 ///
 /// When the plan changes its subtask structure the fingerprint changes, which
 /// tells the mirror to re-create task-board entries from scratch.
-/// On serialization failure (practically impossible for these simple types),
-/// returns an error string that will never match any real plan fingerprint.
 pub fn plan_task_board_fingerprint(plan: &TaskPlan) -> String {
-    let parts: Vec<serde_json::Value> = plan
-        .subtasks
-        .iter()
-        .map(|subtask| {
-            let mut depends_on = subtask.depends_on.clone();
-            depends_on.sort();
-            serde_json::json!({
-                "id": subtask.id,
-                "title": subtask.title,
-                "description": subtask.description,
-                "depends_on": depends_on,
-            })
-        })
-        .collect();
-    match serde_json::to_string(&parts) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::error!(
-                error = %error,
-                step_count = plan.subtasks.len(),
-                "plan task-board fingerprint serialization failed — \
-                 this should be impossible for simple string types"
-            );
-            format!("__fingerprint_serialization_error__:{error}")
+    let mut hash_buf = String::with_capacity(plan.subtasks.len() * 64);
+    for subtask in &plan.subtasks {
+        use std::fmt::Write;
+        let _ = write!(hash_buf, "{}|{}|", subtask.id, subtask.title);
+        if let Some(ref desc) = subtask.description {
+            let _ = write!(hash_buf, "{desc}|");
         }
+        let mut deps = subtask.depends_on.clone();
+        deps.sort();
+        for dep in &deps {
+            let _ = write!(hash_buf, "{dep},");
+        }
+        let _ = writeln!(hash_buf);
     }
+    hash_buf
 }
 
-/// Does `task` already represent the approved plan (open-work check)?
-pub fn approved_plan_task_matches(
+/// Single identity check for approved-plan tasks.
+///
+/// - `plan_subtask_id`: if `Some`, additionally verify the subtask id matches.
+/// - `require_open_work`: if `true`, the task must be in an open-work status
+///   (pending, in_progress, paused). Pass `false` for post-create verification
+///   where the task may already be `in_progress`.
+pub fn approved_plan_task_identity(
     task: &SessionTask,
     plan_id: &str,
     plan_fingerprint: &str,
+    plan_subtask_id: Option<&str>,
+    require_open_work: bool,
 ) -> bool {
-    if !task.status.is_open_work() {
+    if require_open_work && !task.status.is_open_work() {
         return false;
     }
-    let metadata = task.metadata.as_ref();
-    let source = metadata
-        .and_then(|m| m.get("source"))
-        .and_then(serde_json::Value::as_str);
-    let task_plan_id = metadata
-        .and_then(|m| m.get("plan_id"))
-        .and_then(serde_json::Value::as_str);
-    let task_fingerprint = metadata
-        .and_then(|m| m.get("plan_fingerprint"))
-        .and_then(serde_json::Value::as_str);
+    let md = task.metadata.as_ref();
+    let get_field = |key: &str| {
+        md.and_then(|m| m.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
 
-    source == Some("approved_plan")
-        && task_fingerprint == Some(plan_fingerprint)
-        && task_plan_id == Some(plan_id)
-}
-
-/// Like [`approved_plan_task_matches`] but also requires the specific
-/// `plan_subtask_id` to match.
-pub fn approved_plan_step_task_matches(
-    task: &SessionTask,
-    plan_id: &str,
-    plan_fingerprint: &str,
-    plan_subtask_id: &str,
-) -> bool {
-    if !approved_plan_task_matches(task, plan_id, plan_fingerprint) {
+    if get_field("source") != Some("approved_plan")
+        || get_field("plan_fingerprint") != Some(plan_fingerprint)
+        || get_field("plan_id") != Some(plan_id)
+        || (plan_subtask_id.is_some_and(|id| get_field("plan_subtask_id") != Some(id)))
+    {
         return false;
     }
-    task.metadata
-        .as_ref()
-        .and_then(|m| m.get("plan_subtask_id"))
-        .and_then(serde_json::Value::as_str)
-        == Some(plan_subtask_id)
-}
-
-/// Strict identity check — ignores `is_open_work` filter. Used for
-/// post-create verification where the task may already be `in_progress`.
-pub fn approved_plan_task_identity_matches(
-    task: &SessionTask,
-    plan_id: &str,
-    plan_fingerprint: &str,
-) -> bool {
-    let metadata = task.metadata.as_ref();
-    let source = metadata
-        .and_then(|m| m.get("source"))
-        .and_then(serde_json::Value::as_str);
-    let task_plan_id = metadata
-        .and_then(|m| m.get("plan_id"))
-        .and_then(serde_json::Value::as_str);
-    let task_fingerprint = metadata
-        .and_then(|m| m.get("plan_fingerprint"))
-        .and_then(serde_json::Value::as_str);
-
-    source == Some("approved_plan")
-        && task_fingerprint == Some(plan_fingerprint)
-        && task_plan_id == Some(plan_id)
-}
-
-/// Strict identity check for a specific step within the plan.
-pub fn approved_plan_step_task_identity_matches(
-    task: &SessionTask,
-    plan_id: &str,
-    plan_fingerprint: &str,
-    plan_subtask_id: &str,
-) -> bool {
-    if !approved_plan_task_identity_matches(task, plan_id, plan_fingerprint) {
-        return false;
-    }
-    task.metadata
-        .as_ref()
-        .and_then(|m| m.get("plan_subtask_id"))
-        .and_then(serde_json::Value::as_str)
-        == Some(plan_subtask_id)
+    true
 }
 
 /// Map orchestrator [`TaskStatus`] to the session task-board status kind.
@@ -351,7 +287,9 @@ pub async fn ensure_plan_step_task(request: PlanStepTaskRequest<'_>) -> Result<S
         .await
         .map_err(|error| format!("load task board before approved-plan mirror: {error}"))?
         .into_iter()
-        .find(|task| approved_plan_step_task_matches(task, plan_id, plan_fingerprint, &subtask.id))
+        .find(|task| {
+            approved_plan_task_identity(task, plan_id, plan_fingerprint, Some(&subtask.id), true)
+        })
         .map(|task| task.id);
     if let Some(task_id) = existing_task_id {
         return Ok(task_id);
@@ -396,7 +334,7 @@ pub async fn ensure_plan_step_task(request: PlanStepTaskRequest<'_>) -> Result<S
         .map_err(|error| format!("load task board after approved-plan step create: {error}"))?
         .into_iter()
         .filter(|task| {
-            approved_plan_step_task_identity_matches(task, plan_id, plan_fingerprint, &subtask.id)
+            approved_plan_task_identity(task, plan_id, plan_fingerprint, Some(&subtask.id), false)
         })
         .collect();
     if matching.len() > 1 {
@@ -517,4 +455,247 @@ mod tests {
             assert_eq!(task_status_to_session_status(ts), expected);
         }
     }
+
+    // ── Plan markdown parser ─────────────────────────────────────────
+
+    #[test]
+    fn parse_plan_markdown_empty_and_no_numbered_steps_returns_none() {
+        assert!(parse_plan_markdown_to_task_plan("").is_none());
+        assert!(parse_plan_markdown_to_task_plan("no steps here\njust text\n").is_none());
+    }
+
+    #[test]
+    fn parse_plan_markdown_dot_numbered() {
+        let md = "1. Refactor DB\n2. Add tests\n3. Update docs\n";
+        let plan = parse_plan_markdown_to_task_plan(md).unwrap();
+        assert_eq!(plan.subtasks.len(), 3);
+        assert_eq!(plan.subtasks[0].id, "step-1");
+        assert_eq!(plan.subtasks[0].title, "Refactor DB");
+        assert!(
+            plan.subtasks[0].depends_on.is_empty(),
+            "first step has no deps"
+        );
+        assert_eq!(plan.subtasks[1].id, "step-2");
+        assert_eq!(plan.subtasks[1].depends_on, vec!["step-1"]);
+        assert_eq!(plan.subtasks[2].id, "step-3");
+        assert_eq!(plan.subtasks[2].depends_on, vec!["step-2"]);
+    }
+
+    #[test]
+    fn parse_plan_markdown_multi_digit_steps() {
+        // Regression: strip_prefix(is_ascii_digit) only stripped 1 digit,
+        // so "10. Step" → "0. Step" → failed to match.
+        let md = "9. Ninth step\n10. Tenth step\n11. Eleventh step\n";
+        let plan = parse_plan_markdown_to_task_plan(md).unwrap();
+        assert_eq!(plan.subtasks.len(), 3, "must parse all 3 steps");
+        assert_eq!(plan.subtasks[0].title, "Ninth step");
+        assert_eq!(plan.subtasks[1].title, "Tenth step");
+        assert_eq!(plan.subtasks[2].title, "Eleventh step");
+    }
+
+    #[test]
+    fn parse_plan_markdown_paren_numbered() {
+        let md = "1) First\n2) Second\n";
+        let plan = parse_plan_markdown_to_task_plan(md).unwrap();
+        assert_eq!(plan.subtasks.len(), 2);
+        assert_eq!(plan.subtasks[0].title, "First");
+    }
+
+    #[test]
+    fn parse_plan_markdown_dash_numbered() {
+        let md = "1 - One\n2 - Two\n";
+        let plan = parse_plan_markdown_to_task_plan(md).unwrap();
+        assert_eq!(plan.subtasks.len(), 2);
+    }
+
+    #[test]
+    fn parse_plan_markdown_skips_non_numbered_lines() {
+        let md = "Preamble\n1. Step one\nIntermediate\n2. Step two\n";
+        let plan = parse_plan_markdown_to_task_plan(md).unwrap();
+        assert_eq!(plan.subtasks.len(), 2);
+    }
+
+    #[test]
+    fn parse_plan_markdown_truncates_long_title() {
+        let long = "x".repeat(250);
+        let md = format!("1. {long}");
+        let plan = parse_plan_markdown_to_task_plan(&md).unwrap();
+        assert_eq!(plan.subtasks[0].title.len(), 200);
+        assert!(plan.subtasks[0].title.ends_with('…'));
+    }
+
+    #[test]
+    fn parse_plan_markdown_skips_empty_title_after_number() {
+        let md = "1.\n2. Real step\n";
+        let plan = parse_plan_markdown_to_task_plan(md).unwrap();
+        assert_eq!(plan.subtasks.len(), 1);
+        assert_eq!(plan.subtasks[0].title, "Real step");
+        // It becomes step-1 since it's the first valid step
+        assert_eq!(plan.subtasks[0].id, "step-1");
+    }
+
+    // ── Mirror idempotency (integration via in-memory TaskManager) ──
+
+    #[tokio::test]
+    async fn mirror_approved_plan_creates_tasks_and_links_dependencies() {
+        use crate::task_mgmt::TaskManager;
+
+        let manager = TaskManager::in_memory();
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "Add index".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "Migrate data".into(),
+                    depends_on: vec!["s1".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        mirror_approved_plan_to_task_board(
+            &manager,
+            "test",
+            "session-1",
+            "plan-1",
+            "Optimize queries",
+            &plan,
+        )
+        .await
+        .unwrap();
+
+        let tasks = manager.load_active_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 2, "should create 2 tasks");
+        assert!(tasks.iter().any(|t| t.title == "Add index"));
+        assert!(tasks.iter().any(|t| t.title == "Migrate data"));
+
+        // s2 should block on s1
+        let s2 = tasks.iter().find(|t| t.title == "Migrate data").unwrap();
+        let s1 = tasks.iter().find(|t| t.title == "Add index").unwrap();
+        assert!(
+            s2.blocked_by.contains(&s1.id),
+            "s2 should be blocked by s1: {s2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_approved_plan_idempotent_on_retry() {
+        use crate::task_mgmt::TaskManager;
+
+        let manager = TaskManager::in_memory();
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "only".into(),
+                title: "Do it".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // First mirror
+        mirror_approved_plan_to_task_board(&manager, "test", "session-2", "plan-2", "Goal", &plan)
+            .await
+            .unwrap();
+        let after_first = manager.load_active_tasks().await.unwrap().len();
+
+        // Second mirror (retry)
+        mirror_approved_plan_to_task_board(&manager, "test", "session-2", "plan-2", "Goal", &plan)
+            .await
+            .unwrap();
+        let after_second = manager.load_active_tasks().await.unwrap().len();
+
+        assert_eq!(
+            after_first, after_second,
+            "idempotent: retry should not create duplicate tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_approved_plan_empty_subtasks_is_noop() {
+        use crate::task_mgmt::TaskManager;
+
+        let manager = TaskManager::in_memory();
+        let plan: TaskPlan = Default::default();
+        mirror_approved_plan_to_task_board(&manager, "test", "session-3", "plan-3", "Goal", &plan)
+            .await
+            .unwrap();
+        assert!(manager.load_active_tasks().await.unwrap().is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan markdown → TaskPlan parser
+// ---------------------------------------------------------------------------
+
+/// Parse a numbered-list plan markdown into a [`TaskPlan`].
+///
+/// Recognizes lines like `1. Do the thing` or `1) Do the thing` as plan
+/// steps. Each step becomes a `SubtaskPlan` with sequential dependencies
+/// (step N depends on step N-1).
+///
+/// Returns `None` when no numbered steps are found.
+pub fn parse_plan_markdown_to_task_plan(markdown: &str) -> Option<TaskPlan> {
+    let mut subtasks: Vec<SubtaskPlan> = Vec::new();
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        // Match patterns: "1. Title", "1) Title", "1 - Title"
+        // Use trim_start_matches to handle multi-digit numbers (10, 100, etc.)
+        let title = if let Some(rest) = trimmed
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .strip_prefix('.')
+            .or_else(|| {
+                trimmed
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .strip_prefix(')')
+            })
+            .or_else(|| {
+                trimmed
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .strip_prefix(" -")
+            }) {
+            rest.trim()
+        } else {
+            continue;
+        };
+
+        if title.is_empty() {
+            continue;
+        }
+
+        // Truncate title to a reasonable length
+        let title = if title.len() > 200 {
+            format!("{}…", &title[..197])
+        } else {
+            title.to_string()
+        };
+
+        let depends_on: Vec<String> = if subtasks.is_empty() {
+            Vec::new()
+        } else {
+            vec![subtasks.last().unwrap().id.clone()]
+        };
+
+        subtasks.push(SubtaskPlan {
+            id: format!("step-{}", subtasks.len() + 1),
+            title,
+            description: Some(String::new()),
+            depends_on,
+            ..Default::default()
+        });
+    }
+
+    if subtasks.is_empty() {
+        return None;
+    }
+
+    Some(TaskPlan {
+        subtasks,
+        ..Default::default()
+    })
 }

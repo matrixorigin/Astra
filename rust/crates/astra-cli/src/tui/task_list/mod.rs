@@ -1019,38 +1019,32 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
         Style::default().add_modifier(Modifier::DIM),
     ));
 
-    if sub_total > 0 {
-        spans.push(Span::styled(
-            format!(" · {sub_done}/{sub_total} done"),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-    }
-
-    let used_before_toggle: usize = spans.iter().map(|s| s.content.width()).sum();
-    let min_title_width = if current_task.is_some() {
-        " · ".width() + 8
-    } else {
-        0
-    };
-    if used_before_toggle + TASK_BOARD_TOGGLE_HINT.width() + min_title_width <= columns as usize {
-        spans.push(Span::styled(
-            TASK_BOARD_TOGGLE_HINT,
-            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
-        ));
-    }
-
+    // Show in-progress task title BEFORE subtask roll-up and toggle hint.
+    // Space priority: title > toggle hint > subtask counts > status breakdown.
+    // The user must always see what's being worked on.
     if let Some(task) = current_task {
-        // Trim the title to whatever space is left after the rest of
-        // the line so we don't blow past `columns`.
-        let used: usize = spans.iter().map(|s| s.content.width()).sum();
-        let reserved = used + " · ".width();
-        let title_budget = (columns as usize).saturating_sub(reserved).max(8);
+        let title_budget = max_subject_width(columns).saturating_sub(2);
         let title = truncate_to_width(&task.title, title_budget);
         spans.push(Span::styled(
             " · ".to_string(),
             Style::default().add_modifier(Modifier::DIM),
         ));
         spans.push(Span::styled(title, Style::default()));
+    }
+
+    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    if used + TASK_BOARD_TOGGLE_HINT.width() <= columns as usize {
+        spans.push(Span::styled(
+            TASK_BOARD_TOGGLE_HINT,
+            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
+        ));
+    }
+
+    if sub_total > 0 {
+        spans.push(Span::styled(
+            format!(" · {sub_done}/{sub_total} done"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
     }
 
     Some(Line::from(spans))

@@ -245,6 +245,7 @@ struct PrepareChatTurnRequest<'a> {
     /// so the per-turn SelfModel ingest can read recent feedback signals.
     observability_hub: Option<&'a Arc<astra_runtime::observability::ObservabilityHub>>,
     append_system_prompt: Option<&'a str>,
+    plan_resume_hint: Option<&'a str>,
     /// Whether the current permission mode is `Plan`. When true the schema-
     /// preparation step adds every mutating tool to `restricted_tools` so the
     /// model only sees read-only + plan-control tools (`exit_plan_mode` etc.).
@@ -932,6 +933,17 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             );
         }
     }
+    // ─── Task context: inject through plan_resume_hint channel ───
+    if let Some(plan_hint) = ctx.plan_resume_hint {
+        // Route through edge_profile so the server bridge can merge into
+        // ExternalSources.plan_context (with proper token budgeting).
+        if let Some(root) = payload.as_object_mut()
+            && let Some(ep) = root.get_mut("edge_profile")
+            && let Some(ep_obj) = ep.as_object_mut()
+        {
+            ep_obj.insert("task_context_text".to_string(), json!(plan_hint));
+        }
+    }
     log_chat_turn_timing_phase(timing, "self_awareness_inject", &mut mark);
 
     // Injection-freshness observation happens AFTER the bridge's SSE
@@ -1141,6 +1153,10 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub observability_hub: Option<&'a Arc<astra_runtime::observability::ObservabilityHub>>,
     pub incremental_state: Option<Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
     pub append_system_prompt: Option<&'a str>,
+    /// Task context injected through the standard plan_resume_hint →
+    /// ExternalSources.plan_context pipeline (with proper token accounting).
+    /// Separate from append_system_prompt (which is for user-provided overrides).
+    pub plan_resume_hint: Option<&'a str>,
 }
 struct ChatTurnSseFetchUi {
     timing: bool,
@@ -1271,6 +1287,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         observability_hub,
         incremental_state,
         append_system_prompt,
+        plan_resume_hint,
         semantic_query_override,
         ..
     } = ctx;
@@ -1347,6 +1364,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             recent_rejections: perm_manager.recent_rejections(),
             observability_hub,
             append_system_prompt,
+            plan_resume_hint,
             plan_mode_active: perm_manager.mode()
                 == crate::cli::permission_manager::PermissionMode::Plan,
             lessons_text: lessons_text_ref,
@@ -1999,6 +2017,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: true,
             lessons_text: None,
         })
@@ -2177,6 +2196,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -2296,6 +2316,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -2411,6 +2432,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -2505,6 +2527,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -2616,6 +2639,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -2728,6 +2752,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -2851,6 +2876,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -2974,6 +3000,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3083,6 +3110,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3185,6 +3213,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3295,6 +3324,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3401,6 +3431,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3464,6 +3495,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
+            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3479,6 +3511,201 @@ mod tests {
         assert!(
             restricted_tools.is_empty(),
             "soft health signals must not remove visible tool schemas"
+        );
+    }
+
+    // ── plan_resume_hint passthrough ───────────────────────────────────
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_injects_task_context_from_plan_resume_hint() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = vec![schema("bash")];
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(100);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        let messages = vec![json!({"role": "user", "content": "fix the bug"})];
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "fix the bug",
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor,
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                trace_collector: None,
+            },
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_resume_hint: Some("## Active Task Board\n- 🔄 In progress: Refactor DB layer\nFocus on completing the in-progress task before starting new work.\n"),
+            plan_mode_active: false,
+            lessons_text: None,
+        })
+        .await;
+
+        // Verify task_context_text is injected into edge_profile
+        let task_ctx = payload["edge_profile"]["task_context_text"]
+            .as_str()
+            .expect("task_context_text must be present in edge_profile");
+        assert!(task_ctx.contains("Active Task Board"), "{task_ctx}");
+        assert!(
+            task_ctx.contains("🔄 In progress: Refactor DB layer"),
+            "{task_ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_no_task_context_when_plan_resume_hint_none() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = vec![schema("bash")];
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(100);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_volatile_texts: &[],
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "hi",
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor,
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                trace_collector: None,
+            },
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_resume_hint: None,
+            plan_mode_active: false,
+            lessons_text: None,
+        })
+        .await;
+
+        // task_context_text should NOT be present when plan_resume_hint is None
+        let task_ctx = payload["edge_profile"].get("task_context_text");
+        assert!(
+            task_ctx.is_none() || task_ctx.unwrap().as_str().unwrap_or("").is_empty(),
+            "task_context_text must be absent when plan_resume_hint is None"
         );
     }
 }
