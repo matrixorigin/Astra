@@ -149,10 +149,17 @@ struct HeadlessBlockedTool<'a> {
     name: &'a str,
     args: &'a Value,
     reason_code: &'a str,
+    journal_kind: HeadlessShortCircuitJournalKind,
     err_msg: String,
     journal_reason: String,
     early_exit_ms: u64,
     status_line: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeadlessShortCircuitJournalKind {
+    HardBlocked,
+    SuppressedRetry,
 }
 
 enum HeadlessToolSlotControl {
@@ -2981,8 +2988,8 @@ mod tests {
         assert!(
             pipeline.ctx.tool_results[0]
                 .to_string()
-                .contains("Outcome memory blocked"),
-            "expected blocked outcome-memory advisory in tool result"
+                .contains("identical_retry_suppressed"),
+            "expected identical retry suppression advisory in tool result"
         );
         drop(pipeline);
 
@@ -3006,8 +3013,12 @@ mod tests {
                 .as_ref()
                 .and_then(|payload| payload.get("reason"))
                 .and_then(Value::as_str),
-            Some("outcome_memory_blocked")
+            Some("identical_failure_suppressed")
         );
+        assert_eq!(harness.tool_call_records.len(), 1);
+        assert!(harness.tool_call_records[0].ok);
+        assert!(harness.tool_call_records[0].is_synthetic_placeholder());
+        assert!(!harness.tool_call_records[0].was_blocked_by_policy());
     }
 
     #[test]
@@ -3156,9 +3167,14 @@ mod tests {
         assert!(
             pipeline.ctx.tool_results[0]
                 .to_string()
-                .contains("Busy-poll backoff"),
+                .contains("retry_deferred: Busy-poll backoff"),
             "repeated non-progress outcomes should trigger a short-term backoff"
         );
+        drop(pipeline);
+        assert_eq!(harness.tool_call_records.len(), 1);
+        assert!(harness.tool_call_records[0].ok);
+        assert!(harness.tool_call_records[0].is_synthetic_placeholder());
+        assert!(!harness.tool_call_records[0].was_blocked_by_policy());
     }
 
     #[test]
@@ -3296,8 +3312,8 @@ mod tests {
         assert!(
             pipeline.ctx.tool_results[0]
                 .to_string()
-                .contains("Outcome memory blocked"),
-            "restored identical failure history should block the next-session retry"
+                .contains("identical_retry_suppressed"),
+            "restored identical failure history should suppress the next-session identical retry"
         );
     }
 

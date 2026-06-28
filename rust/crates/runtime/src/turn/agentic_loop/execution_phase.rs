@@ -3247,7 +3247,7 @@ fn should_wrap_up_for_cumulative_budget<H: AgenticLoopHost>(
     if state.max_cumulative_tokens == 0 {
         return false;
     }
-    let cumulative = state.total_prompt + state.total_completion;
+    let cumulative = state.provider_total_tokens();
     if cumulative <= state.max_cumulative_tokens || state.budget_wrapup_injected {
         return false;
     }
@@ -5895,7 +5895,7 @@ mod tests {
     }
 
     #[test]
-    fn exploration_family_corrective_restricts_search_tools_without_bash() {
+    fn exploration_family_corrective_retry_cautions_search_tools_without_bash() {
         let mut state = make_state();
         state.message = "investigate auth flow".into();
         for round in 0..astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD {
@@ -5929,6 +5929,27 @@ mod tests {
         assert!(
             !state.restricted_tools.contains("bash"),
             "search-family corrective must not globally block bash"
+        );
+    }
+
+    #[test]
+    fn cumulative_budget_counts_cache_buckets() {
+        let mut state = make_state();
+        state.max_cumulative_tokens = 100;
+        state.total_prompt = 5;
+        state.total_completion = 5;
+        state.total_cache_read = 20;
+        state.total_cache_creation = 80;
+        let mut host = MockHost::new(Vec::new());
+
+        assert!(should_wrap_up_for_cumulative_budget(
+            &mut host, &mut state, true
+        ));
+        assert!(state.budget_wrapup_injected);
+        assert!(
+            state.interruption.as_ref().is_some_and(|record| record.kind
+                == astra_turn_core::interruption::InterruptionKind::CumulativeBudgetExceeded),
+            "cache-inclusive cumulative budget should record an interruption"
         );
     }
 

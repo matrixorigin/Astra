@@ -121,7 +121,7 @@ pub(crate) fn record_loop_completion_feedback(
     }
 
     // ── 2. Token usage signal ──
-    let total_tokens = state.total_prompt + state.total_completion;
+    let total_tokens = state.provider_total_tokens();
     // Heuristic threshold: >50k tokens suggests inefficiency for most tasks.
     let token_threshold = 50_000u64;
     if total_tokens > token_threshold {

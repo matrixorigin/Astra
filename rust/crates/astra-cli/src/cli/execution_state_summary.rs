@@ -6,8 +6,11 @@
 //! - whether a plan is being authored or executed,
 //! - whether the last turn was interrupted,
 //! - what durable verification state exists,
-//! - what the last lifecycle event was,
-//! - and what the session task board currently says.
+//! - and what the last lifecycle event was.
+//!
+//! Task-board context is injected through `TaskManager::build_active_task_context`
+//! into the runtime context pipeline. Keeping it out of this append prompt gives
+//! the model one authoritative task source per turn.
 
 use astra_runtime::plan::{PlanModeState, plan_resume_digest};
 use astra_services::{
@@ -15,7 +18,6 @@ use astra_services::{
     session_journal::{JournalEvent, JournalEventType},
     task_orchestrator::{TaskPlan, TaskStatus},
 };
-use astra_tools::task_mgmt::SessionTask;
 
 pub(crate) struct ExecutionStateSummaryInput<'a> {
     pub model: Option<&'a str>,
@@ -29,12 +31,10 @@ pub(crate) struct ExecutionStateSummaryInput<'a> {
     pub plan_execution_corrections: &'a [String],
     pub durable_contract: Option<&'a TaskContract>,
     pub last_turn_event: Option<&'a JournalEvent>,
-    pub tasks: &'a [SessionTask],
 }
 
 pub(crate) fn format_for_session_state(
     state: &crate::cli::session::session_state::SessionState,
-    tasks: &[SessionTask],
 ) -> Option<String> {
     format_summary(ExecutionStateSummaryInput {
         model: state.model.as_deref(),
@@ -51,7 +51,6 @@ pub(crate) fn format_for_session_state(
             .as_ref()
             .map(|state| &state.contract),
         last_turn_event: state.last_turn_event.as_ref(),
-        tasks,
     })
 }
 
@@ -99,23 +98,17 @@ pub(crate) fn format_summary(input: ExecutionStateSummaryInput<'_>) -> Option<St
         lifecycle_lines.push(event_line);
     }
 
-    let task_block = crate::cli::task::task_summary::format_summary(input.tasks);
     if lifecycle_lines.is_empty() {
-        return task_block;
+        return None;
     }
 
-    let mut sections = Vec::new();
     let mut block = Vec::new();
     block.push("### Turn-start session execution state".to_string());
     if let Some(model) = input.model.map(str::trim).filter(|model| !model.is_empty()) {
         block.push(format!("model: {model}"));
     }
     block.extend(lifecycle_lines);
-    sections.push(block.join("\n"));
-    if let Some(task_block) = task_block {
-        sections.push(task_block);
-    }
-    Some(sections.join("\n\n"))
+    Some(block.join("\n"))
 }
 
 fn render_executing_plan(
@@ -293,37 +286,6 @@ mod tests {
     };
     use astra_services::session_journal::JournalEvent;
     use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
-    use astra_tools::task_mgmt::{SessionSubtask, SessionTask};
-
-    fn task(id: &str, title: &str, status: &str) -> SessionTask {
-        SessionTask {
-            archived_at: None,
-            id: id.into(),
-            title: title.into(),
-            description: None,
-            status: status.into(),
-            subtasks: Vec::new(),
-            created_at: "now".into(),
-            updated_at: "now".into(),
-            active_form: None,
-            owner: None,
-            metadata: None,
-            blocks: Vec::new(),
-            blocked_by: Vec::new(),
-        }
-    }
-
-    fn subtask(id: &str, title: &str, status: &str) -> SessionSubtask {
-        SessionSubtask {
-            id: id.into(),
-            title: title.into(),
-            description: None,
-            status: status.into(),
-            depends_on: Vec::new(),
-            owner: None,
-            reason: None,
-        }
-    }
 
     fn durable_contract() -> TaskContract {
         TaskContract {
@@ -408,11 +370,6 @@ mod tests {
             2,
             1,
         );
-        let mut parent = task("task-1", "Ship auth flow", "in_progress");
-        parent.subtasks = vec![
-            subtask("sub-1", "Model auth state", "completed"),
-            subtask("sub-2", "Verify auth API", "in_progress"),
-        ];
         let durable = durable_contract();
 
         let out = format_summary(ExecutionStateSummaryInput {
@@ -427,7 +384,6 @@ mod tests {
             plan_execution_corrections: &["add regression coverage".into()],
             durable_contract: Some(&durable),
             last_turn_event: Some(&event),
-            tasks: &[parent],
         })
         .expect("summary");
 
@@ -461,11 +417,10 @@ mod tests {
             ),
             "{out}"
         );
-        assert!(out.contains("### Active task board"), "{out}");
     }
 
     #[test]
-    fn summary_returns_task_block_when_no_lifecycle_state_exists() {
+    fn summary_returns_none_when_no_lifecycle_state_exists() {
         let out = format_summary(ExecutionStateSummaryInput {
             model: Some("gpt-5.4"),
             last_turn_interrupted: false,
@@ -478,15 +433,12 @@ mod tests {
             plan_execution_corrections: &[],
             durable_contract: None,
             last_turn_event: None,
-            tasks: &[task("task-1", "Implement checkout", "pending")],
-        })
-        .expect("task block");
+        });
 
         assert!(
-            !out.contains("### Turn-start session execution state"),
-            "{out}"
+            out.is_none(),
+            "task board must not be injected through execution-state summary"
         );
-        assert!(out.contains("### Active task board"), "{out}");
     }
 
     #[test]
@@ -521,7 +473,6 @@ mod tests {
             plan_execution_corrections: &[],
             durable_contract: None,
             last_turn_event: None,
-            tasks: &[],
         })
         .expect("summary");
 
@@ -554,7 +505,6 @@ mod tests {
             plan_execution_corrections: &[],
             durable_contract: None,
             last_turn_event: None,
-            tasks: &[task("task-1", "Implement checkout", "pending")],
         })
         .expect("summary");
 
@@ -584,7 +534,6 @@ mod tests {
             plan_execution_corrections: &[],
             durable_contract: None,
             last_turn_event: None,
-            tasks: &[],
         })
         .expect("summary");
 

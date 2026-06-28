@@ -170,6 +170,31 @@ pub fn journal_record_blocked_tool(
 }
 
 #[must_use]
+pub fn journal_record_suppressed_tool_retry(
+    name: String,
+    reason_code: &str,
+    reason: String,
+    args_preview: Option<String>,
+    tool_elapsed_ms: u64,
+) -> ToolCallRecord {
+    let preview: String = format!("Deferred: {reason}").chars().take(500).collect();
+    ToolCallRecord {
+        name,
+        ok: true,
+        ms: tool_elapsed_ms,
+        error: Some(reason_code.to_string()),
+        input_bytes: None,
+        output_bytes: None,
+        args_preview,
+        result_preview: Some(preview),
+        file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
+        ..Default::default()
+    }
+}
+
+#[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn journal_record_executed_tool_call(
     name: String,
@@ -449,6 +474,24 @@ mod tests {
         assert_eq!(r.ms, 9);
         assert_eq!(r.error.as_deref(), Some("blocked_tool: denied by policy"));
         assert_eq!(r.args_preview.as_deref(), Some(r#"{"command":"echo hi"}"#));
+    }
+
+    #[test]
+    fn suppressed_retry_record_is_synthetic_success() {
+        let r = journal_record_suppressed_tool_retry(
+            "agent".into(),
+            "nonprogress_retry_deferred",
+            "retry later".into(),
+            Some(r#"{"action":"get_result"}"#.into()),
+            0,
+        );
+        assert!(r.ok);
+        assert_eq!(r.error.as_deref(), Some("nonprogress_retry_deferred"));
+        assert!(r.is_synthetic_placeholder());
+        assert!(
+            !r.was_blocked_by_policy(),
+            "retry deferral must not look like a hard policy block"
+        );
     }
 
     #[test]

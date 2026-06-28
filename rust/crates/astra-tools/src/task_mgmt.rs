@@ -2057,8 +2057,12 @@ impl TaskManager {
         if let Some(task) = in_progress.first() {
             hint.push_str(&format!("- 🔄 In progress: {}\n", compact_title(task)));
         }
-        for task in in_progress.iter().skip(1) {
-            hint.push_str(&format!("- 🔄 Also in progress: {}\n", compact_title(task)));
+        if in_progress.len() > 1 {
+            hint.push_str(&format!(
+                "- 🔄 Also in progress ({}): {}\n",
+                in_progress.len() - 1,
+                compact_titles(&in_progress[1..])
+            ));
         }
         if !pending.is_empty() {
             hint.push_str(&format!(
@@ -6724,6 +6728,32 @@ mod tests {
         assert!(ctx.contains("## Active Task Board"), "{ctx}");
         assert!(ctx.contains("🔄 In progress: Refactor DB layer"), "{ctx}");
         assert!(ctx.contains("Focus on completing the in-progress"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_bounds_many_in_progress_tasks() {
+        let m = mgr();
+        for idx in 0..10 {
+            m.create(&json!({"title": format!("Long-running in-progress task {idx}")}))
+                .await;
+        }
+        let tasks = m.load_active_tasks().await.unwrap();
+        for task in &tasks {
+            set_task_status_fixture(&m, &task.id, SessionTaskStatusKind::InProgress).await;
+        }
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert_eq!(
+            ctx.matches("Also in progress").count(),
+            1,
+            "many in-progress tasks should be summarized, not rendered as unbounded rows: {ctx}"
+        );
+        assert!(ctx.contains("Also in progress (9):"), "{ctx}");
+        assert!(ctx.contains("+3 more"), "{ctx}");
+        assert!(
+            !ctx.contains("Long-running in-progress task 9"),
+            "summary must be bounded to the first additional titles: {ctx}"
+        );
     }
 
     #[tokio::test]

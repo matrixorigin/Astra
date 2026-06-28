@@ -448,7 +448,7 @@ pub(crate) fn build_introspect_snapshot(
     lifecycle_summary: String,
     inspection: Option<&crate::turn::inspection_service::InspectionService<'_>>,
 ) -> astra_turn_core::introspect::IntrospectSnapshot {
-    let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
+    let total_in = state.provider_input_tokens();
     let cache_ratio = if total_in > 0 {
         state.total_cache_read as f64 / total_in as f64
     } else {
@@ -597,7 +597,7 @@ pub(crate) fn build_introspect_snapshot(
         tool_health,
         working_memory_summary: working_mem,
         lifecycle_summary,
-        total_input_tokens: state.total_prompt + state.total_cache_read,
+        total_input_tokens: state.provider_input_tokens(),
         total_output_tokens: state.total_completion,
         cache_read_tokens: state.total_cache_read,
         cache_creation_tokens: state.total_cache_creation,
@@ -1721,7 +1721,7 @@ pub struct AgenticLoopState {
     pub skill_produced_output: bool,
 
     // ── Cumulative token budget ──
-    /// Maximum cumulative (prompt + completion) tokens across all rounds.
+    /// Maximum cumulative provider tokens across all rounds.
     /// 0 = unlimited (default for interactive sessions).
     /// Skill subruns set this to cap total cost.
     pub max_cumulative_tokens: u64,
@@ -1912,6 +1912,25 @@ pub fn runtime_manifest_for_model(
 }
 
 impl AgenticLoopState {
+    /// Provider-reported total tokens consumed by this loop.
+    ///
+    /// The four run-level token buckets are disjoint. Any budget, governor, or
+    /// cost signal that is meant to cap actual provider usage must use this
+    /// total instead of only `prompt + completion`.
+    pub fn provider_total_tokens(&self) -> u64 {
+        self.total_prompt
+            .saturating_add(self.total_cache_read)
+            .saturating_add(self.total_cache_creation)
+            .saturating_add(self.total_completion)
+    }
+
+    /// Provider-reported input tokens, including cache reads and cache writes.
+    pub fn provider_input_tokens(&self) -> u64 {
+        self.total_prompt
+            .saturating_add(self.total_cache_read)
+            .saturating_add(self.total_cache_creation)
+    }
+
     /// Refresh the cached active task-board snapshot from the shared
     /// TaskManager, when one is attached. Call this before any terminal
     /// completion decision so tool calls in the just-finished round are
@@ -2900,6 +2919,18 @@ pub(crate) mod tests {
             "runtime_environment_advertisement".to_string(),
             serde_json::to_value(advertisement).expect("serialize advertisement"),
         )])
+    }
+
+    #[test]
+    fn provider_total_tokens_sums_disjoint_cache_buckets() {
+        let mut state = make_test_loop_state();
+        state.total_prompt = 100;
+        state.total_cache_read = 20;
+        state.total_cache_creation = 7;
+        state.total_completion = 13;
+
+        assert_eq!(state.provider_input_tokens(), 127);
+        assert_eq!(state.provider_total_tokens(), 140);
     }
 
     /// Unwind-safe cleanup guard for tests that write under

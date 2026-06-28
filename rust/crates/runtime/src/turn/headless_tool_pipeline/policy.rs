@@ -13,8 +13,8 @@ use astra_turn_core::headless_tool_assembly::{
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
     journal_record_blocked_tool, journal_record_cross_turn_cache_hit,
-    journal_record_duplicate_within_turn, journal_record_tool_not_admitted,
-    journal_record_unknown_tool,
+    journal_record_duplicate_within_turn, journal_record_suppressed_tool_retry,
+    journal_record_tool_not_admitted, journal_record_unknown_tool,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
@@ -179,12 +179,22 @@ fn emit_blocked_tool_result(
         openai_tool_roundtrip_values(blocked.id, blocked.name, &blocked.err_msg);
     messages.push(tool_msg);
     tool_results.push(err_tr);
-    tool_call_records.push(journal_record_blocked_tool(
-        blocked.name.to_string(),
-        blocked.journal_reason,
-        make_args_preview(blocked.name, blocked.args),
-        blocked.early_exit_ms,
-    ));
+    let record = match blocked.journal_kind {
+        HeadlessShortCircuitJournalKind::HardBlocked => journal_record_blocked_tool(
+            blocked.name.to_string(),
+            blocked.journal_reason,
+            make_args_preview(blocked.name, blocked.args),
+            blocked.early_exit_ms,
+        ),
+        HeadlessShortCircuitJournalKind::SuppressedRetry => journal_record_suppressed_tool_retry(
+            blocked.name.to_string(),
+            blocked.reason_code,
+            blocked.journal_reason,
+            make_args_preview(blocked.name, blocked.args),
+            blocked.early_exit_ms,
+        ),
+    };
+    tool_call_records.push(record);
 }
 
 /// Decide which denial body to emit for a name the validator rejected.
@@ -619,6 +629,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     name: &slot.name,
                     args: &slot.args,
                     reason_code,
+                    journal_kind: HeadlessShortCircuitJournalKind::SuppressedRetry,
                     err_msg: err_msg.clone(),
                     journal_reason: err_msg.clone(),
                     early_exit_ms: 0,
@@ -645,6 +656,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     name: &slot.name,
                     args: &slot.args,
                     reason_code,
+                    journal_kind: HeadlessShortCircuitJournalKind::SuppressedRetry,
                     err_msg: err_msg.clone(),
                     journal_reason: err_msg.clone(),
                     early_exit_ms: 0,
@@ -812,6 +824,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     name: &execution.name,
                     args: &execution.args,
                     reason_code: "runtime_binding_unavailable",
+                    journal_kind: HeadlessShortCircuitJournalKind::HardBlocked,
                     err_msg: err_msg.clone(),
                     journal_reason: err_msg,
                     early_exit_ms: execution.early_exit_ms,
@@ -848,6 +861,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         name: &execution.name,
                         args: &execution.args,
                         reason_code: REASON_REDUNDANT_VALIDATION_SUPPRESSED,
+                        journal_kind: HeadlessShortCircuitJournalKind::SuppressedRetry,
                         err_msg: body.clone(),
                         journal_reason: body,
                         early_exit_ms: execution.early_exit_ms,
@@ -890,6 +904,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     name: &execution.name,
                     args: &execution.args,
                     reason_code: "edge_runtime_capability_denied",
+                    journal_kind: HeadlessShortCircuitJournalKind::HardBlocked,
                     journal_reason: err_msg.clone(),
                     err_msg,
                     early_exit_ms: execution.early_exit_ms,
@@ -932,6 +947,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     name: &execution.name,
                     args: &execution.args,
                     reason_code: "restricted_tool",
+                    journal_kind: HeadlessShortCircuitJournalKind::HardBlocked,
                     journal_reason: err_msg.clone(),
                     err_msg,
                     early_exit_ms: execution.early_exit_ms,
@@ -991,6 +1007,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                             name: &execution.name,
                             args: &execution.args,
                             reason_code: "permission_denied",
+                            journal_kind: HeadlessShortCircuitJournalKind::HardBlocked,
                             err_msg,
                             journal_reason: reason,
                             early_exit_ms: execution.early_exit_ms,
@@ -1030,6 +1047,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                             name: &execution.name,
                             args: &execution.args,
                             reason_code: "pre_tool_hook_blocked",
+                            journal_kind: HeadlessShortCircuitJournalKind::HardBlocked,
                             journal_reason: err_msg.clone(),
                             err_msg,
                             early_exit_ms: execution.early_exit_ms,
@@ -1134,11 +1152,11 @@ fn outcome_memory_block_message(
             .and_then(Value::as_str)
             .unwrap_or("<unknown path>");
         let msg = format!(
-            "blocked_tool: str_replace recovery required for {path}: this exact edit failed \
+            "identical_retry_suppressed: str_replace recovery required for {path}: this exact edit failed \
              {failure_count} recent time(s). Do not repeat the same old_str. First read_file \
              the target range to verify exact bytes, then retry once with the verified old_str; \
              if the edit is still ambiguous, use multi_edit/write_file with the current file \
-             content instead."
+             content instead. The str_replace tool remains available for changed arguments."
         );
         return (
             "str_replace_recovery_required",
@@ -1148,14 +1166,14 @@ fn outcome_memory_block_message(
     }
 
     (
-        "outcome_memory_blocked",
+        "identical_failure_suppressed",
         format!(
-            "blocked_tool: Outcome memory blocked '{tool_name}' with identical arguments: \
+            "identical_retry_suppressed: '{tool_name}' with identical arguments failed \
              this canonical call failed {failure_count} recent time(s) with no intervening \
-             success. Change the arguments, use a different tool, or explain why a retry is \
-             necessary."
+             success. The tool is not disabled; change the arguments, gather new evidence, \
+             use a different tool path, or explain why this exact retry is necessary."
         ),
-        format!("  ⚠ Outcome-memory block: {tool_name}"),
+        format!("  ⚠ Identical retry suppressed: {tool_name}"),
     )
 }
 
@@ -1165,12 +1183,13 @@ fn nonprogress_backoff_message(
     remaining_secs: u64,
 ) -> (&'static str, String, String) {
     (
-        "nonprogress_backoff",
+        "nonprogress_retry_deferred",
         format!(
-            "blocked_tool: Busy-poll backoff for '{tool_name}' with identical arguments: \
+            "retry_deferred: Busy-poll backoff for '{tool_name}' with identical arguments: \
              the last {repeat_count} recent call(s) produced no finished result. Wait about \
              {remaining_secs}s before polling again, or continue with other completed work \
-             instead of repeating the same request immediately."
+             instead of repeating the same request immediately. The tool remains available \
+             after the backoff or with changed arguments."
         ),
         format!("  ⚠ Busy-poll backoff: {tool_name} (~{remaining_secs}s)"),
     )

@@ -754,7 +754,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         }
 
         let turns = (SUBRUN_MAX_TURNS - state.remaining_turns) as u32;
-        let tokens_used = (state.total_prompt + state.total_completion) as u32;
+        let tokens_used = state.provider_total_tokens().min(u32::MAX as u64) as u32;
 
         Ok(SubRunResult {
             output: state.final_text,

@@ -8056,7 +8056,7 @@ mod resume_tests {
         assert!(state.durable_task_state.is_some());
 
         let summary =
-            crate::cli::execution_state_summary::format_for_session_state(&state, &[]).unwrap();
+            crate::cli::execution_state_summary::format_for_session_state(&state).unwrap();
         assert!(summary.contains("turn state: last turn was interrupted"));
         assert!(summary.contains("plan execution: goal=\"Ship lifecycle UX\""));
         assert!(summary.contains("in_progress=\"Verify lifecycle state\""));

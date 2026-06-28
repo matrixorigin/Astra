@@ -5076,7 +5076,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
                 // Record tokens consumed so check_token_budget sees up-to-date usage.
                 if let Some(ref gov) = bg_resource_governor {
-                    let total = loop_state.total_prompt + loop_state.total_completion;
+                    let total = loop_state.provider_total_tokens();
                     if total > 0 {
                         gov.record_tokens(&bg_user_id, total).await;
                     }
@@ -5773,7 +5773,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // Record tokens consumed regardless of cancel — cancelled runs still
                 // consumed tokens and must count toward the daily budget.
                 if let Some(ref gov) = bg_resource_governor {
-                    let total = state.total_prompt + state.total_completion;
+                    let total = state.provider_total_tokens();
                     if total > 0 {
                         gov.record_tokens(&bg_user_id, total).await;
                     }
