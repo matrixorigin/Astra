@@ -527,6 +527,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
     align_high_cost_low_yield_verdict(&mut eval, &tool_calls, telemetry);
     apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records);
+    calibrate_confidence_after_quality_penalties(&mut eval);
 
     eval
 }
@@ -649,6 +650,18 @@ fn align_high_cost_low_yield_verdict(
 
 fn high_cost_low_yield_confidence_cap(quality: f64) -> f64 {
     (0.25 + quality.clamp(0.0, 1.0) * 0.60).clamp(0.25, 0.55)
+}
+
+fn calibrate_confidence_after_quality_penalties(eval: &mut TurnEvaluation) {
+    if eval
+        .signals
+        .iter()
+        .any(|signal| matches!(signal, EvalSignal::HighCostLowYield { .. }))
+    {
+        eval.confidence = eval
+            .confidence
+            .min(high_cost_low_yield_confidence_cap(eval.quality));
+    }
 }
 
 fn result_class_is_outcome_failure(class: &str) -> bool {
@@ -2277,6 +2290,41 @@ mod tests {
             "low quality should not retain high confidence"
         );
         assert_eq!(high_cost_low_yield_confidence_cap(1.0), 0.55);
+    }
+
+    #[test]
+    fn high_cost_low_yield_confidence_recalibrates_after_late_quality_penalties() {
+        let mut records = vec![
+            record_in_round("git", 0, Some("b-0")),
+            record_in_round("git", 0, Some("b-0")),
+            record_in_round("git", 1, Some("b-1")),
+            record_in_round("git", 1, Some("b-1")),
+            record_in_round("git", 2, Some("b-2")),
+            record_in_round("git", 2, Some("b-2")),
+        ];
+        records[0].result_class = Some("test_failure".to_string());
+
+        let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
+            "review local changes",
+            &["git".to_string()],
+            &records,
+            0,
+            false,
+            0.95,
+            EvaluationThresholds::default(),
+            TurnEvaluationTelemetry {
+                llm_rounds: Some(9),
+                prompt_tokens: Some(136_947),
+                first_round_prompt_tokens: Some(9_401),
+                max_round_prompt_tokens: Some(20_954),
+            },
+        );
+
+        assert_eq!(eval.quality, 0.0, "{eval:?}");
+        assert!(
+            eval.confidence <= high_cost_low_yield_confidence_cap(eval.quality),
+            "high-cost low-yield confidence must stay calibrated after later penalties: {eval:?}"
+        );
     }
 
     #[test]

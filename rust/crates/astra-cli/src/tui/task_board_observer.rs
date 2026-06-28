@@ -644,6 +644,7 @@ impl TaskBoardObserver {
                             } = event
                             {
                                 st.completed_at.remove(task_id);
+                                st.cancelled_at.remove(task_id);
                             }
                         }
                         for event in events {
@@ -662,16 +663,27 @@ impl TaskBoardObserver {
                         // them as "freshly completed" relative to this
                         // observer's lifetime — fine, they age out 30s
                         // later just like any other.
-                        let backfill_ids: Vec<String> = st
+                        let completed_backfill_ids: Vec<String> = st
                             .snapshot
                             .tasks
                             .iter()
-                            .filter(|t| t.status.is_completed() || t.status.is_cancelled())
+                            .filter(|t| t.status.is_completed())
                             .filter(|t| !st.completed_at.contains_key(&t.id))
                             .map(|t| t.id.clone())
                             .collect();
-                        for id in backfill_ids {
+                        for id in completed_backfill_ids {
                             st.completed_at.insert(id, at);
+                        }
+                        let cancelled_backfill_ids: Vec<String> = st
+                            .snapshot
+                            .tasks
+                            .iter()
+                            .filter(|t| t.status.is_cancelled())
+                            .filter(|t| !st.cancelled_at.contains_key(&t.id))
+                            .map(|t| t.id.clone())
+                            .collect();
+                        for id in cancelled_backfill_ids {
+                            st.cancelled_at.insert(id, at);
                         }
                     }
                     let has_incomplete = st.snapshot.has_incomplete();
@@ -943,6 +955,59 @@ mod tests {
         // Truth snapshot still reports the row so task-board counts remain accurate.
         let truth = obs.snapshot();
         assert_eq!(truth.tasks.len(), 1, "snapshot() must keep aged rows");
+    }
+
+    #[tokio::test]
+    async fn cancelled_tasks_age_out_using_cancelled_ttl() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let obs = TaskBoardObserver::new(store_dyn, "sess-cancelled-ttl");
+        let m = mgr(store, "sess-cancelled-ttl");
+
+        m.create(&json!({"title": "discarded work"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "cancelled"}))
+            .await;
+        wait_until(
+            || {
+                let s = obs.snapshot();
+                s.tasks.len() == 1 && s.tasks[0].status == SessionTaskStatusKind::Cancelled
+            },
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+
+        assert_eq!(
+            obs.snapshot_for_render().tasks.len(),
+            1,
+            "freshly cancelled task must still render"
+        );
+
+        {
+            let mut st = obs.inner.state.lock_recover();
+            st.cancelled_at.insert(
+                "task-1".to_string(),
+                Instant::now()
+                    .checked_sub(CANCELLED_TASK_TTL + Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now),
+            );
+            assert!(
+                !st.completed_at.contains_key("task-1"),
+                "cancelled tasks must not be backfilled into completed_at"
+            );
+        }
+
+        let render = obs.snapshot_for_render();
+        assert!(
+            render.tasks.is_empty(),
+            "cancelled task aged past cancelled TTL must drop from render snapshot: {:?}",
+            render.tasks
+        );
+        assert_eq!(
+            obs.snapshot().tasks.len(),
+            1,
+            "snapshot() must keep aged cancelled rows for counts/audit"
+        );
     }
 
     /// REGRESSION: TUI used to start with an empty `state.session_id`

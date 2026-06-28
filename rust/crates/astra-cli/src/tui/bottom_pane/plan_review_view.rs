@@ -135,10 +135,11 @@ impl PlanReviewView {
     }
 
     fn max_scroll(&self) -> u16 {
-        // Use character count as a conservative scroll bound.
-        // The markdown renderer may produce more visual lines,
-        // but scrolling by raw line count is fine for navigation.
-        let len = self.plan_markdown.lines().count() as u16;
+        // The markdown renderer wraps long logical lines. Raw line count can
+        // therefore under-estimate scrollable content and trap the user at the
+        // top of a long one-line plan. Use character count as a conservative
+        // upper bound; Paragraph clamps during render.
+        let len = self.plan_markdown.chars().count().min(u16::MAX as usize) as u16;
         len.saturating_sub(1)
     }
 
@@ -345,6 +346,19 @@ mod tests {
             "scroll keys must not dispatch a decision"
         );
         assert!(!view.is_complete());
+    }
+
+    #[test]
+    fn long_single_line_plan_can_scroll_after_markdown_wrapping() {
+        let (tx, _rx) = oneshot::channel();
+        let mut view = PlanReviewView::new(format!("1. {}", "long step ".repeat(200)), tx);
+
+        view.handle_key(key(KeyCode::End));
+
+        assert!(
+            view.scroll > 0,
+            "wrapped single-line markdown must have a non-zero scroll bound"
+        );
     }
 
     #[test]

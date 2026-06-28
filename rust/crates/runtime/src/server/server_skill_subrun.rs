@@ -422,7 +422,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget: task_profile.agentic_turn_budget,
             budget_policy: None,
-            policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,

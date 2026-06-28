@@ -7561,7 +7561,6 @@ mod tests {
                         tuning: Default::default(),
                     }
                 }),
-            policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,

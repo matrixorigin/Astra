@@ -1556,9 +1556,6 @@ pub struct AgenticLoopState {
     /// Budget policy for auto-expansion based on outcome streaks.
     /// When `None` (default), the production `Default::default()` is used.
     pub budget_policy: Option<RuntimePolicy>,
-    /// Set to true when budget policy expanded the turn budget this turn.
-    /// Prevents [`maybe_extend_turn_budget`] from double-extending.
-    pub policy_expanded_this_turn: bool,
     /// Current agentic loop turn index (0-based, updated each iteration).
     /// Used by the CLI to inject `round_index` into the bridge payload so the
     /// system prompt can include round budget directives.
@@ -2799,7 +2796,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         turn_budget_hint_emitted_20: false,
         agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
         budget_policy: None,
-        policy_expanded_this_turn: false,
         current_round_index: 0,
         llm_rounds_completed: 0,
         last_request_message_count: None,
@@ -3282,7 +3278,6 @@ pub(crate) mod tests {
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             budget_policy: None,
-            policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,

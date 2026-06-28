@@ -737,8 +737,7 @@ async fn maybe_inject_task_board_start_gate<H: AgenticLoopHost>(
 
 fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
     let budget = state.agentic_turn_budget;
-    if state.policy_expanded_this_turn
-        || budget.extension_turns == 0
+    if budget.extension_turns == 0
         || budget.max_extensions == 0
         || state.max_turns >= budget.hard_turn_limit
         || used_budget_extensions(state) >= budget.max_extensions
@@ -2009,6 +2008,43 @@ mod tests {
         assert!(
             !recent_activity_supports_budget_extension(&state),
             "failed-only activity should not extend the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_budget_extension_uses_recent_activity_not_stale_side_flags() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
+            initial_turns: 2,
+            hard_turn_limit: 4,
+            extension_turns: 2,
+            max_extensions: 1,
+        };
+        state.max_turns = 2;
+        state.remaining_turns = 0;
+        state.stall.tool_call_records = vec![read_record(0, 1, 80), read_record(1, 81, 160)];
+        state.stall.turn_sigs = vec![turn_sig("read_file:1-80"), turn_sig("read_file:81-160")];
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 2)
+            .await
+            .expect("prepare should continue after extension");
+
+        assert!(
+            matches!(prepared, PreparedTurnIteration::Ready(_)),
+            "recent useful activity should drive extension at budget exhaustion"
+        );
+        assert_eq!(state.max_turns, 4);
+        assert_eq!(
+            state.remaining_turns, 1,
+            "extension adds two turns, then current prepare consumes one"
+        );
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .any(|entry| entry.content.contains("Budget review")),
+            "budget review should explain the extension"
         );
     }
 

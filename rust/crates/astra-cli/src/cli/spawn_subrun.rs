@@ -667,7 +667,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
             budget_policy: None,
-            policy_expanded_this_turn: false,
             restricted_tools,
             boosted_tools: HashSet::new(),
             widen_selection_pending: false,

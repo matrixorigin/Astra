@@ -197,15 +197,25 @@ impl CompactionEvent {
     ) -> Self {
         let tokens_after = tokens_before.saturating_sub(tokens_freed);
         // Dimmed prefix so the line is visually distinct from agent output.
-        let mut summary = format!(
-            "  ♻ {}: freed ~{} tokens ({}→{} of {}), pressure {:.0}%",
-            kind,
-            tokens_freed,
-            tokens_before,
-            tokens_after,
-            max_tokens,
-            pressure * 100.0,
-        );
+        let mut summary = if kind == CompactionKind::PressureWarning {
+            format!(
+                "  ⚠ {}: context pressure {:.0}% ({} of {} tokens); compaction may run soon",
+                kind,
+                pressure * 100.0,
+                tokens_before,
+                max_tokens,
+            )
+        } else {
+            format!(
+                "  ♻ {}: freed ~{} tokens ({}→{} of {}), pressure {:.0}%",
+                kind,
+                tokens_freed,
+                tokens_before,
+                tokens_after,
+                max_tokens,
+                pressure * 100.0,
+            )
+        };
         // Append what was compacted so users know which tool results / turns
         // have been summarized or removed — this makes compaction transparent
         // instead of a silent loss of context.
@@ -308,6 +318,33 @@ mod tests {
             vec![],
         );
         assert_eq!(ev.tokens_after, 0);
+    }
+
+    #[test]
+    fn pressure_warning_summary_does_not_claim_tokens_were_freed() {
+        let ev = CompactionEvent::new(
+            CompactionKind::PressureWarning,
+            0.82,
+            0,
+            82_000,
+            100_000,
+            0,
+            40,
+            vec![],
+        );
+
+        assert!(
+            ev.summary.contains("context pressure 82%"),
+            "{}",
+            ev.summary
+        );
+        assert!(
+            !ev.summary.contains("freed ~0 tokens"),
+            "pressure warning is not a compaction result: {}",
+            ev.summary
+        );
+        assert_eq!(ev.tokens_freed, 0);
+        assert_eq!(ev.tokens_after, 82_000);
     }
 
     // ── Adaptive thresholds ────────────────────────────────────────

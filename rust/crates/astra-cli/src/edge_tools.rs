@@ -2743,9 +2743,6 @@ impl ToolExecutor {
         }
     }
 
-    /// Local-only exit path (Shift+Tab / `/allow plan` entry). No
-    /// cloud row, no server-side guard, no network calls — purely
-    /// the overlay + `pending_permission_mode_change` slot. This is
     /// Mirror an approved plan into the session task board so the user
     /// sees actionable step-by-step work items in the dashboard.
     ///
@@ -2813,7 +2810,7 @@ impl ToolExecutor {
                 Some(plan) if !plan.is_empty() => {
                     // Mirror approved plan steps into the task board so the user
                     // sees actionable step-by-step work items in the dashboard.
-                    let _mirror_result = self.mirror_approved_plan_to_task_board(plan).await;
+                    self.mirror_approved_plan_to_task_board(plan).await;
                     format!(" Plan recorded:\n{plan}")
                 }
                 _ => String::new(),

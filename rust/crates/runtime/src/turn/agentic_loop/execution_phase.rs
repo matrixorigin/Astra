@@ -187,6 +187,15 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     Ok(())
 }
 
+pub(crate) fn turn_result_tokens_consumed(turn_result: &HostTurnResult) -> u64 {
+    turn_result
+        .accum
+        .prompt_tokens
+        .saturating_add(turn_result.accum.completion_tokens)
+        .saturating_add(turn_result.accum.cache_read_tokens)
+        .saturating_add(turn_result.accum.cache_creation_tokens)
+}
+
 /// Record an `llm_round` event for an early-exit path (no tool calls).
 fn record_early_exit_llm_round(
     state: &mut AgenticLoopState,
@@ -717,7 +726,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         let added = capped - state.max_turns;
                         state.max_turns = capped;
                         state.remaining_turns += added;
-                        state.policy_expanded_this_turn = true;
                         // Reset self-pacing hint flags so the new budget gets fresh hints
                         state.turn_budget_hint_emitted_90 = false;
                         state.turn_budget_hint_emitted_50 = false;
@@ -1377,6 +1385,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     turn_index,
                     prep.turn_start_time,
                     turn_result.ttft_ms,
+                    turn_result_tokens_consumed(&turn_result),
                 );
                 state.step_recorder.end_turn(false);
                 finalize_and_render(host, state).await;
@@ -1700,6 +1709,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 turn_index,
                 prep.turn_start_time,
                 turn_result.ttft_ms,
+                turn_result_tokens_consumed(&turn_result),
             );
             finalize_and_render(host, state).await;
             return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
@@ -2969,6 +2979,7 @@ pub(crate) fn observe_turn_end_without_tools(
     _turn_index: usize,
     turn_start_time: Instant,
     ttft_ms: Option<u64>,
+    tokens_consumed: u64,
 ) {
     // ── Telemetry timing ─────────────────────────────────────────
     if let (Some(hub), Some(session)) = (
@@ -2993,13 +3004,9 @@ pub(crate) fn observe_turn_end_without_tools(
     // need to feed the observation journal and persistence store so the
     // self-status block and cross-session analysis see them.
     {
-        let tokens = state.total_prompt
-            + state.total_completion
-            + state.total_cache_read
-            + state.total_cache_creation;
         let mut metrics = astra_core::TurnMetrics::default();
         metrics.rounds_completed = state.llm_rounds_completed;
-        metrics.tokens_consumed = tokens;
+        metrics.tokens_consumed = tokens_consumed;
 
         state.observation_journal.record_turn(&metrics);
         let facts = state
@@ -3088,6 +3095,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             turn_index,
             prep.turn_start_time,
             turn_result.ttft_ms,
+            turn_result_tokens_consumed(turn_result),
         );
         state.step_recorder.end_turn(false);
         finalize_and_render(host, state).await;
@@ -3447,17 +3455,29 @@ mod tests {
         state.session_turn = 6;
         state.max_turns = 20;
         state.remaining_turns = 4;
+        state.total_prompt = 10_000;
+        state.total_completion = 20_000;
+        state.total_cache_read = 30_000;
+        state.total_cache_creation = 40_000;
         let hub = ObservabilityHub::new();
         let session = hub.start_session("u1", "s1");
         state.telemetry.observability_hub = Some(Arc::new(hub));
         state.telemetry.observability_session = Some(session.clone());
 
         let turn_start_time = Instant::now() - Duration::from_millis(25);
-        observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7));
+        observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7), 123);
 
         let guard = session.read().unwrap();
         assert_eq!(guard.turn_timings.len(), 1);
         assert_eq!(guard.turn_timings[0].turn, 6);
+        assert_eq!(
+            state
+                .observation_journal
+                .last_entry()
+                .map(|entry| entry.tokens_consumed),
+            Some(123),
+            "tool-less observation must record the current LLM round cost, not cumulative session tokens"
+        );
     }
 
     #[test]

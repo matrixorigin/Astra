@@ -33,21 +33,22 @@ use crate::task_mgmt::{MAX_CREATE_SUBTASKS, SessionTask, SessionTaskStatusKind, 
 /// When the plan changes its subtask structure the fingerprint changes, which
 /// tells the mirror to re-create task-board entries from scratch.
 pub fn plan_task_board_fingerprint(plan: &TaskPlan) -> String {
-    let mut hash_buf = String::with_capacity(plan.subtasks.len() * 64);
-    for subtask in &plan.subtasks {
-        use std::fmt::Write;
-        let _ = write!(hash_buf, "{}|{}|", subtask.id, subtask.title);
-        if let Some(ref desc) = subtask.description {
-            let _ = write!(hash_buf, "{desc}|");
-        }
-        let mut deps = subtask.depends_on.clone();
-        deps.sort();
-        for dep in &deps {
-            let _ = write!(hash_buf, "{dep},");
-        }
-        let _ = writeln!(hash_buf);
-    }
-    hash_buf
+    let canonical: Vec<serde_json::Value> = plan
+        .subtasks
+        .iter()
+        .map(|subtask| {
+            let mut depends_on = subtask.depends_on.clone();
+            depends_on.sort();
+            serde_json::json!({
+                "id": subtask.id,
+                "title": subtask.title,
+                "description": subtask.description,
+                "depends_on": depends_on,
+            })
+        })
+        .collect();
+    serde_json::to_string(&canonical)
+        .expect("plan task-board fingerprint serialization must be infallible")
 }
 
 /// Single identity check for approved-plan tasks.
@@ -392,6 +393,83 @@ pub async fn pause_other_in_progress_tasks_for_plan_handoff(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Plan markdown → TaskPlan parser
+// ---------------------------------------------------------------------------
+
+/// Parse a numbered-list plan markdown into a [`TaskPlan`].
+///
+/// Recognizes lines like `1. Do the thing` or `1) Do the thing` as plan
+/// steps. Each step becomes a `SubtaskPlan` with sequential dependencies
+/// (step N depends on step N-1).
+///
+/// Returns `None` when no numbered steps are found.
+pub fn parse_plan_markdown_to_task_plan(markdown: &str) -> Option<TaskPlan> {
+    let mut subtasks: Vec<SubtaskPlan> = Vec::new();
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        // Match patterns: "1. Title", "1) Title", "1 - Title"
+        // Use trim_start_matches to handle multi-digit numbers (10, 100, etc.)
+        let title = if let Some(rest) = trimmed
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .strip_prefix('.')
+            .or_else(|| {
+                trimmed
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .strip_prefix(')')
+            })
+            .or_else(|| {
+                trimmed
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .strip_prefix(" -")
+            }) {
+            rest.trim()
+        } else {
+            continue;
+        };
+
+        if title.is_empty() {
+            continue;
+        }
+
+        let title = truncate_plan_step_title(title);
+
+        let depends_on: Vec<String> = if subtasks.is_empty() {
+            Vec::new()
+        } else {
+            vec![subtasks.last().unwrap().id.clone()]
+        };
+
+        subtasks.push(SubtaskPlan {
+            id: format!("step-{}", subtasks.len() + 1),
+            title,
+            description: Some(String::new()),
+            depends_on,
+            ..Default::default()
+        });
+    }
+
+    if subtasks.is_empty() {
+        return None;
+    }
+
+    Some(TaskPlan {
+        subtasks,
+        ..Default::default()
+    })
+}
+
+fn truncate_plan_step_title(title: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    if title.chars().count() <= MAX_CHARS {
+        return title.to_string();
+    }
+    let mut truncated: String = title.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +500,32 @@ mod tests {
         assert_ne!(
             fp_a, fp_b,
             "dependency changes must produce different fingerprints"
+        );
+    }
+
+    #[test]
+    fn fingerprint_does_not_collide_on_delimiter_characters() {
+        let plan_a = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "a|b".into(),
+                title: "c".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan_b = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "a".into(),
+                title: "b|c".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_ne!(
+            plan_task_board_fingerprint(&plan_a),
+            plan_task_board_fingerprint(&plan_b),
+            "fingerprint identity must be field-structured, not delimiter-encoded"
         );
     }
 
@@ -520,7 +624,16 @@ mod tests {
         let long = "x".repeat(250);
         let md = format!("1. {long}");
         let plan = parse_plan_markdown_to_task_plan(&md).unwrap();
-        assert_eq!(plan.subtasks[0].title.len(), 200);
+        assert_eq!(plan.subtasks[0].title.chars().count(), 200);
+        assert!(plan.subtasks[0].title.ends_with('…'));
+    }
+
+    #[test]
+    fn parse_plan_markdown_truncates_long_multibyte_title_without_panic() {
+        let long = "修复".repeat(150);
+        let md = format!("1. {long}");
+        let plan = parse_plan_markdown_to_task_plan(&md).unwrap();
+        assert_eq!(plan.subtasks[0].title.chars().count(), 200);
         assert!(plan.subtasks[0].title.ends_with('…'));
     }
 
@@ -626,76 +739,4 @@ mod tests {
             .unwrap();
         assert!(manager.load_active_tasks().await.unwrap().is_empty());
     }
-}
-
-// ---------------------------------------------------------------------------
-// Plan markdown → TaskPlan parser
-// ---------------------------------------------------------------------------
-
-/// Parse a numbered-list plan markdown into a [`TaskPlan`].
-///
-/// Recognizes lines like `1. Do the thing` or `1) Do the thing` as plan
-/// steps. Each step becomes a `SubtaskPlan` with sequential dependencies
-/// (step N depends on step N-1).
-///
-/// Returns `None` when no numbered steps are found.
-pub fn parse_plan_markdown_to_task_plan(markdown: &str) -> Option<TaskPlan> {
-    let mut subtasks: Vec<SubtaskPlan> = Vec::new();
-
-    for line in markdown.lines() {
-        let trimmed = line.trim();
-        // Match patterns: "1. Title", "1) Title", "1 - Title"
-        // Use trim_start_matches to handle multi-digit numbers (10, 100, etc.)
-        let title = if let Some(rest) = trimmed
-            .trim_start_matches(|c: char| c.is_ascii_digit())
-            .strip_prefix('.')
-            .or_else(|| {
-                trimmed
-                    .trim_start_matches(|c: char| c.is_ascii_digit())
-                    .strip_prefix(')')
-            })
-            .or_else(|| {
-                trimmed
-                    .trim_start_matches(|c: char| c.is_ascii_digit())
-                    .strip_prefix(" -")
-            }) {
-            rest.trim()
-        } else {
-            continue;
-        };
-
-        if title.is_empty() {
-            continue;
-        }
-
-        // Truncate title to a reasonable length
-        let title = if title.len() > 200 {
-            format!("{}…", &title[..197])
-        } else {
-            title.to_string()
-        };
-
-        let depends_on: Vec<String> = if subtasks.is_empty() {
-            Vec::new()
-        } else {
-            vec![subtasks.last().unwrap().id.clone()]
-        };
-
-        subtasks.push(SubtaskPlan {
-            id: format!("step-{}", subtasks.len() + 1),
-            title,
-            description: Some(String::new()),
-            depends_on,
-            ..Default::default()
-        });
-    }
-
-    if subtasks.is_empty() {
-        return None;
-    }
-
-    Some(TaskPlan {
-        subtasks,
-        ..Default::default()
-    })
 }

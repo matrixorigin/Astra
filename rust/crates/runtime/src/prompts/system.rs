@@ -1213,8 +1213,9 @@ fn task_lifecycle_section(tool_names: &[&str]) -> String {
     }
     "\n## Task Lifecycle\n\
      - When facing 3+ distinct outcomes or work spanning multiple files, break it into subtasks with `task create`.\n\
-     - Claim before starting: `task update subtask_id=X new_status=in_progress`.\n\
-     - Mark done after verifying: `task update subtask_id=X new_status=completed`.\n\
+     - Claim before starting: `task update task_id=task-1 new_status=in_progress`.\n\
+     - Mark done after verifying: `task update task_id=task-1 new_status=completed`.\n\
+     - For a child item, include its parent: `task update task_id=task-1 subtask_id=s1 new_status=completed`.\n\
      - Check remaining: `task list` to see what is unfinished.\n\
      - The task board is your working memory across turns — if the session resumes or you are interrupted, read it before acting.\n"
         .to_string()
@@ -2369,6 +2370,12 @@ mod tests {
         let p_task = build_main_system_prompt(&["task", "bash"], "", None);
         assert!(p_task.contains("Task Lifecycle"));
         assert!(p_task.contains("task create"));
+        assert!(p_task.contains("task update task_id=task-1 new_status=in_progress"));
+        assert!(p_task.contains("task update task_id=task-1 subtask_id=s1 new_status=completed"));
+        assert!(
+            !p_task.contains("task update subtask_id=X"),
+            "task update examples must include the required parent task_id"
+        );
 
         // Task lifecycle: no task tool → no lifecycle guidance
         let p_no_task = build_main_system_prompt(&["bash", "read_file"], "", None);

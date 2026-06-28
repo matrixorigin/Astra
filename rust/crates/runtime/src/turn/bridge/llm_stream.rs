@@ -1827,7 +1827,7 @@ mod tests {
             // final usage, then message_stop.
             let sse = concat!(
                 "event: message_start\n",
-                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":42,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":10,\"output_tokens\":0}}}\n\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":42,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":10,\"output_tokens\":0}}}\n\n",
                 "event: content_block_start\n",
                 "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
                 "event: content_block_delta\n",
@@ -1929,6 +1929,14 @@ mod tests {
                 .unwrap_or(0),
             10,
             "cached_input_tokens must propagate — got {last_usage}",
+        );
+        assert_eq!(
+            last_usage
+                .get("cache_creation_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            2,
+            "cache_creation_tokens must propagate from message_start to final usage — got {last_usage}",
         );
         assert!(
             last_usage

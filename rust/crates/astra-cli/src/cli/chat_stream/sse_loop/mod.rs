@@ -737,7 +737,6 @@ pub(crate) async fn stream_chat_sse(
         last_request_message_count: None,
         turn_guard,
         budget_policy: None,
-        policy_expanded_this_turn: false,
         restricted_tools: initial_restricted,
         boosted_tools: HashSet::new(),
         widen_selection_pending: false,

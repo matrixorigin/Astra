@@ -1023,13 +1023,17 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
     // Space priority: title > toggle hint > subtask counts > status breakdown.
     // The user must always see what's being worked on.
     if let Some(task) = current_task {
-        let title_budget = max_subject_width(columns).saturating_sub(2);
-        let title = truncate_to_width(&task.title, title_budget);
-        spans.push(Span::styled(
-            " · ".to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        spans.push(Span::styled(title, Style::default()));
+        let used: usize = spans.iter().map(|s| s.content.width()).sum();
+        let sep = " · ";
+        let title_budget = (columns as usize).saturating_sub(used + sep.width());
+        if title_budget > 0 {
+            let title = truncate_to_width(&task.title, title_budget);
+            spans.push(Span::styled(
+                sep.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            spans.push(Span::styled(title, Style::default()));
+        }
     }
 
     let used: usize = spans.iter().map(|s| s.content.width()).sum();
@@ -1041,10 +1045,14 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
     }
 
     if sub_total > 0 {
-        spans.push(Span::styled(
-            format!(" · {sub_done}/{sub_total} done"),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+        let label = format!(" · {sub_done}/{sub_total} done");
+        let used: usize = spans.iter().map(|s| s.content.width()).sum();
+        if used + label.width() <= columns as usize {
+            spans.push(Span::styled(
+                label,
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
     }
 
     Some(Line::from(spans))
@@ -1356,6 +1364,43 @@ mod tests {
         let line = render_collapsed_summary(&[parent], 100).expect("non-empty");
         let text = spans_text(&line);
         assert!(text.contains("1/2 done"), "{text}");
+    }
+
+    #[test]
+    fn collapsed_summary_never_overflows_columns_with_long_title_and_subtasks() {
+        use astra_tools::task_mgmt::SessionSubtask;
+        let mut parent = mk_task(
+            "task-1",
+            "this is a very long current task title that must be clipped before optional suffixes",
+            "in_progress",
+        );
+        parent.subtasks = vec![
+            SessionSubtask {
+                id: "s1".into(),
+                title: "first".into(),
+                description: None,
+                status: "completed".into(),
+                depends_on: vec![],
+                owner: None,
+                reason: None,
+            },
+            SessionSubtask {
+                id: "s2".into(),
+                title: "second".into(),
+                description: None,
+                status: "pending".into(),
+                depends_on: vec![],
+                owner: None,
+                reason: None,
+            },
+        ];
+
+        let line = render_collapsed_summary(&[parent], 40).expect("non-empty");
+        let text = spans_text(&line);
+        assert!(
+            unicode_width::UnicodeWidthStr::width(text.as_str()) <= 40,
+            "collapsed summary must fit its render width: {text:?}"
+        );
     }
 
     #[test]

@@ -2711,32 +2711,13 @@ mod tests {
 
     fn init_temp_repo() -> TempDir {
         let dir = TempDir::new().expect("temp repo");
-        std::process::Command::new("git")
-            .arg("init")
-            .current_dir(dir.path())
-            .output()
-            .expect("git init");
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(dir.path())
-            .output()
-            .expect("git config user.name");
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir.path())
-            .output()
-            .expect("git config user.email");
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.name", "Test User"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "commit.gpgsign", "false"]);
         std::fs::write(dir.path().join("tracked.txt"), "one\n").expect("seed tracked file");
-        std::process::Command::new("git")
-            .args(["add", "tracked.txt"])
-            .current_dir(dir.path())
-            .output()
-            .expect("git add");
-        std::process::Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(dir.path())
-            .output()
-            .expect("git commit");
+        run_git(dir.path(), &["add", "tracked.txt"]);
+        run_git(dir.path(), &["commit", "-m", "init"]);
         dir
     }
 
@@ -2813,6 +2794,13 @@ mod tests {
             let message = format!("update tracked {commit_index}");
             run_git(root, &["commit", "-m", &message]);
         }
+        let actual_commits: usize = git_stdout(root, &["rev-list", "--count", "HEAD"])
+            .parse()
+            .expect("commit count");
+        assert_eq!(
+            actual_commits, total_commits,
+            "linear diff history must create exactly the requested number of commits"
+        );
         dir
     }
 

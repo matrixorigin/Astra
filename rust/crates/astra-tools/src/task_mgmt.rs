@@ -1995,6 +1995,29 @@ impl TaskManager {
     /// reads from the durable store, and flows through the context pipeline's
     /// proper token accounting.
     pub async fn build_active_task_context(&self) -> Option<String> {
+        fn compact_title(title: &str) -> String {
+            const MAX_CHARS: usize = 120;
+            if title.chars().count() <= MAX_CHARS {
+                return title.to_string();
+            }
+            let mut out: String = title.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+            out.push('…');
+            out
+        }
+
+        fn compact_titles(titles: &[&str]) -> String {
+            const MAX_TITLES: usize = 6;
+            let mut rendered: Vec<String> = titles
+                .iter()
+                .take(MAX_TITLES)
+                .map(|title| compact_title(title))
+                .collect();
+            if titles.len() > MAX_TITLES {
+                rendered.push(format!("+{} more", titles.len() - MAX_TITLES));
+            }
+            rendered.join(", ")
+        }
+
         let tasks = match self.load_tasks().await {
             Ok(t) => t,
             Err(e) => {
@@ -2020,29 +2043,46 @@ impl TaskManager {
             .filter(|t| t.status == SessionTaskStatusKind::Pending)
             .map(|t| t.title.as_str())
             .collect();
+        let paused: Vec<&str> = tasks
+            .iter()
+            .filter(|t| t.status == SessionTaskStatusKind::Paused)
+            .map(|t| t.title.as_str())
+            .collect();
 
-        if in_progress.is_empty() && pending.is_empty() {
+        if in_progress.is_empty() && pending.is_empty() && paused.is_empty() {
             return None;
         }
 
         let mut hint = String::from("## Active Task Board\n");
         if let Some(task) = in_progress.first() {
-            hint.push_str(&format!("- 🔄 In progress: {task}\n"));
+            hint.push_str(&format!("- 🔄 In progress: {}\n", compact_title(task)));
         }
         for task in in_progress.iter().skip(1) {
-            hint.push_str(&format!("- 🔄 Also in progress: {task}\n"));
+            hint.push_str(&format!("- 🔄 Also in progress: {}\n", compact_title(task)));
         }
         if !pending.is_empty() {
             hint.push_str(&format!(
                 "- ⏳ Pending ({}): {}\n",
                 pending.len(),
-                pending.join(", ")
+                compact_titles(&pending)
+            ));
+        }
+        if !paused.is_empty() {
+            hint.push_str(&format!(
+                "- ⏸ Paused ({}): {}\n",
+                paused.len(),
+                compact_titles(&paused)
             ));
         }
         if in_progress.is_empty() && !pending.is_empty() {
             hint.push_str(&format!(
                 "Focus on the first pending task: {}\n",
-                pending[0]
+                compact_title(pending[0])
+            ));
+        } else if in_progress.is_empty() && !paused.is_empty() {
+            hint.push_str(&format!(
+                "Resume or reprioritize the first paused task: {}\n",
+                compact_title(paused[0])
             ));
         } else if !in_progress.is_empty() {
             hint.push_str("Focus on completing the in-progress task before starting new work.\n");
@@ -6702,6 +6742,27 @@ mod tests {
             "{ctx}"
         );
         assert!(ctx.contains("Focus on the first pending"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_includes_paused_open_work() {
+        let m = mgr();
+        m.create(
+            &json!({"title": "Investigate flaky resume loop", "active_form": "investigating"}),
+        )
+        .await;
+        let tasks = m.load_active_tasks().await.unwrap();
+        set_task_status_fixture(&m, &tasks[0].id, SessionTaskStatusKind::Paused).await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert!(
+            ctx.contains("⏸ Paused (1): Investigate flaky resume loop"),
+            "{ctx}"
+        );
+        assert!(
+            ctx.contains("Resume or reprioritize the first paused task"),
+            "{ctx}"
+        );
     }
 
     #[tokio::test]

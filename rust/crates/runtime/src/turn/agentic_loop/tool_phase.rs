@@ -24,7 +24,9 @@ use super::super::agentic::headless_round::{
     run_agentic_headless_tool_round,
 };
 use super::super::agentic::tool_interception::{PreparedToolRound, prepare_intercepted_tool_round};
-use super::execution_phase::{TurnExecutionPhase, observe_turn_end_without_tools};
+use super::execution_phase::{
+    TurnExecutionPhase, observe_turn_end_without_tools, turn_result_tokens_consumed,
+};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
     ControlToolRecovery, MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render,
@@ -1201,6 +1203,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             turn_index,
             prep.turn_start_time,
             turn_result.ttft_ms,
+            turn_result_tokens_consumed(&turn_result),
         );
         finalize_and_render(host, state).await;
         return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
@@ -1263,6 +1266,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             turn_index,
             prep.turn_start_time,
             turn_result.ttft_ms,
+            turn_result_tokens_consumed(&turn_result),
         );
         finalize_and_render(host, state).await;
         return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
@@ -1508,10 +1512,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 error: r.error.as_deref(),
             })
             .collect();
-        let tokens = state.total_prompt
-            + state.total_completion
-            + state.total_cache_read
-            + state.total_cache_creation;
+        let tokens = turn_result_tokens_consumed(&turn_result);
         let metrics =
             astra_core::TurnMetrics::from_samples(&samples, state.llm_rounds_completed, tokens);
 
