@@ -28,6 +28,10 @@ Use these files as the canonical configuration references:
 
 - `ASTRA_API_HOST`, `ASTRA_API_PORT`, `ASTRA_CORS_ORIGINS`
 
+`ASTRA_API_PORT` defaults to `17001` across source, Docker API, and all-in-one
+stack modes. In the all-in-one compose stack, this value controls the
+host-facing published port; the API container listens on port `17001`.
+
 ### Auth secrets (REQUIRED in production)
 
 - `ASTRA_JWT_SECRET`

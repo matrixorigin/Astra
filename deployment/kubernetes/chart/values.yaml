@@ -5,7 +5,7 @@ api:
     repository: astra-engine
     tag: latest
     pullPolicy: IfNotPresent
-  port: 6789
+  port: 17001
   workers: 2
   resources:
     requests:

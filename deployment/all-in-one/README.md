@@ -32,12 +32,12 @@ data volume this performs the initial admin bootstrap. After an admin exists,
 `astra-admin register` must be run while logged in as an existing admin.
 
 ```bash
-./rust/target/debug/astra-admin --api-url http://127.0.0.1:6789 register \
+./rust/target/debug/astra-admin --api-url http://127.0.0.1:17001 register \
   --username admin \
   --email admin@example.com \
   --password '<password>'
 
-./rust/target/debug/astra-admin --api-url http://127.0.0.1:6789 model load .models.yaml --update-existing
+./rust/target/debug/astra-admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
 ```
 
 `astra-admin register` stores the returned admin credentials locally. It prints
@@ -90,12 +90,12 @@ docker compose up -d
 
 | Service | Host port | Description |
 | --- | --- | --- |
-| `api` | `6789` | `astra-server` HTTP API |
+| `api` | `17001` | `astra-server` HTTP API |
 | `memoria` | `8100` | Memoria memory service |
 | `matrixone` | `26001` | MatrixOne MySQL-compatible endpoint |
 | `matrixone` debug | `26060` | MatrixOne debug/health endpoint |
 
-`ASTRA_API_PORT` in `.env` controls the host-facing published port. The API container itself listens on `6789`.
+`ASTRA_API_PORT` in `.env` controls the host-facing published port. The API container itself listens on `17001`.
 
 ## Images
 
@@ -121,7 +121,7 @@ make stack-logs SERVICE=api
 docker compose ps
 docker compose logs -f api
 docker compose logs -f memoria
-curl http://localhost:6789/health
+curl http://localhost:17001/health
 ```
 
 Stop the stack:

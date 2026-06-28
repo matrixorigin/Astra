@@ -138,7 +138,7 @@ aws elbv2 create-load-balancer \
 aws elbv2 create-target-group \
   --name astra-targets \
   --protocol HTTP \
-  --port 6789 \
+  --port 17001 \
   --vpc-id vpc-xxx \
   --health-check-path /health
 ```

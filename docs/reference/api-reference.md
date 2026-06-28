@@ -1,8 +1,8 @@
 # API Reference
 
-Base URL: `http://localhost:6789`
+Base URL: `http://localhost:17001`
 
-Interactive docs: `http://localhost:6789/docs` (Swagger UI) | `http://localhost:6789/redoc` (ReDoc)
+Interactive docs: `http://localhost:17001/docs` (Swagger UI) | `http://localhost:17001/redoc` (ReDoc)
 
 ## Authentication
 

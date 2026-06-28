@@ -106,7 +106,9 @@ CLI_BINS := astra astra-admin
 IMAGE_NAME ?= matrixorigin/astra
 DOCKER_BUILD_ARGS ?=
 DOCKER_PROXY_BUILD_ARGS := --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
-DEFAULT_API_PORT := 6789
+# Project-wide default for every API server mode. Compose may remap the
+# host-facing port, but the container listens on this value.
+DEFAULT_API_PORT := 17001
 STACK_DIR := deployment/all-in-one
 STACK_ENV := $(STACK_DIR)/.env
 STACK_COMPOSE := cd $(STACK_DIR) && docker compose --env-file $(abspath $(STACK_ENV))

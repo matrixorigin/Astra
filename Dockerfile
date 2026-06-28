@@ -6,6 +6,12 @@ FROM rust:${RUST_VERSION} AS builder
 
 ARG CARGO_REGISTRY
 ARG DEBIAN_MIRROR
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 WORKDIR /app
 
@@ -80,6 +86,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim
 
 ARG DEBIAN_MIRROR
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
 
 WORKDIR /app
 RUN set -eux; \
@@ -100,12 +112,12 @@ COPY --from=builder /app/rust/target/release/astra-admin /usr/local/bin/astra-ad
 RUN chown root:appgroup /app && chmod 1770 /app
 USER appuser
 
-EXPOSE 6789
+EXPOSE 17001
 ENV HOME=/home/appuser
 ENV ASTRA_API_HOST=0.0.0.0
-ENV ASTRA_API_PORT=6789
+ENV ASTRA_API_PORT=17001
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -fsS http://localhost:6789/health >/dev/null || exit 1
+    CMD curl -fsS http://localhost:17001/health >/dev/null || exit 1
 
 CMD ["astra-server"]

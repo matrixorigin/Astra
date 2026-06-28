@@ -10,7 +10,7 @@ Group=astra
 WorkingDirectory=/opt/astra
 EnvironmentFile=/opt/astra/.env
 Environment=ASTRA_API_HOST=0.0.0.0
-Environment=ASTRA_API_PORT=6789
+Environment=ASTRA_API_PORT=17001
 ExecStart=/usr/local/bin/astra-rs-api-shell
 Restart=always
 RestartSec=10

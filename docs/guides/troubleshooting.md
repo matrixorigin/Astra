@@ -6,7 +6,7 @@
 make dev-status
 make dev-api-logs
 make dev-deps-logs
-curl http://localhost:6789/health
+curl http://localhost:17001/health
 ```
 
 ## Cargo Missing

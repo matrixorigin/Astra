@@ -65,7 +65,7 @@ db_reachable() {
 }
 
 api_reachable() {
-    curl -sf http://localhost:6789/health >/dev/null 2>&1
+    curl -sf http://localhost:17001/health >/dev/null 2>&1
 }
 
 matrixone_db_name() {
@@ -172,7 +172,7 @@ preflight() {
     if api_reachable; then
         ok "API server reachable"
     else
-        err "API server not reachable (localhost:6789)"
+        err "API server not reachable (localhost:17001)"
         echo ""
         echo "  Start it with:  make dev-start"
         echo "  Then re-run:    make dev-setup-demo"
@@ -448,8 +448,8 @@ summary() {
     cur=$(current_profile)
 
     echo "  Current profile:  ${cur:-<none>}"
-    echo "  API server:       http://localhost:6789"
-    echo "  API docs:         http://localhost:6789/docs"
+    echo "  API server:       http://localhost:17001"
+    echo "  API docs:         http://localhost:17001/docs"
     echo ""
     echo "  Quick start:"
     echo "    astra chat                    # start chatting"

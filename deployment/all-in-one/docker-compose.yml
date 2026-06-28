@@ -112,12 +112,12 @@ services:
     command: ["astra-server"]
     env_file: *astra-env-files
     ports:
-      # ASTRA_API_PORT is the host-facing port. The container listens on 6789.
-      - "${ASTRA_API_PORT:-6789}:6789"
+      # ASTRA_API_PORT is the host-facing port. The container listens on 17001.
+      - "${ASTRA_API_PORT:-17001}:17001"
     environment:
       RUST_LOG: ${ASTRA_RUST_LOG:-info}
       ASTRA_API_HOST: 0.0.0.0
-      ASTRA_API_PORT: 6789
+      ASTRA_API_PORT: 17001
       ASTRA_CORS_ORIGINS: ${ASTRA_CORS_ORIGINS:-}
       ASTRA_ALLOW_INSECURE_DEFAULTS: ${ASTRA_ALLOW_INSECURE_DEFAULTS:-0}
       ASTRA_AUTO_CREATE_DATABASE: ${ASTRA_AUTO_CREATE_DATABASE:-1}
@@ -145,7 +145,7 @@ services:
     networks:
       - mo-net
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:6789/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:17001/health"]
       interval: 30s
       timeout: 5s
       retries: 5

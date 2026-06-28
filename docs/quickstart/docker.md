@@ -19,7 +19,7 @@ make stack-env
 make stack-up
 
 # 4. Verify
-curl http://localhost:6789/health
+curl http://localhost:17001/health
 ```
 
 ## Compose Stack
@@ -69,11 +69,15 @@ MEMORIA_EMBEDDING_API_KEY=...
 MEMORIA_EMBEDDING_BASE_URL=...
 
 # Host ports
-ASTRA_API_PORT=6789
+ASTRA_API_PORT=17001
 MEMORIA_PORT=8100
 MATRIXONE_PORT=26001
 MATRIXONE_DEBUG_HTTP_PORT=26060
 ```
+
+`ASTRA_API_PORT` is the public host port for the all-in-one stack. The API
+container itself listens on `17001`, so changing this value remaps the host port
+without changing the in-container listener.
 
 See [Configuration Reference](../reference/configuration.md) for all options.
 
@@ -81,7 +85,7 @@ See [Configuration Reference](../reference/configuration.md) for all options.
 
 The stack includes:
 
-- **api**: REST API (port 6789)
+- **api**: REST API (port 17001)
 - **memoria**: memory service (port 8100)
 - **matrixone**: database (port 26001, debug port 26060)
 
@@ -130,7 +134,7 @@ docker compose down -v
 make stack-status
 
 # API health
-curl http://localhost:6789/health
+curl http://localhost:17001/health
 
 # MatrixOne
 cd deployment/all-in-one && docker compose exec matrixone mysql -h127.0.0.1 -P6001 -uroot -p111 -e "SELECT 1"

@@ -161,7 +161,7 @@ make dev-api-logs
 
 Common issues:
 
-- Port 6789 already in use: `lsof -i :6789` and kill the process
+- Port 17001 already in use: `lsof -i :17001` and kill the process
 - Dependencies not ready: Wait and retry
 - **Missing JWT secret / bridge secret**: If you see `MissingRequiredKey` for `JWT_SECRET` or `BRIDGE_SECRET`:
   - Run `make dev-init` (auto-generates secrets in `.env`)

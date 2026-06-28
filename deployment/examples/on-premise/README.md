@@ -50,7 +50,7 @@ cp .env.example .env
 docker-compose -f docker-compose.prod.yml up -d
 
 # 4. Verify
-curl http://localhost:6789/health
+curl http://localhost:17001/health
 ```
 
 ### Option 2: Systemd Services
@@ -82,9 +82,9 @@ sudo systemctl status astra
 # /etc/nginx/sites-available/astra
 upstream api_backend {
     least_conn;
-    server 10.0.1.10:6789 max_fails=3 fail_timeout=30s;
-    server 10.0.1.11:6789 max_fails=3 fail_timeout=30s;
-    server 10.0.1.12:6789 max_fails=3 fail_timeout=30s;
+    server 10.0.1.10:17001 max_fails=3 fail_timeout=30s;
+    server 10.0.1.11:17001 max_fails=3 fail_timeout=30s;
+    server 10.0.1.12:17001 max_fails=3 fail_timeout=30s;
 }
 
 server {

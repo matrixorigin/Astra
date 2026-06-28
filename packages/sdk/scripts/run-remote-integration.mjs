@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Run Vitest Mode B (remote) with defaults for local dev: E2E=1 and
- * ASTRA_SDK_BASE_URL=http://127.0.0.1:6789 when unset (matches Makefile dev-start).
+ * ASTRA_SDK_BASE_URL=http://127.0.0.1:17001 when unset (matches Makefile dev-start).
  *
  *   npm run test:integration:remote
  *   ASTRA_SDK_BASE_URL=http://other:9 npm run test:integration:remote
@@ -17,7 +17,7 @@ const vitestBin = join(pkgRoot, 'node_modules', 'vitest', 'vitest.mjs');
 
 process.env.ASTRA_SDK_E2E = '1';
 if (!process.env.ASTRA_SDK_BASE_URL) {
-  process.env.ASTRA_SDK_BASE_URL = 'http://127.0.0.1:6789';
+  process.env.ASTRA_SDK_BASE_URL = 'http://127.0.0.1:17001';
 }
 
 const code =

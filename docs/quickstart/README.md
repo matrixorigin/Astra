@@ -17,7 +17,7 @@ make dev-start
 make dev-status
 ```
 
-Open `http://localhost:6789/docs`.
+Open `http://localhost:17001/docs`.
 
 ## Docker App Stack
 

@@ -10,7 +10,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Configuration
-API_URL="${API_URL:-http://localhost:6789}"
+API_URL="${API_URL:-http://localhost:17001}"
 
 if [ -f .env ]; then
     set -a; source .env; set +a

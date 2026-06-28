@@ -8,8 +8,8 @@
  *   ASTRA_SDK_BASE_URL=... ASTRA_SDK_ACCESS_TOKEN=... node scripts/sdk-online-smoke.mjs
  *   ASTRA_SDK_PATH_PREFIX=/api ...  # prepended to /auth/*, /sessions, /chat/...
  */
-/** Default: Makefile `make dev-start` API on http://localhost:6789 */
-const base = process.env.ASTRA_SDK_BASE_URL || 'http://127.0.0.1:6789';
+/** Default: Makefile `make dev-start` API on http://localhost:17001 */
+const base = process.env.ASTRA_SDK_BASE_URL || 'http://127.0.0.1:17001';
 if (!process.env.ASTRA_SDK_BASE_URL) {
   // eslint-disable-next-line no-console
   console.info(`[sdk-online-smoke] ASTRA_SDK_BASE_URL unset, using default: ${base}`);

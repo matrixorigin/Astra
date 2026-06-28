@@ -10,7 +10,7 @@ source "$ROOT_DIR/scripts/dev/web-config.sh"
 WEB_DIR="$ROOT_DIR/web"
 WEB_PORT="$(web_agent_port)"
 WEB_HOST="$(web_agent_host)"
-API_URL="${ASTRA_API_URL:-http://localhost:${ASTRA_API_PORT:-6789}}"
+API_URL="${ASTRA_API_URL:-http://localhost:${ASTRA_API_PORT:-17001}}"
 NEXT_DIST_DIR="${ASTRA_NEXT_DIST_DIR:-.next-dev}"
 NEXT_BIN="$WEB_DIR/node_modules/next/dist/bin/next"
 

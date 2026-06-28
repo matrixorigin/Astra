@@ -25,13 +25,13 @@ make dev-deps-up      # MatrixOne + Memoria
 make dev-api-start    # API server (auto-creates database schema)
 ```
 
-Open `http://localhost:6789/health` to verify.
+Open `http://localhost:17001/health` to verify.
 
 You can also start the runtime directly from the CLI:
 
 ```bash
-astra serve                         # HTTP API server, defaults to 127.0.0.1:6789
-astra serve http --port 6789        # explicit HTTP mode
+astra serve                         # HTTP API server, defaults to 127.0.0.1:17001
+astra serve http --port 17001        # explicit HTTP mode
 astra serve stdio                   # stdio JSON-RPC app-server mode
 ```
 

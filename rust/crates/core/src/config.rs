@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 pub(crate) const DEFAULT_MEMORIA_URL: &str = "http://127.0.0.1:8100";
 
 /// Default host-facing HTTP API port for local development and single-host stacks.
-pub const DEFAULT_API_PORT: u16 = 6789;
+pub const DEFAULT_API_PORT: u16 = 17001;
 
 /// Default client-facing HTTP API URL.
-pub const DEFAULT_API_URL: &str = "http://127.0.0.1:6789";
+pub const DEFAULT_API_URL: &str = "http://127.0.0.1:17001";
 
 /// Default max connections for the shared DB pool.
 /// Sized for 50 concurrent runs + sweepers + HTTP handlers + WS overhead.
