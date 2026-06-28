@@ -1651,7 +1651,7 @@ mod tests {
 
         assert!(policy.visible_tool_names.is_empty());
         assert!(policy.evidence_tool_names.is_empty());
-        assert!(policy.allow_ask_user);
+        assert!(!policy.allow_ask_user);
     }
 
     #[test]

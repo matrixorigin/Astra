@@ -738,7 +738,7 @@ pub(crate) fn initialize_session_state(
     state.perm_manager = match cli_context.permission_mode.as_deref() {
         Some(mode) => PermissionManager::with_workspace_trust_mode(
             mode.parse::<PermissionMode>()
-                .unwrap_or(PermissionMode::Ask),
+                .unwrap_or(PermissionMode::Prompt),
             &project_root,
         ),
         None => PermissionManager::with_workspace_trust(cli_context.auto_approve, &project_root),

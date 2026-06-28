@@ -90,14 +90,14 @@ fn auto_mode_sensitive_path_denial_reason(path: &str) -> String {
         PathSensitivity::Sensitive => {
             format!(
                 "Sandbox: Path '{}' is blocked as a sensitive credential path. \
-                 To allow: add an allow rule in .astra/permissions.json or switch to Ask mode.",
+                 To allow: add an allow rule in .astra/permissions.json or switch to Prompt mode.",
                 path
             )
         }
         PathSensitivity::WriteSensitive => {
             format!(
                 "Sandbox: Path '{}' is blocked as write-sensitive app/runtime state. \
-                 To allow: add an allow rule in .astra/permissions.json or switch to Ask mode.",
+                 To allow: add an allow rule in .astra/permissions.json or switch to Prompt mode.",
                 path
             )
         }
@@ -110,7 +110,7 @@ fn auto_mode_sensitive_path_denial_reason(path: &str) -> String {
         PathSensitivity::Normal => {
             format!(
                 "Sandbox: Path '{}' is blocked in Auto mode. \
-                 To allow: add an allow rule in .astra/permissions.json or switch to Ask mode.",
+                 To allow: add an allow rule in .astra/permissions.json or switch to Prompt mode.",
                 path
             )
         }
@@ -449,7 +449,7 @@ fn cloud_detail_is_sensitive(tool: &str, detail: Option<&str>) -> bool {
     }
 }
 
-fn edits_auto_allows_tool_args(tool: &str, args: &serde_json::Value) -> bool {
+fn accept_edits_auto_allows_tool_args(tool: &str, args: &serde_json::Value) -> bool {
     matches!(
         (
             cloud_gated_tool_kind_with_args(tool, Some(args)),
@@ -459,10 +459,10 @@ fn edits_auto_allows_tool_args(tool: &str, args: &serde_json::Value) -> bool {
     )
 }
 
-fn edits_auto_allows_cloud_request(tool: &str, detail: Option<&str>) -> bool {
+fn accept_edits_auto_allows_cloud_request(tool: &str, detail: Option<&str>) -> bool {
     match (cloud_gated_tool_kind(tool), detail) {
         (Some(CloudGatedToolKind::Write), Some(path)) => {
-            edits_auto_allows_tool_args(tool, &serde_json::json!({ "path": path }))
+            accept_edits_auto_allows_tool_args(tool, &serde_json::json!({ "path": path }))
         }
         _ => false,
     }
@@ -521,11 +521,11 @@ pub(crate) use astra_turn_core::permission::types::PermissionRule;
 /// stable; widening the enum requires updating both directions.
 fn encode_mode_for_mirror(mode: PermissionMode) -> u8 {
     match mode {
-        PermissionMode::Ask => 0,
+        PermissionMode::Prompt => 0,
         PermissionMode::Auto => 1,
         PermissionMode::Plan => 2,
-        PermissionMode::Edits => 3,
-        PermissionMode::Ci => 4,
+        PermissionMode::AcceptEdits => 3,
+        PermissionMode::Deny => 4,
     }
 }
 
@@ -533,9 +533,9 @@ fn decode_mode_for_mirror(value: u8) -> PermissionMode {
     match value {
         1 => PermissionMode::Auto,
         2 => PermissionMode::Plan,
-        3 => PermissionMode::Edits,
-        4 => PermissionMode::Ci,
-        _ => PermissionMode::Ask,
+        3 => PermissionMode::AcceptEdits,
+        4 => PermissionMode::Deny,
+        _ => PermissionMode::Prompt,
     }
 }
 
@@ -1433,7 +1433,7 @@ impl PermissionManager {
         let mode = if auto_approve {
             PermissionMode::Auto
         } else {
-            PermissionMode::Ask
+            PermissionMode::Prompt
         };
         Self {
             mode,
@@ -1469,7 +1469,7 @@ impl PermissionManager {
         let mode = if auto_approve {
             PermissionMode::Auto
         } else {
-            PermissionMode::Ask
+            PermissionMode::Prompt
         };
         Self::with_project_mode(mode, project_root)
     }
@@ -1492,7 +1492,7 @@ impl PermissionManager {
         let mode = if auto_approve {
             PermissionMode::Auto
         } else {
-            PermissionMode::Ask
+            PermissionMode::Prompt
         };
         Self::with_workspace_trust_mode(mode, project_root)
     }
@@ -1618,9 +1618,11 @@ impl PermissionManager {
         let mode = match inherited.mode {
             astra_runtime::orchestration::PermissionMode::Auto => PermissionMode::Auto,
             astra_runtime::orchestration::PermissionMode::Plan => PermissionMode::Plan,
-            astra_runtime::orchestration::PermissionMode::Edits => PermissionMode::Edits,
-            astra_runtime::orchestration::PermissionMode::Ask => PermissionMode::Ask,
-            astra_runtime::orchestration::PermissionMode::Ci => PermissionMode::Ci,
+            astra_runtime::orchestration::PermissionMode::AcceptEdits => {
+                PermissionMode::AcceptEdits
+            }
+            astra_runtime::orchestration::PermissionMode::Prompt => PermissionMode::Prompt,
+            astra_runtime::orchestration::PermissionMode::Deny => PermissionMode::Deny,
         };
         let project_outcome = PermissionSettings::try_load(project_root);
         let user_outcome = PermissionSettings::try_load_user();
@@ -1775,9 +1777,9 @@ impl PermissionManager {
         let mode = match self.mode {
             PermissionMode::Auto => RuntimePermissionMode::Auto,
             PermissionMode::Plan => RuntimePermissionMode::Plan,
-            PermissionMode::Edits => RuntimePermissionMode::Edits,
-            PermissionMode::Ask => RuntimePermissionMode::Ask,
-            PermissionMode::Ci => RuntimePermissionMode::Ci,
+            PermissionMode::AcceptEdits => RuntimePermissionMode::AcceptEdits,
+            PermissionMode::Prompt => RuntimePermissionMode::Prompt,
+            PermissionMode::Deny => RuntimePermissionMode::Deny,
         };
 
         let mut inherited = self
@@ -1863,7 +1865,7 @@ impl PermissionManager {
                     if !was_auto {
                         eprintln!(
                             "  {}",
-                            "  ⚡ Auto-run enabled for this session. Use /allow ask to restore."
+                            "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
                                 .yellow()
                         );
                     }
@@ -1925,7 +1927,7 @@ impl PermissionManager {
                     if !was_auto {
                         eprintln!(
                             "  {}",
-                            "  ⚡ Auto-run enabled for this session. Use /allow ask to restore."
+                            "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
                                 .yellow()
                         );
                     }
@@ -2040,7 +2042,7 @@ impl PermissionManager {
             self.set_mode(PermissionMode::Auto);
             eprintln!(
                 "  {}",
-                "  ⚡ Auto-run enabled for this session. Use /allow ask to restore.".yellow()
+                "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore.".yellow()
             );
             for (idx, _, _, _, _) in unresolved {
                 decisions[idx] = Some(ApprovalDecision::Allow);
@@ -2106,7 +2108,7 @@ impl PermissionManager {
         }
 
         if sensitive_path {
-            if matches!(self.mode, PermissionMode::Plan | PermissionMode::Ci) {
+            if matches!(self.mode, PermissionMode::Plan | PermissionMode::Deny) {
                 return Some(ApprovalDecision::Deny);
             }
             if self.mode == PermissionMode::Auto {
@@ -2131,10 +2133,12 @@ impl PermissionManager {
             return Some(match self.mode {
                 PermissionMode::Auto => ApprovalDecision::Allow,
                 PermissionMode::Plan => ApprovalDecision::Deny,
-                PermissionMode::Edits if edits_auto_allows_cloud_request(tool, detail) => {
+                PermissionMode::AcceptEdits
+                    if accept_edits_auto_allows_cloud_request(tool, detail) =>
+                {
                     ApprovalDecision::Allow
                 }
-                PermissionMode::Edits | PermissionMode::Ask | PermissionMode::Ci => {
+                PermissionMode::AcceptEdits | PermissionMode::Prompt | PermissionMode::Deny => {
                     ApprovalDecision::Deny
                 }
             });
@@ -2144,21 +2148,21 @@ impl PermissionManager {
             return match self.mode {
                 PermissionMode::Auto => Some(ApprovalDecision::Allow),
                 PermissionMode::Plan => Some(ApprovalDecision::Deny),
-                PermissionMode::Edits => None,
-                PermissionMode::Ci => Some(ApprovalDecision::Deny),
-                PermissionMode::Ask => None,
+                PermissionMode::AcceptEdits => None,
+                PermissionMode::Deny => Some(ApprovalDecision::Deny),
+                PermissionMode::Prompt => None,
             };
         }
 
         match self.mode {
             PermissionMode::Auto => return Some(ApprovalDecision::Allow),
             PermissionMode::Plan => return Some(ApprovalDecision::Deny),
-            PermissionMode::Edits if edits_auto_allows_cloud_request(tool, detail) => {
+            PermissionMode::AcceptEdits if accept_edits_auto_allows_cloud_request(tool, detail) => {
                 return Some(ApprovalDecision::Allow);
             }
-            PermissionMode::Ci => return Some(ApprovalDecision::Deny),
-            PermissionMode::Ask => {}
-            PermissionMode::Edits => {}
+            PermissionMode::Deny => return Some(ApprovalDecision::Deny),
+            PermissionMode::Prompt => {}
+            PermissionMode::AcceptEdits => {}
         }
 
         // Standard-kind: consult the denial tracker. The session
@@ -2554,7 +2558,8 @@ impl PermissionManager {
                 self.set_mode(PermissionMode::Auto);
                 eprintln!(
                     "  {}",
-                    "  ⚡ Auto-run enabled for this session. Use /allow ask to restore.".yellow()
+                    "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                        .yellow()
                 );
                 ApprovalDecision::Allow
             }
@@ -2966,40 +2971,42 @@ impl PermissionManager {
         let side_effect = Self::classify_with_args(name, args);
 
         // Step 2: Git safety checks.
-        // Hard violations deny in Auto and require explicit approval in
-        // interactive modes. Only cd+git boundary warnings stay warn-only.
+        // Hard violations always require explicit approval.
+        // Soft violations (cd+git, commit --amend) respect auto mode and session overrides.
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
                 use astra_runtime::tool_sandbox::is_soft_violation;
 
-                let all_soft = git_violations.iter().all(|v| is_soft_violation(v));
+                let has_hard = git_violations.iter().any(|v| !is_soft_violation(v));
+                let all_soft = !has_hard;
 
                 for v in &git_violations {
                     eprintln!("  {}", format!("⚠  Git safety: {v}").yellow());
                 }
-                // In CI/plan mode, reject git safety violations outright.
-                if matches!(self.mode, PermissionMode::Plan | PermissionMode::Ci) {
+                // In deny mode, reject git safety violations outright.
+                if matches!(self.mode, PermissionMode::Plan | PermissionMode::Deny) {
                     eprintln!("  {}", "  Git safety violation — blocked".red());
                     return false;
                 }
-                // Auto skips prompts, not hard git safety. Only the
-                // cd-wrapper boundary warning stays warn-only.
-                if self.mode == PermissionMode::Auto {
-                    return all_soft
-                        && git_violations
-                            .iter()
-                            .all(|v| matches!(v, GitSafetyViolation::CdGitCompound));
-                }
-                // Soft-only violations: respect session overrides.
+                // Soft-only violations: respect auto mode and session overrides.
                 if all_soft {
+                    if self.mode == PermissionMode::Auto {
+                        return true;
+                    }
                     if let Some(allowed) = self
                         .check_overrides_any(&approval_lookup_fingerprint_candidates(name, args))
                     {
                         return allowed;
                     }
                 }
-                // Hard violations require explicit approval in interactive modes.
+                // Hard violations: always require explicit approval.
+                if self.mode == PermissionMode::Auto && has_hard {
+                    eprintln!(
+                        "  {}",
+                        "  Git safety violation — requires your approval".yellow()
+                    );
+                }
                 let (header, detail) = Self::format_tool_display(name, args);
                 eprintln!("  {}", format!("⚠  {header}").yellow());
                 if let Some(detail) = detail {
@@ -3012,13 +3019,12 @@ impl PermissionManager {
         // Step 3: Dangerous file path check (bypass-immune).
         if let Some(warning) = Self::check_dangerous_path(name, args) {
             eprintln!("  {}", warning.yellow());
-            if matches!(self.mode, PermissionMode::Plan | PermissionMode::Ci) {
+            if matches!(self.mode, PermissionMode::Plan | PermissionMode::Deny) {
                 eprintln!("  {}", "  Sensitive path — blocked".red());
                 return false;
             }
             if self.mode == PermissionMode::Auto {
-                return self.settings.allow_sensitive_path_writes
-                    || self.user_settings.allow_sensitive_path_writes;
+                eprintln!("  {}", "  Sensitive path — requires your approval".yellow());
             }
             let (header, detail) = Self::format_tool_display(name, args);
             eprintln!("  {}", format!("⚠  {header}").yellow());
@@ -3066,12 +3072,9 @@ impl PermissionManager {
         if let Some(reason) =
             astra_turn_core::action_compensation::explicit_approval_reason(name, args)
         {
-            if matches!(self.mode, PermissionMode::Plan | PermissionMode::Ci) {
+            if matches!(self.mode, PermissionMode::Plan | PermissionMode::Deny) {
                 eprintln!("  {}", reason.red());
                 return false;
-            }
-            if self.mode == PermissionMode::Auto {
-                return true;
             }
             let (header, detail) = Self::format_tool_display(name, args);
             eprintln!("  {}", format!("⚠  {header}").yellow());
@@ -3094,15 +3097,15 @@ impl PermissionManager {
                 eprintln!("  {}", format!("  ✗ {header} — blocked").red());
                 return false;
             }
-            PermissionMode::Edits if edits_auto_allows_tool_args(name, args) => {
+            PermissionMode::AcceptEdits if accept_edits_auto_allows_tool_args(name, args) => {
                 return true;
             }
-            PermissionMode::Ci => {
+            PermissionMode::Deny => {
                 let (header, _) = Self::format_tool_display(name, args);
                 eprintln!("  {}", format!("  ✗ {header} — blocked").red());
                 return false;
             }
-            PermissionMode::Edits | PermissionMode::Ask => {}
+            PermissionMode::AcceptEdits | PermissionMode::Prompt => {}
         }
 
         let (header, detail) = Self::format_tool_display(name, args);
@@ -3241,41 +3244,31 @@ impl PermissionManager {
             }
         }
 
-        if let DecisionSource::SensitivePath { path } = &envelope.source {
-            let internal_runtime_artifact_denial = matches!(
-                &envelope.decision,
-                HardDecision::Deny { reason } if reason == "Internal runtime artifact is read-only"
-            );
-            let sensitive_path_needs_host_policy =
-                matches!(&envelope.decision, HardDecision::NeedExternal { .. })
-                    || (self.mode == PermissionMode::Auto
-                        && matches!(&envelope.decision, HardDecision::Deny { .. })
-                        && !internal_runtime_artifact_denial);
-
-            if sensitive_path_needs_host_policy {
-                if let Some(allowed) = self.check_overrides_for_request(
-                    &approval_lookup_fingerprint_candidates(name, args),
-                    true,
-                ) {
-                    return if allowed {
-                        GateOutcome::Allow
-                    } else {
-                        GateOutcome::Deny("Sensitive path denied for session".into())
-                    };
-                }
-                if self.mode == PermissionMode::Auto
-                    && (self.settings.allow_sensitive_path_writes
-                        || self.user_settings.allow_sensitive_path_writes)
-                {
-                    astra_core::agent_warn!(
-                        "permission",
-                        "Auto mode allowed write to sensitive path (opt-in): tool={name}"
-                    );
-                    return GateOutcome::Allow;
-                }
-                if self.mode == PermissionMode::Auto {
-                    return GateOutcome::Deny(auto_mode_sensitive_path_denial_reason(path));
-                }
+        if let DecisionSource::SensitivePath { path } = &envelope.source
+            && matches!(envelope.decision, HardDecision::NeedExternal { .. })
+        {
+            if let Some(allowed) = self.check_overrides_for_request(
+                &approval_lookup_fingerprint_candidates(name, args),
+                true,
+            ) {
+                return if allowed {
+                    GateOutcome::Allow
+                } else {
+                    GateOutcome::Deny("Sensitive path denied for session".into())
+                };
+            }
+            if self.mode == PermissionMode::Auto
+                && (self.settings.allow_sensitive_path_writes
+                    || self.user_settings.allow_sensitive_path_writes)
+            {
+                astra_core::agent_warn!(
+                    "permission",
+                    "Auto mode allowed write to sensitive path (opt-in): tool={name}"
+                );
+                return GateOutcome::Allow;
+            }
+            if self.mode == PermissionMode::Auto {
+                return GateOutcome::Deny(auto_mode_sensitive_path_denial_reason(path));
             }
         }
 
@@ -3635,7 +3628,7 @@ mod tests {
 
     #[test]
     fn safe_alternative_covers_sensitive_path_denial() {
-        let out = safe_alternative_for("Sensitive path (ci mode)").unwrap();
+        let out = safe_alternative_for("Sensitive path (deny mode)").unwrap();
         assert!(
             out.contains("allow_sensitive_path_writes"),
             "safe alt must name the opt-in flag: {out}"
@@ -3674,7 +3667,7 @@ mod tests {
 
     #[test]
     fn format_denied_message_appends_safe_alt_when_matched() {
-        let out = format_denied_message("Sensitive path (ci mode)");
+        let out = format_denied_message("Sensitive path (deny mode)");
         assert!(
             out.starts_with("Error: Sensitive path"),
             "must preserve the raw error line: {out}"
@@ -3855,7 +3848,8 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("perm-manager-audit-{}", uuid::Uuid::new_v4());
         let project_dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, project_dir.path());
+        let mut pm =
+            PermissionManager::with_project_mode(PermissionMode::Prompt, project_dir.path());
         pm.set_active_session_id(&session_id);
         let args = serde_json::json!({"path": "x.md", "content": "# x"});
 
@@ -4407,7 +4401,7 @@ mod tests {
         std::fs::create_dir_all(&kiro).unwrap();
         std::fs::write(kiro.join("permissions.json"), "not valid json").unwrap();
 
-        let pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let errors = pm.load_errors();
         assert!(
             errors
@@ -4583,7 +4577,7 @@ mod tests {
         .unwrap();
 
         let pm = PermissionManager::with_load_policy(
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             dir.path(),
             &PermissionLoadPolicy::InteractiveUntrusted,
         );
@@ -4614,7 +4608,7 @@ mod tests {
         .unwrap();
 
         let pm = PermissionManager::with_load_policy(
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             dir.path(),
             &PermissionLoadPolicy::InteractiveTrusted,
         );
@@ -4657,7 +4651,7 @@ mod tests {
         let ledger_path = dir.path().join("trusted_workspaces.json");
 
         let pm = PermissionManager::with_workspace_trust_mode_from_ledger_path(
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             dir.path(),
             ledger_path,
         );
@@ -4675,7 +4669,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("trusted_workspaces.json");
         let pm = PermissionManager::with_workspace_trust_mode_from_ledger_path(
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             dir.path(),
             ledger_path,
         );
@@ -4693,7 +4687,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ledger_path = dir.path().join("trusted_workspaces.json");
         let pm = PermissionManager::with_workspace_trust_mode_from_ledger_path(
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             dir.path(),
             ledger_path,
         );
@@ -4726,7 +4720,7 @@ mod tests {
         ledger.save().unwrap();
 
         let pm = PermissionManager::with_workspace_trust_mode_from_ledger_path(
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             dir.path(),
             ledger_path,
         );
@@ -4764,7 +4758,7 @@ mod tests {
         )
         .unwrap();
         let pm = PermissionManager::with_workspace_trust_mode_from_ledger_path(
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             dir.path(),
             ledger_path,
         );
@@ -4815,26 +4809,26 @@ mod tests {
         assert!("yolo".parse::<PermissionMode>().is_err());
         assert!("bypass-safety".parse::<PermissionMode>().is_err());
         assert_eq!(
-            "edits".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Edits
+            "accept_edits".parse::<PermissionMode>().unwrap(),
+            PermissionMode::AcceptEdits
         );
         assert_eq!(
             "plan".parse::<PermissionMode>().unwrap(),
             PermissionMode::Plan
         );
         assert_eq!(
-            "ask".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Ask
+            "prompt".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Prompt
         );
-        assert_eq!("ci".parse::<PermissionMode>().unwrap(), PermissionMode::Ci);
+        assert_eq!(
+            "deny".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Deny
+        );
         assert_eq!(
             "AUTO".parse::<PermissionMode>().unwrap(),
             PermissionMode::Auto
         );
         assert!("accept-edits".parse::<PermissionMode>().is_err());
-        assert!("accept_edits".parse::<PermissionMode>().is_err());
-        assert!("prompt".parse::<PermissionMode>().is_err());
-        assert!("deny".parse::<PermissionMode>().is_err());
         assert!("invalid".parse::<PermissionMode>().is_err());
     }
 
@@ -4842,33 +4836,33 @@ mod tests {
     fn permission_mode_display() {
         assert_eq!(PermissionMode::Auto.to_string(), "auto");
         assert_eq!(PermissionMode::Plan.to_string(), "plan");
-        assert_eq!(PermissionMode::Edits.to_string(), "edits");
-        assert_eq!(PermissionMode::Ask.to_string(), "ask");
-        assert_eq!(PermissionMode::Ci.to_string(), "ci");
+        assert_eq!(PermissionMode::AcceptEdits.to_string(), "accept_edits");
+        assert_eq!(PermissionMode::Prompt.to_string(), "prompt");
+        assert_eq!(PermissionMode::Deny.to_string(), "deny");
     }
 
     #[test]
-    fn ci_mode_rejects_write_tools() {
+    fn deny_mode_rejects_write_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ci, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let args = serde_json::json!({"path": "test.txt", "content": "hello"});
-        // write_file is a Write side-effect tool — denied in CI mode.
+        // write_file is a Write side-effect tool — denied in deny mode
         assert!(!pm.check("write_file", &args));
     }
 
     #[test]
-    fn ci_mode_allows_read_tools() {
+    fn deny_mode_allows_read_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ci, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let args = serde_json::json!({"path": "test.txt"});
         // read_file is a Read side-effect tool — always allowed
         assert!(pm.check("read_file", &args));
     }
 
     #[test]
-    fn ci_mode_cloud_approval_denied() {
+    fn deny_mode_cloud_approval_denied() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ci, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision =
             pm.resolve_cloud_approval("bash", Some("/tmp"), None, ApprovalKind::Standard, false);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
@@ -4909,9 +4903,9 @@ mod tests {
     }
 
     #[test]
-    fn ci_mode_cloud_explicit_interactive_denies() {
+    fn deny_mode_cloud_explicit_interactive_denies() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ci, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm.resolve_cloud_approval(
             "write_file",
             Some("new.rs"),
@@ -4939,7 +4933,7 @@ mod tests {
     #[test]
     fn cloud_approval_auto_run_switches_session_to_auto() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         let decision = pm.apply_cloud_approval_choice("bash", None, '!');
 
@@ -4950,7 +4944,7 @@ mod tests {
     #[test]
     fn cloud_approval_always_sets_session_override() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         let decision = pm.apply_cloud_approval_choice("bash", None, 'a');
 
@@ -4961,7 +4955,7 @@ mod tests {
     #[test]
     fn cloud_approval_skip_sets_session_deny_override() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         let decision = pm.apply_cloud_approval_choice("bash", None, 's');
 
@@ -5038,7 +5032,7 @@ mod tests {
     #[test]
     fn sandbox_expand_allow_rule_cannot_bypass_sensitive_target() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.settings
             .allow
             .push("sandbox_expand:read_file()".to_string());
@@ -5059,9 +5053,9 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_expand_ci_mode_denies() {
+    fn sandbox_expand_deny_mode_denies() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ci, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
         assert!(matches!(decision, GateOutcome::Deny(_)));
@@ -5070,7 +5064,7 @@ mod tests {
     #[test]
     fn sandbox_expand_prompt_mode_needs_approval() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         // Clear user settings so that ~/.astra/permissions.json allow rules granted
         // in a previous interactive session do not bypass the prompt in this test.
         pm.replace_user_settings(PermissionSettings::default());
@@ -5086,9 +5080,9 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_expand_edits_mode_still_needs_approval() {
+    fn sandbox_expand_accept_edits_mode_still_needs_approval() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Edits, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::AcceptEdits, dir.path());
         pm.replace_user_settings(PermissionSettings::default());
         let args = serde_json::json!({
             "reason": "Path '/tmp/outside.md' is outside the project directory '/tmp/project'; sandbox approval is required for this external path."
@@ -5108,7 +5102,7 @@ mod tests {
                 assert_eq!(detail, None);
                 assert!(reason.contains("/tmp/outside.md"), "{reason}");
             }
-            other => panic!("Edits must ask before expanding outside sandbox; got {other:?}"),
+            other => panic!("AcceptEdits must ask before expanding outside sandbox; got {other:?}"),
         }
     }
 
@@ -5119,7 +5113,7 @@ mod tests {
         // permission_manager appended their own copy. The approval now
         // carries detail=None and a trimmed reason (no "Ask the user…").
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let raw_fs_msg = "Path '/home/x/outside' is outside the project directory '/home/x/inside'. \
                           Ask the user for permission before accessing files outside the project.";
         let args = serde_json::json!({"reason": raw_fs_msg});
@@ -5149,7 +5143,7 @@ mod tests {
     #[test]
     fn sandbox_expand_session_override_remembered() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.record_approval("sandbox_expand:read_file", None, true);
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
@@ -5171,7 +5165,7 @@ mod tests {
         let child_file = child_dir.join("REPL.tsx");
         std::fs::write(&child_file, "component").unwrap();
 
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate pressing Always on a first prompt via read_file.
         let args_a = serde_json::json!({
@@ -5222,7 +5216,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let trusted_root = outside.path().join("scratch");
         std::fs::create_dir(&trusted_root).unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         pm.trust_sandbox_root(trusted_root.clone());
 
@@ -5247,7 +5241,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let sensitive = tempfile::tempdir().unwrap();
         let missing_root = outside.path().join("future-link");
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         pm.trust_sandbox_root(missing_root.clone());
         #[cfg(unix)]
@@ -5283,7 +5277,7 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(sensitive.path(), &link).unwrap();
 
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.trust_sandbox_root(trusted_root);
 
         let escaped = link.join("secret.txt");
@@ -5339,7 +5333,7 @@ mod tests {
         // different path. (The fingerprint for sandbox_expand:* is
         // path-free so this is expected to work.)
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // First call: approved with Always.
         let args_a = serde_json::json!({"reason": "Path '/a' is outside the project '/root'."});
@@ -5360,7 +5354,7 @@ mod tests {
     #[test]
     fn sandbox_expand_session_deny_remembered() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.record_approval("sandbox_expand:read_file", None, false);
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
@@ -5372,7 +5366,7 @@ mod tests {
         // Verify that a normal read_file tool still goes through the standard
         // permission flow, not the sandbox_expand shortcut.
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let args = serde_json::json!({"path": "test.txt"});
         let decision = pm.check_nonblocking("read_file", &args);
         // read_file is classified as Read → always allowed
@@ -5382,7 +5376,7 @@ mod tests {
     #[test]
     fn write_file_prompt_keeps_recovery_jargon_out_of_primary_prompt() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let args = serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"});
         let decision = pm.check_nonblocking("write_file", &args);
         match decision {
@@ -5402,7 +5396,7 @@ mod tests {
     #[test]
     fn explicit_prompt_uses_user_facing_copy_not_policy_jargon() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let args = serde_json::json!({"command": "cargo test -p astra-cli"});
         let decision = pm.check_nonblocking("bash", &args);
         match decision {
@@ -5442,22 +5436,22 @@ mod tests {
     }
 
     #[test]
-    fn explicit_irreversible_actions_need_approval_in_ask_mode() {
-        let mut pm = PermissionManager::new(false); // Ask mode
+    fn explicit_irreversible_actions_need_approval_in_prompt_mode() {
+        let mut pm = PermissionManager::new(false); // prompt mode
         let args = serde_json::json!({"action": "commit", "message": "ship it"});
         let decision = pm.check_nonblocking("git", &args);
         assert!(
             matches!(decision, GateOutcome::NeedApproval { .. }),
-            "Ask mode should require approval for explicit tools, got: {decision:?}"
+            "Prompt mode should require approval for explicit tools, got: {decision:?}"
         );
     }
 
     // ── Gap 3: system-driven denials auto-record into recent_rejections ──────
 
     #[test]
-    fn ci_mode_denial_recorded_in_recent_rejections() {
+    fn deny_mode_denial_recorded_in_recent_rejections() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ci, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let args = serde_json::json!({"path": "note.txt", "content": "hi"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
@@ -5495,30 +5489,20 @@ mod tests {
         assert!(pm.recent_rejections().is_empty());
     }
 
-    // ── Security: hard-deny rules stay hard; Auto skips prompts, not policy ───
+    // ── Security: session overrides cannot bypass safety checks ──────────────
 
     #[test]
-    fn auto_mode_denies_hard_git_safety_risk_without_prompting() {
+    fn session_override_cannot_bypass_git_safety() {
+        // CRITICAL: Even if user previously approved "bash", dangerous git
+        // operations must still require manual approval.
         let mut pm = PermissionManager::new(true); // auto mode
         pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({"command": "git push --force"});
+        // Must NOT be Allow — git safety is bypass-immune
         let decision = pm.check_nonblocking("bash", &args);
         assert!(
-            matches!(decision, GateOutcome::Deny(_)),
-            "Auto mode must deny hard git safety risk without prompting: got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn auto_mode_allows_cd_git_soft_risk_without_prompting() {
-        let mut pm = PermissionManager::new(true); // auto mode
-        let args = serde_json::json!({
-            "command": "cd /Users/xupeng/github/astra && git diff origin/main...feature"
-        });
-        let decision = pm.check_nonblocking("bash", &args);
-        assert!(
-            matches!(decision, GateOutcome::Allow),
-            "Auto mode should allow cd+git soft risk without prompting: got {decision:?}"
+            matches!(decision, GateOutcome::NeedApproval { .. }),
+            "session override must not bypass git safety: got {decision:?}"
         );
     }
 
@@ -5536,21 +5520,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_denies_sensitive_path_without_opt_in() {
+    fn session_override_cannot_bypass_dangerous_path() {
+        // Hard boundary: Auto mode never opens an interactive prompt for
+        // sensitive paths. Without a content-specific approval or explicit
+        // opt-in it fails closed.
         let mut pm = PermissionManager::new(true);
         pm.session_overrides.insert(bare_fp("write_file"), true);
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
             matches!(decision, GateOutcome::Deny(_)),
-            "Auto mode must deny sensitive path writes without opt-in: got {decision:?}"
+            "Auto mode must deny sensitive paths by default instead of prompting: got {decision:?}"
         );
 
+        // Opt-in unlocks it.
         pm.settings.allow_sensitive_path_writes = true;
         let decision2 = pm.check_nonblocking("write_file", &args);
         assert!(
             matches!(decision2, GateOutcome::Allow),
-            "allow_sensitive_path_writes should opt Auto into sensitive path writes: got {decision2:?}"
+            "opt-in should unlock Auto mode sensitive writes: got {decision2:?}"
         );
     }
 
@@ -5568,7 +5556,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_directory_override_does_not_allow_sensitive_sibling_path() {
+    fn directory_override_cannot_bypass_sensitive_sibling_path() {
         let mut pm = PermissionManager::new(true);
         let safe = serde_json::json!({"path": "src/deep/main.rs", "content": "ok"});
         let sensitive = serde_json::json!({"path": "src/deep/.env", "content": "SECRET=x"});
@@ -5578,7 +5566,7 @@ mod tests {
         let decision = pm.check_nonblocking("write_file", &sensitive);
         assert!(
             matches!(decision, GateOutcome::Deny(_)),
-            "directory approval must not cover sensitive sibling paths: got {decision:?}"
+            "non-sensitive directory approval must not unlock sensitive sibling in Auto mode: got {decision:?}"
         );
     }
 
@@ -5604,7 +5592,7 @@ mod tests {
     #[test]
     fn session_override_still_allows_safe_commands() {
         // Session override should still work for commands that pass all safety checks.
-        let mut pm = PermissionManager::new(false); // Ask mode
+        let mut pm = PermissionManager::new(false); // prompt mode
         pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({"command": "echo hello"});
         let decision = pm.check_nonblocking("bash", &args);
@@ -5615,14 +5603,14 @@ mod tests {
     }
 
     #[test]
-    fn dangerous_path_still_prompts_in_ask_mode() {
-        // In Ask mode, dangerous-path writes still require approval.
-        let mut pm = PermissionManager::new(false); // Ask mode
+    fn dangerous_path_still_prompts_in_prompt_mode() {
+        // In Prompt mode, dangerous-path writes still require approval.
+        let mut pm = PermissionManager::new(false); // prompt mode
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
             matches!(decision, GateOutcome::NeedApproval { .. }),
-            "Ask mode should require approval for dangerous path: got {decision:?}"
+            "Prompt mode should require approval for dangerous path: got {decision:?}"
         );
     }
 
@@ -6059,10 +6047,10 @@ mod tests {
             r#"{"allow":["Bash(argv_prefix=\"cargo\")"],"deny":["Bash(argv_prefix=\"rm\")"]}"#,
         )
         .unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, root);
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, root);
         pm.record_approval("edit_file", None, true);
         let summary = pm.rules_summary();
-        assert!(summary.contains("ask"), "should show mode");
+        assert!(summary.contains("prompt"), "should show mode");
         assert!(summary.contains("cargo"), "should show allow rule");
         assert!(summary.contains("rm"), "should show deny rule");
         assert!(
@@ -6100,7 +6088,7 @@ mod tests {
             InheritedPermissions, PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
         };
 
-        let mut inherited = InheritedPermissions::new(RuntimeMode::Ask);
+        let mut inherited = InheritedPermissions::new(RuntimeMode::Prompt);
         inherited.add_allow(RuntimeRule::parse(r#"Bash(argv_prefix="git commit")"#));
 
         let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
@@ -6117,7 +6105,7 @@ mod tests {
             InheritedPermissions, PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
         };
 
-        let mut inherited = InheritedPermissions::new(RuntimeMode::Ask);
+        let mut inherited = InheritedPermissions::new(RuntimeMode::Prompt);
         inherited.add_deny(RuntimeRule::parse(r#"Bash(argv_prefix="rm -rf")"#));
 
         let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
@@ -6136,13 +6124,13 @@ mod tests {
         use astra_runtime::orchestration::PermissionMode as RuntimeMode;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), true);
         pm.session_overrides.insert(bare_fp("file_write"), false);
 
         let inherited = pm.inherited_permissions_for_child(true);
 
-        assert_eq!(inherited.mode, RuntimeMode::Ask);
+        assert_eq!(inherited.mode, RuntimeMode::Prompt);
         assert!(inherited.is_background);
         // The fingerprinted overrides survived the trip across the
         // runtime boundary as a JSON blob.
@@ -6166,7 +6154,7 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let mut parent = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut parent = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Parent presses Always on `Bash(argv_prefix="cargo test")` -> session override.
         let cargo_test_fp = ApprovalFingerprint {
@@ -6181,7 +6169,7 @@ mod tests {
 
         // Hand off to child.
         let envelope = parent.inherited_permissions_for_child(true);
-        assert_eq!(envelope.mode, RuntimeMode::Ask);
+        assert_eq!(envelope.mode, RuntimeMode::Prompt);
 
         let child_dir = tempfile::tempdir().unwrap();
         let child = PermissionManager::with_inherited(child_dir.path(), envelope);
@@ -6221,7 +6209,7 @@ mod tests {
         // the parent's allow_rules / deny_rules are still honoured.
         use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
 
-        let mut envelope = InheritedPermissions::new(RuntimeMode::Ask);
+        let mut envelope = InheritedPermissions::new(RuntimeMode::Prompt);
         envelope.fingerprinted_overrides =
             Some(serde_json::json!({"this is": "not the right shape"}));
 
@@ -6305,8 +6293,8 @@ mod tests {
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
 
-        // CI mode -> deny
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ci, dir.path());
+        // Deny mode → deny
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
@@ -6314,7 +6302,7 @@ mod tests {
     }
 
     /// Regression: async Explicit + Auto must auto-allow without prompting;
-    /// Explicit + CI must deny without prompting.
+    /// Explicit + Deny must deny without prompting.
     #[tokio::test]
     async fn cloud_approval_async_explicit_routing() {
         let dir = tempfile::tempdir().unwrap();
@@ -6331,7 +6319,7 @@ mod tests {
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
 
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ci, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm
             .resolve_cloud_approval_async(
                 "write_file",
@@ -6349,7 +6337,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // positive override → allow
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), true);
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
@@ -6357,7 +6345,7 @@ mod tests {
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
 
         // negative override → deny
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), false);
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
@@ -6374,7 +6362,7 @@ mod tests {
     #[tokio::test]
     async fn cloud_always_persists_to_local_check_nonblocking() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate user selecting "always allow this tool" in cloud approval
         let decision = pm.apply_cloud_approval_choice("write_file", None, 'a');
@@ -6394,7 +6382,7 @@ mod tests {
     #[tokio::test]
     async fn cloud_autorun_persists_to_local_check_nonblocking() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate user selecting "auto-run session" in cloud approval
         let decision = pm.apply_cloud_approval_choice("bash", None, '!');
@@ -6416,7 +6404,7 @@ mod tests {
     #[tokio::test]
     async fn session_override_persists_across_multiple_calls() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // 1st call: user selects 'a' in cloud approval
         pm.apply_cloud_approval_choice("write_file", None, 'a');
@@ -6476,35 +6464,35 @@ mod tests {
                 ApprovalKind::Explicit,
             ),
             (
-                PermissionMode::Ci,
+                PermissionMode::Deny,
                 true,
                 "bash",
                 None,
                 ApprovalKind::Standard,
             ),
             (
-                PermissionMode::Ci,
+                PermissionMode::Deny,
                 false,
                 "bash",
                 None,
                 ApprovalKind::Standard,
             ),
             (
-                PermissionMode::Ask,
+                PermissionMode::Prompt,
                 true,
                 "bash",
                 None,
                 ApprovalKind::Standard,
             ),
             (
-                PermissionMode::Ask,
+                PermissionMode::Prompt,
                 false,
                 "bash",
                 Some(true),
                 ApprovalKind::Standard,
             ),
             (
-                PermissionMode::Ask,
+                PermissionMode::Prompt,
                 false,
                 "bash",
                 Some(false),
@@ -6574,7 +6562,7 @@ mod tests {
         // Bug: explicit_approval_reason was checked BEFORE session overrides,
         // causing approved tools to be re-prompted every call.
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let args = serde_json::json!({"path": "src/main.rs", "content": "hello"});
 
         // First call should need approval (no override yet).
@@ -6598,7 +6586,7 @@ mod tests {
     #[test]
     fn bash_command_family_approval_skips_cd_wrapped_reprompt() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let approved_args = serde_json::json!({"command": "cargo test --lib"});
         let similar_args =
             serde_json::json!({"command": "cd rust && cargo test -p astra-cli tui::approval"});
@@ -6617,7 +6605,7 @@ mod tests {
     #[test]
     fn record_approval_with_match_target_trusts_safe_writes_across_workspace() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let args_a = serde_json::json!({"path": "src/foo.rs", "content": "a"});
         let args_b = serde_json::json!({"path": "tests/bar.rs", "content": "b"});
         let replace_args = serde_json::json!({
@@ -6658,7 +6646,7 @@ mod tests {
     #[test]
     fn exact_path_match_target_allows_only_same_deep_path() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let args = serde_json::json!({"path": "src/deep/main.rs", "content": "a"});
         let sibling = serde_json::json!({"path": "src/deep/other.rs", "content": "b"});
 
@@ -6680,7 +6668,7 @@ mod tests {
     #[test]
     fn record_approval_without_args_falls_back_to_bare() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Record with no args → bare fingerprint (subsumes everything).
         pm.record_approval("write_file", None, true);
@@ -6715,7 +6703,7 @@ mod tests {
                 "Deny",
                 || {
                     let mut pm = PermissionManager::new(false);
-                    pm.set_mode(PermissionMode::Ci);
+                    pm.set_mode(PermissionMode::Deny);
                     pm
                 },
                 false,
@@ -6758,7 +6746,7 @@ mod tests {
     fn cloud_approval_choice_modes_and_overrides() {
         // '!' auto-run: sets mode to Auto
         let mut pm = PermissionManager::new(false);
-        assert_eq!(pm.mode, PermissionMode::Ask);
+        assert_eq!(pm.mode, PermissionMode::Prompt);
         let decision = pm.apply_cloud_approval_choice("str_replace", Some("src/foo.rs"), '!');
         assert!(matches!(
             decision,
@@ -6810,7 +6798,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_denies_sensitive_path_by_default_without_prompting() {
+    fn auto_mode_strict_on_sensitive_path_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         // Target .ssh/id_rsa — sensitive by DANGEROUS_FILE_PATHS rule.
@@ -6818,7 +6806,7 @@ mod tests {
         let d = pm.check_nonblocking("write_file", &args);
         assert!(
             matches!(d, GateOutcome::Deny(_)),
-            "Auto mode must deny sensitive paths without prompting, got {d:?}"
+            "Auto mode must deny sensitive paths by default instead of prompting, got {d:?}"
         );
 
         // Non-sensitive path still auto-allowed.
@@ -6826,12 +6814,12 @@ mod tests {
         let d2 = pm.check_nonblocking("write_file", &safe);
         assert!(matches!(d2, GateOutcome::Allow));
 
-        // Opt-in explicitly allows Auto to write sensitive paths.
+        // Opt-in via project settings flips it to Allow.
         pm.settings.allow_sensitive_path_writes = true;
         let d3 = pm.check_nonblocking("write_file", &args);
         assert!(
             matches!(d3, GateOutcome::Allow),
-            "allow_sensitive_path_writes should opt Auto into sensitive paths, got {d3:?}"
+            "allow_sensitive_path_writes opt-in should let Auto mode proceed, got {d3:?}"
         );
     }
 
@@ -6935,7 +6923,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_denies_hidden_home_app_writes_and_secret_reads_without_prompting() {
+    fn auto_mode_allows_hidden_home_logs_but_blocks_writes_and_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = "~/.xxx/logs/session.log";
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
@@ -6953,22 +6941,31 @@ mod tests {
         });
         let write_decision = pm.check_nonblocking("write_file", &write_args);
         assert!(
-            matches!(&write_decision, GateOutcome::Deny(_)),
-            "hidden home app writes require opt-in in Auto mode: {write_decision:?}"
+            matches!(
+                &write_decision,
+                GateOutcome::Deny(reason) if reason.contains("write-sensitive app/runtime state")
+            ),
+            "hidden home app state remains write-sensitive in Auto mode: {write_decision:?}"
         );
 
         let secret_args = serde_json::json!({"path": "~/.xxx/.env"});
         let secret_decision = pm.check_nonblocking("read_file", &secret_args);
         assert!(
-            matches!(&secret_decision, GateOutcome::Deny(_)),
-            "credential-shaped hidden-home reads require opt-in in Auto mode: {secret_decision:?}"
+            matches!(
+                &secret_decision,
+                GateOutcome::Deny(reason) if reason.contains("sensitive credential")
+            ),
+            "credential-shaped files under hidden home app state must still gate: {secret_decision:?}"
         );
 
         let bash_secret_args = serde_json::json!({"command": "cat ~/.xxx/.env"});
         let bash_secret_decision = pm.check_nonblocking("bash", &bash_secret_args);
         assert!(
-            matches!(&bash_secret_decision, GateOutcome::Deny(_)),
-            "shell reads of hidden-home credentials require opt-in in Auto mode: {bash_secret_decision:?}"
+            matches!(
+                &bash_secret_decision,
+                GateOutcome::Deny(reason) if reason.contains("sensitive credential")
+            ),
+            "shell reads of hidden-home credentials must still gate: {bash_secret_decision:?}"
         );
     }
 
@@ -7047,7 +7044,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_preflight_auto_denies_sensitive_path_without_opt_in() {
+    fn cloud_preflight_strict_on_sensitive_path_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
 
@@ -7060,7 +7057,7 @@ mod tests {
         assert_eq!(
             interactive,
             Some(astra_thin_client::ApprovalDecision::Deny),
-            "interactive Auto mode must deny sensitive cloud writes without opt-in"
+            "interactive Auto mode must deny sensitive cloud writes instead of prompting"
         );
 
         let quiet = pm.preflight_cloud_approval_decision(
@@ -7072,7 +7069,7 @@ mod tests {
         assert_eq!(
             quiet,
             Some(astra_thin_client::ApprovalDecision::Deny),
-            "quiet Auto mode must deny sensitive cloud writes without opt-in"
+            "quiet Auto mode cannot prompt, so sensitive cloud writes must deny"
         );
 
         pm.settings.allow_sensitive_path_writes = true;
@@ -7092,7 +7089,7 @@ mod tests {
     #[test]
     fn cloud_preflight_bare_override_does_not_allow_sensitive_path() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("write_file"), true);
 
         let decision = pm.preflight_cloud_approval_decision(
@@ -7120,9 +7117,9 @@ mod tests {
     }
 
     #[test]
-    fn edits_cloud_preflight_auto_allows_safe_writes_only() {
+    fn accept_edits_cloud_preflight_auto_allows_safe_writes_only() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Edits, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::AcceptEdits, dir.path());
 
         let safe_write = pm.preflight_cloud_approval_decision(
             "write_file",
@@ -7133,7 +7130,7 @@ mod tests {
         assert_eq!(
             safe_write,
             Some(astra_thin_client::ApprovalDecision::Allow),
-            "edits should auto-allow workspace-local writes"
+            "accept_edits should auto-allow workspace-local writes"
         );
 
         let bash = pm.preflight_cloud_approval_decision(
@@ -7144,7 +7141,7 @@ mod tests {
         );
         assert!(
             bash.is_none(),
-            "edits should still prompt for bash execution"
+            "accept_edits should still prompt for bash execution"
         );
 
         let external_write = pm.preflight_cloud_approval_decision(
@@ -7155,7 +7152,7 @@ mod tests {
         );
         assert!(
             external_write.is_none(),
-            "edits should still prompt for workspace-external writes"
+            "accept_edits should still prompt for workspace-external writes"
         );
 
         let escaped_relative = pm.preflight_cloud_approval_decision(
@@ -7166,14 +7163,14 @@ mod tests {
         );
         assert!(
             escaped_relative.is_none(),
-            "edits must not auto-allow parent-relative writes that escape the workspace"
+            "accept_edits must not auto-allow parent-relative writes that escape the workspace"
         );
     }
 
     #[test]
-    fn edits_cloud_preflight_keeps_sensitive_and_quiet_fail_closed() {
+    fn accept_edits_cloud_preflight_keeps_sensitive_and_quiet_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Edits, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::AcceptEdits, dir.path());
 
         let interactive_sensitive = pm.preflight_cloud_approval_decision(
             "write_file",
@@ -7183,7 +7180,7 @@ mod tests {
         );
         assert!(
             interactive_sensitive.is_none(),
-            "edits should still prompt for sensitive writes"
+            "accept_edits should still prompt for sensitive writes"
         );
 
         let quiet_bash = pm.preflight_cloud_approval_decision(
@@ -7195,7 +7192,7 @@ mod tests {
         assert_eq!(
             quiet_bash,
             Some(astra_thin_client::ApprovalDecision::Deny),
-            "quiet edits cannot prompt for bash"
+            "quiet accept_edits cannot prompt for bash"
         );
 
         let quiet_sensitive = pm.preflight_cloud_approval_decision(
@@ -7207,7 +7204,7 @@ mod tests {
         assert_eq!(
             quiet_sensitive,
             Some(astra_thin_client::ApprovalDecision::Deny),
-            "quiet edits must fail closed for sensitive writes"
+            "quiet accept_edits must fail closed for sensitive writes"
         );
     }
 
@@ -7216,10 +7213,10 @@ mod tests {
     #[test]
     fn auto_mode_skips_all_write_approval() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let args = serde_json::json!({"path": "src/foo.rs", "content": "x"});
 
-        // Ask mode -> NeedApproval.
+        // Prompt mode → NeedApproval.
         let d1 = pm.check_nonblocking("write_file", &args);
         assert!(matches!(d1, GateOutcome::NeedApproval { .. }));
 
@@ -7242,7 +7239,7 @@ mod tests {
     #[test]
     fn auto_mode_persists_across_cloud_and_local_checks() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate "!" at cloud approval → sets Auto mode.
         pm.set_mode(PermissionMode::Auto);
@@ -7280,7 +7277,7 @@ mod tests {
     //      pending approval on the next authoritative check (deny wins).
     //   4. A session override recorded while one tool is in-flight does not
     //      cross-contaminate a different tool's decision.
-    //   5. Flipping mode Auto->CI mid-session does not retroactively revoke
+    //   5. Flipping mode Auto→Deny mid-session does not retroactively revoke
     //      decisions already taken, but does apply strictly going forward.
     //   6. add_allow_rule is idempotent: the second call is a no-op.
     // ═══════════════════════════════════════════════════════════════════════
@@ -7288,14 +7285,14 @@ mod tests {
     #[test]
     fn phase_h_set_mode_applies_only_to_next_check() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
-        // First check in Ask mode -> NeedApproval.
+        // First check in Prompt mode → NeedApproval.
         let args = serde_json::json!({"path": "src/x.rs", "content": "x"});
         let d1 = pm.check_nonblocking("write_file", &args);
         assert!(
             matches!(d1, GateOutcome::NeedApproval { .. }),
-            "expected NeedApproval in Ask mode, got {d1:?}",
+            "expected NeedApproval in Prompt mode, got {d1:?}",
         );
 
         // Mid-session: user types `/mode auto`. The decision for d1 (already
@@ -7320,7 +7317,7 @@ mod tests {
         // (which would bypass allow rules by design). `str_replace` is
         // bounded + reversible so it falls through to step 6 (allow rules).
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         let args = serde_json::json!({"path": "src/foo.rs", "old_str": "a", "new_str": "b"});
         let d1 = pm.check_nonblocking("str_replace", &args);
@@ -7341,7 +7338,7 @@ mod tests {
     #[test]
     fn phase_h_add_allow_rule_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         pm.add_allow_rule(r#"Bash(argv_prefix="ls")"#);
         let first = pm.settings.allow.clone();
@@ -7356,7 +7353,7 @@ mod tests {
     #[test]
     fn phase_h_add_allow_rule_merges_with_disk_baseline_under_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate another astra process writing a rule after this
         // manager was constructed. add_allow_rule must use
@@ -7392,7 +7389,7 @@ mod tests {
     #[test]
     fn phase_h_deny_rule_added_mid_session_overrides_pending_approval() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         let args = serde_json::json!({"path": "secrets.env", "content": "x"});
         let d1 = pm.check_nonblocking("write_file", &args);
@@ -7412,7 +7409,7 @@ mod tests {
     #[test]
     fn phase_h_session_override_for_one_tool_does_not_affect_another() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate user approving `bash ls` for the session (allow-once).
         let bash_args = serde_json::json!({"command": "ls"});
@@ -7446,11 +7443,11 @@ mod tests {
             "Auto mode must allow write_file, got {d1:?}",
         );
 
-        pm.set_mode(PermissionMode::Ci);
+        pm.set_mode(PermissionMode::Deny);
         let d2 = pm.check_nonblocking("write_file", &args);
         assert!(
             matches!(d2, GateOutcome::Deny(_)),
-            "CI mode must reject write_file after flip, got {d2:?}",
+            "Deny mode must reject write_file after flip, got {d2:?}",
         );
 
         // The earlier Allow decision is not retroactively mutated.
@@ -7460,11 +7457,11 @@ mod tests {
     #[test]
     fn phase_h_multiple_concurrent_in_flight_decisions_are_independent() {
         // Simulates two parallel NeedApproval decisions issued back-to-back
-        // in Ask mode. A mode change between them must only affect the
+        // in Prompt mode. A mode change between them must only affect the
         // second, not retroactively the first, and both decision values are
         // independent.
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         let a = serde_json::json!({"path": "a.txt", "content": "A"});
         let b = serde_json::json!({"path": "b.txt", "content": "B"});
@@ -7484,7 +7481,7 @@ mod tests {
     #[test]
     fn phase_h_allow_rule_then_deny_rule_deny_wins() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         pm.add_allow_rule(r#"Bash(argv_prefix="rm")"#);
         // Operator realizes mistake, adds a specific deny for dangerous rm.
@@ -7543,7 +7540,7 @@ mod tests {
                         _ => g.set_mode(if i % 2 == 0 {
                             PermissionMode::Auto
                         } else {
-                            PermissionMode::Ask
+                            PermissionMode::Prompt
                         }),
                     }
                 }
@@ -7593,7 +7590,7 @@ mod tests {
         // Uses `str_replace` which is bounded+reversible and therefore falls
         // through to the rule tier (see phase_h_add_allow_rule_applies_...).
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         pm.add_allow_rule("str_replace");
         let args = serde_json::json!({"path": "src/foo.rs", "old_str": "a", "new_str": "b"});
@@ -7621,7 +7618,7 @@ mod tests {
         // Orthogonality: adding a deny for tool A must not flip tool B's
         // decision. Guards against over-broad cache invalidation bugs.
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         let sr_args = serde_json::json!({"path": "a.rs", "old_str": "x", "new_str": "y"});
         let rf_args = serde_json::json!({"path": "a.rs"});
@@ -7667,7 +7664,7 @@ mod tests {
     #[test]
     fn cloud_always_persists_allow_rule_to_project_settings() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let before = pm.settings.allow.clone();
 
         let decision = pm.apply_cloud_approval_choice("bash", Some("cargo test --lib"), 'a');
@@ -7723,12 +7720,12 @@ mod tests {
         // disk" bug this test regression-guards.
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+            let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
             pm.apply_cloud_approval_choice("write_file", Some("src/main.rs"), 'a');
         }
         // Fresh manager — simulates a CLI restart. Session_overrides
         // are gone; only the disk-persisted allow rule remains.
-        let mut reborn = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut reborn = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let decision = reborn.check_nonblocking(
             "write_file",
             &serde_json::json!({"path": "src/main.rs", "content": "hi"}),
@@ -7743,11 +7740,11 @@ mod tests {
     fn cloud_always_workspace_write_survives_restart_for_other_workspace_paths() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+            let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
             pm.apply_cloud_approval_choice("write_file", Some("src/main.rs"), 'a');
         }
 
-        let mut reborn = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut reborn = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let decision = reborn.check_nonblocking(
             "write_file",
             &serde_json::json!({"path": "tests/another.rs", "content": "hi"}),
@@ -7762,7 +7759,7 @@ mod tests {
     fn cloud_always_sensitive_write_stays_session_only_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+            let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
             let first = pm.apply_cloud_approval_choice("write_file", Some(".env"), 'a');
             assert_eq!(first, astra_thin_client::ApprovalDecision::AllowSession);
 
@@ -7786,7 +7783,7 @@ mod tests {
             );
         }
 
-        let mut reborn = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut reborn = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         let after_restart = reborn.preflight_cloud_approval_decision(
             "write_file",
             Some(".env"),
@@ -7817,7 +7814,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_bash_always_is_honored_on_second_call() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // First call: user presses "Always" on `cargo test --lib`.
         let first = pm.apply_cloud_approval_choice("bash", Some("cargo test --lib"), 'a');
@@ -7849,7 +7846,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_bash_always_covers_cd_wrapped_command_family() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         let first = pm.apply_cloud_approval_choice("bash", Some("cargo test --lib"), 'a');
         assert_eq!(first, astra_thin_client::ApprovalDecision::AllowSession);
@@ -7878,7 +7875,7 @@ mod tests {
         // None so the caller falls through to the interactive
         // prompt.
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         let decision = pm.preflight_cloud_approval_decision(
             "bash",
@@ -7888,7 +7885,7 @@ mod tests {
         );
         assert!(
             decision.is_none(),
-            "no override + Ask mode + Explicit -> must fall through to prompt; got {decision:?}"
+            "no override + Prompt mode + Explicit → must fall through to prompt; got {decision:?}"
         );
     }
 
@@ -7900,7 +7897,7 @@ mod tests {
         // in the same session. Post-fix, session overrides win
         // even under Silent.
         let dir = tempfile::tempdir().unwrap();
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Ask, dir.path());
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         pm.apply_cloud_approval_choice("bash", Some("git status"), 'a');
 
@@ -7928,11 +7925,11 @@ mod tests {
     fn mode_mirror_encode_and_current() {
         // All modes encode/decode without collisions
         let all_modes = [
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             PermissionMode::Auto,
             PermissionMode::Plan,
-            PermissionMode::Edits,
-            PermissionMode::Ci,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Deny,
         ];
         let mut seen = std::collections::HashSet::new();
         for mode in all_modes {
@@ -7951,7 +7948,7 @@ mod tests {
         // mirror.current() reflects live mode after set_mode
         let mut pm = PermissionManager::new(false);
         let mirror = pm.mode_mirror_handle();
-        assert_eq!(mirror.current(), PermissionMode::Ask);
+        assert_eq!(mirror.current(), PermissionMode::Prompt);
         pm.set_mode(PermissionMode::Plan);
         assert_eq!(mirror.current(), PermissionMode::Plan);
         pm.set_mode(PermissionMode::Auto);
@@ -7964,11 +7961,11 @@ mod tests {
         let mirror = pm.mode_mirror_handle();
 
         // stage() does NOT mutate pm.mode(); only pull does
-        assert_eq!(pm.mode(), PermissionMode::Ask);
+        assert_eq!(pm.mode(), PermissionMode::Prompt);
         mirror.stage(PermissionMode::Plan);
         assert_eq!(
             pm.mode(),
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             "stage alone must not mutate self.mode; the host must pull explicitly"
         );
         pm.pull_mode_from_mirror();

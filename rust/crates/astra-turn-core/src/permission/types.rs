@@ -23,17 +23,17 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
-    /// Run tools without approval prompts; risk is recorded, not escalated.
+    /// Auto-approve all tools (except bypass-immune safety checks).
     Auto,
     /// Read-only investigation/planning mode: allow read tools, deny mutations.
     Plan,
     /// Auto-approve safe workspace-local edit/write operations only.
-    Edits,
+    AcceptEdits,
     /// Prompt the user for write/execute tools (default interactive mode).
     #[default]
-    Ask,
+    Prompt,
     /// Deny all write/execute tools without prompting (CI/headless mode).
-    Ci,
+    Deny,
 }
 
 impl PermissionMode {
@@ -42,9 +42,9 @@ impl PermissionMode {
         match self {
             Self::Auto => "Auto",
             Self::Plan => "Plan",
-            Self::Edits => "Edits",
-            Self::Ask => "Ask",
-            Self::Ci => "CI",
+            Self::AcceptEdits => "Edits",
+            Self::Prompt => "Ask",
+            Self::Deny => "Deny",
         }
     }
 
@@ -55,9 +55,9 @@ impl PermissionMode {
         match self {
             Self::Auto => (255, 255, 0),
             Self::Plan => (100, 149, 237),
-            Self::Edits => (0, 255, 255),
-            Self::Ask => (255, 255, 255),
-            Self::Ci => (255, 0, 0),
+            Self::AcceptEdits => (0, 255, 255),
+            Self::Prompt => (255, 255, 255),
+            Self::Deny => (255, 0, 0),
         }
     }
 }
@@ -67,9 +67,9 @@ impl std::fmt::Display for PermissionMode {
         match self {
             Self::Auto => write!(f, "auto"),
             Self::Plan => write!(f, "plan"),
-            Self::Edits => write!(f, "edits"),
-            Self::Ask => write!(f, "ask"),
-            Self::Ci => write!(f, "ci"),
+            Self::AcceptEdits => write!(f, "accept_edits"),
+            Self::Prompt => write!(f, "prompt"),
+            Self::Deny => write!(f, "deny"),
         }
     }
 }
@@ -80,11 +80,11 @@ impl std::str::FromStr for PermissionMode {
         match s.to_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
             "plan" => Ok(Self::Plan),
-            "edits" => Ok(Self::Edits),
-            "ask" => Ok(Self::Ask),
-            "ci" => Ok(Self::Ci),
+            "accept_edits" => Ok(Self::AcceptEdits),
+            "prompt" => Ok(Self::Prompt),
+            "deny" => Ok(Self::Deny),
             _ => Err(format!(
-                "invalid permission mode '{s}': expected ask, edits, plan, auto, or ci"
+                "invalid permission mode '{s}': expected auto, plan, accept_edits, prompt, or deny"
             )),
         }
     }
@@ -1168,27 +1168,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn permission_mode_roundtrip_includes_edits() {
-        let parsed = "edits".parse::<PermissionMode>().unwrap();
-        assert_eq!(parsed, PermissionMode::Edits);
-        assert_eq!(parsed.to_string(), "edits");
+    fn permission_mode_roundtrip_includes_accept_edits() {
+        let parsed = "accept_edits".parse::<PermissionMode>().unwrap();
+        assert_eq!(parsed, PermissionMode::AcceptEdits);
+        assert_eq!(parsed.to_string(), "accept_edits");
         assert_eq!(parsed.chip_text(), "Edits");
-        assert!("accept_edits".parse::<PermissionMode>().is_err());
         assert!("accept-edits".parse::<PermissionMode>().is_err());
-    }
-
-    #[test]
-    fn permission_mode_roundtrip_includes_ask_and_ci() {
-        let ask = "ask".parse::<PermissionMode>().unwrap();
-        assert_eq!(ask, PermissionMode::Ask);
-        assert_eq!(ask.to_string(), "ask");
-
-        let ci = "ci".parse::<PermissionMode>().unwrap();
-        assert_eq!(ci, PermissionMode::Ci);
-        assert_eq!(ci.to_string(), "ci");
-
-        assert!("prompt".parse::<PermissionMode>().is_err());
-        assert!("deny".parse::<PermissionMode>().is_err());
     }
 
     #[test]
@@ -1234,7 +1219,7 @@ mod tests {
 
     #[test]
     fn dangerous_bash_allow_shapes_are_not_honored_as_allow_rules() {
-        let mut inherited = InheritedPermissions::new(PermissionMode::Ask);
+        let mut inherited = InheritedPermissions::new(PermissionMode::Prompt);
         inherited.add_allow(PermissionRule::parse("bash()"));
         inherited.add_allow(PermissionRule::parse(
             r#"Bash(argv_prefix="python", op="execute")"#,
@@ -1422,7 +1407,7 @@ mod tests {
     #[test]
     fn sync_context_uses_current_constraints_for_allow_rules() {
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![PermissionRule::parse(
                 r#"Bash(argv_prefix="npm test", cwd_root="packages/web")"#,
             )],
@@ -1459,7 +1444,7 @@ mod tests {
     #[test]
     fn test_permission_sync_context() {
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![PermissionRule::parse(r#"Bash(argv_prefix="git")"#)],
             deny_rules: vec![],
             ..Default::default()
@@ -1481,7 +1466,7 @@ mod tests {
     #[tokio::test]
     async fn permission_sync_shared_handle_preserves_explicit_envelope() {
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Ci,
+            mode: PermissionMode::Deny,
             allowed_tools: Some(["read_file".to_string()].into_iter().collect()),
             ..Default::default()
         };
@@ -1489,24 +1474,24 @@ mod tests {
         let handle = PermissionSyncContext::shared(inherited);
         let ctx = handle.read().await;
 
-        assert_eq!(ctx.mode(), PermissionMode::Ci);
+        assert_eq!(ctx.mode(), PermissionMode::Deny);
         assert!(ctx.inherited.is_tool_allowed_by_allowlist("read_file"));
         assert!(!ctx.inherited.is_tool_allowed_by_allowlist("bash"));
     }
 
     #[tokio::test]
     async fn permission_sync_shared_root_uses_root_envelope() {
-        let handle = PermissionSyncContext::shared_root(PermissionMode::Edits);
+        let handle = PermissionSyncContext::shared_root(PermissionMode::AcceptEdits);
         let ctx = handle.read().await;
 
-        assert_eq!(ctx.mode(), PermissionMode::Edits);
+        assert_eq!(ctx.mode(), PermissionMode::AcceptEdits);
         assert!(ctx.inherited.allow_rules.is_empty());
         assert!(ctx.inherited.deny_rules.is_empty());
     }
 
     #[tokio::test]
     async fn permission_sync_into_shared_preserves_session_updates() {
-        let mut ctx = PermissionSyncContext::root(PermissionMode::Ask);
+        let mut ctx = PermissionSyncContext::root(PermissionMode::Prompt);
         ctx.apply_update(&PermissionUpdate::allow(PermissionRule::parse(
             r#"Bash(argv_prefix="cargo test")"#,
         )));

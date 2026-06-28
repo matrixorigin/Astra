@@ -378,7 +378,7 @@ pub(crate) struct ChatArgs {
     /// Auto-approve tool calls
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     pub auto_approve: bool,
-    /// Permission mode: auto, edits, plan, ask (interactive, default), or ci.
+    /// Permission mode: auto, plan, accept_edits, prompt (interactive, default), or deny.
     #[arg(long = "permission-mode", value_parser = parse_permission_mode_arg)]
     pub permission_mode: Option<String>,
     /// Suppress spinner and progress output (result still printed)
@@ -718,7 +718,7 @@ pub(crate) struct GrepPatternArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra permissions rules\n  astra permissions auto\n  astra permissions edits\n  astra permissions plan\n  astra permissions ask\n  astra permissions trust\n  astra permissions trace"
+    after_help = "Examples:\n  astra permissions rules\n  astra permissions auto\n  astra permissions plan\n  astra permissions accept_edits\n  astra permissions prompt\n  astra permissions trust\n  astra permissions trace"
 )]
 pub(crate) struct PermissionsArgs {
     #[command(subcommand)]
@@ -729,14 +729,15 @@ pub(crate) struct PermissionsArgs {
 pub(crate) enum PermissionsSubcommand {
     /// Auto-approve allowed tool calls
     Auto,
-    /// Auto-approve workspace-local edits while still asking before shell and external writes
-    Edits,
+    /// Auto-approve workspace-local edits while still prompting for shell and external writes
+    #[command(name = "accept_edits")]
+    AcceptEdits,
     /// Read-only investigation mode: allow reads, deny mutations
     Plan,
-    /// Ask before running tools that need a human decision
-    Ask,
-    /// CI-safe mode: reject writes and high-risk tools without prompting
-    Ci,
+    /// Prompt before running allowed tool calls
+    Prompt,
+    /// Deny writes and high-risk tools
+    Deny,
     /// Show permission rules summary
     Rules,
     /// Trust this workspace and enable saved workspace allow rules

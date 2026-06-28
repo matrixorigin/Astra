@@ -1,8 +1,6 @@
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use astra_turn_core::interaction_types::AskUserBehavior;
-
 use astra_tools::{
     AskUserAnswers, AskUserGate, AskUserPrompt, ToolProgressCallback,
     build_ask_user_prompt_telemetry, build_ask_user_tool_call_audit, normalize_ask_user_answers,
@@ -12,8 +10,6 @@ use astra_tools::{
 pub(crate) struct AskUserExecutionContext<'a> {
     pub(crate) user_id: &'a str,
     pub(crate) session_id: &'a str,
-    pub(crate) ask_user_behavior: AskUserBehavior,
-    pub(crate) auto_duplicate: bool,
     pub(crate) gate: Option<&'a dyn AskUserGate>,
     pub(crate) progress_callback: Option<&'a dyn ToolProgressCallback>,
     pub(crate) auxiliary_event_writer: Option<&'a dyn crate::TurnAuxiliaryEventWriter>,
@@ -28,75 +24,14 @@ pub(crate) async fn execute_ask_user(
         Err(error) => return astra_tools::ToolResult::error(error),
     };
 
-    let request_id = format!("ask-{}-{}", context.session_id, Uuid::new_v4());
-    let content = ask_user_content_preview(&prompt);
-
-    match context.ask_user_behavior {
-        AskUserBehavior::AutoUnanswered => {
-            let (status, event_type, reason, instruction) = if context.auto_duplicate {
-                (
-                    "auto_unanswered_duplicate",
-                    "ask_user_auto_duplicate",
-                    "same clarification was already unavailable in this turn",
-                    "Do not call ask_user again for this question. Decide with stated assumptions, gather factual evidence, or stop with a concrete blocker.",
-                )
-            } else {
-                (
-                    "auto_unanswered",
-                    "ask_user_auto_unanswered",
-                    "auto mode does not interrupt the user",
-                    "Continue with best judgment. Prefer reversible actions, use conservative defaults for irreversible decisions, and state material assumptions in the final response.",
-                )
-            };
-            if let Some(cb) = context.progress_callback {
-                cb.ask_user_resolved(&request_id, status, &[], Some(false), None)
-                    .await;
-            }
-            let output = json!({
-                "status": status,
-                "source": "runtime_policy",
-                "answers": [],
-                "reason": reason,
-                "instruction": instruction,
-            });
-            persist_ask_user_auxiliary_event(
-                &context,
-                event_type,
-                content,
-                request_id.clone(),
-                json!({
-                    "tool_name": "ask_user",
-                    "request_id": request_id,
-                    "ask_user": {
-                        "status": status,
-                        "source": "runtime_policy",
-                        "prompt": build_ask_user_prompt_telemetry(&prompt),
-                        "response": {
-                            "outcome": status,
-                            "answered_question_count": 0,
-                            "annotation_count": 0,
-                            "freeform_answer_count": 0,
-                        },
-                    },
-                }),
-            )
-            .await;
-            return astra_tools::ToolResult::text(output.to_string());
-        }
-        AskUserBehavior::Hidden => {
-            return astra_tools::ToolResult::error(
-                "Error: ask_user cannot collect a human response in this execution preset".into(),
-            );
-        }
-        AskUserBehavior::PromptUser => {}
-    }
-
     let Some(gate) = context.gate else {
         return astra_tools::ToolResult::error(
             "Error: ask_user requires an interactive client connection".into(),
         );
     };
 
+    let request_id = format!("ask-{}-{}", context.session_id, Uuid::new_v4());
+    let content = ask_user_content_preview(&prompt);
     persist_ask_user_auxiliary_event(
         &context,
         "ask_user_prompted",
@@ -118,14 +53,8 @@ pub(crate) async fn execute_ask_user(
                 Ok(answers) => answers,
                 Err(error) => {
                     if let Some(cb) = context.progress_callback {
-                        cb.ask_user_resolved(
-                            &request_id,
-                            "interaction_error",
-                            &[],
-                            None,
-                            Some(&error),
-                        )
-                        .await;
+                        cb.ask_user_resolved(&request_id, "error", &[], None, Some(&error))
+                            .await;
                     }
                     persist_ask_user_auxiliary_event(
                         &context,
@@ -135,16 +64,11 @@ pub(crate) async fn execute_ask_user(
                         json!({
                             "tool_name": "ask_user",
                             "request_id": request_id.clone(),
-                            "ask_user": build_ask_user_tool_call_audit(&prompt, "interaction_error", None, Some(&error)),
+                            "ask_user": build_ask_user_tool_call_audit(&prompt, "error", None, Some(&error)),
                         }),
                     )
                     .await;
-                    return ask_user_status_result(
-                        "interaction_error",
-                        "runtime_policy",
-                        &error,
-                        "Treat this as unavailable human input. Continue with stated assumptions or report a concrete blocker.",
-                    );
+                    return astra_tools::ToolResult::error(error);
                 }
             };
             let flattened_answers = flatten_ask_user_answers(&answers);
@@ -176,18 +100,7 @@ pub(crate) async fn execute_ask_user(
                 }),
             )
             .await;
-            astra_tools::ToolResult::text(
-                json!({
-                    "status": "user_answered",
-                    "source": "user",
-                    "answers": answers.to_tool_result_value()
-                        .get("answers")
-                        .cloned()
-                        .unwrap_or_else(|| json!({})),
-                    "raw": answers.to_tool_result_value(),
-                })
-                .to_string(),
-            )
+            astra_tools::ToolResult::text(answers.to_tool_result_value().to_string())
         }
         astra_tools::AskUserDecision::Cancelled => {
             let error = "Error: ask_user was cancelled by the user";
@@ -207,12 +120,7 @@ pub(crate) async fn execute_ask_user(
                 }),
             )
             .await;
-            ask_user_status_result(
-                "cancelled",
-                "user",
-                error,
-                "Continue without a human answer. Do not claim the user approved or selected an option.",
-            )
+            astra_tools::ToolResult::error(error.into())
         }
         astra_tools::AskUserDecision::Timeout => {
             let error = "Error: ask_user timed out waiting for user response";
@@ -232,17 +140,12 @@ pub(crate) async fn execute_ask_user(
                 }),
             )
             .await;
-            ask_user_status_result(
-                "timeout",
-                "runtime_policy",
-                error,
-                "Continue without a human answer. Prefer reversible defaults and state material assumptions.",
-            )
+            astra_tools::ToolResult::error(error.into())
         }
         astra_tools::AskUserDecision::Error(message) => {
             let error = format!("Error: ask_user failed: {message}");
             if let Some(cb) = context.progress_callback {
-                cb.ask_user_resolved(&request_id, "interaction_error", &[], None, Some(&error))
+                cb.ask_user_resolved(&request_id, "error", &[], None, Some(&error))
                     .await;
             }
             persist_ask_user_auxiliary_event(
@@ -253,36 +156,13 @@ pub(crate) async fn execute_ask_user(
                 json!({
                     "tool_name": "ask_user",
                     "request_id": request_id.clone(),
-                    "ask_user": build_ask_user_tool_call_audit(&prompt, "interaction_error", None, Some(&error)),
+                    "ask_user": build_ask_user_tool_call_audit(&prompt, "error", None, Some(&error)),
                 }),
             )
             .await;
-            ask_user_status_result(
-                "interaction_error",
-                "runtime_policy",
-                &error,
-                "Treat this as unavailable human input. Continue with stated assumptions or report a concrete blocker.",
-            )
+            astra_tools::ToolResult::error(format!("ask_user failed: {message}"))
         }
     }
-}
-
-fn ask_user_status_result(
-    status: &str,
-    source: &str,
-    reason: &str,
-    instruction: &str,
-) -> astra_tools::ToolResult {
-    astra_tools::ToolResult::text(
-        json!({
-            "status": status,
-            "source": source,
-            "answers": [],
-            "reason": reason,
-            "instruction": instruction,
-        })
-        .to_string(),
-    )
 }
 
 fn ask_user_content_preview(prompt: &AskUserPrompt) -> String {

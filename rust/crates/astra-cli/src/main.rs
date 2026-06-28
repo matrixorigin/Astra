@@ -2369,25 +2369,18 @@ total_tokens_out: 500
 
     #[test]
     fn cli_chat_permission_mode_rejects_legacy_aliases() {
-        for mode in [
-            "accept-edits",
-            "accept_edits",
-            "prompt",
-            "deny",
-            "yolo",
-            "bypass-safety",
-            "bypass_safety",
-        ] {
+        for mode in ["accept-edits", "yolo", "bypass-safety", "bypass_safety"] {
             assert!(Cli::try_parse_from(["astra", "chat", "--permission-mode", mode]).is_err());
         }
     }
 
     #[test]
-    fn cli_chat_permission_mode_edits() {
-        let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", "edits"]).unwrap();
+    fn cli_chat_permission_mode_accept_edits() {
+        let cli =
+            Cli::try_parse_from(["astra", "chat", "--permission-mode", "accept_edits"]).unwrap();
         match cli.command {
             Some(Command::Chat(ref args)) => {
-                assert_eq!(args.permission_mode.as_deref(), Some("edits"));
+                assert_eq!(args.permission_mode.as_deref(), Some("accept_edits"));
             }
             _ => panic!("expected Chat command"),
         }
@@ -2856,11 +2849,11 @@ total_tokens_out: 500
     }
 
     #[test]
-    fn cli_permissions_command_edits_mode() {
-        let cli = Cli::try_parse_from(["astra", "permissions", "edits"]).unwrap();
+    fn cli_permissions_command_accept_edits_mode() {
+        let cli = Cli::try_parse_from(["astra", "permissions", "accept_edits"]).unwrap();
         match cli.command {
             Some(Command::Permissions(args)) => match args.command {
-                Some(PermissionsSubcommand::Edits) => {}
+                Some(PermissionsSubcommand::AcceptEdits) => {}
                 other => panic!("unexpected permissions subcommand: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
@@ -2881,7 +2874,7 @@ total_tokens_out: 500
 
     #[test]
     fn cli_permissions_command_rejects_removed_aliases() {
-        for removed in ["all", "status", "accept_edits", "prompt", "deny"] {
+        for removed in ["all", "status"] {
             assert!(
                 Cli::try_parse_from(["astra", "permissions", removed]).is_err(),
                 "removed permissions subcommand must be rejected: {removed}"
@@ -2891,10 +2884,10 @@ total_tokens_out: 500
 
     #[test]
     fn cli_allow_alias_parses_permissions_command() {
-        let cli = Cli::try_parse_from(["astra", "allow", "ask"]).unwrap();
+        let cli = Cli::try_parse_from(["astra", "allow", "prompt"]).unwrap();
         match cli.command {
             Some(Command::Permissions(args)) => match args.command {
-                Some(PermissionsSubcommand::Ask) => {}
+                Some(PermissionsSubcommand::Prompt) => {}
                 other => panic!("unexpected permissions subcommand: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
@@ -3236,14 +3229,14 @@ total_tokens_out: 500
     }
 
     #[test]
-    fn cli_yes_with_permission_mode_ci() {
+    fn cli_yes_with_permission_mode_deny() {
         // Both flags accepted by parser on `chat` subcommand — runtime resolves conflict
         let cli = Cli::try_parse_from([
             "astra",
             "chat",
             "-y",
             "--permission-mode",
-            "ci",
+            "deny",
             "-m",
             "test",
         ])
@@ -3251,7 +3244,7 @@ total_tokens_out: 500
         match &cli.command {
             Some(Command::Chat(args)) => {
                 assert!(args.auto_approve);
-                assert_eq!(args.permission_mode.as_deref(), Some("ci"));
+                assert_eq!(args.permission_mode.as_deref(), Some("deny"));
             }
             _ => panic!("expected Chat command"),
         }
@@ -3311,18 +3304,18 @@ total_tokens_out: 500
             false,
             &std::path::PathBuf::from("/tmp"),
         );
-        assert_eq!(pm.mode(), permission_manager::PermissionMode::Ask);
-        pm.set_mode(cli::permission_manager::PermissionMode::Edits);
-        assert_eq!(pm.mode(), permission_manager::PermissionMode::Edits);
+        assert_eq!(pm.mode(), permission_manager::PermissionMode::Prompt);
+        pm.set_mode(cli::permission_manager::PermissionMode::AcceptEdits);
+        assert_eq!(pm.mode(), permission_manager::PermissionMode::AcceptEdits);
         pm.set_mode(cli::permission_manager::PermissionMode::Auto);
         assert_eq!(pm.mode(), permission_manager::PermissionMode::Auto);
-        pm.set_mode(cli::permission_manager::PermissionMode::Ci);
-        assert_eq!(pm.mode(), permission_manager::PermissionMode::Ci);
+        pm.set_mode(cli::permission_manager::PermissionMode::Deny);
+        assert_eq!(pm.mode(), permission_manager::PermissionMode::Deny);
     }
 
     #[test]
     fn permission_mode_roundtrip_parse() {
-        for mode_str in &["auto", "edits", "plan", "ask", "ci"] {
+        for mode_str in &["auto", "accept_edits", "plan", "prompt", "deny"] {
             let mode: permission_manager::PermissionMode = mode_str.parse().unwrap();
             assert_eq!(mode.to_string().to_lowercase(), *mode_str);
         }

@@ -382,7 +382,7 @@ impl StatusLine {
         // Permission mode changes whether tools run automatically or ask first.
         // Keep it visible so `/mode` feedback matches the persistent status line.
         match ctx.permission_mode {
-            PermissionMode::Ask => {
+            PermissionMode::Prompt => {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),
                     muted.add_modifier(Modifier::BOLD),
@@ -404,7 +404,7 @@ impl StatusLine {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            PermissionMode::Edits => {
+            PermissionMode::AcceptEdits => {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),
                     Style::default()
@@ -412,7 +412,7 @@ impl StatusLine {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            PermissionMode::Ci => {
+            PermissionMode::Deny => {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),

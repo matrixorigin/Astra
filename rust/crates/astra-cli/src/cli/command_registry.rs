@@ -321,13 +321,13 @@ const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
 
 const ALLOW_SUBCOMMANDS: &[(&str, &str)] = &[
     ("auto", "Auto-approve all tool use"),
-    (
-        "edits",
-        "Auto-approve workspace-local file edits while still asking before shell and external writes",
-    ),
     ("plan", "Read-only investigation mode; mutations are denied"),
-    ("ask", "Ask before tool use"),
-    ("ci", "Reject writes and high-risk tools without prompting"),
+    (
+        "accept_edits",
+        "Auto-approve workspace-local file edits while still prompting for shell and external writes",
+    ),
+    ("deny", "Deny all tool use"),
+    ("prompt", "Prompt before tool use"),
     ("rules", "Show current permission rules"),
     ("trust", "Trust this workspace"),
     ("untrust", "Mark this workspace untrusted"),
@@ -779,11 +779,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── System ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/allow",
-        "Permission mode: /allow [auto|edits|plan|ask|ci|rules|trust|untrust|trace]",
+        "Permission mode: /allow [auto|plan|accept_edits|prompt|deny|rules|trust|untrust|trace]",
         CommandGroup::System,
     )
     .with_subcommands(ALLOW_SUBCOMMANDS)
-    .with_arg_hint("[auto|edits|plan|ask|ci|rules|trust|untrust|trace]")
+    .with_arg_hint("[auto|accept_edits|plan|prompt|deny|rules|trust|untrust|trace]")
     .with_tui_handler(TuiHandler::Inline),
     CommandMeta::new(
         "/instructions",
@@ -1096,27 +1096,23 @@ mod tests {
     }
 
     #[test]
-    fn allow_command_lists_canonical_permission_modes() {
+    fn allow_command_lists_accept_edits_mode() {
         let allow = COMMANDS
             .iter()
             .find(|meta| meta.name == "/allow")
             .expect("/allow command");
-        assert!(allow.description.contains("edits"));
+        assert!(allow.description.contains("accept_edits"));
         assert!(allow.description.contains("plan"));
         assert_eq!(
             allow.arg_hint,
-            Some("[auto|edits|plan|ask|ci|rules|trust|untrust|trace]")
+            Some("[auto|accept_edits|plan|prompt|deny|rules|trust|untrust|trace]")
         );
 
         let subs = subcommand_completions("/allow").expect("/allow subcommands");
-        assert!(subs.iter().any(|(tok, _)| *tok == "edits"));
-        assert!(subs.iter().any(|(tok, _)| *tok == "ask"));
-        assert!(subs.iter().any(|(tok, _)| *tok == "ci"));
-        assert!(!subs.iter().any(|(tok, _)| *tok == "accept_edits"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "accept_edits"));
         assert!(!subs.iter().any(|(tok, _)| *tok == "accept-edits"));
-        assert!(!subs.iter().any(|(tok, _)| *tok == "prompt"));
-        assert!(!subs.iter().any(|(tok, _)| *tok == "deny"));
         assert!(!subs.iter().any(|(tok, _)| *tok == "default"));
+        assert!(!subs.iter().any(|(tok, _)| *tok == "ask"));
         assert!(!subs.iter().any(|(tok, _)| *tok == "all"));
         assert!(!subs.iter().any(|(tok, _)| *tok == "status"));
         assert!(subs.iter().any(|(tok, _)| *tok == "plan"));

@@ -15,28 +15,19 @@ pub enum TurnInteractionMode {
     NonInteractive,
     Prompt,
     Auto,
-    Ci,
+    Deny,
     Headless,
 }
 
 impl TurnInteractionMode {
     #[must_use]
-    pub fn ask_user_behavior(self) -> AskUserBehavior {
-        match self {
-            Self::Prompt => AskUserBehavior::PromptUser,
-            Self::Auto => AskUserBehavior::AutoUnanswered,
-            Self::Ci | Self::Headless | Self::NonInteractive => AskUserBehavior::Hidden,
-        }
-    }
-
-    #[must_use]
     pub fn allows_ask_user(self) -> bool {
-        self.ask_user_behavior().visible()
+        matches!(self, Self::Prompt)
     }
 
     #[must_use]
     pub fn can_pause_for_user(self) -> bool {
-        self.ask_user_behavior().can_pause()
+        matches!(self, Self::Prompt)
     }
 
     /// True when the runtime should suppress its own *interruption-style*
@@ -66,28 +57,9 @@ impl TurnInteractionMode {
             Self::NonInteractive => "non_interactive",
             Self::Prompt => "prompt",
             Self::Auto => "auto",
-            Self::Ci => "ci",
+            Self::Deny => "deny",
             Self::Headless => "headless",
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AskUserBehavior {
-    PromptUser,
-    AutoUnanswered,
-    Hidden,
-}
-
-impl AskUserBehavior {
-    #[must_use]
-    pub fn visible(self) -> bool {
-        matches!(self, Self::PromptUser | Self::AutoUnanswered)
-    }
-
-    #[must_use]
-    pub fn can_pause(self) -> bool {
-        matches!(self, Self::PromptUser)
     }
 }
 
@@ -98,7 +70,6 @@ pub struct TurnInteractionPolicy {
     pub evidence_tool_names: Vec<String>,
     pub can_pause_for_user: bool,
     pub allow_ask_user: bool,
-    pub ask_user_behavior: AskUserBehavior,
 }
 
 impl Default for TurnInteractionPolicy {
@@ -131,7 +102,6 @@ impl TurnInteractionPolicy {
             evidence_tool_names,
             can_pause_for_user: mode.can_pause_for_user(),
             allow_ask_user: mode.allows_ask_user(),
-            ask_user_behavior: mode.ask_user_behavior(),
         }
     }
 
@@ -163,9 +133,10 @@ impl TurnInteractionPolicy {
 /// Returns the set of tool names that should be restricted for the given interaction mode.
 #[must_use]
 pub fn interaction_scoped_tool_restrictions(mode: TurnInteractionMode) -> HashSet<String> {
-    match mode.ask_user_behavior() {
-        AskUserBehavior::PromptUser | AskUserBehavior::AutoUnanswered => HashSet::new(),
-        AskUserBehavior::Hidden => HashSet::from([ASK_USER_TOOL_NAME.to_string()]),
+    if mode.allows_ask_user() {
+        HashSet::new()
+    } else {
+        HashSet::from([ASK_USER_TOOL_NAME.to_string()])
     }
 }
 
@@ -195,37 +166,11 @@ mod tests {
     }
 
     #[test]
-    fn ask_mode_keeps_nudges() {
-        // Ask mode is "I want to see / approve each step" — keep
+    fn prompt_mode_keeps_nudges() {
+        // Prompt mode is "I want to see / approve each step" — keep
         // the nudges so the user sees when the runtime thinks the
         // model is wandering.
         assert!(!TurnInteractionMode::Prompt.suppresses_loop_nudges());
-    }
-
-    #[test]
-    fn auto_keeps_ask_user_visible_without_pause() {
-        assert_eq!(
-            TurnInteractionMode::Auto.ask_user_behavior(),
-            AskUserBehavior::AutoUnanswered
-        );
-        assert!(TurnInteractionMode::Auto.allows_ask_user());
-        assert!(!TurnInteractionMode::Auto.can_pause_for_user());
-        assert!(
-            !interaction_scoped_tool_restrictions(TurnInteractionMode::Auto)
-                .contains(ASK_USER_TOOL_NAME)
-        );
-    }
-
-    #[test]
-    fn headless_hides_ask_user() {
-        assert_eq!(
-            TurnInteractionMode::Headless.ask_user_behavior(),
-            AskUserBehavior::Hidden
-        );
-        assert!(
-            interaction_scoped_tool_restrictions(TurnInteractionMode::Headless)
-                .contains(ASK_USER_TOOL_NAME)
-        );
     }
 
     #[test]
@@ -244,11 +189,11 @@ mod tests {
     }
 
     #[test]
-    fn ci_keeps_nudges() {
-        // CI interaction mode blocks tool execution — the nudges are irrelevant
+    fn deny_keeps_nudges() {
+        // Deny mode blocks tool execution — the nudges are irrelevant
         // (tools are already blocked), but we still report them so the
         // user sees WHY nothing is progressing. No reason to silence.
-        assert!(!TurnInteractionMode::Ci.suppresses_loop_nudges());
+        assert!(!TurnInteractionMode::Deny.suppresses_loop_nudges());
     }
 
     #[test]

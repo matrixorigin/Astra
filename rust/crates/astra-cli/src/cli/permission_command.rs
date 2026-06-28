@@ -4,7 +4,7 @@ use crate::cli::theme;
 use crossterm::style::Stylize;
 
 pub(crate) const PERMISSION_COMMAND_USAGE: &str =
-    "auto, edits, plan, ask, ci, rules, trust, untrust, trace";
+    "auto, plan, accept_edits, prompt, deny, rules, trust, untrust, trace";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionCommandAction<'a> {
@@ -51,19 +51,19 @@ pub(crate) fn parse_permission_command(arg: &str) -> PermissionCommandAction<'_>
 
 /// Next mode when cycling `/allow` with no argument.
 ///
-/// `Ci` is intentionally sticky under the cycle: it is the most restrictive
-/// mode and must only be exited by an explicit `/allow ask` (or another
-/// named mode). Cycling must never silently move a session out of `Ci`,
+/// `Deny` is intentionally sticky under the cycle: it is the most restrictive
+/// mode and must only be exited by an explicit `/allow prompt` (or another
+/// named mode). Cycling must never silently move a session out of `Deny`,
 /// because that would widen permissions without an explicit user action.
-/// `Ci` is likewise never a cycle *target* — it is reachable only via
-/// `/allow ci`.
+/// `Deny` is likewise never a cycle *target* — it is reachable only via
+/// `/allow deny`.
 pub(crate) fn next_permission_mode_for_cycle(current: PermissionMode) -> PermissionMode {
     match current {
-        PermissionMode::Ci => PermissionMode::Ci,
-        PermissionMode::Ask => PermissionMode::Edits,
-        PermissionMode::Edits => PermissionMode::Plan,
+        PermissionMode::Deny => PermissionMode::Deny,
+        PermissionMode::Prompt => PermissionMode::AcceptEdits,
+        PermissionMode::AcceptEdits => PermissionMode::Plan,
         PermissionMode::Plan => PermissionMode::Auto,
-        PermissionMode::Auto => PermissionMode::Ask,
+        PermissionMode::Auto => PermissionMode::Prompt,
     }
 }
 
@@ -75,8 +75,8 @@ pub(crate) fn permission_mode_cli_detail(mode: PermissionMode) -> Option<&'stati
     match mode {
         PermissionMode::Auto => Some("all tools auto-approved"),
         PermissionMode::Plan => Some("read-only investigation mode"),
-        PermissionMode::Edits => Some("workspace-local edits auto-approved"),
-        PermissionMode::Ask | PermissionMode::Ci => None,
+        PermissionMode::AcceptEdits => Some("workspace-local edits auto-approved"),
+        PermissionMode::Prompt | PermissionMode::Deny => None,
     }
 }
 
@@ -170,9 +170,9 @@ mod tests {
         let cases = [
             ("auto", PermissionMode::Auto),
             ("plan", PermissionMode::Plan),
-            ("edits", PermissionMode::Edits),
-            ("ask", PermissionMode::Ask),
-            ("ci", PermissionMode::Ci),
+            ("accept_edits", PermissionMode::AcceptEdits),
+            ("prompt", PermissionMode::Prompt),
+            ("deny", PermissionMode::Deny),
         ];
 
         for (input, mode) in cases {
@@ -186,15 +186,7 @@ mod tests {
 
     #[test]
     fn parser_rejects_removed_permission_aliases() {
-        for alias in [
-            "all",
-            "default",
-            "status",
-            "accept-edits",
-            "accept_edits",
-            "prompt",
-            "deny",
-        ] {
+        for alias in ["all", "default", "ask", "status", "accept-edits"] {
             assert_eq!(
                 parse_permission_command(alias),
                 PermissionCommandAction::Unknown(alias),
@@ -235,11 +227,11 @@ mod tests {
     #[test]
     fn cycle_order_matches_user_facing_picker() {
         assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Ask),
-            PermissionMode::Edits
+            next_permission_mode_for_cycle(PermissionMode::Prompt),
+            PermissionMode::AcceptEdits
         );
         assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Edits),
+            next_permission_mode_for_cycle(PermissionMode::AcceptEdits),
             PermissionMode::Plan
         );
         assert_eq!(
@@ -248,13 +240,13 @@ mod tests {
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Auto),
-            PermissionMode::Ask
+            PermissionMode::Prompt
         );
-        // `CI` is sticky under the cycle: it must only be exited by an
+        // `Deny` is sticky under the cycle: it must only be exited by an
         // explicit `/allow <mode>`, never by a bare `/allow`.
         assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Ci),
-            PermissionMode::Ci
+            next_permission_mode_for_cycle(PermissionMode::Deny),
+            PermissionMode::Deny
         );
     }
 }

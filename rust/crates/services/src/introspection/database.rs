@@ -79,26 +79,6 @@ fn extract_ask_user_audit(metadata: &Value) -> Option<&Value> {
     })
 }
 
-fn is_first_class_ask_user_interaction_event(event_type: &str) -> bool {
-    matches!(
-        event_type,
-        "ask_user_submitted"
-            | "ask_user_cancelled"
-            | "ask_user_timeout"
-            | "ask_user_error"
-            | "ask_user_auto_unanswered"
-            | "ask_user_auto_duplicate"
-    )
-}
-
-fn ask_user_outcome_from_audit(audit: &Value) -> Option<&str> {
-    audit
-        .get("response")
-        .and_then(|response| response.get("outcome"))
-        .and_then(Value::as_str)
-        .or_else(|| audit.get("status").and_then(Value::as_str))
-}
-
 fn build_ask_user_history_summary(rows: &[AskUserHistoryRow]) -> Value {
     let has_first_class_events = rows
         .iter()
@@ -106,8 +86,6 @@ fn build_ask_user_history_summary(rows: &[AskUserHistoryRow]) -> Value {
     let mut submitted_count = 0usize;
     let mut cancelled_count = 0usize;
     let mut timeout_count = 0usize;
-    let mut auto_unanswered_count = 0usize;
-    let mut auto_duplicate_count = 0usize;
     let mut error_count = 0usize;
     let mut prompt_count = 0usize;
     let mut question_count_sum = 0usize;
@@ -135,7 +113,10 @@ fn build_ask_user_history_summary(rows: &[AskUserHistoryRow]) -> Value {
         }
 
         let counts_as_interaction = if has_first_class_events {
-            is_first_class_ask_user_interaction_event(row.event_type.as_str())
+            matches!(
+                row.event_type.as_str(),
+                "ask_user_submitted" | "ask_user_cancelled" | "ask_user_timeout" | "ask_user_error"
+            )
         } else {
             matches!(row.event_type.as_str(), "tool_call" | "tool_error")
         };
@@ -143,16 +124,16 @@ fn build_ask_user_history_summary(rows: &[AskUserHistoryRow]) -> Value {
             continue;
         }
 
-        let response = audit.get("response");
-        let Some(outcome) = ask_user_outcome_from_audit(audit) else {
+        let Some(response) = audit.get("response") else {
+            continue;
+        };
+        let Some(outcome) = response.get("outcome").and_then(Value::as_str) else {
             continue;
         };
         match outcome {
             "submitted" => submitted_count += 1,
             "cancelled" => cancelled_count += 1,
             "timeout" => timeout_count += 1,
-            "auto_unanswered" => auto_unanswered_count += 1,
-            "auto_unanswered_duplicate" => auto_duplicate_count += 1,
             _ => error_count += 1,
         }
         let first_question = prompt
@@ -174,24 +155,22 @@ fn build_ask_user_history_summary(rows: &[AskUserHistoryRow]) -> Value {
                 .unwrap_or_default(),
             "first_question": first_question,
             "answered_question_count": response
-                .and_then(|response| response.get("answered_question_count"))
+                .get("answered_question_count")
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
             "annotation_count": response
-                .and_then(|response| response.get("annotation_count"))
+                .get("annotation_count")
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
             "freeform_answer_count": response
-                .and_then(|response| response.get("freeform_answer_count"))
+                .get("freeform_answer_count")
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
             "content_preview": row.content_preview,
         }));
     }
 
-    let no_answer_count =
-        cancelled_count + timeout_count + auto_unanswered_count + auto_duplicate_count;
-    let interactions_observed = submitted_count + no_answer_count + error_count;
+    let interactions_observed = submitted_count + cancelled_count + timeout_count + error_count;
     let avg_question_count = if prompt_count > 0 {
         question_count_sum as f64 / prompt_count as f64
     } else {
@@ -203,9 +182,6 @@ fn build_ask_user_history_summary(rows: &[AskUserHistoryRow]) -> Value {
         "submitted_count": submitted_count,
         "cancelled_count": cancelled_count,
         "timeout_count": timeout_count,
-        "auto_unanswered_count": auto_unanswered_count,
-        "auto_duplicate_count": auto_duplicate_count,
-        "no_answer_count": no_answer_count,
         "error_count": error_count,
         "prompt_count": prompt_count,
         "avg_question_count": avg_question_count,
@@ -784,8 +760,8 @@ impl IntrospectionService for DatabaseIntrospectionService {
             "SELECT \
                SUM(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 ELSE 0 END) AS tool_total_calls, \
                SUM(CASE WHEN event_type = 'tool_error' THEN 1 ELSE 0 END) AS tool_fail_count, \
-               SUM(CASE WHEN event_type IN ('ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error', 'ask_user_auto_unanswered', 'ask_user_auto_duplicate') THEN 1 ELSE 0 END) AS ask_user_total_calls, \
-               SUM(CASE WHEN event_type = 'ask_user_error' THEN 1 ELSE 0 END) AS ask_user_fail_count \
+               SUM(CASE WHEN event_type IN ('ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END) AS ask_user_total_calls, \
+               SUM(CASE WHEN event_type IN ('ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END) AS ask_user_fail_count \
               FROM agent_events \
               WHERE user_id = ? \
                 AND (skill_name = ? OR meta_tool_name = ?) \
@@ -823,7 +799,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
                  FROM agent_events \
                  WHERE user_id = ? \
                    AND (skill_name = ? OR meta_tool_name = ?) \
-                   AND event_type = 'ask_user_error' \
+                   AND event_type IN ('ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') \
                    AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR) \
                  ORDER BY created_at DESC LIMIT 10",
             )
@@ -875,7 +851,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
                  FROM agent_events \
                  WHERE user_id = ? \
                    AND (skill_name = ? OR meta_tool_name = ?) \
-                   AND event_type IN ('ask_user_prompted', 'ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error', 'ask_user_auto_unanswered', 'ask_user_auto_duplicate') \
+                   AND event_type IN ('ask_user_prompted', 'ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') \
                    AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR) \
                  ORDER BY created_at DESC LIMIT ?",
             )
@@ -1318,8 +1294,6 @@ mod tests {
         assert_eq!(summary["interactions_observed"], 2);
         assert_eq!(summary["submitted_count"], 1);
         assert_eq!(summary["cancelled_count"], 1);
-        assert_eq!(summary["no_answer_count"], 1);
-        assert_eq!(summary["error_count"], 0);
         assert_eq!(summary["avg_question_count"], 1.5);
         assert_eq!(summary["recent_interactions"][0]["outcome"], "submitted");
     }
@@ -1393,88 +1367,6 @@ mod tests {
         assert_eq!(summary["avg_question_count"], 2.0);
         assert_eq!(summary["interactions_observed"], 1);
         assert_eq!(summary["recent_interactions"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn ask_user_history_summary_tracks_auto_unanswered_without_marking_error() {
-        let rows = vec![
-            AskUserHistoryRow {
-                session_id: "s-auto".into(),
-                event_type: "ask_user_auto_unanswered".into(),
-                created_at: "2026-01-01T00:00:00".into(),
-                metadata: serde_json::json!({
-                    "request_id": "req-auto",
-                    "ask_user": {
-                        "status": "auto_unanswered",
-                        "source": "runtime_policy",
-                        "prompt": {
-                            "question_count": 1,
-                            "headers": ["Decision"],
-                            "questions": [{"question": "Which option?"}]
-                        }
-                    }
-                }),
-                content_preview: "Which option?".into(),
-            },
-            AskUserHistoryRow {
-                session_id: "s-auto".into(),
-                event_type: "ask_user_auto_duplicate".into(),
-                created_at: "2026-01-01T00:00:01".into(),
-                metadata: serde_json::json!({
-                    "request_id": "req-auto-2",
-                    "ask_user": {
-                        "status": "auto_unanswered_duplicate",
-                        "source": "runtime_policy",
-                        "prompt": {
-                            "question_count": 1,
-                            "headers": ["Decision"],
-                            "questions": [{"question": "Which option?"}]
-                        },
-                        "response": {
-                            "outcome": "auto_unanswered_duplicate",
-                            "answered_question_count": 0,
-                            "annotation_count": 0,
-                            "freeform_answer_count": 0
-                        }
-                    }
-                }),
-                content_preview: "Which option?".into(),
-            },
-            AskUserHistoryRow {
-                session_id: "s-auto".into(),
-                event_type: "ask_user_error".into(),
-                created_at: "2026-01-01T00:00:02".into(),
-                metadata: serde_json::json!({
-                    "request_id": "req-error",
-                    "ask_user": {
-                        "prompt": {"question_count": 1},
-                        "response": {
-                            "outcome": "interaction_error",
-                            "answered_question_count": 0,
-                            "annotation_count": 0,
-                            "freeform_answer_count": 0
-                        }
-                    }
-                }),
-                content_preview: "transport failed".into(),
-            },
-        ];
-
-        let summary = build_ask_user_history_summary(&rows);
-        assert_eq!(summary["interactions_observed"], 3);
-        assert_eq!(summary["auto_unanswered_count"], 1);
-        assert_eq!(summary["auto_duplicate_count"], 1);
-        assert_eq!(summary["no_answer_count"], 2);
-        assert_eq!(summary["error_count"], 1);
-        assert_eq!(summary["prompt_count"], 0);
-        assert_eq!(
-            summary["recent_interactions"][0]["outcome"],
-            "auto_unanswered"
-        );
-        assert_eq!(
-            summary["recent_interactions"][1]["outcome"],
-            "auto_unanswered_duplicate"
-        );
     }
 
     // ── UnconfiguredIntrospectionService ─────────────────────────────────

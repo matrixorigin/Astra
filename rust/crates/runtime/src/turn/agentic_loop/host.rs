@@ -3712,17 +3712,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn interaction_scoped_restrictions_keep_ask_user_for_prompt_and_auto_turns() {
+    fn interaction_scoped_restrictions_hide_ask_user_outside_prompt_turns() {
         assert!(
             !interaction_scoped_tool_restrictions(TurnInteractionMode::Prompt)
                 .contains(ASK_USER_TOOL_NAME)
         );
-        assert!(
-            !interaction_scoped_tool_restrictions(TurnInteractionMode::Auto)
-                .contains(ASK_USER_TOOL_NAME)
-        );
         for mode in [
-            TurnInteractionMode::Ci,
+            TurnInteractionMode::Auto,
+            TurnInteractionMode::Deny,
             TurnInteractionMode::Headless,
             TurnInteractionMode::NonInteractive,
         ] {

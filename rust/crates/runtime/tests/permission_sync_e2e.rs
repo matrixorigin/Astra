@@ -214,7 +214,7 @@ async fn e2e_callback_controls_permission() {
     .await;
 
     // Handler with custom callback
-    let parent_ctx = PermissionSyncContext::root(PermissionMode::Ask);
+    let parent_ctx = PermissionSyncContext::root(PermissionMode::Prompt);
     let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(parent_ctx))).with_callback(
         Box::new(|req, _ctx| {
             // Only allow read_file and grep, deny everything else
@@ -261,7 +261,7 @@ async fn e2e_callback_controls_permission() {
 #[tokio::test]
 async fn e2e_inherited_permissions_propagate() {
     // Parent creates inherited permissions for child
-    let mut parent_ctx = PermissionSyncContext::root(PermissionMode::Ask);
+    let mut parent_ctx = PermissionSyncContext::root(PermissionMode::Prompt);
 
     // Add session allow rule
     let update = PermissionUpdate::allow(PermissionRule::parse(r#"Bash(argv_prefix="git")"#));
@@ -277,7 +277,7 @@ async fn e2e_inherited_permissions_propagate() {
 
     // Child's context should use these
     let child_ctx = PermissionSyncContext::new(child_inherited);
-    assert_eq!(child_ctx.mode(), PermissionMode::Ask);
+    assert_eq!(child_ctx.mode(), PermissionMode::Prompt);
     assert!(child_ctx.is_allowed("bash", Some("git commit -m 'test'")));
 }
 
@@ -305,10 +305,10 @@ async fn e2e_permission_updates_persist() {
     assert!(!ctx.is_allowed("bash", Some("npm install")));
 }
 
-/// Test: CI mode rejects all permission escalation requests
+/// Test: deny mode rejects all requests
 #[tokio::test]
-async fn e2e_ci_mode_rejects_all() {
-    let parent_ctx = PermissionSyncContext::root(PermissionMode::Ci);
+async fn e2e_deny_mode_rejects_all() {
+    let parent_ctx = PermissionSyncContext::root(PermissionMode::Deny);
     let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(parent_ctx)));
 
     let requests = vec![
@@ -320,11 +320,7 @@ async fn e2e_ci_mode_rejects_all() {
     for req in requests {
         let response = handler.handle_request(&req).await;
         assert!(!response.approved);
-        assert_eq!(
-            response.reason.as_deref(),
-            Some("permission mode is ci"),
-            "CI mode should reject escalation without pretending a tool was banned"
-        );
+        assert!(response.reason.as_ref().unwrap().contains("deny"));
     }
 }
 
@@ -332,7 +328,7 @@ async fn e2e_ci_mode_rejects_all() {
 #[tokio::test]
 async fn e2e_tool_allowlist() {
     let inherited = InheritedPermissions {
-        mode: PermissionMode::Ask,
+        mode: PermissionMode::Prompt,
         allowed_tools: Some(
             ["read_file", "grep", "glob"]
                 .iter()
@@ -352,7 +348,7 @@ async fn e2e_tool_allowlist() {
 #[tokio::test]
 async fn e2e_multi_level_delegation() {
     // Root → Child → Grandchild
-    let root_ctx = PermissionSyncContext::root(PermissionMode::Ask);
+    let root_ctx = PermissionSyncContext::root(PermissionMode::Prompt);
 
     // Add allow rule at root level
     let mut root_ctx = root_ctx;

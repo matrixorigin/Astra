@@ -652,7 +652,7 @@ mod tests {
         })];
 
         let permission_context = PermissionSyncContext::shared(InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![],
@@ -1357,14 +1357,14 @@ mod tests {
         let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
 
         // Parent has a handler that approves bash requests
-        let parent_ctx = PermissionSyncContext::shared_root(PermissionMode::Ask);
+        let parent_ctx = PermissionSyncContext::shared_root(PermissionMode::Prompt);
         let handler = PermissionRequestHandler::new(parent_ctx.clone());
 
         // Child has permission context that requires asking parent for bash.
         // Use a bare ask rule so this test cannot be accidentally satisfied by
         // the read-only shortcut before it reaches the mailbox.
         let child_inherited = InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![PermissionRule::parse("bash")],
@@ -1495,14 +1495,14 @@ mod tests {
 
         let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
 
-        // Parent has CI mode - rejects all requests
-        let parent_ctx = PermissionSyncContext::shared_root(PermissionMode::Ci);
+        // Parent has deny mode - rejects all requests
+        let parent_ctx = PermissionSyncContext::shared_root(PermissionMode::Deny);
         let handler = PermissionRequestHandler::new(parent_ctx.clone());
 
         // Child requires asking parent for bash. The bare ask rule pins the
         // request-parent flow before any local shortcut can decide.
         let child_inherited = InheritedPermissions {
-            mode: PermissionMode::Ask,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![PermissionRule::parse("bash")],
@@ -1521,7 +1521,7 @@ mod tests {
                 .expect("should have message");
 
             if let Some((correlation_id, response)) = handler.process_message(&msg).await {
-                // Response should already be denied due to CI mode
+                // Response should already be denied due to Deny mode
                 assert!(!response.approved);
 
                 // Extract the target address from the Direct variant
@@ -1538,7 +1538,7 @@ mod tests {
         let tool_calls = vec![json!({
             "id": "call-bash-denied",
             "name": "bash",
-            // Keep this command non-read-only: Ask mode now auto-approves
+            // Keep this command non-read-only: Prompt mode now auto-approves
             // read-only bash calls like `echo hi` locally, so they never reach
             // the parent mailbox this test is exercising.
             "arguments": r#"{"command": "touch astra-permission-denied-test"}"#

@@ -793,7 +793,7 @@ mod tests {
     fn force_retry_only_for_first_zero_tool_factual_answer() {
         let none: Vec<String> = vec![];
         let policy = TurnInteractionPolicy::from_visible_tool_names(
-            TurnInteractionMode::Ci,
+            TurnInteractionMode::Deny,
             vec!["github".into()],
         );
         assert!(should_force_factual_tool_retry(
@@ -875,7 +875,7 @@ mod tests {
     #[test]
     fn factual_retry_message_guides_toward_dedicated_tools() {
         let policy = TurnInteractionPolicy::from_visible_tool_names(
-            TurnInteractionMode::Ci,
+            TurnInteractionMode::Deny,
             vec!["mo_query".into()],
         );
         let msg = factual_tool_retry_message("memoria 最新的一个ci?", &policy);
@@ -887,7 +887,7 @@ mod tests {
     #[test]
     fn factual_retry_message_lists_visible_tools_when_provided() {
         let policy = TurnInteractionPolicy::from_visible_tool_names(
-            TurnInteractionMode::Ci,
+            TurnInteractionMode::Deny,
             vec!["mo_query".to_string(), "read_file".to_string()],
         );
         let msg = factual_tool_retry_message("看session指标", &policy);
@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn openai_factual_tool_retry_user_message_shape() {
         let policy = TurnInteractionPolicy::from_visible_tool_names(
-            TurnInteractionMode::Ci,
+            TurnInteractionMode::Deny,
             vec!["mo_query".into()],
         );
         let v = openai_factual_tool_retry_user_message("q", &policy);

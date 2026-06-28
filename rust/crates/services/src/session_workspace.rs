@@ -275,8 +275,9 @@ pub struct WorkspaceMetadata {
     pub model: Option<String>,
     /// Permission mode active for this session.
     ///
-    /// Stored as the canonical CLI string (`auto`, `edits`, `plan`, `ask`, or
-    /// `ci`). Missing means the session predates mode persistence.
+    /// Stored as the canonical CLI string (`auto`, `plan`,
+    /// `accept_edits`, `prompt`, or `deny`). Missing means the session
+    /// predates mode persistence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     /// ISO 8601 creation timestamp.
