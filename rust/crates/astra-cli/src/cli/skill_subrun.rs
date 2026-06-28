@@ -132,13 +132,8 @@ pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -
     state.step_recorder.end_turn(false);
 
     let summary = state.step_recorder.summary();
-    let blocked_tools = state
-        .turn_guard
-        .health
-        .health_avoidance_tools()
-        .iter()
-        .map(|tool| tool.to_string())
-        .collect::<Vec<_>>();
+    let mut blocked_tools = state.restricted_tools.iter().cloned().collect::<Vec<_>>();
+    blocked_tools.sort();
     if let Some(heavy) = state.step_recorder.build_heavy_checkpoint(
         &state.messages,
         state.max_turn_input_tokens,

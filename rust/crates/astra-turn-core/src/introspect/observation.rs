@@ -77,7 +77,7 @@ pub fn build_introspect_report(
         evidence_class: "observed_evidence".to_string(),
         source: "runtime.introspect_snapshot".to_string(),
         summary: format!(
-            "pressure={:.0}% cache={:.0}% turns={}/{} alerts={} tool_errors={}",
+            "pressure={:.0}% cache={:.0}% turns={}/{} signals={} tool_failures={}",
             snapshot.token_pressure * 100.0,
             snapshot.cache_hit_ratio * 100.0,
             snapshot.turns_completed,
@@ -952,7 +952,7 @@ mod tests {
             ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
             evidence_class: "observed_evidence".into(),
             source: "runtime.introspect_snapshot".into(),
-            summary: "pressure=0% cache=0% turns=0/0 alerts=0 tool_errors=0".into(),
+            summary: "pressure=0% cache=0% turns=0/0 signals=0 tool_failures=0".into(),
             confidence: ObservationConfidence::evidence(0.75),
         }];
         let action_hints = Vec::new();
@@ -999,7 +999,7 @@ mod tests {
             ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
             evidence_class: "observed_evidence".into(),
             source: "runtime.introspect_snapshot".into(),
-            summary: "pressure=0% cache=0% turns=0/0 alerts=0 tool_errors=1".into(),
+            summary: "pressure=0% cache=0% turns=0/0 signals=0 tool_failures=1".into(),
             confidence: ObservationConfidence::evidence(0.75),
         }];
         let action_hints = Vec::new();

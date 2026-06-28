@@ -817,9 +817,9 @@ fn build_skill_extra(state: &AgenticLoopState) -> HashMap<String, String> {
             .recent_error_count(astra_turn_core::error_recovery::ErrorCategory::ToolTimeout)
             .to_string(),
     );
-    let avoidance = state.turn_guard.health.health_avoidance_tools();
-    if !avoidance.is_empty() {
-        extra.insert("health_avoidance_tools".into(), avoidance.join(", "));
+    let retry_cautioned = state.turn_guard.health.health_avoidance_tools();
+    if !retry_cautioned.is_empty() {
+        extra.insert("retry_cautioned_tools".into(), retry_cautioned.join(", "));
     }
     if !state.stall.events.is_empty() {
         let stalls: Vec<String> = state

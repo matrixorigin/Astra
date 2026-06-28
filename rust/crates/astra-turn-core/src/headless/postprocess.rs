@@ -1,10 +1,9 @@
 //! Error/limit enrichment and TurnGuard quality for the headless tool round (CLI §5.5).
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::guardrails::error_recovery::{ErrorCategory, build_recovery_message, classify_error};
-use crate::guardrails::turn_guard::{TurnGuard, is_read_only_never_restrict};
+use crate::guardrails::turn_guard::TurnGuard;
 use crate::headless_tool_assembly::{HeadlessRoundToolIdx, headless_timeout_aborted_tool_names};
 use crate::result_quality::ResultQuality;
 use crate::tool::result::semantics::is_resource_limit_output;
@@ -20,7 +19,6 @@ use serde_json::Value;
 /// UI hooks for headless postprocess (CLI maps to colored `eprintln!`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadlessOutputEnrichSignal {
-    ResourceLimitBlocked { tool: String },
     ResourceLimitObserved { tool: String },
     ResourceLimitDetectedInOutput { tool: String },
 }
@@ -28,7 +26,6 @@ pub enum HeadlessOutputEnrichSignal {
 /// Mutable state used while enriching one headless tool result.
 pub struct HeadlessOutputEnrichCtx<'a> {
     pub turn_guard: &'a mut TurnGuard,
-    pub restricted_tools: &'a mut HashSet<String>,
 }
 
 /// `true` when resource-limit handling forced error-quality treatment (matches CLI `resource_limit_recorded`).
@@ -50,15 +47,9 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
             ctx.turn_guard.health.record_resource_limit_failure(name);
             ctx.turn_guard.errors.record_error(category);
             resource_limit_recorded = true;
-            if restrict_resource_limited_tool(name, ctx.restricted_tools) {
-                on_signal(HeadlessOutputEnrichSignal::ResourceLimitBlocked {
-                    tool: name.to_string(),
-                });
-            } else {
-                on_signal(HeadlessOutputEnrichSignal::ResourceLimitObserved {
-                    tool: name.to_string(),
-                });
-            }
+            on_signal(HeadlessOutputEnrichSignal::ResourceLimitObserved {
+                tool: name.to_string(),
+            });
         }
 
         if category.is_retryable() {
@@ -78,26 +69,12 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
             .record_error(ErrorCategory::ResourceLimit);
         *is_err = true;
         resource_limit_recorded = true;
-        if restrict_resource_limited_tool(name, ctx.restricted_tools) {
-            on_signal(HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput {
-                tool: name.to_string(),
-            });
-        } else {
-            on_signal(HeadlessOutputEnrichSignal::ResourceLimitObserved {
-                tool: name.to_string(),
-            });
-        }
+        on_signal(HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput {
+            tool: name.to_string(),
+        });
     }
 
     resource_limit_recorded
-}
-
-fn restrict_resource_limited_tool(name: &str, restricted_tools: &mut HashSet<String>) -> bool {
-    if is_read_only_never_restrict(name) {
-        return false;
-    }
-    restricted_tools.insert(name.to_string());
-    true
 }
 
 /// Record tool result quality and append optional TurnGuard feedback into `result_str`.
@@ -267,15 +244,13 @@ mod tests {
     }
 
     #[test]
-    fn enrich_resource_limit_classifies_and_restricts() {
+    fn enrich_resource_limit_classifies_without_hard_restricting_tool() {
         let mut tg = TurnGuard::new();
-        let mut restricted = HashSet::new();
         let mut out = "out of memory".to_string();
         let mut is_err = true;
         let mut signals = Vec::new();
         let mut ctx = HeadlessOutputEnrichCtx {
             turn_guard: &mut tg,
-            restricted_tools: &mut restricted,
         };
         let rec = enrich_headless_tool_output_for_errors_and_limits(
             "bash",
@@ -287,10 +262,9 @@ mod tests {
             |s| signals.push(s),
         );
         assert!(rec);
-        assert!(restricted.contains("bash"));
         assert_eq!(
             signals,
-            vec![HeadlessOutputEnrichSignal::ResourceLimitBlocked {
+            vec![HeadlessOutputEnrichSignal::ResourceLimitObserved {
                 tool: "bash".into()
             }]
         );
@@ -300,13 +274,11 @@ mod tests {
     #[test]
     fn enrich_resource_limit_does_not_hard_restrict_read_only_tools() {
         let mut tg = TurnGuard::new();
-        let mut restricted = HashSet::new();
         let mut out = "read failed: Resource temporarily unavailable".to_string();
         let mut is_err = true;
         let mut signals = Vec::new();
         let mut ctx = HeadlessOutputEnrichCtx {
             turn_guard: &mut tg,
-            restricted_tools: &mut restricted,
         };
 
         let rec = enrich_headless_tool_output_for_errors_and_limits(
@@ -320,10 +292,6 @@ mod tests {
         );
 
         assert!(rec);
-        assert!(
-            restricted.is_empty(),
-            "read-only observation tools must not become hard restricted by a transient resource limit"
-        );
         assert_eq!(
             signals,
             vec![HeadlessOutputEnrichSignal::ResourceLimitObserved {
@@ -335,13 +303,11 @@ mod tests {
     #[test]
     fn enrich_resource_limit_in_output_flips_err() {
         let mut tg = TurnGuard::new();
-        let mut restricted = HashSet::new();
         let mut out = "fork: retry: Resource temporarily unavailable".to_string();
         let mut is_err = false;
         let mut signals = Vec::new();
         let mut ctx = HeadlessOutputEnrichCtx {
             turn_guard: &mut tg,
-            restricted_tools: &mut restricted,
         };
         let rec = enrich_headless_tool_output_for_errors_and_limits(
             "bash",

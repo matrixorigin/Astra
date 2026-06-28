@@ -40,7 +40,7 @@ You've been going in circles or hitting dead ends. Use the runtime data below to
 | Tool calls (total) | ${{CTX_TOTAL_TOOL_CALLS}} |
 | Stall nudges sent | ${{CTX_NUDGE_COUNT}} |
 | Errors | ${{CTX_ERROR_COUNT}} |
-| Health avoidance tools | ${{CTX_HEALTH_AVOIDANCE_TOOLS}} |
+| Tool retry cautions | ${{CTX_HEALTH_AVOIDANCE_TOOLS}} |
 | Stall events | ${{CTX_STALL_EVENTS}} |
 | Correction follow rate | ${{CTX_CORRECTION_FOLLOW_RATE}} |
 
@@ -50,9 +50,9 @@ Read the metrics and classify the blocker:
 
 | Pattern | Diagnosis | Go to |
 |---------|-----------|-------|
-| `nudge_count` ≥ 2 | System already told you to stop. You ignored it. | Step 3 option 5 |
-| `error_count` / `tool_calls` > 30% | Tool or environment is broken | Step 2: challenge assumption #1–#4 |
-| `health_avoidance_tools` non-empty | These tools are failing repeatedly — stop using them | Step 3: use different tools |
+| `nudge_count` ≥ 2 | Runtime already flagged repeated low-yield behavior. | Step 3 option 5 |
+| `error_count` / `tool_calls` > 30% | Tool-call path or environment assumption is failing | Step 2: challenge assumption #1–#4 |
+| retry cautions non-empty | These tool-call paths are failing repeatedly — change inputs or hypothesis before retrying | Step 3: use different evidence |
 | `stall_events` present | Exact stall type tells you what's repeating | Step 3: pick the opposite strategy |
 | High `tool_calls`, low progress | Exploring without a plan | Step 3 option 1 |
 | High `prompt_tokens`, few turns | Context bloated from large reads | Step 3 option 2 |
@@ -79,7 +79,7 @@ Pick ONE. Time-box to 15 minutes — if no progress, switch to the next:
 2. **Minimal reproduction** — new empty project, add only what's needed. If it works in isolation, the bug is in the interaction.
 3. **Read the source** — the dependency's code, not yours. The answer is in the implementation.
 4. **Invert the problem** — instead of "why does this fail?", ask "under what conditions would this succeed?" and verify each.
-5. **Stop and report** — if `nudge_count` ≥ 2, summarize what you've found and ask the user for guidance. Do NOT keep trying.
+5. **Report with evidence** — if `nudge_count` ≥ 2 and you cannot name a changed hypothesis or input, summarize what you've found and ask the user for guidance instead of repeating the same call.
 
 ## Step 4: Escalate
 
@@ -89,8 +89,8 @@ If nothing works:
 - Formulate: "I'm trying to [goal]. Expected [X], got [Y]. Tried [A, B, C]. Minimal repro: [code]."
 
 ## Rules
-- Do NOT keep trying the same approach with small variations
-- If `health_avoidance_tools` lists a tool, do NOT use it
-- If `nudge_count` ≥ 3, you MUST stop and ask the user — no more autonomous attempts
+- Do not keep trying the same approach with cosmetic variations; change the hypothesis, input, or verification path.
+- If retry cautions list a tool-call path, do not repeat the identical call. The tool is still available unless the runtime returns `restricted_tool`; use it only with changed inputs or a concrete new hypothesis.
+- If `nudge_count` ≥ 3 and you cannot name a materially changed next attempt, summarize verified facts and ask the user for guidance.
 "#.to_string()
 }

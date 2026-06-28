@@ -171,7 +171,7 @@ pub fn verdict_event_summary_line(
     force_stop: bool,
 ) -> String {
     format!(
-        "T{} {} {}  mode={}{}  nudges={}  pressure={}  health_avoidance={}{}",
+        "T{} {} {}  mode={}{}  nudges={}  pressure={}  retry_caution={}{}",
         turn,
         icon,
         severity,
@@ -190,7 +190,7 @@ pub fn verdict_event_summary_line(
 
 #[must_use]
 pub fn verdict_avoid_tools_line(tools_csv: &str) -> String {
-    format!("  ├─ avoid: [{}]", tools_csv)
+    format!("  ├─ retry-caution: [{}]", tools_csv)
 }
 
 #[must_use]
@@ -453,7 +453,7 @@ mod tests {
         let s = verdict_event_summary_line(1, "🛑", "critical", 0, "auto", true, 5, 2, true);
         assert!(s.contains("FORCE_STOP"));
         assert!(s.contains("suppress_nudges=1"));
-        assert!(s.contains("health_avoidance=2"));
+        assert!(s.contains("retry_caution=2"));
     }
 
     // ──────────────────────────────────────────────────────────
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn verdict_avoid_tools_line_format() {
         let s = verdict_avoid_tools_line("bash, exec");
-        assert!(s.contains("avoid: [bash, exec]"));
+        assert!(s.contains("retry-caution: [bash, exec]"));
     }
 
     #[test]

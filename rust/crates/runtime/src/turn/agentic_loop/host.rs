@@ -569,10 +569,10 @@ pub(crate) fn build_introspect_snapshot(
     if stall_state.nudge_count > 0 {
         alerts.push(format!("stall_nudge_count={}", stall_state.nudge_count));
     }
-    if !state.turn_guard.health.recent_errors(10).is_empty() {
+    let recent_tool_failures = state.turn_guard.health.recent_errors(10).len();
+    if recent_tool_failures > 0 {
         alerts.push(format!(
-            "recent_tool_errors={}",
-            state.turn_guard.health.recent_errors(10).len()
+            "recent_tool_failures={recent_tool_failures}; tools remain available unless restricted_tools says otherwise"
         ));
     }
 
@@ -6640,7 +6640,7 @@ pub(crate) mod tests {
         assert!(
             state
                 .final_text
-                .contains("ignored both the wrap-up advisory and the restricted-tools lockout"),
+                .contains("ignored repeated wrap-up advisories"),
             "terminal output should include the concrete abort reason"
         );
     }

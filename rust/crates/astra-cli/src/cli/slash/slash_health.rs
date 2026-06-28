@@ -76,7 +76,7 @@ pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
             sorted.sort_by_key(|x| std::cmp::Reverse(x.1.total_failures));
             for (name, health) in &sorted {
                 let status_str = if health.avoidance_advised {
-                    "⛔ health avoidance".red().to_string()
+                    "⚠ retry caution".yellow().to_string()
                 } else if health.rehabilitation_count >= 2 {
                     "⚠ flaky".yellow().to_string()
                 } else if health.total_failures > 0 {
@@ -117,12 +117,12 @@ pub(crate) async fn handle_health_command(arg: &str, state: &SessionState) {
             }
         } else {
             // Compact view: only show problematic tools
-            let avoidance_advised = tracker.health_avoidance_tools();
-            if !avoidance_advised.is_empty() {
+            let retry_cautioned = tracker.health_avoidance_tools();
+            if !retry_cautioned.is_empty() {
                 eprintln!(
                     "  {} {}",
-                    "Health avoidance:".red(),
-                    avoidance_advised.join(", ").red()
+                    "Retry caution:".yellow(),
+                    retry_cautioned.join(", ").yellow()
                 );
             }
             let all = tracker.all();

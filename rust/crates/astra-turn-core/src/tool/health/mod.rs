@@ -166,7 +166,7 @@ pub fn failure_category_from_tag(tag: &str) -> Option<FailureCategory> {
     })
 }
 
-/// Maximum consecutive failures before health avoidance advice is enabled.
+/// Maximum consecutive failures before retry-caution guidance is enabled.
 const CONSECUTIVE_FAILURE_THRESHOLD: usize = 3;
 
 /// Consecutive successes needed to clear the "flaky" flag after rehabilitation.
@@ -193,7 +193,7 @@ pub struct ToolHealth {
     pub total_calls: usize,
     pub total_failures: usize,
     pub consecutive_failures: usize,
-    /// Whether repeated failures should produce health avoidance advice.
+    /// Whether repeated failures should produce retry-caution guidance.
     pub avoidance_advised: bool,
     /// Number of times this tool was rehabilitated this session.
     /// Rising rehab count means the tool is flaky, so health avoidance triggers faster.
@@ -269,7 +269,7 @@ impl ToolHealthTracker {
         health.total_calls += 1;
         health.consecutive_failures = 0;
         health.consecutive_successes += 1;
-        // Success can rehabilitate a tool after health avoidance advice.
+        // Success rehabilitates a tool after retry-caution guidance.
         if health.avoidance_advised {
             health.avoidance_advised = false;
             health.rehabilitation_count += 1;
@@ -285,7 +285,7 @@ impl ToolHealthTracker {
     }
 
     /// Record a failed tool execution.
-    /// Flaky tools (rehabilitated 2+ times) trigger health avoidance faster.
+    /// Flaky tools (rehabilitated 2+ times) trigger retry caution faster.
     pub fn record_failure(&mut self, tool_name: &str) {
         let health = self.tools.entry(tool_name.to_string()).or_default();
         health.total_calls += 1;
@@ -449,21 +449,23 @@ impl ToolHealthTracker {
         &self.tools
     }
 
-    /// Build a structured warning message for tools under health avoidance.
-    /// Returns None if no tools need health avoidance guidance.
+    /// Build a structured warning message for tools under retry caution.
+    /// Returns None if no tools need retry-caution guidance.
     pub fn health_avoidance_warning(&self) -> Option<String> {
-        let blocked: Vec<&str> = self.health_avoidance_tools();
-        if blocked.is_empty() {
+        let retry_cautioned: Vec<&str> = self.health_avoidance_tools();
+        if retry_cautioned.is_empty() {
             return None;
         }
-        let tools_list = blocked.join(", ");
+        let tools_list = retry_cautioned.join(", ");
         let mut msg = format!(
             "⚠ The following tools have failed {} or more times consecutively \
-             and should not be retried blindly with the same inputs: [{}].",
+             and should not be retried blindly with the same inputs: [{}]. \
+             The tools remain available; retry only after changing inputs, scope, \
+             working directory, or the underlying hypothesis.",
             CONSECUTIVE_FAILURE_THRESHOLD, tools_list
         );
-        // Provide specific alternative suggestions for common blocked tools
-        for tool in &blocked {
+        // Provide specific alternative suggestions for common retry-cautioned tools.
+        for tool in &retry_cautioned {
             match *tool {
                 "read_file" => {
                     msg.push_str(
@@ -473,8 +475,9 @@ impl ToolHealthTracker {
                 }
                 "bash" => {
                     msg.push_str(
-                        " Instead of bash, use built-in tools like read_file, grep, glob, \
-                         or list_dir for file operations.",
+                        " If bash failed because the command or cwd was wrong, fix that and retry. \
+                         For file inspection, built-in tools like read_file, grep, glob, or list_dir \
+                         may provide narrower evidence.",
                     );
                 }
                 "str_replace" => {
@@ -1269,9 +1272,9 @@ mod tests {
         }
         tracker.record_success("git");
 
-        let mut blocked = tracker.health_avoidance_tools();
-        blocked.sort();
-        assert_eq!(blocked, vec!["bash", "read_file"]);
+        let mut cautioned = tracker.health_avoidance_tools();
+        cautioned.sort();
+        assert_eq!(cautioned, vec!["bash", "read_file"]);
     }
 
     #[test]
@@ -1439,7 +1442,7 @@ mod tests {
     #[test]
     fn resource_limit_immediately_enables_health_avoidance() {
         let mut tracker = ToolHealthTracker::new();
-        // A single resource-limit failure should immediately advise avoidance.
+        // A single resource-limit failure should immediately advise caution.
         tracker.record_resource_limit_failure("bash");
         assert!(tracker.is_avoidance_advised("bash"));
         let health = tracker.get("bash").unwrap();
@@ -1453,8 +1456,8 @@ mod tests {
         let mut tracker = ToolHealthTracker::new();
         tracker.record_resource_limit_failure("bash");
         assert!(tracker.is_avoidance_advised("bash"));
-        // Even after a success, the tool should be rehabilitated (standard behavior)
-        // but the system should have already blocked it in restricted_tools
+        // A later success rehabilitates the tool; no runtime path should have
+        // physically blocked it merely because resource pressure was observed.
         tracker.record_success("bash");
         assert!(!tracker.is_avoidance_advised("bash")); // rehabilitated
         assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 1);

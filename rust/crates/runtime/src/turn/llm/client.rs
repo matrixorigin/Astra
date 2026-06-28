@@ -140,7 +140,16 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
         builder = apply_env_proxy(builder);
         match builder.build()
         {
-            Ok(client) => client,
+            Ok(client) => {
+                tracing::info!(
+                    target: "astra_runtime::llm_client",
+                    pool_max_idle_per_host = 4,
+                    connect_timeout_s = connect.as_secs(),
+                    total_timeout_s = total.as_secs(),
+                    "global LLM HTTP client built"
+                );
+                client
+            }
             Err(e) => {
                 // audit-C1: TLS / HTTP stack init failure should not crash the process.
                 // Retry with the same timeouts but without pool tuning so we still bound
@@ -2614,9 +2623,31 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
             req = req.timeout(timeout);
         }
 
+        tracing::debug!(
+            target: "astra_runtime::llm_client",
+            url = %url,
+            attempt,
+            provider,
+            model_name,
+            "LLM request sending"
+        );
         let response = match req.json(&body).send().await {
-            Ok(r) => r,
+            Ok(r) => {
+                tracing::debug!(
+                    target: "astra_runtime::llm_client",
+                    url = %url,
+                    status = r.status().as_u16(),
+                    "LLM request connected"
+                );
+                r
+            }
             Err(e) => {
+                tracing::warn!(
+                    target: "astra_runtime::llm_client",
+                    url = %url,
+                    error = %e,
+                    "LLM send failed"
+                );
                 last_err = format!("LLM request failed: {e}");
                 last_kind = astra_core::ErrorKind::Network;
                 continue;
@@ -3711,12 +3742,23 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     let effective_timeout = request_timeout
         .map(|value| value.min(timeout))
         .unwrap_or(timeout);
+    tracing::debug!(
+        target: "astra_runtime::llm_client",
+        url = %url,
+        "LLM non-stream fallback sending"
+    );
     let resp = req
         .timeout(effective_timeout)
         .json(&body)
         .send()
         .await
         .map_err(|e| {
+            tracing::warn!(
+                target: "astra_runtime::llm_client",
+                url = %url,
+                error = %e,
+                "LLM non-stream fallback send failed"
+            );
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Network,
                 format!(

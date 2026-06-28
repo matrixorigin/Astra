@@ -392,7 +392,10 @@ pub fn local_reflect_from_snapshot(
         }
 
         ObservationFacet::Errors => {
-            lines.push(format!("tool_errors={}", snapshot.tool_errors.len(),));
+            lines.push(format!(
+                "tool_failures={} (failed executions; not a tool ban)",
+                snapshot.tool_errors.len(),
+            ));
             for err in &snapshot.tool_errors {
                 lines.push(format!(
                     "  {}: {}",

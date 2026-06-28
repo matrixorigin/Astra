@@ -246,10 +246,10 @@ pub(crate) fn record_loop_completion_feedback(
     }
 
     // ── 8. Tool health signals ──
-    // Emit signals for health avoidance tools so observation/SelfModel can react.
+    // Emit signals for retry-cautioned tools so observation/SelfModel can react.
     {
-        let avoidance_advised = state.turn_guard.health.health_avoidance_tools();
-        for tool_name in avoidance_advised {
+        let retry_cautioned = state.turn_guard.health.health_avoidance_tools();
+        for tool_name in retry_cautioned {
             hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::ToolHealthAvoidance {
                     tool_name: tool_name.to_string(),

@@ -34,6 +34,13 @@ pub enum ErrorKind {
     /// Connection reset, TLS failure, or other transport error mid-stream.
     StreamTransport,
 
+    // ── Connection pool ──────────────────────────────
+    /// HTTP connection pool exhausted (reqwest/hyper). The client's
+    /// connection pool is saturated — new requests wait for a free
+    /// connection until the pool timeout fires. Distinct from
+    /// [`DatabaseError`] which covers SQLx / MatrixOne pool failures.
+    ConnectionPoolExhausted,
+
     // ── Budget / limits ──────────────────────────────
     /// Total LLM time budget for the turn/session exhausted.
     BudgetExhausted,
@@ -92,6 +99,7 @@ impl ErrorKind {
             Self::InvalidRequest => "invalid_request",
             Self::StreamIdle => "stream_idle",
             Self::StreamTransport => "stream_transport",
+            Self::ConnectionPoolExhausted => "connection_pool_exhausted",
             Self::BudgetExhausted => "budget_exhausted",
             Self::ToolRoundsExhausted => "tool_rounds_exhausted",
             Self::Network => "network",
@@ -118,6 +126,7 @@ impl ErrorKind {
                 | Self::ServerError
                 | Self::StreamIdle
                 | Self::StreamTransport
+                | Self::ConnectionPoolExhausted
                 | Self::Network
         )
     }
@@ -134,6 +143,7 @@ impl ErrorKind {
             Self::ServerError => 2_000,
             Self::StreamIdle => 0,
             Self::StreamTransport => 1_000,
+            Self::ConnectionPoolExhausted => 5_000,
             Self::Network => 3_000,
             _ => return None,
         };
@@ -214,6 +224,11 @@ impl ErrorKind {
                 "System resource limit reached (memory/disk/processes). \
                  This tool is BLOCKED for the rest of this session. \
                  Reduce system load or try a different approach."
+            }
+            Self::ConnectionPoolExhausted => {
+                "HTTP connection pool saturated (reqwest/hyper). \
+                 Reduce parallel LLM requests, check for response body leaks, \
+                 or increase pool_max_size. Retrying with backoff."
             }
             Self::DatabaseError => {
                 "Database query failed (SQL syntax, deadlock, or pool). \
@@ -305,6 +320,11 @@ impl ErrorKind {
                  Kill orphan processes: `ps aux | grep defunct`. May need to restart \
                  the system or increase limits."
             }
+            Self::ConnectionPoolExhausted => {
+                "The reqwest HTTP pool is saturated. Reduce parallel LLM calls, \
+                 check for un-consumed SSE response bodies, and verify \
+                 `pool_max_idle_per_host` / `pool_max_size` settings."
+            }
             Self::DatabaseError => {
                 "Check MatrixOne connectivity and SQL syntax. Use CAST for DATETIME \
                  columns, MIN/MAX for non-grouped columns. For deadlocks, reorder \
@@ -347,6 +367,7 @@ impl ErrorKind {
             "invalid_request" => Some(Self::InvalidRequest),
             "stream_idle" => Some(Self::StreamIdle),
             "stream_transport" => Some(Self::StreamTransport),
+            "connection_pool_exhausted" => Some(Self::ConnectionPoolExhausted),
             "budget_exhausted" => Some(Self::BudgetExhausted),
             "tool_rounds_exhausted" => Some(Self::ToolRoundsExhausted),
             "network" => Some(Self::Network),
@@ -532,7 +553,7 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         || lower.contains("error returned from database")
         || lower.contains("sqlx")
         || lower.contains("deadlock")
-        || is_database_pool_timeout(&lower)
+        || lower.contains("matrixone pool timed out")
         || (lower.contains("column") && lower.contains("group by"))
     {
         return ErrorKind::DatabaseError;
@@ -766,7 +787,7 @@ pub fn is_workspace_read_before_write(lower: &str) -> bool {
         || lower.contains("read the full file before overwriting")
 }
 
-fn is_database_pool_timeout(lower: &str) -> bool {
+fn is_connection_pool_timeout(lower: &str) -> bool {
     lower.contains("connection pool timed out")
         || lower.contains("pool timed out while waiting for an open connection")
         || lower.contains("pool timed out waiting for an open connection")
@@ -784,8 +805,8 @@ pub fn classify_llm_error(msg: &str) -> ErrorKind {
         ErrorKind::ContextWindow
     } else if lower.contains("rate") || lower.contains("429") {
         ErrorKind::RateLimit
-    } else if is_database_pool_timeout(&lower) {
-        ErrorKind::DatabaseError
+    } else if is_connection_pool_timeout(&lower) {
+        ErrorKind::ConnectionPoolExhausted
     } else if lower.contains("timeout") || lower.contains("timed out") {
         ErrorKind::StreamIdle
     } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
@@ -843,6 +864,7 @@ mod tests {
         ErrorKind::InvalidRequest,
         ErrorKind::StreamIdle,
         ErrorKind::StreamTransport,
+        ErrorKind::ConnectionPoolExhausted,
         ErrorKind::BudgetExhausted,
         ErrorKind::ToolRoundsExhausted,
         ErrorKind::Network,
@@ -1217,8 +1239,8 @@ mod tests {
             "SQL syntax error: column must appear in GROUP BY",
             "error returned from database: deadlock found",
             "sqlx: connection pool timed out",
-            "Error: pool timed out while waiting for an open connection",
             "deadlock detected on table x",
+            "matrixone pool timed out: query cancelled",
         ] {
             assert_eq!(classify_tool_output(st), ErrorKind::DatabaseError);
         }
@@ -1269,18 +1291,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_llm_error_pool_timeout_is_database_error() {
+    fn classify_llm_error_pool_timeout_is_connection_pool_exhausted() {
         assert_eq!(
             classify_llm_error("Error: pool timed out while waiting for an open connection"),
-            ErrorKind::DatabaseError
+            ErrorKind::ConnectionPoolExhausted
         );
         assert_eq!(
             classify_llm_error("connection pool timed out"),
-            ErrorKind::DatabaseError
+            ErrorKind::ConnectionPoolExhausted
         );
         assert_eq!(
             classify_llm_error("pool timed out waiting for an open connection"),
-            ErrorKind::DatabaseError
+            ErrorKind::ConnectionPoolExhausted
         );
     }
 

@@ -5216,14 +5216,14 @@ impl ToolExecutor {
                 "tools_dropped_by_surface": caps.dropped_by_surface,
                 "tools_pass_through_mcp": caps.mcp_pass_through,
                 "tool_count": model.capabilities.total_tools,
-                "health_avoidance_tools": model.capabilities.health_avoidance_tools,
+                "retry_cautioned_tools": model.capabilities.retry_cautioned_tools,
                 "skills": model.capabilities.skills,
                 "tool_health": model.capabilities.tool_health.iter().map(|t| {
                     json!({
                         "name": t.name,
                         "total_calls": t.total_calls,
                         "success_rate": t.success_rate,
-                        "avoidance_advised": t.avoidance_advised,
+                        "retry_cautioned": t.retry_cautioned,
                     })
                 }).collect::<Vec<_>>(),
             })

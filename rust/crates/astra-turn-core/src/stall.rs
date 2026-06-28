@@ -340,7 +340,7 @@ Stop repeating cheap actions that do not advance the task.",
     );
     if !avoid_tools.is_empty() {
         message.push_str(&format!(
-            "\nAvoid these tools next: [{}].",
+            "\nRetry-cautioned tools: [{}]. Do not repeat identical low-value calls; change inputs or use a different verification path.",
             avoid_tools.join(", ")
         ));
     }
@@ -495,7 +495,7 @@ impl StallReflection {
         ];
         if !self.avoid_tools.is_empty() {
             parts.push(format!(
-                "\nAvoid these tools: [{}]",
+                "\nRetry-cautioned tools: [{}] — change inputs or strategy before using them again",
                 self.avoid_tools.join(", ")
             ));
         }
@@ -1116,7 +1116,7 @@ mod tests {
 
         assert!(message.contains("Reward-hacking guard"));
         assert!(message.contains("repeated identical tool call x2"));
-        assert!(message.contains("Avoid these tools next: [read_file, grep]"));
+        assert!(message.contains("Retry-cautioned tools: [read_file, grep]"));
     }
 
     // ── Universal stemming ──
@@ -1237,7 +1237,7 @@ mod tests {
         assert!(msg.contains("What happened:"));
         assert!(msg.contains("Why:"));
         assert!(msg.contains("What to try:"));
-        assert!(msg.contains("Avoid these tools:"));
+        assert!(msg.contains("Retry-cautioned tools:"));
     }
 
     #[test]
@@ -1869,7 +1869,7 @@ mod tests {
             avoid_tools: vec![],
         };
         let msg = r.to_nudge_message();
-        assert!(!msg.contains("Avoid these tools"));
+        assert!(!msg.contains("Retry-cautioned tools"));
     }
 
     #[test]

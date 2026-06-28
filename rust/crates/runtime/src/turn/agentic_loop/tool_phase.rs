@@ -1115,11 +1115,10 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     // wrap-up promise ("Do NOT call any more tools") without discarding
     // any partial text that arrived alongside the tool_calls:
     //
-    //   round 1 post-wrap-up: physical lockout — drop the tool_calls,
-    //     populate `restricted_tools` (same mechanism as
-    //     `tool_round_hard_stop_message`), inject a short terminal reminder,
-    //     and continue the loop so the model gets one more LLM call to
-    //     produce text.
+    //   round 1 post-wrap-up: drop the tool_calls, inject a short terminal
+    //     reminder, and continue the loop so the model gets one more LLM call
+    //     to produce text. Do not mutate `restricted_tools`: budget pressure
+    //     is not evidence that a tool is unavailable.
     //   round 2+ post-wrap-up: abort the turn with an interruption. One
     //     lockout round is a fair chance; ignoring it twice means the
     //     model is not going to comply.
@@ -1139,22 +1138,16 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 host.emit_headless_line(
                     super::super::agentic::headless_round::HeadlessStderrStyle::Yellow,
                     format!(
-                        "⚠ Budget wrapup active — dropping {dropped_count} tool call(s) and restricting tools for one more round.",
+                        "⚠ Budget wrapup active — dropping {dropped_count} tool call(s); next response must be text-only.",
                     ),
                 );
-            }
-            // Physical lockout: the host policy consults `restricted_tools`.
-            // Any tool call the model emits on the next round will be
-            // filtered / blocked rather than executed.
-            for name in host.valid_tool_names() {
-                state.restricted_tools.insert(name.clone());
             }
             state.push_volatile(
                 super::host::VolatileKind::BudgetAdvisory,
                 "Wrap-up lockout active: the runtime has dropped the tool \
-                 calls in your previous response and restricted tool access. \
-                 Any tool calls you emit next WILL BE DROPPED before \
-                 execution. Produce a final text-only answer now: summarize \
+                 calls in your previous response because the turn budget is \
+                 exhausted. Tool availability has not changed, but this turn \
+                 must now finish with a final text-only answer: summarize \
                  progress, name what you verified, and flag anything that \
                  remains unfinished.",
             );
@@ -1187,7 +1180,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             super::lifecycle::interruption_state_summary(
                 state,
                 Some(format!(
-                    "The runtime stopped this turn because token pressure stayed high and the model ignored both the wrap-up advisory and the restricted-tools lockout, attempting {dropped_count} more tool call(s). Progress from earlier rounds is preserved. Resume by summarizing verified work first and only call more tools if one concrete fact is still missing."
+                    "The runtime stopped this turn because token pressure stayed high and the model ignored repeated wrap-up advisories, attempting {dropped_count} more tool call(s). Progress from earlier rounds is preserved. Resume by summarizing verified work first and only call more tools if one concrete fact is still missing."
                 )),
             ),
         ));

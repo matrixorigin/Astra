@@ -8,8 +8,7 @@ use astra_turn_core::headless_tool_postprocess::{
     enrich_headless_tool_output_for_errors_and_limits,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
-    headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
-    headless_stderr_resource_limit_observed,
+    headless_stderr_resource_limit_in_output, headless_stderr_resource_limit_observed,
 };
 use astra_turn_core::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
 use astra_turn_core::tool_result_semantics::{
@@ -156,7 +155,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let term = &mut self.ctx.term;
         let mut enrich_ctx = HeadlessOutputEnrichCtx {
             turn_guard: self.ctx.turn_guard,
-            restricted_tools: self.ctx.restricted_tools,
         };
         let resource_limit_recorded = enrich_headless_tool_output_for_errors_and_limits(
             &execution.name,
@@ -170,12 +168,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     return;
                 }
                 match sig {
-                    HeadlessOutputEnrichSignal::ResourceLimitBlocked { tool } => {
-                        term.emit_line(
-                            HeadlessStderrStyle::Yellow,
-                            headless_stderr_resource_limit_blocked(&tool),
-                        );
-                    }
                     HeadlessOutputEnrichSignal::ResourceLimitObserved { tool } => {
                         term.emit_line(
                             HeadlessStderrStyle::Dim,

@@ -353,7 +353,10 @@ pub fn build_escalation_message(level: EscalationLevel, avoid_tools: &[String]) 
         EscalationLevel::Warning => {
             let mut msg = "⚠ SESSION WARNING: Multiple issues detected. Focus on completing the user's request directly.".to_string();
             if !avoid_tools.is_empty() {
-                msg.push_str(&format!(" Avoid: [{}].", avoid_tools.join(", ")));
+                msg.push_str(&format!(
+                    " Retry-cautioned tools: [{}]; change inputs or strategy before using them again.",
+                    avoid_tools.join(", ")
+                ));
             }
             Some(msg)
         }
@@ -363,7 +366,7 @@ pub fn build_escalation_message(level: EscalationLevel, avoid_tools: &[String]) 
                  (2) Ask the user for clarification. \
                  Do NOT continue calling tools that have been failing.{}",
             if !avoid_tools.is_empty() {
-                format!(" Blocked tools: [{}].", avoid_tools.join(", "))
+                format!(" Retry-cautioned tools: [{}].", avoid_tools.join(", "))
             } else {
                 String::new()
             }

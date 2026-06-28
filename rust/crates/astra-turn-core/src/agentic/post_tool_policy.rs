@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::chat_history_openai::append_openai_user_content_messages;
-use crate::guardrails::turn_guard::{TurnGuard, VerdictSeverity, is_read_only_never_restrict};
+use crate::guardrails::turn_guard::{TurnGuard, VerdictSeverity};
 use crate::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use crate::interaction_types::TurnInteractionMode;
 use crate::stall::{
@@ -154,26 +154,11 @@ pub fn apply_agentic_post_tool_policy(
             append_openai_user_content_messages(messages, &verdict.injections);
         }
 
-        // `avoid_tools` is advisory stall-recovery guidance for Warning and
-        // below: removing those tools from the visible schema changes the
-        // model contract mid-turn and can force it onto a worse surface.
-        //
-        // Critical is the exception. On a first Critical verdict the guard
-        // has already injected a "SESSION CRITICAL" nudge naming the
-        // high-risk write/execute tools. If we leave them merely advisory,
-        // the model can ignore the nudge and keep calling them — observed
-        // in sessions where the model burned the entire remaining turn
-        // budget retrying a failing `bash`/`write_file` after a Critical.
-        // Physically restricting the avoid_tools on Critical gives the model
-        // exactly one read-only recovery round; a second Critical then
-        // force-stops via the `critical_turns >= 2` path below.
-        if verdict.severity == VerdictSeverity::Critical && !verdict.force_stop {
-            for tool in &verdict.avoid_tools {
-                if !is_read_only_never_restrict(tool) {
-                    restricted_tools.insert(tool.clone());
-                }
-            }
-        }
+        // `avoid_tools` is advisory stall-recovery guidance at every severity.
+        // Tool failures are observations, not capability facts: the model may
+        // have used the tool incorrectly, passed stale arguments, or hit a
+        // transient environment issue. Do not mutate `restricted_tools` from a
+        // verdict; only explicit capability/permission policy may do that.
 
         match verdict.severity {
             VerdictSeverity::Critical => {
@@ -537,12 +522,10 @@ mod tests {
     }
 
     #[test]
-    fn critical_verdict_physically_restricts_avoid_tools() {
+    fn critical_verdict_does_not_physically_restrict_avoid_tools() {
         // First-Critical verdict (critical_turns == 1, force_stop == false)
-        // must physically move the named avoid_tools into restricted_tools
-        // so the model cannot keep calling them. Without this, the model
-        // can ignore the "SESSION CRITICAL" nudge and burn the remaining
-        // turn budget retrying the same failing write/execute tool.
+        // can still name tools in retry guidance, but it must not remove them
+        // from the schema. A failure does not prove the tool is unusable.
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut stall_events = Vec::new();
@@ -592,10 +575,9 @@ mod tests {
             verdict.avoid_tools.contains(&"bash".to_string()),
             "first Critical must name bash in avoid_tools"
         );
-        // The new hard-protection: bash is physically restricted.
         assert!(
-            restricted_tools.contains("bash"),
-            "first Critical must physically restrict the avoid_tools"
+            restricted_tools.is_empty(),
+            "critical health/stall guidance must not physically restrict avoid_tools"
         );
         assert_ne!(
             out,

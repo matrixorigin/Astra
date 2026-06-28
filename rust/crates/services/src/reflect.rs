@@ -350,7 +350,7 @@ fn severity_for(kind: astra_core::ErrorKind, count: i64) -> &'static str {
     use astra_core::ErrorKind as K;
     match (kind, count) {
         // Always critical — system-level or data-integrity
-        (K::ResourceLimit | K::DatabaseError, _) => "critical",
+        (K::ResourceLimit | K::DatabaseError | K::ConnectionPoolExhausted, _) => "critical",
         // Stall ramps with repetition
         (K::Stall, n) if n >= 3 => "warning",
         (K::Stall, _) => "info",
@@ -400,6 +400,11 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
             format!("Turn/session budget exhausted ({tool}): {count} occurrences")
         }
         K::ToolRoundsExhausted => format!("Tool-round cap hit ({tool}): {count} occurrences"),
+        K::ConnectionPoolExhausted => {
+            format!(
+                "HTTP connection pool saturated ({tool}): reqwest pool exhausted — {count} occurrences"
+            )
+        }
         K::DatabaseError => {
             format!("Database error ({tool}): SQL or pool failure — {count} occurrences")
         }

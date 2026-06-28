@@ -345,9 +345,9 @@ impl TurnGuard {
                     }
                     error_recovery::ErrorCategory::ToolUnavailable => {}
                     // Schema / input-validation failures are the *caller*'s fault
-                    // (bad args from the LLM), not the tool's. Do not enable health avoidance
-                    // the tool — otherwise a few malformed calls can banish a
-                    // perfectly healthy tool (regression from session 7e3fecb5).
+                    // (bad args from the LLM), not the tool's. Do not enable retry
+                    // caution for the tool — otherwise a few malformed calls can
+                    // make a perfectly healthy tool look unavailable.
                     // See commit 60203cab for the new API; this is the wiring.
                     error_recovery::ErrorCategory::ToolInvalidArgs => {
                         self.health.record_input_validation_failure(tool_name);
@@ -494,7 +494,7 @@ impl TurnGuard {
     ///
     /// ## De-duplication
     ///
-    /// Every warning category (escalation message, health-avoidance tools,
+    /// Every warning category (escalation message, retry-cautioned tools,
     /// timeout-dominant tools, cache waste) is emitted at most once per
     /// unique fingerprint. The warning re-fires only when the fingerprint
     /// changes — i.e. the underlying health state actually shifts.
@@ -593,7 +593,7 @@ impl TurnGuard {
         if let Some(ref reflection) = self.last_reflection
             && !stall_detected
         {
-            // Check if last turn's tools violated the avoid list
+            // Check if the latest turn repeated a previously cautioned pattern.
             let current_tools: HashSet<String> = self
                 .tool_sigs
                 .last()
@@ -610,8 +610,10 @@ impl TurnGuard {
                     .collect();
             if !violated.is_empty() {
                 injections.push(format!(
-                    "⚠ You were told to avoid [{}] but used them anyway. \
-                         This wastes tokens. STOP using these tools immediately.",
+                    "⚠ A prior correction asked you to change approach for [{}], \
+                         but the latest round repeated the same tool pattern. \
+                         Pivot now: change inputs, use a focused alternative, or report the blocker. \
+                         These tools are not disabled unless a restricted_tool result says so.",
                     violated.join(", ")
                 ));
                 for t in violated {
