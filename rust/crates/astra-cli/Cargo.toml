@@ -18,6 +18,7 @@ path = "src/lib.rs"
 [features]
 default = ["harness"]
 harness = ["astra-runtime/harness", "dep:astra-harness"]
+release-vendored-openssl = ["astra-services/openssl-vendored"]
 
 [dependencies]
 astra-core.workspace = true

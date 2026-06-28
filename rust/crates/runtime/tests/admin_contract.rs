@@ -262,6 +262,13 @@ struct StubAdminUserRoleManager;
 
 #[async_trait]
 impl AdminUserRoleManager for StubAdminUserRoleManager {
+    async fn has_role_members(
+        &self,
+        _role_name: &str,
+    ) -> Result<bool, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(false)
+    }
+
     async fn grant_role(
         &self,
         request: AdminUserRoleRequestData,

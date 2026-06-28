@@ -3,6 +3,9 @@ name = "astra-services"
 version.workspace = true
 edition.workspace = true
 
+[features]
+openssl-vendored = ["dep:openssl", "openssl/vendored"]
+
 [dependencies]
 astra-config.workspace = true
 astra-core.workspace = true
@@ -32,6 +35,9 @@ uuid.workspace = true
 dirs = "6.0.0"
 fastrand = "2"
 fs2 = "0.4.3"
+# `fernet` depends on `openssl` but does not expose its vendored feature.
+# The release workflow enables this optional dependency for musl CLI builds.
+openssl = { version = "0.10.79", optional = true }
 
 [dev-dependencies]
 dotenvy.workspace = true

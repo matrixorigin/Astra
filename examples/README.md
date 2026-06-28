@@ -21,6 +21,6 @@ Then try:
 ```bash
 astra login
 astra chat -m "帮我分析这个仓库"
-astra-admin login
-astra-admin audit --limit 20
+astra admin login
+astra admin audit --limit 20
 ```

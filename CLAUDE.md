@@ -6,7 +6,7 @@ A second file at `.claude/CLAUDE.md` is also loaded — it carries the MANDATORY
 
 ## Project Overview
 
-`astra-engine` — a Rust-first agent platform for auditable chat runs, session history, replay, skills, admin operations, and MatrixOne-backed state. The flagship binary is `astra-server` (Axum HTTP API); the operator-facing surfaces are the `astra` CLI (interactive TUI + scripting), `astra-admin` CLI, and a Next.js admin dashboard under `web/`.
+`astra-engine` — a Rust-first agent platform for auditable chat runs, session history, replay, skills, admin operations, and MatrixOne-backed state. The flagship binary is `astra-server` (Axum HTTP API); the operator-facing surfaces are the `astra` CLI (interactive TUI + scripting + admin operations), and a Next.js admin dashboard under `web/`.
 
 ## ⚠ Cargo Workspace Lives Under `rust/`
 
@@ -29,7 +29,7 @@ Prefer `make <target>` from the repo root — those already cd correctly.
 ```bash
 make build              # Release workspace build (sweeps stale artifacts first)
 make build-debug        # Debug, fast incremental
-make build-cli          # astra + astra-admin only
+make build-cli          # astra CLI only
 make build-server       # astra-server only
 
 make test               # Full: offline + online (online needs MatrixOne running)
@@ -89,7 +89,7 @@ make dev-api-logs
 make dev-seed           # End-to-end bootstrap: recreate DB, restart API, register admin@mo.com / 11111111, load .models.yaml
 ```
 
-After `make build`, binaries live at `rust/target/release/` (or `debug/`): `astra-server`, `astra`, `astra-admin`.
+After `make build`, binaries live at `rust/target/release/` (or `debug/`): `astra-server`, `astra`.
 
 ## Logging & Observability
 
@@ -110,7 +110,7 @@ rust/             # Cargo workspace (24+ crates)
   crates/services/     sessions, journals, durable tasks, cloud sync
   crates/runtime/      Axum HTTP server (astra-server bin), contract tests in tests/
   crates/astra-cli/    astra TUI + scripting CLI
-  crates/astra-admin/  astra-admin CLI
+  crates/astra-cli/    astra CLI (includes admin subcommands under src/admin_cli/)
   crates/astra-edge/   edge runtime (5/5 HTTP, WS, edge-cloud sync)
   crates/astra-plan/   plan executor
   crates/astra-skills/ skill loading + execution

@@ -2,15 +2,15 @@
 # Install the astra CLI from GitHub Releases.
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/matrixorigin/astra/main/scripts/install.sh | sh
-#   curl -sSL https://gh-proxy.com/https://raw.githubusercontent.com/matrixorigin/astra/main/scripts/install.sh | sh
+#   curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
+#   curl -sSL https://gh-proxy.com/https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
 #   curl -sSL ... | sh -s -- -v v0.1.0 -y
 #   curl -sSL ... | sh -s -- -d "$HOME/.local/bin"
 
 set -eu
 
 BINARY="astra"
-REPO="${ASTRA_REPO:-matrixorigin/astra}"
+REPO="${ASTRA_REPO:-matrixorigin/astra-suite}"
 VERSION="${ASTRA_VERSION:-latest}"
 INSTALL_DIR="${ASTRA_INSTALL_DIR:-/usr/local/bin}"
 if [ "${ASTRA_GHPROXY+x}" ]; then
@@ -33,7 +33,7 @@ Options:
   -h, --help          Show this help
 
 Environment:
-  ASTRA_REPO          GitHub repo (default: matrixorigin/astra)
+  ASTRA_REPO          GitHub repo (default: matrixorigin/astra-suite)
   ASTRA_VERSION       Version tag (default: latest)
   ASTRA_INSTALL_DIR   Install directory
   ASTRA_GHPROXY       Space-separated GitHub proxy prefixes (default: https://gh-proxy.com;

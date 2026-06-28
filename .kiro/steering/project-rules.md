@@ -25,7 +25,7 @@ make dev-stop           # Stop all
 - `rust/crates/services/` — sessions, journals, durable tasks, cloud sync
 - `rust/crates/runtime/` — Axum HTTP server, contract tests in `tests/`
 - `rust/crates/astra-cli/` — CLI, edge tools, plan executor, code intel
-- `rust/crates/astra-admin/` — admin CLI
+- `rust/crates/astra-cli/` — CLI (admin subcommands under `src/admin_cli/`)
 - `skills/` — Agent Skills (SKILL.md format, see `skills/README.md`)
 - `web/` — Next.js admin dashboard
 
