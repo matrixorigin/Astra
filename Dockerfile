@@ -1,7 +1,7 @@
 ARG RUST_VERSION=1.94-bookworm
 ARG CARGO_CHEF_VERSION=0.1.77
 ARG CARGO_REGISTRY=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
-ARG DEBIAN_MIRROR=mirrors.aliyun.com
+ARG DEBIAN_MIRROR=https://mirrors.aliyun.com
 
 FROM rust:${RUST_VERSION} AS chef
 
@@ -33,10 +33,9 @@ RUN set -eux; \
 RUN set -eux; \
     if [ -n "${DEBIAN_MIRROR}" ]; then \
         mirror="${DEBIAN_MIRROR%/}"; \
-        mirror="${mirror#http://}"; \
-        mirror="${mirror#https://}"; \
+        case "${mirror}" in http://*|https://*) ;; *) mirror="https://${mirror}" ;; esac; \
         find /etc/apt -type f \( -name 'sources.list' -o -name '*.sources' \) -print0 \
-            | xargs -0 -r sed -i -E "s#https?://(deb.debian.org|security.debian.org)#http://${mirror}#g"; \
+            | xargs -0 -r sed -i -E "s#https?://(deb.debian.org|security.debian.org)#${mirror}#g"; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates curl; \
@@ -56,6 +55,8 @@ FROM chef AS builder
 
 WORKDIR /app/rust
 COPY --from=planner /app/rust/recipe.json recipe.json
+# Runtime image intentionally ships the API server plus public user/admin CLIs.
+# Test-only mock_mcp_server and the standalone astra-edge daemon are excluded.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/rust/target \
@@ -77,6 +78,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 
+LABEL org.opencontainers.image.title="Astra" \
+      org.opencontainers.image.description="Astra API server and CLI runtime image" \
+      org.opencontainers.image.source="https://github.com/matrixorigin/astra"
+
 ARG DEBIAN_MIRROR
 ARG http_proxy
 ARG https_proxy
@@ -89,15 +94,16 @@ WORKDIR /app
 RUN set -eux; \
     export http_proxy="${http_proxy:-}" https_proxy="${https_proxy:-}" no_proxy="${no_proxy:-}" \
         HTTP_PROXY="${HTTP_PROXY:-}" HTTPS_PROXY="${HTTPS_PROXY:-}" NO_PROXY="${NO_PROXY:-}"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates; \
     if [ -n "${DEBIAN_MIRROR}" ]; then \
         mirror="${DEBIAN_MIRROR%/}"; \
-        mirror="${mirror#http://}"; \
-        mirror="${mirror#https://}"; \
+        case "${mirror}" in http://*|https://*) ;; *) mirror="https://${mirror}" ;; esac; \
         find /etc/apt -type f \( -name 'sources.list' -o -name '*.sources' \) -print0 \
-            | xargs -0 -r sed -i -E "s#https?://(deb.debian.org|security.debian.org)#http://${mirror}#g"; \
+            | xargs -0 -r sed -i -E "s#https?://(deb.debian.org|security.debian.org)#${mirror}#g"; \
+        apt-get update; \
     fi; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl; \
+    apt-get install -y --no-install-recommends curl libssl3; \
     rm -rf /var/lib/apt/lists/*; \
     groupadd -r appgroup; \
     useradd --system --create-home --home-dir /home/appuser --shell /usr/sbin/nologin -g appgroup appuser
@@ -117,4 +123,5 @@ ENV ASTRA_API_PORT=17001
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -fsS http://localhost:17001/health >/dev/null || exit 1
 
+STOPSIGNAL SIGTERM
 CMD ["astra-server"]

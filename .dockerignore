@@ -27,6 +27,9 @@ dist
 build
 target
 rust/target
+rust/.rustc_info.json
+rust/Cargo.lock.patch
+rust/*.patch
 .runtime
 *.egg-info
 memoria/data/
