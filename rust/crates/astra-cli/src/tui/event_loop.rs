@@ -1045,6 +1045,9 @@ pub(crate) async fn run_tui_session(
                                     state.perm_manager.mode(),
                                 );
                                 state.perm_manager.set_mode(next_mode);
+                                crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(
+                                    &mut state,
+                                );
                                 chat_widget.commit_system(
                                     crate::tui::history_cell::system::SystemCell::response(
                                         slash_dispatch::permission_mode_feedback(next_mode),
@@ -1699,8 +1702,6 @@ pub(crate) async fn run_tui_session(
                                                 }
                                                 refresh_footer_from_state(&mut bottom_pane, &state);
                                                 flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                                frame_requester.schedule_frame();
-                                                continue;
                                             }
                                             Err(e) => {
                                                 chat_widget.commit_system(
@@ -5456,6 +5457,11 @@ mod tests {
         let exit_msg = plan_transition_notice(&entered_goal, &exited_running, false)
             .expect("background execution exit should be surfaced");
         assert!(exit_msg.contains("running in the background"));
+
+        assert!(
+            plan_transition_notice(&inactive, &inactive, true).is_none(),
+            "a failed/no-op plan request must not be reported as delivered"
+        );
     }
 
     #[test]
@@ -5483,6 +5489,44 @@ mod tests {
             arm.contains("crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(")
                 && arm.contains("crate::cli::plan::plan_lifecycle::enter_remote_plan_mode("),
             "the first plain message after bare /plan should bind remote plan mode and continue as chat"
+        );
+
+        let implicit_start = arm
+            .find("if looks_like_implicit_plan_request(&submit_text)")
+            .expect("implicit plan request branch must exist");
+        let implicit_ok_start = arm[implicit_start..]
+            .find("Ok(_) => {")
+            .map(|offset| implicit_start + offset)
+            .expect("implicit plan request branch must have a success arm");
+        let implicit_err_start = arm[implicit_ok_start..]
+            .find("Err(e) =>")
+            .map(|offset| implicit_ok_start + offset)
+            .expect("implicit plan request branch must have an error arm");
+        let implicit_success_branch = &arm[implicit_ok_start..implicit_err_start];
+        assert!(
+            !implicit_success_branch.contains("continue;"),
+            "successful implicit plan entry must fall through to the chat turn instead of swallowing input"
+        );
+    }
+
+    #[test]
+    fn shift_tab_mode_cycle_clears_inactive_pending_local_plan_entry() {
+        let source = include_str!("event_loop.rs");
+        let branch_start = source
+            .find("BottomPaneAction::CyclePermissionMode => {")
+            .expect("CyclePermissionMode branch must exist");
+        let branch_end = source[branch_start..]
+            .find("BottomPaneAction::SubmitInput(text) => {")
+            .map(|offset| branch_start + offset)
+            .expect("cycle branch must end before submit branch");
+        let branch = &source[branch_start..branch_end];
+
+        assert!(
+            branch.contains("state.perm_manager.set_mode(next_mode);")
+                && branch.contains(
+                    "clear_pending_local_plan_entry_if_inactive(\n                                    &mut state,"
+                ),
+            "Shift+Tab leaving Plan must clear stale bare-/plan pending state"
         );
     }
 

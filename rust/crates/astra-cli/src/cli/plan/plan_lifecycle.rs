@@ -124,6 +124,9 @@ pub(crate) async fn enter_remote_plan_mode(
         value.get("version").and_then(Value::as_u64),
     ));
     state.plan_mode_sync_error = None;
+    state
+        .perm_manager
+        .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
     Ok(plan_id)
 }
 
@@ -245,11 +248,29 @@ pub(crate) async fn fresh_token_for_plan(
 pub(crate) fn looks_like_pending_local_plan_entry(
     state: &crate::cli::session::session_state::SessionState,
 ) -> bool {
-    state
+    state.plan_mode_active()
+        && state
+            .cloud_plan_mirror
+            .as_ref()
+            .map(|plan| plan.goal.trim().is_empty())
+            .unwrap_or(false)
+}
+
+pub(crate) fn clear_pending_local_plan_entry_if_inactive(
+    state: &mut crate::cli::session::session_state::SessionState,
+) {
+    if state.plan_mode_active() {
+        return;
+    }
+    if state
         .cloud_plan_mirror
         .as_ref()
         .map(|plan| plan.goal.trim().is_empty())
         .unwrap_or(false)
+    {
+        state.cloud_plan_mirror = None;
+        state.plan_mode_sync_error = None;
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +336,10 @@ mod tests {
                 .map(|plan| plan.plan.subtasks.len()),
             Some(1)
         );
+        assert!(
+            state.plan_mode_active(),
+            "remote plan entry must switch the authoritative permission mode to Plan"
+        );
     }
 
     #[tokio::test]
@@ -350,6 +375,56 @@ mod tests {
         assert!(
             state.cloud_plan_mirror.is_none(),
             "failed plan create must not arm local mirror"
+        );
+        assert!(
+            !state.plan_mode_active(),
+            "failed plan create must not switch into plan mode"
+        );
+    }
+
+    #[test]
+    fn pending_local_plan_entry_requires_active_plan_mode() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
+
+        assert!(
+            !super::looks_like_pending_local_plan_entry(&state),
+            "stale empty plan mirror outside Plan mode must not swallow the next input"
+        );
+
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
+        assert!(
+            super::looks_like_pending_local_plan_entry(&state),
+            "empty local mirror is pending only while Plan mode is authoritative"
+        );
+    }
+
+    #[test]
+    fn clear_pending_local_plan_entry_only_clears_inactive_empty_local_mirror() {
+        let mut inactive_empty = crate::cli::session::session_state::SessionState::default();
+        inactive_empty.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
+        super::clear_pending_local_plan_entry_if_inactive(&mut inactive_empty);
+        assert!(inactive_empty.cloud_plan_mirror.is_none());
+
+        let mut active_empty = crate::cli::session::session_state::SessionState::default();
+        active_empty.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
+        active_empty
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
+        super::clear_pending_local_plan_entry_if_inactive(&mut active_empty);
+        assert!(
+            active_empty.cloud_plan_mirror.is_some(),
+            "active bare /plan state must wait for the user's next goal"
+        );
+
+        let mut inactive_remote = crate::cli::session::session_state::SessionState::default();
+        inactive_remote.cloud_plan_mirror = Some(plan::PlanModeState::new("Ship auth".into()));
+        super::clear_pending_local_plan_entry_if_inactive(&mut inactive_remote);
+        assert!(
+            inactive_remote.cloud_plan_mirror.is_some(),
+            "non-empty remote plan mirror must not be discarded by a local cleanup"
         );
     }
 

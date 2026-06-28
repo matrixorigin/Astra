@@ -180,6 +180,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Fallback;
             }
 
+            crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(ctx.state);
             if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(ctx.state) {
                 crate::cli::slash::slash_plan::exit_local_plan_mode(ctx.state);
                 return SlashResult::Handled;
@@ -207,12 +208,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Handled;
             }
 
-            let Some(_token) =
-                crate::cli::plan::plan_lifecycle::fresh_token_for_plan(ctx.api, ctx.profile).await
-            else {
-                ctx.show_error("Not logged in. Use /login.".into());
-                return SlashResult::Handled;
-            };
             crate::cli::slash::slash_plan::enter_local_plan_mode(ctx.state);
             SlashResult::Handled
         }
@@ -305,6 +300,9 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 PermissionCommandAction::SetMode(mode) => {
                     ctx.state.perm_manager.set_mode(mode);
+                    crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(
+                        ctx.state,
+                    );
                     ctx.show_response(permission_mode_feedback(mode));
                     SlashResult::Handled
                 }
@@ -1248,6 +1246,7 @@ fn apply_permission_mode_selection(
     mode: crate::cli::permission_manager::PermissionMode,
 ) {
     state.perm_manager.set_mode(mode);
+    crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(state);
     chat_widget.commit_system(SystemCell::response(permission_mode_feedback(mode)));
 }
 
@@ -3964,6 +3963,7 @@ mod view_result_tests {
     use crate::tui::bottom_pane::BottomPane;
     use crate::tui::chat_widget::ChatWidget;
     use crate::tui::history_cell::system::SystemCell;
+    use astra_runtime::plan;
 
     fn last_system_message(widget: &ChatWidget) -> Option<String> {
         widget
@@ -4003,6 +4003,23 @@ mod view_result_tests {
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
             Some("Mode → Auto")
+        );
+    }
+
+    #[test]
+    fn permission_selection_clears_stale_pending_local_plan_entry() {
+        let mut state = SessionState::default();
+        state.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
+        state.perm_manager.set_mode(PermissionMode::Plan);
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result("Auto", &mut state, &mut bottom_pane, &mut chat_widget);
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
+        assert!(
+            state.cloud_plan_mirror.is_none(),
+            "permission picker leaving Plan must clear a bare-/plan pending goal"
         );
     }
 

@@ -43,6 +43,10 @@ pub(crate) async fn handle_plan_command(
 ) -> Result<(), String> {
     let plan_request = arg.trim();
 
+    if plan_request.is_empty() {
+        crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(state);
+    }
+
     if plan_request.is_empty()
         && crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(state)
     {
@@ -74,11 +78,6 @@ pub(crate) async fn handle_plan_command(
         return Ok(());
     }
 
-    let Some(token) = resolve_plan_token(api, profile, token).await else {
-        eprintln!("{}", "  Not logged in. Use /login.".yellow());
-        return Ok(());
-    };
-
     if plan_request.is_empty() {
         enter_local_plan_mode(state);
         eprintln!();
@@ -88,6 +87,11 @@ pub(crate) async fn handle_plan_command(
         );
         return Ok(());
     }
+
+    let Some(token) = resolve_plan_token(api, profile, token).await else {
+        eprintln!("{}", "  Not logged in. Use /login.".yellow());
+        return Ok(());
+    };
 
     crate::cli::plan::plan_lifecycle::enter_remote_plan_mode(
         api,
@@ -128,7 +132,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut state = SessionState::default();
 
-        handle_plan_command("", &api, None, &mut state, Some("token"))
+        handle_plan_command("", &api, None, &mut state, None)
             .await
             .unwrap();
 
@@ -136,6 +140,23 @@ mod tests {
         assert!(
             state.plan_mode_active(),
             "bare /plan should switch UI into plan mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_plan_clears_stale_pending_local_entry_before_entering() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        state.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
+
+        handle_plan_command("", &api, None, &mut state, None)
+            .await
+            .unwrap();
+
+        assert!(crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(&state));
+        assert!(
+            state.plan_mode_active(),
+            "stale inactive pending state should be replaced by a fresh local plan entry"
         );
     }
 

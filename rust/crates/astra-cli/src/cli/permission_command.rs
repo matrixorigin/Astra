@@ -89,10 +89,12 @@ pub(crate) fn handle_permission_command(arg: &str, state: &mut SessionState) {
         PermissionCommandAction::Cycle => {
             let next = next_permission_mode_for_cycle(state.perm_manager.mode());
             state.perm_manager.set_mode(next);
+            crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(state);
             print_permission_mode(next);
         }
         PermissionCommandAction::SetMode(mode) => {
             state.perm_manager.set_mode(mode);
+            crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(state);
             print_permission_mode(mode);
         }
         PermissionCommandAction::ShowRules => {
@@ -161,9 +163,12 @@ fn print_permission_mode(mode: PermissionMode) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PermissionCommandAction, next_permission_mode_for_cycle, parse_permission_command,
+        PermissionCommandAction, handle_permission_command, next_permission_mode_for_cycle,
+        parse_permission_command,
     };
     use crate::cli::permission_manager::PermissionMode;
+    use crate::cli::session::session_state::SessionState;
+    use astra_runtime::plan;
 
     #[test]
     fn parser_accepts_only_canonical_permission_modes() {
@@ -255,6 +260,21 @@ mod tests {
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Ci),
             PermissionMode::Ci
+        );
+    }
+
+    #[test]
+    fn cycling_out_of_plan_clears_pending_local_plan_entry() {
+        let mut state = SessionState::default();
+        state.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
+        state.perm_manager.set_mode(PermissionMode::Plan);
+
+        handle_permission_command("", &mut state);
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
+        assert!(
+            state.cloud_plan_mirror.is_none(),
+            "leaving Plan mode must clear a bare-/plan pending goal"
         );
     }
 }

@@ -36,7 +36,7 @@ pub(crate) fn summarize_plan_goal(goal: &str) -> String {
 pub(crate) fn plan_transition_notice(
     before: &PlanModeUiSnapshot,
     after: &PlanModeUiSnapshot,
-    triggered_by_plan_request: bool,
+    _triggered_by_plan_request: bool,
 ) -> Option<String> {
     match (before.active, after.active) {
         (false, true) => {
@@ -59,9 +59,6 @@ pub(crate) fn plan_transition_notice(
             Some("Plan mode closed - execution is running in the background.".into())
         }
         (true, false) => Some("Plan mode closed - back to normal chat.".into()),
-        (false, false) if triggered_by_plan_request => {
-            Some("Planning response delivered - continuing in normal chat.".into())
-        }
         _ => None,
     }
 }
