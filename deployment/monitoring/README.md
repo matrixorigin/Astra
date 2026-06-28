@@ -168,7 +168,7 @@ groups:
 open http://localhost:9091/targets
 
 # Check if API metrics endpoint is accessible
-curl http://localhost:8000/metrics
+curl http://localhost:6789/metrics
 ```
 
 ### Grafana Dashboard Not Loading

@@ -57,10 +57,10 @@ astra-engine/
 
 ```bash
 # Development
-ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server
+ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=6789 astra-server
 
 # Production
-ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server
+ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=6789 astra-server
 ```
 
 Features: structured JSON logging, JWT auth, rate limiting (60 req/min), health checks, Prometheus metrics.

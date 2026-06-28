@@ -284,7 +284,7 @@ Sync model:
 │  │ (Docker) │  │ (Docker) │  │  (conda env)     │  │
 │  │ :6001    │  │ :6379    │  │                   │  │
 │  └──────────┘  └──────────┘  │  API Server       │  │
-│                               │  :8000            │  │
+│                               │  :6789            │  │
 │                               └──────────────────┘  │
 └─────────────────────────────────────────────────────┘
 ```
@@ -293,7 +293,7 @@ Sync model:
 ```bash
 conda activate agent-engine
 make dev-start                       # MatrixOne + Redis in Docker
-ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server  # API server (required, unless --local)
+ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=6789 astra-server  # API server (required, unless --local)
 astra-admin init                        # Init DB (via API after migration)
 astra chat                        # CLI → API Server → DB
 # OR: astra --local chat          # Dev shortcut: CLI → DB directly
@@ -317,7 +317,7 @@ astra chat                        # CLI → API Server → DB
 │                                                              │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
 │  │MatrixOne │  │  Redis   │  │   Init   │→ │ API Server │  │
-│  │ :6001    │  │ :6379    │  │ (run     │  │ :8000      │  │
+│  │ :6001    │  │ :6379    │  │ (run     │  │ :6789      │  │
 │  │          │  │          │  │  once)   │  │ workers: 2 │  │
 │  └──────────┘  └──────────┘  └──────────┘  └────────────┘  │
 │                                                              │
@@ -837,7 +837,7 @@ RUN pip install --no-cache-dir -e .
 COPY . .
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
-EXPOSE 8000
+EXPOSE 6789
 
 # Dockerfile.train — Heavy (training + GPU)
 FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04 AS train
@@ -890,7 +890,7 @@ spec:
         image: astra:latest
         command: ["astra-server"]
         ports:
-        - containerPort: 8000
+        - containerPort: 6789
         resources:
           requests:
             cpu: "500m"
@@ -907,13 +907,13 @@ spec:
         readinessProbe:
           httpGet:
             path: /health
-            port: 8000
+            port: 6789
           initialDelaySeconds: 5
           periodSeconds: 10
         livenessProbe:
           httpGet:
             path: /health
-            port: 8000
+            port: 6789
           initialDelaySeconds: 15
           periodSeconds: 30
 ---
@@ -1229,7 +1229,7 @@ class DeploymentDetector:
 # Before: 手动启动各组件
 make dev-start       # MatrixOne + Redis
 astra-admin init        # Init DB
-ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server # API
+ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=6789 astra-server # API
 
 # After: 一键全部拉起
 docker-compose up -d

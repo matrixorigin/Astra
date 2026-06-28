@@ -17,6 +17,7 @@
 //!
 //! See repository `README.md` for `RUST_LOG` / `ASTRA_LOG_FORMAT`.
 
+use astra_core::DEFAULT_API_PORT;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -48,7 +49,7 @@ fn parse_benchmark_profile_arg(value: &str) -> Result<astra_harness::HarnessProf
 #[command(name = "astra")]
 #[command(about = "AI agent CLI — run `astra` for interactive chat")]
 pub(crate) struct Cli {
-    /// API server base URL [env: ASTRA_API_URL] [config: api_url] [default: http://127.0.0.1:8000]
+    /// API server base URL [env: ASTRA_API_URL] [config: api_url] [default: http://127.0.0.1:6789]
     #[arg(long)]
     pub api_url: Option<String>,
     /// Config profile name
@@ -307,7 +308,7 @@ pub(crate) struct LoginArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra serve\n  astra serve http --host 127.0.0.1 --port 8000\n  astra serve stdio\n\nModes:\n  http   Starts the Axum HTTP API server. This is also the default when no mode is provided.\n  stdio  Starts a long-lived app-server over stdin/stdout JSON-RPC. A parent process sends requests on stdin and reads events/responses from stdout, allowing one child process to keep session and turn state across requests. In stdio mode stdout is reserved for protocol messages; diagnostics must go to stderr or a log file."
+    after_help = "Examples:\n  astra serve\n  astra serve http --host 127.0.0.1 --port 6789\n  astra serve stdio\n\nModes:\n  http   Starts the Axum HTTP API server. This is also the default when no mode is provided.\n  stdio  Starts a long-lived app-server over stdin/stdout JSON-RPC. A parent process sends requests on stdin and reads events/responses from stdout, allowing one child process to keep session and turn state across requests. In stdio mode stdout is reserved for protocol messages; diagnostics must go to stderr or a log file."
 )]
 pub(crate) struct ServeArgs {
     /// Serve mode. Defaults to `http` for backwards compatibility.
@@ -317,7 +318,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
     /// Port to listen on for the default HTTP mode
-    #[arg(short, long, default_value_t = 8000)]
+    #[arg(short, long, default_value_t = DEFAULT_API_PORT)]
     pub port: u16,
 }
 
@@ -338,7 +339,7 @@ pub(crate) struct ServeHttpArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
     /// Port to listen on
-    #[arg(short, long, default_value_t = 8000)]
+    #[arg(short, long, default_value_t = DEFAULT_API_PORT)]
     pub port: u16,
 }
 

@@ -77,6 +77,8 @@ services:
     networks:
       - mo-net
     healthcheck:
+      # The current Memoria image does not ship curl/wget; keep this process
+      # check until the image can self-probe http://localhost:8100/health.
       test: ["CMD-SHELL", "grep -aq 'memoria' /proc/1/cmdline"]
       interval: 15s
       timeout: 5s

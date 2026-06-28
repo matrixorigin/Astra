@@ -269,15 +269,65 @@ async fn main() -> Result<(), String> {
             let email = args
                 .email
                 .unwrap_or_else(|| format!("{username}@example.com"));
+            let existing_token = load_credentials();
+            let existing_profile_name = profile_name(cli.profile.as_deref(), &existing_token);
+            let existing_token = existing_token
+                .profiles
+                .get(&existing_profile_name)
+                .and_then(|profile| profile.access_token.as_deref());
+            let had_existing_token = existing_token.is_some();
             let body = api
-                .post_auth_register_json(&serde_json::json!({
-                    "username": username,
-                    "email": email,
-                    "password": password
-                }))
+                .post_path_json_text(
+                    paths::ADMIN_REGISTER,
+                    &serde_json::json!({
+                        "username": username,
+                        "email": email,
+                        "password": password
+                    }),
+                    existing_token,
+                )
                 .await
                 .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
+            let value: serde_json::Value =
+                serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            let access = value
+                .get("access_token")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "missing access_token".to_string())?
+                .to_string();
+            let refresh = value
+                .get("refresh_token")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "missing refresh_token".to_string())?
+                .to_string();
+            let is_admin = value
+                .get("is_admin")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !is_admin {
+                return Err("admin registration did not return an admin account".to_string());
+            }
+            let cli_profile = cli.profile.clone();
+            credentials::store()
+                .mutate(|creds| {
+                    let name = profile_name(cli_profile.as_deref(), creds);
+                    creds.current_profile = Some(name.clone());
+                    creds.profiles.insert(
+                        name,
+                        Profile {
+                            username: Some(username),
+                            access_token: Some(access),
+                            refresh_token: Some(refresh),
+                            ..Default::default()
+                        },
+                    );
+                })
+                .map_err(|e| e.to_string())?;
+            if had_existing_token {
+                println!("registered and logged in (admin)");
+            } else {
+                println!("registered and logged in (initial admin)");
+            }
             Ok(())
         }
         Command::Whoami => {

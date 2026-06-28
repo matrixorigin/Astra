@@ -67,7 +67,7 @@ pub(crate) fn read_config_api_url_from(
         .map(|s| s.to_string()))
 }
 
-pub(crate) const DEFAULT_API_URL: &str = "http://127.0.0.1:8000";
+pub(crate) const DEFAULT_API_URL: &str = astra_core::DEFAULT_API_URL;
 
 /// Resolve API URL with priority: flag > env var > config file > default.
 pub(crate) fn resolve_api_url(flag: Option<&str>) -> Result<String, String> {

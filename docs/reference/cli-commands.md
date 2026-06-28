@@ -35,7 +35,7 @@ Binary locations:
 Global options:
 
 ```bash
-astra --api-url http://127.0.0.1:8000 --profile default <command>
+astra --api-url http://127.0.0.1:6789 --profile default <command>
 ```
 
 Commands:
@@ -80,7 +80,7 @@ astra skill status [--per-group 50]
 Global options:
 
 ```bash
-astra-admin --api-url http://127.0.0.1:8000 --profile admin <command>
+astra-admin --api-url http://127.0.0.1:6789 --profile admin <command>
 ```
 
 Commands:

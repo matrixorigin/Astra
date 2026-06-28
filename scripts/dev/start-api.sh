@@ -89,7 +89,7 @@ start_detached() {
 }
 
 # Start server in a detached process so it survives Ctrl+C from parent.
-# Default Rust API address keeps external port 8000 behavior.
+# Default Rust API address keeps external port 6789 behavior.
 #
 # Pass proxy env vars THROUGH to the server. Only the LLM HTTP client reads
 # them (via runtime/src/turn/llm_client.rs::apply_env_proxy); all other
@@ -103,14 +103,14 @@ start_detached env \
     ALL_PROXY="${ALL_PROXY:-${all_proxy:-}}" \
     NO_PROXY="${NO_PROXY:-${no_proxy:-}}" \
     ASTRA_API_HOST="${ASTRA_API_HOST:-0.0.0.0}" \
-    ASTRA_API_PORT="${ASTRA_API_PORT:-8000}" \
+    ASTRA_API_PORT="${ASTRA_API_PORT:-6789}" \
     "$BIN_PATH"
 SETSID_PID=$DETACHED_PID
 sleep 1
 PID=$SETSID_PID
 echo $PID > "$PID_FILE"
 
-API_PORT="${ASTRA_API_PORT:-8000}"
+API_PORT="${ASTRA_API_PORT:-6789}"
 API_START_TIMEOUT_SECONDS="${API_START_TIMEOUT_SECONDS:-180}"
 API_HEALTH_INTERVAL_SECONDS="${API_HEALTH_INTERVAL_SECONDS:-2}"
 

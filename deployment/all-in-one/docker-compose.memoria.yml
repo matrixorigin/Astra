@@ -52,6 +52,8 @@ services:
     networks:
       - mo-net
     healthcheck:
+      # The current Memoria image does not ship curl/wget; keep this process
+      # check until the image can self-probe its HTTP health endpoint.
       test: ["CMD-SHELL", "grep -aq 'memoria' /proc/1/cmdline"]
       interval: 30s
       timeout: 3s
@@ -64,6 +66,13 @@ services:
   init:
     build:
       context: ../..
+      args:
+        - http_proxy=${http_proxy:-}
+        - https_proxy=${https_proxy:-}
+        - no_proxy=${no_proxy:-}
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
     command: ["astra-admin", "init"]
     environment:
       - MATRIXONE_HOST=matrixone
@@ -84,13 +93,20 @@ services:
   api:
     build:
       context: ../..
+      args:
+        - http_proxy=${http_proxy:-}
+        - https_proxy=${https_proxy:-}
+        - no_proxy=${no_proxy:-}
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
     hostname: api
     command: ["astra-server"]
     ports:
-      - "${ASTRA_API_PORT:-8000}:8000"
+      - "${ASTRA_API_PORT:-6789}:6789"
     environment:
       - ASTRA_API_HOST=0.0.0.0
-      - ASTRA_API_PORT=8000
+      - ASTRA_API_PORT=6789
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001
       - MATRIXONE_PASSWORD=${MATRIXONE_PASSWORD}
@@ -111,7 +127,7 @@ services:
     networks:
       - mo-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:6789/health"]
       interval: 30s
       timeout: 3s
       retries: 3

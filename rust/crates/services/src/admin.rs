@@ -135,6 +135,11 @@ pub trait AdminFeedbackStatsReader: Send + Sync {
 
 #[async_trait]
 pub trait AdminUserRoleManager: Send + Sync {
+    async fn has_role_members(
+        &self,
+        role_name: &str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)>;
+
     async fn grant_role(
         &self,
         request: AdminUserRoleRequestData,

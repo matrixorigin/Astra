@@ -17,6 +17,7 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     Interactive,
     Login(LoginArgs),
+    /// Create an admin account. Bootstraps the first admin, or requires an existing admin login.
     Register(RegisterArgs),
     Whoami,
     Refresh,

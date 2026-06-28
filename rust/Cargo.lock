@@ -123,6 +123,7 @@ dependencies = [
 name = "astra-admin-cli"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
  "astra-credentials",
  "astra-thin-client",
  "clap",

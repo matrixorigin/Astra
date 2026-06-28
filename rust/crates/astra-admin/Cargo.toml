@@ -8,6 +8,7 @@ name = "astra-admin"
 path = "src/main.rs"
 
 [dependencies]
+astra-core.workspace = true
 astra-credentials.workspace = true
 astra-thin-client.workspace = true
 clap = { version = "4.5.38", features = ["derive"] }

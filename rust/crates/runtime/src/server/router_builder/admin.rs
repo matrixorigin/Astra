@@ -3,6 +3,10 @@ use super::*;
 pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<AppState> {
     router
         .nest("/admin/harness", admin_harness_routes(state.clone()))
+        .route(
+            "/admin/register",
+            post(admin_handlers::admin_register_handler),
+        )
         .route("/admin/init", post(admin_handlers::admin_init_handler))
         .route(
             "/admin/audit",

@@ -22,10 +22,25 @@ pub(super) async fn auth_register_handler(
         .auth_service
         .login(AuthLoginRequestData { username, password })
         .await?;
+    let mut auth_headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", tokens.access_token)) {
+        auth_headers.insert("authorization", value);
+    }
+    let is_admin = state
+        .admin
+        .authorizer
+        .require_admin(&auth_headers)
+        .await
+        .is_ok();
+    let mut roles = vec!["astra_user".to_string()];
+    if is_admin {
+        roles.push("astra_admin".to_string());
+    }
     tracing::info!(
         target: "astra_runtime::auth",
         request_id = %trace.request_id,
         user_id = %user.user_id,
+        is_admin,
         "user registered"
     );
     Ok((
@@ -35,6 +50,8 @@ pub(super) async fn auth_register_handler(
             username: user.username,
             email: user.email,
             display_name: user.display_name,
+            roles,
+            is_admin,
             access_token: tokens.access_token,
             refresh_token: tokens.refresh_token,
             token_type: tokens.token_type,

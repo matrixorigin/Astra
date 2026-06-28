@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 /// on dual-stack systems, causing connection failures.
 pub(crate) const DEFAULT_MEMORIA_URL: &str = "http://127.0.0.1:8100";
 
+/// Default host-facing HTTP API port for local development and single-host stacks.
+pub const DEFAULT_API_PORT: u16 = 6789;
+
+/// Default client-facing HTTP API URL.
+pub const DEFAULT_API_URL: &str = "http://127.0.0.1:6789";
+
 /// Default max connections for the shared DB pool.
 /// Sized for 50 concurrent runs + sweepers + HTTP handlers + WS overhead.
 /// Override with `ASTRA_DB_POOL_MAX_CONNECTIONS`.
@@ -304,7 +310,7 @@ impl ApiConfig {
         self.host.as_deref().unwrap_or("0.0.0.0")
     }
     pub fn port(&self) -> u16 {
-        self.port.unwrap_or(8000)
+        self.port.unwrap_or(DEFAULT_API_PORT)
     }
     pub fn cors_origins(&self) -> &[String] {
         self.cors_origins.as_deref().unwrap_or(&[])
@@ -687,7 +693,7 @@ impl AppSettings {
             jwt: JwtSettings::from_lookup(&lookup)?,
             api: ApiSettings {
                 host: value_or_default(&lookup, "ASTRA_API_HOST", "0.0.0.0"),
-                port: parse_or_default(&lookup, "ASTRA_API_PORT", 8000)?,
+                port: parse_or_default(&lookup, "ASTRA_API_PORT", DEFAULT_API_PORT)?,
                 cors_origins: lookup("ASTRA_CORS_ORIGINS"),
             },
             memoria: MemoriaSettings {

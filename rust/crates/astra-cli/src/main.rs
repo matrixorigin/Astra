@@ -2414,7 +2414,7 @@ total_tokens_out: 500
         match cli.command {
             Some(Command::Serve(ref args)) => {
                 assert_eq!(args.host, "127.0.0.1");
-                assert_eq!(args.port, 8000);
+                assert_eq!(args.port, astra_core::DEFAULT_API_PORT);
             }
             _ => panic!("expected Serve command"),
         }

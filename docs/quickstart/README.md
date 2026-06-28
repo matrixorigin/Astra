@@ -11,20 +11,21 @@
 
 ```bash
 git clone <repo-url>
-cd mo-dev-agent
+cd astra
 make dev-init
 make dev-start
 make dev-status
 ```
 
-Open `http://localhost:8000/docs`.
+Open `http://localhost:6789/docs`.
 
 ## Docker App Stack
 
 ```bash
-cp .env.example .env
-make dev-start-docker
-make dev-status
+make stack-env
+# Edit deployment/all-in-one/.env and fill MEMORIA_EMBEDDING_API_KEY/MEMORIA_EMBEDDING_BASE_URL.
+make stack-up
+make stack-status
 ```
 
 ## First Validation Pass

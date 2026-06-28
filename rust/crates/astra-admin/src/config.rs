@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use astra_core::DEFAULT_API_URL;
+
 fn settings_path(override_path: Option<&std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
     if let Some(p) = override_path {
         return Ok(p.clone());
@@ -30,8 +32,6 @@ fn read_config_api_url_from(path_override: Option<&PathBuf>) -> Result<Option<St
         .and_then(|v| v.as_str())
         .map(|s| s.to_string()))
 }
-
-const DEFAULT_API_URL: &str = "http://127.0.0.1:8000";
 
 /// Resolve API URL with priority: flag > env var > config file > default.
 pub(crate) fn resolve_api_url(flag: Option<&str>) -> String {

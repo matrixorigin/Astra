@@ -36,7 +36,7 @@ export function maskToken(token?: string): string | undefined {
   return `${token.slice(0, 4)}••••${token.slice(-4)}`;
 }
 
-export const DEFAULT_API_URL = 'http://localhost:8000';
+export const DEFAULT_API_URL = 'http://localhost:6789';
 
 export async function getRuntimeConfig(): Promise<RuntimeConfig> {
   const cookieStore = await cookies();
@@ -81,7 +81,7 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
     };
   }
 
-  // Live mode: API URL is always available (defaults to localhost:8000)
+  // Live mode: API URL is always available (defaults to localhost:6789)
   const source: 'cookie' | 'env' | 'none' = cookieApiUrl
     ? 'cookie'
     : process.env.ASTRA_API_URL

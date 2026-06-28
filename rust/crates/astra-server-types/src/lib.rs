@@ -287,6 +287,8 @@ pub struct AuthRegisterResponse {
     pub username: String,
     pub email: String,
     pub display_name: Option<String>,
+    pub roles: Vec<String>,
+    pub is_admin: bool,
     pub access_token: String,
     pub refresh_token: String,
     pub token_type: String,

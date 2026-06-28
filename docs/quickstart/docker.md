@@ -1,82 +1,78 @@
 # Docker Deployment
 
-Run astra using Docker and Docker Compose.
+Run Astra with the all-in-one Docker Compose stack.
 
 ## Quick Start
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/matrixorigin/mo-dev-agent.git
-cd mo-dev-agent
+git clone <repo-url>
+cd astra
 
-# 2. Configure environment
-cp .env.example .env
-# Edit .env with your settings
+# 2. Create stack environment
+make stack-env
+# Edit deployment/all-in-one/.env and fill:
+#   MEMORIA_EMBEDDING_API_KEY
+#   MEMORIA_EMBEDDING_BASE_URL
 
 # 3. Start all services
-make dev-start-docker
+make stack-up
 
 # 4. Verify
-curl http://localhost:8000/health
+curl http://localhost:6789/health
 ```
 
-## Docker Compose Modes
+## Compose Stack
 
-### Development Mode
+### All-in-One
 
-Uses local source code with hot-reload:
+Uses published images by default:
 
 ```bash
-# Start services
-docker-compose -f deployment/all-in-one/docker-compose.yml up -d
+cd deployment/all-in-one
+cp .env.example .env
+# Edit required embedding configuration.
 
-# View logs
-docker-compose -f deployment/all-in-one/docker-compose.yml logs -f
+docker compose up -d
+docker compose logs -f api
 
-# Stop services
-docker-compose -f deployment/all-in-one/docker-compose.yml down
+docker compose down
 ```
 
-### Production Mode
+### API Docker Mode
 
-Uses pre-built Docker image:
+For development, keep dependency services from `make dev-deps-up` and run only the API container:
 
 ```bash
 # Build image
 make dev-api-docker-build
 
-# Start services
-docker-compose -f deployment/all-in-one/docker-compose.prod.yml up -d
+# Start MatrixOne + Memoria deps
+make dev-deps-up
 
-# Scale API servers
-docker-compose -f deployment/all-in-one/docker-compose.prod.yml up -d --scale api=3
+# Start API container
+make dev-api-docker-up
+
+# Stop API container
+make dev-api-docker-down
 ```
 
 ## Configuration
 
 ### Environment Variables
 
-Create `.env` file with required variables:
+Create `deployment/all-in-one/.env` with:
 
 ```bash
-# Security
-ASTRA_TOKEN_ENCRYPTION_KEY=your-encryption-key-here
-ASTRA_JWT_SECRET=your-jwt-secret-here
-ASTRA_BRIDGE_SECRET=your-bridge-secret-here
+# Required
+MEMORIA_EMBEDDING_API_KEY=...
+MEMORIA_EMBEDDING_BASE_URL=...
 
-# LLM models are configured via the admin CLI after the server starts:
-#   astra-admin model add gpt-4o-mini openai --api-key sk-...
-#   astra-admin model check gpt-4o-mini
-
-# Database
-MATRIXONE_HOST=matrixone
-MATRIXONE_PORT=6001
-MATRIXONE_USER=root
-MATRIXONE_PASSWORD=111
-ASTRA_DATABASE=astra_runtime
-
-# API
-ASTRA_API_PORT=8000
+# Host ports
+ASTRA_API_PORT=6789
+MEMORIA_PORT=8100
+MATRIXONE_PORT=26001
+MATRIXONE_DEBUG_HTTP_PORT=26060
 ```
 
 See [Configuration Reference](../reference/configuration.md) for all options.
@@ -85,44 +81,44 @@ See [Configuration Reference](../reference/configuration.md) for all options.
 
 The stack includes:
 
-- **matrixone**: Database (port 6001)
-- **api**: REST API (port 8000)
+- **api**: REST API (port 6789)
+- **memoria**: memory service (port 8100)
+- **matrixone**: database (port 26001, debug port 26060)
 
 ## Docker Commands
 
 ### Using Makefile
 
 ```bash
-# Build API image
-make dev-api-docker-build
+# Create stack environment
+make stack-env
 
-# Start services
-make dev-api-docker-up
+# Start stack
+make stack-up
 
-# Stop services
-make dev-api-docker-down
+# Stop stack
+make stack-down
 
 # View logs
-make dev-api-docker-logs
-
-# Scale API servers
-make dev-api-docker-scale REPLICAS=3
+make stack-logs SERVICE=api
 ```
 
 ### Using Docker Compose Directly
 
 ```bash
+cd deployment/all-in-one
+
 # Start services
-docker-compose -f deployment/all-in-one/docker-compose.yml up -d
+docker compose up -d
 
 # View logs
-docker-compose -f deployment/all-in-one/docker-compose.yml logs -f api
+docker compose logs -f api
 
 # Stop services
-docker-compose -f deployment/all-in-one/docker-compose.yml down
+docker compose down
 
 # Remove volumes (clean data)
-docker-compose -f deployment/all-in-one/docker-compose.yml down -v
+docker compose down -v
 ```
 
 ## Health Checks
@@ -131,16 +127,13 @@ docker-compose -f deployment/all-in-one/docker-compose.yml down -v
 
 ```bash
 # All services
-docker-compose -f deployment/all-in-one/docker-compose.yml ps
+make stack-status
 
 # API health
-curl http://localhost:8000/health
+curl http://localhost:6789/health
 
 # MatrixOne
-docker exec -it matrixone mysql -h127.0.0.1 -P6001 -uroot -p111 -e "SELECT 1"
-
-# Redis
-docker exec -it redis redis-cli ping
+cd deployment/all-in-one && docker compose exec matrixone mysql -h127.0.0.1 -P6001 -uroot -p111 -e "SELECT 1"
 ```
 
 ## Troubleshooting
@@ -149,26 +142,26 @@ docker exec -it redis redis-cli ping
 
 ```bash
 # Check logs
-docker-compose -f deployment/all-in-one/docker-compose.yml logs
+make stack-logs
 
 # Check specific service
-docker-compose -f deployment/all-in-one/docker-compose.yml logs api
+make stack-logs SERVICE=api
 
 # Restart services
-docker-compose -f deployment/all-in-one/docker-compose.yml restart
+cd deployment/all-in-one && docker compose restart
 ```
 
 ### Database Connection Issues
 
 ```bash
 # Check MatrixOne status
-docker-compose -f deployment/all-in-one/docker-compose.yml ps matrixone
+cd deployment/all-in-one && docker compose ps matrixone
 
 # View MatrixOne logs
-docker-compose -f deployment/all-in-one/docker-compose.yml logs matrixone
+cd deployment/all-in-one && docker compose logs matrixone
 
 # Restart MatrixOne
-docker-compose -f deployment/all-in-one/docker-compose.yml restart matrixone
+cd deployment/all-in-one && docker compose restart matrixone
 ```
 
 ### Port Conflicts
@@ -177,17 +170,19 @@ If ports are already in use, modify `.env`:
 
 ```bash
 ASTRA_API_PORT=8001
-MATRIXONE_PORT=6002
+MATRIXONE_PORT=26002
+MATRIXONE_DEBUG_HTTP_PORT=26061
 ```
 
 ### Clean Restart
 
 ```bash
 # Stop and remove everything
-docker-compose -f deployment/all-in-one/docker-compose.yml down -v
+cd deployment/all-in-one
+docker compose down -v
 
 # Start fresh
-docker-compose -f deployment/all-in-one/docker-compose.yml up -d
+docker compose up -d
 ```
 
 ## Production Considerations
@@ -215,9 +210,7 @@ Ensure data persistence with named volumes:
 
 ```yaml
 volumes:
-  matrixone_data:
-    driver: local
-  redis_data:
+  matrixone-data:
     driver: local
 ```
 
@@ -227,17 +220,18 @@ Add monitoring services (Prometheus, Grafana):
 
 ```bash
 # See deployment/monitoring/ for configuration
-docker-compose -f deployment/monitoring/docker-compose.yml up -d
+cd deployment/monitoring && docker compose up -d
 ```
 
 ### Backup
 
 ```bash
 # Backup MatrixOne data
-docker exec matrixone mysqldump -h127.0.0.1 -P6001 -uroot -p111 astra > backup.sql
+cd deployment/all-in-one
+docker compose exec -T matrixone mysqldump -h127.0.0.1 -P6001 -uroot -p111 astra_runtime > backup.sql
 
 # Restore
-docker exec -i matrixone mysql -h127.0.0.1 -P6001 -uroot -p111 astra < backup.sql
+docker compose exec -T matrixone mysql -h127.0.0.1 -P6001 -uroot -p111 astra_runtime < backup.sql
 ```
 
 ## Next Steps

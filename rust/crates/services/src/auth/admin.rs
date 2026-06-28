@@ -675,6 +675,26 @@ impl AdminInitializer for DatabaseAdminInitializer {
 
 #[async_trait]
 impl AdminUserRoleManager for DatabaseAdminUserRoleManager {
+    async fn has_role_members(
+        &self,
+        role_name: &str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let has_members = query(
+            "SELECT 1 \
+             FROM auth_user_roles ur \
+             JOIN auth_roles r ON ur.role_id = r.role_id \
+             WHERE r.role_name = ? \
+             LIMIT 1",
+        )
+        .bind(role_name)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?
+        .is_some();
+        Ok(has_members)
+    }
+
     async fn grant_role(
         &self,
         request: AdminUserRoleRequestData,
@@ -857,6 +877,16 @@ pub struct UnconfiguredAdminUserRoleManager;
 
 #[async_trait]
 impl AdminUserRoleManager for UnconfiguredAdminUserRoleManager {
+    async fn has_role_members(
+        &self,
+        _role_name: &str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Admin user role manager not configured",
+        ))
+    }
+
     async fn grant_role(
         &self,
         _request: AdminUserRoleRequestData,

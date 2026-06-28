@@ -532,12 +532,16 @@ fn auth_register_response_serializes() {
         username: "alice".into(),
         email: "a@b.com".into(),
         display_name: Some("Alice".into()),
+        roles: vec!["astra_user".into(), "astra_admin".into()],
+        is_admin: true,
         access_token: "at".into(),
         refresh_token: "rt".into(),
         token_type: "Bearer".into(),
         expires_in: 3600,
     };
     let v = serde_json::to_value(&resp).unwrap();
+    assert_eq!(v["roles"], json!(["astra_user", "astra_admin"]));
+    assert_eq!(v["is_admin"], true);
     assert_eq!(v["user_id"], "u1");
     assert_eq!(v["access_token"], "at");
     assert_eq!(v["display_name"], "Alice");

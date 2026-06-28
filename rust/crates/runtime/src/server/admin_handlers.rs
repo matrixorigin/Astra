@@ -1,5 +1,80 @@
 use super::*;
 
+pub(super) async fn admin_register_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AuthRegisterRequest>,
+) -> Result<(StatusCode, Json<AuthRegisterResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let admin_exists = state
+        .admin
+        .user_role_manager
+        .has_role_members("astra_admin")
+        .await?;
+
+    if admin_exists {
+        state.admin.authorizer.require_admin(&headers).await?;
+    }
+
+    let username = request.username.clone();
+    let password = request.password.clone();
+    let user = state
+        .auth_service
+        .register(AuthRegisterRequestData {
+            username: request.username,
+            email: request.email,
+            password: request.password,
+            display_name: request.display_name,
+        })
+        .await?;
+
+    state
+        .admin
+        .user_role_manager
+        .grant_role(AdminUserRoleRequestData {
+            username: user.username.clone(),
+            role_name: "astra_admin".to_string(),
+        })
+        .await?;
+
+    let tokens = state
+        .auth_service
+        .login(AuthLoginRequestData { username, password })
+        .await?;
+
+    let mut auth_headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", tokens.access_token)) {
+        auth_headers.insert("authorization", value);
+    }
+    if state
+        .admin
+        .authorizer
+        .require_admin(&auth_headers)
+        .await
+        .is_err()
+    {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Admin bootstrap already exists; log in as an existing admin to create another admin",
+        ));
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(AuthRegisterResponse {
+            user_id: user.user_id,
+            username: user.username,
+            email: user.email,
+            display_name: user.display_name,
+            roles: vec!["astra_user".to_string(), "astra_admin".to_string()],
+            is_admin: true,
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            token_type: tokens.token_type,
+            expires_in: tokens.expires_in,
+        }),
+    ))
+}
+
 pub(super) async fn admin_init_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

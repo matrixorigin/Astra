@@ -20,7 +20,7 @@ make test
 ## Runtime Verification
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:6789/health
 ```
 
 ## Related Files

@@ -574,16 +574,14 @@ impl AuthService for DatabaseAuthService {
         }
 
         query(
-            "INSERT INTO auth_user_roles (user_id, role_id) \
+            "INSERT IGNORE INTO auth_user_roles (user_id, role_id) \
              SELECT ?, r.role_id FROM auth_roles r \
-             WHERE r.role_name = 'astra_admin' \
-             AND NOT EXISTS (SELECT 1 FROM auth_user_roles ur JOIN auth_roles r2 \
-             ON ur.role_id = r2.role_id WHERE r2.role_name = 'astra_admin')",
+             WHERE r.role_name = 'astra_user'",
         )
         .bind(&user_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| map_auth_sqlx(e, "register.assign_initial_roles", Some(&pool)))?;
+        .map_err(|e| map_auth_sqlx(e, "register.assign_user_role", Some(&pool)))?;
 
         tx.commit()
             .await

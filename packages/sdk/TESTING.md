@@ -53,13 +53,13 @@ Not run in default CI. Set `ASTRA_SDK_E2E=1` to enable Vitest integration tests 
 npm run test:integration:local
 # equivalent: ASTRA_SDK_E2E=1 npm test -- src/__tests__/integration/online
 
-# Vitest + your real API (Mode B; **BASE_URL 默认 http://127.0.0.1:8000** 与 `make dev-start` 一致)
+# Vitest + your real API (Mode B; **BASE_URL 默认 http://127.0.0.1:6789** 与 `make dev-start` 一致)
 ASTRA_SDK_ACCESS_TOKEN=... npm run test:integration:remote
 # 或: ASTRA_SDK_USERNAME=u ASTRA_SDK_PASSWORD=p  npm run test:integration:remote
-# 非 8000 时:  ASTRA_SDK_BASE_URL=http://127.0.0.1:9xxx npm run test:integration:remote
+# 非 6789 时:  ASTRA_SDK_BASE_URL=http://127.0.0.1:9xxx npm run test:integration:remote
 # 可选: ASTRA_SDK_PATH_PREFIX=/api  ASTRA_SDK_TEST_RUN_ID=run-xxx
 
-# Standalone script (no test runner; 默认同样指向 :8000)
+# Standalone script (no test runner; 默认同样指向 :6789)
 npm run test:online
 # 或: ASTRA_SDK_BASE_URL=http://127.0.0.1:9xxx npm run test:online
 # Optional: ASTRA_SDK_ACCESS_TOKEN=... npm run test:online
