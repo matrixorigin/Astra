@@ -188,7 +188,7 @@ jobs:
           body: |
             Astra CLI v${{ needs.version.outputs.value }}.
 
-            This release contains the `astra` CLI binaries consumed by the astra-suite installer.
+            This release contains the `astra` CLI binaries consumed by astra-suite `scripts/install-astra.sh`.
             Source release tag: ${{ needs.version.outputs.source_tag }}.
 
             Assets:

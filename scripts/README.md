@@ -32,7 +32,7 @@ Sets up a demo environment and performs prerequisite checks.
 The published `astra` CLI installer is owned by the public `matrixorigin/astra-suite` repository:
 
 ```sh
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
 ```
 
 Keep installer behavior there so the public install path, documentation, and release assets stay in one repository.
