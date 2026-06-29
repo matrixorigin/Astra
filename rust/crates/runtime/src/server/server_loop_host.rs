@@ -440,6 +440,43 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for RequestAwareSummaryCli
     }
 }
 
+impl RequestAwareSummaryClient {
+    fn from_resolved_config(llm_cfg: &ResolvedTurnLlmConfig, max_output_tokens: usize) -> Self {
+        Self {
+            model_name: llm_cfg.model_name.clone(),
+            wire_model_name: llm_cfg.wire_model_name.clone(),
+            api_key: llm_cfg.api_key.clone(),
+            base_url: llm_cfg.base_url.clone(),
+            provider: llm_cfg.provider.clone(),
+            max_output_tokens,
+            header_overrides: llm_cfg.header_overrides.clone(),
+            request_body_overrides: llm_cfg.request_body_overrides.clone(),
+            completions_url_override: llm_cfg.completions_url_override.clone(),
+            request_timeout: llm_cfg.request_timeout,
+        }
+    }
+}
+
+struct SummaryClientTurnIntentJudge {
+    client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+}
+
+#[async_trait]
+impl astra_services::TurnIntentJudge for SummaryClientTurnIntentJudge {
+    async fn judge(
+        &self,
+        ctx: &astra_services::TurnIntentJudgeContext,
+    ) -> Result<astra_config::user_profile::TurnIntent, astra_services::TurnIntentJudgeError> {
+        let messages = astra_services::turn_intent_judge_messages(ctx);
+        let response = self
+            .client
+            .summarize(&messages)
+            .await
+            .map_err(astra_services::TurnIntentJudgeError::Transport)?;
+        astra_services::parse_turn_intent_response(response.text.as_str())
+    }
+}
+
 fn normalize_request_model(preferred_model: Option<&str>) -> Option<String> {
     preferred_model
         .map(str::trim)
@@ -818,6 +855,10 @@ pub struct ServerAgenticLoopHost {
     /// Used by `summary_client()` to construct the compact-summary client
     /// without re-resolving (model resolution requires async DB call).
     resolved_llm_params: Option<astra_turn_core::cloud_summary::LlmConnParams>,
+    /// Full resolved config from the last successful model resolution.
+    /// Summary-classifier calls need completion overrides and forwarded
+    /// headers, which `LlmConnParams` intentionally does not carry.
+    resolved_llm_config: Option<ResolvedTurnLlmConfig>,
 
     // ── Context ──
     edge_tools: Vec<Value>,
@@ -1317,6 +1358,7 @@ impl ServerAgenticLoopHostBuilder {
             llm_token_service: self.llm_token_service,
             resolved_model_name: None,
             resolved_llm_params: None,
+            resolved_llm_config: None,
             edge_tools,
             capabilities: self.capabilities,
             edge_profile: self.edge_profile,
@@ -1434,6 +1476,71 @@ impl ServerAgenticLoopHost {
     /// intent.
     pub fn set_turn_intent_judge(&mut self, judge: Arc<dyn astra_services::TurnIntentJudge>) {
         self.turn_intent_judge = Some(judge);
+    }
+
+    async fn resolve_llm_config_for_state(
+        &self,
+        state: &AgenticLoopState,
+    ) -> Result<ResolvedTurnLlmConfig, String> {
+        // Skill-level model override takes precedence over the host-level one.
+        let effective_model_override = state
+            .skills
+            .model_override
+            .as_deref()
+            .or(self.model_override.as_deref());
+        let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
+        resolve_llm_model_for_turn(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            effective_model_override,
+            pool_ref,
+            self.llm_token_service.as_ref(),
+            &state.hooks.forward_headers,
+        )
+        .await
+    }
+
+    fn remember_resolved_llm_config(&mut self, llm_cfg: &ResolvedTurnLlmConfig) {
+        self.resolved_model_name = Some(llm_cfg.model_name.clone());
+        self.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
+            model_name: llm_cfg.model_name.clone(),
+            api_key: llm_cfg.api_key.clone(),
+            base_url: llm_cfg.base_url.clone(),
+            provider: llm_cfg.provider.clone(),
+            max_output_tokens: 4096,
+        });
+        self.resolved_llm_config = Some(llm_cfg.clone());
+    }
+
+    async fn turn_intent_summary_client(
+        &mut self,
+        state: &AgenticLoopState,
+    ) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+        if let Some(config) = self.resolved_llm_config.as_ref() {
+            return Some(Box::new(RequestAwareSummaryClient::from_resolved_config(
+                config, 256,
+            )));
+        }
+
+        if self.resolved_llm_params.is_none() {
+            let llm_cfg = match self.resolve_llm_config_for_state(state).await {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "astra::turn_intent",
+                        error = %error,
+                        "turn intent judge skipped because model resolution is unavailable"
+                    );
+                    return None;
+                }
+            };
+            self.remember_resolved_llm_config(&llm_cfg);
+            return Some(Box::new(RequestAwareSummaryClient::from_resolved_config(
+                &llm_cfg, 256,
+            )));
+        }
+
+        self.summary_client()
     }
 
     /// Install runtime MCP tool schemas into the LLM tool surface.
@@ -3143,27 +3250,36 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
     ) -> Option<astra_config::user_profile::TurnIntent> {
-        match self.turn_intent_judge.as_ref() {
-            Some(judge) => {
-                let has_prior_assistant_turn = state
-                    .messages
-                    .iter()
-                    .rev()
-                    .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
-                // Use 1-based turn count: llm_rounds_completed counts
-                // *prior* rounds, so the current user turn is +1.
-                let turn_count = state.llm_rounds_completed.saturating_add(1);
-                crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
-                    judge.as_ref(),
-                    &state.message,
-                    turn_count,
-                    &state.recent_tools,
-                    has_prior_assistant_turn,
-                )
-                .await
-            }
-            None => None,
+        let has_prior_assistant_turn = state
+            .messages
+            .iter()
+            .rev()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+        // Use 1-based turn count: llm_rounds_completed counts *prior* rounds,
+        // so the current user turn is +1.
+        let turn_count = state.llm_rounds_completed.saturating_add(1);
+
+        if let Some(judge) = self.turn_intent_judge.as_ref() {
+            return crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
+                judge.as_ref(),
+                &state.message,
+                turn_count,
+                &state.recent_tools,
+                has_prior_assistant_turn,
+            )
+            .await;
         }
+
+        let client = self.turn_intent_summary_client(state).await?;
+        let judge = SummaryClientTurnIntentJudge { client };
+        crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
+            &judge,
+            &state.message,
+            turn_count,
+            &state.recent_tools,
+            has_prior_assistant_turn,
+        )
+        .await
     }
 
     async fn judge_factual_retry_fallback(
@@ -3287,23 +3403,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
 
         // ── 1. Resolve LLM model ────────────────────────────────────────
-        // Skill-level model override takes precedence over the host-level one.
-        let effective_model_override = state
-            .skills
-            .model_override
-            .as_deref()
-            .or(self.model_override.as_deref());
-        let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-        let mut llm_cfg = match resolve_llm_model_for_turn(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            effective_model_override,
-            pool_ref,
-            self.llm_token_service.as_ref(),
-            &state.hooks.forward_headers,
-        )
-        .await
-        {
+        let mut llm_cfg = match self.resolve_llm_config_for_state(state).await {
             Ok(m) => m,
             Err(e) => {
                 return Err(astra_core::ClassifiedError::new(
@@ -3330,6 +3430,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 let enc = self.encryptor.as_ref();
                 let lts = self.llm_token_service.as_ref();
                 let fwd = &state.hooks.forward_headers;
+                let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
                 match try_resolve_fallback(
                     cooldown,
                     &llm_cfg.fallback_chain,
@@ -3403,14 +3504,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &llm_cfg.provider,
             &llm_cfg.model_name,
         );
-        self.resolved_model_name = Some(llm_cfg.model_name.clone());
-        self.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: llm_cfg.model_name.clone(),
-            api_key: llm_cfg.api_key.clone(),
-            base_url: llm_cfg.base_url.clone(),
-            provider: llm_cfg.provider.clone(),
-            max_output_tokens: 4096,
-        });
+        self.remember_resolved_llm_config(&llm_cfg);
 
         // ── 2b. Run the context pipeline ─────────────────────────────────
         // Pipeline is the single source of truth for:
@@ -4147,9 +4241,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
-        // LLM config is resolved per-turn inside execute_turn. We cache it in
-        // `resolved_llm_params` after first successful resolution so the trait
-        // method can construct the client without re-resolving.
+        // LLM config is resolved per-turn inside execute_turn. Prefer the full
+        // config because gateway completion overrides and forwarded auth
+        // headers are part of the runtime contract for all auxiliary LLM calls.
+        if let Some(config) = self.resolved_llm_config.as_ref() {
+            return Some(Box::new(RequestAwareSummaryClient::from_resolved_config(
+                config, 4096,
+            )));
+        }
+
+        // Older tests can still seed the minimal params directly.
         let params = self.resolved_llm_params.as_ref()?;
         Some(Box::new(
             astra_turn_core::cloud_summary::HttpSummaryClient::new(params.clone()),
@@ -10167,8 +10268,10 @@ mod tests {
     // judge is absent or fails.
     mod turn_intent_judge_wiring {
         use super::*;
-        use astra_config::user_profile::{TurnContinuationMode, TurnIntent};
-        use astra_services::{TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError};
+        use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
+        use astra_services::{
+            LlmTokenServiceConfig, TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError,
+        };
         use async_trait::async_trait;
 
         struct ScriptedJudge {
@@ -10282,6 +10385,131 @@ mod tests {
             state.message = "please inspect the current changes".to_string();
 
             assert_eq!(host.judge_turn_intent(&state).await, None);
+        }
+
+        #[tokio::test]
+        async fn judge_turn_intent_uses_gateway_llm_when_no_judge_is_injected() {
+            use axum::{Router, extract::State, routing::post};
+            use tokio::net::TcpListener;
+
+            #[derive(Default)]
+            struct RequestCapture {
+                authorization: tokio::sync::Mutex<Option<String>>,
+                workspace_id: tokio::sync::Mutex<Option<String>>,
+                body: tokio::sync::Mutex<Option<Value>>,
+            }
+
+            async fn handler(
+                State(capture): State<Arc<RequestCapture>>,
+                headers: axum::http::HeaderMap,
+                request: axum::extract::Request,
+            ) -> axum::Json<Value> {
+                *capture.authorization.lock().await = headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(String::from);
+                *capture.workspace_id.lock().await = headers
+                    .get("x-workspace-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(String::from);
+
+                let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .expect("read request body");
+                *capture.body.lock().await =
+                    Some(serde_json::from_slice(&bytes).expect("json body"));
+
+                axum::Json(json!({
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "{\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":true}"
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }))
+            }
+
+            let capture = Arc::new(RequestCapture::default());
+            let app = Router::new()
+                .route("/gateway/chat/completions", post(handler))
+                .with_state(capture.clone());
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr().expect("listener addr");
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("test server should run");
+            });
+
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .with_llm_token_service(Some(LlmTokenServiceConfig {
+                url: format!("http://{addr}/gateway/chat/completions"),
+                timeout_ms: Some(2_000),
+            }))
+            .build();
+
+            let mut state = crate::turn::agentic_loop::host::tests::make_state();
+            state.message = "不对，我要的是系统性修复，不是临时补丁".to_string();
+            state.messages = vec![
+                serde_json::json!({"role": "user", "content": "earlier"}),
+                serde_json::json!({"role": "assistant", "content": "ok"}),
+            ];
+            state.hooks.forward_headers.insert(
+                "authorization".to_string(),
+                "Bearer forwarded-token".to_string(),
+            );
+            state
+                .hooks
+                .forward_headers
+                .insert("x-workspace-id".to_string(), "ws-judge".to_string());
+
+            let intent = host
+                .judge_turn_intent(&state)
+                .await
+                .expect("gateway judge should return intent");
+
+            assert_eq!(intent.requested_scenario, Some(Scenario::Refactoring));
+            assert_eq!(
+                intent.continuation_mode,
+                TurnContinuationMode::ContinueCurrentObjective
+            );
+            assert!(
+                intent.reanchors_current_objective,
+                "judge response should drive reanchor behavior"
+            );
+            assert_eq!(
+                capture.authorization.lock().await.as_deref(),
+                Some("Bearer forwarded-token")
+            );
+            assert_eq!(
+                capture.workspace_id.lock().await.as_deref(),
+                Some("ws-judge")
+            );
+
+            let body = capture.body.lock().await.clone().expect("judge request");
+            let messages = body["messages"].as_array().expect("messages");
+            assert_eq!(messages.len(), 2);
+            let prompt = messages[1]["content"].as_str().expect("user prompt");
+            assert!(
+                prompt.contains("reanchors_current_objective"),
+                "judge prompt must request the structured reanchor field"
+            );
+            assert!(
+                prompt.contains("不对，我要的是系统性修复，不是临时补丁"),
+                "judge prompt must include the current user message as data"
+            );
+
+            server.abort();
         }
     }
 }

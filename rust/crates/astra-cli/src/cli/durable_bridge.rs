@@ -844,12 +844,12 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
 /// `/v1/chat/completions` proxy.
 ///
 /// Mirrors [`ServerProxyLlmJudge`] (verification): same auth, same model
-/// resolution, no extra credentials. Hosts wire this into
-/// `ServerAgenticLoopHost::set_turn_intent_judge` so the agentic loop's
-/// per-turn intent classification uses the LLM rather than only a
-/// keyword-matching fallback. On any error (transport, malformed output,
-/// rejection), the host falls back to the deterministic classifier so a
-/// transient outage never blocks the user's session.
+/// resolution, no extra credentials. It can be injected through
+/// `ServerAgenticLoopHost::set_turn_intent_judge` when a caller wants an
+/// explicit proxy-backed judge instead of the host's built-in summary-client
+/// judge path. On any error (transport, malformed output, rejection), the host
+/// proceeds without explicit turn intent so a transient outage never blocks
+/// the user's session.
 pub struct ServerProxyTurnIntentJudge {
     api: astra_thin_client::ThinClient,
     token: String,
@@ -868,18 +868,8 @@ impl astra_services::TurnIntentJudge for ServerProxyTurnIntentJudge {
         &self,
         ctx: &astra_services::TurnIntentJudgeContext,
     ) -> Result<astra_config::user_profile::TurnIntent, astra_services::TurnIntentJudgeError> {
-        let prompt = astra_services::build_turn_intent_prompt(ctx);
-        let system_msg = serde_json::json!({
-            "role": "system",
-            "content": "You output ONLY a JSON object as described in the user message. No prose. No markdown fences."
-        });
-        let user_msg = serde_json::json!({
-            "role": "user",
-            "content": prompt,
-        });
-
         let mut body = serde_json::json!({
-            "messages": [system_msg, user_msg],
+            "messages": astra_services::turn_intent_judge_messages(ctx),
             // Keep judge replies tight — the schema is fixed and small.
             "max_tokens": 256,
             // Low temperature for deterministic classification.

@@ -320,7 +320,7 @@ pub use triggers::{
 };
 pub use turn_intent_judge::{
     TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError, build_turn_intent_prompt,
-    parse_turn_intent_response,
+    parse_turn_intent_response, turn_intent_judge_messages,
 };
 pub use workflows::{
     UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,

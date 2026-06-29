@@ -34,6 +34,7 @@
 
 use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
 use async_trait::async_trait;
+use serde_json::{Value, json};
 
 /// Context passed to the turn intent judge.
 #[derive(Debug, Clone, Default)]
@@ -167,6 +168,24 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
     prompt.push_str(&format!("\nUser: \"{}\"\n", sanitized));
 
     prompt
+}
+
+/// Build the chat messages sent to the turn-intent judge.
+///
+/// Keep this centralized so CLI/server judge implementations cannot drift in
+/// system wording, prompt shape, or output contract.
+#[must_use]
+pub fn turn_intent_judge_messages(ctx: &TurnIntentJudgeContext) -> Vec<Value> {
+    vec![
+        json!({
+            "role": "system",
+            "content": "You output ONLY a JSON object as described in the user message. No prose. No markdown fences."
+        }),
+        json!({
+            "role": "user",
+            "content": build_turn_intent_prompt(ctx),
+        }),
+    ]
 }
 
 // ─── Response parser ────────────────────────────────────────────────────────
