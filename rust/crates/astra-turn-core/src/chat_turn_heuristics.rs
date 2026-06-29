@@ -29,6 +29,44 @@ const STANDARD_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
 const COMPLEX_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
     AgenticTurnBudget::new(140, 280, 35, 4);
 
+const WORKSPACE_EVIDENCE_PHRASES: &[&str] = &[
+    "working tree",
+    "local changes",
+    "current changes",
+    "pull request",
+    "test failure",
+    "build failure",
+    "仓库",
+    "工作区",
+    "改动",
+    "修改",
+    "变更",
+    "提交",
+    "分支",
+    "代码",
+    "文件",
+    "函数",
+    "测试失败",
+    "构建失败",
+];
+
+const WORKSPACE_EVIDENCE_WORDS: &[&str] = &[
+    "repo",
+    "repository",
+    "workspace",
+    "changes",
+    "diff",
+    "commit",
+    "branch",
+    "pr",
+    "ci",
+    "github",
+    "codebase",
+    "code",
+    "file",
+    "function",
+];
+
 const MUTATING_TERMS: &[&str] = &[
     "fix",
     "修改代码",
@@ -231,6 +269,18 @@ fn contains_any_keyword(q: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|kw| q.contains(kw))
 }
 
+fn contains_ascii_word(q: &str, word: &str) -> bool {
+    q.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == word)
+}
+
+fn contains_workspace_evidence_signal(q: &str) -> bool {
+    contains_any_keyword(q, WORKSPACE_EVIDENCE_PHRASES)
+        || WORKSPACE_EVIDENCE_WORDS
+            .iter()
+            .any(|word| contains_ascii_word(q, word))
+}
+
 #[must_use]
 pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
     let q = input.to_lowercase();
@@ -259,11 +309,13 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
     // analysis wins for object descriptions such as "评审当前修改" / "review
     // current changes".
     let should_mutate = has_explicit_mutation_directive || has_mutating && !has_analysis;
+    let needs_workspace_evidence =
+        should_mutate || exploratory || contains_workspace_evidence_signal(&q);
     if should_mutate {
         TaskExecutionProfile {
             mutates_workspace: true,
             verification_required: true,
-            allow_factual_retry: false,
+            allow_factual_retry: needs_workspace_evidence,
             exploration_round_window,
             stall_window,
             complexity,
@@ -274,7 +326,7 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
         TaskExecutionProfile {
             mutates_workspace: false,
             verification_required: false,
-            allow_factual_retry: false,
+            allow_factual_retry: needs_workspace_evidence,
             exploration_round_window,
             stall_window,
             complexity,
@@ -287,6 +339,7 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
             stall_window,
             complexity,
             exploratory_task: exploratory,
+            allow_factual_retry: needs_workspace_evidence,
             agentic_turn_budget: default_agentic_turn_budget(false, exploratory, complexity),
             ..TaskExecutionProfile::default()
         }
@@ -553,13 +606,13 @@ mod tests {
         let review = infer_task_execution_profile("review 最新的commit");
         assert!(!review.mutates_workspace);
         assert!(!review.verification_required);
-        assert!(!review.allow_factual_retry);
+        assert!(review.allow_factual_retry);
         assert_eq!(review.stall_window, DEFAULT_STALL_WINDOW);
 
         let implementation = infer_task_execution_profile("implement the feature");
         assert!(implementation.mutates_workspace);
         assert!(implementation.verification_required);
-        assert!(!implementation.allow_factual_retry);
+        assert!(implementation.allow_factual_retry);
         assert!(
             implementation.agentic_turn_budget.initial_turns
                 > review.agentic_turn_budget.initial_turns
@@ -577,6 +630,7 @@ mod tests {
                 >= implementation.agentic_turn_budget.hard_turn_limit
         );
         assert!(exploratory.exploratory_task);
+        assert!(exploratory.allow_factual_retry);
     }
 
     #[test]
@@ -669,13 +723,22 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_profiles_do_not_enable_factual_retry() {
+    fn heuristic_profiles_enable_factual_retry_only_for_workspace_evidence() {
         let profile = infer_task_execution_profile("review local changes");
-        assert!(!profile.allow_factual_retry);
+        assert!(profile.allow_factual_retry);
         let profile2 = infer_task_execution_profile("explain this function");
-        assert!(!profile2.allow_factual_retry);
+        assert!(profile2.allow_factual_retry);
         let profile3 = infer_task_execution_profile("implement the feature");
-        assert!(!profile3.allow_factual_retry);
+        assert!(profile3.allow_factual_retry);
+        let profile4 =
+            infer_task_execution_profile("what do 59% and 117k mean in the status line?");
+        assert!(!profile4.allow_factual_retry);
+        let profile5 = infer_task_execution_profile("what is Rust?");
+        assert!(!profile5.allow_factual_retry);
+        let profile6 = infer_task_execution_profile("explain recursion conceptually");
+        assert!(!profile6.allow_factual_retry);
+        let profile7 = infer_task_execution_profile("explain prompt profile settings");
+        assert!(!profile7.allow_factual_retry);
     }
 
     #[test]

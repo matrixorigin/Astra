@@ -1018,6 +1018,82 @@ mod tests {
     }
 
     #[test]
+    fn factual_retry_is_reachable_from_workspace_evidence_profile() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: Some(50),
+            session_id: &None,
+            run_id: &None,
+            full_text: "The latest PR looks green.",
+            tool_calls: &[],
+            prompt_tokens: 100,
+            completion_tokens: 200,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let mut pack = Pack::new();
+        pack.task_profile =
+            crate::chat_turn_heuristics::infer_task_execution_profile("show me the latest PR");
+
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "show me the latest PR",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+
+        assert_eq!(out, AgenticTurnIngestOutcome::Continue);
+        assert!(pack.forced_factual_retry);
+        assert_eq!(
+            pack.factual_retry_fallback_text.as_deref(),
+            Some("The latest PR looks green.")
+        );
+    }
+
+    #[test]
+    fn factual_retry_does_not_fire_for_status_line_concept_profile() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "59% is context usage; 117k is the token count.",
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let query = "what do 59% and 117k mean in the status line?";
+        let mut pack = Pack::new();
+        pack.task_profile = crate::chat_turn_heuristics::infer_task_execution_profile(query);
+
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            query,
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert!(!pack.forced_factual_retry);
+        assert_eq!(
+            pack.messages.last().unwrap()["content"],
+            "59% is context usage; 117k is the token count."
+        );
+    }
+
+    #[test]
     fn factual_retry_restores_original_when_no_evidence_retry_drops_the_question() {
         let original = "59% is context usage; 117k is the token count.";
         let query = "what do 59% and 117k mean in the status line?";
