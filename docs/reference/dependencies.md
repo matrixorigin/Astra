@@ -15,4 +15,3 @@
 ## Optional Python Usage
 
 Python is **not** required for the repository's server development flow.
-The remaining Python-specific path is the published CLI installer in `scripts/install.sh`.

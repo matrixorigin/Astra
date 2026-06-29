@@ -1,4 +1,4 @@
-name: Release Binaries
+name: Release Astra CLI Binaries
 
 on:
   push:
@@ -22,6 +22,7 @@ jobs:
     outputs:
       value: ${{ steps.resolve.outputs.value }}
       tag: ${{ steps.resolve.outputs.tag }}
+      source_tag: ${{ steps.resolve.outputs.source_tag }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
     steps:
       - name: Resolve release version
@@ -51,7 +52,8 @@ jobs:
           fi
 
           echo "value=${value}" >> "${GITHUB_OUTPUT}"
-          echo "tag=v${value}" >> "${GITHUB_OUTPUT}"
+          echo "tag=astra-cli-v${value}" >> "${GITHUB_OUTPUT}"
+          echo "source_tag=v${value}" >> "${GITHUB_OUTPUT}"
           echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
 
   build:
@@ -85,6 +87,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.source_tag }}
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -175,11 +179,24 @@ jobs:
         with:
           repository: ${{ env.RELEASE_REPOSITORY }}
           token: ${{ secrets.ASTRA_SUITE_PAT }}
-          name: ${{ needs.version.outputs.tag }}
+          name: Astra CLI v${{ needs.version.outputs.value }}
           tag_name: ${{ needs.version.outputs.tag }}
           target_commitish: main
           draft: false
           prerelease: ${{ needs.version.outputs.prerelease }}
-          generate_release_notes: true
+          generate_release_notes: false
+          body: |
+            Astra CLI v${{ needs.version.outputs.value }}.
+
+            This release contains the `astra` CLI binaries consumed by the astra-suite installer.
+            Source release tag: ${{ needs.version.outputs.source_tag }}.
+
+            Assets:
+            - astra-v${{ needs.version.outputs.value }}-linux-amd64.tar.gz
+            - astra-v${{ needs.version.outputs.value }}-linux-arm64.tar.gz
+            - astra-v${{ needs.version.outputs.value }}-darwin-amd64.tar.gz
+            - astra-v${{ needs.version.outputs.value }}-darwin-arm64.tar.gz
+            - checksums.txt
+          make_latest: false
           files: dist/*
           fail_on_unmatched_files: true

@@ -17,7 +17,7 @@ scripts/
 │   ├── deploy.sh
 │   ├── health_check.sh
 │   └── restore.sh
-└── install.sh
+└── README.md
 ```
 
 ## Key Scripts
@@ -28,8 +28,14 @@ Initializes local development configuration, generating required local secrets i
 ### `scripts/setup/demo-init.sh`
 Sets up a demo environment and performs prerequisite checks.
 
-### `scripts/install.sh`
-Installs the published CLI package. This path still requires Python 3.11+ because it installs the packaged CLI for end users, not because the repository's server runtime is Python-based.
+### Public CLI Installer
+The published `astra` CLI installer is owned by the public `matrixorigin/astra-suite` repository:
+
+```sh
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install.sh | sh
+```
+
+Keep installer behavior there so the public install path, documentation, and release assets stay in one repository.
 
 ### `scripts/ops/*.sh`
 Operational helpers for health checks, backup/restore, and deployment.
