@@ -72,12 +72,12 @@ jobs:
             suffix: linux-arm64
             use-cross: true
             features: --features release-vendored-openssl
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             suffix: darwin-amd64
             use-cross: false
             features: ""
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             suffix: darwin-arm64
             use-cross: false
