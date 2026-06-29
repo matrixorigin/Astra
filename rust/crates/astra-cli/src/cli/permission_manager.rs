@@ -2554,49 +2554,106 @@ impl PermissionManager {
                 // right pattern (`Bash(argv_prefix="cargo")` vs `write_file`).
                 let rule_args =
                     cloud_detail_permission_args(tool, detail).unwrap_or(serde_json::Value::Null);
-                let fp = fingerprint_for_match_target(
+                let match_target = default_match_target(tool, &rule_args);
+                let fp = fingerprint_for_match_target(tool, &rule_args, &match_target);
+                let envelope = self.evaluate_permission_envelope(tool, &rule_args);
+                let scope_ctx = astra_turn_core::permission::scope::scope_context_for_tool_request(
                     tool,
                     &rule_args,
-                    &default_match_target(tool, &rule_args),
+                    envelope.risk_tags.clone(),
+                    false,
+                    !self.project_allow_rules_active(),
                 );
-                self.session_overrides.insert(fp, true);
-                let rule = Self::make_allow_rule(tool, &rule_args);
-                let workspace_persistence_available = self.project_root.is_some();
-                let location = if self.project_root.is_some() {
-                    "in this workspace"
-                } else {
-                    "in this session"
+                let always_scope =
+                    astra_turn_core::permission::scope::default_always_scope(&scope_ctx);
+                let location = match always_scope {
+                    astra_turn_core::permission::scope::AllowScope::Project => "in this workspace",
+                    astra_turn_core::permission::scope::AllowScope::User => "for this user",
+                    astra_turn_core::permission::scope::AllowScope::RestOfSession => {
+                        "in this session"
+                    }
+                    astra_turn_core::permission::scope::AllowScope::RestOfTurn => "for this turn",
+                    astra_turn_core::permission::scope::AllowScope::OnceThisCall => "for this call",
                 };
                 let remember_preview = astra_turn_core::permission::match_target::remember_preview(
                     tool, &rule_args, location,
                 );
-                if sensitive_path_match_for_request(tool, &rule_args).is_some() {
-                    eprintln!(
-                        "{}",
-                        cloud_always_feedback_message(
-                            &remember_preview,
-                            workspace_persistence_available,
-                            None,
+                match always_scope {
+                    astra_turn_core::permission::scope::AllowScope::Project => {
+                        self.record_approval_with_match_target(
+                            tool,
+                            &rule_args,
+                            &match_target,
                             true,
-                        )
-                        .dim()
-                    );
-                } else {
-                    self.add_allow_rule(&rule);
-                    let persist_error = self.take_last_save_error();
-                    let feedback = cloud_always_feedback_message(
-                        &remember_preview,
-                        workspace_persistence_available,
-                        persist_error.as_deref(),
-                        false,
-                    );
-                    if persist_error.is_some() {
-                        eprintln!("{}", feedback.yellow());
-                    } else {
-                        eprintln!("{}", feedback.dim());
+                        );
+                        let rule = Self::make_allow_rule_with_match_target(
+                            tool,
+                            &rule_args,
+                            &match_target,
+                        );
+                        self.add_allow_rule(&rule);
+                        let persist_error = self.take_last_save_error();
+                        let feedback = cloud_always_feedback_message(
+                            &remember_preview,
+                            true,
+                            persist_error.as_deref(),
+                            false,
+                        );
+                        if persist_error.is_some() {
+                            eprintln!("{}", feedback.yellow());
+                        } else {
+                            eprintln!("{}", feedback.dim());
+                        }
+                        return ApprovalDecision::AllowSession;
                     }
+                    astra_turn_core::permission::scope::AllowScope::User => {
+                        self.record_approval_with_match_target(
+                            tool,
+                            &rule_args,
+                            &match_target,
+                            true,
+                        );
+                        let rule = Self::make_allow_rule_with_match_target(
+                            tool,
+                            &rule_args,
+                            &match_target,
+                        );
+                        self.add_user_allow_rule(&rule);
+                        let persist_error = self.take_last_save_error();
+                        let feedback = cloud_always_feedback_message(
+                            &remember_preview,
+                            true,
+                            persist_error.as_deref(),
+                            false,
+                        );
+                        if persist_error.is_some() {
+                            eprintln!("{}", feedback.yellow());
+                        } else {
+                            eprintln!("{}", feedback.dim());
+                        }
+                        return ApprovalDecision::AllowSession;
+                    }
+                    astra_turn_core::permission::scope::AllowScope::RestOfSession => {
+                        self.session_overrides.insert(fp, true);
+                        eprintln!(
+                            "{}",
+                            cloud_always_feedback_message(&remember_preview, false, None, true)
+                                .dim()
+                        );
+                        return ApprovalDecision::AllowSession;
+                    }
+                    astra_turn_core::permission::scope::AllowScope::RestOfTurn => {
+                        self.turn_overrides.insert(fp, true);
+                        eprintln!(
+                            "{}",
+                            cloud_always_feedback_message(&remember_preview, false, None, true)
+                                .dim()
+                        );
+                        return ApprovalDecision::Allow;
+                    }
+                    astra_turn_core::permission::scope::AllowScope::OnceThisCall => {}
                 }
-                ApprovalDecision::AllowSession
+                ApprovalDecision::Allow
             }
             '!' => {
                 self.set_mode(PermissionMode::Auto);
@@ -5021,14 +5078,15 @@ mod tests {
     }
 
     #[test]
-    fn cloud_approval_always_sets_session_override() {
+    fn cloud_approval_always_without_detail_is_turn_scoped() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         let decision = pm.apply_cloud_approval_choice("bash", None, 'a');
 
-        assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
-        assert_eq!(pm.session_overrides.check(&bare_fp("bash")), Some(true));
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+        assert_eq!(pm.turn_overrides.check(&bare_fp("bash")), Some(true));
+        assert_eq!(pm.session_overrides.check(&bare_fp("bash")), None);
     }
 
     #[test]
@@ -6526,7 +6584,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate user selecting "always allow this tool" in cloud approval
-        let decision = pm.apply_cloud_approval_choice("write_file", None, 'a');
+        let decision = pm.apply_cloud_approval_choice("write_file", Some("src/lib.rs"), 'a');
         assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
 
         // Now the local check_nonblocking must auto-allow (no prompt)
@@ -6568,7 +6626,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // 1st call: user selects 'a' in cloud approval
-        pm.apply_cloud_approval_choice("write_file", None, 'a');
+        pm.apply_cloud_approval_choice("write_file", Some("src/lib.rs"), 'a');
 
         // 1st call: local check
         let args1 = serde_json::json!({"path": "src/lib.rs", "content": "pub fn one() {}\n"});
@@ -8136,6 +8194,51 @@ mod tests {
         assert!(
             after_restart.is_none(),
             "after restart, sensitive write should prompt again instead of persisting"
+        );
+    }
+
+    #[test]
+    fn cloud_always_git_destructive_stays_session_only_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = "git restore --staged --worktree rust/crates/foo/src/lib.rs";
+        {
+            let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+            let first = pm.apply_cloud_approval_choice("bash", Some(command), 'a');
+            assert_eq!(first, astra_thin_client::ApprovalDecision::AllowSession);
+
+            let same_session = pm.preflight_cloud_approval_decision(
+                "bash",
+                Some(command),
+                ApprovalKind::Standard,
+                false,
+            );
+            assert_eq!(
+                same_session,
+                Some(astra_thin_client::ApprovalDecision::Allow),
+                "same-session git destructive Always should avoid re-prompting"
+            );
+        }
+
+        let settings_path = dir.path().join(".astra").join("permissions.json");
+        if settings_path.exists() {
+            let on_disk = std::fs::read_to_string(&settings_path).unwrap();
+            let saved: PermissionSettings = serde_json::from_str(&on_disk).unwrap();
+            assert!(
+                saved.allow.iter().all(|rule| !rule.contains("git restore")),
+                "git destructive Always must remain session-only: {on_disk}"
+            );
+        }
+
+        let mut reborn = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let after_restart = reborn.preflight_cloud_approval_decision(
+            "bash",
+            Some(command),
+            ApprovalKind::Standard,
+            false,
+        );
+        assert!(
+            after_restart.is_none(),
+            "after restart, git destructive request should prompt again instead of persisting"
         );
     }
 

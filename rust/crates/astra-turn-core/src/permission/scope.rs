@@ -23,6 +23,7 @@
 //! `permitted_scopes(...)` to know which entries to grey out.
 
 use crate::permission::engine::RiskTag;
+use crate::permission::memory_profile::{PersistentMemoryBlock, permission_memory_profile};
 
 /// Allowed-rule scope. Mirrors the dropdown choices in the
 /// approval card.
@@ -101,6 +102,74 @@ pub struct ScopeAvailability {
     pub scope: AllowScope,
     pub available: bool,
     pub reason: Option<ScopeUnavailableReason>,
+}
+
+/// Build the scope policy input for one concrete tool request.
+///
+/// Risk classification is supplied by the permission engine so callers do not
+/// duplicate git/path/MCP risk detection. This function owns the orthogonal
+/// memory-shape facts: whether the request has a stable target and whether
+/// that target is too broad to remember beyond the current turn.
+#[must_use]
+pub fn scope_context_for_tool_request(
+    tool: &str,
+    args: &serde_json::Value,
+    risk_tags: Vec<RiskTag>,
+    source_agent_present: bool,
+    workspace_untrusted: bool,
+) -> ScopeAvailabilityContext {
+    let memory_profile = permission_memory_profile(tool, args);
+    let mut ctx = ScopeAvailabilityContext {
+        risk_tags,
+        source_agent_present,
+        workspace_untrusted,
+        unsafe_rule_shape: !memory_profile.has_stable_target
+            || matches!(
+                memory_profile.persistent_block,
+                Some(PersistentMemoryBlock::UnsafeRuleShape)
+            ),
+        is_compound_command: matches!(
+            memory_profile.persistent_block,
+            Some(PersistentMemoryBlock::CompoundCommand)
+        ),
+        has_dynamic_eval: matches!(
+            memory_profile.persistent_block,
+            Some(PersistentMemoryBlock::DynamicEval)
+        ),
+        ..Default::default()
+    };
+
+    if tool.starts_with("mcp_") {
+        ctx.mcp_unknown_capability = true;
+        if !ctx.risk_tags.contains(&RiskTag::MCPUnknownCapability) {
+            ctx.risk_tags.push(RiskTag::MCPUnknownCapability);
+        }
+    }
+
+    ctx
+}
+
+/// Pick the strongest safe default scope for the "Always" button.
+#[must_use]
+pub fn default_always_scope(ctx: &ScopeAvailabilityContext) -> AllowScope {
+    let scopes = permitted_scopes(ctx);
+    let is_available = |target| {
+        scopes
+            .iter()
+            .any(|entry| entry.scope == target && entry.available)
+    };
+
+    if is_available(AllowScope::Project) {
+        return AllowScope::Project;
+    }
+    if is_available(AllowScope::RestOfSession) {
+        return AllowScope::RestOfSession;
+    }
+    if is_available(AllowScope::RestOfTurn) {
+        return AllowScope::RestOfTurn;
+    }
+
+    AllowScope::OnceThisCall
 }
 
 /// Compute the scope picker state.

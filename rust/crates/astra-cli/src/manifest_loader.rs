@@ -435,10 +435,10 @@ pub fn register_manifest_tools(skills_dir: &Path, registry: &mut PluginRegistry)
 /// Best-effort skill loading from standard locations.
 ///
 /// Uses [`skill_instructions::skill_search_paths()`] for consistent directory
-/// resolution across the CLI:
-/// 1. `{cwd}/.astra/skills/`
-/// 2. `{cwd}/skills/`
-/// 3. `~/.astra/skills/`
+/// resolution across the CLI. That wrapper delegates to the shared
+/// `astra-skills` loader, so manifest tools and MCP configs see the same
+/// `.astra/skills`, Agent Skills-compatible `.claude/skills`, legacy
+/// `skills/`, and HOME global paths as the runtime skill registry.
 ///
 /// Silently skips if no skills directory exists.
 pub fn load_skills_directory(registry: &mut PluginRegistry) {

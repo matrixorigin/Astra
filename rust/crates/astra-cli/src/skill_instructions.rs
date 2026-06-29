@@ -28,9 +28,10 @@
 //!
 //! # Discovery Paths
 //!
-//! Skills are discovered from (highest priority first):
-//! 1. `{cwd}/.astra/skills/` — project-level
-//! 2. `~/.astra/skills/` — user-level global skills
+//! Skills are discovered with the shared `astra-skills` loader. That keeps
+//! legacy CLI manifest/MCP discovery aligned with the runtime skill registry:
+//! cwd walk-up `.astra/skills` and `.claude/skills`, cwd `skills/`, and user
+//! global `.astra/skills` / `.claude/skills`.
 //!
 //! # Three-Level Loading
 //!
@@ -38,30 +39,17 @@
 //! - **Level 2 (Instructions)**: Full SKILL.md content loaded on skill invocation
 //! - **Level 3 (Resources)**: Templates, scripts, references loaded on demand
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 // ── Skill Discovery Paths ─────────────────────────────────────────────────
 
 /// Standard skill directory search order (high → low priority):
 ///
-/// 1. `{cwd}/.astra/skills/`  — project-level
-/// 2. `~/.astra/skills/`      — user-level global skills
-pub fn skill_search_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::with_capacity(2);
-
-    if let Ok(cwd) = std::env::current_dir() {
-        paths.push(cwd.join(".astra").join("skills"));
-    } else {
-        paths.push(PathBuf::from(".astra/skills"));
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".astra").join("skills"));
-    }
-
-    paths
+/// Delegates to `astra_skills::loader::skill_search_paths()` so all CLI and
+/// runtime skill surfaces agree on `.astra/skills`, Agent Skills-compatible
+/// `.claude/skills`, legacy `skills/`, and HOME-level global paths.
+pub fn skill_search_paths() -> Vec<std::path::PathBuf> {
+    astra_skills::loader::skill_search_paths()
 }
 
 /// Skill instruction parsed from SKILL.md file.
@@ -196,12 +184,9 @@ mod tests {
     use super::skill_search_paths;
 
     #[test]
-    fn skill_search_paths_returns_non_empty() {
+    fn skill_search_paths_delegates_to_shared_loader() {
         let paths = skill_search_paths();
         assert!(!paths.is_empty());
-        // All paths end with .astra/skills
-        for p in &paths {
-            assert!(p.ends_with(".astra/skills"));
-        }
+        assert_eq!(paths, astra_skills::loader::skill_search_paths());
     }
 }

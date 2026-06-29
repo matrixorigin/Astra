@@ -176,15 +176,6 @@ fn approval_batch_group_key(
     )
 }
 
-fn push_risk_tag(
-    tags: &mut Vec<astra_turn_core::permission::engine::RiskTag>,
-    tag: astra_turn_core::permission::engine::RiskTag,
-) {
-    if !tags.contains(&tag) {
-        tags.push(tag);
-    }
-}
-
 fn approval_args_from_cloud_detail(tool: &str, detail: Option<&str>) -> Value {
     match (
         astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind(tool),
@@ -206,70 +197,13 @@ fn approval_scope_context_for_tool(
     source_agent_present: bool,
     workspace_untrusted: bool,
 ) -> astra_turn_core::permission::scope::ScopeAvailabilityContext {
-    use astra_turn_core::permission::engine::RiskTag;
-    use astra_turn_core::permission::memory_profile::{
-        PersistentMemoryBlock, permission_memory_profile,
-    };
-
-    let mut ctx = astra_turn_core::permission::scope::ScopeAvailabilityContext {
+    astra_turn_core::permission::scope::scope_context_for_tool_request(
+        tool,
+        args,
+        astra_turn_core::permission::engine::risk_tags_for_request(tool, args),
         source_agent_present,
         workspace_untrusted,
-        ..Default::default()
-    };
-    let memory_profile = permission_memory_profile(tool, args);
-    ctx.unsafe_rule_shape = !memory_profile.has_stable_target
-        || matches!(
-            memory_profile.persistent_block,
-            Some(PersistentMemoryBlock::UnsafeRuleShape)
-        );
-
-    let base_tag = match astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind_with_args(
-        tool,
-        Some(args),
-    ) {
-        Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Execute) => {
-            RiskTag::BashExecute
-        }
-        Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Write) => {
-            RiskTag::WritesOutsidePackage
-        }
-        _ => RiskTag::BashExecute,
-    };
-    push_risk_tag(&mut ctx.risk_tags, base_tag);
-
-    if let Some(path) = args.get("path").and_then(|v| v.as_str())
-        && astra_turn_core::permission::redact::matches_sensitive_path(path)
-    {
-        push_risk_tag(&mut ctx.risk_tags, RiskTag::WritesSensitiveFile);
-    }
-
-    if matches!(tool, "bash" | "powershell")
-        && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
-    {
-        ctx.is_compound_command = matches!(
-            memory_profile.persistent_block,
-            Some(PersistentMemoryBlock::CompoundCommand)
-        );
-        ctx.has_dynamic_eval = matches!(
-            memory_profile.persistent_block,
-            Some(PersistentMemoryBlock::DynamicEval)
-        );
-
-        if tool == "bash" && !astra_runtime::tool_sandbox::validate_git_command(cmd).is_empty() {
-            push_risk_tag(&mut ctx.risk_tags, RiskTag::GitDestructive);
-        }
-    }
-
-    // Issue #326 P5 / R2 Major 5: MCP tools without a registered
-    // ToolCapabilityMetadata default to MCPUnknownCapability. The
-    // server-annotation lookup (slash_mcp's ToolAnnotations →
-    // ApprovalMetadata) can clear this once it is wired.
-    if tool.starts_with("mcp_") {
-        ctx.mcp_unknown_capability = true;
-        push_risk_tag(&mut ctx.risk_tags, RiskTag::MCPUnknownCapability);
-    }
-
-    ctx
+    )
 }
 
 fn approval_has_stable_memory_target(tool: &str, args: &Value) -> bool {
@@ -280,26 +214,7 @@ fn approval_has_stable_memory_target(tool: &str, args: &Value) -> bool {
 fn approval_default_always_scope(
     ctx: &astra_turn_core::permission::scope::ScopeAvailabilityContext,
 ) -> astra_turn_core::permission::scope::AllowScope {
-    use astra_turn_core::permission::scope::{AllowScope, permitted_scopes};
-
-    let scopes = permitted_scopes(ctx);
-    let is_available = |target| {
-        scopes
-            .iter()
-            .any(|entry| entry.scope == target && entry.available)
-    };
-
-    if is_available(AllowScope::Project) {
-        return AllowScope::Project;
-    }
-    if is_available(AllowScope::RestOfSession) {
-        return AllowScope::RestOfSession;
-    }
-    if is_available(AllowScope::RestOfTurn) {
-        return AllowScope::RestOfTurn;
-    }
-
-    AllowScope::OnceThisCall
+    astra_turn_core::permission::scope::default_always_scope(ctx)
 }
 
 fn approval_memory_preview(tool: &str, args: &Value, scope_label: Option<&str>) -> String {

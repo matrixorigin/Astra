@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use sqlx::Row;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU32, Ordering},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -185,6 +185,74 @@ fn assert_presigned_artifact_download(
 struct RawTransportServerHits {
     stream_hits: Arc<AtomicU32>,
     nonstream_hits: Arc<AtomicU32>,
+    connectivity_probe_hits: Arc<AtomicU32>,
+    turn_intent_judge_hits: Arc<AtomicU32>,
+    primary_nonstream_fallback_hits: Arc<AtomicU32>,
+    primary_nonstream_fallback_requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl RawTransportServerHits {
+    fn new() -> Self {
+        Self {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            nonstream_hits: Arc::new(AtomicU32::new(0)),
+            connectivity_probe_hits: Arc::new(AtomicU32::new(0)),
+            turn_intent_judge_hits: Arc::new(AtomicU32::new(0)),
+            primary_nonstream_fallback_hits: Arc::new(AtomicU32::new(0)),
+            primary_nonstream_fallback_requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn record_stream(&self) {
+        self.stream_hits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_nonstream(&self, req: &str) -> u32 {
+        let previous = self.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+        if is_connectivity_probe_request(req) {
+            self.connectivity_probe_hits.fetch_add(1, Ordering::SeqCst);
+        } else if is_turn_intent_judge_request(req) {
+            self.turn_intent_judge_hits.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.primary_nonstream_fallback_hits
+                .fetch_add(1, Ordering::SeqCst);
+            self.primary_nonstream_fallback_requests
+                .lock()
+                .expect("primary nonstream fallback request log lock")
+                .push(summarize_provider_request(req));
+        }
+        previous
+    }
+
+    fn primary_nonstream_fallback_request_summary(&self) -> String {
+        let requests = self
+            .primary_nonstream_fallback_requests
+            .lock()
+            .expect("primary nonstream fallback request log lock");
+        if requests.is_empty() {
+            return "<none>".to_string();
+        }
+        requests.join(" | ")
+    }
+}
+
+fn is_connectivity_probe_request(req: &str) -> bool {
+    req.contains("\"max_tokens\":1")
+        && req.contains("\"content\":\"hi\"")
+        && !req.contains("\"stream\":true")
+}
+
+fn is_turn_intent_judge_request(req: &str) -> bool {
+    req.contains("turn intent classifier") && req.contains("continuation_mode")
+}
+
+fn summarize_provider_request(req: &str) -> String {
+    let body = req
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or(req)
+        .replace('\n', " ");
+    body.chars().take(260).collect()
 }
 
 type StreamIdleEnvGuard = astra_runtime::turn::stream_idle_test_hooks::StreamIdleTimeoutGuard;
@@ -224,6 +292,19 @@ fn assert_nonstream_hits_in_range(actual: u32, min: u32, max: u32, message: &str
     );
 }
 
+fn assert_no_primary_nonstream_fallback(hits: &RawTransportServerHits, message: &str) {
+    let actual = hits.primary_nonstream_fallback_hits.load(Ordering::SeqCst);
+    assert_eq!(
+        actual,
+        0,
+        "{message}: expected 0 primary non-stream fallback hits, got {actual}; total_nonstream={}, connectivity_probes={}, turn_intent_judges={}; fallback_requests={}",
+        hits.nonstream_hits.load(Ordering::SeqCst),
+        hits.connectivity_probe_hits.load(Ordering::SeqCst),
+        hits.turn_intent_judge_hits.load(Ordering::SeqCst),
+        hits.primary_nonstream_fallback_request_summary()
+    );
+}
+
 async fn spawn_raw_partial_transport_server(
     partial_text: &str,
     fallback_status: u16,
@@ -233,10 +314,7 @@ async fn spawn_raw_partial_transport_server(
         .await
         .expect("bind raw mock llm listener");
     let addr = listener.local_addr().expect("raw local_addr");
-    let hits = RawTransportServerHits {
-        stream_hits: Arc::new(AtomicU32::new(0)),
-        nonstream_hits: Arc::new(AtomicU32::new(0)),
-    };
+    let hits = RawTransportServerHits::new();
     let hits_task = hits.clone();
     let partial_text = partial_text.to_string();
     tokio::spawn(async move {
@@ -250,7 +328,7 @@ async fn spawn_raw_partial_transport_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.stream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_stream();
                     let partial = format!(
                         "data: {}\n\n",
                         json!({"choices":[{"delta":{"content": partial_text}}]})
@@ -265,7 +343,7 @@ async fn spawn_raw_partial_transport_server(
                         .expect("write partial stream response");
                     let _ = socket.shutdown().await;
                 } else {
-                    let nonstream_ix = hits.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let nonstream_ix = hits.record_nonstream(&req);
                     let (status, body) = if nonstream_ix == 0 {
                         (
                             200,
@@ -306,10 +384,7 @@ async fn spawn_raw_idle_after_progress_server(
         .await
         .expect("bind idle mock llm listener");
     let addr = listener.local_addr().expect("idle local_addr");
-    let hits = RawTransportServerHits {
-        stream_hits: Arc::new(AtomicU32::new(0)),
-        nonstream_hits: Arc::new(AtomicU32::new(0)),
-    };
+    let hits = RawTransportServerHits::new();
     let hits_task = hits.clone();
     let partial_text = partial_text.to_string();
     tokio::spawn(async move {
@@ -323,7 +398,7 @@ async fn spawn_raw_idle_after_progress_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.stream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_stream();
                     let partial = format!(
                         "data: {}\n\n",
                         json!({"choices":[{"delta":{"content": partial_text}}]})
@@ -339,7 +414,7 @@ async fn spawn_raw_idle_after_progress_server(
                     tokio::time::sleep(stall_for).await;
                     let _ = socket.shutdown().await;
                 } else {
-                    let nonstream_ix = hits.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let nonstream_ix = hits.record_nonstream(&req);
                     let (status, body) = if nonstream_ix == 0 {
                         (
                             200,
@@ -378,10 +453,7 @@ async fn spawn_raw_stream_rate_limit_server(
         .await
         .expect("bind rate-limit mock llm listener");
     let addr = listener.local_addr().expect("rate-limit local_addr");
-    let hits = RawTransportServerHits {
-        stream_hits: Arc::new(AtomicU32::new(0)),
-        nonstream_hits: Arc::new(AtomicU32::new(0)),
-    };
+    let hits = RawTransportServerHits::new();
     let hits_task = hits.clone();
     tokio::spawn(async move {
         loop {
@@ -393,7 +465,7 @@ async fn spawn_raw_stream_rate_limit_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.stream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_stream();
                     let retry_after_header = retry_after
                         .map(|value| format!("Retry-After: {value}\r\n"))
                         .unwrap_or_default();
@@ -407,7 +479,7 @@ async fn spawn_raw_stream_rate_limit_server(
                         .expect("write rate-limit stream response");
                     let _ = socket.shutdown().await;
                 } else {
-                    hits.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_nonstream(&req);
                     let body = r#"{"choices":[{"message":{"content":"probe ok"}}]}"#;
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -435,10 +507,7 @@ async fn spawn_raw_stream_rate_limit_then_sse_server(
     let addr = listener
         .local_addr()
         .expect("rate-limit recovery local_addr");
-    let hits = RawTransportServerHits {
-        stream_hits: Arc::new(AtomicU32::new(0)),
-        nonstream_hits: Arc::new(AtomicU32::new(0)),
-    };
+    let hits = RawTransportServerHits::new();
     let hits_task = hits.clone();
     let success_text = success_text.to_string();
     tokio::spawn(async move {
@@ -474,7 +543,7 @@ async fn spawn_raw_stream_rate_limit_then_sse_server(
                         .expect("write rate-limit recovery stream response");
                     let _ = socket.shutdown().await;
                 } else {
-                    hits.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_nonstream(&req);
                     let body = r#"{"choices":[{"message":{"content":"probe ok"}}]}"#;
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -500,10 +569,7 @@ async fn spawn_raw_tool_call_block_parse_recovery_server() -> (String, RawTransp
     let addr = listener
         .local_addr()
         .expect("tool-call block-parse local_addr");
-    let hits = RawTransportServerHits {
-        stream_hits: Arc::new(AtomicU32::new(0)),
-        nonstream_hits: Arc::new(AtomicU32::new(0)),
-    };
+    let hits = RawTransportServerHits::new();
     let hits_task = hits.clone();
     tokio::spawn(async move {
         loop {
@@ -515,7 +581,7 @@ async fn spawn_raw_tool_call_block_parse_recovery_server() -> (String, RawTransp
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.stream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_stream();
                     let part1 = json!({
                         "choices": [{
                             "delta": {
@@ -556,7 +622,7 @@ async fn spawn_raw_tool_call_block_parse_recovery_server() -> (String, RawTransp
                         .expect("write tool-call block-parse stream response");
                     let _ = socket.shutdown().await;
                 } else {
-                    hits.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_nonstream(&req);
                     let body = json!({
                         "choices": [{
                             "message": {
@@ -601,10 +667,7 @@ async fn spawn_raw_server_loop_block_parse_recovery_server(
     let addr = listener
         .local_addr()
         .expect("server-loop block-parse recovery local_addr");
-    let hits = RawTransportServerHits {
-        stream_hits: Arc::new(AtomicU32::new(0)),
-        nonstream_hits: Arc::new(AtomicU32::new(0)),
-    };
+    let hits = RawTransportServerHits::new();
     let hits_task = hits.clone();
     let partial_text = partial_text.to_string();
     let recovered_text = recovered_text.to_string();
@@ -620,7 +683,7 @@ async fn spawn_raw_server_loop_block_parse_recovery_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.stream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_stream();
                     let partial = json!({"choices":[{"delta":{"content": partial_text}}]});
                     let body = format!("data: {partial}\n\ndata: not-json\n\n");
                     let response = format!(
@@ -633,7 +696,7 @@ async fn spawn_raw_server_loop_block_parse_recovery_server(
                         .expect("write server-loop block-parse stream response");
                     let _ = socket.shutdown().await;
                 } else {
-                    hits.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_nonstream(&req);
                     let body = json!({
                         "choices": [{
                             "message": { "content": recovered_text },
@@ -668,10 +731,7 @@ async fn spawn_raw_server_loop_block_parse_failure_server(
     let addr = listener
         .local_addr()
         .expect("server-loop block-parse failure local_addr");
-    let hits = RawTransportServerHits {
-        stream_hits: Arc::new(AtomicU32::new(0)),
-        nonstream_hits: Arc::new(AtomicU32::new(0)),
-    };
+    let hits = RawTransportServerHits::new();
     let hits_task = hits.clone();
     let partial_text = partial_text.to_string();
     tokio::spawn(async move {
@@ -685,7 +745,7 @@ async fn spawn_raw_server_loop_block_parse_failure_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.stream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_stream();
                     let partial = json!({"choices":[{"delta":{"content": partial_text}}]});
                     let body = format!("data: {partial}\n\ndata: not-json\n\n");
                     let response = format!(
@@ -698,7 +758,7 @@ async fn spawn_raw_server_loop_block_parse_failure_server(
                         .expect("write server-loop block-parse failure stream response");
                     let _ = socket.shutdown().await;
                 } else {
-                    hits.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_nonstream(&req);
                     let body = "fallback exploded";
                     let response = format!(
                         "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -722,10 +782,7 @@ async fn spawn_raw_hanging_stream_server(partial_text: &str) -> (String, RawTran
         .await
         .expect("bind hanging mock llm listener");
     let addr = listener.local_addr().expect("hanging local_addr");
-    let hits = RawTransportServerHits {
-        stream_hits: Arc::new(AtomicU32::new(0)),
-        nonstream_hits: Arc::new(AtomicU32::new(0)),
-    };
+    let hits = RawTransportServerHits::new();
     let hits_task = hits.clone();
     let partial_text = partial_text.to_string();
     tokio::spawn(async move {
@@ -739,7 +796,7 @@ async fn spawn_raw_hanging_stream_server(partial_text: &str) -> (String, RawTran
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
-                    hits.stream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_stream();
                     let partial = format!(
                         "data: {}\n\n",
                         json!({"choices":[{"delta":{"content": partial_text}}]})
@@ -755,7 +812,7 @@ async fn spawn_raw_hanging_stream_server(partial_text: &str) -> (String, RawTran
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     let _ = socket.shutdown().await;
                 } else {
-                    hits.nonstream_hits.fetch_add(1, Ordering::SeqCst);
+                    hits.record_nonstream(&req);
                     let body = r#"{"choices":[{"message":{"content":"probe ok"}}]}"#;
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2816,11 +2873,9 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         4,
         "expected one initial stream attempt plus three retries before failure"
     );
-    assert_nonstream_hits_in_range(
-        hits.nonstream_hits.load(Ordering::SeqCst),
-        0,
-        1,
-        "repeated stream 429s plus cooldown reject should not issue a non-stream fallback beyond any optional connectivity probe",
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "repeated stream 429s plus cooldown reject should not issue a non-stream fallback",
     );
 
     let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
@@ -2946,11 +3001,9 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
         2,
         "expected one 429 stream attempt and one successful retry stream"
     );
-    assert_nonstream_hits_in_range(
-        hits.nonstream_hits.load(Ordering::SeqCst),
-        0,
-        1,
-        "successful stream retry should not require a non-stream fallback beyond any optional connectivity probe",
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "successful stream retry should not require a non-stream fallback",
     );
 
     let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
@@ -3706,11 +3759,9 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
         4,
         "expected one initial stream attempt plus three retries before failure"
     );
-    assert_nonstream_hits_in_range(
-        hits.nonstream_hits.load(Ordering::SeqCst),
-        0,
-        1,
-        "repeated stream 429s plus cooldown reject should not issue a non-stream fallback beyond any optional connectivity probe",
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "repeated stream 429s plus cooldown reject should not issue a non-stream fallback",
     );
 
     let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
@@ -3836,11 +3887,9 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
         2,
         "expected one 429 stream attempt and one successful retry stream"
     );
-    assert_nonstream_hits_in_range(
-        hits.nonstream_hits.load(Ordering::SeqCst),
-        0,
-        1,
-        "successful stream retry should not require a non-stream fallback beyond any optional connectivity probe",
+    assert_no_primary_nonstream_fallback(
+        &hits,
+        "successful stream retry should not require a non-stream fallback",
     );
 
     let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")

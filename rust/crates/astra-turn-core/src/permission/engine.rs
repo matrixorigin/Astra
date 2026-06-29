@@ -1593,7 +1593,8 @@ fn push_unique_fingerprint(
     }
 }
 
-fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
+#[must_use]
+pub fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
     let mut tags = Vec::new();
     let has_git_safety_violation = !git_safety_violations_for_request(tool_name, args).is_empty();
     if tool_name.starts_with("sandbox_expand:") {
@@ -1609,7 +1610,9 @@ fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
         Some(CloudGatedToolKind::Write) if sensitive_path_match(tool_name, args).is_some() => {
             push_risk_tag(&mut tags, RiskTag::WritesSensitiveFile);
         }
-        Some(CloudGatedToolKind::Write) => {}
+        Some(CloudGatedToolKind::Write) => {
+            push_risk_tag(&mut tags, RiskTag::WritesOutsidePackage);
+        }
         None => {}
     }
     if has_git_safety_violation {
