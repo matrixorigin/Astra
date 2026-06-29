@@ -2426,23 +2426,48 @@ impl CliSseStreamHost<'_> {
         } else {
             "Cloud approval required before this tool can run.".to_string()
         };
-        if tx
-            .send(chat_stream::ApprovalRequest::bare(
+        let approval_args = approval_args_from_cloud_detail(tool, detail);
+        let workspace_untrusted = self
+            .perm_manager
+            .as_ref()
+            .is_some_and(|pm| !pm.project_allow_rules_active());
+        let scope_ctx =
+            approval_scope_context_for_tool(tool, &approval_args, false, workspace_untrusted);
+        let always_scope = approval_default_always_scope(&scope_ctx);
+        let mut metadata = crate::tui::approval::queue::ApprovalMetadata::default();
+        metadata.request_key = Some(
+            astra_turn_core::approval_request_key::ApprovalRequestKey::new(
                 tool.to_string(),
-                header,
-                display_label.or(detail).map(ToString::to_string),
-                reason,
-                // Cloud approvals are launched without structured
-                // args in scope (the cloud server already validated
-                // the call). Re-evaluation after a mode pivot will
-                // see Value::Null and fall through unchanged, which
-                // is correct: cloud approvals are bound to the
-                // cloud's own gate, not the local mode.
-                serde_json::Value::Null,
-                resp_tx,
-            ))
-            .is_err()
-        {
+                std::env::current_dir().unwrap_or_default(),
+                &approval_args,
+                None,
+                uuid::Uuid::nil(),
+            ),
+        );
+        metadata.risk_tags = scope_ctx.risk_tags.clone();
+        metadata.workspace_untrusted = scope_ctx.workspace_untrusted;
+        metadata.is_compound_command = scope_ctx.is_compound_command;
+        metadata.has_dynamic_eval = scope_ctx.has_dynamic_eval;
+        metadata.unsafe_rule_shape = scope_ctx.unsafe_rule_shape;
+        metadata.batch_group_key = Some(approval_batch_group_key(
+            tool,
+            &approval_args,
+            &metadata.risk_tags,
+        ));
+        if always_scope == astra_turn_core::permission::scope::AllowScope::Project {
+            metadata.remember_preview = Some(approval_memory_preview(tool, &approval_args, None));
+        }
+
+        let mut request = chat_stream::ApprovalRequest::bare(
+            tool.to_string(),
+            header,
+            display_label.or(detail).map(ToString::to_string),
+            reason,
+            approval_args.clone(),
+            resp_tx,
+        );
+        request.metadata = Some(Box::new(metadata));
+        if tx.send(request).is_err() {
             astra_core::agent_warn!(
                 "permission",
                 "Auto-denied cloud approval for {tool}: TUI approval sink is closed"
@@ -2460,19 +2485,8 @@ impl CliSseStreamHost<'_> {
             resp_rx.await.unwrap_or(ApprovalResponse::Deny)
         };
 
-        let explicit = matches!(approval_kind, astra_thin_client::ApprovalKind::Explicit);
-        let approval_args = approval_args_from_cloud_detail(tool, detail);
-        let always_scope = approval_default_always_scope(&approval_scope_context_for_tool(
-            tool,
-            &approval_args,
-            false,
-            false,
-        ));
         match response {
             ApprovalResponse::AllowOnce => ApprovalDecision::Allow,
-            // Explicit cloud approvals are confirm-once by contract,
-            // so treat Always as AllowOnce for this prompt kind.
-            ApprovalResponse::AlwaysAllow if explicit => ApprovalDecision::Allow,
             ApprovalResponse::AlwaysAllow => {
                 let action = approval_memory_action(&response, always_scope, true);
                 let save_warning_tx = self.stream_event_tx.clone();
@@ -7281,6 +7295,11 @@ mod tests {
             );
             let responder = async {
                 let request = approval_rx.recv().await.expect("approval request");
+                assert_eq!(
+                    request.args["path"].as_str(),
+                    Some("src/main.rs"),
+                    "cloud approval card should carry command args for re-evaluation"
+                );
                 request
                     .response_tx
                     .send(chat_stream::ApprovalResponse::AlwaysAllow)
@@ -7346,6 +7365,18 @@ mod tests {
             );
             let responder = async {
                 let request = approval_rx.recv().await.expect("approval request");
+                assert_eq!(
+                    request.args["path"].as_str(),
+                    Some(".env"),
+                    "cloud approval card should carry command args for re-evaluation"
+                );
+                let metadata = request.metadata.as_ref().expect("approval metadata");
+                assert!(
+                    metadata.risk_tags.contains(
+                        &astra_turn_core::permission::engine::RiskTag::WritesSensitiveFile
+                    ),
+                    "cloud approval card should carry sensitive-path risk metadata"
+                );
                 request
                     .response_tx
                     .send(chat_stream::ApprovalResponse::AlwaysAllow)
@@ -7368,6 +7399,99 @@ mod tests {
             reloaded.check_nonblocking("write_file", &args),
             crate::cli::permission_manager::GateOutcome::NeedApproval { .. }
         ));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn explicit_cloud_approval_always_git_destructive_is_session_only() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::unbounded_channel::<chat_stream::ApprovalRequest>();
+        let command = "git restore --staged --worktree rust/crates/foo/src/lib.rs";
+
+        let decision = {
+            let mut host = CliSseStreamHost::from_edge_ctx(
+                EdgeSseContext {
+                    api: &api,
+                    token: "tok",
+                    executor_id: "edge-test",
+                    executor,
+                    render_policy: RenderPolicy::Stream,
+                    perm_manager: Some(&mut pm),
+                    cancel_token: None,
+                    stream_event_tx: None,
+                    stream_event_sink: None,
+                    approval_request_tx: Some(approval_tx),
+                    ask_user_request_tx: None,
+                    skill_resolver: None,
+                    skill_continuation: false,
+                    turn_rollback_on_failure: false,
+                    tool_cache: &mut tool_cache,
+                    observability_hub: None,
+                    incremental_state: None,
+                },
+                80,
+                false,
+            );
+            let decision_fut = host.resolve_cloud_approval_via_tui(
+                "bash",
+                Some(command),
+                None,
+                astra_thin_client::ApprovalKind::Explicit,
+            );
+            let responder = async {
+                let request = approval_rx.recv().await.expect("approval request");
+                assert_eq!(
+                    request.args["command"].as_str(),
+                    Some(command),
+                    "cloud approval card should carry command args for re-evaluation"
+                );
+                let metadata = request.metadata.as_ref().expect("approval metadata");
+                assert!(
+                    metadata
+                        .risk_tags
+                        .contains(&astra_turn_core::permission::engine::RiskTag::GitDestructive),
+                    "cloud approval card should carry git-destructive risk metadata"
+                );
+                request
+                    .response_tx
+                    .send(chat_stream::ApprovalResponse::AlwaysAllow)
+                    .expect("send response");
+            };
+            let (decision, ()) = tokio::join!(decision_fut, responder);
+            decision
+        };
+
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
+        assert_eq!(
+            pm.preflight_cloud_approval_decision(
+                "bash",
+                Some(command),
+                astra_thin_client::ApprovalKind::Explicit,
+                false,
+            ),
+            Some(astra_thin_client::ApprovalDecision::Allow),
+            "same-session explicit git Always should avoid re-prompting"
+        );
+
+        let mut reloaded =
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+        assert_eq!(
+            reloaded.preflight_cloud_approval_decision(
+                "bash",
+                Some(command),
+                astra_thin_client::ApprovalKind::Explicit,
+                false,
+            ),
+            None,
+            "explicit git Always must not persist across restarts"
+        );
     }
 
     #[serial_test::serial]

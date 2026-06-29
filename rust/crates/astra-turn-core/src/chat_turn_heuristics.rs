@@ -57,6 +57,37 @@ const MUTATING_TERMS: &[&str] = &[
     "修正",
 ];
 
+const EXPLICIT_MUTATION_DIRECTIVE_TERMS: &[&str] = &[
+    "fix",
+    "fix issues",
+    "fix failures",
+    "implement",
+    "write",
+    "edit",
+    "update code",
+    "create",
+    "add ",
+    "remove",
+    "delete",
+    "patch",
+    "refactor",
+    "apply",
+    "cleanup",
+    "clean up",
+    "修改代码",
+    "修改文件",
+    "重构",
+    "实现",
+    "新增",
+    "删除",
+    "更新代码",
+    "更新文件",
+    "修复",
+    "修正",
+    "清理",
+    "合理采纳",
+];
+
 const ANALYSIS_TERMS: &[&str] = &[
     "review",
     "code review",
@@ -204,6 +235,8 @@ fn contains_any_keyword(q: &str, keywords: &[&str]) -> bool {
 pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
     let q = input.to_lowercase();
     let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
+    let has_explicit_mutation_directive =
+        contains_any_keyword(&q, EXPLICIT_MUTATION_DIRECTIVE_TERMS);
     let has_analysis = contains_any_keyword(&q, ANALYSIS_TERMS);
     let exploratory = contains_any_keyword(&q, EXPLORATION_TERMS);
     let complexity = if contains_any_keyword(&q, COMPLEXITY_TERMS) {
@@ -221,10 +254,12 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
     } else {
         DEFAULT_STALL_WINDOW
     };
-    // When both mutating and analysis terms are present, analysis wins —
-    // the user is asking to *review/inspect* something that involves changes,
-    // not asking to *make* changes. E.g. "评审当前修改" = review changes.
-    if has_mutating && !has_analysis {
+    // When both mutating and analysis terms are present, an explicit mutation
+    // directive wins ("review and fix", "评审并修复", "清理过时测试"). Otherwise
+    // analysis wins for object descriptions such as "评审当前修改" / "review
+    // current changes".
+    let should_mutate = has_explicit_mutation_directive || has_mutating && !has_analysis;
+    if should_mutate {
         TaskExecutionProfile {
             mutates_workspace: true,
             verification_required: true,
@@ -245,18 +280,6 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
             complexity,
             exploratory_task: exploratory,
             agentic_turn_budget: default_agentic_turn_budget(false, exploratory, complexity),
-        }
-    } else if has_mutating {
-        // Mutating without analysis context
-        TaskExecutionProfile {
-            mutates_workspace: true,
-            verification_required: true,
-            allow_factual_retry: false,
-            exploration_round_window,
-            stall_window,
-            complexity,
-            exploratory_task: exploratory,
-            agentic_turn_budget: default_agentic_turn_budget(true, exploratory, complexity),
         }
     } else {
         TaskExecutionProfile {
@@ -353,12 +376,9 @@ pub fn looks_like_mutating_task(input: &str) -> bool {
     let q = input.to_lowercase();
     let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
     let has_read_only = contains_any_keyword(&q, ANALYSIS_TERMS);
-    // Analysis context overrides mutating terms — user is reviewing/inspecting
-    // something that involves changes, not requesting changes themselves.
-    if has_read_only {
-        return false;
-    }
-    has_mutating
+    let has_explicit_mutation_directive =
+        contains_any_keyword(&q, EXPLICIT_MUTATION_DIRECTIVE_TERMS);
+    has_explicit_mutation_directive || has_mutating && !has_read_only
 }
 
 pub fn should_force_factual_tool_retry(
@@ -509,10 +529,6 @@ mod tests {
             "what changed in the latest commit?"
         ));
         assert!(!looks_like_mutating_task("explain this diff"));
-        // Analysis context overrides even when mutating terms are present
-        assert!(!looks_like_mutating_task(
-            "review the latest commit and fix any issues"
-        ));
         assert!(!looks_like_mutating_task("评审当前修改"));
         assert!(!looks_like_mutating_task("审查修改"));
         assert!(!looks_like_mutating_task("看一下修改"));
@@ -520,6 +536,16 @@ mod tests {
         assert!(looks_like_mutating_task("implement the feature"));
         assert!(looks_like_mutating_task("fix the bug"));
         assert!(looks_like_mutating_task("修复这个问题"));
+        // Mixed review + explicit mutation should still get a mutating profile.
+        assert!(looks_like_mutating_task(
+            "review the latest commit and fix any issues"
+        ));
+        assert!(looks_like_mutating_task(
+            "review the current changes and fix any issues"
+        ));
+        assert!(looks_like_mutating_task(
+            "多角度review这个分支changes，清理过时测试"
+        ));
     }
 
     #[test]
@@ -595,9 +621,16 @@ mod tests {
     }
 
     #[test]
-    fn analysis_wins_over_mutating_when_both_present() {
-        // "review and fix" → analysis wins (user is reviewing, not just fixing)
+    fn explicit_mutation_wins_over_analysis_when_both_present() {
+        // "review and fix" is a mixed request: inspect first, then mutate.
         let profile = infer_task_execution_profile("review the code and fix issues");
+        assert!(profile.verification_required);
+        assert!(profile.mutates_workspace);
+        let profile = infer_task_execution_profile("多角度review这个分支changes，清理过时测试");
+        assert!(profile.verification_required);
+        assert!(profile.mutates_workspace);
+        // Describing changes as the object of review remains read-only.
+        let profile = infer_task_execution_profile("review current changes");
         assert!(!profile.verification_required);
         // Pure mutating still works
         let profile = infer_task_execution_profile("fix the compilation error");

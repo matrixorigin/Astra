@@ -1067,7 +1067,7 @@ pub(crate) async fn run_tui_session(
                                     chat_widget.commit_system(
                                         crate::tui::history_cell::system::SystemCell::response(
                                             format!(
-                                                "  ✓ {released} pending approval(s) auto-resolved by the new mode",
+                                                "  ✓ {released} pending approval(s) resolved by the new mode",
                                             ),
                                         ),
                                     );
@@ -1786,7 +1786,7 @@ pub(crate) async fn run_tui_session(
                                                                     chat_widget.commit_system(
                                                                         history_cell::system::SystemCell::response(
                                                                             format!(
-                                                                                "  ✓ {released} pending approval(s) auto-resolved by the new mode",
+                                                                                "  ✓ {released} pending approval(s) resolved by the new mode",
                                                                             ),
                                                                         ),
                                                                     );
@@ -3566,15 +3566,15 @@ pub(crate) async fn run_tui_session(
                     // pull_mode_from_mirror after exit_plan_mode
                     // overlay or mid-turn Shift+Tab). Re-evaluate
                     // the approval queue against the new mode so
-                    // any pending entries the new mode would
-                    // auto-approve are released — same machinery
+                    // any pending entries the new mode can resolve
+                    // are released — same machinery
                     // the keystroke paths use.
                     let released = bottom_pane.reevaluate_approvals_for_mode(live_mode_enum);
                     if released > 0 {
                         chat_widget.commit_system(
                             crate::tui::history_cell::system::SystemCell::response(
                                 format!(
-                                    "  ✓ {released} pending approval(s) auto-resolved by the new mode",
+                                    "  ✓ {released} pending approval(s) resolved by the new mode",
                                 ),
                             ),
                         );

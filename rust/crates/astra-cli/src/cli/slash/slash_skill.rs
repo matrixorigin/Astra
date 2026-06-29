@@ -618,7 +618,7 @@ Follow these steps:
                         eprintln!(
                             "{}",
                             format!(
-                                "  \u{2717} Skill directory not found for '{name}' (searched .astra/skills, skills/, ~/.astra/skills)"
+                                "  \u{2717} Skill directory not found for '{name}' (searched .astra/skills, .claude/skills, skills/, ~/.astra/skills, ~/.claude/skills)"
                             )
                             .yellow()
                         );
@@ -723,7 +723,8 @@ Follow these steps:
                 }
                 return Ok(());
             }
-            // Search all skill paths (project .astra/skills/, skills/, ~/.astra/skills/)
+            // Search all shared loader paths: project .astra/.claude skills,
+            // cwd skills/, and user-level .astra/.claude skills.
             let search_paths = crate::skill_instructions::skill_search_paths();
             let found = search_paths.iter().find_map(|base| {
                 let dir = base.join(name);
@@ -829,14 +830,14 @@ Follow these steps:
             if !api_ok {
                 eprintln!(
                     "  {}",
-                    "Local view: unified catalog + on-disk paths (.astra/skills, skills/, ~/.astra/skills)."
+                    "Local view: unified catalog + on-disk paths (.astra/skills, .claude/skills, skills/, ~/.astra/skills, ~/.claude/skills)."
                         .dim()
                 );
                 let registry = &state.unified_skill_registry;
                 let mut manifests = registry.all_manifests();
                 if manifests.is_empty() {
                     eprintln!("  {}", "No skills discovered in catalog.".dim());
-                    eprintln!("  {}", "Use /skill new <name> to create one, or add SKILL.md files to .astra/skills/.".dim());
+                    eprintln!("  {}", "Use /skill new <name> to create one, or add SKILL.md files to .astra/skills/ or .claude/skills/.".dim());
                     eprintln!();
                     return Ok(());
                 }
@@ -1315,7 +1316,8 @@ fn parse_skill_info_args(sub_arg: &str) -> (String, bool) {
     (s.to_string(), false)
 }
 
-/// Same resolution order as `/skill dev`: `.astra/skills`, `skills/`, `~/.astra/skills`.
+/// Same resolution order as `/skill dev`: shared loader paths for project,
+/// legacy cwd, and user-level skills.
 fn resolve_skill_dir_on_disk(name: &str) -> Option<std::path::PathBuf> {
     crate::skill_instructions::skill_search_paths()
         .into_iter()

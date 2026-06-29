@@ -327,20 +327,6 @@ impl PendingApproval {
     }
 
     fn always_action_disabled(&self) -> bool {
-        use astra_turn_core::permission::engine::RiskTag;
-
-        if self.source_agent.is_some()
-            || self.is_compound_command
-            || self.has_dynamic_eval
-            || self.unsafe_rule_shape
-            || self.risk_tags.contains(&RiskTag::WritesSensitiveFile)
-            || self.risk_tags.contains(&RiskTag::WritesOutsideWorkspace)
-            || self.risk_tags.contains(&RiskTag::CredentialAccess)
-            || self.risk_tags.contains(&RiskTag::MCPUnknownCapability)
-        {
-            return true;
-        }
-
         [
             AllowScope::RestOfSession,
             AllowScope::Project,
@@ -505,17 +491,32 @@ impl ApprovalQueue {
     where
         F: FnMut(&PendingApproval) -> bool,
     {
+        self.drain_resolved(|entry| {
+            (!still_needs_approval(entry)).then_some(ApprovalResponse::AllowOnce)
+        })
+    }
+
+    /// Drain entries whose request is resolved by a policy change and send the
+    /// corresponding response to all waiters.
+    ///
+    /// Unlike [`drain_now_allowed`], this can resolve to Deny as well as Allow.
+    /// Mode-pivot re-evaluation must preserve that distinction: a request that
+    /// becomes a hard deny under the new mode must not be released as AllowOnce.
+    pub fn drain_resolved<F>(&mut self, mut resolve: F) -> usize
+    where
+        F: FnMut(&PendingApproval) -> Option<ApprovalResponse>,
+    {
         let mut released = 0usize;
         let mut idx = 0usize;
         while idx < self.entries.len() {
-            if still_needs_approval(&self.entries[idx]) {
+            let Some(response) = resolve(&self.entries[idx]) else {
                 idx += 1;
                 continue;
-            }
-            // Take this entry out and broadcast Allow to its waiters.
+            };
+            // Take this entry out and broadcast the policy response to its waiters.
             let mut entry = self.entries.remove(idx).expect("index in range");
             for tx in entry.response_txs.drain(..) {
-                let _ = tx.send(ApprovalResponse::AllowOnce);
+                let _ = tx.send(response.clone());
             }
             released += 1;
             // Don't advance idx: the next entry slid into this slot.
@@ -1385,6 +1386,38 @@ mod tests {
     }
 
     #[test]
+    fn focused_button_action_allows_always_for_sensitive_path_session_only() {
+        use astra_turn_core::permission::engine::RiskTag;
+
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "write_file".into(),
+            ".env".into(),
+            None,
+            "sensitive file".into(),
+            serde_json::json!({"path": ".env", "content": "TOKEN=1"}),
+            tx,
+            ApprovalMetadata::default().with_risk_tags(vec![RiskTag::WritesSensitiveFile]),
+        );
+
+        q.focused_button_move_right();
+        assert_eq!(
+            q.focused_button_action(),
+            Some(super::super::button_row::ButtonAction::Respond(
+                ApprovalResponse::AlwaysAllow
+            )),
+            "sensitive-path requests should keep don't-ask-again available as a session-only override"
+        );
+
+        let view = q.focused_view().expect("pending approval");
+        assert_eq!(
+            view.selection_hint.as_deref(),
+            Some("Don't ask again stays session-only for this request.")
+        );
+    }
+
+    #[test]
     fn focused_button_action_blocks_always_for_unsafe_rule_shape() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
@@ -1571,6 +1604,30 @@ mod tests {
         assert_eq!(
             rx_b.try_recv().unwrap(),
             crate::cli::chat_stream::ApprovalResponse::AllowOnce,
+        );
+    }
+
+    #[test]
+    fn drain_resolved_can_broadcast_deny_instead_of_allowing() {
+        let mut q = ApprovalQueue::new();
+        let (tx, mut rx) = oneshot::channel();
+        q.push(
+            "bash".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            serde_json::Value::Null,
+            tx,
+        );
+
+        let released = q.drain_resolved(|_| Some(crate::cli::chat_stream::ApprovalResponse::Deny));
+
+        assert_eq!(released, 1);
+        assert_eq!(q.len(), 0);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::cli::chat_stream::ApprovalResponse::Deny,
+            "mode pivots must preserve hard denials instead of converting them to AllowOnce",
         );
     }
 }

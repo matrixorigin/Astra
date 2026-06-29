@@ -14,7 +14,7 @@ use astra_turn_core::cloud_approval_policy::{
     cloud_gated_tool_kind_with_args,
 };
 use astra_turn_core::permission::engine::{
-    DecisionEnvelope, DecisionSource, HardDecision, allow_rule_preview,
+    DecisionEnvelope, DecisionSource, HardDecision, RiskTag, allow_rule_preview,
     allow_rule_preview_for_match_target,
 };
 use astra_turn_core::permission::match_target::{
@@ -150,17 +150,32 @@ fn persist_permission_mode_to_workspace(session_id: &str, mode: PermissionMode) 
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloudAlwaysSessionOnlyReason {
+    SensitivePath,
+    BoundedRisk,
+}
+
 fn cloud_always_feedback_message(
     remember_preview: &str,
     workspace_persistence_available: bool,
     persist_error: Option<&str>,
-    sensitive_path: bool,
+    session_only_reason: Option<CloudAlwaysSessionOnlyReason>,
 ) -> String {
-    if sensitive_path {
-        return format!(
-            "  ✓ {remember_preview}: allowed for this session only. \
+    match session_only_reason {
+        Some(CloudAlwaysSessionOnlyReason::SensitivePath) => {
+            return format!(
+                "  ✓ {remember_preview}: allowed for this session only. \
 To auto-allow sensitive paths across sessions, set allow_sensitive_path_writes=true in .astra/permissions.json."
-        );
+            );
+        }
+        Some(CloudAlwaysSessionOnlyReason::BoundedRisk) => {
+            return format!(
+                "  ✓ {remember_preview}: allowed for this session only. \
+This request cannot be remembered safely across sessions."
+            );
+        }
+        None => {}
     }
     if let Some(err) = persist_error {
         return format!(
@@ -2597,7 +2612,7 @@ impl PermissionManager {
                             &remember_preview,
                             true,
                             persist_error.as_deref(),
-                            false,
+                            None,
                         );
                         if persist_error.is_some() {
                             eprintln!("{}", feedback.yellow());
@@ -2624,7 +2639,7 @@ impl PermissionManager {
                             &remember_preview,
                             true,
                             persist_error.as_deref(),
-                            false,
+                            None,
                         );
                         if persist_error.is_some() {
                             eprintln!("{}", feedback.yellow());
@@ -2635,19 +2650,41 @@ impl PermissionManager {
                     }
                     astra_turn_core::permission::scope::AllowScope::RestOfSession => {
                         self.session_overrides.insert(fp, true);
+                        let session_only_reason =
+                            if envelope.risk_tags.contains(&RiskTag::WritesSensitiveFile) {
+                                CloudAlwaysSessionOnlyReason::SensitivePath
+                            } else {
+                                CloudAlwaysSessionOnlyReason::BoundedRisk
+                            };
                         eprintln!(
                             "{}",
-                            cloud_always_feedback_message(&remember_preview, false, None, true)
-                                .dim()
+                            cloud_always_feedback_message(
+                                &remember_preview,
+                                false,
+                                None,
+                                Some(session_only_reason),
+                            )
+                            .dim()
                         );
                         return ApprovalDecision::AllowSession;
                     }
                     astra_turn_core::permission::scope::AllowScope::RestOfTurn => {
                         self.turn_overrides.insert(fp, true);
+                        let session_only_reason =
+                            if envelope.risk_tags.contains(&RiskTag::WritesSensitiveFile) {
+                                CloudAlwaysSessionOnlyReason::SensitivePath
+                            } else {
+                                CloudAlwaysSessionOnlyReason::BoundedRisk
+                            };
                         eprintln!(
                             "{}",
-                            cloud_always_feedback_message(&remember_preview, false, None, true)
-                                .dim()
+                            cloud_always_feedback_message(
+                                &remember_preview,
+                                false,
+                                None,
+                                Some(session_only_reason),
+                            )
+                            .dim()
                         );
                         return ApprovalDecision::Allow;
                     }
@@ -3267,7 +3304,7 @@ impl PermissionManager {
                     &remember_preview,
                     self.project_root.is_some(),
                     persist_error.as_deref(),
-                    false,
+                    None,
                 );
                 if persist_error.is_some() {
                     eprintln!("{}", feedback.yellow());
@@ -3717,9 +3754,9 @@ fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPromptKind, ExecuteDecision, GateOutcome, ModifyError, PermissionLoadPolicy,
-        PermissionManager, PermissionMode, PermissionRule, PermissionSettings,
-        PermissionSettingsLoadError, SideEffect, cloud_always_feedback_message,
+        ApprovalPromptKind, CloudAlwaysSessionOnlyReason, ExecuteDecision, GateOutcome,
+        ModifyError, PermissionLoadPolicy, PermissionManager, PermissionMode, PermissionRule,
+        PermissionSettings, PermissionSettingsLoadError, SideEffect, cloud_always_feedback_message,
         content_aware_fingerprint, decode_mode_for_mirror, encode_mode_for_mirror,
         format_denied_message, is_read_only_allowlisted, parse_sandbox_target_path,
         safe_alternative_for,
@@ -3798,8 +3835,12 @@ mod tests {
 
     #[test]
     fn cloud_always_feedback_message_explains_sensitive_path_session_only() {
-        let out =
-            cloud_always_feedback_message("this file edit in this workspace", true, None, true);
+        let out = cloud_always_feedback_message(
+            "this file edit in this workspace",
+            true,
+            None,
+            Some(CloudAlwaysSessionOnlyReason::SensitivePath),
+        );
         assert!(
             out.contains("session only"),
             "missing session-only hint: {out}"
@@ -3811,12 +3852,34 @@ mod tests {
     }
 
     #[test]
+    fn cloud_always_feedback_message_explains_bounded_risk_without_sensitive_path_guidance() {
+        let out = cloud_always_feedback_message(
+            "this git command in this session",
+            false,
+            None,
+            Some(CloudAlwaysSessionOnlyReason::BoundedRisk),
+        );
+        assert!(
+            out.contains("session only"),
+            "missing session-only hint: {out}"
+        );
+        assert!(
+            out.contains("cannot be remembered safely across sessions"),
+            "missing bounded-risk persistence explanation: {out}"
+        );
+        assert!(
+            !out.contains("allow_sensitive_path_writes"),
+            "git/destructive session-only prompt must not mention sensitive path config: {out}"
+        );
+    }
+
+    #[test]
     fn cloud_always_feedback_message_uses_command_family_language() {
         let out = cloud_always_feedback_message(
             "the `cargo test` command family in this workspace",
             true,
             None,
-            false,
+            None,
         );
         assert_eq!(
             out,
@@ -3831,7 +3894,7 @@ mod tests {
             "the `cargo test` command family in this session",
             false,
             None,
-            false,
+            None,
         );
         assert_eq!(
             out,

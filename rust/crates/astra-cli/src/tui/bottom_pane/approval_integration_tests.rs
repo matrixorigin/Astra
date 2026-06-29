@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 
 use super::{ApprovalActivation, BottomPane, BottomPaneAction};
 use crate::cli::chat_stream::ApprovalResponse;
+use crate::cli::permission_manager::PermissionMode;
 use crate::tui::approval::queue::ApprovalMetadata;
 use crate::tui::slash_menu::SlashItem;
 
@@ -243,6 +244,27 @@ fn enter_with_text_in_composer_submits_instead_of_approving() {
         }
         other => panic!("expected SubmitInput, got {other:?}"),
     }
+}
+
+#[test]
+fn mode_pivot_to_deny_resolves_pending_write_as_deny() {
+    let mut bp = BottomPane::new();
+    let (tx, rx) = oneshot::channel();
+    bp.enqueue_approval(
+        "write_file".into(),
+        "write_file needs approval".into(),
+        None,
+        "write".into(),
+        serde_json::json!({"path": "src/lib.rs", "content": "updated"}),
+        tx,
+    );
+
+    let resolved = bp.reevaluate_approvals_for_mode(PermissionMode::Deny);
+
+    assert_eq!(resolved, 1);
+    assert_eq!(bp.footer.pending_approvals, 0);
+    assert!(!bp.has_pending_approvals());
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
 }
 
 #[test]

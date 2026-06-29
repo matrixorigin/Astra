@@ -536,38 +536,36 @@ impl BottomPane {
         id
     }
 
-    /// Re-evaluate every pending approval against `new_mode` and
-    /// auto-approve the ones the new mode would not gate. Used when
-    /// the user pivots permission modes (Shift+Tab, `/permissions`,
-    /// or the `exit_plan_mode` overlay) so the approval queue does
-    /// not lag behind the chip.
+    /// Re-evaluate every pending approval against `new_mode` and resolve the
+    /// ones the new mode can decide without asking. Used when the user pivots
+    /// permission modes (Shift+Tab, `/permissions`, or the `exit_plan_mode`
+    /// overlay) so the approval queue does not lag behind the chip.
     ///
-    /// Returns the number of entries auto-approved. Footer counter
-    /// is refreshed so the chip reads the new pending count.
+    /// Returns the number of entries resolved. Footer counter is refreshed so
+    /// the chip reads the new pending count.
     pub fn reevaluate_approvals_for_mode(
         &mut self,
         new_mode: crate::cli::permission_manager::PermissionMode,
     ) -> usize {
+        use crate::cli::chat_stream::ApprovalResponse;
         use astra_turn_core::permission::engine::{HardDecision, evaluate_permission};
         use astra_turn_core::permission::types::{InheritedPermissions, PermissionSyncContext};
 
         let ctx = PermissionSyncContext::new(InheritedPermissions::new(new_mode));
-        let released = self.approval_queue.drain_now_allowed(|entry| {
-            // Cloud / sandbox-expand entries arrive without args
-            // (Value::Null). We can't safely re-evaluate those —
-            // the cloud path owns its own gate — so leave them in
-            // the queue and let the user resolve them explicitly.
+        let released = self.approval_queue.drain_resolved(|entry| {
+            // Legacy cloud / sandbox-expand entries can arrive
+            // without args (Value::Null). We can't safely
+            // re-evaluate those, so leave them in the queue and let
+            // the original gate resolve them explicitly.
             if entry.args.is_null() {
-                return true;
+                return None;
             }
             let envelope = evaluate_permission(&entry.tool, &entry.args, &ctx);
-            // Keep the entry only if the new mode still needs an
-            // external approval. Allow / Deny outcomes mean "no
-            // user-facing prompt is required any more"; they are
-            // dropped from the queue (Deny is the rarer path —
-            // historically the approval card stayed open even for
-            // a guaranteed-deny call which was just noise).
-            matches!(envelope.decision, HardDecision::NeedExternal { .. })
+            match envelope.decision {
+                HardDecision::Allow => Some(ApprovalResponse::AllowOnce),
+                HardDecision::Deny { .. } => Some(ApprovalResponse::Deny),
+                HardDecision::NeedExternal { .. } => None,
+            }
         });
         self.footer.pending_approvals = self.approval_queue.len();
         released
