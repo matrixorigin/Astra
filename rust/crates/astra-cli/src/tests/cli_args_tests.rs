@@ -443,6 +443,7 @@ fn cli_permissions_subcommand() {
         ("accept_edits", |s| {
             matches!(s, PermissionsSubcommand::AcceptEdits)
         }),
+        ("bypass", |s| matches!(s, PermissionsSubcommand::Bypass)),
         ("plan", |s| matches!(s, PermissionsSubcommand::Plan)),
     ];
     for (mode, check) in cases {

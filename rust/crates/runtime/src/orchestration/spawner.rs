@@ -399,7 +399,7 @@ pub enum WaitForAgentOutcome {
 /// Permission summary for display purposes.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionSummary {
-    /// Permission mode (auto, plan, accept_edits, prompt, deny).
+    /// Permission mode (auto, bypass, plan, accept_edits, prompt, deny).
     pub mode: String,
     /// Number of explicit allow rules.
     pub allow_rules: u32,

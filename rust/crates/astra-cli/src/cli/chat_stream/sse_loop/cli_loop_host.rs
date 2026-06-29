@@ -207,16 +207,19 @@ fn derive_turn_interaction_mode(
         return TurnInteractionMode::NonInteractive;
     }
 
+    // Auto-resolving modes are the user's explicit opt-in to "run
+    // uninterrupted" — they stay Auto regardless of stdin /
+    // approval-channel / silent render. All of those signals only
+    // matter for Prompt (which needs stdin to ask the user), and
+    // auto-resolving modes already short-circuit prompts anyway.
+    // Regression for session c6e18730 where piped or silent contexts
+    // silently demoted Auto → NonInteractive, which disabled the
+    // nudge-suppression gate the user opted into.
+    if permission_mode.auto_resolves_approval_prompts() {
+        return TurnInteractionMode::Auto;
+    }
+
     match permission_mode {
-        // Auto is the user's explicit opt-in to "run uninterrupted" —
-        // it stays Auto regardless of stdin/approval-channel/silent
-        // render. All of those signals only matter for Prompt (which
-        // needs stdin to ask the user), and Auto already short-circuits
-        // prompts anyway. Regression for session c6e18730 where piped
-        // or silent contexts silently demoted Auto → NonInteractive,
-        // which in turn disabled the nudge-suppression gate the user
-        // opted into.
-        PermissionMode::Auto | PermissionMode::Bypass => TurnInteractionMode::Auto,
         PermissionMode::Plan => {
             if has_approval_request_tx || render_is_silent || !stdin_is_terminal {
                 TurnInteractionMode::NonInteractive
@@ -260,6 +263,7 @@ fn derive_turn_interaction_mode(
                 TurnInteractionMode::Deny
             }
         }
+        mode => unreachable!("auto-resolving permission mode returned before match: {mode:?}"),
     }
 }
 

@@ -118,19 +118,20 @@ asynchronously.
 
 ## Permission modes
 
-Five permission modes exist underneath. The TUI cycles through four of
+Six permission modes exist underneath. The TUI cycles through five of
 them; `Deny` is reserved for headless / CI use and never appears in the
 Shift+Tab cycle to prevent accidental entry.
 
 | Permission mode (enum) | TUI label    | Cycle position | Behaviour                                          |
 |------------------------|--------------|----------------|----------------------------------------------------|
 | `Prompt`               | **Default**  | 1              | Each write/execute tool prompts the user           |
-| `Auto`                 | **Auto**     | 2              | Everything auto-approved                           |
-| `AcceptEdits`          | **Edit**     | 3              | Workspace edits auto-approved; shell still prompts |
-| `Plan`                 | **Plan**     | 4              | Read-only schema + exit_plan_mode                  |
+| `AcceptEdits`          | **Edit**     | 2              | Workspace edits auto-approved; shell still prompts |
+| `Plan`                 | **Plan**     | 3              | Read-only schema + exit_plan_mode                  |
+| `Auto`                 | **Auto**     | 4              | Normal tool risk auto-approved; hard prompts may remain |
+| `Bypass`               | **Bypass**   | 5              | Approval prompts skipped; hard denies still apply  |
 | `Deny`                 | (hidden)     | —              | All tools denied (CI / harness only)               |
 
-`Shift+Tab` cycles `Default → Auto → Edit → Plan → Default`.
+`Shift+Tab` cycles `Default → Edit → Plan → Auto → Bypass → Default`.
 
 ## Invariants
 

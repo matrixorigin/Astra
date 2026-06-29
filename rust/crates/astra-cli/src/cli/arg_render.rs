@@ -137,6 +137,7 @@ pub(crate) fn render_permissions_args(args: &PermissionsArgs) -> String {
     match &args.command {
         None => String::new(),
         Some(PermissionsSubcommand::Auto) => "auto".to_string(),
+        Some(PermissionsSubcommand::Bypass) => "bypass".to_string(),
         Some(PermissionsSubcommand::AcceptEdits) => "accept_edits".to_string(),
         Some(PermissionsSubcommand::Plan) => "plan".to_string(),
         Some(PermissionsSubcommand::Prompt) => "prompt".to_string(),
@@ -257,6 +258,14 @@ mod arg_render_tests {
             command: Some(PermissionsSubcommand::Untrust),
         };
         assert_eq!(render_permissions_args(&untrust), "untrust");
+    }
+
+    #[test]
+    fn permissions_bypass_renders_mode_arg() {
+        let args = PermissionsArgs {
+            command: Some(PermissionsSubcommand::Bypass),
+        };
+        assert_eq!(render_permissions_args(&args), "bypass");
     }
 
     #[test]

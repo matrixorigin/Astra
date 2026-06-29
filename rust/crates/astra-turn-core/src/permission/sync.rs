@@ -291,12 +291,35 @@ impl PermissionRequestHandler {
         }
 
         // Check mode
-        match ctx.mode() {
-            PermissionMode::Auto | PermissionMode::Bypass => {
-                // Auto/Bypass approve at this layer. Bypass-immune safety guards
-                // (catastrophic-command circuit breaker, sensitive-path
-                // checks) live earlier in the pipeline; by the time we reach
-                // permission_sync those have already had their say.
+        let mode = ctx.mode();
+        if mode.auto_resolves_approval_prompts() {
+            // Auto/Bypass approve at this layer. Bypass-immune safety guards
+            // (catastrophic-command circuit breaker, sensitive-path
+            // checks) live earlier in the pipeline; by the time we reach
+            // permission_sync those have already had their say.
+            let response = if let Some(ref rule_str) = request.suggested_rule {
+                PermissionResponse::approve()
+                    .with_update(PermissionUpdate::allow(PermissionRule::parse(rule_str)))
+            } else {
+                PermissionResponse::approve()
+            };
+
+            // Apply updates to our context
+            drop(ctx);
+            if !response.updates.is_empty() {
+                let mut ctx_mut = self.sync_context.write().await;
+                ctx_mut.apply_response(&response);
+            }
+
+            return response;
+        }
+
+        let manual_policy = mode
+            .manual_approval_policy()
+            .expect("auto-resolving permission modes returned before mode match");
+
+        match manual_policy {
+            ManualApprovalPolicy::AcceptEdits if accept_edits_auto_allows_request(request) => {
                 let response = if let Some(ref rule_str) = request.suggested_rule {
                     PermissionResponse::approve()
                         .with_update(PermissionUpdate::allow(PermissionRule::parse(rule_str)))
@@ -304,7 +327,6 @@ impl PermissionRequestHandler {
                     PermissionResponse::approve()
                 };
 
-                // Apply updates to our context
                 drop(ctx);
                 if !response.updates.is_empty() {
                     let mut ctx_mut = self.sync_context.write().await;
@@ -313,27 +335,11 @@ impl PermissionRequestHandler {
 
                 response
             }
-            PermissionMode::AcceptEdits if accept_edits_auto_allows_request(request) => {
-                let response = if let Some(ref rule_str) = request.suggested_rule {
-                    PermissionResponse::approve()
-                        .with_update(PermissionUpdate::allow(PermissionRule::parse(rule_str)))
-                } else {
-                    PermissionResponse::approve()
-                };
-
-                drop(ctx);
-                if !response.updates.is_empty() {
-                    let mut ctx_mut = self.sync_context.write().await;
-                    ctx_mut.apply_response(&response);
-                }
-
-                response
-            }
-            PermissionMode::Deny => {
+            ManualApprovalPolicy::Deny => {
                 // Deny mode: reject without escalation
                 PermissionResponse::deny("permission mode is deny")
             }
-            PermissionMode::Plan => {
+            ManualApprovalPolicy::Plan => {
                 if crate::tool::schema::prune::PLAN_MODE_REQUIRED_TOOLS
                     .contains(&request.tool_name.as_str())
                 {
@@ -344,7 +350,7 @@ impl PermissionRequestHandler {
                     ))
                 }
             }
-            PermissionMode::AcceptEdits | PermissionMode::Prompt => {
+            ManualApprovalPolicy::AcceptEdits | ManualApprovalPolicy::Prompt => {
                 // Prompt mode: use callback or default logic
                 drop(ctx);
 

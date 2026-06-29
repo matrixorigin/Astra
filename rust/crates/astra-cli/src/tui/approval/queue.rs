@@ -351,17 +351,20 @@ impl PendingApproval {
     }
 
     fn always_uses_session_fallback(&self) -> bool {
-        self.workspace_untrusted
-            && !self.always_action_disabled()
+        !self.always_action_disabled()
             && !self.scope_available(AllowScope::Project)
+            && self.scope_available(AllowScope::RestOfSession)
     }
 
     fn selection_hint(&self) -> Option<String> {
         if self.always_uses_session_fallback() {
-            return Some(
-                "Don't ask again stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
-                    .to_string(),
-            );
+            if self.workspace_untrusted {
+                return Some(
+                    "Don't ask again stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
+                        .to_string(),
+                );
+            }
+            return Some("Don't ask again stays session-only for this request.".to_string());
         }
         None
     }
@@ -1352,6 +1355,32 @@ mod tests {
                 ApprovalResponse::AlwaysAllow
             )),
             "bounded git requests should keep don't-ask-again available"
+        );
+    }
+
+    #[test]
+    fn bounded_git_destructive_always_is_session_only_in_view() {
+        use astra_turn_core::permission::engine::RiskTag;
+
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "git restore --staged --worktree rust/crates/foo/src/lib.rs".into(),
+            None,
+            "git destructive".into(),
+            serde_json::json!({
+                "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
+            }),
+            tx,
+            ApprovalMetadata::default()
+                .with_risk_tags(vec![RiskTag::BashExecute, RiskTag::GitDestructive]),
+        );
+
+        let view = q.focused_view().expect("pending approval");
+        assert_eq!(
+            view.selection_hint.as_deref(),
+            Some("Don't ask again stays session-only for this request.")
         );
     }
 

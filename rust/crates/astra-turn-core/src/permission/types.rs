@@ -38,7 +38,74 @@ pub enum PermissionMode {
     Deny,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ManualApprovalPolicy {
+    Plan,
+    AcceptEdits,
+    Prompt,
+    Deny,
+}
+
 impl PermissionMode {
+    /// True when ordinary approval prompts should be skipped.
+    ///
+    /// This is the approval-interaction axis, not the safety-policy axis:
+    /// hard denies and explicit deny/allowlist policy can still apply.
+    pub fn auto_resolves_approval_prompts(self) -> bool {
+        matches!(self, Self::Auto | Self::Bypass)
+    }
+
+    /// True for the explicit "do not interrupt me for approval" mode.
+    pub fn skips_human_approval_prompts(self) -> bool {
+        matches!(self, Self::Bypass)
+    }
+
+    /// True when soft, noisy shell-obfuscation guards are treated as advisory.
+    pub fn relaxes_soft_shell_obfuscation(self) -> bool {
+        matches!(self, Self::Auto | Self::Bypass)
+    }
+
+    /// True when soft git policy findings may be auto-allowed.
+    pub fn auto_allows_soft_git_policy(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn manual_approval_policy(self) -> Option<ManualApprovalPolicy> {
+        match self {
+            Self::Auto => None,
+            Self::Bypass => None,
+            Self::Plan => Some(ManualApprovalPolicy::Plan),
+            Self::AcceptEdits => Some(ManualApprovalPolicy::AcceptEdits),
+            Self::Prompt => Some(ManualApprovalPolicy::Prompt),
+            Self::Deny => Some(ManualApprovalPolicy::Deny),
+        }
+    }
+
+    /// Stable compact encoding used by CLI/TUI atomic mirrors.
+    pub fn mirror_code(self) -> u8 {
+        match self {
+            Self::Prompt => 0,
+            Self::Auto => 1,
+            Self::Plan => 2,
+            Self::AcceptEdits => 3,
+            Self::Deny => 4,
+            Self::Bypass => 5,
+        }
+    }
+
+    /// Decode the compact CLI/TUI mirror encoding. Unknown values fail closed
+    /// to Prompt rather than inheriting an accidentally permissive mode.
+    pub fn from_mirror_code(value: u8) -> Self {
+        match value {
+            1 => Self::Auto,
+            2 => Self::Plan,
+            3 => Self::AcceptEdits,
+            4 => Self::Deny,
+            5 => Self::Bypass,
+            _ => Self::Prompt,
+        }
+    }
+
     /// Human label for the status-line mode chip.
     pub fn chip_text(self) -> &'static str {
         match self {
@@ -1199,6 +1266,54 @@ mod tests {
         assert_eq!(
             "skip".parse::<PermissionMode>().unwrap(),
             PermissionMode::Bypass
+        );
+    }
+
+    #[test]
+    fn permission_mode_policy_helpers_are_explicit_axes() {
+        assert!(PermissionMode::Auto.auto_resolves_approval_prompts());
+        assert!(PermissionMode::Bypass.auto_resolves_approval_prompts());
+        assert!(!PermissionMode::Auto.skips_human_approval_prompts());
+        assert!(PermissionMode::Bypass.skips_human_approval_prompts());
+        assert!(PermissionMode::Auto.auto_allows_soft_git_policy());
+        assert!(!PermissionMode::Bypass.auto_allows_soft_git_policy());
+        assert!(!PermissionMode::Prompt.auto_resolves_approval_prompts());
+
+        assert_eq!(PermissionMode::Auto.manual_approval_policy(), None);
+        assert_eq!(PermissionMode::Bypass.manual_approval_policy(), None);
+        assert_eq!(
+            PermissionMode::Plan.manual_approval_policy(),
+            Some(ManualApprovalPolicy::Plan)
+        );
+        assert_eq!(
+            PermissionMode::AcceptEdits.manual_approval_policy(),
+            Some(ManualApprovalPolicy::AcceptEdits)
+        );
+        assert_eq!(
+            PermissionMode::Prompt.manual_approval_policy(),
+            Some(ManualApprovalPolicy::Prompt)
+        );
+        assert_eq!(
+            PermissionMode::Deny.manual_approval_policy(),
+            Some(ManualApprovalPolicy::Deny)
+        );
+    }
+
+    #[test]
+    fn permission_mode_mirror_code_roundtrip() {
+        for mode in [
+            PermissionMode::Prompt,
+            PermissionMode::Auto,
+            PermissionMode::Bypass,
+            PermissionMode::Plan,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Deny,
+        ] {
+            assert_eq!(PermissionMode::from_mirror_code(mode.mirror_code()), mode);
+        }
+        assert_eq!(
+            PermissionMode::from_mirror_code(u8::MAX),
+            PermissionMode::Prompt
         );
     }
 

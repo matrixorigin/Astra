@@ -523,8 +523,9 @@ Set permission mode for tool execution.
 
 | Mode                                     | Description                   |
 | ---------------------------------------- | ----------------------------- |
-| `auto`                                   | Auto-approve all tool use     |
+| `auto`                                   | Auto-approve normal tool risk |
 | `all`                                    | Alias for auto                |
+| `bypass` / `skip`                        | Skip approval prompts; hard denies still apply |
 | `plan`                                   | Read-only investigation mode  |
 | `accept_edits` / `accept-edits` / `edit` | Auto-approve local file edits |
 | `prompt`                                 | Prompt before each tool       |
@@ -532,7 +533,8 @@ Set permission mode for tool execution.
 | `rules`                                  | Show current permission rules |
 
 ```
-/allow auto      # Trust all tools
+/allow auto      # Auto-approve normal tool risk
+/allow bypass    # Skip approval prompts
 /allow prompt    # Ask before each
 /allow rules     # Show rules
 ```

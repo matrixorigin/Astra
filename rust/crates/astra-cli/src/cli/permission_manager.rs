@@ -483,11 +483,8 @@ fn stored_override_allows_sensitive_path(
         return false;
     };
 
-    if stored.path_match == astra_turn_core::approval_fingerprint::PathMatchKind::Exact {
-        return true;
-    }
-
-    sensitive_path_match(&serde_json::json!({ "path": path })).is_some()
+    sensitive_path_match_for_request(&stored.tool_name, &serde_json::json!({ "path": path }))
+        .is_some()
 }
 
 fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
@@ -513,32 +510,18 @@ fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -
 // `GateOutcome` because its shape (Allow / Deny / NeedApproval) is
 // genuinely different from turn-core's callback decision type
 // (Approve / Deny / Escalate).
-pub(crate) use astra_turn_core::permission::types::PermissionMode;
 pub(crate) use astra_turn_core::permission::types::PermissionRule;
+pub(crate) use astra_turn_core::permission::types::{ManualApprovalPolicy, PermissionMode};
 
 /// Atomic encoding of [`PermissionMode`] for the lock-free mirror
 /// the TUI inner-tick path consumes. Keeps the mapping local and
 /// stable; widening the enum requires updating both directions.
 fn encode_mode_for_mirror(mode: PermissionMode) -> u8 {
-    match mode {
-        PermissionMode::Prompt => 0,
-        PermissionMode::Auto => 1,
-        PermissionMode::Plan => 2,
-        PermissionMode::AcceptEdits => 3,
-        PermissionMode::Deny => 4,
-        PermissionMode::Bypass => 5,
-    }
+    mode.mirror_code()
 }
 
 fn decode_mode_for_mirror(value: u8) -> PermissionMode {
-    match value {
-        1 => PermissionMode::Auto,
-        2 => PermissionMode::Plan,
-        3 => PermissionMode::AcceptEdits,
-        4 => PermissionMode::Deny,
-        5 => PermissionMode::Bypass,
-        _ => PermissionMode::Prompt,
-    }
+    PermissionMode::from_mirror_code(value)
 }
 
 /// Read-only handle to the live permission mode held by a
@@ -2115,7 +2098,7 @@ impl PermissionManager {
             if matches!(self.mode, PermissionMode::Plan | PermissionMode::Deny) {
                 return Some(ApprovalDecision::Deny);
             }
-            if self.mode == PermissionMode::Bypass {
+            if self.mode.skips_human_approval_prompts() {
                 return Some(ApprovalDecision::Allow);
             }
             if self.mode == PermissionMode::Auto {
@@ -2137,39 +2120,59 @@ impl PermissionManager {
         }
 
         if quiet {
-            return Some(match self.mode {
-                PermissionMode::Auto | PermissionMode::Bypass => ApprovalDecision::Allow,
-                PermissionMode::Plan => ApprovalDecision::Deny,
-                PermissionMode::AcceptEdits
+            if self.mode.auto_resolves_approval_prompts() {
+                return Some(ApprovalDecision::Allow);
+            }
+            let manual_policy = self
+                .mode
+                .manual_approval_policy()
+                .expect("auto-resolving permission modes returned before quiet match");
+            return Some(match manual_policy {
+                ManualApprovalPolicy::Plan => ApprovalDecision::Deny,
+                ManualApprovalPolicy::AcceptEdits
                     if accept_edits_auto_allows_cloud_request(tool, detail) =>
                 {
                     ApprovalDecision::Allow
                 }
-                PermissionMode::AcceptEdits | PermissionMode::Prompt | PermissionMode::Deny => {
-                    ApprovalDecision::Deny
-                }
+                ManualApprovalPolicy::AcceptEdits
+                | ManualApprovalPolicy::Prompt
+                | ManualApprovalPolicy::Deny => ApprovalDecision::Deny,
             });
         }
 
         if Self::cloud_approval_is_explicit(approval_kind) {
-            return match self.mode {
-                PermissionMode::Auto | PermissionMode::Bypass => Some(ApprovalDecision::Allow),
-                PermissionMode::Plan => Some(ApprovalDecision::Deny),
-                PermissionMode::AcceptEdits => None,
-                PermissionMode::Deny => Some(ApprovalDecision::Deny),
-                PermissionMode::Prompt => None,
+            if self.mode.auto_resolves_approval_prompts() {
+                return Some(ApprovalDecision::Allow);
+            }
+            let manual_policy = self
+                .mode
+                .manual_approval_policy()
+                .expect("auto-resolving permission modes returned before explicit match");
+            return match manual_policy {
+                ManualApprovalPolicy::Plan => Some(ApprovalDecision::Deny),
+                ManualApprovalPolicy::AcceptEdits => None,
+                ManualApprovalPolicy::Deny => Some(ApprovalDecision::Deny),
+                ManualApprovalPolicy::Prompt => None,
             };
         }
 
-        match self.mode {
-            PermissionMode::Auto | PermissionMode::Bypass => return Some(ApprovalDecision::Allow),
-            PermissionMode::Plan => return Some(ApprovalDecision::Deny),
-            PermissionMode::AcceptEdits if accept_edits_auto_allows_cloud_request(tool, detail) => {
+        if self.mode.auto_resolves_approval_prompts() {
+            return Some(ApprovalDecision::Allow);
+        }
+        let manual_policy = self
+            .mode
+            .manual_approval_policy()
+            .expect("auto-resolving permission modes returned before standard match");
+        match manual_policy {
+            ManualApprovalPolicy::Plan => return Some(ApprovalDecision::Deny),
+            ManualApprovalPolicy::AcceptEdits
+                if accept_edits_auto_allows_cloud_request(tool, detail) =>
+            {
                 return Some(ApprovalDecision::Allow);
             }
-            PermissionMode::Deny => return Some(ApprovalDecision::Deny),
-            PermissionMode::Prompt => {}
-            PermissionMode::AcceptEdits => {}
+            ManualApprovalPolicy::Deny => return Some(ApprovalDecision::Deny),
+            ManualApprovalPolicy::Prompt => {}
+            ManualApprovalPolicy::AcceptEdits => {}
         }
 
         // Standard-kind: consult the denial tracker. The session
@@ -2996,7 +2999,7 @@ impl PermissionManager {
                     eprintln!("  {}", "  Git safety violation — blocked".red());
                     return false;
                 }
-                if self.mode == PermissionMode::Bypass {
+                if self.mode.skips_human_approval_prompts() {
                     return true;
                 }
                 // Soft-only violations: respect auto mode and session overrides.
@@ -3033,7 +3036,7 @@ impl PermissionManager {
                 eprintln!("  {}", "  Sensitive path — blocked".red());
                 return false;
             }
-            if self.mode == PermissionMode::Bypass {
+            if self.mode.skips_human_approval_prompts() {
                 return true;
             }
             if self.mode == PermissionMode::Auto {
@@ -3103,22 +3106,28 @@ impl PermissionManager {
         }
 
         // Step 7: Permission mode determines final action.
-        match self.mode {
-            PermissionMode::Auto | PermissionMode::Bypass => return true,
-            PermissionMode::Plan => {
+        if self.mode.auto_resolves_approval_prompts() {
+            return true;
+        }
+        let manual_policy = self
+            .mode
+            .manual_approval_policy()
+            .expect("auto-resolving permission modes returned before final match");
+        match manual_policy {
+            ManualApprovalPolicy::Plan => {
                 let (header, _) = Self::format_tool_display(name, args);
                 eprintln!("  {}", format!("  ✗ {header} — blocked").red());
                 return false;
             }
-            PermissionMode::AcceptEdits if accept_edits_auto_allows_tool_args(name, args) => {
+            ManualApprovalPolicy::AcceptEdits if accept_edits_auto_allows_tool_args(name, args) => {
                 return true;
             }
-            PermissionMode::Deny => {
+            ManualApprovalPolicy::Deny => {
                 let (header, _) = Self::format_tool_display(name, args);
                 eprintln!("  {}", format!("  ✗ {header} — blocked").red());
                 return false;
             }
-            PermissionMode::AcceptEdits | PermissionMode::Prompt => {}
+            ManualApprovalPolicy::AcceptEdits | ManualApprovalPolicy::Prompt => {}
         }
 
         let (header, detail) = Self::format_tool_display(name, args);
@@ -3270,7 +3279,7 @@ impl PermissionManager {
                     GateOutcome::Deny("Sensitive path denied for session".into())
                 };
             }
-            if self.mode == PermissionMode::Bypass {
+            if self.mode.skips_human_approval_prompts() {
                 return GateOutcome::Allow;
             }
             if self.mode == PermissionMode::Auto
@@ -5579,6 +5588,31 @@ mod tests {
         assert!(
             matches!(decision, GateOutcome::Allow),
             "content-specific sensitive path approval should be honored: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn exact_session_override_uses_path_sensitivity_policy() {
+        use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
+
+        let safe_exact = ApprovalFingerprint::file_op_exact("file_write", Some("src/lib.rs"));
+        assert!(
+            !super::stored_override_allows_sensitive_path(&safe_exact),
+            "exact non-sensitive path approval must not be treated as a sensitive-path override"
+        );
+
+        let skill_exact =
+            ApprovalFingerprint::file_op_exact("file_write", Some(".astra/skills/rust/SKILL.md"));
+        assert!(
+            !super::stored_override_allows_sensitive_path(&skill_exact),
+            "skill content is intentionally normal file content, not sensitive app state"
+        );
+
+        let sensitive_exact =
+            ApprovalFingerprint::file_op_exact("file_write", Some(".astra/config.toml"));
+        assert!(
+            super::stored_override_allows_sensitive_path(&sensitive_exact),
+            "exact sensitive path approval should remain content-specific and reusable"
         );
     }
 

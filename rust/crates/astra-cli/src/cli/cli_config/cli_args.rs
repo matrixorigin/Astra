@@ -721,7 +721,7 @@ pub(crate) struct GrepPatternArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra permissions rules\n  astra permissions auto\n  astra permissions plan\n  astra permissions accept_edits\n  astra permissions prompt\n  astra permissions trust\n  astra permissions trace"
+    after_help = "Examples:\n  astra permissions rules\n  astra permissions auto\n  astra permissions bypass\n  astra permissions plan\n  astra permissions accept_edits\n  astra permissions prompt\n  astra permissions trust\n  astra permissions trace"
 )]
 pub(crate) struct PermissionsArgs {
     #[command(subcommand)]
@@ -732,6 +732,8 @@ pub(crate) struct PermissionsArgs {
 pub(crate) enum PermissionsSubcommand {
     /// Auto-approve allowed tool calls
     Auto,
+    /// Skip approval prompts; hard denies still apply
+    Bypass,
     /// Auto-approve workspace-local edits while still prompting for shell and external writes
     #[command(name = "accept_edits")]
     AcceptEdits,
