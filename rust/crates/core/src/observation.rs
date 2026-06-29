@@ -136,6 +136,10 @@ fn is_workspace_mutation_tool(tool_name: &str, family: ToolFamily) -> bool {
     }
 }
 
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 impl TurnMetrics {
     /// Build metrics from lightweight `ToolCallSample` records.
     pub fn from_samples(
@@ -181,7 +185,7 @@ impl TurnMetrics {
                                     1,
                                     sample
                                         .error
-                                        .map(|e| e[..e.len().min(200)].to_string())
+                                        .map(|e| truncate_chars(e, 200))
                                         .unwrap_or_default(),
                                 ),
                             );
@@ -190,7 +194,7 @@ impl TurnMetrics {
                         // Different tool failed — start new streak for this tool
                         let first_err = sample
                             .error
-                            .map(|e| e[..e.len().min(200)].to_string())
+                            .map(|e| truncate_chars(e, 200))
                             .unwrap_or_default();
                         streak_map.insert(lower.clone(), (1, first_err));
                     }
@@ -198,7 +202,7 @@ impl TurnMetrics {
                     // First failure in turn
                     let first_err = sample
                         .error
-                        .map(|e| e[..e.len().min(200)].to_string())
+                        .map(|e| truncate_chars(e, 200))
                         .unwrap_or_default();
                     streak_map.insert(lower.clone(), (1, first_err));
                 }
@@ -1298,6 +1302,25 @@ mod tests {
         let metrics = TurnMetrics::from_samples(&samples, 2, 100);
         assert_eq!(metrics.mutation_count, 2);
         assert_eq!(metrics.rounds_since_last_mutation, 0);
+    }
+
+    #[test]
+    fn error_streak_preview_truncates_on_utf8_char_boundary() {
+        let error = format!("{}⚠ task returned an error", "x".repeat(199));
+        let samples = [ToolCallSample {
+            name: "task.create",
+            ok: false,
+            round: Some(1),
+            file_path: None,
+            error: Some(&error),
+        }];
+
+        let metrics = TurnMetrics::from_samples(&samples, 1, 100);
+
+        assert_eq!(metrics.error_streaks.len(), 1);
+        let first_error = &metrics.error_streaks[0].first_error;
+        assert_eq!(first_error.chars().count(), 200);
+        assert!(first_error.ends_with('⚠'));
     }
 
     #[test]
