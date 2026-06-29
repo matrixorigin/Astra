@@ -1405,10 +1405,7 @@ fn execute_hard_deny_reason(tool_name: &str, args: &Value) -> Option<String> {
     }
     let command = command_hint_from_args(args)?;
     let lower = command.to_ascii_lowercase();
-    if ["rm -rf /", "rm -fr /", ":(){ :|:& };:", "chmod 777 /"]
-        .iter()
-        .any(|p| lower.contains(p))
-    {
+    if crate::safety_middleware::absolute_dangerous_command_reason(command).is_some() {
         return Some("Dangerous command refused".to_string());
     }
     if lower.contains("shred ") || lower.contains("wipefs") {
@@ -2146,6 +2143,82 @@ mod tests {
         assert!(matches!(
             envelope.source,
             DecisionSource::SafetyMiddleware { .. }
+        ));
+    }
+
+    #[test]
+    fn evaluate_non_catastrophic_rm_requires_approval_not_hard_deny() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "rm -rf /tmp/foo"}),
+            &ctx,
+        );
+
+        assert!(
+            matches!(envelope.decision, HardDecision::NeedExternal { .. }),
+            "bounded destructive rm should be reviewable, got {:?}",
+            envelope.decision
+        );
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::ExplicitApprovalGate { .. }
+        ));
+    }
+
+    #[test]
+    fn evaluate_sudo_root_rm_stays_hard_denied_without_tmp_overmatch() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        let root = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "SUDO -n rm -rf /"}),
+            &ctx,
+        );
+        assert!(
+            matches!(root.decision, HardDecision::Deny { .. }),
+            "sudo root rm must be hard denied even through wrapper options, got {:?}",
+            root.decision
+        );
+
+        let tmp = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "sudo rm -rf /tmp/foo"}),
+            &ctx,
+        );
+        assert!(
+            matches!(tmp.decision, HardDecision::NeedExternal { .. }),
+            "sudo rm under /tmp should be reviewable, got {:?}",
+            tmp.decision
+        );
+        assert!(matches!(
+            tmp.source,
+            DecisionSource::ExplicitApprovalGate { .. }
+        ));
+    }
+
+    #[test]
+    fn execute_hard_deny_root_chmod_does_not_overmatch_tmp_paths() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "chmod 777 /tmp/foo"}),
+            &ctx,
+        );
+
+        assert!(
+            matches!(envelope.decision, HardDecision::NeedExternal { .. }),
+            "chmod under /tmp should be reviewable, got {:?}",
+            envelope.decision
+        );
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::ExplicitApprovalGate { .. }
         ));
     }
 

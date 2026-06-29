@@ -449,6 +449,16 @@ fn cloud_detail_is_sensitive(tool: &str, detail: Option<&str>) -> bool {
     }
 }
 
+fn cloud_detail_permission_args(tool: &str, detail: Option<&str>) -> Option<serde_json::Value> {
+    match (cloud_gated_tool_kind(tool), detail) {
+        (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+            Some(serde_json::json!({ "command": cmd }))
+        }
+        (Some(CloudGatedToolKind::Write), Some(path)) => Some(serde_json::json!({ "path": path })),
+        _ => None,
+    }
+}
+
 fn accept_edits_auto_allows_tool_args(tool: &str, args: &serde_json::Value) -> bool {
     matches!(
         (
@@ -2083,6 +2093,28 @@ impl PermissionManager {
         // workspace-scoped write memory can both match.
         let fps = cloud_detail_lookup_fingerprint_candidates(tool, detail);
         let sensitive_path = cloud_detail_is_sensitive(tool, detail);
+        let mut engine_requires_external_review = false;
+
+        if let Some(args) = cloud_detail_permission_args(tool, detail) {
+            let envelope = self.evaluate_permission_envelope(tool, &args);
+            match envelope.decision {
+                HardDecision::Allow
+                    if !Self::cloud_approval_is_explicit(approval_kind)
+                        || self.mode.auto_resolves_approval_prompts()
+                        || matches!(
+                            envelope.source,
+                            DecisionSource::SessionOverride { allowed: true }
+                        ) =>
+                {
+                    return Some(ApprovalDecision::Allow);
+                }
+                HardDecision::Allow => {}
+                HardDecision::Deny { .. } => return Some(ApprovalDecision::Deny),
+                HardDecision::NeedExternal { .. } => {
+                    engine_requires_external_review = true;
+                }
+            }
+        }
 
         // Session override check — applies to every kind. A matched
         // `Always` means the user has already made an informed
@@ -2116,6 +2148,14 @@ impl PermissionManager {
                     },
                 );
             }
+            return if quiet {
+                Some(ApprovalDecision::Deny)
+            } else {
+                None
+            };
+        }
+
+        if engine_requires_external_review && self.mode.auto_resolves_approval_prompts() {
             return if quiet {
                 Some(ApprovalDecision::Deny)
             } else {
@@ -2338,9 +2378,8 @@ impl PermissionManager {
         }
         // PrivilegeEscalation (sudo, doas, etc.) is handled below as Ask — user can review.
 
-        // Exact substring patterns (original denylist)
-        let exact_patterns = ["rm -rf /", ":(){ :|:& };:", "chmod 777 /"];
-        if exact_patterns.iter().any(|p| lower.contains(p)) {
+        if astra_turn_core::safety_middleware::absolute_dangerous_command_reason(cmd_str).is_some()
+        {
             return ExecuteDecision::Deny;
         }
 
@@ -2513,17 +2552,8 @@ impl PermissionManager {
                 // Execute, a path for Write. Build the allow-rule arg
                 // shape to match so `make_allow_rule` produces the
                 // right pattern (`Bash(argv_prefix="cargo")` vs `write_file`).
-                let kind = cloud_gated_tool_kind(tool);
-                let rule_args = match (kind, detail) {
-                    (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                        serde_json::json!({ "command": cmd })
-                    }
-                    (Some(CloudGatedToolKind::Write), Some(p)) => {
-                        serde_json::json!({ "path": p })
-                    }
-                    (Some(CloudGatedToolKind::Write), None) => serde_json::Value::Null,
-                    _ => serde_json::Value::Null,
-                };
+                let rule_args =
+                    cloud_detail_permission_args(tool, detail).unwrap_or(serde_json::Value::Null);
                 let fp = fingerprint_for_match_target(
                     tool,
                     &rule_args,
@@ -3579,8 +3609,12 @@ fn is_word_boundary(c: u8) -> bool {
         || !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'/')
 }
 
-/// Returns true if `rm -rf`/`rm -fr` targets a catastrophic path (root, home, system dirs).
+/// Returns true if `rm -rf`/`rm -fr` targets a catastrophic path.
 fn is_rm_catastrophic_target(lower: &str) -> bool {
+    if astra_turn_core::safety_middleware::absolute_dangerous_command_reason(lower).is_some() {
+        return true;
+    }
+
     // Find the rm target path using find() so compound commands
     // (sudo rm -rf /, cd / && rm -rf *) are caught.
     let rest = lower
@@ -3597,21 +3631,6 @@ fn is_rm_catastrophic_target(lower: &str) -> bool {
     if target.is_empty() {
         // bare `rm -rf` with no arguments — treat as dangerous
         return true;
-    }
-    if matches!(target, "/" | "/*" | "~" | "~/") {
-        return true;
-    }
-    if target.starts_with("$home") {
-        return true;
-    }
-    const SYSTEM_DIRS: &[&str] = &[
-        "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/boot", "/dev", "/proc", "/sys", "/opt",
-        "/root", "/tmp", "/home",
-    ];
-    for d in SYSTEM_DIRS {
-        if target == *d || target.starts_with(&format!("{d}/")) {
-            return true;
-        }
     }
     false
 }
@@ -3966,7 +3985,8 @@ mod tests {
 
     #[test]
     fn bypass_vectors_now_blocked() {
-        // doas rm -rf / is still Deny because "rm -rf /" is in exact_patterns
+        // doas rm -rf / is still Deny because wrapper-aware catastrophic
+        // checks strip the privilege wrapper before classifying the segment.
         let doas = serde_json::json!({"command": "doas rm -rf /"});
         assert!(PermissionManager::is_dangerous("bash", &doas));
 
@@ -4091,7 +4111,17 @@ mod tests {
 
     #[test]
     fn rm_rf_root_is_deny() {
-        for cmd_str in &["rm -rf /", "rm -rf /*", "rm -rf ~", "rm -rf ~/", "rm -fr /"] {
+        for cmd_str in &[
+            "rm -rf /",
+            "rm -rf /*",
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -fr /",
+            "sudo rm -rf /",
+            "doas rm -rf /",
+            "SUDO -n rm -rf /",
+            "pkexec chmod 777 /",
+        ] {
             let cmd = serde_json::json!({"command": cmd_str});
             let d = PermissionManager::execute_decision("bash", &cmd);
             assert_eq!(d, ExecuteDecision::Deny, "should deny: {cmd_str}");
@@ -4105,6 +4135,10 @@ mod tests {
             "rm -rf node_modules",
             "rm -rf dist/",
             "rm -rf target/debug",
+            "rm -rf /tmp/foo",
+            "sudo rm -rf /tmp/foo",
+            "SUDO rm -rf /home/user/project",
+            "pkexec chmod 777 /tmp/foo",
         ] {
             let cmd = serde_json::json!({"command": cmd_str});
             let d = PermissionManager::execute_decision("bash", &cmd);
@@ -7311,6 +7345,87 @@ mod tests {
             opted_in,
             Some(astra_thin_client::ApprovalDecision::Allow),
             "sensitive cloud writes should allow only after explicit opt-in"
+        );
+    }
+
+    #[test]
+    fn cloud_preflight_reuses_engine_for_hard_git_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut auto = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        let interactive = auto.preflight_cloud_approval_decision(
+            "bash",
+            Some("git push --force origin main"),
+            ApprovalKind::Standard,
+            false,
+        );
+        assert!(
+            interactive.is_none(),
+            "interactive Auto must route hard git through approval instead of auto-allowing it: {interactive:?}"
+        );
+
+        let quiet = auto.preflight_cloud_approval_decision(
+            "bash",
+            Some("git push --force origin main"),
+            ApprovalKind::Standard,
+            true,
+        );
+        assert_eq!(
+            quiet,
+            Some(astra_thin_client::ApprovalDecision::Deny),
+            "quiet Auto cannot prompt for hard git, so it must fail closed"
+        );
+
+        let mut bypass = PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
+        let bypass_decision = bypass.preflight_cloud_approval_decision(
+            "bash",
+            Some("git push --force origin main"),
+            ApprovalKind::Standard,
+            false,
+        );
+        assert_eq!(
+            bypass_decision,
+            Some(astra_thin_client::ApprovalDecision::Deny),
+            "Bypass skips approval prompts, but hard git policy still applies"
+        );
+    }
+
+    #[test]
+    fn cloud_preflight_reuses_engine_for_persistent_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        pm.settings
+            .deny
+            .push(r#"Bash(argv_prefix="cargo test")"#.to_string());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+        let denied = pm.preflight_cloud_approval_decision(
+            "bash",
+            Some("cargo test --lib"),
+            ApprovalKind::Standard,
+            false,
+        );
+        assert_eq!(
+            denied,
+            Some(astra_thin_client::ApprovalDecision::Deny),
+            "cloud preflight must honor deny rules before Auto mode"
+        );
+
+        pm.settings.deny.clear();
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+        pm.settings.allow.push("write_file()".to_string());
+        pm.cached_allow = pm.settings.parsed_allow_rules();
+        pm.set_mode(PermissionMode::Prompt);
+        let allowed = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some("src/lib.rs"),
+            ApprovalKind::Standard,
+            false,
+        );
+        assert_eq!(
+            allowed,
+            Some(astra_thin_client::ApprovalDecision::Allow),
+            "cloud preflight must honor allow rules instead of prompting again"
         );
     }
 

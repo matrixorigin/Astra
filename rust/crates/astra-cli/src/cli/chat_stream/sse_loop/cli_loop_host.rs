@@ -207,11 +207,11 @@ fn derive_turn_interaction_mode(
         return TurnInteractionMode::NonInteractive;
     }
 
-    // Auto-resolving modes are the user's explicit opt-in to "run
-    // uninterrupted" — they stay Auto regardless of stdin /
-    // approval-channel / silent render. All of those signals only
-    // matter for Prompt (which needs stdin to ask the user), and
-    // auto-resolving modes already short-circuit prompts anyway.
+    // Auto-resolving modes are the user's explicit opt-in to suppress
+    // ordinary interaction nudges and ask_user prompts. Keep this as
+    // TurnInteractionMode::Auto regardless of stdin / approval-channel /
+    // silent render; hard permission gates are evaluated separately by
+    // the permission engine and may still require review or deny.
     // Regression for session c6e18730 where piped or silent contexts
     // silently demoted Auto → NonInteractive, which disabled the
     // nudge-suppression gate the user opted into.
@@ -1365,13 +1365,14 @@ mod tests {
 
     // ── Auto mode preservation under non-interactive contexts ─────────
     //
-    // The user's Auto-mode intent is "don't interrupt me, trust the
-    // model". This must NOT be silently demoted to NonInteractive just
-    // because the turn is happening in a piped-stdin / silent-render /
-    // approval-channel context — those only matter for Prompt mode (no
-    // stdin to prompt on → fall back to NonInteractive so nothing
-    // blocks on a human). In Auto, there's nothing to prompt anyway,
-    // so the structural non-interactivity is orthogonal.
+    // The user's Auto-mode intent is "suppress ordinary interaction
+    // nudges and ask_user prompts". This must NOT be silently demoted
+    // to NonInteractive just because the turn is happening in a
+    // piped-stdin / silent-render / approval-channel context — those
+    // only matter for Prompt mode (no stdin to prompt on → fall back
+    // to NonInteractive so nothing blocks on a human). Hard permission
+    // gates remain the permission engine's job, not this interaction
+    // classifier's job.
     //
     // Regression for session c6e18730: Auto-mode user saw `## ⚠
     // Sequential Tool Calls Detected` nudges injected into message
@@ -1404,8 +1405,7 @@ mod tests {
         assert_eq!(
             derive_turn_interaction_mode(PermissionMode::Auto, false, true, false, false, true),
             TurnInteractionMode::Auto,
-            "approval-tx (e.g. web-approval flow) is irrelevant to Auto — Auto short-\
-             circuits approvals anyway"
+            "approval-tx (e.g. web-approval flow) must not demote Auto interaction mode"
         );
     }
 

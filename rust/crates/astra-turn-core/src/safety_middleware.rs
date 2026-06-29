@@ -538,6 +538,18 @@ pub fn catastrophic_command_reason(command: &str) -> Option<String> {
         "rm -rf /*",
         "rm -fr /*",
         // home-equivalent paths
+        "rm -rf /home",
+        "rm -fr /home",
+        "rm -r -f /home",
+        "rm -f -r /home",
+        "rm -rf /home/",
+        "rm -fr /home/",
+        "rm -rf /root",
+        "rm -fr /root",
+        "rm -r -f /root",
+        "rm -f -r /root",
+        "rm -rf /root/",
+        "rm -fr /root/",
         "rm -rf ~",
         "rm -fr ~",
         "rm -rf ~/",
@@ -586,6 +598,73 @@ pub fn catastrophic_command_reason(command: &str) -> Option<String> {
         }
     }
 
+    None
+}
+
+/// Absolute, non-configurable command danger guard used by permission gates.
+///
+/// This wraps [`catastrophic_command_reason`] with shell-list segmentation and
+/// common privilege/dispatch wrapper stripping, so `sudo rm -rf /` is treated
+/// the same as `rm -rf /` without overmatching bounded targets like
+/// `sudo rm -rf /tmp/foo`.
+#[must_use]
+pub fn absolute_dangerous_command_reason(command: &str) -> Option<String> {
+    command
+        .split([';', '\n'])
+        .flat_map(|segment| segment.split("&&"))
+        .flat_map(|segment| segment.split("||"))
+        .map(strip_common_shell_wrappers)
+        .find_map(|segment| {
+            catastrophic_command_reason(segment).or_else(|| chmod_777_root_reason(segment))
+        })
+}
+
+fn strip_common_shell_wrappers(segment: &str) -> &str {
+    let mut rest = segment.trim();
+    loop {
+        let Some((head, tail)) = rest.split_once(char::is_whitespace) else {
+            return rest;
+        };
+        let head_lower = head.to_ascii_lowercase();
+        if matches!(
+            head_lower.as_str(),
+            "sudo" | "doas" | "pkexec" | "command" | "builtin"
+        ) {
+            rest = tail.trim_start();
+            if matches!(head_lower.as_str(), "sudo" | "doas" | "pkexec") {
+                rest = strip_leading_wrapper_options(rest);
+            }
+            continue;
+        }
+        return rest;
+    }
+}
+
+fn strip_leading_wrapper_options(segment: &str) -> &str {
+    let mut rest = segment.trim_start();
+    loop {
+        let Some((head, tail)) = rest.split_once(char::is_whitespace) else {
+            return rest;
+        };
+        if head == "--" || head.starts_with('-') {
+            rest = tail.trim_start();
+            continue;
+        }
+        return rest;
+    }
+}
+
+fn chmod_777_root_reason(command: &str) -> Option<String> {
+    let normalized = command
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized == "chmod 777 /" || normalized.starts_with("chmod 777 / ") {
+        return Some(format!(
+            "catastrophic command refused (circuit breaker): `{command}` makes the root directory world-writable"
+        ));
+    }
     None
 }
 
@@ -1995,6 +2074,8 @@ mod tests {
             ("rm -rf ~/", "circuit breaker"),
             ("rm -rf $HOME", "circuit breaker"),
             ("rm -rf ${HOME}", "circuit breaker"),
+            ("rm -fr /home", "circuit breaker"),
+            ("rm -rf /root", "circuit breaker"),
             (":(){ :|:& };:", "fork bomb"),
             ("dd if=/dev/zero of=/dev/sda", "circuit breaker"),
             ("dd if=/dev/zero of=/dev/disk0", "circuit breaker"),
@@ -2021,6 +2102,7 @@ mod tests {
             "rm -rf ./build",
             "rm -rf target/debug",
             "rm /tmp/foo",
+            "rm -rf /home/user/project",
             "rm -rf node_modules",
             "rm -rf $(mktemp -d)",
             "dd if=/dev/zero of=/tmp/zeros bs=1M count=1",
@@ -2030,6 +2112,39 @@ mod tests {
             assert!(
                 catastrophic_command_reason(cmd).is_none(),
                 "circuit breaker must NOT block safe rm: `{cmd}`"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_dangerous_command_reason_strips_common_wrappers_without_tmp_overmatch() {
+        let blocked: &[&str] = &[
+            "sudo rm -rf /",
+            "SUDO rm -rf /",
+            "sudo -n rm -rf /",
+            "sudo -- rm -rf /",
+            "DOAS rm -fr /home",
+            "pkexec chmod 777 /",
+            "command rm -rf /root",
+            "builtin rm -rf ~",
+        ];
+        for cmd in blocked {
+            assert!(
+                absolute_dangerous_command_reason(cmd).is_some(),
+                "absolute danger guard must reject wrapper form: `{cmd}`"
+            );
+        }
+
+        let allowed: &[&str] = &[
+            "sudo rm -rf /tmp/foo",
+            "SUDO rm -rf /home/user/project",
+            "pkexec chmod 777 /tmp/foo",
+            "command rm -rf ./build",
+        ];
+        for cmd in allowed {
+            assert!(
+                absolute_dangerous_command_reason(cmd).is_none(),
+                "absolute danger guard must not overmatch bounded target: `{cmd}`"
             );
         }
     }

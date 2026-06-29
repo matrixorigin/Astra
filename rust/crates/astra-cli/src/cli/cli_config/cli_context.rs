@@ -144,17 +144,28 @@ mod tests {
 
     #[test]
     fn from_launch_options_normalizes_tool_lists() {
-        let ctx = CliContext::from_launch_options(
-            false,
-            Some(12),
-            &["bash, view".into(), "rg".into()],
-            &["read_file edit_file".into()],
-            &[],
-            false,
-            None,
-            None,
-        )
-        .expect("cli context");
+        let ctx = temp_env::with_vars(
+            [
+                ("ASTRA_CLI_MAX_TURNS", None::<&str>),
+                ("ASTRA_CLI_SESSION_ID", None::<&str>),
+                ("ASTRA_CLI_SESSION_NAME", None::<&str>),
+                ("ASTRA_CLI_ALLOWED_TOOLS", None::<&str>),
+                ("ASTRA_CLI_DISALLOWED_TOOLS", None::<&str>),
+            ],
+            || {
+                CliContext::from_launch_options(
+                    false,
+                    Some(12),
+                    &["bash, view".into(), "rg".into()],
+                    &["read_file edit_file".into()],
+                    &[],
+                    false,
+                    None,
+                    None,
+                )
+                .expect("cli context")
+            },
+        );
 
         assert_eq!(ctx.max_turns, Some(12));
         assert_eq!(ctx.allowed_tools, vec!["bash", "view", "rg"]);

@@ -1,6 +1,6 @@
 //! Plan-mode UI helpers extracted from `event_loop.rs`.
 //!
-//! Handles plan-mode transitions, implicit plan request detection,
+//! Handles plan-mode transition notices, explicit `/plan <goal>` parsing,
 //! and UI snapshotting when entering/exiting plan mode.
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

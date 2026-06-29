@@ -995,7 +995,7 @@ mod tests {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![],
-            deny_rules: vec![PermissionRule::parse("bash(rm -rf:*)")],
+            deny_rules: vec![PermissionRule::parse(r#"Bash(argv_prefix="rm -rf")"#)],
             ask_rules: vec![],
             allowed_tools: None,
             is_background: false,
