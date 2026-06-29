@@ -128,10 +128,13 @@ Shift+Tab cycle to prevent accidental entry.
 | `AcceptEdits`          | **Edit**     | 2              | Workspace edits auto-approved; shell still prompts |
 | `Plan`                 | **Plan**     | 3              | Read-only schema + exit_plan_mode                  |
 | `Auto`                 | **Auto**     | 4              | Normal tool risk auto-approved; hard prompts may remain |
-| `Bypass`               | **Bypass**   | 5              | Approval prompts skipped; hard denies still apply  |
+| `Bypass`               | **Bypass**   | explicit       | Approval prompts skipped; hard denies still apply  |
 | `Deny`                 | (hidden)     | —              | All tools denied (CI / harness only)               |
 
-`Shift+Tab` cycles `Default → Edit → Plan → Auto → Bypass → Default`.
+`Shift+Tab` cycles `Default → Edit → Plan → Auto → Default`. `Bypass`
+requires an explicit `/allow bypass` or CLI `--permission-mode bypass` so a
+fast cycle cannot accidentally jump from Auto into the most permissive
+approval-interaction mode.
 
 ## Invariants
 

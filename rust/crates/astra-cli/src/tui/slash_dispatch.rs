@@ -1233,7 +1233,7 @@ fn build_permission_mode_picker(
         },
     ];
     ListSelectionView::new(items, Some("Modes".into())).with_footer_hint(
-        "Shift+Tab cycles ask → edits → plan → auto → bypass · /allow rules · /allow trust · /allow trace",
+        "Shift+Tab cycles ask → edits → plan → auto · bypass is explicit · /allow rules · /allow trust · /allow trace",
     )
 }
 
@@ -4117,14 +4117,14 @@ mod view_result_tests {
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Auto),
-            PermissionMode::Bypass
+            PermissionMode::Prompt
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Bypass),
             PermissionMode::Prompt
         );
-        // `Deny` is sticky under the cycle: it must only be exited by an
-        // explicit `/allow <mode>`, never by a bare `/allow`.
+        // `Bypass` is explicit-only, and `Deny` is sticky under the cycle:
+        // neither can be reached by a bare `/allow`.
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Deny),
             PermissionMode::Deny

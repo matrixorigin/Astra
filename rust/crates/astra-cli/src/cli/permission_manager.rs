@@ -1585,8 +1585,11 @@ impl PermissionManager {
 
     /// Create with inherited permissions from a parent agent.
     ///
-    /// The child agent inherits the parent's permission mode and rules,
-    /// but can still load project-level settings for additional rules.
+    /// The child agent inherits the parent's effective permission mode and
+    /// rules, but can still load project-level settings for additional rules.
+    /// Root-only Bypass is projected to Auto before export so fan-out agents
+    /// do not inherit the parent UI's approval-prompt bypass as a safety
+    /// policy.
     ///
     /// Issue #326 P0 / R1 Major 10 / task #17: if the parent envelope
     /// carries a `fingerprinted_overrides` JSON blob, we deserialize
@@ -1601,7 +1604,7 @@ impl PermissionManager {
         inherited: astra_runtime::orchestration::InheritedPermissions,
     ) -> Self {
         // Use inherited mode, but load project settings too
-        let mode = match inherited.mode {
+        let mode = match inherited.mode.child_inherited_mode() {
             astra_runtime::orchestration::PermissionMode::Auto => PermissionMode::Auto,
             astra_runtime::orchestration::PermissionMode::Bypass => PermissionMode::Bypass,
             astra_runtime::orchestration::PermissionMode::Plan => PermissionMode::Plan,
@@ -1761,7 +1764,7 @@ impl PermissionManager {
             PermissionRule as RuntimePermissionRule,
         };
 
-        let mode = match self.mode {
+        let mode = match self.mode.child_inherited_mode() {
             PermissionMode::Auto => RuntimePermissionMode::Auto,
             PermissionMode::Bypass => RuntimePermissionMode::Bypass,
             PermissionMode::Plan => RuntimePermissionMode::Plan,
@@ -2982,8 +2985,9 @@ impl PermissionManager {
         let side_effect = Self::classify_with_args(name, args);
 
         // Step 2: Git safety approval gate.
-        // Broad overrides cannot skip this gate. Bypass mode can resolve it
-        // without prompting; Auto only resolves soft findings.
+        // Broad overrides cannot skip this gate. Auto/Bypass can resolve soft
+        // findings without prompting; hard findings remain denied/prompted by
+        // mode policy.
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
@@ -3001,6 +3005,10 @@ impl PermissionManager {
                     return false;
                 }
                 if self.mode.skips_human_approval_prompts() {
+                    if has_hard {
+                        eprintln!("  {}", "  Git safety hard violation — blocked".red());
+                        return false;
+                    }
                     return true;
                 }
                 // Soft-only violations: respect auto mode and session overrides.
@@ -6171,6 +6179,20 @@ mod tests {
     }
 
     #[test]
+    fn with_inherited_downgrades_parent_bypass_mode() {
+        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
+
+        let inherited = InheritedPermissions::new(RuntimeMode::Bypass);
+        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
+
+        assert_eq!(
+            pm.mode,
+            PermissionMode::Auto,
+            "child permission managers must not preserve root-only Bypass"
+        );
+    }
+
+    #[test]
     fn with_inherited_checks_parent_allow_rules() {
         use astra_runtime::orchestration::{
             InheritedPermissions, PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
@@ -6227,6 +6249,23 @@ mod tests {
             "fingerprinted_overrides must be populated; got {:?}",
             inherited.fingerprinted_overrides
         );
+    }
+
+    #[test]
+    fn inherited_permissions_for_child_downgrades_root_bypass_to_auto() {
+        use astra_runtime::orchestration::PermissionMode as RuntimeMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pm = PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
+
+        let inherited = pm.inherited_permissions_for_child(true);
+
+        assert_eq!(
+            inherited.mode,
+            RuntimeMode::Auto,
+            "Bypass is a root UI interaction mode and must not propagate to child agents"
+        );
+        assert!(inherited.is_background);
     }
 
     #[test]
@@ -6930,17 +6969,19 @@ mod tests {
     }
 
     #[test]
-    fn bypass_mode_skips_git_hard_approval() {
+    fn bypass_mode_denies_git_hard_violation_without_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
         let args = serde_json::json!({
             "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
         });
 
-        assert!(matches!(
-            pm.check_nonblocking("bash", &args),
-            GateOutcome::Allow
-        ));
+        match pm.check_nonblocking("bash", &args) {
+            GateOutcome::Deny(reason) => {
+                assert!(reason.contains("Git safety hard violation"), "{reason}");
+            }
+            other => panic!("expected hard git denial in bypass mode, got {other:?}"),
+        }
     }
 
     #[test]

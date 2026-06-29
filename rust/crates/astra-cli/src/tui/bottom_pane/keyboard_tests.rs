@@ -68,11 +68,10 @@ fn backtab_cycles_mode_when_composer_has_text() {
 
 #[test]
 fn next_mode_cycle_full_loop_skips_deny() {
-    // Prompt → AcceptEdits → Plan → Auto → Bypass → Prompt (wrap).
-    // `Deny` is sticky under the cycle: a bare `/allow` (or Shift+Tab) must
-    // never silently move a session out of the most restrictive mode — it
-    // is only exited by an explicit `/allow <mode>`. Likewise `Deny` is
-    // never a cycle *target*.
+    // Prompt → AcceptEdits → Plan → Auto → Prompt (wrap).
+    // `Bypass` is explicit-only, and `Deny` is sticky under the cycle: a bare
+    // `/allow` (or Shift+Tab) must never silently move into the broadest or out
+    // of the most restrictive mode.
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Prompt),
         PermissionMode::AcceptEdits
@@ -91,7 +90,7 @@ fn next_mode_cycle_full_loop_skips_deny() {
     );
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Auto),
-        PermissionMode::Bypass
+        PermissionMode::Prompt
     );
     assert_eq!(
         next_permission_mode_for_cycle(PermissionMode::Bypass),

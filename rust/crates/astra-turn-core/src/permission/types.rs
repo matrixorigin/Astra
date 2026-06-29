@@ -73,6 +73,20 @@ impl PermissionMode {
         matches!(self, Self::Auto)
     }
 
+    /// Permission mode to export into child agents.
+    ///
+    /// `Bypass` is a root user-interaction choice: skip approval prompts in
+    /// the current UI session. It must not become a transitive child-agent
+    /// safety policy because spawned/fan-out agents have no direct user in the
+    /// loop and should not inherit the root session's broad prompt bypass.
+    #[must_use]
+    pub fn child_inherited_mode(self) -> Self {
+        match self {
+            Self::Bypass => Self::Auto,
+            other => other,
+        }
+    }
+
     pub fn manual_approval_policy(self) -> Option<ManualApprovalPolicy> {
         match self {
             Self::Auto => None,
@@ -697,8 +711,10 @@ impl std::fmt::Display for PermissionRule {
 
 /// Permission context inherited from parent to child agent.
 ///
-/// Contains the parent's permission mode and rules that the child should honor.
-/// Child agents cannot escalate permissions beyond what parent allows.
+/// Contains the parent's effective permission mode and rules that the child
+/// should honor. Child agents cannot escalate permissions beyond what parent
+/// allows. Root-only interaction choices such as `Bypass` are projected to the
+/// child-safe execution mode by [`PermissionMode::child_inherited_mode`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InheritedPermissions {
     /// Permission mode inherited from parent.
@@ -1141,6 +1157,7 @@ impl PermissionSyncContext {
     /// Create inherited permissions for a child agent.
     pub fn for_child(&self, is_background: bool) -> InheritedPermissions {
         let mut inherited = self.inherited.clone();
+        inherited.mode = inherited.mode.child_inherited_mode();
         inherited.is_background = is_background;
         // Add session rules to inherited rules for child
         for rule in &self.session_allow {
@@ -1281,6 +1298,14 @@ mod tests {
         assert!(PermissionMode::Auto.auto_allows_soft_git_policy());
         assert!(!PermissionMode::Bypass.auto_allows_soft_git_policy());
         assert!(!PermissionMode::Prompt.auto_resolves_approval_prompts());
+        assert_eq!(
+            PermissionMode::Bypass.child_inherited_mode(),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            PermissionMode::Prompt.child_inherited_mode(),
+            PermissionMode::Prompt
+        );
 
         assert_eq!(PermissionMode::Auto.manual_approval_policy(), None);
         assert_eq!(PermissionMode::Bypass.manual_approval_policy(), None);
@@ -1598,6 +1623,16 @@ mod tests {
         assert!(child_perms.is_background);
         assert!(child_perms.is_allowed("bash", Some("git status")));
         assert!(child_perms.is_allowed("bash", Some("npm install")));
+    }
+
+    #[test]
+    fn permission_sync_context_downgrades_bypass_for_child() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Bypass);
+
+        let child_perms = ctx.for_child(true);
+
+        assert_eq!(child_perms.mode, PermissionMode::Auto);
+        assert!(child_perms.is_background);
     }
 
     #[tokio::test]

@@ -1264,6 +1264,19 @@ fn resolve_git_safety_guard(
     }
 
     if ctx.mode().skips_human_approval_prompts() {
+        if has_hard_violation {
+            let reason = format!("Git safety hard violation (bypass denied): {joined_reasons}");
+            return GuardResolution::Return {
+                decision: HardDecision::Deny {
+                    reason: reason.clone(),
+                },
+                source: DecisionSource::GitSafety {
+                    violation: reason.clone(),
+                },
+                detail: reason,
+                skipped_notes,
+            };
+        }
         if ctx.inherited.allowed_tools.is_some() {
             skipped_notes.push(format!(
                 "bypass mode git violation, deferring to allowlist: {joined_reasons}",
@@ -2603,6 +2616,27 @@ mod tests {
     }
 
     #[test]
+    fn structured_git_force_push_feature_branch_is_allowed_in_bypass_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Bypass,
+        );
+        let envelope = evaluate_permission(
+            "git",
+            &serde_json::json!({
+                "action": "push",
+                "remote": "origin",
+                "branch": "feature/my-branch",
+                "force_with_lease": true
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+    }
+
+    #[test]
     fn structured_git_force_push_protected_branch_requires_approval_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -2627,7 +2661,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_git_force_push_protected_branch_is_allowed_in_bypass_mode() {
+    fn structured_git_force_push_protected_branch_is_denied_in_bypass_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Bypass,
         );
@@ -2642,7 +2676,11 @@ mod tests {
             &ctx,
         );
 
-        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(matches!(
+            envelope.decision,
+            HardDecision::Deny { ref reason }
+                if reason.contains("Git safety hard violation")
+        ));
         assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
     }
@@ -2804,7 +2842,7 @@ mod tests {
             &serde_json::json!({
                 "action": "push",
                 "remote": "origin",
-                "branch": "main",
+                "branch": "feature/my-branch",
                 "force_with_lease": true
             }),
             &ctx,

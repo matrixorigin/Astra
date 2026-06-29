@@ -538,6 +538,9 @@ Set permission mode for tool execution.
 /allow rules     # Show rules
 ```
 
+Bare `/allow` and Shift+Tab cycle `prompt → accept_edits → plan → auto → prompt`.
+Use `/allow bypass` explicitly when you want to skip approval prompts.
+
 ### `/instructions [subcommand]`
 
 Project instructions from `.astra/instructions.md`.
