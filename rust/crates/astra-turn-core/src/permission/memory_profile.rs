@@ -1,6 +1,8 @@
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
+use astra_sandbox::validate_git_command;
+
 use crate::cloud::approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
 use crate::parallel_tool_exec::is_read_only_tool_with_args;
 use crate::permission::compound_command::{
@@ -64,6 +66,10 @@ fn execute_memory_profile(tool_name: &str, args: &Value) -> PermissionMemoryProf
 }
 
 fn command_match_target(command: &str) -> AllowMatchTarget {
+    if !validate_git_command(command).is_empty() {
+        return AllowMatchTarget::Exact;
+    }
+
     let prefix = normalized_argv_prefix(command);
     if prefix.is_empty() {
         AllowMatchTarget::Exact
@@ -306,5 +312,20 @@ mod tests {
             profile.persistent_block,
             Some(PersistentMemoryBlock::DynamicEval)
         );
+    }
+
+    #[test]
+    fn git_safety_commands_stay_exact() {
+        for command in [
+            "git restore --staged --worktree rust/crates/foo/src/lib.rs",
+            "git push --force-with-lease origin main",
+            "cd /repo && git diff origin/main...HEAD --stat",
+        ] {
+            let args = serde_json::json!({"command": command});
+            let profile = permission_memory_profile("bash", &args);
+            assert_eq!(profile.match_target, AllowMatchTarget::Exact, "{command}");
+            assert_eq!(profile.persistent_block, None, "{command}");
+            assert!(profile.has_stable_target, "{command}");
+        }
     }
 }

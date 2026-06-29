@@ -759,6 +759,7 @@ pub(crate) async fn stream_chat_sse(
             last_heavy_checkpoint: None,
             tool_call_records: Vec::new(),
             forced_factual_retry: false,
+            factual_retry_fallback_text: None,
             forced_execution_retry: false,
             forced_execution_escalation: false,
             forced_parallel_batching: false,

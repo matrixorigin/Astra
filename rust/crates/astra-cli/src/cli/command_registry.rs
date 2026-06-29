@@ -322,9 +322,12 @@ const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
 const ALLOW_SUBCOMMANDS: &[(&str, &str)] = &[
     (
         "auto",
-        "Auto-approve normal tool risk; hard prompts may still apply",
+        "Auto-approve normal tool risk; some git/sensitive gates may still stop",
     ),
-    ("bypass", "Skip approval prompts; hard denies still apply"),
+    (
+        "bypass",
+        "Skip approval prompts; catastrophic and policy hard-denies still apply",
+    ),
     ("plan", "Read-only investigation mode; mutations are denied"),
     (
         "accept_edits",

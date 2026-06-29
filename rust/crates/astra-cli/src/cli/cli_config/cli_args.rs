@@ -732,7 +732,7 @@ pub(crate) struct PermissionsArgs {
 pub(crate) enum PermissionsSubcommand {
     /// Auto-approve allowed tool calls
     Auto,
-    /// Skip approval prompts; hard denies still apply
+    /// Skip approval prompts; catastrophic and policy hard-denies still apply
     Bypass,
     /// Auto-approve workspace-local edits while still prompting for shell and external writes
     #[command(name = "accept_edits")]

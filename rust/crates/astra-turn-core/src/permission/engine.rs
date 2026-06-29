@@ -376,10 +376,10 @@ pub(crate) fn plan_mode_denial_reason(tool_name: &str) -> String {
 /// context.
 ///
 /// This is the shared pure evaluator for runtime/sub-agent permission checks:
-/// it runs the same bypass-immune guards before any relaxable rule or mode
-/// branch, and returns `NeedExternal` instead of deciding how to ask the user.
-/// Callers are responsible for routing that prompt to a TUI sink, parent
-/// mailbox, or headless fail-closed path.
+/// it runs absolute safety and policy guards before any relaxable rule or
+/// mode branch, and returns `NeedExternal` instead of deciding how to ask the
+/// user. Callers are responsible for routing that prompt to a TUI sink,
+/// parent mailbox, or headless fail-closed path.
 #[must_use]
 pub fn evaluate_permission(
     tool_name: &str,
@@ -1479,7 +1479,7 @@ fn fingerprinted_override_match(
 }
 
 fn stored_override_allows_git_safety(stored: &ApprovalFingerprint) -> bool {
-    stored.command_exact.is_some() || stored.command_prefix.is_some()
+    stored.command_exact.is_some()
 }
 
 fn stored_override_allows_sensitive_path(stored: &ApprovalFingerprint) -> bool {
@@ -2723,6 +2723,40 @@ mod tests {
                 .note
                 .contains("broad session override cannot bypass git safety")),
             "ignored broad override should stay visible in trace: {:?}",
+            envelope.trace
+        );
+    }
+
+    #[test]
+    fn git_worktree_destructive_prefix_session_override_does_not_fall_through() {
+        let args = serde_json::json!({
+            "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
+        });
+        let mut overrides = FingerprintedOverrides::default();
+        overrides.insert(
+            ApprovalFingerprint::shell_prefix("bash", "git restore", false),
+            true,
+        );
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Auto,
+                fingerprinted_overrides: Some(serde_json::to_value(overrides).unwrap()),
+                ..Default::default()
+            },
+        );
+
+        let envelope = evaluate_permission("bash", &args, &ctx);
+
+        assert!(matches!(
+            envelope.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(
+            envelope.trace.iter().any(|step| step
+                .note
+                .contains("broad session override cannot bypass git safety")),
+            "ignored prefix override should stay visible in trace: {:?}",
             envelope.trace
         );
     }

@@ -66,6 +66,7 @@ use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_tools::task_mgmt::{SessionTask, TaskManager};
+use astra_turn_core::agentic_turn_ingest::FactualRetryFallbackDecision;
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionTier};
@@ -136,6 +137,13 @@ pub struct HostTurnResult {
     pub error_kind: Option<astra_core::ErrorKind>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FactualRetryFallbackJudgeContext<'a> {
+    pub original_query: &'a str,
+    pub fallback_text: &'a str,
+    pub retry_text: &'a str,
+}
+
 pub enum ControlToolRecovery {
     Unsupported,
     Missing,
@@ -178,15 +186,22 @@ pub trait AgenticLoopHost: Send {
 
     /// Optional semantic judge for the current user turn.
     ///
-    /// The default implementation provides a deterministic baseline from the
-    /// current message plus `TaskExecutionProfile`; hosts can override it with a
-    /// higher-fidelity classifier if they have one.
-    async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-        Some(crate::turn::agentic::turn_intent::fallback_turn_intent(
-            &state.message,
-            &state.recent_tools,
-            state.has_prior_assistant_turn,
-        ))
+    /// The default implementation returns no semantic intent. Hosts that have
+    /// an LLM judge or another explicit structured signal should override this;
+    /// runtime defaults must not infer natural-language intent from keyword
+    /// lists.
+    async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
+        None
+    }
+
+    /// Optional LLM response-selection judge for factual retries that gathered
+    /// no real evidence. The runtime must not fall back to lexical similarity
+    /// here; absence or failure means "keep retry".
+    async fn judge_factual_retry_fallback(
+        &mut self,
+        _ctx: FactualRetryFallbackJudgeContext<'_>,
+    ) -> Option<FactualRetryFallbackDecision> {
+        None
     }
 
     /// Whether the host already injects round budget guidance into the system
@@ -841,6 +856,10 @@ pub struct StallTrackingState {
     pub tool_call_records: Vec<ToolCallRecord>,
     /// Whether a factual-retry was forced this loop.
     pub forced_factual_retry: bool,
+    /// Original text-only answer saved before a forced factual retry. It is
+    /// restored only when an upstream response-selection judge explicitly
+    /// chooses it after a no-evidence retry.
+    pub factual_retry_fallback_text: Option<String>,
     /// Whether an execution-retry was forced after a mutating/confirmed task
     /// attempted to finish without applying any concrete workspace mutation.
     pub forced_execution_retry: bool,
@@ -3044,14 +3063,8 @@ pub(crate) mod tests {
             Ok(result)
         }
 
-        async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-            self.turn_intent.clone().or_else(|| {
-                Some(crate::turn::agentic::turn_intent::fallback_turn_intent(
-                    &state.message,
-                    &state.recent_tools,
-                    state.has_prior_assistant_turn,
-                ))
-            })
+        async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
+            self.turn_intent.clone()
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {

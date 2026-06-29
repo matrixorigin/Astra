@@ -331,6 +331,10 @@ fn validate_explicit_turn_identity(
     }))
 }
 
+fn inferred_force_intent_for_bridge_user_query(_user_query: &str) -> Option<String> {
+    None
+}
+
 pub(super) async fn prepare_chat_turn_bridge_body(
     state: &AppState,
     user: &AuthUserRecord,
@@ -444,7 +448,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         let meta = serde_json::Value::Object(build_skipped_routing_metadata("selected_model"));
         URL_SAFE.encode(serde_json::to_string(&meta).unwrap_or_default().as_bytes())
     });
-    let force_intent = detect_correction(&user_query).then_some("question".to_string());
+    let force_intent = inferred_force_intent_for_bridge_user_query(&user_query);
     let execution_state_b64 = request
         .execution_state_obj()
         .map(normalize_execution_state)
@@ -1313,6 +1317,17 @@ mod tests {
         );
         assert_eq!(state.get("history"), Some(&json!(["turn1", "turn2"])));
         assert_eq!(state.get("turn_count"), Some(&json!(0)));
+    }
+
+    #[test]
+    fn bridge_prep_does_not_infer_force_intent_from_correction_text() {
+        for query in [
+            "wrong, that's not what I meant",
+            "不对，你搞错了",
+            "actually, I meant the runtime branch",
+        ] {
+            assert_eq!(inferred_force_intent_for_bridge_user_query(query), None);
+        }
     }
 
     // ── trim_edge_tools_for_result_turn ─────────────────────────────

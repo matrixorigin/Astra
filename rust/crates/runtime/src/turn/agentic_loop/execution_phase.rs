@@ -2,8 +2,9 @@ use std::time::Instant;
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, DeferredInputState, HostTurnResult,
-    TaskBoardSnapshot, finalize_and_render, finalize_turn_trace, try_write_heavy_checkpoint,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, DeferredInputState,
+    FactualRetryFallbackJudgeContext, HostTurnResult, TaskBoardSnapshot, finalize_and_render,
+    finalize_turn_trace, try_write_heavy_checkpoint,
 };
 use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
@@ -13,8 +14,8 @@ use astra_core::render_compact_status;
 use astra_services::{ContextManifestWrite, DatabaseContextManifestStore};
 use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
-    agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
-    map_ingest_outcome_to_iteration_control,
+    FactualRetryFallbackDecision, agentic_turn_stream_snapshot_with_kind,
+    ingest_agentic_turn_stream, map_ingest_outcome_to_iteration_control,
 };
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interaction_types::TurnInteractionMode;
@@ -432,6 +433,32 @@ fn circuit_breaker_introspection_message(
          Tools remain available.",
         llm_rounds_completed, consecutive_read_only
     )
+}
+
+async fn maybe_judge_factual_retry_fallback<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &AgenticLoopState,
+    retry_text: &str,
+    round_has_edge_work: bool,
+) -> Option<FactualRetryFallbackDecision> {
+    if round_has_edge_work
+        || !state.stall.forced_factual_retry
+        || state.total_evidence_tool_calls != 0
+        || retry_text.trim().is_empty()
+    {
+        return None;
+    }
+    let fallback_text = state.stall.factual_retry_fallback_text.as_deref()?;
+    if fallback_text.trim().is_empty() {
+        return None;
+    }
+
+    host.judge_factual_retry_fallback(FactualRetryFallbackJudgeContext {
+        original_query: state.message.as_str(),
+        fallback_text,
+        retry_text,
+    })
+    .await
 }
 
 pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
@@ -1205,6 +1232,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     update_turn_trace_collector(state, &turn_result);
 
     let edge_len = turn_result.edge_tool_round.len();
+    let round_has_edge_work = edge_len > 0 || !snap.tool_calls.is_empty();
+    let factual_retry_fallback_decision =
+        maybe_judge_factual_retry_fallback(host, state, snap.full_text, round_has_edge_work).await;
     let ingest_outcome = ingest_agentic_turn_stream(
         &snap,
         edge_len,
@@ -1229,6 +1259,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             all_tools_used: &mut state.telemetry.all_tools_used,
             has_any_usage: &mut state.has_any_usage,
             forced_factual_retry: &mut state.stall.forced_factual_retry,
+            factual_retry_fallback_text: &mut state.stall.factual_retry_fallback_text,
+            factual_retry_fallback_decision,
             messages: &mut state.messages,
             last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
             consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
@@ -3367,6 +3399,95 @@ mod tests {
                 release_failures: Mutex::new(release_failures),
             }
         }
+    }
+
+    struct JudgeOnlyHost {
+        decision: Option<FactualRetryFallbackDecision>,
+        calls: Vec<(String, String, String)>,
+        valid_tools: HashSet<String>,
+    }
+
+    #[async_trait]
+    impl AgenticLoopHost for JudgeOnlyHost {
+        async fn execute_turn(
+            &mut self,
+            _state: &mut AgenticLoopState,
+        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Unknown,
+                "not used",
+            ))
+        }
+
+        async fn judge_factual_retry_fallback(
+            &mut self,
+            ctx: FactualRetryFallbackJudgeContext<'_>,
+        ) -> Option<FactualRetryFallbackDecision> {
+            self.calls.push((
+                ctx.original_query.to_string(),
+                ctx.fallback_text.to_string(),
+                ctx.retry_text.to_string(),
+            ));
+            self.decision
+        }
+
+        fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, _line: String) {}
+
+        fn is_quiet(&self) -> bool {
+            true
+        }
+
+        fn valid_tool_names(&self) -> &HashSet<String> {
+            &self.valid_tools
+        }
+    }
+
+    #[tokio::test]
+    async fn factual_retry_fallback_judge_called_only_for_no_evidence_retry_final() {
+        let mut host = JudgeOnlyHost {
+            decision: Some(FactualRetryFallbackDecision::RestoreFallback),
+            calls: Vec::new(),
+            valid_tools: HashSet::new(),
+        };
+        let mut state = make_state();
+        state.message = "what do 59% and 117k mean?".to_string();
+        state.stall.forced_factual_retry = true;
+        state.stall.factual_retry_fallback_text =
+            Some("59% is context usage; 117k is token count.".to_string());
+        state.total_evidence_tool_calls = 0;
+
+        let decision =
+            maybe_judge_factual_retry_fallback(&mut host, &state, "I completed the work.", false)
+                .await;
+
+        assert_eq!(
+            decision,
+            Some(FactualRetryFallbackDecision::RestoreFallback)
+        );
+        assert_eq!(host.calls.len(), 1);
+        assert_eq!(host.calls[0].0, "what do 59% and 117k mean?");
+    }
+
+    #[tokio::test]
+    async fn factual_retry_fallback_judge_not_called_when_evidence_exists_or_fallback_missing() {
+        let mut host = JudgeOnlyHost {
+            decision: Some(FactualRetryFallbackDecision::RestoreFallback),
+            calls: Vec::new(),
+            valid_tools: HashSet::new(),
+        };
+        let mut state = make_state();
+        state.stall.forced_factual_retry = true;
+        state.stall.factual_retry_fallback_text = Some("original".to_string());
+        state.total_evidence_tool_calls = 1;
+
+        let decision = maybe_judge_factual_retry_fallback(&mut host, &state, "retry", false).await;
+        assert_eq!(decision, None);
+
+        state.total_evidence_tool_calls = 0;
+        state.stall.factual_retry_fallback_text = None;
+        let decision = maybe_judge_factual_retry_fallback(&mut host, &state, "retry", false).await;
+        assert_eq!(decision, None);
+        assert!(host.calls.is_empty());
     }
 
     #[async_trait]

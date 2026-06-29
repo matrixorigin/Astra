@@ -5869,7 +5869,7 @@ mod tests {
         assert!(err.contains("sensitive credential path"), "{err}");
         assert!(
             !err.starts_with(super::SANDBOX_DENIED_PREFIX),
-            "sensitive paths are bypass-immune, not expandable sandbox boundaries: {err}"
+            "sensitive paths are absolute safety guards, not expandable sandbox boundaries: {err}"
         );
     }
 

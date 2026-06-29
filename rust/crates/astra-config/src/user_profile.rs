@@ -386,6 +386,13 @@ pub struct TurnIntent {
     /// starting a fresh scenario.
     #[serde(default)]
     pub continuation_mode: TurnContinuationMode,
+    /// Whether the user is correcting or reanchoring the current objective.
+    ///
+    /// This is deliberately separate from `continuation_mode`: a plain
+    /// "continue" keeps working, while a reanchor may reset transient guard
+    /// state that belongs to the previous failed attempt.
+    #[serde(default)]
+    pub reanchors_current_objective: bool,
 }
 
 impl TurnIntent {
@@ -398,6 +405,12 @@ impl TurnIntent {
     #[must_use]
     pub fn with_continuation_mode(mut self, mode: TurnContinuationMode) -> Self {
         self.continuation_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_reanchors_current_objective(mut self, reanchors: bool) -> Self {
+        self.reanchors_current_objective = reanchors;
         self
     }
 
@@ -417,6 +430,11 @@ impl TurnIntent {
     #[must_use]
     pub fn continues_current_objective(&self) -> bool {
         self.continuation_mode == TurnContinuationMode::ContinueCurrentObjective
+    }
+
+    #[must_use]
+    pub fn reanchors_current_objective(&self) -> bool {
+        self.reanchors_current_objective
     }
 }
 
@@ -1068,6 +1086,18 @@ mod tests {
 
         assert!(intent.continues_current_objective());
         assert!(!TurnIntent::default().continues_current_objective());
+    }
+
+    #[test]
+    fn turn_intent_reanchor_is_separate_from_continuation() {
+        let continued = TurnIntent::default()
+            .with_continuation_mode(TurnContinuationMode::ContinueCurrentObjective);
+        assert!(continued.continues_current_objective());
+        assert!(!continued.reanchors_current_objective());
+
+        let reanchored = TurnIntent::default().with_reanchors_current_objective(true);
+        assert!(reanchored.reanchors_current_objective());
+        assert!(!reanchored.continues_current_objective());
     }
 
     #[test]

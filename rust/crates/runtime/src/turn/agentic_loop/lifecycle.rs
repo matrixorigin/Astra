@@ -967,7 +967,6 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
-    apply_user_correction_reanchor(state);
     maybe_inject_task_board_start_gate(host, state).await;
 
     if state
@@ -1019,8 +1018,8 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     // See `context_pipeline_adapter::build_session_context` + `bind_project_context`.
 }
 
-fn apply_user_correction_reanchor(state: &mut AgenticLoopState) -> bool {
-    if !astra_turn_core::input_classifier::is_correction_signal(&state.message) {
+fn apply_structured_user_reanchor(state: &mut AgenticLoopState) -> bool {
+    if state.message.trim().is_empty() {
         return false;
     }
 
@@ -1464,6 +1463,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     let judged_turn_intent = host.judge_turn_intent(state).await;
     if let Some(intent) = judged_turn_intent.as_ref() {
         apply_judged_turn_intent_to_observability_session(state, intent);
+        if intent.reanchors_current_objective() {
+            apply_structured_user_reanchor(state);
+        }
     }
     // Turn intent not yet wired to adaptive execution profiles — observation
     // plane records scenario signals without mutating runtime config.
@@ -3285,7 +3287,7 @@ mod tests {
     }
 
     #[test]
-    fn user_correction_reanchors_working_memory_before_turn() {
+    fn structured_reanchor_updates_working_memory_before_turn() {
         let mut state = make_state();
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -3302,7 +3304,7 @@ mod tests {
             memory.set_next_action("retry stale path");
         }
 
-        assert!(apply_user_correction_reanchor(&mut state));
+        assert!(apply_structured_user_reanchor(&mut state));
 
         let rendered = state
             .pipeline_session
@@ -3319,13 +3321,15 @@ mod tests {
         assert!(rendered.contains("server-side executor"));
     }
 
-    #[test]
-    fn ordinary_followup_does_not_reanchor_working_memory() {
+    #[tokio::test]
+    async fn prepare_turn_without_judged_reanchor_does_not_reanchor_working_memory() {
+        let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
-        state.message = "continue with the implementation".into();
+        state.message = "No, that's wrong; use the server-side executor.".into();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
         {
             let memory = state
                 .pipeline_session
@@ -3336,7 +3340,11 @@ mod tests {
             memory.set_next_action("continue current path");
         }
 
-        assert!(!apply_user_correction_reanchor(&mut state));
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
 
         let rendered = state
             .pipeline_session
@@ -3374,7 +3382,7 @@ mod tests {
         state.restricted_tools.insert("bash".into());
         state.boosted_tools.insert("grep".into());
 
-        assert!(apply_user_correction_reanchor(&mut state));
+        assert!(apply_structured_user_reanchor(&mut state));
 
         assert_eq!(state.turn_guard.nudge_count, 0);
         assert!(state.turn_guard.tool_sigs.is_empty());
@@ -3394,6 +3402,48 @@ mod tests {
         assert!(
             state.widen_selection_pending,
             "the next assembly should expose the full tool catalogue once"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_applies_structured_reanchor_from_judge() {
+        let intent = TurnIntent::default().with_reanchors_current_objective(true);
+        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
+        let mut state = make_state();
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        state.message = "不是修修补补，我要的是第一性原则系统性修复。".into();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        state.turn_guard.nudge_count = 2;
+        state.restricted_tools.insert("bash".into());
+        state.boosted_tools.insert("grep".into());
+        state
+            .pipeline_session
+            .as_mut()
+            .expect("pipeline session")
+            .working_memory_mut()
+            .set_next_action("stale path");
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert_eq!(state.turn_guard.nudge_count, 0);
+        assert!(state.restricted_tools.is_empty());
+        assert!(state.boosted_tools.is_empty());
+        assert!(state.widen_selection_pending);
+        let rendered = state
+            .pipeline_session
+            .as_ref()
+            .expect("pipeline session")
+            .working_memory()
+            .render_prompt_section();
+        assert!(!rendered.contains("stale path"));
+        assert!(
+            rendered.contains("Latest user correction overrides conflicting prior working memory")
         );
     }
 

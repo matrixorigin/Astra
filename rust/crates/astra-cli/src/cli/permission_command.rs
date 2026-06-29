@@ -74,8 +74,12 @@ pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static st
 
 pub(crate) fn permission_mode_cli_detail(mode: PermissionMode) -> Option<&'static str> {
     match mode {
-        PermissionMode::Auto => Some("normal tool risk auto-approved; hard prompts may remain"),
-        PermissionMode::Bypass => Some("skip approval prompts; hard denies still apply"),
+        PermissionMode::Auto => {
+            Some("normal tool risk auto-approved; some git/sensitive gates may still stop")
+        }
+        PermissionMode::Bypass => {
+            Some("skip approval prompts; catastrophic and policy hard-denies still apply")
+        }
         PermissionMode::Plan => Some("read-only investigation mode"),
         PermissionMode::AcceptEdits => Some("workspace-local edits auto-approved"),
         PermissionMode::Prompt | PermissionMode::Deny => None,

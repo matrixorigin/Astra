@@ -1214,12 +1214,16 @@ fn build_permission_mode_picker(
         },
         SelectionItem {
             name: "Auto".into(),
-            description: Some("Auto-approve normal tool risk; hard prompts may still apply".into()),
+            description: Some(
+                "Auto-approve normal tool risk; some git/sensitive gates may still stop".into(),
+            ),
             is_current: current == crate::cli::permission_manager::PermissionMode::Auto,
         },
         SelectionItem {
             name: "Bypass".into(),
-            description: Some("Skip approval prompts; hard denies still apply".into()),
+            description: Some(
+                "Skip approval prompts; catastrophic and policy hard-denies still apply".into(),
+            ),
             is_current: current == crate::cli::permission_manager::PermissionMode::Bypass,
         },
         SelectionItem {

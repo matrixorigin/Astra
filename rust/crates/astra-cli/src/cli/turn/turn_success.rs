@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use astra_turn_core::chat_turn_heuristics::looks_like_live_query_with_context;
 use astra_turn_core::conversation_log::manager::CslManager;
 
 use super::turn_commit::TurnCommitOutcome;
@@ -329,16 +328,6 @@ fn apply_turn_success_sync(
             eprintln!(
                 "{}",
                 format!("  💡 Next prompt: {}  (Tab to accept)", suggestion.text).dim()
-            );
-        }
-
-        if result.tool_calls_count == 0
-            && looks_like_live_query_with_context(line, &state.recent_tools)
-        {
-            eprintln!(
-                "{}",
-                "  ⚠ Warning: This answer was generated without tool calls. Data may be hallucinated."
-                    .yellow()
             );
         }
     }

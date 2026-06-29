@@ -12,8 +12,6 @@
 use astra_services::session_journal::{JournalEvent, ToolCallRecord};
 use serde_json::json;
 
-use crate::chat_turn_heuristics::looks_like_live_query_with_context;
-
 /// Signals detected during evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalSignal {
@@ -360,8 +358,8 @@ pub fn evaluate_tool_call_records_with_thresholds(
 
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
-    input: &str,
-    recent_tools: &[String],
+    _input: &str,
+    _recent_tools: &[String],
     tool_call_records: &[ToolCallRecord],
     stall_count: usize,
     verdict_warning: bool,
@@ -415,7 +413,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
             no_op: record.is_noop_or_cached_result(),
         })
         .collect::<Vec<_>>();
-    let is_live_query = looks_like_live_query_with_context(input, recent_tools);
+    let is_live_query = false;
     let mut eval = evaluate_turn(
         &tool_calls,
         stall_count,
@@ -1346,8 +1344,8 @@ pub fn build_turn_evaluation_journal_event(
     session_id: Option<&str>,
     turn: Option<u32>,
     source: &str,
-    input: &str,
-    recent_tools: &[String],
+    _input: &str,
+    _recent_tools: &[String],
     tool_call_records: &[ToolCallRecord],
     stall_count: usize,
     verdict_warning: bool,
@@ -1358,7 +1356,7 @@ pub fn build_turn_evaluation_journal_event(
         session_id,
         turn,
         source,
-        looks_like_live_query_with_context(input, recent_tools),
+        false,
         eval.success,
         eval.quality,
         eval.confidence,
@@ -1590,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_tool_call_records_reuses_live_query_heuristic() {
+    fn evaluate_tool_call_records_does_not_infer_live_query_from_text() {
         let eval = evaluate_tool_call_records(
             "Check the latest git status",
             &["git".to_string()],
@@ -1599,8 +1597,8 @@ mod tests {
             false,
             0.2,
         );
-        assert!(!eval.success);
-        assert!(eval.signals.contains(&EvalSignal::NoToolsNeeded));
+        assert!(eval.success);
+        assert!(!eval.signals.contains(&EvalSignal::NoToolsNeeded));
     }
 
     #[test]
@@ -1717,7 +1715,7 @@ mod tests {
         assert_eq!(event.event_type, JournalEventType::TurnEvaluation);
         let metadata = event.metadata.expect("turn evaluation metadata");
         assert_eq!(metadata["source"], "cli_repl");
-        assert_eq!(metadata["live_query"], true);
+        assert_eq!(metadata["live_query"], false);
         assert_eq!(metadata["tool_call_count"], 1);
         assert_eq!(metadata["signal_count"], 2);
         assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");

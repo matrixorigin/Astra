@@ -8799,8 +8799,8 @@ mod tests {
     #[test]
     fn correction_keywords_trigger_was_corrected_via_implicit_feedback() {
         // Sanity-check that the detect_implicit_feedback_signal contract used in
-        // record_server_loop_learning_outcome produces a "correction" signal
-        // for the Chinese-language corrections listed in routing::detect_correction.
+        // record_server_loop_learning_outcome still recognizes Chinese-language
+        // user corrections.
         let signal = astra_turn_types::detect_implicit_feedback_signal(
             "不对，你搞错了",
             Some("previous assistant reply"),
@@ -10848,7 +10848,7 @@ mod tests {
         assert_eq!(event.turn, None);
         let metadata = event.metadata.expect("turn evaluation metadata");
         assert_eq!(metadata["source"], "server_runtime");
-        assert_eq!(metadata["live_query"], true);
+        assert_eq!(metadata["live_query"], false);
         assert_eq!(metadata["stall_count"], 1);
         assert_eq!(metadata["verdict_warning"], true);
         assert_eq!(metadata["tool_call_count"], 1);

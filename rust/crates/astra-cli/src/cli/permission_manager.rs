@@ -581,10 +581,11 @@ pub(crate) struct PermissionSettings {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
-    /// Hard-boundary opt-in: allow Auto mode to bypass approval for sensitive
+    /// Hard-boundary opt-in: allow Auto mode to auto-resolve sensitive
     /// file paths (e.g. `.git/`, `.ssh/`, shell configs). Default `false` —
-    /// even in Auto mode, sensitive-path writes require explicit approval
-    /// unless the user sets this to `true` at project or user scope.
+    /// Auto mode fails closed on sensitive-path writes unless the user sets
+    /// this to `true` at project or user scope. Bypass mode skips that prompt
+    /// axis directly; absolute hard-denies still run first.
     #[serde(default)]
     pub allow_sensitive_path_writes: bool,
 }
@@ -2203,7 +2204,7 @@ impl PermissionManager {
         }
     }
 
-    /// Check persistent deny rules (inherited + project + user, bypass-immune).
+    /// Check persistent deny rules (inherited + project + user) before mode shortcuts.
     fn check_deny_rules(&self, name: &str, args: &serde_json::Value) -> bool {
         let ctx = astra_turn_core::permission::types::RuleMatchContext::from_tool_args(name, args);
         // Check inherited deny rules first (from parent agent)
@@ -2972,7 +2973,7 @@ impl PermissionManager {
     /// Only used by tests; production code uses [`check_nonblocking()`].
     #[cfg(test)]
     pub(crate) fn check(&mut self, name: &str, args: &serde_json::Value) -> bool {
-        // Step 1: Deny rules are bypass-immune (checked first, even with auto_approve).
+        // Step 1: Deny rules are checked first, before auto/bypass shortcuts.
         if self.check_deny_rules(name, args) {
             eprintln!("{}", format!("  ✗  Denied by rule: {name}").red());
             return false;
@@ -2980,9 +2981,9 @@ impl PermissionManager {
 
         let side_effect = Self::classify_with_args(name, args);
 
-        // Step 2: Git safety checks.
-        // Hard violations always require explicit approval.
-        // Soft violations (cd+git, commit --amend) respect auto mode and session overrides.
+        // Step 2: Git safety approval gate.
+        // Broad overrides cannot skip this gate. Bypass mode can resolve it
+        // without prompting; Auto only resolves soft findings.
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
@@ -3013,7 +3014,8 @@ impl PermissionManager {
                         return allowed;
                     }
                 }
-                // Hard violations: always require explicit approval.
+                // Hard git findings still require explicit approval in Auto.
+                // Bypass is the explicit "do not interrupt me" mode.
                 if self.mode == PermissionMode::Auto && has_hard {
                     eprintln!(
                         "  {}",
@@ -3029,7 +3031,7 @@ impl PermissionManager {
             }
         }
 
-        // Step 3: Dangerous file path check (bypass-immune).
+        // Step 3: Sensitive path approval gate.
         if let Some(warning) = Self::check_dangerous_path(name, args) {
             eprintln!("  {}", warning.yellow());
             if matches!(self.mode, PermissionMode::Plan | PermissionMode::Deny) {
@@ -3077,8 +3079,9 @@ impl PermissionManager {
             return true;
         }
 
-        // Step 5: Session overrides (AFTER bypass-immune safety checks, BEFORE
-        // explicit-approval and mode gating so a prior approval isn't re-prompted).
+        // Step 5: Session overrides (after safety approval gates, before
+        // explicit-approval and mode gating so a prior exact approval isn't
+        // re-prompted).
         if let Some(allowed) =
             self.check_overrides_any(&approval_lookup_fingerprint_candidates(name, args))
         {
@@ -5006,7 +5009,7 @@ mod tests {
 
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let args = serde_json::json!({"command": "rm -rf /"});
-        // Even in auto mode, deny rules are bypass-immune
+        // Even in auto mode, deny rules run before approval shortcuts.
         assert!(!pm.check("bash", &args));
     }
 
@@ -5526,19 +5529,43 @@ mod tests {
     // ── Security: session overrides cannot bypass safety checks ──────────────
 
     #[test]
-    fn session_override_cannot_bypass_git_safety() {
-        // CRITICAL: Even if user previously approved "bash", dangerous git
-        // operations must still require manual approval.
+    fn broad_session_override_cannot_bypass_git_safety() {
+        // CRITICAL: a broad "bash" approval must not cover destructive git.
+        // Only an exact command approval can reuse this gate.
         let mut pm = PermissionManager::new(true); // auto mode
         pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({
             "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
         });
-        // Must NOT be Allow — git safety is bypass-immune
+        // Must NOT be Allow in Auto; broad overrides are too wide here.
         let decision = pm.check_nonblocking("bash", &args);
         assert!(
             matches!(decision, GateOutcome::NeedApproval { .. }),
-            "session override must not bypass git safety: got {decision:?}"
+            "broad session override must not bypass git safety: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn exact_session_override_allows_same_bounded_git_safety_request_only() {
+        let mut pm = PermissionManager::new(true); // auto mode
+        let args = serde_json::json!({
+            "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
+        });
+        pm.record_approval_with_match_target("bash", &args, &AllowMatchTarget::Exact, true);
+
+        let decision = pm.check_nonblocking("bash", &args);
+        assert!(
+            matches!(decision, GateOutcome::Allow),
+            "exact git approval should cover the same command: got {decision:?}"
+        );
+
+        let sibling = serde_json::json!({
+            "command": "git restore --staged --worktree rust/crates/foo/src/other.rs"
+        });
+        let sibling_decision = pm.check_nonblocking("bash", &sibling);
+        assert!(
+            matches!(sibling_decision, GateOutcome::NeedApproval { .. }),
+            "exact git approval must not widen to sibling commands: got {sibling_decision:?}"
         );
     }
 
@@ -5676,7 +5703,7 @@ mod tests {
     }
 
     #[test]
-    fn check_session_override_cannot_bypass_git_safety() {
+    fn check_session_override_cannot_bypass_dangerous_command() {
         // Same test for the synchronous check() path
         let mut pm = PermissionManager::new(true);
         pm.session_overrides.insert(bare_fp("bash"), true);

@@ -675,12 +675,12 @@ pub(crate) async fn complete_session_startup(
     if state.perm_manager.mode() == permission_manager::PermissionMode::Auto {
         eprintln!(
             "{}",
-            "  🔓 Auto mode is ON — normal tool risk is auto-approved; hard prompts may still appear.".dim()
+            "  🔓 Auto mode is ON — normal tool risk is auto-approved; some git/sensitive gates may still stop.".dim()
         );
     } else if state.perm_manager.mode() == permission_manager::PermissionMode::Bypass {
         eprintln!(
             "{}",
-            "  🔓 Bypass mode is ON — approval prompts are skipped; hard denies still apply.".dim()
+            "  🔓 Bypass mode is ON — approval prompts are skipped; catastrophic and policy hard-denies still apply.".dim()
         );
     }
 

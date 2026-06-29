@@ -507,7 +507,7 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
     check_shell_command_safety_with_mode(command, TrustMode::Strict)
 }
 
-/// Catastrophic command circuit breaker — bypass-immune, not configurable.
+/// Catastrophic command circuit breaker — absolute safety guard, not configurable.
 ///
 /// These specific patterns must always be denied. They are unrecoverable
 /// (delete the user's home, the whole disk, fork-bomb the machine).
@@ -603,7 +603,7 @@ pub fn catastrophic_command_reason(command: &str) -> Option<String> {
 /// configurable.
 #[must_use]
 pub fn check_shell_command_safety_with_mode(command: &str, mode: TrustMode) -> Option<String> {
-    // 0. Catastrophic command circuit breaker — bypass-immune and not
+    // 0. Catastrophic command circuit breaker — absolute safety guard and not
     //    configurable.
     if let Some(reason) = catastrophic_command_reason(command) {
         return Some(reason);

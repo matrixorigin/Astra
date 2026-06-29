@@ -6,6 +6,8 @@
 use serde_json::Value;
 use std::collections::HashSet;
 
+use crate::tool::registry::meta::{IntentType, tool_meta};
+
 /// Canonical name of the ask-user tool.
 pub const ASK_USER_TOOL_NAME: &str = "ask_user";
 
@@ -140,10 +142,46 @@ pub fn interaction_scoped_tool_restrictions(mode: TurnInteractionMode) -> HashSe
     }
 }
 
-/// Whether a tool invocation counts as factual evidence (all tools except ask_user).
+/// Whether a tool invocation counts as factual evidence for post-hoc live-data retry.
+///
+/// Evidence means the tool observes user/world/workspace data. Control-plane
+/// and runtime-self-observation tools are useful for agent steering, but they
+/// should not make a forced factual retry overwrite a good first answer.
 #[must_use]
 pub fn tool_counts_as_factual_evidence(tool_name: &str) -> bool {
-    tool_name != ASK_USER_TOOL_NAME
+    if tool_name == ASK_USER_TOOL_NAME {
+        return false;
+    }
+    if matches!(
+        tool_name,
+        "introspect"
+            | "tool_search"
+            | "compress_context"
+            | "rollback_session_state"
+            | "enter_plan_mode"
+            | "exit_plan_mode"
+    ) {
+        return false;
+    }
+    if let Some(meta) = tool_meta(tool_name) {
+        if meta.intents.contains(&IntentType::Introspect) {
+            return false;
+        }
+        if !meta.intents.iter().any(|intent| {
+            matches!(
+                intent,
+                IntentType::CodeRead
+                    | IntentType::CodeEdit
+                    | IntentType::Git
+                    | IntentType::GitHub
+                    | IntentType::Memory
+                    | IntentType::Database
+            )
+        }) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -202,5 +240,56 @@ mod tests {
         // NOT be the silencing mode. Silencing is opt-in via explicit
         // Auto.
         assert!(!TurnInteractionMode::default().suppresses_loop_nudges());
+    }
+
+    #[test]
+    fn runtime_control_tools_do_not_count_as_factual_evidence() {
+        for name in [
+            ASK_USER_TOOL_NAME,
+            "introspect",
+            "reflect",
+            "session",
+            "tool_search",
+            "compress_context",
+            "rollback_session_state",
+            "enter_plan_mode",
+            "exit_plan_mode",
+        ] {
+            assert!(
+                !tool_counts_as_factual_evidence(name),
+                "{name} must not satisfy factual-retry evidence"
+            );
+        }
+
+        for name in [
+            "read_file",
+            "grep",
+            "glob",
+            "bash",
+            "git",
+            "github",
+            "mo_query",
+        ] {
+            assert!(
+                tool_counts_as_factual_evidence(name),
+                "{name} should count as factual-retry evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn interaction_policy_excludes_control_tools_from_evidence_list() {
+        let policy = TurnInteractionPolicy::from_visible_tool_names(
+            TurnInteractionMode::Auto,
+            vec![
+                "introspect".into(),
+                "read_file".into(),
+                "ask_user".into(),
+                "grep".into(),
+            ],
+        );
+
+        assert_eq!(policy.evidence_tool_names, vec!["read_file", "grep"]);
+        assert!(policy.has_evidence_tools());
     }
 }

@@ -23,9 +23,9 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
-    /// Auto-approve all tools (except bypass-immune safety checks).
+    /// Auto-resolve ordinary approval prompts; git/sensitive gates may still stop.
     Auto,
-    /// Skip human approval prompts; hard safety denies and policy allowlists still apply.
+    /// Skip human approval prompts; absolute safety denies and policy allowlists still apply.
     Bypass,
     /// Read-only investigation/planning mode: allow read tools, deny mutations.
     Plan,
@@ -47,7 +47,7 @@ pub enum ManualApprovalPolicy {
 }
 
 impl PermissionMode {
-    /// True when ordinary approval prompts should be skipped.
+    /// True when ordinary approval prompts can be resolved without blocking.
     ///
     /// This is the approval-interaction axis, not the safety-policy axis:
     /// hard denies and explicit deny/allowlist policy can still apply.
@@ -56,6 +56,9 @@ impl PermissionMode {
     }
 
     /// True for the explicit "do not interrupt me for approval" mode.
+    ///
+    /// This skips git/sensitive approval gates, but not absolute safety
+    /// denies, explicit deny rules, or child-agent allowlists.
     pub fn skips_human_approval_prompts(self) -> bool {
         matches!(self, Self::Bypass)
     }

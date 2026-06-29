@@ -86,6 +86,8 @@ pub struct AgenticTurnIngestMut<'a> {
     pub all_tools_used: &'a mut HashSet<String>,
     pub has_any_usage: &'a mut bool,
     pub forced_factual_retry: &'a mut bool,
+    pub factual_retry_fallback_text: &'a mut Option<String>,
+    pub factual_retry_fallback_decision: Option<FactualRetryFallbackDecision>,
     pub messages: &'a mut Vec<Value>,
     /// See [`crate::agentic_loop_host_types::AgenticLoopState::last_measured_prompt_tokens`].
     pub last_measured_prompt_tokens: &'a mut Option<u64>,
@@ -101,6 +103,119 @@ pub enum AgenticTurnIngestOutcome {
     Continue,
     Fatal(astra_core::ClassifiedError),
     HasToolCalls,
+}
+
+/// Explicit response-selection decision for a factual retry with no real
+/// evidence. This is intentionally an input to ingest, not computed inside it:
+/// only an upstream judge/policy layer may decide that the pre-retry answer is
+/// better than the retry output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactualRetryFallbackDecision {
+    RestoreFallback,
+    KeepRetry,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FactualRetryFallbackJudgeInput<'a> {
+    pub original_query: &'a str,
+    pub fallback_text: &'a str,
+    pub retry_text: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactualRetryFallbackJudgeVerdict {
+    pub decision: FactualRetryFallbackDecision,
+    pub confidence: f64,
+    pub reason: Option<String>,
+}
+
+impl FactualRetryFallbackJudgeVerdict {
+    #[must_use]
+    pub fn accepted_decision(&self) -> FactualRetryFallbackDecision {
+        if self.decision == FactualRetryFallbackDecision::RestoreFallback
+            && self.confidence < FACTUAL_RETRY_FALLBACK_MIN_CONFIDENCE
+        {
+            FactualRetryFallbackDecision::KeepRetry
+        } else {
+            self.decision
+        }
+    }
+}
+
+pub const FACTUAL_RETRY_FALLBACK_MIN_CONFIDENCE: f64 = 0.70;
+
+#[must_use]
+pub fn factual_retry_fallback_judge_messages(
+    input: FactualRetryFallbackJudgeInput<'_>,
+) -> Vec<Value> {
+    vec![
+        serde_json::json!({
+            "role": "system",
+            "content": "You are a response-selection judge for an agentic coding assistant. \
+                Choose which assistant answer should be shown to the user after a forced factual retry. \
+                Output only JSON."
+        }),
+        serde_json::json!({
+            "role": "user",
+            "content": format!(
+                "The assistant first answered without tools. The runtime forced a retry, but the retry gathered no real evidence tools.\n\n\
+                 Original user query:\n{original_query}\n\n\
+                 Candidate A: original text-only answer before retry:\n{fallback_text}\n\n\
+                 Candidate B: answer produced by the retry:\n{retry_text}\n\n\
+                 Decide which candidate should be shown.\n\n\
+                 Rules:\n\
+                 - Return restore_fallback only when Candidate A clearly answers the user's actual question and Candidate B does not.\n\
+                 - Return keep_retry when Candidate B answers the question, correctly admits lack of evidence, or when Candidate A makes an unverifiable live-data claim.\n\
+                 - Return keep_retry when uncertain.\n\n\
+                 Output JSON exactly like:\n\
+                 {{\"decision\":\"restore_fallback\"|\"keep_retry\",\"confidence\":0.0,\"reason\":\"short reason\"}}",
+                original_query = input.original_query,
+                fallback_text = input.fallback_text,
+                retry_text = input.retry_text,
+            )
+        }),
+    ]
+}
+
+pub fn parse_factual_retry_fallback_judge_response(
+    raw: &str,
+) -> Result<FactualRetryFallbackJudgeVerdict, String> {
+    let json_text = extract_first_json_object(raw)
+        .ok_or_else(|| format!("judge response did not contain a JSON object: {raw}"))?;
+    let value: Value = serde_json::from_str(json_text)
+        .map_err(|err| format!("judge response was not valid JSON: {err}: {raw}"))?;
+    let decision = match value.get("decision").and_then(Value::as_str) {
+        Some("restore_fallback") => FactualRetryFallbackDecision::RestoreFallback,
+        Some("keep_retry") => FactualRetryFallbackDecision::KeepRetry,
+        other => {
+            return Err(format!(
+                "judge response had invalid decision {other:?}: {raw}"
+            ));
+        }
+    };
+    let confidence = value
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("judge response missing numeric confidence: {raw}"))?
+        .clamp(0.0, 1.0);
+    let reason = value
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+
+    Ok(FactualRetryFallbackJudgeVerdict {
+        decision,
+        confidence,
+        reason,
+    })
+}
+
+fn extract_first_json_object(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    (start <= end).then_some(&raw[start..=end])
 }
 
 /// Maps [`AgenticTurnIngestOutcome`] to multi-turn loop control (hosts map break/continue to their enums).
@@ -254,6 +369,26 @@ pub fn ingest_agentic_turn_stream(
     }
 
     if !round_has_edge_work {
+        if *st.forced_factual_retry
+            && *st.total_evidence_tool_calls == 0
+            && st
+                .factual_retry_fallback_text
+                .as_ref()
+                .is_some_and(|text| !text.trim().is_empty())
+            && matches!(
+                st.factual_retry_fallback_decision,
+                Some(FactualRetryFallbackDecision::RestoreFallback)
+            )
+        {
+            let fallback_text = st
+                .factual_retry_fallback_text
+                .take()
+                .expect("fallback presence checked before restore");
+            *st.final_text = fallback_text;
+            persist_final_assistant_message(st.messages, st.final_text.as_str());
+            record_prompt_calibration_success(snap, &mut st);
+            return AgenticTurnIngestOutcome::Break;
+        }
         if should_force_factual_tool_retry(
             st.task_profile,
             message,
@@ -263,8 +398,11 @@ pub fn ingest_agentic_turn_stream(
             &st.turn_policy,
         ) {
             *st.forced_factual_retry = true;
+            if !st.final_text.trim().is_empty() {
+                *st.factual_retry_fallback_text = Some(st.final_text.clone());
+            }
             if !quiet {
-                eprintln!("  ↻ No tool call on a live-data query; forcing one corrective retry…");
+                eprintln!("  ↻ Explicit evidence retry requested; forcing one corrective retry…");
             }
             st.messages.push(openai_factual_tool_retry_user_message(
                 message,
@@ -277,6 +415,7 @@ pub fn ingest_agentic_turn_stream(
         if !snap.full_text.is_empty() {
             persist_final_assistant_message(st.messages, st.final_text.as_str());
         }
+        st.factual_retry_fallback_text.take();
         record_prompt_calibration_success(snap, &mut st);
         return AgenticTurnIngestOutcome::Break;
     }
@@ -333,10 +472,13 @@ mod tests {
         all_tools_used: HashSet<String>,
         has_any_usage: bool,
         forced_factual_retry: bool,
+        factual_retry_fallback_text: Option<String>,
+        factual_retry_fallback_decision: Option<FactualRetryFallbackDecision>,
         messages: Vec<Value>,
         last_measured_prompt_tokens: Option<u64>,
         consecutive_context_window_errors: u32,
         turn_policy: TurnInteractionPolicy,
+        task_profile: TaskExecutionProfile,
     }
 
     impl Pack {
@@ -356,6 +498,8 @@ mod tests {
                 all_tools_used: HashSet::new(),
                 has_any_usage: false,
                 forced_factual_retry: false,
+                factual_retry_fallback_text: None,
+                factual_retry_fallback_decision: None,
                 messages: Vec::new(),
                 last_measured_prompt_tokens: None,
                 consecutive_context_window_errors: 0,
@@ -363,6 +507,7 @@ mod tests {
                     TurnInteractionMode::Deny,
                     vec!["read_file".into()],
                 ),
+                task_profile: TaskExecutionProfile::default(),
             }
         }
 
@@ -375,7 +520,7 @@ mod tests {
             step_persistence_enabled: bool,
         ) -> AgenticTurnIngestMut<'_> {
             AgenticTurnIngestMut {
-                task_profile: TaskExecutionProfile::default(),
+                task_profile: self.task_profile,
                 step_persistence_enabled,
                 first_ttft_ms: &mut self.first_ttft_ms,
                 current_session_id: &mut self.current_session_id,
@@ -391,6 +536,8 @@ mod tests {
                 all_tools_used: &mut self.all_tools_used,
                 has_any_usage: &mut self.has_any_usage,
                 forced_factual_retry: &mut self.forced_factual_retry,
+                factual_retry_fallback_text: &mut self.factual_retry_fallback_text,
+                factual_retry_fallback_decision: self.factual_retry_fallback_decision,
                 messages: &mut self.messages,
                 last_measured_prompt_tokens: &mut self.last_measured_prompt_tokens,
                 consecutive_context_window_errors: &mut self.consecutive_context_window_errors,
@@ -496,6 +643,54 @@ mod tests {
             map_ingest_outcome_to_iteration_control(AgenticTurnIngestOutcome::HasToolCalls),
             AgenticIngestIterationControl::ProceedWithToolCalls
         );
+    }
+
+    #[test]
+    fn factual_retry_fallback_judge_prompt_and_parser_contract() {
+        let messages = factual_retry_fallback_judge_messages(FactualRetryFallbackJudgeInput {
+            original_query: "what do 59% and 117k mean?",
+            fallback_text: "59% is context usage; 117k is token count.",
+            retry_text: "I completed the requested work.",
+        });
+        assert_eq!(messages.len(), 2);
+        let prompt = messages[1]["content"].as_str().unwrap();
+        assert!(prompt.contains("Original user query"));
+        assert!(prompt.contains("Candidate A"));
+        assert!(prompt.contains("Candidate B"));
+        assert!(prompt.contains("\"decision\":\"restore_fallback\"|\"keep_retry\""));
+
+        let verdict = parse_factual_retry_fallback_judge_response(
+            r#"```json
+            {"decision":"restore_fallback","confidence":0.91,"reason":"A answers the question"}
+            ```"#,
+        )
+        .expect("valid judge JSON");
+        assert_eq!(
+            verdict.accepted_decision(),
+            FactualRetryFallbackDecision::RestoreFallback
+        );
+        assert_eq!(verdict.reason.as_deref(), Some("A answers the question"));
+    }
+
+    #[test]
+    fn factual_retry_fallback_judge_low_confidence_restore_fails_closed() {
+        let verdict = parse_factual_retry_fallback_judge_response(
+            r#"{"decision":"restore_fallback","confidence":0.41}"#,
+        )
+        .expect("valid judge JSON");
+        assert_eq!(
+            verdict.accepted_decision(),
+            FactualRetryFallbackDecision::KeepRetry
+        );
+    }
+
+    #[test]
+    fn factual_retry_fallback_judge_rejects_malformed_decisions() {
+        let err = parse_factual_retry_fallback_judge_response(
+            r#"{"decision":"maybe","confidence":0.99}"#,
+        )
+        .expect_err("unknown decisions must fail closed");
+        assert!(err.contains("invalid decision"), "{err}");
     }
 
     #[test]
@@ -775,8 +970,9 @@ mod tests {
 
     #[test]
     fn factual_retry_injects_nudge_and_clears_text() {
-        // When LLM answers a live-data query with zero tool calls,
-        // ingest should inject a retry nudge and return Continue.
+        // When policy explicitly requires factual retry and the LLM produced no
+        // evidence tool calls, ingest should inject a retry nudge and return
+        // Continue.
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: Some(50),
             session_id: &None,
@@ -792,6 +988,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
+        pack.task_profile.allow_factual_retry = true;
         let out = ingest_agentic_turn_stream(
             &snap,
             0,
@@ -803,6 +1000,10 @@ mod tests {
         );
         assert_eq!(out, AgenticTurnIngestOutcome::Continue);
         assert!(pack.forced_factual_retry, "flag should be set");
+        assert_eq!(
+            pack.factual_retry_fallback_text.as_deref(),
+            Some("Here are your recent PRs: ...")
+        );
         assert!(pack.final_text.is_empty(), "text should be cleared");
         assert_eq!(pack.last_measured_prompt_tokens, Some(100));
         assert_eq!(pack.messages.len(), 1, "nudge message should be injected");
@@ -814,6 +1015,240 @@ mod tests {
                 .unwrap()
                 .contains("Runtime correction"),
         );
+    }
+
+    #[test]
+    fn factual_retry_restores_original_when_no_evidence_retry_drops_the_question() {
+        let original = "59% is context usage; 117k is the token count.";
+        let query = "what do 59% and 117k mean in the status line?";
+        let mut pack = Pack::new();
+        pack.forced_factual_retry = true;
+        pack.factual_retry_fallback_text = Some(original.to_string());
+        pack.factual_retry_fallback_decision = Some(FactualRetryFallbackDecision::RestoreFallback);
+
+        let tool_round = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let out = ingest_agentic_turn_stream(
+            &tool_round,
+            1,
+            |_| "introspect".to_string(),
+            query,
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
+        assert_eq!(
+            pack.total_evidence_tool_calls, 0,
+            "introspect is runtime self-observation, not factual evidence"
+        );
+
+        let retry_final = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "I completed the requested work and no further action is needed.",
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let out = ingest_agentic_turn_stream(
+            &retry_final,
+            0,
+            |_| String::new(),
+            query,
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert_eq!(pack.final_text, original);
+        assert_eq!(pack.factual_retry_fallback_text, None);
+        assert_eq!(pack.messages.last().unwrap()["role"], "assistant");
+        assert_eq!(pack.messages.last().unwrap()["content"], original);
+    }
+
+    #[test]
+    fn factual_retry_accepts_direct_retry_answer_after_control_plane_tools() {
+        let original = "59% is context usage; 117k is the token count.";
+        let query = "what do 59% and 117k mean in the status line?";
+        let corrected = "59% is the context-window usage; 117k is the current token count.";
+        let mut pack = Pack::new();
+        pack.forced_factual_retry = true;
+        pack.factual_retry_fallback_text = Some(original.to_string());
+
+        let tool_round = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let out = ingest_agentic_turn_stream(
+            &tool_round,
+            1,
+            |_| "introspect".to_string(),
+            query,
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
+        assert_eq!(pack.total_evidence_tool_calls, 0);
+
+        let retry_final = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: corrected,
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let out = ingest_agentic_turn_stream(
+            &retry_final,
+            0,
+            |_| String::new(),
+            query,
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert_eq!(pack.final_text, corrected);
+        assert_eq!(pack.factual_retry_fallback_text, None);
+        assert_eq!(pack.messages.last().unwrap()["content"], corrected);
+    }
+
+    #[test]
+    fn factual_retry_does_not_restore_unverified_live_data_answer_without_evidence() {
+        let original = "The latest CI is green.";
+        let query = "latest CI?";
+        let retry = "I could not verify that from the available evidence.";
+        let mut pack = Pack::new();
+        pack.forced_factual_retry = true;
+        pack.factual_retry_fallback_text = Some(original.to_string());
+
+        let retry_final = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: retry,
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let out = ingest_agentic_turn_stream(
+            &retry_final,
+            0,
+            |_| String::new(),
+            query,
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert_eq!(pack.final_text, retry);
+        assert_eq!(pack.factual_retry_fallback_text, None);
+        assert_eq!(pack.messages.last().unwrap()["content"], retry);
+    }
+
+    #[test]
+    fn factual_retry_accepts_retry_answer_after_real_evidence_tool() {
+        let original = "The CI is green.";
+        let query = "最新的一个ci?";
+        let mut pack = Pack::new();
+        pack.forced_factual_retry = true;
+        pack.factual_retry_fallback_text = Some(original.to_string());
+
+        let tool_round = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let out = ingest_agentic_turn_stream(
+            &tool_round,
+            1,
+            |_| "github".to_string(),
+            query,
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
+        assert_eq!(pack.total_evidence_tool_calls, 1);
+
+        let corrected = "The latest CI is failing.";
+        let retry_final = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: corrected,
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let out = ingest_agentic_turn_stream(
+            &retry_final,
+            0,
+            |_| String::new(),
+            query,
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert_eq!(pack.final_text, corrected);
+        assert_eq!(pack.factual_retry_fallback_text, None);
+        assert_eq!(pack.messages.last().unwrap()["content"], corrected);
     }
 
     #[test]
@@ -902,6 +1337,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
+        pack.task_profile.allow_factual_retry = true;
         pack.total_tool_calls = 1; // ask_user was called previously
         let out = ingest_agentic_turn_stream(
             &snap,
@@ -955,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn factual_retry_works_for_chinese_workspace_queries() {
+    fn factual_retry_does_not_infer_chinese_workspace_queries_from_text() {
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: None,
             session_id: &None,
@@ -980,9 +1416,9 @@ mod tests {
             true,
             pack.ingest_mut(),
         );
-        assert_eq!(out, AgenticTurnIngestOutcome::Continue);
-        assert!(pack.forced_factual_retry);
-        assert!(pack.final_text.is_empty());
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert!(!pack.forced_factual_retry);
+        assert_eq!(pack.final_text, "代码看起来很好...");
         assert_eq!(pack.messages.len(), 1);
     }
 

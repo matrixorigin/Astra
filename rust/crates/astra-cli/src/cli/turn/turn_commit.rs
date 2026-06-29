@@ -496,7 +496,7 @@ mod tests {
         assert_eq!(event.turn, Some(1));
         let metadata = event.metadata.as_ref().expect("turn evaluation metadata");
         assert_eq!(metadata["source"], "cli_repl");
-        assert_eq!(metadata["live_query"], true);
+        assert_eq!(metadata["live_query"], false);
         assert_eq!(metadata["success"], true);
         assert_eq!(metadata["tool_call_count"], 1);
         assert_eq!(metadata["signal_count"], 2);

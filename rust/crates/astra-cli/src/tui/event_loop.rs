@@ -1661,59 +1661,6 @@ pub(crate) async fn run_tui_session(
                                                 );
                                             }
                                         }
-                                        if looks_like_implicit_plan_request(&submit_text) {
-                                        let before = capture_plan_mode_ui_snapshot(&state);
-                                        let Some(token) =
-                                            crate::cli::plan::plan_lifecycle::fresh_token_for_plan(api, profile)
-                                                .await
-                                        else {
-                                            chat_widget.commit_system(
-                                                history_cell::system::SystemCell::error(
-                                                    "Not logged in. Use /login.",
-                                                ),
-                                            );
-                                            refresh_footer_from_state(&mut bottom_pane, &state);
-                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                            frame_requester.schedule_frame();
-                                            continue;
-                                        };
-                                        match crate::cli::plan::plan_lifecycle::enter_remote_plan_mode(
-                                            api,
-                                            profile,
-                                            &token,
-                                            &mut state,
-                                            &submit_text,
-                                        )
-                                        .await
-                                        {
-                                            Ok(_) => {
-                                                commit_plan_transition_notice(
-                                                    &mut chat_widget,
-                                                    &before,
-                                                    &state,
-                                                    true,
-                                                );
-                                                if let Some(ref sid) = state.session_id
-                                                    && chat_widget.session_id() != sid
-                                                {
-                                                    chat_widget.set_session_id(sid.clone());
-                                                    task_board.rebind_session(sid.clone());
-                                                    board_user_pin = None;
-                                                }
-                                                refresh_footer_from_state(&mut bottom_pane, &state);
-                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                            }
-                                            Err(e) => {
-                                                chat_widget.commit_system(
-                                                    history_cell::system::SystemCell::error(e),
-                                                );
-                                                refresh_footer_from_state(&mut bottom_pane, &state);
-                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                                frame_requester.schedule_frame();
-                                                continue;
-                                            }
-                                        }
-                                        }
                                     }
 
                                     bottom_pane.set_task_status(TaskStatus::WaitingModel);
@@ -5406,26 +5353,6 @@ mod tests {
     }
 
     #[test]
-    fn implicit_plan_request_detector_accepts_actionable_prompts() {
-        assert!(looks_like_implicit_plan_request(
-            "帮我计划在/tmp下生成一个报销系统"
-        ));
-        assert!(looks_like_implicit_plan_request(
-            "help me plan how to refactor the auth middleware"
-        ));
-        assert!(looks_like_implicit_plan_request(
-            "please plan how to migrate this service to Axum"
-        ));
-    }
-
-    #[test]
-    fn implicit_plan_request_detector_rejects_meta_plan_questions() {
-        assert!(!looks_like_implicit_plan_request("现在plan是怎么工作的?"));
-        assert!(!looks_like_implicit_plan_request("what is /plan mode?"));
-        assert!(!looks_like_implicit_plan_request("/plan"));
-    }
-
-    #[test]
     fn plan_transition_notice_covers_enter_goal_and_exit() {
         let inactive = PlanModeUiSnapshot::default();
         let entered_empty = PlanModeUiSnapshot {
@@ -5465,7 +5392,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_input_routes_plan_mode_and_implicit_plan_requests_before_chat_turn() {
+    fn submit_input_routes_only_explicit_plan_mode_before_chat_turn() {
         let source = include_str!("event_loop.rs");
         let arm_start = source
             .find("BottomPaneAction::SubmitInput(text) => {")
@@ -5481,31 +5408,14 @@ mod tests {
             "/plan <goal> should pre-enter remote plan mode before the chat turn"
         );
         assert!(
-            arm.contains("looks_like_implicit_plan_request(&submit_text)")
-                && arm.contains("crate::cli::plan::plan_lifecycle::enter_remote_plan_mode("),
-            "plain planning requests should enter remote /plan semantics before normal chat turns"
-        );
-        assert!(
             arm.contains("crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(")
                 && arm.contains("crate::cli::plan::plan_lifecycle::enter_remote_plan_mode("),
             "the first plain message after bare /plan should bind remote plan mode and continue as chat"
         );
-
-        let implicit_start = arm
-            .find("if looks_like_implicit_plan_request(&submit_text)")
-            .expect("implicit plan request branch must exist");
-        let implicit_ok_start = arm[implicit_start..]
-            .find("Ok(_) => {")
-            .map(|offset| implicit_start + offset)
-            .expect("implicit plan request branch must have a success arm");
-        let implicit_err_start = arm[implicit_ok_start..]
-            .find("Err(e) =>")
-            .map(|offset| implicit_ok_start + offset)
-            .expect("implicit plan request branch must have an error arm");
-        let implicit_success_branch = &arm[implicit_ok_start..implicit_err_start];
         assert!(
-            !implicit_success_branch.contains("continue;"),
-            "successful implicit plan entry must fall through to the chat turn instead of swallowing input"
+            !arm.contains("looks_like_implicit_plan_request")
+                && !arm.contains("if submit_text.to_lowercase().contains(\"plan\")"),
+            "plain natural-language prompts must not toggle plan mode"
         );
     }
 

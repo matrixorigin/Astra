@@ -523,14 +523,13 @@ Set permission mode for tool execution.
 
 | Mode                                     | Description                   |
 | ---------------------------------------- | ----------------------------- |
-| `auto`                                   | Auto-approve normal tool risk |
-| `all`                                    | Alias for auto                |
-| `bypass` / `skip`                        | Skip approval prompts; hard denies still apply |
-| `plan`                                   | Read-only investigation mode  |
-| `accept_edits` / `accept-edits` / `edit` | Auto-approve local file edits |
-| `prompt`                                 | Prompt before each tool       |
-| `deny`                                   | Deny all tool use             |
-| `rules`                                  | Show current permission rules |
+| `auto`            | Auto-approve normal tool risk; some git/sensitive gates may still stop |
+| `bypass` / `skip` | Skip approval prompts; catastrophic and policy hard-denies still apply |
+| `plan`            | Read-only investigation mode  |
+| `accept_edits`    | Auto-approve local file edits |
+| `prompt`          | Prompt before each tool       |
+| `deny`            | Deny all tool use             |
+| `rules`           | Show current permission rules |
 
 ```
 /allow auto      # Auto-approve normal tool risk

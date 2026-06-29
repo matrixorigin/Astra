@@ -36,8 +36,8 @@ use crate::server::tool_transport::{
 };
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
-    AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode, TurnInteractionPolicy,
-    interaction_scoped_tool_restrictions,
+    AgenticLoopHost, AgenticLoopState, FactualRetryFallbackJudgeContext, HostTurnResult,
+    TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
 };
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge::llm_stream::rate_limit_cooldown;
@@ -55,6 +55,10 @@ use astra_services::multi_agent::EdgeDispatchService;
 use astra_services::runs::RequestedTurnInteractionMode;
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, SharedAgentLiveEventSink,
+};
+use astra_turn_core::agentic_turn_ingest::{
+    FactualRetryFallbackDecision, FactualRetryFallbackJudgeInput,
+    factual_retry_fallback_judge_messages, parse_factual_retry_fallback_judge_response,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
@@ -3159,6 +3163,40 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 .await
             }
             None => None,
+        }
+    }
+
+    async fn judge_factual_retry_fallback(
+        &mut self,
+        ctx: FactualRetryFallbackJudgeContext<'_>,
+    ) -> Option<FactualRetryFallbackDecision> {
+        let client = self.summary_client()?;
+        let messages = factual_retry_fallback_judge_messages(FactualRetryFallbackJudgeInput {
+            original_query: ctx.original_query,
+            fallback_text: ctx.fallback_text,
+            retry_text: ctx.retry_text,
+        });
+        let response = match client.summarize(&messages).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra::factual_retry_judge",
+                    error = %error,
+                    "factual retry fallback judge unavailable; keeping retry output"
+                );
+                return None;
+            }
+        };
+        match parse_factual_retry_fallback_judge_response(response.text.as_str()) {
+            Ok(verdict) => Some(verdict.accepted_decision()),
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra::factual_retry_judge",
+                    error = %error,
+                    "factual retry fallback judge returned malformed output; keeping retry output"
+                );
+                None
+            }
         }
     }
 
@@ -8849,6 +8887,87 @@ mod tests {
             capture.path.lock().await.as_deref(),
             Some("/gateway/chat/completions")
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn factual_retry_fallback_judge_uses_llm_response_selection() {
+        use axum::{Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+
+        #[derive(Default)]
+        struct RequestCapture {
+            body: tokio::sync::Mutex<Option<Value>>,
+        }
+
+        async fn handler(
+            State(capture): State<Arc<RequestCapture>>,
+            request: axum::extract::Request,
+        ) -> axum::Json<Value> {
+            let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("read request body");
+            *capture.body.lock().await = Some(serde_json::from_slice(&bytes).expect("json body"));
+            axum::Json(json!({
+                "choices": [
+                    {
+                        "message": {
+                            "content": "{\"decision\":\"restore_fallback\",\"confidence\":0.94,\"reason\":\"candidate A answers the UI question\"}"
+                        },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let capture = Arc::new(RequestCapture::default());
+        let app = Router::new()
+            .route("/gateway/chat/completions", post(handler))
+            .with_state(capture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-judge".to_string(),
+            "session-judge".to_string(),
+        )
+        .build();
+        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
+            model_name: "gpt-4o-mini".to_string(),
+            api_key: String::new(),
+            base_url: format!("http://{addr}/gateway"),
+            provider: "openai".to_string(),
+            max_output_tokens: 128,
+        });
+
+        let decision = host
+            .judge_factual_retry_fallback(FactualRetryFallbackJudgeContext {
+                original_query: "what do 59% and 117k mean?",
+                fallback_text: "59% is context usage; 117k is token count.",
+                retry_text: "I completed the requested work.",
+            })
+            .await;
+
+        assert_eq!(
+            decision,
+            Some(FactualRetryFallbackDecision::RestoreFallback)
+        );
+        let body = capture.body.lock().await.clone().expect("judge request");
+        let messages = body["messages"].as_array().expect("messages");
+        let prompt = messages[1]["content"].as_str().expect("user prompt");
+        assert!(prompt.contains("Candidate A"));
+        assert!(prompt.contains("Candidate B"));
 
         server.abort();
     }

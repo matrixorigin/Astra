@@ -317,7 +317,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "状态",
             "健康度",
         ],
-        intents: &[IntentType::CodeRead],
+        intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
         binding_validation: RuntimeBindingValidation::None,
@@ -921,7 +921,7 @@ mod tests {
 
     #[test]
     fn catalog_includes_top_level_session_state_tools() {
-        for name in ["compress_context", "rollback_session_state"] {
+        for name in ["introspect", "compress_context", "rollback_session_state"] {
             let tool = TOOL_CATALOG
                 .iter()
                 .find(|tool| tool.name == name)

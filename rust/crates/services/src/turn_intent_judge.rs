@@ -106,7 +106,8 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
          {\n  \
             \"requested_scenario\": <scenario | null>,\n  \
             \"prohibited_scenarios\": [<scenario>, ...],   // may be empty\n  \
-            \"continuation_mode\": \"continue_current_objective\" | \"new_objective\" | \"unknown\"\n\
+            \"continuation_mode\": \"continue_current_objective\" | \"new_objective\" | \"unknown\",\n  \
+            \"reanchors_current_objective\": <boolean>\n\
          }\n\
          \n\
          scenario must be one of:\n\
@@ -120,20 +121,24 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
              * \"continue_current_objective\" only when the user explicitly asks to proceed, apply, fix, run, or continue prior work (e.g. \"go on\", \"fix it\", \"继续\").\n  \
              * \"new_objective\" when starting an unrelated task.\n  \
              * \"unknown\" for status/progress/why/what-remains questions unless the user also explicitly asks to execute more work.\n\
+         - reanchors_current_objective: true only when the user corrects, redirects, or supersedes the current approach/objective; false for ordinary continuation.\n\
          - Return ONLY the JSON. No prose, no markdown fences.\n\
          \n\
          Examples:\n\
          User: \"please inspect the current changes\"\n\
-         {\"requested_scenario\":\"code_review\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\"}\n\
+         {\"requested_scenario\":\"code_review\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false}\n\
          \n\
          User: \"fix it\" (after assistant proposed an implementation)\n\
-         {\"requested_scenario\":null,\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\"}\n\
+         {\"requested_scenario\":null,\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":false}\n\
          \n\
          User: \"还有什么？\" (after assistant was working on a task)\n\
-         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\"}\n\
+         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false}\n\
+         \n\
+         User: \"不对，我要的是系统性修复，不是临时补丁\"\n\
+         {\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":true}\n\
          \n\
          User: \"don't review this, just continue the implementation\"\n\
-         {\"requested_scenario\":\"implementation\",\"prohibited_scenarios\":[\"code_review\"],\"continuation_mode\":\"continue_current_objective\"}\n\
+         {\"requested_scenario\":\"implementation\",\"prohibited_scenarios\":[\"code_review\"],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":false}\n\
          \n",
     );
 
@@ -255,6 +260,19 @@ pub fn parse_turn_intent_response(raw: &str) -> Result<TurnIntent, TurnIntentJud
             })?;
     }
 
+    // reanchors_current_objective: optional, defaults to false. A missing
+    // value is fail-closed for the strong runtime reanchor behavior.
+    if let Some(reanchors) = value.get("reanchors_current_objective")
+        && !reanchors.is_null()
+    {
+        intent.reanchors_current_objective =
+            reanchors
+                .as_bool()
+                .ok_or_else(|| TurnIntentJudgeError::Malformed {
+                    raw: format!("reanchors_current_objective not a boolean: {reanchors}"),
+                })?;
+    }
+
     Ok(intent)
 }
 
@@ -315,6 +333,8 @@ mod tests {
         assert!(prompt.contains("Turn: 3"));
         assert!(prompt.contains("Has prior assistant turn: yes"));
         assert!(prompt.contains("read_file, bash"));
+        assert!(prompt.contains("\"reanchors_current_objective\": <boolean>"));
+        assert!(prompt.contains("false for ordinary continuation"));
     }
 
     #[test]
@@ -364,7 +384,8 @@ mod tests {
         let raw = r#"{
           "requested_scenario": "implementation",
           "prohibited_scenarios": ["code_review"],
-          "continuation_mode": "continue_current_objective"
+          "continuation_mode": "continue_current_objective",
+          "reanchors_current_objective": false
         }"#;
         let intent = parse_turn_intent_response(raw).unwrap();
         assert_eq!(intent.requested_scenario, Some(Scenario::Implementation));
@@ -373,6 +394,21 @@ mod tests {
             intent.continuation_mode,
             TurnContinuationMode::ContinueCurrentObjective
         );
+        assert!(!intent.reanchors_current_objective());
+    }
+
+    #[test]
+    fn parses_structured_reanchor_separately_from_continuation() {
+        let raw = r#"{
+          "requested_scenario": "refactoring",
+          "prohibited_scenarios": [],
+          "continuation_mode": "continue_current_objective",
+          "reanchors_current_objective": true
+        }"#;
+        let intent = parse_turn_intent_response(raw).unwrap();
+        assert_eq!(intent.requested_scenario, Some(Scenario::Refactoring));
+        assert!(intent.continues_current_objective());
+        assert!(intent.reanchors_current_objective());
     }
 
     #[test]
@@ -445,6 +481,14 @@ mod tests {
         assert!(intent.requested_scenario.is_none());
         assert!(intent.prohibited_scenarios.is_empty());
         assert_eq!(intent.continuation_mode, TurnContinuationMode::Unknown);
+        assert!(!intent.reanchors_current_objective());
+    }
+
+    #[test]
+    fn non_boolean_reanchor_returns_malformed() {
+        let raw = r#"{"requested_scenario":null,"prohibited_scenarios":[],"continuation_mode":"unknown","reanchors_current_objective":"true"}"#;
+        let err = parse_turn_intent_response(raw).unwrap_err();
+        assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
 
     #[test]

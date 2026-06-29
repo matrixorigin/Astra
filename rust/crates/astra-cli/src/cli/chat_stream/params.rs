@@ -208,7 +208,7 @@ impl ApprovalResponse {
 }
 
 /// Approval request sent from the SSE stream host to the plan executor / REPL
-/// when a tool requires interactive approval (bypass-immune check).
+/// when a tool requires interactive approval.
 ///
 /// Issue #326 P3: optional `metadata` carries the source-agent /
 /// host / risk-tag / will-save-preview / base-digest fields the
@@ -381,7 +381,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) agent_live_event_sink:
         Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     /// Optional channel for async tool approval during plan execution.
-    /// When a bypass-immune permission check triggers, the approval request is sent
+    /// When an interactive permission check triggers, the approval request is sent
     /// through this channel instead of blocking on stdin.
     pub(crate) approval_request_tx: Option<ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
