@@ -334,7 +334,6 @@ impl PendingApproval {
             || self.has_dynamic_eval
             || self.unsafe_rule_shape
             || self.risk_tags.contains(&RiskTag::WritesSensitiveFile)
-            || self.risk_tags.contains(&RiskTag::GitDestructive)
             || self.risk_tags.contains(&RiskTag::WritesOutsideWorkspace)
             || self.risk_tags.contains(&RiskTag::CredentialAccess)
             || self.risk_tags.contains(&RiskTag::MCPUnknownCapability)
@@ -342,7 +341,13 @@ impl PendingApproval {
             return true;
         }
 
-        !self.workspace_untrusted && !self.scope_available(AllowScope::Project)
+        [
+            AllowScope::RestOfSession,
+            AllowScope::Project,
+            AllowScope::User,
+        ]
+        .into_iter()
+        .all(|scope| !self.scope_available(scope))
     }
 
     fn always_uses_session_fallback(&self) -> bool {
@@ -1318,6 +1323,35 @@ mod tests {
         assert!(
             q.focused_button_action().is_none(),
             "compound shell commands must keep Always disabled"
+        );
+    }
+
+    #[test]
+    fn focused_button_action_allows_always_for_bounded_git_destructive_request() {
+        use astra_turn_core::permission::engine::RiskTag;
+
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "git restore --staged --worktree rust/crates/foo/src/lib.rs".into(),
+            None,
+            "git destructive".into(),
+            serde_json::json!({
+                "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
+            }),
+            tx,
+            ApprovalMetadata::default()
+                .with_risk_tags(vec![RiskTag::BashExecute, RiskTag::GitDestructive]),
+        );
+
+        q.focused_button_move_right();
+        assert_eq!(
+            q.focused_button_action(),
+            Some(super::super::button_row::ButtonAction::Respond(
+                ApprovalResponse::AlwaysAllow
+            )),
+            "bounded git requests should keep don't-ask-again available"
         );
     }
 

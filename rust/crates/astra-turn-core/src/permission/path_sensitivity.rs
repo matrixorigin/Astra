@@ -56,6 +56,9 @@ pub fn classify_path_sensitivity(path: &str) -> PathSensitivity {
     if is_read_sensitive_path(path) {
         return PathSensitivity::Sensitive;
     }
+    if is_agent_skill_content_path(path) {
+        return PathSensitivity::Normal;
+    }
     if is_write_sensitive_path(path) {
         return PathSensitivity::WriteSensitive;
     }
@@ -76,6 +79,31 @@ fn is_write_sensitive_path(path: &str) -> bool {
         || is_dangerous_file_path(&expanded.to_string_lossy())
         || is_tilde_hidden_home_app_state_path(path)
         || is_hidden_home_app_state_path(&expanded)
+}
+
+fn is_agent_skill_content_path(path: &str) -> bool {
+    let expanded = expand_home_path(path);
+    is_agent_skill_content_path_components(Path::new(path))
+        || is_agent_skill_content_path_components(&expanded)
+}
+
+fn is_agent_skill_content_path_components(path: &Path) -> bool {
+    let components = normal_component_strings(path);
+    components.windows(2).any(|window| {
+        matches!(window, [agent_dir, skills_dir]
+            if matches!(agent_dir.as_str(), ".astra" | ".claude")
+                && skills_dir == "skills")
+    })
+}
+
+fn normal_component_strings(path: &Path) -> Vec<String> {
+    normalize_lexical_path(path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn is_tilde_hidden_home_app_state_path(path: &str) -> bool {
@@ -861,6 +889,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(path_sensitivity_home)]
     fn classifies_legacy_global_tool_results_as_read_only_artifacts() {
         let (_temp, _guard, artifact_path) = create_legacy_tool_result();
         let artifact_path = artifact_path.to_string_lossy();
@@ -1033,6 +1062,110 @@ mod tests {
             .expect("mutating hidden home app state should gate");
         assert_eq!(shell_write.sensitivity, PathSensitivity::WriteSensitive);
         assert_eq!(shell_write.access, PathAccess::Write);
+    }
+
+    #[test]
+    #[serial_test::serial(path_sensitivity_home)]
+    fn agent_skill_content_is_editable_hidden_app_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("HOME", temp.path());
+        let absolute_astra = temp
+            .path()
+            .join(".astra/skills/code-review/SKILL.md")
+            .to_string_lossy()
+            .to_string();
+
+        for path in [
+            ".astra/skills/code-review/SKILL.md",
+            "./.claude/skills/code-review/SKILL.md",
+            "~/.astra/skills/code-review/SKILL.md",
+            "$HOME/.claude/skills/code-review/SKILL.md",
+            absolute_astra.as_str(),
+        ] {
+            assert_eq!(
+                classify_path_sensitivity(path),
+                PathSensitivity::Normal,
+                "{path}"
+            );
+            assert!(
+                path_requires_sensitive_gate(path, PathAccess::Write).is_none(),
+                "{path}"
+            );
+
+            let write_args = serde_json::json!({ "path": path, "content": "# Skill\n" });
+            assert_eq!(
+                sensitive_path_match_for_tool_args("write_file", &write_args),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(path_sensitivity_home)]
+    fn agent_skill_credentials_and_control_files_remain_sensitive() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("HOME", temp.path());
+
+        for path in [
+            "~/.astra/skills/code-review/.env",
+            "~/.claude/skills/code-review/credentials.json",
+        ] {
+            assert_eq!(
+                classify_path_sensitivity(path),
+                PathSensitivity::Sensitive,
+                "{path}"
+            );
+            assert!(
+                path_requires_sensitive_gate(path, PathAccess::Read).is_some(),
+                "{path}"
+            );
+            assert!(
+                path_requires_sensitive_gate(path, PathAccess::Write).is_some(),
+                "{path}"
+            );
+        }
+
+        for path in [
+            "~/.astra/permissions.json",
+            "~/.astra/config.toml",
+            "~/.claude/settings.json",
+        ] {
+            assert_eq!(
+                classify_path_sensitivity(path),
+                PathSensitivity::WriteSensitive,
+                "{path}"
+            );
+            assert!(
+                path_requires_sensitive_gate(path, PathAccess::Read).is_none(),
+                "{path}"
+            );
+            assert!(
+                path_requires_sensitive_gate(path, PathAccess::Write).is_some(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_writes_to_agent_skill_content_do_not_trip_sensitive_gate() {
+        assert_eq!(
+            sensitive_path_match_for_shell_command(
+                "cat > ~/.astra/skills/code-review/SKILL.md <<'EOF'\n# Skill\nEOF"
+            ),
+            None
+        );
+        assert_eq!(
+            sensitive_path_match_for_shell_command(
+                "mkdir -p .claude/skills/code-review && touch .claude/skills/code-review/SKILL.md"
+            ),
+            None
+        );
+
+        let hit = sensitive_path_match_for_shell_command("cat ~/.claude/skills/code-review/.env")
+            .expect("credential file under a skill must still gate");
+        assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
+        assert_eq!(hit.access, PathAccess::Read);
     }
 
     #[test]

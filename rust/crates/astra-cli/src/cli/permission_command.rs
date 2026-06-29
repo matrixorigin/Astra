@@ -4,7 +4,7 @@ use crate::cli::theme;
 use crossterm::style::Stylize;
 
 pub(crate) const PERMISSION_COMMAND_USAGE: &str =
-    "auto, plan, accept_edits, prompt, deny, rules, trust, untrust, trace";
+    "auto, bypass, plan, accept_edits, prompt, deny, rules, trust, untrust, trace";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionCommandAction<'a> {
@@ -63,7 +63,8 @@ pub(crate) fn next_permission_mode_for_cycle(current: PermissionMode) -> Permiss
         PermissionMode::Prompt => PermissionMode::AcceptEdits,
         PermissionMode::AcceptEdits => PermissionMode::Plan,
         PermissionMode::Plan => PermissionMode::Auto,
-        PermissionMode::Auto => PermissionMode::Prompt,
+        PermissionMode::Auto => PermissionMode::Bypass,
+        PermissionMode::Bypass => PermissionMode::Prompt,
     }
 }
 
@@ -74,6 +75,7 @@ pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static st
 pub(crate) fn permission_mode_cli_detail(mode: PermissionMode) -> Option<&'static str> {
     match mode {
         PermissionMode::Auto => Some("all tools auto-approved"),
+        PermissionMode::Bypass => Some("skip approval prompts; hard denies still apply"),
         PermissionMode::Plan => Some("read-only investigation mode"),
         PermissionMode::AcceptEdits => Some("workspace-local edits auto-approved"),
         PermissionMode::Prompt | PermissionMode::Deny => None,
@@ -174,6 +176,8 @@ mod tests {
     fn parser_accepts_only_canonical_permission_modes() {
         let cases = [
             ("auto", PermissionMode::Auto),
+            ("bypass", PermissionMode::Bypass),
+            ("skip", PermissionMode::Bypass),
             ("plan", PermissionMode::Plan),
             ("accept_edits", PermissionMode::AcceptEdits),
             ("prompt", PermissionMode::Prompt),
@@ -245,6 +249,10 @@ mod tests {
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Auto),
+            PermissionMode::Bypass
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Bypass),
             PermissionMode::Prompt
         );
         // `Deny` is sticky under the cycle: it must only be exited by an

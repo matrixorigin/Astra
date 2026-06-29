@@ -1214,8 +1214,13 @@ fn build_permission_mode_picker(
         },
         SelectionItem {
             name: "Auto".into(),
-            description: Some("All tools auto-approved".into()),
+            description: Some("Auto-approve normal tool risk; hard prompts may still apply".into()),
             is_current: current == crate::cli::permission_manager::PermissionMode::Auto,
+        },
+        SelectionItem {
+            name: "Bypass".into(),
+            description: Some("Skip approval prompts; hard denies still apply".into()),
+            is_current: current == crate::cli::permission_manager::PermissionMode::Bypass,
         },
         SelectionItem {
             name: "Deny".into(),
@@ -1224,7 +1229,7 @@ fn build_permission_mode_picker(
         },
     ];
     ListSelectionView::new(items, Some("Modes".into())).with_footer_hint(
-        "Shift+Tab cycles ask → edits → plan → auto · /allow rules · /allow trust · /allow trace",
+        "Shift+Tab cycles ask → edits → plan → auto → bypass · /allow rules · /allow trust · /allow trace",
     )
 }
 
@@ -1444,6 +1449,14 @@ pub(crate) fn handle_view_result(
                 state,
                 chat_widget,
                 crate::cli::permission_manager::PermissionMode::Auto,
+            );
+            return;
+        }
+        "Bypass" | "Skip" => {
+            apply_permission_mode_selection(
+                state,
+                chat_widget,
+                crate::cli::permission_manager::PermissionMode::Bypass,
             );
             return;
         }
@@ -4007,6 +4020,21 @@ mod view_result_tests {
     }
 
     #[test]
+    fn bypass_selection_updates_state_and_commits_feedback() {
+        let mut state = SessionState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result("Bypass", &mut state, &mut bottom_pane, &mut chat_widget);
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Bypass);
+        assert_eq!(
+            last_system_message(&chat_widget).as_deref(),
+            Some("Mode → Bypass")
+        );
+    }
+
+    #[test]
     fn permission_selection_clears_stale_pending_local_plan_entry() {
         let mut state = SessionState::default();
         state.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
@@ -4085,6 +4113,10 @@ mod view_result_tests {
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Auto),
+            PermissionMode::Bypass
+        );
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Bypass),
             PermissionMode::Prompt
         );
         // `Deny` is sticky under the cycle: it must only be exited by an

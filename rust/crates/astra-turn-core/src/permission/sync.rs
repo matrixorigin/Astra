@@ -292,8 +292,8 @@ impl PermissionRequestHandler {
 
         // Check mode
         match ctx.mode() {
-            PermissionMode::Auto => {
-                // Auto approves at this layer. Bypass-immune safety guards
+            PermissionMode::Auto | PermissionMode::Bypass => {
+                // Auto/Bypass approve at this layer. Bypass-immune safety guards
                 // (catastrophic-command circuit breaker, sensitive-path
                 // checks) live earlier in the pipeline; by the time we reach
                 // permission_sync those have already had their say.

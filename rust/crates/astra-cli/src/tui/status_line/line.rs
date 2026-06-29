@@ -396,6 +396,14 @@ impl StatusLine {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
+            PermissionMode::Bypass => {
+                out.left.push(Segment::styled(
+                    permission_mode_label(ctx.permission_mode),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             PermissionMode::Plan => {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),

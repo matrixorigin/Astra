@@ -438,7 +438,7 @@ pub fn evaluate_permission(
             // are relaxed: the user has delegated trust to the agent.
             // Catastrophic commands (rm -rf /, fork bombs) and destructive SQL
             // (DROP TABLE, etc.) remain hard-denied regardless of mode.
-            if ctx.mode() == PermissionMode::Auto
+            if matches!(ctx.mode(), PermissionMode::Auto | PermissionMode::Bypass)
                 && reason.contains("shell_obfuscation")
                 && !reason.contains("catastrophic")
             {
@@ -495,12 +495,81 @@ pub fn evaluate_permission(
                 risk_tags,
             );
         }
-        if ctx.mode() == PermissionMode::Auto && !has_hard_violation {
+        let mut git_safety_deferred = false;
+        if let Some((stored_override, allowed)) = fingerprinted_override_match(tool_name, args, ctx)
+        {
+            if allowed && !stored_override_allows_git_safety(&stored_override) {
+                push_skipped(
+                    &mut trace,
+                    EvaluationStep::GitSafety,
+                    "broad session override cannot bypass git safety",
+                );
+            } else if ctx.inherited.allowed_tools.is_some() {
+                push_skipped(
+                    &mut trace,
+                    EvaluationStep::GitSafety,
+                    &format!(
+                        "session override matched git violation, deferring to allowlist: {}",
+                        reasons.join(", ")
+                    ),
+                );
+                git_safety_deferred = true;
+            } else {
+                let decision = if allowed {
+                    HardDecision::Allow
+                } else {
+                    HardDecision::Deny {
+                        reason: "Skipped for session".to_string(),
+                    }
+                };
+                push_matched(
+                    &mut trace,
+                    EvaluationStep::GitSafety,
+                    &decision,
+                    "fingerprinted session override matched git safety request",
+                );
+                return envelope(
+                    decision,
+                    DecisionSource::SessionOverride { allowed },
+                    trace,
+                    will_save,
+                    risk_tags,
+                );
+            }
+        }
+        if !git_safety_deferred && ctx.mode() == PermissionMode::Bypass {
+            if ctx.inherited.allowed_tools.is_some() {
+                push_skipped(
+                    &mut trace,
+                    EvaluationStep::GitSafety,
+                    &format!(
+                        "bypass mode git violation, deferring to allowlist: {}",
+                        reasons.join(", ")
+                    ),
+                );
+                git_safety_deferred = true;
+            } else {
+                let reason = format!("Git safety (bypass): {}", reasons.join(", "));
+                let decision = HardDecision::Allow;
+                push_matched(&mut trace, EvaluationStep::GitSafety, &decision, &reason);
+                return envelope(
+                    decision,
+                    DecisionSource::GitSafety { violation: reason },
+                    trace,
+                    will_save,
+                    risk_tags,
+                );
+            }
+        }
+        if git_safety_deferred {
+            // Continue into ToolAllowlist; if allowed there, SessionOverride
+            // or the final Bypass mode decision can allow the exact request.
+        } else if ctx.mode() == PermissionMode::Auto && !has_hard_violation {
             // Soft git violation in auto mode: allow.
             // If there's an explicit allowlist, let ExplicitApprovalGate evaluate
             // whether git is listed.
-            // If a session override exists, defer so SessionOverride can refuse
-            // to bypass git safety.
+            // If a session override exists, defer so SessionOverride can honor
+            // the already-approved exact fingerprint after allowlist policy.
             if ctx.inherited.allowed_tools.is_some() {
                 push_skipped(
                     &mut trace,
@@ -520,7 +589,7 @@ pub fn evaluate_permission(
                         reasons.join(", ")
                     ),
                 );
-                // continue — SessionOverride will refuse to bypass git safety
+                // continue — SessionOverride will apply the bounded decision
             } else {
                 let reason = format!("Git safety (auto-allow): {}", reasons.join(", "));
                 let decision = HardDecision::Allow;
@@ -606,7 +675,74 @@ pub fn evaluate_permission(
                 risk_tags,
             );
         }
-        if ctx.mode() == PermissionMode::Auto {
+        let mut defer_sensitive_to_allowlist = false;
+        if let Some((stored_override, allowed)) = fingerprinted_override_match(tool_name, args, ctx)
+        {
+            if allowed && !stored_override_allows_sensitive_path(&stored_override) {
+                push_skipped(
+                    &mut trace,
+                    EvaluationStep::SensitivePath,
+                    "broad session override cannot bypass sensitive path",
+                );
+            } else if ctx.inherited.allowed_tools.is_some() {
+                push_skipped(
+                    &mut trace,
+                    EvaluationStep::SensitivePath,
+                    "session override matched sensitive path, deferring to allowlist",
+                );
+                defer_sensitive_to_allowlist = true;
+            } else {
+                let decision = if allowed {
+                    HardDecision::Allow
+                } else {
+                    HardDecision::Deny {
+                        reason: "Sensitive path denied for session".to_string(),
+                    }
+                };
+                push_matched(
+                    &mut trace,
+                    EvaluationStep::SensitivePath,
+                    &decision,
+                    "fingerprinted session override matched sensitive path",
+                );
+                return envelope(
+                    decision,
+                    DecisionSource::SessionOverride { allowed },
+                    trace,
+                    will_save,
+                    risk_tags,
+                );
+            }
+        }
+        if !defer_sensitive_to_allowlist && ctx.mode() == PermissionMode::Bypass {
+            if ctx.inherited.allowed_tools.is_some() {
+                push_skipped(
+                    &mut trace,
+                    EvaluationStep::SensitivePath,
+                    "bypass mode sensitive path, deferring to allowlist",
+                );
+                defer_sensitive_to_allowlist = true;
+            } else {
+                let decision = HardDecision::Allow;
+                push_matched(
+                    &mut trace,
+                    EvaluationStep::SensitivePath,
+                    &decision,
+                    "sensitive path allowed by bypass mode",
+                );
+                return envelope(
+                    decision,
+                    DecisionSource::SensitivePath { path },
+                    trace,
+                    will_save,
+                    risk_tags,
+                );
+            }
+        }
+        if defer_sensitive_to_allowlist {
+            // Continue into ToolAllowlist; if allowed there, SessionOverride
+            // or the final Bypass mode decision can allow the exact request.
+        } else if ctx.mode() == PermissionMode::Auto {
             let reason = "Targets a sensitive file path and requires manual approval".to_string();
             let decision = HardDecision::NeedExternal {
                 prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
@@ -620,18 +756,20 @@ pub fn evaluate_permission(
                 risk_tags,
             );
         }
-        let reason = "Targets a sensitive file path and requires manual approval".to_string();
-        let decision = HardDecision::NeedExternal {
-            prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
-        };
-        push_matched(&mut trace, EvaluationStep::SensitivePath, &decision, &path);
-        return envelope(
-            decision,
-            DecisionSource::SensitivePath { path },
-            trace,
-            will_save,
-            risk_tags,
-        );
+        if !defer_sensitive_to_allowlist {
+            let reason = "Targets a sensitive file path and requires manual approval".to_string();
+            let decision = HardDecision::NeedExternal {
+                prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
+            };
+            push_matched(&mut trace, EvaluationStep::SensitivePath, &decision, &path);
+            return envelope(
+                decision,
+                DecisionSource::SensitivePath { path },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
     }
     push_skipped(
         &mut trace,
@@ -641,7 +779,7 @@ pub fn evaluate_permission(
 
     if let Some(inner_tool) = tool_name.strip_prefix("sandbox_expand:") {
         return match ctx.mode() {
-            PermissionMode::Auto => {
+            PermissionMode::Auto | PermissionMode::Bypass => {
                 let decision = HardDecision::Allow;
                 push_matched(
                     &mut trace,
@@ -769,23 +907,32 @@ pub fn evaluate_permission(
         .inherited
         .ask_rule_with_context(tool_name, &rule_match_context)
     {
-        let reason = format!("Tool '{tool_name}' requires parent approval");
-        let decision = HardDecision::NeedExternal {
-            prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
-        };
-        push_matched(&mut trace, EvaluationStep::AskRules, &decision, &reason);
-        return envelope(
-            decision,
-            DecisionSource::AskRule {
-                rule: rule.to_string(),
-                origin: RuleOrigin::Inherited,
-            },
-            trace,
-            will_save,
-            risk_tags,
-        );
+        if ctx.mode() == PermissionMode::Bypass {
+            push_skipped(
+                &mut trace,
+                EvaluationStep::AskRules,
+                "ask rule skipped by bypass mode",
+            );
+        } else {
+            let reason = format!("Tool '{tool_name}' requires parent approval");
+            let decision = HardDecision::NeedExternal {
+                prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
+            };
+            push_matched(&mut trace, EvaluationStep::AskRules, &decision, &reason);
+            return envelope(
+                decision,
+                DecisionSource::AskRule {
+                    rule: rule.to_string(),
+                    origin: RuleOrigin::Inherited,
+                },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
+    } else {
+        push_skipped(&mut trace, EvaluationStep::AskRules, "no ask rule matched");
     }
-    push_skipped(&mut trace, EvaluationStep::AskRules, "no ask rule matched");
 
     if explicit_approval_reason(tool_name, args).is_none()
         && is_read_only_tool_with_args(tool_name, Some(args))
@@ -870,32 +1017,6 @@ pub fn evaluate_permission(
     }
 
     if let Some(allowed) = fingerprinted_override(tool_name, args, ctx) {
-        // Session overrides must not bypass git safety. If a git
-        // safety violation is present, refuse the override and
-        // require explicit approval.
-        if allowed && !git_safety_violations_for_request(tool_name, args).is_empty() {
-            let reasons: Vec<String> = git_safety_violations_for_request(tool_name, args)
-                .iter()
-                .map(|v| v.to_string())
-                .collect();
-            let reason = format!("Git safety: {}", reasons.join(", "));
-            let decision = HardDecision::NeedExternal {
-                prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
-            };
-            push_matched(
-                &mut trace,
-                EvaluationStep::SessionOverride,
-                &decision,
-                "session override refused — git safety violation present",
-            );
-            return envelope(
-                decision,
-                DecisionSource::GitSafety { violation: reason },
-                trace,
-                will_save,
-                risk_tags,
-            );
-        }
         let decision = if allowed {
             HardDecision::Allow
         } else {
@@ -967,9 +1088,9 @@ pub fn evaluate_permission(
                     risk_tags,
                 )
             }
-            PermissionMode::Auto => {
+            PermissionMode::Auto | PermissionMode::Bypass => {
                 // ToolAllowlist step already denied unlisted tools, so
-                // anything reaching ExplicitApproval in Auto mode is
+                // anything reaching ExplicitApproval in Auto/Bypass mode is
                 // allowed (it's an explicit-approval-gated tool that
                 // the mode auto-approves).
                 let decision = HardDecision::Allow;
@@ -1065,7 +1186,7 @@ pub fn evaluate_permission(
 
     let mode = ctx.mode();
     let (decision, mode_label) = match mode {
-        PermissionMode::Auto => (HardDecision::Allow, mode.to_string()),
+        PermissionMode::Auto | PermissionMode::Bypass => (HardDecision::Allow, mode.to_string()),
         PermissionMode::Plan => (
             HardDecision::Deny {
                 reason: format!("Tool '{tool_name}' denied by permission mode"),
@@ -1329,6 +1450,14 @@ fn fingerprinted_override(
     args: &Value,
     ctx: &PermissionSyncContext,
 ) -> Option<bool> {
+    fingerprinted_override_match(tool_name, args, ctx).map(|(_, allowed)| allowed)
+}
+
+fn fingerprinted_override_match(
+    tool_name: &str,
+    args: &Value,
+    ctx: &PermissionSyncContext,
+) -> Option<(ApprovalFingerprint, bool)> {
     let json = ctx.inherited.fingerprinted_overrides.as_ref()?;
     // Fail-closed: a corrupt overrides blob must NOT silently fall through
     // to broader (potentially permissive) rules. Distinguish "no overrides
@@ -1343,12 +1472,40 @@ fn fingerprinted_override(
                 "fingerprinted_overrides blob is present but undecodable; denying tool {} as fail-closed",
                 tool_name,
             );
-            return Some(false);
+            return Some((ApprovalFingerprint::bare(tool_name), false));
         }
     };
     content_aware_fingerprint_candidates(tool_name, args)
         .into_iter()
-        .find_map(|fp| overrides.check(&fp))
+        .find_map(|fp| {
+            overrides
+                .matching_rule(&fp)
+                .map(|(stored, allowed)| (stored.clone(), *allowed))
+        })
+}
+
+fn stored_override_allows_git_safety(stored: &ApprovalFingerprint) -> bool {
+    stored.command_exact.is_some() || stored.command_prefix.is_some()
+}
+
+fn stored_override_allows_sensitive_path(stored: &ApprovalFingerprint) -> bool {
+    if let Some(command) = stored
+        .command_exact
+        .as_deref()
+        .or(stored.command_prefix.as_deref())
+    {
+        return sensitive_path_match("bash", &serde_json::json!({ "command": command })).is_some();
+    }
+
+    let Some(path) = stored.path_pattern.as_deref() else {
+        return false;
+    };
+
+    if stored.path_match == crate::approval_fingerprint::PathMatchKind::Exact {
+        return true;
+    }
+
+    sensitive_path_match(&stored.tool_name, &serde_json::json!({ "path": path })).is_some()
 }
 
 fn accept_edits_auto_allows(tool_name: &str, args: &Value) -> bool {
@@ -1976,6 +2133,20 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_denies_catastrophic_shell_before_bypass_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Bypass,
+        );
+        let envelope =
+            evaluate_permission("bash", &serde_json::json!({"command": "rm -rf /"}), &ctx);
+        assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::SafetyMiddleware { .. }
+        ));
+    }
+
+    #[test]
     fn evaluate_explicit_approval_precedes_allow_rule_in_prompt_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
@@ -2016,6 +2187,45 @@ mod tests {
         assert!(matches!(
             envelope.source,
             DecisionSource::SensitivePath { .. }
+        ));
+    }
+
+    #[test]
+    fn evaluate_sensitive_path_is_allowed_in_bypass_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Bypass,
+        );
+        let envelope = evaluate_permission(
+            "write_file",
+            &serde_json::json!({"path": ".env", "content": "TOKEN=x"}),
+            &ctx,
+        );
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::SensitivePath { .. }
+        ));
+    }
+
+    #[test]
+    fn evaluate_sensitive_path_session_override_is_honored() {
+        let args = serde_json::json!({"path": ".env", "content": "TOKEN=x"});
+        let mut overrides = FingerprintedOverrides::default();
+        overrides.insert(content_aware_fingerprint("write_file", &args), true);
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                fingerprinted_overrides: Some(serde_json::to_value(overrides).unwrap()),
+                ..Default::default()
+            },
+        );
+
+        let envelope = evaluate_permission("write_file", &args, &ctx);
+
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::SessionOverride { allowed: true }
         ));
     }
 
@@ -2395,6 +2605,27 @@ mod tests {
     }
 
     #[test]
+    fn structured_git_force_push_protected_branch_is_allowed_in_bypass_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Bypass,
+        );
+        let envelope = evaluate_permission(
+            "git",
+            &serde_json::json!({
+                "action": "push",
+                "remote": "origin",
+                "branch": "main",
+                "force_with_lease": true
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+    }
+
+    #[test]
     fn git_worktree_destructive_bash_requires_approval_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -2417,6 +2648,30 @@ mod tests {
             envelope.source
         );
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+    }
+
+    #[test]
+    fn git_worktree_destructive_bash_session_override_is_honored() {
+        let args = serde_json::json!({
+            "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
+        });
+        let mut overrides = FingerprintedOverrides::default();
+        overrides.insert(content_aware_fingerprint("bash", &args), true);
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Auto,
+                fingerprinted_overrides: Some(serde_json::to_value(overrides).unwrap()),
+                ..Default::default()
+            },
+        );
+
+        let envelope = evaluate_permission("bash", &args, &ctx);
+
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::SessionOverride { allowed: true }
+        ));
     }
 
     #[test]

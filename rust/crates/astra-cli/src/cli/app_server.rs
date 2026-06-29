@@ -1023,6 +1023,20 @@ mod tests {
     }
 
     #[test]
+    fn permission_mode_accepts_bypass() {
+        assert_eq!(
+            permission_mode_from_params(&serde_json::json!({"permissionMode": "bypass"}), false)
+                .unwrap(),
+            PermissionMode::Bypass
+        );
+        assert_eq!(
+            permission_mode_from_params(&serde_json::json!({"permission_mode": "skip"}), false)
+                .unwrap(),
+            PermissionMode::Bypass
+        );
+    }
+
+    #[test]
     fn permission_mode_validates_before_auto_approve_override() {
         assert!(
             permission_mode_from_params(&serde_json::json!({"permissionMode": "oops"}), true)

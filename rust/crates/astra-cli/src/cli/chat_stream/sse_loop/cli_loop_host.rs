@@ -216,7 +216,7 @@ fn derive_turn_interaction_mode(
         // or silent contexts silently demoted Auto → NonInteractive,
         // which in turn disabled the nudge-suppression gate the user
         // opted into.
-        PermissionMode::Auto => TurnInteractionMode::Auto,
+        PermissionMode::Auto | PermissionMode::Bypass => TurnInteractionMode::Auto,
         PermissionMode::Plan => {
             if has_approval_request_tx || render_is_silent || !stdin_is_terminal {
                 TurnInteractionMode::NonInteractive
@@ -1309,6 +1309,10 @@ mod tests {
         );
         assert_eq!(
             derive_turn_interaction_mode(PermissionMode::Auto, false, false, false, false, true),
+            TurnInteractionMode::Auto
+        );
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Bypass, false, false, false, false, true),
             TurnInteractionMode::Auto
         );
         assert_eq!(

@@ -419,6 +419,8 @@ fn cli_chat_subcommand() {
     // Permission modes
     for (input, expected) in [
         ("auto", "auto"),
+        ("bypass", "bypass"),
+        ("skip", "bypass"),
         ("accept_edits", "accept_edits"),
         ("plan", "plan"),
     ] {

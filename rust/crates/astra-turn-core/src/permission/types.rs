@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 pub enum PermissionMode {
     /// Auto-approve all tools (except bypass-immune safety checks).
     Auto,
+    /// Skip human approval prompts; hard safety denies and policy allowlists still apply.
+    Bypass,
     /// Read-only investigation/planning mode: allow read tools, deny mutations.
     Plan,
     /// Auto-approve safe workspace-local edit/write operations only.
@@ -41,6 +43,7 @@ impl PermissionMode {
     pub fn chip_text(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
+            Self::Bypass => "Bypass",
             Self::Plan => "Plan",
             Self::AcceptEdits => "Edits",
             Self::Prompt => "Ask",
@@ -51,9 +54,11 @@ impl PermissionMode {
     /// Color hint for the status-line mode chip.
     /// Returns `(red, green, blue)` for a ratatui-style `Color::Rgb`.
     pub fn chip_color_rgb(self) -> (u8, u8, u8) {
-        // Blue for plan, cyan for edit, yellow for auto, red for deny, white for default.
+        // Blue for plan, cyan for edit, yellow for auto, magenta for bypass,
+        // red for deny, white for default.
         match self {
             Self::Auto => (255, 255, 0),
+            Self::Bypass => (255, 0, 255),
             Self::Plan => (100, 149, 237),
             Self::AcceptEdits => (0, 255, 255),
             Self::Prompt => (255, 255, 255),
@@ -66,6 +71,7 @@ impl std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => write!(f, "auto"),
+            Self::Bypass => write!(f, "bypass"),
             Self::Plan => write!(f, "plan"),
             Self::AcceptEdits => write!(f, "accept_edits"),
             Self::Prompt => write!(f, "prompt"),
@@ -79,12 +85,13 @@ impl std::str::FromStr for PermissionMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
+            "bypass" | "skip" => Ok(Self::Bypass),
             "plan" => Ok(Self::Plan),
             "accept_edits" => Ok(Self::AcceptEdits),
             "prompt" => Ok(Self::Prompt),
             "deny" => Ok(Self::Deny),
             _ => Err(format!(
-                "invalid permission mode '{s}': expected auto, plan, accept_edits, prompt, or deny"
+                "invalid permission mode '{s}': expected auto, bypass, plan, accept_edits, prompt, or deny"
             )),
         }
     }
@@ -1181,6 +1188,18 @@ mod tests {
         let parsed = "plan".parse::<PermissionMode>().unwrap();
         assert_eq!(parsed, PermissionMode::Plan);
         assert_eq!(parsed.to_string(), "plan");
+    }
+
+    #[test]
+    fn permission_mode_roundtrip_includes_bypass() {
+        let parsed = "bypass".parse::<PermissionMode>().unwrap();
+        assert_eq!(parsed, PermissionMode::Bypass);
+        assert_eq!(parsed.to_string(), "bypass");
+        assert_eq!(parsed.chip_text(), "Bypass");
+        assert_eq!(
+            "skip".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Bypass
+        );
     }
 
     #[test]

@@ -1097,6 +1097,10 @@ mod permission_mode_display_tests {
         assert_eq!(permission_mode_display_label(PermissionMode::Prompt), "Ask");
         assert_eq!(permission_mode_display_label(PermissionMode::Auto), "Auto");
         assert_eq!(
+            permission_mode_display_label(PermissionMode::Bypass),
+            "Bypass"
+        );
+        assert_eq!(
             permission_mode_display_label(PermissionMode::AcceptEdits),
             "Edits"
         );
@@ -3372,6 +3376,10 @@ mod one_shot_effective_settings_tests {
             effective_one_shot_permission_mode(Some("plan"), true, Some("accept_edits"), false)
                 .unwrap(),
             PermissionMode::Plan
+        );
+        assert_eq!(
+            effective_one_shot_permission_mode(Some("bypass"), false, Some("plan"), false).unwrap(),
+            PermissionMode::Bypass
         );
         assert_eq!(
             effective_one_shot_permission_mode(None, true, Some("plan"), false).unwrap(),

@@ -526,6 +526,7 @@ fn encode_mode_for_mirror(mode: PermissionMode) -> u8 {
         PermissionMode::Plan => 2,
         PermissionMode::AcceptEdits => 3,
         PermissionMode::Deny => 4,
+        PermissionMode::Bypass => 5,
     }
 }
 
@@ -535,6 +536,7 @@ fn decode_mode_for_mirror(value: u8) -> PermissionMode {
         2 => PermissionMode::Plan,
         3 => PermissionMode::AcceptEdits,
         4 => PermissionMode::Deny,
+        5 => PermissionMode::Bypass,
         _ => PermissionMode::Prompt,
     }
 }
@@ -1617,6 +1619,7 @@ impl PermissionManager {
         // Use inherited mode, but load project settings too
         let mode = match inherited.mode {
             astra_runtime::orchestration::PermissionMode::Auto => PermissionMode::Auto,
+            astra_runtime::orchestration::PermissionMode::Bypass => PermissionMode::Bypass,
             astra_runtime::orchestration::PermissionMode::Plan => PermissionMode::Plan,
             astra_runtime::orchestration::PermissionMode::AcceptEdits => {
                 PermissionMode::AcceptEdits
@@ -1776,6 +1779,7 @@ impl PermissionManager {
 
         let mode = match self.mode {
             PermissionMode::Auto => RuntimePermissionMode::Auto,
+            PermissionMode::Bypass => RuntimePermissionMode::Bypass,
             PermissionMode::Plan => RuntimePermissionMode::Plan,
             PermissionMode::AcceptEdits => RuntimePermissionMode::AcceptEdits,
             PermissionMode::Prompt => RuntimePermissionMode::Prompt,
@@ -2111,6 +2115,9 @@ impl PermissionManager {
             if matches!(self.mode, PermissionMode::Plan | PermissionMode::Deny) {
                 return Some(ApprovalDecision::Deny);
             }
+            if self.mode == PermissionMode::Bypass {
+                return Some(ApprovalDecision::Allow);
+            }
             if self.mode == PermissionMode::Auto {
                 return Some(
                     if self.settings.allow_sensitive_path_writes
@@ -2131,7 +2138,7 @@ impl PermissionManager {
 
         if quiet {
             return Some(match self.mode {
-                PermissionMode::Auto => ApprovalDecision::Allow,
+                PermissionMode::Auto | PermissionMode::Bypass => ApprovalDecision::Allow,
                 PermissionMode::Plan => ApprovalDecision::Deny,
                 PermissionMode::AcceptEdits
                     if accept_edits_auto_allows_cloud_request(tool, detail) =>
@@ -2146,7 +2153,7 @@ impl PermissionManager {
 
         if Self::cloud_approval_is_explicit(approval_kind) {
             return match self.mode {
-                PermissionMode::Auto => Some(ApprovalDecision::Allow),
+                PermissionMode::Auto | PermissionMode::Bypass => Some(ApprovalDecision::Allow),
                 PermissionMode::Plan => Some(ApprovalDecision::Deny),
                 PermissionMode::AcceptEdits => None,
                 PermissionMode::Deny => Some(ApprovalDecision::Deny),
@@ -2155,7 +2162,7 @@ impl PermissionManager {
         }
 
         match self.mode {
-            PermissionMode::Auto => return Some(ApprovalDecision::Allow),
+            PermissionMode::Auto | PermissionMode::Bypass => return Some(ApprovalDecision::Allow),
             PermissionMode::Plan => return Some(ApprovalDecision::Deny),
             PermissionMode::AcceptEdits if accept_edits_auto_allows_cloud_request(tool, detail) => {
                 return Some(ApprovalDecision::Allow);
@@ -2989,6 +2996,9 @@ impl PermissionManager {
                     eprintln!("  {}", "  Git safety violation — blocked".red());
                     return false;
                 }
+                if self.mode == PermissionMode::Bypass {
+                    return true;
+                }
                 // Soft-only violations: respect auto mode and session overrides.
                 if all_soft {
                     if self.mode == PermissionMode::Auto {
@@ -3022,6 +3032,9 @@ impl PermissionManager {
             if matches!(self.mode, PermissionMode::Plan | PermissionMode::Deny) {
                 eprintln!("  {}", "  Sensitive path — blocked".red());
                 return false;
+            }
+            if self.mode == PermissionMode::Bypass {
+                return true;
             }
             if self.mode == PermissionMode::Auto {
                 eprintln!("  {}", "  Sensitive path — requires your approval".yellow());
@@ -3091,7 +3104,7 @@ impl PermissionManager {
 
         // Step 7: Permission mode determines final action.
         match self.mode {
-            PermissionMode::Auto => return true,
+            PermissionMode::Auto | PermissionMode::Bypass => return true,
             PermissionMode::Plan => {
                 let (header, _) = Self::format_tool_display(name, args);
                 eprintln!("  {}", format!("  ✗ {header} — blocked").red());
@@ -3256,6 +3269,9 @@ impl PermissionManager {
                 } else {
                     GateOutcome::Deny("Sensitive path denied for session".into())
                 };
+            }
+            if self.mode == PermissionMode::Bypass {
+                return GateOutcome::Allow;
             }
             if self.mode == PermissionMode::Auto
                 && (self.settings.allow_sensitive_path_writes
@@ -4806,6 +4822,14 @@ mod tests {
             "auto".parse::<PermissionMode>().unwrap(),
             PermissionMode::Auto
         );
+        assert_eq!(
+            "bypass".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Bypass
+        );
+        assert_eq!(
+            "skip".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Bypass
+        );
         assert!("yolo".parse::<PermissionMode>().is_err());
         assert!("bypass-safety".parse::<PermissionMode>().is_err());
         assert_eq!(
@@ -4835,6 +4859,7 @@ mod tests {
     #[test]
     fn permission_mode_display() {
         assert_eq!(PermissionMode::Auto.to_string(), "auto");
+        assert_eq!(PermissionMode::Bypass.to_string(), "bypass");
         assert_eq!(PermissionMode::Plan.to_string(), "plan");
         assert_eq!(PermissionMode::AcceptEdits.to_string(), "accept_edits");
         assert_eq!(PermissionMode::Prompt.to_string(), "prompt");
@@ -5497,7 +5522,9 @@ mod tests {
         // operations must still require manual approval.
         let mut pm = PermissionManager::new(true); // auto mode
         pm.session_overrides.insert(bare_fp("bash"), true);
-        let args = serde_json::json!({"command": "git push --force"});
+        let args = serde_json::json!({
+            "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
+        });
         // Must NOT be Allow — git safety is bypass-immune
         let decision = pm.check_nonblocking("bash", &args);
         assert!(
@@ -6824,6 +6851,38 @@ mod tests {
     }
 
     #[test]
+    fn bypass_mode_skips_sensitive_path_approval_but_not_hard_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
+
+        let sensitive = serde_json::json!({"path": ".ssh/id_rsa", "content": "x"});
+        assert!(matches!(
+            pm.check_nonblocking("write_file", &sensitive),
+            GateOutcome::Allow
+        ));
+
+        let catastrophic = serde_json::json!({"command": "rm -rf /"});
+        assert!(matches!(
+            pm.check_nonblocking("bash", &catastrophic),
+            GateOutcome::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn bypass_mode_skips_git_hard_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
+        let args = serde_json::json!({
+            "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
+        });
+
+        assert!(matches!(
+            pm.check_nonblocking("bash", &args),
+            GateOutcome::Allow
+        ));
+    }
+
+    #[test]
     fn sensitive_path_gate_ignores_internal_tool_result_pipeline() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_root = dir.path().join("sessions");
@@ -6967,6 +7026,73 @@ mod tests {
             ),
             "shell reads of hidden-home credentials must still gate: {bash_secret_decision:?}"
         );
+    }
+
+    #[test]
+    fn auto_mode_allows_agent_skill_content_but_not_agent_control_or_skill_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        for path in [
+            ".astra/skills/code-review/SKILL.md",
+            ".claude/skills/code-review/SKILL.md",
+        ] {
+            let write_args = serde_json::json!({"path": path, "content": "# Skill\n"});
+            let write_decision = pm.check_nonblocking("write_file", &write_args);
+            assert!(
+                matches!(write_decision, GateOutcome::Allow),
+                "Auto mode must allow agent skill content edits without approval: {write_decision:?}"
+            );
+
+            let read_args = serde_json::json!({"path": path});
+            let read_decision = pm.check_nonblocking("read_file", &read_args);
+            assert!(
+                matches!(read_decision, GateOutcome::Allow),
+                "Auto mode must allow agent skill content reads without approval: {read_decision:?}"
+            );
+        }
+
+        for path in [
+            ".astra/permissions.json",
+            ".astra/config.toml",
+            ".claude/settings.json",
+        ] {
+            let write_args = serde_json::json!({"path": path, "content": "{}\n"});
+            let decision = pm.check_nonblocking("write_file", &write_args);
+            assert!(
+                matches!(
+                    &decision,
+                    GateOutcome::Deny(reason)
+                        if reason.contains("write-sensitive app/runtime state")
+                ),
+                "agent control files must stay write-sensitive in Auto mode: {decision:?}"
+            );
+        }
+
+        for path in [
+            ".astra/skills/code-review/.env",
+            ".claude/skills/code-review/credentials.json",
+        ] {
+            let read_args = serde_json::json!({"path": path});
+            let read_decision = pm.check_nonblocking("read_file", &read_args);
+            assert!(
+                matches!(
+                    &read_decision,
+                    GateOutcome::Deny(reason) if reason.contains("sensitive credential")
+                ),
+                "skill-local credentials must still be sensitive in Auto mode: {read_decision:?}"
+            );
+
+            let write_args = serde_json::json!({"path": path, "content": "SECRET=x\n"});
+            let write_decision = pm.check_nonblocking("write_file", &write_args);
+            assert!(
+                matches!(
+                    &write_decision,
+                    GateOutcome::Deny(reason) if reason.contains("sensitive credential")
+                ),
+                "skill-local credential writes must still be sensitive in Auto mode: {write_decision:?}"
+            );
+        }
     }
 
     #[test]
@@ -7927,6 +8053,7 @@ mod tests {
         let all_modes = [
             PermissionMode::Prompt,
             PermissionMode::Auto,
+            PermissionMode::Bypass,
             PermissionMode::Plan,
             PermissionMode::AcceptEdits,
             PermissionMode::Deny,
@@ -7953,6 +8080,8 @@ mod tests {
         assert_eq!(mirror.current(), PermissionMode::Plan);
         pm.set_mode(PermissionMode::Auto);
         assert_eq!(mirror.current(), PermissionMode::Auto);
+        pm.set_mode(PermissionMode::Bypass);
+        assert_eq!(mirror.current(), PermissionMode::Bypass);
     }
 
     #[test]

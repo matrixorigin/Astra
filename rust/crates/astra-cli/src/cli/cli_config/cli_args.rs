@@ -381,7 +381,7 @@ pub(crate) struct ChatArgs {
     /// Auto-approve tool calls
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     pub auto_approve: bool,
-    /// Permission mode: auto, plan, accept_edits, prompt (interactive, default), or deny.
+    /// Permission mode: auto, bypass, plan, accept_edits, prompt (interactive, default), or deny.
     #[arg(long = "permission-mode", value_parser = parse_permission_mode_arg)]
     pub permission_mode: Option<String>,
     /// Suppress spinner and progress output (result still printed)

@@ -800,6 +800,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let telemetry = ctx_guard.telemetry();
         let mode = match ctx_guard.mode() {
             astra_runtime::orchestration::PermissionMode::Auto => "auto".to_string(),
+            astra_runtime::orchestration::PermissionMode::Bypass => "bypass".to_string(),
             astra_runtime::orchestration::PermissionMode::Plan => "plan".to_string(),
             astra_runtime::orchestration::PermissionMode::AcceptEdits => "accept_edits".to_string(),
             astra_runtime::orchestration::PermissionMode::Prompt => "prompt".to_string(),

@@ -2119,7 +2119,7 @@ total_tokens_out: 500
 
     #[test]
     fn permission_mode_roundtrip_parse() {
-        for mode_str in &["auto", "accept_edits", "plan", "prompt", "deny"] {
+        for mode_str in &["auto", "bypass", "accept_edits", "plan", "prompt", "deny"] {
             let mode: permission_manager::PermissionMode = mode_str.parse().unwrap();
             assert_eq!(mode.to_string().to_lowercase(), *mode_str);
         }

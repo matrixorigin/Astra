@@ -280,7 +280,6 @@ impl ApprovalCell {
         for label in &self.risk_tag_labels {
             match label.as_str() {
                 "WritesSensitiveFile" => return Some("sensitive path"),
-                "GitDestructive" => return Some("git destructive"),
                 "WritesOutsideWorkspace" => return Some("outside workspace"),
                 "CredentialAccess" => return Some("credential access"),
                 "MCPUnknownCapability" => return Some("MCP unknown"),
@@ -296,13 +295,26 @@ impl ApprovalCell {
         if self.unsafe_rule_shape {
             return Some("command shape too broad to remember");
         }
+        if !self.has_available_remember_scope() {
+            return Some("no remember scope available");
+        }
         None
     }
 
     fn always_action_disabled(&self) -> bool {
         self.always_disabled_reason().is_some()
-            || (!self.workspace_untrusted
-                && !self.scope_available(astra_turn_core::permission::scope::AllowScope::Project))
+    }
+
+    fn has_available_remember_scope(&self) -> bool {
+        use astra_turn_core::permission::scope::AllowScope;
+
+        [
+            AllowScope::RestOfSession,
+            AllowScope::Project,
+            AllowScope::User,
+        ]
+        .into_iter()
+        .any(|scope| self.scope_available(scope))
     }
 
     fn risk_tags_for_scope(&self) -> Vec<astra_turn_core::permission::engine::RiskTag> {
@@ -935,6 +947,26 @@ mod tests {
     }
 
     #[test]
+    fn always_enabled_for_git_destructive_request_with_bounded_memory() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "git restore --staged --worktree rust/crates/foo/src/lib.rs".into(),
+            None,
+            "git destructive".into(),
+            true,
+        )
+        .with_risk_tag_labels(vec!["BashExecute".into(), "GitDestructive".into()]);
+
+        assert_eq!(cell.always_disabled_reason(), None);
+        let rendered = render(&cell);
+        assert!(
+            !rendered.contains("Can't remember"),
+            "bounded git requests should keep don't-ask-again available, got:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn always_enabled_for_untrusted_workspace_benign_request() {
         let cell = ApprovalCell::new(
             1,
@@ -995,16 +1027,16 @@ mod tests {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
-            "rm -rf /".into(),
+            "edit /etc/hosts".into(),
             None,
             "execute".into(),
             true,
         )
-        .with_risk_tag_labels(vec!["GitDestructive".into()]);
+        .with_risk_tag_labels(vec!["WritesOutsideWorkspace".into()]);
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Can't remember · git destructive"),
-            "destructive cell must advertise the disabled-Always state, got:\n{rendered}"
+            rendered.contains("Can't remember · outside workspace"),
+            "outside-workspace cell must advertise the disabled-Always state, got:\n{rendered}"
         );
     }
 

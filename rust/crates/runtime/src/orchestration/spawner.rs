@@ -2887,6 +2887,7 @@ fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
     let inherited = &context.inherited_permissions;
     summary.mode = match inherited.mode {
         super::permission_sync::PermissionMode::Auto => "auto".to_string(),
+        super::permission_sync::PermissionMode::Bypass => "bypass".to_string(),
         super::permission_sync::PermissionMode::Plan => "plan".to_string(),
         super::permission_sync::PermissionMode::AcceptEdits => "accept_edits".to_string(),
         super::permission_sync::PermissionMode::Prompt => "prompt".to_string(),
