@@ -46,6 +46,34 @@ pub enum ManualApprovalPolicy {
     Deny,
 }
 
+/// Permission mode safe for child-agent inheritance.
+///
+/// `Bypass` is intentionally excluded: root-user interaction choices
+/// must not become transitive child-agent safety policy. The compiler
+/// guarantees that no match on this type can ever receive a Bypass
+/// variant, unlike the previous approach where an `unreachable!()` arm
+/// served the same guarantee at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChildPermissionMode {
+    Auto,
+    Plan,
+    AcceptEdits,
+    Prompt,
+    Deny,
+}
+
+impl From<ChildPermissionMode> for PermissionMode {
+    fn from(m: ChildPermissionMode) -> Self {
+        match m {
+            ChildPermissionMode::Auto => Self::Auto,
+            ChildPermissionMode::Plan => Self::Plan,
+            ChildPermissionMode::AcceptEdits => Self::AcceptEdits,
+            ChildPermissionMode::Prompt => Self::Prompt,
+            ChildPermissionMode::Deny => Self::Deny,
+        }
+    }
+}
+
 impl PermissionMode {
     /// True when ordinary approval prompts can be resolved without blocking.
     ///
@@ -79,11 +107,18 @@ impl PermissionMode {
     /// the current UI session. It must not become a transitive child-agent
     /// safety policy because spawned/fan-out agents have no direct user in the
     /// loop and should not inherit the root session's broad prompt bypass.
+    ///
+    /// Returns a [`ChildPermissionMode`] that cannot represent Bypass,
+    /// making the downgrade a compile-time guarantee.
     #[must_use]
-    pub fn child_inherited_mode(self) -> Self {
+    pub fn child_inherited_mode(self) -> ChildPermissionMode {
         match self {
-            Self::Bypass => Self::Auto,
-            other => other,
+            Self::Bypass => ChildPermissionMode::Auto,
+            Self::Auto => ChildPermissionMode::Auto,
+            Self::Plan => ChildPermissionMode::Plan,
+            Self::AcceptEdits => ChildPermissionMode::AcceptEdits,
+            Self::Prompt => ChildPermissionMode::Prompt,
+            Self::Deny => ChildPermissionMode::Deny,
         }
     }
 
@@ -714,7 +749,8 @@ impl std::fmt::Display for PermissionRule {
 /// Contains the parent's effective permission mode and rules that the child
 /// should honor. Child agents cannot escalate permissions beyond what parent
 /// allows. Root-only interaction choices such as `Bypass` are projected to the
-/// child-safe execution mode by [`PermissionMode::child_inherited_mode`].
+/// child-safe execution mode by [`PermissionMode::child_inherited_mode`], which returns
+/// a [`ChildPermissionMode`] that cannot represent `Bypass`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InheritedPermissions {
     /// Permission mode inherited from parent.
@@ -1157,7 +1193,7 @@ impl PermissionSyncContext {
     /// Create inherited permissions for a child agent.
     pub fn for_child(&self, is_background: bool) -> InheritedPermissions {
         let mut inherited = self.inherited.clone();
-        inherited.mode = inherited.mode.child_inherited_mode();
+        inherited.mode = PermissionMode::from(inherited.mode.child_inherited_mode());
         inherited.is_background = is_background;
         // Add session rules to inherited rules for child
         for rule in &self.session_allow {
@@ -1299,11 +1335,11 @@ mod tests {
         assert!(!PermissionMode::Bypass.auto_allows_soft_git_policy());
         assert!(!PermissionMode::Prompt.auto_resolves_approval_prompts());
         assert_eq!(
-            PermissionMode::Bypass.child_inherited_mode(),
+            PermissionMode::from(PermissionMode::Bypass.child_inherited_mode()),
             PermissionMode::Auto
         );
         assert_eq!(
-            PermissionMode::Prompt.child_inherited_mode(),
+            PermissionMode::from(PermissionMode::Prompt.child_inherited_mode()),
             PermissionMode::Prompt
         );
 

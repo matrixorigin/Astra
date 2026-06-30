@@ -536,7 +536,9 @@ fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -
 // genuinely different from turn-core's callback decision type
 // (Approve / Deny / Escalate).
 pub(crate) use astra_turn_core::permission::types::PermissionRule;
-pub(crate) use astra_turn_core::permission::types::{ManualApprovalPolicy, PermissionMode};
+pub(crate) use astra_turn_core::permission::types::{
+    ChildPermissionMode, ManualApprovalPolicy, PermissionMode,
+};
 
 /// Atomic encoding of [`PermissionMode`] for the lock-free mirror
 /// the TUI inner-tick path consumes. Keeps the mapping local and
@@ -1630,14 +1632,13 @@ impl PermissionManager {
     ) -> Self {
         // Use inherited mode, but load project settings too
         let mode = match inherited.mode.child_inherited_mode() {
-            astra_runtime::orchestration::PermissionMode::Auto => PermissionMode::Auto,
-            astra_runtime::orchestration::PermissionMode::Bypass => PermissionMode::Bypass,
-            astra_runtime::orchestration::PermissionMode::Plan => PermissionMode::Plan,
-            astra_runtime::orchestration::PermissionMode::AcceptEdits => {
+            astra_runtime::orchestration::ChildPermissionMode::Auto => PermissionMode::Auto,
+            astra_runtime::orchestration::ChildPermissionMode::Plan => PermissionMode::Plan,
+            astra_runtime::orchestration::ChildPermissionMode::AcceptEdits => {
                 PermissionMode::AcceptEdits
             }
-            astra_runtime::orchestration::PermissionMode::Prompt => PermissionMode::Prompt,
-            astra_runtime::orchestration::PermissionMode::Deny => PermissionMode::Deny,
+            astra_runtime::orchestration::ChildPermissionMode::Prompt => PermissionMode::Prompt,
+            astra_runtime::orchestration::ChildPermissionMode::Deny => PermissionMode::Deny,
         };
         let project_outcome = PermissionSettings::try_load(project_root);
         let user_outcome = PermissionSettings::try_load_user();
@@ -1790,12 +1791,11 @@ impl PermissionManager {
         };
 
         let mode = match self.mode.child_inherited_mode() {
-            PermissionMode::Auto => RuntimePermissionMode::Auto,
-            PermissionMode::Bypass => RuntimePermissionMode::Bypass,
-            PermissionMode::Plan => RuntimePermissionMode::Plan,
-            PermissionMode::AcceptEdits => RuntimePermissionMode::AcceptEdits,
-            PermissionMode::Prompt => RuntimePermissionMode::Prompt,
-            PermissionMode::Deny => RuntimePermissionMode::Deny,
+            ChildPermissionMode::Auto => RuntimePermissionMode::Auto,
+            ChildPermissionMode::Plan => RuntimePermissionMode::Plan,
+            ChildPermissionMode::AcceptEdits => RuntimePermissionMode::AcceptEdits,
+            ChildPermissionMode::Prompt => RuntimePermissionMode::Prompt,
+            ChildPermissionMode::Deny => RuntimePermissionMode::Deny,
         };
 
         let mut inherited = self

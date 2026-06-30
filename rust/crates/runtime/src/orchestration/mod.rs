@@ -44,10 +44,10 @@ pub mod permission_sync {
 }
 pub use fork_cache_probe::{ForkCacheProbeState, maybe_emit_fork_cache_probe};
 pub use permission_sync::{
-    InheritedPermissions, PermissionAction, PermissionCallback, PermissionDecision, PermissionMode,
-    PermissionRequest, PermissionRequestHandler, PermissionRequestMessaging, PermissionResponse,
-    PermissionResponseMessaging, PermissionRule, PermissionSyncContext, PermissionSyncHandle,
-    PermissionUpdate,
+    ChildPermissionMode, InheritedPermissions, PermissionAction, PermissionCallback,
+    PermissionDecision, PermissionMode, PermissionRequest, PermissionRequestHandler,
+    PermissionRequestMessaging, PermissionResponse, PermissionResponseMessaging, PermissionRule,
+    PermissionSyncContext, PermissionSyncHandle, PermissionUpdate,
 };
 pub use spawner::{
     AgentHistoryRecord, AgentStatus, DynamicAgentSpawner, InheritedChildPrefix, PermissionSummary,

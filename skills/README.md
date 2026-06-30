@@ -49,37 +49,38 @@ cp -r .claude/skills/some-skill .astra/skills/some-skill
 
 ### Frontmatter compatibility
 
-| Field | Agent Skills standard | Claude Code | Astra |
-|-------|----------------------|-------------|-------|
-| `name` | ✅ required | ✅ | ✅ |
-| `description` | ✅ required | ✅ | ✅ |
-| `allowed-tools` / `allowed_tools` | ✅ optional | ✅ | ✅ (both forms) |
-| `user-invocable` / `user_invocable` | — | ✅ | ✅ (both forms) |
-| `when_to_use` | — | — | ✅ astra extension |
-| `arguments` | — | via `$ARGUMENTS` | ✅ structured |
-| `context: fork` | — | ✅ | ✅ |
-| `disable-model-invocation` | — | ✅ | — (use `user_invocable: false`) |
-| `hooks` | — | ✅ | ✅ |
-| `paths` | — | ✅ | ✅ |
-| `model` | — | ✅ | ✅ |
-| `effort` | — | ✅ | ✅ |
+| Field                               | Agent Skills standard | Claude Code      | Astra                           |
+| ----------------------------------- | --------------------- | ---------------- | ------------------------------- |
+| `name`                              | ✅ required           | ✅               | ✅                              |
+| `description`                       | ✅ required           | ✅               | ✅                              |
+| `allowed-tools` / `allowed_tools`   | ✅ optional           | ✅               | ✅ (both forms)                 |
+| `user-invocable` / `user_invocable` | —                     | ✅               | ✅ (both forms)                 |
+| `when_to_use`                       | —                     | —                | ✅ astra extension              |
+| `arguments`                         | —                     | via `$ARGUMENTS` | ✅ structured                   |
+| `context: fork`                     | —                     | ✅               | ✅                              |
+| `disable-model-invocation`          | —                     | ✅               | — (use `user_invocable: false`) |
+| `hooks`                             | —                     | ✅               | ✅                              |
+| `paths`                             | —                     | ✅               | ✅                              |
+| `model`                             | —                     | ✅               | ✅                              |
+| `effort`                            | —                     | ✅               | ✅                              |
 
 ## Skills in this repo
 
-| Skill | Purpose |
-|-------|---------|
-| `analyze_session` | Diagnostic analysis and debugging of astra sessions (includes stall/escalation forensics) |
-| `audit_cloud_sync` | Audit edge-cloud sync: events, learning, checkpoints, tasks |
-| `evaluate_session` | Evaluate session performance metrics and optimization |
-| `optimize_prompt` | Analyze and optimize LLM prompt assembly and token usage |
-| `review_changes` | Context-aware code review with git diffs + code intelligence |
-| `trace_delegation` | Trace multi-agent delegation flows and verification gates |
-| `verify_task` | Verify task completion using the 8-type verification engine |
-| **`github_ci_check`** | Check CI/CD status, analyze failures, diagnose root causes |
-| **`github_pre_pr`** | Pre-PR checklist: make check, format, clippy, tests |
-| **`github_create_pr`** | Create PRs with gh CLI, auto-generate body from changes |
-| **`github_create_issue`** | Create issues with gh CLI, structured templates |
-| **`github_pr_review`** | Review PR comments, address feedback, draft responses |
+| Skill                     | Purpose                                                                                                                                              |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `analyze_session`         | Diagnostic analysis and debugging of astra sessions (includes stall/escalation forensics)                                                            |
+| `audit_cloud_sync`        | Audit edge-cloud sync: events, learning, checkpoints, tasks                                                                                          |
+| `evaluate_session`        | Evaluate session performance metrics and optimization                                                                                                |
+| `optimize_prompt`         | Analyze and optimize LLM prompt assembly and token usage                                                                                             |
+| `review_changes`          | Context-aware code review with git diffs + code intelligence                                                                                         |
+| `trace_delegation`        | Trace multi-agent delegation flows and verification gates                                                                                            |
+| `verify_task`             | Verify task completion using the 8-type verification engine                                                                                          |
+| **`github_ci_check`**     | Check CI/CD status, analyze failures, diagnose root causes                                                                                           |
+| **`github_pre_pr`**       | Pre-PR checklist: make check, format, clippy, tests                                                                                                  |
+| **`github_create_pr`**    | Create PRs with gh CLI, auto-generate body from changes                                                                                              |
+| **`github_create_issue`** | Create issues with gh CLI, structured templates                                                                                                      |
+| `github_pr_review`        | Review PR comments, address feedback, draft responses                                                                                                |
+| `unhappy_path_audit`      | Reachability-driven unhappy-path audit (R0→R3): dead code, misclassification, error-propagation breaks, state inconsistency, resource leaks/hung/OOM |
 
 ## Skill structure
 
