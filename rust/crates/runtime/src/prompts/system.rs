@@ -621,11 +621,11 @@ fn safety_section() -> &'static str {
 /// stack (~60 lines of repetition) with a tight 18-line contract.
 fn planning_section() -> &'static str {
     "\n## Plan, Batch, Execute\n\
-     1. **Plan first** (3+ tool calls): state goal + numbered steps in a <think> block, then act.\n\
-     2. **Batch independent reads** into ONE turn (≤5 parallel). Only serialize when one result feeds the next call's args.\n\
+     1. **Plan first** (3+ tool calls): state goal + numbered steps in a <think> block, then act. If blocked or surprised, re-plan before retrying.\n\
+     2. **Batch independent reads** into ONE turn (≤5 parallel): multi-file reads, multi-grep, or known list_dir + known read_file. Only serialize when one result feeds the next call's args.\n\
      3. **Reuse history**: if context was already fetched this session, reference it — don't re-fetch.\n\
      4. **Discover before reading**: use list_dir/glob to confirm paths. Never guess.\n\
-     5. **Targeted reads**: prefer line ranges + outline=true over full files. Use glob before grep.\n\
+     5. **Progressive reads**: structure first (outline=true or list), signal next (grep/files-with-matches), then targeted ranges. Full-file reads only for small files or when full context is needed.\n\
      6. **Never batch writes**: write_file / str_replace / bash / git execute sequentially.\n\
      7. **Build/test only AFTER your writes** — not for exploration, review, or Q&A.\n\
      8. **Open-ended loops** (\"keep going\", \"as many as you can\"): do one useful pass, then stop.\n\
@@ -1176,9 +1176,10 @@ fn search_strategy_section(tool_names: &[&str]) -> String {
              - {first_step} for filenames/dirs, then grep only that subset for content.\n\
              - For broad exploration that clearly needs >3 searches, consider an explore agent if available.\n\
              - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
+             - Rank by signal density before reading: API entry points → core logic → domain/types → config only if relevant → examples/docs only if asked.\n\
              - For code review, search changed files or adjacent modules before the whole repo.\n\
-             - Skip generated or bulky trees unless the task explicitly targets them: build, dist, target, coverage, htmlcov, node_modules, vendor.\n\
-             - After grep finds candidates, switch to targeted reads instead of repeating more broad searches.\n\
+             - Skip generated, bulky, or low-signal files unless targeted: build, dist, target, coverage, htmlcov, node_modules, vendor, *.example.*, fixtures, docs.\n\
+             - After grep finds candidates, switch to outline/range reads instead of repeating more broad searches.\n\
              - If grep is slow or noisy, tighten path, extension, or literal term — do NOT repeat the same broad search.\n\
              - Use `symbols` for code symbols only when visible or activated; keep grep for content searches.\n"
         )
@@ -1188,9 +1189,10 @@ fn search_strategy_section(tool_names: &[&str]) -> String {
              - Use visible layout/file tools first for filenames/dirs, then targeted reads for exact context.\n\
              - For broad exploration that clearly needs >3 searches, consider an explore agent if available.\n\
              - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
+             - Rank by signal density before reading: API entry points → core logic → domain/types → config only if relevant → examples/docs only if asked.\n\
              - For code review, inspect changed files or adjacent modules before the whole repo.\n\
-             - Skip generated or bulky trees unless the task explicitly targets them: build, dist, target, coverage, htmlcov, node_modules, vendor.\n\
-             - After locating candidates, switch to targeted reads instead of repeating broad searches.\n",
+             - Skip generated, bulky, or low-signal files unless targeted: build, dist, target, coverage, htmlcov, node_modules, vendor, *.example.*, fixtures, docs.\n\
+             - After locating candidates, switch to outline/range reads instead of repeating broad searches.\n",
         );
         if tool_visible(tool_names, "tool_search") {
             body.push_str(
@@ -2305,10 +2307,13 @@ mod tests {
         // Parallel tool calls
         assert!(p.contains("Batch independent reads"));
         assert!(p.contains("ONE turn"));
+        assert!(p.contains("multi-file reads"));
+        assert!(p.contains("Only serialize when one result feeds the next call's args"));
 
         // Token efficiency
-        assert!(p.contains("Targeted reads"));
-        assert!(p.contains("line ranges"));
+        assert!(p.contains("Progressive reads"));
+        assert!(p.contains("structure first"));
+        assert!(p.contains("targeted ranges"));
 
         // Build/test guidance
         assert!(p.contains("Build/test only AFTER your writes"));
@@ -2423,6 +2428,10 @@ mod tests {
         let p_search = build_main_system_prompt(&["glob", "grep", "read_file"], "", None);
         assert!(p_search.contains("Search Strategy"));
         assert!(p_search.contains("Use glob first"));
+        assert!(p_search.contains("Rank by signal density"));
+        assert!(p_search.contains("API entry points"));
+        assert!(p_search.contains("*.example.*"));
+        assert!(p_search.contains("outline/range reads"));
 
         // Search strategy → absent without search tools
         let p_no_search = build_main_system_prompt(&["bash"], "", None);
