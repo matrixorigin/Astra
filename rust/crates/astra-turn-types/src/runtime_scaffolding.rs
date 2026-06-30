@@ -40,6 +40,7 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
     "✓ Previous round:",
     "♻ Duplicate calls detected",
     // Runtime directives
+    "## ⚡ Self-Status",
     "⚠️ VERIFICATION REQUIRED",
     "🔄 ERROR BUDGET",
     "<system-reminder>",
@@ -157,6 +158,14 @@ mod tests {
         assert!(is_runtime_scaffolding_message(&msg(
             "user",
             "🔄 ERROR BUDGET EXHAUSTED: hit Unknown errors 3 turns in a row"
+        )));
+    }
+
+    #[test]
+    fn self_status_directive_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "## ⚡ Self-Status\nTurn 9/299 | Token pressure: 5% | Cache: 86%"
         )));
     }
 

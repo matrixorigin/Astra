@@ -265,15 +265,27 @@ pub fn ingest_agentic_turn_stream(
         *st.current_run_id = snap.run_id.clone();
     }
     let round_has_edge_work = !snap.tool_calls.is_empty() || edge_round_len > 0;
+    let preserve_prior_final_after_runtime_scaffolding_retry = !snap.full_text.is_empty()
+        && !round_has_edge_work
+        && should_preserve_prior_final_after_runtime_scaffolding_retry(
+            st.messages,
+            st.final_text.as_str(),
+        );
 
     // Only text-only responses are final answers. Text that accompanies tool
     // calls is an intermediate preamble; surfacing it as `final_text` makes
     // interrupted/budget-exhausted turns look successfully completed.
-    if !snap.full_text.is_empty() && !round_has_edge_work {
+    if !snap.full_text.is_empty()
+        && !round_has_edge_work
+        && !preserve_prior_final_after_runtime_scaffolding_retry
+    {
         *st.final_text = snap.full_text.to_string();
     }
 
-    if !snap.full_text.is_empty() && !round_has_edge_work {
+    if !snap.full_text.is_empty()
+        && !round_has_edge_work
+        && !preserve_prior_final_after_runtime_scaffolding_retry
+    {
         let guard = apply_response_guards(st.final_text.as_str(), snap.tool_calls, &[], message);
         if let Some(replacement) = guard.replacement {
             agent_warn!("response_guard", "Guard triggered, replacing LLM output");
@@ -412,7 +424,7 @@ pub fn ingest_agentic_turn_stream(
             record_prompt_calibration_success(snap, &mut st);
             return AgenticTurnIngestOutcome::Continue;
         }
-        if !snap.full_text.is_empty() {
+        if !snap.full_text.is_empty() && !preserve_prior_final_after_runtime_scaffolding_retry {
             persist_final_assistant_message(st.messages, st.final_text.as_str());
         }
         st.factual_retry_fallback_text.take();
@@ -447,6 +459,30 @@ fn persist_final_assistant_message(messages: &mut Vec<Value>, final_text: &str) 
         "role": "assistant",
         "content": final_text,
     }));
+}
+
+fn should_preserve_prior_final_after_runtime_scaffolding_retry(
+    messages: &[Value],
+    prior_final_text: &str,
+) -> bool {
+    if prior_final_text.trim().is_empty() {
+        return false;
+    }
+
+    let mut saw_runtime_scaffolding = false;
+    for msg in messages.iter().rev() {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        let content = msg
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if crate::runtime_scaffolding::is_continuation_scaffolding_for_role(role, content) {
+            saw_runtime_scaffolding = true;
+            continue;
+        }
+        return saw_runtime_scaffolding && role == "assistant" && !content.trim().is_empty();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -964,6 +1000,99 @@ mod tests {
             pack.final_text, "previous stable answer",
             "tool-call preambles are intermediate and must not overwrite the user-visible final answer"
         );
+    }
+
+    #[test]
+    fn no_tool_runtime_scaffolding_retry_preserves_prior_final_answer() {
+        let prior_answer = "Final answer that satisfies the user's request.";
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "Runtime follow-up without any new tool evidence.",
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let mut pack = Pack::new();
+        pack.final_text = prior_answer.to_string();
+        pack.messages.push(json!({
+            "role": "assistant",
+            "content": prior_answer,
+        }));
+        pack.messages.push(json!({
+            "role": "user",
+            "content": "⚠️ VERIFICATION REQUIRED: Before you finish, run any missing checks",
+        }));
+        pack.messages.push(json!({
+            "role": "user",
+            "content": "## ⚡ Self-Status\nTurn 9/299 | Token pressure: 5% | Cache: 86%",
+        }));
+
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "give advice only",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert_eq!(pack.final_text, prior_answer);
+        assert_eq!(
+            pack.messages.len(),
+            3,
+            "no-tool runtime-scaffolding retries must not append or replace the user-visible answer"
+        );
+    }
+
+    #[test]
+    fn no_tool_regular_user_followup_can_replace_prior_final_answer() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "Updated answer for the user's follow-up.",
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+            error_kind: None,
+        };
+        let mut pack = Pack::new();
+        pack.final_text = "Previous answer.".to_string();
+        pack.messages.push(json!({
+            "role": "assistant",
+            "content": "Previous answer.",
+        }));
+        pack.messages.push(json!({
+            "role": "user",
+            "content": "Please adjust the recommendation.",
+        }));
+
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "Please adjust the recommendation.",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert_eq!(pack.final_text, "Updated answer for the user's follow-up.");
+        assert_eq!(pack.messages.len(), 3);
     }
 
     // ─── Factual retry injection tests ──────────────────────────────────────

@@ -2058,7 +2058,8 @@ fn should_skip_auto_verify_stop_hooks(state: &AgenticLoopState) -> bool {
     {
         return false;
     }
-    has_successful_verification_after_latest_mutation(state)
+    !has_concrete_workspace_mutation(state)
+        || has_successful_verification_after_latest_mutation(state)
 }
 
 fn is_auto_verify_changes_hook(hook: &astra_turn_core::stop_hooks::StopHook) -> bool {
@@ -4108,6 +4109,28 @@ mod tests {
                     .into(),
             ),
             result_preview: Some("✓ cargo | 426 passed, 0 failed".into()),
+            ..Default::default()
+        });
+
+        assert!(should_skip_auto_verify_stop_hooks(&state));
+    }
+
+    #[test]
+    fn auto_verify_stop_hook_skips_when_no_workspace_mutation_happened() {
+        let mut state = make_state();
+        state.hooks.stop_hooks = vec![auto_verify_hook()];
+        state.final_text = "Here is the advice you asked for.".into();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            args_full: Some(r#"{"path":"src/lib.rs"}"#.into()),
+            ..Default::default()
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"git diff --stat"}"#.into()),
+            result_preview: Some("no changes".into()),
             ..Default::default()
         });
 

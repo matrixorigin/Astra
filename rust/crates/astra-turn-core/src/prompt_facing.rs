@@ -432,6 +432,7 @@ mod tests {
             json!({"role": "assistant", "content": "working"}),
             json!({"role": "user", "content": "⚠️ VERIFICATION REQUIRED: Before you finish, run any missing checks"}),
             json!({"role": "user", "content": "🔄 ERROR BUDGET EXHAUSTED: You've hit Unknown errors 3 turns in a row"}),
+            json!({"role": "user", "content": "## ⚡ Self-Status\nTurn 9/299 | Token pressure: 5% | Cache: 86%"}),
             json!({"role": "assistant", "content": "Tools used: bash, grep, read_file"}),
             json!({"role": "assistant", "content": "done"}),
         ];
@@ -453,6 +454,7 @@ mod tests {
         );
         assert!(!joined.contains("VERIFICATION REQUIRED"));
         assert!(!joined.contains("ERROR BUDGET"));
+        assert!(!joined.contains("Self-Status"));
         assert!(!joined.contains("Tools used:"));
     }
 
