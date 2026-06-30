@@ -2887,7 +2887,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 self.render.tool_done(idx, tool, args, status, 0, &body);
             }
             return self
-                .finish_edge_tool(request_id, tool, args, body, status.to_string(), 0)
+                .finish_edge_tool_with_fields(
+                    request_id,
+                    tool,
+                    args,
+                    body,
+                    Some(crate::edge_tools::noop_or_cached_tool_result_fields()),
+                    status.to_string(),
+                    0,
+                )
                 .await;
         }
 
@@ -2900,7 +2908,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     .tool_done(idx, tool, args, &cached_status, 0, &cached_output);
             }
             return self
-                .finish_edge_tool(request_id, tool, args, cached_output, cached_status, 0)
+                .finish_edge_tool_with_fields(
+                    request_id,
+                    tool,
+                    args,
+                    cached_output,
+                    Some(crate::edge_tools::noop_or_cached_tool_result_fields()),
+                    cached_status,
+                    0,
+                )
                 .await;
         }
 

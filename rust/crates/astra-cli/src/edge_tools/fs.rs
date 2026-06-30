@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use super::{
     AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, ReadCoverage, ReadDedupKey,
-    SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit,
-    truncate_output,
+    SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel, fuzzy_replacer,
+    noop_or_cached_tool_result_fields, tool_output_limit, truncate_output,
 };
 use astra_runtime::tool_sandbox::validate_path;
 use astra_sandbox::is_internal_safe_path;
@@ -30,6 +30,39 @@ fn expand_home_path_arg(path: &str) -> Option<PathBuf> {
         .or_else(|| path.strip_prefix("$HOME/"))
         .or_else(|| path.strip_prefix("${HOME}/"))
         .map(|suffix| home.join(suffix))
+}
+
+fn is_blocked_device_read_path(path_str_lower: &str) -> bool {
+    const BLOCKED_DEVICE_PATHS: &[&str] = &[
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/full",
+        "/dev/stdin",
+        "/dev/tty",
+        "/dev/console",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/null",
+    ];
+    BLOCKED_DEVICE_PATHS
+        .iter()
+        .any(|blocked| path_str_lower.starts_with(blocked))
+        || (path_str_lower.starts_with("/proc/") && path_str_lower.contains("/fd/"))
+}
+
+fn is_read_file_image_extension(ext_lower: &str) -> bool {
+    const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+    IMAGE_EXTS.contains(&ext_lower)
+}
+
+fn is_read_file_binary_extension(ext_lower: &str) -> bool {
+    const BINARY_EXTS: &[&str] = &[
+        "svg", "pdf", "zip", "gz", "tar", "bz2", "xz", "7z", "rar", "exe", "dll", "so", "dylib",
+        "o", "a", "lib", "wasm", "class", "pyc", "pyo", "mp3", "mp4", "avi", "mov", "wav", "flac",
+        "ogg", "ttf", "otf", "woff", "woff2", "eot", "sqlite", "db", "mdb", "ico",
+    ];
+    BINARY_EXTS.contains(&ext_lower)
 }
 
 /// Append the stable [`TOOL_SUCCESS_SENTINEL`] to a human-readable success body.
@@ -183,6 +216,23 @@ impl ToolExecutor {
     }
 
     pub(crate) fn read_file(&self, args: &Value) -> String {
+        self.read_file_with_metadata(args).0
+    }
+
+    pub(crate) fn read_file_with_metadata(
+        &self,
+        args: &Value,
+    ) -> (String, Option<serde_json::Map<String, Value>>) {
+        let mut tool_result_fields = None;
+        let output = self.read_file_impl(args, &mut tool_result_fields);
+        (output, tool_result_fields)
+    }
+
+    fn read_file_impl(
+        &self,
+        args: &Value,
+        tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
+    ) -> String {
         let args = convert_read_file_args(args);
         if let Err(error) = validate_read_file_args(&args) {
             return error;
@@ -202,28 +252,11 @@ impl ToolExecutor {
         // Device file blocking — prevent hangs on infinite/blocking device files
         {
             let path_str_lower = path.to_string_lossy().to_lowercase();
-            const BLOCKED_DEVICE_PATHS: &[&str] = &[
-                "/dev/zero",
-                "/dev/random",
-                "/dev/urandom",
-                "/dev/full",
-                "/dev/stdin",
-                "/dev/tty",
-                "/dev/console",
-                "/dev/stdout",
-                "/dev/stderr",
-                "/dev/null",
-            ];
-            for blocked in BLOCKED_DEVICE_PATHS {
-                if path_str_lower.starts_with(blocked) {
-                    return format!(
-                        "Error: refusing to read device file '{}' (would block or produce infinite output)",
-                        blocked
-                    );
-                }
-            }
-            if path_str_lower.starts_with("/proc/") && path_str_lower.contains("/fd/") {
-                return "Error: refusing to read /proc fd paths (would block)".to_string();
+            if is_blocked_device_read_path(&path_str_lower) {
+                return format!(
+                    "Error: refusing to read device file '{}' (would block or produce infinite output)",
+                    path.display()
+                );
             }
         }
 
@@ -232,8 +265,7 @@ impl ToolExecutor {
             let ext_lower = ext.to_lowercase();
 
             // Image files: return base64 for vision models
-            const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
-            if IMAGE_EXTS.contains(&ext_lower.as_str()) {
+            if is_read_file_image_extension(&ext_lower) {
                 // Check file size before reading — base64 inflates by ~33%
                 if let Ok(meta) = fs::metadata(&path)
                     && meta.len() > 1_500_000
@@ -263,13 +295,7 @@ impl ToolExecutor {
             }
 
             // Other binary files: block
-            const BINARY_EXTS: &[&str] = &[
-                "svg", "pdf", "zip", "gz", "tar", "bz2", "xz", "7z", "rar", "exe", "dll", "so",
-                "dylib", "o", "a", "lib", "wasm", "class", "pyc", "pyo", "mp3", "mp4", "avi",
-                "mov", "wav", "flac", "ogg", "ttf", "otf", "woff", "woff2", "eot", "sqlite", "db",
-                "mdb", "ico",
-            ];
-            if BINARY_EXTS.contains(&ext_lower.as_str()) {
+            if is_read_file_binary_extension(&ext_lower) {
                 return format!(
                     "Error: refusing to read binary file (.{ext}). Use bash with appropriate tools (e.g. file, xxd, strings) for binary analysis."
                 );
@@ -297,6 +323,7 @@ impl ToolExecutor {
 
         // Consecutive identical outline/range request + unchanged file → stub before I/O.
         if !is_internal_artifact_read && self.can_dedup_identical_partial_read(&path, &dedup_key) {
+            *tool_result_fields = Some(noop_or_cached_tool_result_fields());
             return format!(
                 "[Same read_file request as immediately before — file unchanged. \
                  Refer to the earlier read_file result for {path_str}.]"
@@ -311,6 +338,7 @@ impl ToolExecutor {
             let s = start_raw.unwrap_or(1);
             let e = end_raw.unwrap_or(u64::MAX);
             if !is_internal_artifact_read && self.is_range_already_read(&path, s, e) {
+                *tool_result_fields = Some(noop_or_cached_tool_result_fields());
                 return format!(
                     "[Lines {s}–{e} of {path_str} were already read in earlier requests \
                      and the file is unchanged. Refer to those earlier read_file results \
@@ -556,6 +584,7 @@ impl ToolExecutor {
         // changed, return a stub. Later turns may need the content again after
         // prompt compaction, so cross-turn reads still return the file body.
         if !is_internal_artifact_read && self.can_dedup_read(&path) {
+            *tool_result_fields = Some(noop_or_cached_tool_result_fields());
             let msg = if is_ranged {
                 format!(
                     "[File already fully read earlier in this turn and unchanged — \

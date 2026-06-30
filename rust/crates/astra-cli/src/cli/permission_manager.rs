@@ -1444,7 +1444,7 @@ impl PermissionManager {
     #[cfg(test)]
     pub(crate) fn new(auto_approve: bool) -> Self {
         let mode = if auto_approve {
-            PermissionMode::Auto
+            PermissionMode::Bypass
         } else {
             PermissionMode::Prompt
         };
@@ -1480,7 +1480,7 @@ impl PermissionManager {
     /// Loads `.astra/permissions.json` if it exists, applying persistent allow/deny rules.
     pub(crate) fn with_project(auto_approve: bool, project_root: &Path) -> Self {
         let mode = if auto_approve {
-            PermissionMode::Auto
+            PermissionMode::Bypass
         } else {
             PermissionMode::Prompt
         };
@@ -1503,7 +1503,7 @@ impl PermissionManager {
     /// or changed workspaces apply project deny rules only.
     pub(crate) fn with_workspace_trust(auto_approve: bool, project_root: &Path) -> Self {
         let mode = if auto_approve {
-            PermissionMode::Auto
+            PermissionMode::Bypass
         } else {
             PermissionMode::Prompt
         };
@@ -5626,7 +5626,8 @@ mod tests {
 
     #[test]
     fn explicit_irreversible_actions_auto_allowed_in_auto_mode() {
-        let mut pm = PermissionManager::new(true); // auto mode
+        let mut pm = PermissionManager::new(false);
+        pm.set_mode(PermissionMode::Auto);
         let args = serde_json::json!({"action": "commit", "message": "ship it"});
         let decision = pm.check_nonblocking("git", &args);
         assert!(
@@ -5695,7 +5696,8 @@ mod tests {
     fn broad_session_override_cannot_bypass_git_safety() {
         // CRITICAL: a broad "bash" approval must not cover destructive git.
         // Only an exact command approval can reuse this gate.
-        let mut pm = PermissionManager::new(true); // auto mode
+        let mut pm = PermissionManager::new(false);
+        pm.set_mode(PermissionMode::Auto);
         pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({
             "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
@@ -5710,7 +5712,8 @@ mod tests {
 
     #[test]
     fn exact_session_override_allows_same_bounded_git_safety_request_only() {
-        let mut pm = PermissionManager::new(true); // auto mode
+        let mut pm = PermissionManager::new(false);
+        pm.set_mode(PermissionMode::Auto);
         let args = serde_json::json!({
             "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
         });
@@ -5750,7 +5753,8 @@ mod tests {
         // Hard boundary: Auto mode never opens an interactive prompt for
         // sensitive paths. Without a content-specific approval or explicit
         // opt-in it fails closed.
-        let mut pm = PermissionManager::new(true);
+        let mut pm = PermissionManager::new(false);
+        pm.set_mode(PermissionMode::Auto);
         pm.session_overrides.insert(bare_fp("write_file"), true);
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
         let decision = pm.check_nonblocking("write_file", &args);
@@ -5808,7 +5812,8 @@ mod tests {
 
     #[test]
     fn directory_override_cannot_bypass_sensitive_sibling_path() {
-        let mut pm = PermissionManager::new(true);
+        let mut pm = PermissionManager::new(false);
+        pm.set_mode(PermissionMode::Auto);
         let safe = serde_json::json!({"path": "src/deep/main.rs", "content": "ok"});
         let sensitive = serde_json::json!({"path": "src/deep/.env", "content": "SECRET=x"});
 

@@ -75,7 +75,7 @@ pub(crate) struct Cli {
     /// Resume a specific session by ID (or prefix)
     #[arg(short = 'r', long = "resume")]
     pub resume: Option<String>,
-    /// Auto-approve tool calls without prompting
+    /// Skip approval prompts; hard safety denies still apply
     #[arg(short = 'y', long = "yes")]
     pub yes: bool,
     /// System prompt to prepend (useful with --print for scripting)
@@ -378,7 +378,7 @@ pub(crate) struct ChatArgs {
         value_parser = parse_explain_mode_arg
     )]
     pub explain: Option<crate::cli::session::session_state::ExplainMode>,
-    /// Auto-approve tool calls
+    /// Skip approval prompts; hard safety denies still apply
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     pub auto_approve: bool,
     /// Permission mode: auto, bypass, plan, accept_edits, prompt (interactive, default), or deny.

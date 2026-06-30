@@ -760,7 +760,7 @@ impl SemanticDedup {
             return String::new();
         }
 
-        let mut files: Vec<&str> = Vec::new();
+        let mut files = std::collections::BTreeSet::new();
         let mut searches: Vec<String> = Vec::new();
         let mut git_ops: Vec<&str> = Vec::new();
         let mut github_ops: Vec<String> = Vec::new();
@@ -771,7 +771,7 @@ impl SemanticDedup {
             match tool.as_str() {
                 "read_file" => {
                     if let Some(path) = read_file_path_from_semantic_key(key) {
-                        files.push(path);
+                        files.insert(path.to_string());
                     }
                 }
                 "grep" => {
@@ -816,7 +816,7 @@ impl SemanticDedup {
 
         if !files.is_empty() {
             let count = files.len();
-            let display: Vec<_> = files.iter().take(5).copied().collect();
+            let display: Vec<_> = files.iter().take(5).map(String::as_str).collect();
             let suffix = if count > 5 {
                 format!(" (+{} more)", count - 5)
             } else {
@@ -1499,6 +1499,27 @@ mod tests {
         assert!(inv.contains("Files:"), "should have Files section");
         assert!(inv.contains("src/main.rs"));
         assert!(inv.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn context_inventory_counts_read_ranges_as_one_file() {
+        let mut tracker = SemanticDedup::new(0.75);
+        tracker.check_and_record(
+            "read_file",
+            &json!({"path": "src/lib.rs", "start_line": 1, "end_line": 40}),
+            "content",
+            0,
+        );
+        tracker.check_and_record(
+            "read_file",
+            &json!({"path": "src/lib.rs", "start_line": 80, "end_line": 120}),
+            "content",
+            1,
+        );
+
+        let inv = tracker.context_inventory();
+        assert_eq!(inv.matches("src/lib.rs").count(), 1, "{inv}");
+        assert!(!inv.contains("more"), "{inv}");
     }
 
     #[test]

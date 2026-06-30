@@ -441,6 +441,13 @@ fn cli_tool_output_is_error(output: &str) -> bool {
 
 pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;
 
+pub(crate) fn noop_or_cached_tool_result_fields() -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([(
+        "result_class".to_string(),
+        Value::String(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string()),
+    )])
+}
+
 fn sandbox_denied_outcome_from_output(output: &str) -> Option<ToolExecutionOutcome> {
     let message = crate::sandbox_retry::sandbox_denied_message(output)?.into_owned();
     Some(ToolExecutionOutcome {
@@ -466,6 +473,7 @@ fn tool_execution_outcome_from_output(output: String) -> ToolExecutionOutcome {
 struct EdgeToolRun {
     output: String,
     error_kind: Option<astra_core::ErrorKind>,
+    tool_result_fields: Option<serde_json::Map<String, Value>>,
 }
 
 impl EdgeToolRun {
@@ -473,6 +481,7 @@ impl EdgeToolRun {
         Self {
             output,
             error_kind: None,
+            tool_result_fields: None,
         }
     }
 
@@ -480,6 +489,7 @@ impl EdgeToolRun {
         Self {
             output,
             error_kind: None,
+            tool_result_fields: None,
         }
     }
 
@@ -487,7 +497,13 @@ impl EdgeToolRun {
         Self {
             output,
             error_kind: Some(kind),
+            tool_result_fields: None,
         }
+    }
+
+    fn with_tool_result_fields(mut self, fields: Option<serde_json::Map<String, Value>>) -> Self {
+        self.tool_result_fields = fields;
+        self
     }
 
     fn into_outcome(self) -> ToolExecutionOutcome {
@@ -495,12 +511,24 @@ impl EdgeToolRun {
             return outcome;
         }
 
-        let mut outcome = if self.error_kind.is_some() || cli_tool_output_is_error(&self.output) {
-            ToolExecutionOutcome::error(self.output)
+        let EdgeToolRun {
+            output,
+            error_kind,
+            tool_result_fields,
+        } = self;
+
+        let mut outcome = if error_kind.is_some() || cli_tool_output_is_error(&output) {
+            ToolExecutionOutcome::error(output)
         } else {
-            ToolExecutionOutcome::ok(self.output)
+            ToolExecutionOutcome::ok(output)
         };
-        if let Some(kind) = self.error_kind {
+        if let Some(fields) = tool_result_fields {
+            let metadata = outcome
+                .tool_result_fields
+                .get_or_insert_with(serde_json::Map::new);
+            metadata.extend(fields);
+        }
+        if let Some(kind) = error_kind {
             let metadata = outcome
                 .tool_result_fields
                 .get_or_insert_with(serde_json::Map::new);
@@ -4375,20 +4403,29 @@ impl ToolExecutor {
         if let Some(error) = self.tool_admission_denial(name, args) {
             return error;
         }
-        let output = self.execute_raw(name, args).await;
+        let mut tool_result_fields = None;
+        let output = self.execute_raw(name, args, &mut tool_result_fields).await;
         // Structural error propagation: `execute_raw` returns a plain String,
         // discarding any structured error kind at the source. Recover it here
         // so downstream `tool_work_surface_events` can route on `error_kind`
         // metadata instead of re-deriving it from fragile string matching.
-        if cli_tool_output_is_error(&output) {
+        let is_error = cli_tool_output_is_error(&output);
+        let tool_result_fields = if is_error { None } else { tool_result_fields };
+        if is_error {
             let kind = astra_core::classify_tool_output(&output);
             EdgeToolRun::classified_error(output, kind)
         } else {
             EdgeToolRun::ok(output)
         }
+        .with_tool_result_fields(tool_result_fields)
     }
 
-    async fn execute_raw(&self, name: &str, args: &Value) -> String {
+    async fn execute_raw(
+        &self,
+        name: &str,
+        args: &Value,
+        tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
+    ) -> String {
         let output = if let Err(error) =
             crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
         {
@@ -4415,7 +4452,11 @@ impl ToolExecutor {
                     self.record_tool_search_activation_output(&output);
                     output
                 }
-                "read_file" => self.read_file(args),
+                "read_file" => {
+                    let (output, fields) = self.read_file_with_metadata(args);
+                    *tool_result_fields = fields;
+                    output
+                }
                 "write_file" => {
                     // delete=true routes to delete_file handler
                     if args.get("delete").and_then(Value::as_bool).unwrap_or(false) {

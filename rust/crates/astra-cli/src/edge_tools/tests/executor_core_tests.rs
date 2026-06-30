@@ -272,6 +272,55 @@ async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
     );
 }
 
+#[tokio::test]
+async fn execute_with_metadata_read_file_reuse_is_structured_noop_or_cached() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+    let executor = ToolExecutor::new(temp.path().to_path_buf());
+    let args = json!({"path": "lib.rs", "start_line": 1, "end_line": 1});
+
+    let first = executor.execute_with_metadata("read_file", &args).await;
+    assert!(!first.is_error, "{first:?}");
+    assert!(
+        first
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get("result_class"))
+            .is_none(),
+        "fresh read must not be classified as cached/noop: {first:?}"
+    );
+
+    let second = executor.execute_with_metadata("read_file", &args).await;
+    assert!(!second.is_error, "{second:?}");
+    let fields = second.tool_result_fields.expect("metadata fields");
+    assert_eq!(
+        fields
+            .get("result_class")
+            .and_then(serde_json::Value::as_str),
+        Some(session_journal::NOOP_OR_CACHED_RESULT_CLASS)
+    );
+}
+
+#[tokio::test]
+async fn execute_with_metadata_read_file_error_is_not_structured_noop_or_cached() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(temp.path().to_path_buf());
+    let outcome = executor
+        .execute_with_metadata("read_file", &json!({"path": "missing.rs"}))
+        .await;
+
+    assert!(outcome.is_error, "{outcome:?}");
+    assert_ne!(
+        outcome
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get("result_class"))
+            .and_then(serde_json::Value::as_str),
+        Some(session_journal::NOOP_OR_CACHED_RESULT_CLASS),
+        "read_file errors must not be classified as cached/noop: {outcome:?}"
+    );
+}
+
 /// REGRESSION: the consolidated `agent` tool must reject the blocked
 /// delegate action instead of returning a successful placeholder.
 ///
