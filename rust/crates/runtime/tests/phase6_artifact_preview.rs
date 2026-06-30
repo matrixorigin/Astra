@@ -93,14 +93,20 @@ async fn insert_artifact(pool: &astra_core::SharedPool, seed: ArtifactSeed<'_>) 
 
 async fn artifact_status(
     pool: &astra_core::SharedPool,
+    user_id: &str,
+    session_id: &str,
     artifact_id: &str,
 ) -> (String, Option<String>) {
-    let row =
-        sqlx::query("SELECT status, cold_storage_ref FROM session_artifacts WHERE artifact_id = ?")
-            .bind(artifact_id)
-            .fetch_one(pool.get())
-            .await
-            .unwrap();
+    let row = sqlx::query(
+        "SELECT status, cold_storage_ref FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(artifact_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
     (
         row.try_get("status").unwrap(),
         row.try_get::<Option<String>, _>("cold_storage_ref")
@@ -133,7 +139,7 @@ async fn l2_50_gc_archives_or_extends_artifacts_with_active_references() {
     let outcome = run_artifact_retention_gc_once(pool.clone(), 100)
         .await
         .unwrap();
-    let (status, cold_ref) = artifact_status(&pool, &artifact_id).await;
+    let (status, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_id).await;
     assert!(outcome.scanned >= 1);
     assert_eq!(status, "active");
     assert!(
@@ -169,12 +175,17 @@ async fn l2_51_unknown_tool_uses_400b_fallback_and_writes_warning_event() {
         .unwrap();
     let row = sqlx::query(
         "SELECT
-           (SELECT preview_status FROM session_tool_outputs WHERE tool_name = ? LIMIT 1) AS preview_status,
-           (SELECT CHAR_LENGTH(preview_text) FROM session_tool_outputs WHERE tool_name = ? LIMIT 1) AS preview_len,
-           (SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'preview_template_missing' AND meta_tool_name = ?) AS warning_count",
+           (SELECT preview_status FROM session_tool_outputs WHERE user_id = ? AND session_id = ? AND tool_name = ? LIMIT 1) AS preview_status,
+           (SELECT CHAR_LENGTH(preview_text) FROM session_tool_outputs WHERE user_id = ? AND session_id = ? AND tool_name = ? LIMIT 1) AS preview_len,
+           (SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'preview_template_missing' AND meta_tool_name = ?) AS warning_count",
     )
+    .bind(&user_id)
+    .bind(&session_id)
     .bind(&tool_name)
+    .bind(&user_id)
+    .bind(&session_id)
     .bind(&tool_name)
+    .bind(&user_id)
     .bind(&session_id)
     .bind(&tool_name)
     .fetch_one(pool.get())
@@ -244,8 +255,11 @@ async fn l2_53_large_pg_dump_uses_artifact_ref_and_never_prompt_raw_payload() {
         .unwrap();
     let row = sqlx::query(
         "SELECT artifact_ref, CHAR_LENGTH(preview_text) AS preview_len, payload_bytes
-         FROM session_tool_outputs WHERE output_id = ?",
+         FROM session_tool_outputs
+         WHERE user_id = ? AND session_id = ? AND output_id = ?",
     )
+    .bind(&user_id)
+    .bind(&session_id)
     .bind(&output_id)
     .fetch_one(pool.get())
     .await
@@ -284,7 +298,7 @@ async fn l2_54_project_long_term_artifact_is_extended_not_expired() {
     run_artifact_retention_gc_once(pool.clone(), 100)
         .await
         .unwrap();
-    let (status, _) = artifact_status(&pool, &artifact_id).await;
+    let (status, _) = artifact_status(&pool, &user_id, &session_id, &artifact_id).await;
     assert_eq!(status, "active");
 }
 
@@ -386,11 +400,13 @@ async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
     let started = Instant::now();
     let row = sqlx::query(
         "SELECT
-          (SELECT COUNT(*) FROM session_tool_outputs FORCE INDEX (idx_tool_outputs_run_created) WHERE run_id = ?) AS output_count,
-          (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_session_artifacts_session_kind_created) WHERE session_id = ? AND artifact_kind = 'pg_dump') AS dump_count,
-          (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_artifacts_retention) WHERE status IN ('active', 'expiring') AND retention_until IS NOT NULL) AS retention_count",
+          (SELECT COUNT(*) FROM session_tool_outputs FORCE INDEX (idx_tool_outputs_user_run_created) WHERE user_id = ? AND run_id = ?) AS output_count,
+          (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_session_artifacts_owner_kind_order) WHERE user_id = ? AND session_id = ? AND artifact_kind = 'pg_dump') AS dump_count,
+          (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_artifacts_retention) WHERE retention_until IS NOT NULL AND retention_until <= DATE_ADD(NOW(6), INTERVAL 7 DAY) AND status IN ('active', 'expiring')) AS retention_count",
     )
+    .bind(&user_id)
     .bind(&run_id)
+    .bind(&user_id)
     .bind(&session_id)
     .fetch_one(pool.get())
     .await
@@ -412,7 +428,7 @@ async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
     run_artifact_retention_gc_once(pool.clone(), 100)
         .await
         .unwrap();
-    let (_, cold_ref) = artifact_status(&pool, &artifact_ids[0]).await;
+    let (_, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_ids[0]).await;
     assert!(
         cold_ref.is_some(),
         "referenced pg_dump artifact should be preserved via cold storage"
@@ -454,8 +470,9 @@ async fn l3_18_s12_14_day_review_retention_and_benchmark_budget_flex() {
         "SELECT
            COUNT(*) AS total_artifacts,
            SUM(CASE WHEN retention_policy = 'project_long_term' AND status = 'active' THEN 1 ELSE 0 END) AS long_term_active
-         FROM session_artifacts WHERE session_id = ?",
+         FROM session_artifacts WHERE user_id = ? AND session_id = ?",
     )
+    .bind(&user_id)
     .bind(&session_id)
     .fetch_one(pool.get())
     .await

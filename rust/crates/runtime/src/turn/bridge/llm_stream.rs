@@ -139,7 +139,7 @@ fn usage_sse_event_from_result_map(m: &Map<String, Value>) -> Option<Value> {
     if m.is_empty() {
         return None;
     }
-    let u = crate::turn::token_usage::TokenUsage::from_json_map(m);
+    let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(m);
     Some(json!({
         "type": "usage",
         "input_tokens": u.input_tokens,

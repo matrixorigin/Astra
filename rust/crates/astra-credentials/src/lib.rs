@@ -3,6 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::PathBuf,
+    sync::{Condvar, Mutex, OnceLock},
 };
 
 use fs2::FileExt;
@@ -292,7 +293,104 @@ fn write_private_file(path: &PathBuf, body: &str) -> Result<(), CredentialError>
     }
 }
 
+/// Process-wide credentials directory override for test isolation.
+///
+/// This replaces the `ASTRA_CLI_CREDENTIALS_DIR` env var approach, which is
+/// fundamentally broken for parallel tests: env vars are process-global and
+/// mutating them is unsafe when any other thread can read the environment.
+///
+/// The override is intentionally process-wide, not thread-local. Credential
+/// reads in tests can happen on tokio worker threads, `spawn_blocking` threads,
+/// or ordinary spawned threads. A single in-process override keeps those reads
+/// pointed at the same temp directory while serializing tests that rely on the
+/// default credentials path.
+mod test_override {
+    use super::{Condvar, Mutex, OnceLock, PathBuf};
+    use std::time::Duration;
+
+    struct OverrideState {
+        active: Mutex<bool>,
+        available: Condvar,
+        dir: Mutex<Option<PathBuf>>,
+    }
+
+    fn state() -> &'static OverrideState {
+        static STATE: OnceLock<OverrideState> = OnceLock::new();
+        STATE.get_or_init(|| OverrideState {
+            active: Mutex::new(false),
+            available: Condvar::new(),
+            dir: Mutex::new(None),
+        })
+    }
+
+    fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Set a process-wide credentials directory override for tests.
+    ///
+    /// This call blocks while another credentials override is active, so tests
+    /// that depend on `CredentialStore::new()` get isolation without mutating
+    /// process environment variables.
+    pub fn set_test_credentials_dir(path: PathBuf) -> CredentialsDirOverrideGuard {
+        let state = state();
+        let mut guard = CredentialsDirOverrideGuard { active: false };
+        let mut active = lock_or_recover(&state.active);
+        while *active {
+            let (held, timeout) = state
+                .available
+                .wait_timeout(active, Duration::from_secs(5))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if timeout.timed_out() && *held {
+                panic!(
+                    "CredentialsDirOverrideGuard: timed out after 5s waiting for prior guard to drop. \
+                     This indicates a leaked guard (Drop not called, likely due to a panic in a test)."
+                );
+            }
+            active = held;
+        }
+        // Mark the returned guard as responsible for cleanup before publishing
+        // any process-wide state. If this function ever unwinds below, Drop
+        // restores both the directory and active flag.
+        guard.active = true;
+        *lock_or_recover(&state.dir) = Some(path);
+        *active = true;
+        drop(active);
+        guard
+    }
+
+    pub fn get_test_credentials_dir() -> Option<PathBuf> {
+        lock_or_recover(&state().dir).clone()
+    }
+
+    pub struct CredentialsDirOverrideGuard {
+        active: bool,
+    }
+
+    impl Drop for CredentialsDirOverrideGuard {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let state = state();
+            *lock_or_recover(&state.dir) = None;
+            let mut active = lock_or_recover(&state.active);
+            *active = false;
+            state.available.notify_one();
+        }
+    }
+}
+
+pub use test_override::CredentialsDirOverrideGuard;
+pub use test_override::set_test_credentials_dir;
+
 fn default_path() -> PathBuf {
+    if let Some(dir) = test_override::get_test_credentials_dir() {
+        return dir.join("credentials.json");
+    }
+
     if let Ok(dir) = std::env::var("ASTRA_CLI_CREDENTIALS_DIR") {
         return PathBuf::from(dir).join("credentials.json");
     }
@@ -305,10 +403,29 @@ fn default_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex as TestMutex, MutexGuard as TestMutexGuard};
     use tempfile::TempDir;
+
+    static TEST_CREDENTIALS_OVERRIDE_LOCK: TestMutex<()> = TestMutex::new(());
 
     fn store_in(dir: &TempDir) -> CredentialStore {
         CredentialStore::with_path(dir.path().join("credentials.json"))
+    }
+
+    fn default_path_without_test_override() -> PathBuf {
+        if let Ok(dir) = std::env::var("ASTRA_CLI_CREDENTIALS_DIR") {
+            return PathBuf::from(dir).join("credentials.json");
+        }
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".astra")
+            .join("credentials.json")
+    }
+
+    fn lock_test_credentials_override() -> TestMutexGuard<'static, ()> {
+        TEST_CREDENTIALS_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]
@@ -479,5 +596,32 @@ mod tests {
             assert_eq!(meta.permissions().mode() & 0o777, 0o600);
             assert_eq!(fs::read_to_string(&tmp).unwrap(), "secret-token");
         }
+    }
+
+    #[test]
+    fn test_credentials_dir_override_applies_without_waiting() {
+        let _lock = lock_test_credentials_override();
+        let dir = TempDir::new().unwrap();
+        let _guard = set_test_credentials_dir(dir.path().to_path_buf());
+
+        assert_eq!(default_path(), dir.path().join("credentials.json"));
+    }
+
+    #[test]
+    fn test_credentials_dir_override_restores_default_path_on_drop() {
+        let _lock = lock_test_credentials_override();
+        let expected_default = default_path_without_test_override();
+        let dir = TempDir::new().unwrap();
+
+        {
+            let _guard = set_test_credentials_dir(dir.path().to_path_buf());
+            assert_eq!(default_path(), dir.path().join("credentials.json"));
+        }
+
+        assert_eq!(
+            default_path(),
+            expected_default,
+            "dropping the test credentials guard must restore default path resolution"
+        );
     }
 }

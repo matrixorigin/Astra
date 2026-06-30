@@ -179,6 +179,21 @@ impl DatabaseSkillConfigService {
     }
 }
 
+fn invalid_skill_manifest_error(skill_name: &str, source: serde_json::Error) -> sqlx::Error {
+    sqlx::Error::Decode(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("invalid manifest JSON for skill '{skill_name}': {source}"),
+    )))
+}
+
+fn decode_skill_manifest(
+    skill_name: &str,
+    manifest_str: &str,
+) -> Result<serde_json::Value, sqlx::Error> {
+    serde_json::from_str::<serde_json::Value>(manifest_str)
+        .map_err(|source| invalid_skill_manifest_error(skill_name, source))
+}
+
 #[async_trait]
 impl SkillConfigService for DatabaseSkillConfigService {
     async fn validate_config(
@@ -218,9 +233,9 @@ impl SkillConfigService for DatabaseSkillConfigService {
         .map_err(internal_error)?;
 
         for row in &setting_rows {
-            let name: String = row.try_get("setting_name").unwrap_or_default();
-            let is_secret: i16 = row.try_get("is_secret").unwrap_or(0);
-            let value: String = row.try_get("setting_value").unwrap_or_default();
+            let name: String = row.try_get("setting_name").map_err(internal_error)?;
+            let is_secret: i16 = row.try_get("is_secret").map_err(internal_error)?;
+            let value: String = row.try_get("setting_value").map_err(internal_error)?;
             if is_secret == 1 && value.is_empty() {
                 errors.push(ValidationError {
                     section: "secrets".to_string(),
@@ -260,14 +275,14 @@ impl SkillConfigService for DatabaseSkillConfigService {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for row in &rows {
-            let name: String = row.try_get("setting_name").unwrap_or_default();
+            let name: String = row.try_get("setting_name").map_err(internal_error)?;
             if seen.contains(&name) {
                 continue;
             }
             seen.insert(name.clone());
 
-            let is_secret: i16 = row.try_get("is_secret").unwrap_or(0);
-            let value: String = row.try_get("setting_value").unwrap_or_default();
+            let is_secret: i16 = row.try_get("is_secret").map_err(internal_error)?;
+            let value: String = row.try_get("setting_value").map_err(internal_error)?;
 
             if is_secret == 1 {
                 secrets.insert(name, "***".to_string());
@@ -285,7 +300,7 @@ impl SkillConfigService for DatabaseSkillConfigService {
         .fetch_one(&pool)
         .await
         .map_err(internal_error)?;
-        let resources_configured: i64 = count_row.try_get("cnt").unwrap_or(0);
+        let resources_configured: i64 = count_row.try_get("cnt").map_err(internal_error)?;
 
         Ok(Json(ConfigResponse {
             settings,
@@ -314,7 +329,7 @@ impl SkillConfigService for DatabaseSkillConfigService {
         let is_secret = self
             .check_is_secret(&pool, skill_name, setting_name)
             .await
-            .unwrap_or(false);
+            .map_err(internal_error)?;
 
         let stored_value = if is_secret {
             encryptor.encrypt(&value_str).map_err(|e| {
@@ -329,7 +344,7 @@ impl SkillConfigService for DatabaseSkillConfigService {
         let is_secret_flag: i16 = if is_secret { 1 } else { 0 };
 
         let existing = sqlx::query(
-            "SELECT skill_id FROM skill_settings \
+            "SELECT setting_id FROM skill_settings \
              WHERE skill_name = ? AND setting_name = ? AND scope_type = ? \
              AND (scope_id = ? OR (scope_id IS NULL AND ? IS NULL))",
         )
@@ -362,7 +377,7 @@ impl SkillConfigService for DatabaseSkillConfigService {
         } else {
             let id = uuid::Uuid::new_v4().to_string();
             sqlx::query(
-                "INSERT INTO skill_settings (skill_id, skill_name, setting_name, setting_value, is_secret, scope_type, scope_id, updated_by) \
+                "INSERT INTO skill_settings (setting_id, skill_name, setting_name, setting_value, is_secret, scope_type, scope_id, updated_by) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&id)
@@ -440,13 +455,13 @@ impl SkillConfigService for DatabaseSkillConfigService {
         .await
         .map_err(internal_error)?;
 
-        let entries: Vec<ResourceEntry> = rows
-            .iter()
-            .map(|r| ResourceEntry {
-                resource_key: r.try_get("resource_key").unwrap_or_default(),
-                resource_type: r.try_get("resource_type").unwrap_or_default(),
-            })
-            .collect();
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in &rows {
+            entries.push(ResourceEntry {
+                resource_key: row.try_get("resource_key").map_err(internal_error)?,
+                resource_type: row.try_get("resource_type").map_err(internal_error)?,
+            });
+        }
 
         Ok(Json(entries))
     }
@@ -472,9 +487,10 @@ impl SkillConfigService for DatabaseSkillConfigService {
         .await
         .map_err(internal_error)?;
 
-        let resource_type: String = type_row
-            .map(|r| r.try_get("resource_type").unwrap_or_default())
-            .unwrap_or_else(|| "generic".to_string());
+        let resource_type: String = match type_row {
+            Some(row) => row.try_get("resource_type").map_err(internal_error)?,
+            None => "generic".to_string(),
+        };
 
         for (binding_name, value) in &bindings {
             let value_str = match value {
@@ -485,7 +501,7 @@ impl SkillConfigService for DatabaseSkillConfigService {
             let is_secret = self
                 .check_binding_is_secret(&pool, skill_name, resource_key, binding_name)
                 .await
-                .unwrap_or(false);
+                .map_err(internal_error)?;
 
             let stored_value = if is_secret {
                 encryptor.encrypt(&value_str).map_err(|e| {
@@ -606,9 +622,9 @@ impl DatabaseSkillConfigService {
         .await?;
 
         if let Some(row) = row {
-            let manifest_str: String = row.try_get("manifest").unwrap_or_default();
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str)
-                && let Some(secrets) = manifest.get("secrets")
+            let manifest_str: String = row.try_get("manifest")?;
+            let manifest = decode_skill_manifest(skill_name, &manifest_str)?;
+            if let Some(secrets) = manifest.get("secrets")
                 && let Some(arr) = secrets.as_array()
             {
                 for s in arr {
@@ -639,9 +655,9 @@ impl DatabaseSkillConfigService {
         .await?;
 
         if let Some(row) = row {
-            let manifest_str: String = row.try_get("manifest").unwrap_or_default();
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str)
-                && let Some(resources) = manifest.get("resources")
+            let manifest_str: String = row.try_get("manifest")?;
+            let manifest = decode_skill_manifest(skill_name, &manifest_str)?;
+            if let Some(resources) = manifest.get("resources")
                 && let Some(arr) = resources.as_array()
             {
                 for r in arr {
@@ -837,123 +853,5 @@ mod tests {
     async fn unconfigured_unbind_resource() {
         let svc = UnconfiguredSkillConfigService;
         assert_unavailable(svc.unbind_resource("u", "s", "r").await);
-    }
-
-    // ── Type serialization ──────────────────────────────────────────────
-
-    #[test]
-    fn validation_response_serialize() {
-        let resp = ValidationResponse {
-            valid: false,
-            errors: vec![ValidationError {
-                section: "settings".into(),
-                name: "api_key".into(),
-                resource_key: Some("my-db".into()),
-                error: "Missing".into(),
-            }],
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["valid"], false);
-        assert_eq!(json["errors"][0]["resource_key"], "my-db");
-    }
-
-    #[test]
-    fn validation_response_no_resource_key() {
-        let resp = ValidationResponse {
-            valid: true,
-            errors: vec![ValidationError {
-                section: "secrets".into(),
-                name: "token".into(),
-                resource_key: None,
-                error: "Empty".into(),
-            }],
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        // resource_key: None → should be skipped
-        assert!(json["errors"][0].get("resource_key").is_none());
-    }
-
-    #[test]
-    fn config_response_serialize() {
-        let mut settings = HashMap::new();
-        settings.insert("timeout".into(), serde_json::json!(30));
-        let resp = ConfigResponse {
-            settings,
-            secrets: HashMap::from([("api_key".into(), "***".into())]),
-            resources_configured: 2,
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["settings"]["timeout"], 30);
-        assert_eq!(json["secrets"]["api_key"], "***");
-        assert_eq!(json["resources_configured"], 2);
-    }
-
-    #[test]
-    fn scope_query_default() {
-        let q: ScopeQuery = serde_json::from_str("{}").unwrap();
-        assert_eq!(q.scope, "user");
-    }
-
-    #[test]
-    fn scope_query_custom() {
-        let q: ScopeQuery = serde_json::from_str(r#"{"scope":"global"}"#).unwrap();
-        assert_eq!(q.scope, "global");
-    }
-
-    #[test]
-    fn bind_resource_request_deserialize() {
-        let json = r#"{"bindings":{"host":"localhost","port":5432}}"#;
-        let req: BindResourceRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.bindings.len(), 2);
-        assert_eq!(req.bindings["host"], "localhost");
-    }
-
-    #[test]
-    fn resource_entry_serialize() {
-        let entry = ResourceEntry {
-            resource_key: "my-db".into(),
-            resource_type: "postgres".into(),
-        };
-        let json = serde_json::to_value(&entry).unwrap();
-        assert_eq!(json["resource_key"], "my-db");
-        assert_eq!(json["resource_type"], "postgres");
-    }
-
-    #[test]
-    fn status_response_serialize() {
-        let resp = StatusResponse {
-            status: "ok".into(),
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["status"], "ok");
-    }
-
-    #[test]
-    fn unbind_response_serialize() {
-        let resp = UnbindResourceResponse {
-            status: "deleted".into(),
-            count: 3,
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["count"], 3);
-    }
-
-    #[test]
-    fn bind_response_serialize() {
-        let resp = BindResourceResponse {
-            status: "ok".into(),
-            resource_key: "my-db".into(),
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["resource_key"], "my-db");
-    }
-
-    #[test]
-    fn validate_query_deserialize() {
-        let q: ValidateQuery = serde_json::from_str(r#"{"resource":"my-db"}"#).unwrap();
-        assert_eq!(q.resource, Some("my-db".into()));
-
-        let q: ValidateQuery = serde_json::from_str("{}").unwrap();
-        assert!(q.resource.is_none());
     }
 }

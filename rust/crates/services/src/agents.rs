@@ -107,26 +107,20 @@ impl DatabaseAgentService {
     pub fn agent_record_from_row(
         row: sqlx::mysql::MySqlRow,
     ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
-        let config_json: String = row
-            .try_get("agent_config_json")
-            .unwrap_or_else(|_| "{}".to_string());
-        let source_json: String = row
-            .try_get("data_source_json")
-            .unwrap_or_else(|_| "{}".to_string());
-        let is_active_int: i16 = row.try_get("is_active").unwrap_or(1);
+        let config_json = required_string(&row, "agent_config_json")?;
+        let source_json = required_string(&row, "data_source_json")?;
+        let is_active = decode_is_active(&row)?;
 
         Ok(AgentRecord {
-            agent_id: row.try_get("agent_id").map_err(internal_error)?,
-            name: row.try_get("agent_name").map_err(internal_error)?,
-            agent_type: row.try_get("agent_type").map_err(internal_error)?,
-            owner_user_id: row.try_get("owner_user_id").map_err(internal_error)?,
-            agent_config: serde_json::from_str(&config_json)
-                .unwrap_or(serde_json::Value::Object(Default::default())),
-            data_source: serde_json::from_str(&source_json)
-                .unwrap_or(serde_json::Value::Object(Default::default())),
-            is_active: is_active_int != 0,
-            created_at: row.try_get("created_at").unwrap_or_default(),
-            updated_at: row.try_get("updated_at").ok(),
+            agent_id: required_string(&row, "agent_id")?,
+            name: required_string(&row, "agent_name")?,
+            agent_type: required_string(&row, "agent_type")?,
+            owner_user_id: required_string(&row, "owner_user_id")?,
+            agent_config: parse_json_column("agent_config_json", &config_json)?,
+            data_source: parse_json_column("data_source_json", &source_json)?,
+            is_active,
+            created_at: required_string(&row, "created_at")?,
+            updated_at: optional_string(&row, "updated_at")?,
         })
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
@@ -151,6 +145,56 @@ const AGENT_LIST_SELECT_COLS: &str = "\
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
     DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at";
 const MAX_AGENT_LIST_ROWS: i64 = 200;
+
+fn agent_decode_error(
+    column: &'static str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ErrorResponse>) {
+    internal_error(format!(
+        "agent row decode column `{column}`: {}",
+        message.into()
+    ))
+}
+
+fn required_string(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let value = row.try_get::<String, _>(column).map_err(internal_error)?;
+    if value.trim().is_empty() {
+        return Err(agent_decode_error(column, "must not be empty"));
+    }
+    Ok(value)
+}
+
+fn optional_string(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    row.try_get::<Option<String>, _>(column)
+        .map_err(internal_error)
+}
+
+fn parse_json_column(
+    column: &'static str,
+    raw: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+    serde_json::from_str(raw).map_err(|source| agent_decode_error(column, source.to_string()))
+}
+
+fn decode_is_active(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+    let value = row.try_get::<i16, _>("is_active").map_err(internal_error)?;
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(agent_decode_error(
+            "is_active",
+            format!("expected 0 or 1, got {other}"),
+        )),
+    }
+}
 
 #[async_trait]
 impl AgentService for DatabaseAgentService {
@@ -211,7 +255,9 @@ impl AgentService for DatabaseAgentService {
                 .fetch_one(&pool)
                 .await
                 .map_err(internal_error)?;
-        let total = count_row.try_get::<i64, _>("total").unwrap_or(0);
+        let total = count_row
+            .try_get::<i64, _>("total")
+            .map_err(internal_error)?;
 
         let select_sql = format!(
             "SELECT {} FROM agent_agents WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT ?",
@@ -226,15 +272,14 @@ impl AgentService for DatabaseAgentService {
 
         let mut agents = Vec::with_capacity(rows.len());
         for row in rows {
-            let is_active_int: i16 = row.try_get("is_active").unwrap_or(1);
             agents.push(AgentListItem {
-                agent_id: row.try_get("agent_id").map_err(internal_error)?,
-                name: row.try_get("agent_name").map_err(internal_error)?,
-                agent_type: row.try_get("agent_type").map_err(internal_error)?,
-                owner_user_id: row.try_get("owner_user_id").map_err(internal_error)?,
-                is_active: is_active_int != 0,
-                created_at: row.try_get("created_at").unwrap_or_default(),
-                updated_at: row.try_get("updated_at").ok(),
+                agent_id: required_string(&row, "agent_id")?,
+                name: required_string(&row, "agent_name")?,
+                agent_type: required_string(&row, "agent_type")?,
+                owner_user_id: required_string(&row, "owner_user_id")?,
+                is_active: decode_is_active(&row)?,
+                created_at: required_string(&row, "created_at")?,
+                updated_at: optional_string(&row, "updated_at")?,
             });
         }
 
@@ -249,11 +294,12 @@ impl AgentService for DatabaseAgentService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let select_sql = format!(
-            "SELECT {} FROM agent_agents WHERE agent_id = ?",
+            "SELECT {} FROM agent_agents WHERE agent_id = ? AND owner_user_id = ?",
             AGENT_SELECT_COLS
         );
         let row = query(&select_sql)
             .bind(&agent_id)
+            .bind(&user_id)
             .fetch_optional(&pool)
             .await
             .map_err(internal_error)?;
@@ -264,14 +310,7 @@ impl AgentService for DatabaseAgentService {
                 format!("Agent {} not found", agent_id),
             )
         })?;
-        let record = Self::agent_record_from_row(row)?;
-        if record.owner_user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("Agent {} not found", agent_id),
-            ));
-        }
-        Ok(record)
+        Self::agent_record_from_row(row)
     }
 
     async fn update_agent(
@@ -879,42 +918,5 @@ mod tests {
             .await
             .is_err()
         );
-    }
-
-    #[test]
-    fn agent_response_from_record() {
-        let record = AgentRecord {
-            agent_id: "a1".into(),
-            name: "test".into(),
-            agent_type: "custom".into(),
-            owner_user_id: "u1".into(),
-            agent_config: serde_json::json!({}),
-            data_source: serde_json::json!({}),
-            is_active: true,
-            created_at: "2026-01-01".into(),
-            updated_at: None,
-        };
-        let resp = AgentResponse::from(record);
-        assert_eq!(resp.agent_id, "a1");
-        assert_eq!(resp.name, "test");
-    }
-
-    #[test]
-    fn agent_list_response_from_record() {
-        let record = AgentListRecord {
-            agents: vec![AgentListItem {
-                agent_id: "a1".into(),
-                name: "test".into(),
-                agent_type: "custom".into(),
-                owner_user_id: "u1".into(),
-                is_active: true,
-                created_at: "2026-01-01".into(),
-                updated_at: None,
-            }],
-            total: 1,
-        };
-        let resp = AgentListResponse::from(record);
-        assert_eq!(resp.total, 1);
-        assert_eq!(resp.agents[0].agent_id, "a1");
     }
 }

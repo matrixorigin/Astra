@@ -43,7 +43,6 @@ fn skip_string_escape(chars: &mut Peekable<Chars<'_>>, allow_bel: bool) -> Optio
 }
 
 pub(crate) fn sanitize_terminal_text(text: &str) -> Cow<'_, str> {
-    let text = astra_core::error_kind::strip_tool_binding_sentinel(text);
     if !text.chars().any(|ch| {
         is_unsafe_terminal_control(ch)
             || matches!(
@@ -58,7 +57,7 @@ pub(crate) fn sanitize_terminal_text(text: &str) -> Cow<'_, str> {
                     | '\u{009f}'
             )
     }) {
-        return text;
+        return Cow::Borrowed(text);
     }
 
     let mut sanitized = String::with_capacity(text.len());
@@ -151,17 +150,6 @@ mod tests {
     fn sanitize_terminal_text_strips_control_sequences_but_keeps_newlines_and_tabs() {
         let text = "ok\x1b[31m\tstill\nfine\r\u{009b}1m\x1b]0;title\x07";
         assert_eq!(sanitize_terminal_text(text), "ok\tstill\nfine");
-    }
-
-    #[test]
-    fn sanitize_terminal_text_strips_tool_binding_sentinel() {
-        let text = format!(
-            "Error: runtime binding unavailable {}",
-            astra_core::error_kind::TOOL_BINDING_SENTINEL
-        );
-        let sanitized = sanitize_terminal_text(&text);
-        assert!(!sanitized.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL));
-        assert!(sanitized.contains("runtime binding unavailable"));
     }
 
     #[test]

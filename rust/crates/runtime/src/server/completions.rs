@@ -182,7 +182,7 @@ pub(super) async fn completions_handler(
 
     let content = parsed.full_text;
     let finish_reason = parsed.finish_reason.unwrap_or_else(|| "stop".to_string());
-    let usage = crate::turn::token_usage::TokenUsage::from_json_map(&parsed.usage);
+    let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&parsed.usage);
     // OpenAI-compatible response surface: prompt_tokens = fresh + cached + creation,
     // matching upstream `/v1/chat/completions` semantics.
     let prompt_tokens =

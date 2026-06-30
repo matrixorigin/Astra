@@ -279,13 +279,43 @@ fn preview(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{ExecutionStateSummaryInput, format_summary};
     use astra_runtime::plan::PlanModeState;
-    use astra_services::VerifierKind;
     use astra_services::durable_task::{
         ContractStatus, DurableSubtask, SubtaskStage, TaskContract, TaskScope,
-        VerificationCriterion,
     };
     use astra_services::session_journal::JournalEvent;
     use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
+    use astra_services::{VerificationCriterion, VerifierKind};
+    use astra_tools::task_mgmt::{SessionSubtask, SessionTask};
+
+    fn task(id: &str, title: &str, status: &str) -> SessionTask {
+        SessionTask {
+            archived_at: None,
+            id: id.into(),
+            title: title.into(),
+            description: None,
+            status: status.into(),
+            subtasks: Vec::new(),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        }
+    }
+
+    fn subtask(id: &str, title: &str, status: &str) -> SessionSubtask {
+        SessionSubtask {
+            id: id.into(),
+            title: title.into(),
+            description: None,
+            status: status.into(),
+            depends_on: Vec::new(),
+            owner: None,
+            reason: None,
+        }
+    }
 
     fn durable_contract() -> TaskContract {
         TaskContract {

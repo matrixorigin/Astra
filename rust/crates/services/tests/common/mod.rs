@@ -26,8 +26,9 @@
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::storage::ensure_core_schema;
 
-/// Asserts `ASTRA_TEST_DB_IT=1` is set, loads `.env`, returns MatrixOneSettings.
+/// Loads `.env`, asserts `ASTRA_TEST_DB_IT=1` is set, and returns MatrixOneSettings.
 pub fn require_db_it_env() -> MatrixOneSettings {
+    let _ = dotenvy::dotenv();
     assert_eq!(
         std::env::var("ASTRA_TEST_DB_IT").as_deref(),
         Ok("1"),

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::Value;
 use sqlx::{MySql, QueryBuilder, Row, query};
+use std::collections::HashMap;
 
 use astra_core::{MatrixOneSettings, SharedPool, error_response, internal_error};
 
@@ -10,8 +11,7 @@ use crate::storage::agent_session_exists_for_user;
 use super::scoring::{
     DEGRADATION_DELTA, QUALITY_DEGRADED, QUALITY_GOOD, TOKEN_CHAR_RATIO, analyze_context_health,
     billable_input_from_canonical, compaction_effectiveness, compaction_forecast, compute_drift,
-    compute_trend, parse_relevance_scores, parse_token_usage, pollution_ratio, relevance_quality,
-    zone_balance,
+    compute_trend, pollution_ratio, relevance_quality, zone_balance,
 };
 use super::{IntrospectionService, ServiceResult, SkillInfo, SkillsIntrospectionResponse};
 
@@ -68,6 +68,369 @@ struct AskUserHistoryRow {
     created_at: String,
     metadata: Value,
     content_preview: String,
+}
+
+trait IntrospectionRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error>;
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error>;
+    fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error>;
+}
+
+impl IntrospectionRow for sqlx::mysql::MySqlRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+        self.try_get(column)
+    }
+}
+
+fn introspection_decode_error(
+    context: &str,
+    column: &str,
+    error: impl std::fmt::Display,
+) -> (StatusCode, axum::Json<astra_core::ErrorResponse>) {
+    internal_error(format!(
+        "introspection {context} decode column `{column}`: {error}"
+    ))
+}
+
+fn introspection_row_string(
+    row: &impl IntrospectionRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<String> {
+    row.string_column(column)
+        .map_err(|error| introspection_decode_error(context, column, error))
+}
+
+fn introspection_row_optional_string(
+    row: &impl IntrospectionRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<Option<String>> {
+    row.optional_string_column(column)
+        .map_err(|error| introspection_decode_error(context, column, error))
+}
+
+fn introspection_row_i64(
+    row: &impl IntrospectionRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<i64> {
+    row.i64_column(column)
+        .map_err(|error| introspection_decode_error(context, column, error))
+}
+
+fn introspection_row_optional_i64(
+    row: &impl IntrospectionRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<Option<i64>> {
+    row.optional_i64_column(column)
+        .map_err(|error| introspection_decode_error(context, column, error))
+}
+
+fn introspection_row_non_negative_i64(
+    row: &impl IntrospectionRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<i64> {
+    let value = introspection_row_i64(row, context, column)?;
+    if value < 0 {
+        return Err(introspection_decode_error(
+            context,
+            column,
+            format!("expected non-negative integer, got {value}"),
+        ));
+    }
+    Ok(value)
+}
+
+fn introspection_row_optional_non_negative_i64(
+    row: &impl IntrospectionRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<Option<i64>> {
+    let Some(value) = introspection_row_optional_i64(row, context, column)? else {
+        return Ok(None);
+    };
+    if value < 0 {
+        return Err(introspection_decode_error(
+            context,
+            column,
+            format!("expected non-negative integer, got {value}"),
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn introspection_required_non_empty_string(
+    row: &impl IntrospectionRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<String> {
+    let value = introspection_row_string(row, context, column)?;
+    if value.trim().is_empty() {
+        return Err(introspection_decode_error(
+            context,
+            column,
+            "expected non-empty string",
+        ));
+    }
+    Ok(value)
+}
+
+fn installed_skill_info_from_row(row: &impl IntrospectionRow) -> ServiceResult<SkillInfo> {
+    let context = "installed_skill_row";
+    Ok(SkillInfo {
+        name: introspection_required_non_empty_string(row, context, "skill_name")?,
+        version: introspection_required_non_empty_string(row, context, "skill_version")?,
+        description: introspection_row_string(row, context, "description")?,
+        category: introspection_row_string(row, context, "category")?,
+    })
+}
+
+fn cloud_skill_info_from_row(row: &impl IntrospectionRow) -> ServiceResult<SkillInfo> {
+    let context = "cloud_skill_row";
+    Ok(SkillInfo {
+        name: introspection_required_non_empty_string(row, context, "skill_name")?,
+        version: introspection_required_non_empty_string(row, context, "version")?,
+        description: introspection_row_string(row, context, "description")?,
+        category: introspection_row_string(row, context, "category")?,
+    })
+}
+
+fn decision_trace_row_from_row(row: &impl IntrospectionRow) -> ServiceResult<Value> {
+    let context = "decision_trace_row";
+    let output_json = introspection_row_string(row, context, "output_json")?;
+    let output: Value = serde_json::from_str(&output_json)
+        .map_err(|error| introspection_decode_error(context, "output_json", error))?;
+
+    Ok(serde_json::json!({
+        "decision_id": introspection_required_non_empty_string(row, context, "decision_id")?,
+        "event_id": introspection_required_non_empty_string(row, context, "event_id")?,
+        "decision_type": introspection_required_non_empty_string(row, context, "decision_type")?,
+        "model_used": introspection_row_optional_string(row, context, "model_used")?,
+        "created_at": introspection_required_non_empty_string(row, context, "created_at")?,
+        "output": output,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ToolHistoryAgg {
+    tool_total_calls: i64,
+    tool_fail_count: i64,
+    ask_user_total_calls: i64,
+    ask_user_fail_count: i64,
+}
+
+fn tool_history_agg_from_row(row: &impl IntrospectionRow) -> ServiceResult<ToolHistoryAgg> {
+    let context = "tool_history_agg_row";
+    let agg = ToolHistoryAgg {
+        tool_total_calls: introspection_row_non_negative_i64(row, context, "tool_total_calls")?,
+        tool_fail_count: introspection_row_non_negative_i64(row, context, "tool_fail_count")?,
+        ask_user_total_calls: introspection_row_non_negative_i64(
+            row,
+            context,
+            "ask_user_total_calls",
+        )?,
+        ask_user_fail_count: introspection_row_non_negative_i64(
+            row,
+            context,
+            "ask_user_fail_count",
+        )?,
+    };
+
+    if agg.tool_fail_count > agg.tool_total_calls {
+        return Err(introspection_decode_error(
+            context,
+            "tool_fail_count",
+            format!(
+                "expected <= tool_total_calls {}, got {}",
+                agg.tool_total_calls, agg.tool_fail_count
+            ),
+        ));
+    }
+    if agg.ask_user_fail_count > agg.ask_user_total_calls {
+        return Err(introspection_decode_error(
+            context,
+            "ask_user_fail_count",
+            format!(
+                "expected <= ask_user_total_calls {}, got {}",
+                agg.ask_user_total_calls, agg.ask_user_fail_count
+            ),
+        ));
+    }
+
+    Ok(agg)
+}
+
+fn tool_history_failure_from_row(row: &impl IntrospectionRow) -> ServiceResult<Value> {
+    let context = "tool_history_failure_row";
+    Ok(serde_json::json!({
+        "session_id": introspection_required_non_empty_string(row, context, "session_id")?,
+        "error_preview": introspection_row_string(row, context, "error_preview")?,
+        "created_at": introspection_required_non_empty_string(row, context, "created_at")?,
+    }))
+}
+
+fn ask_user_history_row_from_row(row: &impl IntrospectionRow) -> ServiceResult<AskUserHistoryRow> {
+    let context = "ask_user_history_row";
+    let metadata_json = introspection_row_string(row, context, "metadata_json")?;
+    let metadata: Value = serde_json::from_str(&metadata_json)
+        .map_err(|error| introspection_decode_error(context, "metadata_json", error))?;
+    Ok(AskUserHistoryRow {
+        session_id: introspection_required_non_empty_string(row, context, "session_id")?,
+        event_type: introspection_required_non_empty_string(row, context, "event_type")?,
+        created_at: introspection_required_non_empty_string(row, context, "created_at")?,
+        metadata,
+        content_preview: introspection_row_string(row, context, "content_preview")?,
+    })
+}
+
+fn parse_relevance_scores_strict(context: &str, raw: &str) -> ServiceResult<HashMap<String, f64>> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| introspection_decode_error(context, "relevance_scores", error))?;
+    let object = value.as_object().ok_or_else(|| {
+        introspection_decode_error(context, "relevance_scores", "expected JSON object")
+    })?;
+
+    let mut scores = HashMap::with_capacity(object.len());
+    for (key, value) in object {
+        let score = value.as_f64().ok_or_else(|| {
+            introspection_decode_error(
+                context,
+                "relevance_scores",
+                format!("score `{key}` must be numeric"),
+            )
+        })?;
+        if !(0.0..=1.0).contains(&score) {
+            return Err(introspection_decode_error(
+                context,
+                "relevance_scores",
+                format!("score `{key}` must be in 0..=1, got {score}"),
+            ));
+        }
+        scores.insert(key.clone(), score);
+    }
+    Ok(scores)
+}
+
+fn parse_json_object_strict(context: &str, column: &str, raw: &str) -> ServiceResult<Value> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| introspection_decode_error(context, column, error))?;
+    if !value.is_object() {
+        return Err(introspection_decode_error(
+            context,
+            column,
+            "expected JSON object",
+        ));
+    }
+    Ok(value)
+}
+
+fn retrieval_quality_scores_from_row(
+    row: &impl IntrospectionRow,
+) -> ServiceResult<HashMap<String, f64>> {
+    let context = "retrieval_quality_row";
+    let raw = introspection_row_string(row, context, "relevance_scores")?;
+    parse_relevance_scores_strict(context, &raw)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ContextSnapshotCoreRow {
+    snapshot_id: String,
+    task_type: Option<String>,
+    ctx_managed_tokens: Option<i64>,
+    assembly_ms: Option<i64>,
+    budget: Value,
+    relevance_scores: HashMap<String, f64>,
+    llm_response_id: Option<String>,
+}
+
+fn context_snapshot_core_from_row(
+    row: &impl IntrospectionRow,
+) -> ServiceResult<ContextSnapshotCoreRow> {
+    let context = "context_snapshot_row";
+    let budget_raw = introspection_row_string(row, context, "token_budget")?;
+    let relevance_raw = introspection_row_string(row, context, "relevance_scores")?;
+    Ok(ContextSnapshotCoreRow {
+        snapshot_id: introspection_required_non_empty_string(row, context, "context_capture_id")?,
+        task_type: introspection_row_optional_string(row, context, "task_type")?,
+        ctx_managed_tokens: introspection_row_optional_non_negative_i64(
+            row,
+            context,
+            "total_tokens",
+        )?,
+        assembly_ms: introspection_row_optional_non_negative_i64(row, context, "assembly_time_ms")?,
+        budget: parse_json_object_strict(context, "token_budget", &budget_raw)?,
+        relevance_scores: parse_relevance_scores_strict(context, &relevance_raw)?,
+        llm_response_id: introspection_row_optional_string(row, context, "llm_response_id")?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ContextSnapshotContentRow {
+    selected_events: Option<String>,
+    code_context: Option<String>,
+    skill_definitions: Option<String>,
+    documentation: Option<String>,
+}
+
+fn context_snapshot_content_from_row(
+    row: &impl IntrospectionRow,
+) -> ServiceResult<ContextSnapshotContentRow> {
+    let context = "context_snapshot_content_row";
+    Ok(ContextSnapshotContentRow {
+        selected_events: introspection_row_optional_string(row, context, "selected_events")?,
+        code_context: introspection_row_optional_string(row, context, "code_context")?,
+        skill_definitions: introspection_row_optional_string(row, context, "skill_definitions")?,
+        documentation: introspection_row_optional_string(row, context, "documentation")?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TokenUsageEventRow {
+    event_id: String,
+    token_usage: Value,
+}
+
+fn token_usage_event_from_row(row: &impl IntrospectionRow) -> ServiceResult<TokenUsageEventRow> {
+    let context = "token_usage_event_row";
+    let token_usage_raw = introspection_row_string(row, context, "token_usage")?;
+    Ok(TokenUsageEventRow {
+        event_id: introspection_required_non_empty_string(row, context, "event_id")?,
+        token_usage: parse_json_object_strict(context, "token_usage", &token_usage_raw)?,
+    })
+}
+
+fn context_trend_response_event_id_from_row(row: &impl IntrospectionRow) -> ServiceResult<String> {
+    introspection_required_non_empty_string(
+        row,
+        "context_trend_response_event_row",
+        "response_event_id",
+    )
+}
+
+fn optional_drift_preview_from_row(
+    row: Option<&impl IntrospectionRow>,
+    context: &str,
+) -> ServiceResult<String> {
+    let Some(row) = row else {
+        return Ok(String::new());
+    };
+    introspection_row_string(row, context, "preview")
 }
 
 fn extract_ask_user_audit(metadata: &Value) -> Option<&Value> {
@@ -198,7 +561,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let installed_rows = query(
-            "SELECT i.skill_name, i.skill_version, r.description, r.category \
+            "SELECT i.skill_name, i.skill_version, COALESCE(r.description, '') AS description, COALESCE(r.category, '') AS category \
              FROM skill_installations i \
              LEFT JOIN skills_registry r \
                  ON r.skill_name = i.skill_name AND r.version = i.skill_version AND r.is_active = 1 \
@@ -210,7 +573,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
         .map_err(internal_error)?;
 
         let cloud_rows = query(
-            "SELECT skill_name, version, description, category \
+            "SELECT skill_name, version, COALESCE(description, '') AS description, COALESCE(category, '') AS category \
              FROM skills_registry WHERE is_active = 1 \
              ORDER BY skill_name, version DESC LIMIT 200",
         )
@@ -221,30 +584,20 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let mut installed = Vec::with_capacity(installed_rows.len());
         let mut installed_names = std::collections::HashSet::new();
         for r in &installed_rows {
-            let name: String = r.try_get("skill_name").unwrap_or_default();
-            installed_names.insert(name.clone());
-            installed.push(SkillInfo {
-                name,
-                version: r.try_get("skill_version").unwrap_or_default(),
-                description: r.try_get("description").unwrap_or_default(),
-                category: r.try_get("category").unwrap_or_default(),
-            });
+            let skill = installed_skill_info_from_row(r)?;
+            installed_names.insert(skill.name.clone());
+            installed.push(skill);
         }
 
         let mut cloud = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for r in &cloud_rows {
-            let name: String = r.try_get("skill_name").unwrap_or_default();
-            if seen.contains(&name) || installed_names.contains(&name) {
+            let skill = cloud_skill_info_from_row(r)?;
+            if seen.contains(&skill.name) || installed_names.contains(&skill.name) {
                 continue;
             }
-            seen.insert(name.clone());
-            cloud.push(SkillInfo {
-                name,
-                version: r.try_get("version").unwrap_or_default(),
-                description: r.try_get("description").unwrap_or_default(),
-                category: r.try_get("category").unwrap_or_default(),
-            });
+            seen.insert(skill.name.clone());
+            cloud.push(skill);
         }
 
         Ok(SkillsIntrospectionResponse { installed, cloud })
@@ -284,8 +637,8 @@ impl IntrospectionService for DatabaseIntrospectionService {
 
         let response_event_ids: Vec<String> = response_id_rows
             .iter()
-            .filter_map(|row| row.try_get::<Option<String>, _>("response_event_id").ok()?)
-            .collect();
+            .map(context_trend_response_event_id_from_row)
+            .collect::<ServiceResult<_>>()?;
 
         if response_event_ids.is_empty() {
             return Ok(serde_json::json!({"turns_sampled": 0, "trend": "no_data"}));
@@ -312,20 +665,13 @@ impl IntrospectionService for DatabaseIntrospectionService {
             .map_err(internal_error)?;
         let usage_by_event_id = usage_rows
             .iter()
-            .filter_map(|row| {
-                let event_id: String = row.try_get("event_id").ok()?;
-                let token_usage: String = row.try_get("token_usage").ok()?;
-                Some((event_id, token_usage))
-            })
-            .collect::<std::collections::HashMap<_, _>>();
+            .map(token_usage_event_from_row)
+            .map(|result| result.map(|row| (row.event_id, row.token_usage)))
+            .collect::<ServiceResult<HashMap<_, _>>>()?;
 
         let usages: Vec<Value> = response_event_ids
             .iter()
-            .filter_map(|response_event_id| {
-                usage_by_event_id
-                    .get(response_event_id)
-                    .and_then(|raw| parse_token_usage(raw))
-            })
+            .filter_map(|response_event_id| usage_by_event_id.get(response_event_id).cloned())
             .collect();
 
         if usages.is_empty() {
@@ -390,7 +736,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
 
-        let total_turns: i64 = query(
+        let total_turns_row = query(
             "SELECT COUNT(*) AS cnt \
              FROM ctx_snapshots cs \
              JOIN agent_events e \
@@ -405,9 +751,12 @@ impl IntrospectionService for DatabaseIntrospectionService {
         .bind(session_id)
         .fetch_one(&pool)
         .await
-        .map_err(internal_error)?
-        .try_get("cnt")
-        .unwrap_or(0);
+        .map_err(internal_error)?;
+        let total_turns = introspection_row_non_negative_i64(
+            &total_turns_row,
+            "context_snapshot_count_row",
+            "cnt",
+        )?;
 
         if total_turns == 0 {
             return Err(error_response(
@@ -460,66 +809,96 @@ impl IntrospectionService for DatabaseIntrospectionService {
             .await
             .map_err(internal_error)?;
 
-        let snapshot_id: String = row.try_get("context_capture_id").unwrap_or_default();
-        let task_type: Option<String> = row.try_get("task_type").ok();
-        let ctx_managed_tokens: Option<i64> = row.try_get("total_tokens").ok();
-        let assembly_ms: Option<i64> = row.try_get("assembly_time_ms").ok();
-        let budget_raw: String = row.try_get("token_budget").unwrap_or_else(|_| "{}".into());
-        let relevance_raw: String = row
-            .try_get("relevance_scores")
-            .unwrap_or_else(|_| "{}".into());
-        let llm_response_id: Option<String> = row.try_get("llm_response_id").ok();
+        let snapshot = context_snapshot_core_from_row(&row)?;
+        let task_type = snapshot.task_type.clone();
 
         let mut result = serde_json::json!({
-            "snapshot_id": snapshot_id,
+            "snapshot_id": snapshot.snapshot_id,
             "turn": actual_turn,
             "total_turns": total_turns,
             "task_type": task_type,
-            "context_managed_tokens": ctx_managed_tokens,
-            "assembly_ms": assembly_ms,
+            "context_managed_tokens": snapshot.ctx_managed_tokens,
+            "assembly_ms": snapshot.assembly_ms,
         });
 
         // Layer 1: health, zone_balance, token_breakdown
-        if let Ok(budget) = serde_json::from_str::<Value>(&budget_raw) {
+        {
             let trend_limit = std::cmp::min(actual_turn as i32, MAX_INTROSPECTION_USAGE_ROWS);
-            let trend_rows = query(
-                "SELECT event_id, IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
-                 FROM agent_events \
-                 WHERE session_id = ? AND user_id = ? AND event_type = 'llm_response' AND token_usage IS NOT NULL \
-                  ORDER BY created_at ASC LIMIT ?",
-            )
-            .bind(session_id)
-            .bind(user_id)
-            .bind(trend_limit)
-            .fetch_all(&pool)
-            .await
-            .map_err(internal_error)?;
+            let current_usage = if let Some(ref resp_id) = snapshot.llm_response_id {
+                let current_row = query(
+                    "SELECT event_id, IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
+                     FROM agent_events \
+                     WHERE session_id = ? AND user_id = ? AND event_id = ? \
+                       AND event_type = 'llm_response' AND token_usage IS NOT NULL \
+                     LIMIT 1",
+                )
+                .bind(session_id)
+                .bind(user_id)
+                .bind(resp_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(internal_error)?;
+                current_row
+                    .as_ref()
+                    .map(token_usage_event_from_row)
+                    .transpose()?
+                    .map(|row| row.token_usage)
+            } else {
+                None
+            };
 
-            let mut current_usage: Option<Value> = None;
-            if let Some(ref resp_id) = llm_response_id {
-                for tr in &trend_rows {
-                    let eid: String = tr.try_get("event_id").unwrap_or_default();
-                    if eid == *resp_id {
-                        let raw: String = tr.try_get("token_usage").unwrap_or_default();
-                        current_usage = parse_token_usage(&raw);
-                        break;
-                    }
-                }
-            }
-            if current_usage.is_none()
-                && let Some(last) = trend_rows.last()
-            {
-                let raw: String = last.try_get("token_usage").unwrap_or_default();
-                current_usage = parse_token_usage(&raw);
-            }
-
-            let trend_prompts: Vec<i64> = trend_rows
+            let trend_rows = if let Some(ref resp_id) = snapshot.llm_response_id {
+                query(
+                    "SELECT e.event_id, IFNULL(CAST(e.token_usage AS CHAR), '{}') AS token_usage \
+                     FROM agent_events e \
+                     WHERE e.session_id = ? AND e.user_id = ? \
+                       AND e.event_type = 'llm_response' AND e.token_usage IS NOT NULL \
+                       AND e.created_at <= ( \
+                           SELECT anchor.created_at FROM agent_events anchor \
+                           WHERE anchor.session_id = ? AND anchor.user_id = ? AND anchor.event_id = ? \
+                           LIMIT 1 \
+                       ) \
+                     ORDER BY e.created_at DESC, e.event_id DESC LIMIT ?",
+                )
+                .bind(session_id)
+                .bind(user_id)
+                .bind(session_id)
+                .bind(user_id)
+                .bind(resp_id)
+                .bind(trend_limit)
+                .fetch_all(&pool)
+                .await
+                .map_err(internal_error)?
+            } else {
+                query(
+                    "SELECT event_id, IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
+                     FROM agent_events \
+                     WHERE session_id = ? AND user_id = ? \
+                       AND event_type = 'llm_response' AND token_usage IS NOT NULL \
+                     ORDER BY created_at DESC, event_id DESC LIMIT ?",
+                )
+                .bind(session_id)
+                .bind(user_id)
+                .bind(trend_limit)
+                .fetch_all(&pool)
+                .await
+                .map_err(internal_error)?
+            };
+            let trend_usage_rows: Vec<TokenUsageEventRow> = trend_rows
                 .iter()
-                .filter_map(|r| {
-                    let raw: String = r.try_get("token_usage").ok()?;
-                    let u = parse_token_usage(&raw)?;
-                    billable_input_from_canonical(&u)
-                })
+                .map(token_usage_event_from_row)
+                .collect::<ServiceResult<_>>()?;
+
+            let mut current_usage = current_usage;
+            if current_usage.is_none()
+                && let Some(first) = trend_usage_rows.first()
+            {
+                current_usage = Some(first.token_usage.clone());
+            }
+
+            let trend_prompts: Vec<i64> = trend_usage_rows
+                .iter()
+                .filter_map(|usage_row| billable_input_from_canonical(&usage_row.token_usage))
                 .collect();
 
             let current_prompt = current_usage
@@ -534,25 +913,26 @@ impl IntrospectionService for DatabaseIntrospectionService {
                     serde_json::json!(cu.get("total_tokens").and_then(|v| v.as_i64()));
             }
 
-            let reversed_prompts: Vec<i64> = trend_prompts.iter().copied().rev().collect();
             let health = analyze_context_health(
-                &budget,
-                &reversed_prompts,
+                &snapshot.budget,
+                &trend_prompts,
                 current_prompt,
                 current_usage.as_ref(),
                 128000,
             );
             result["health"] = serde_json::to_value(&health).unwrap_or_default();
             result["zone_balance"] =
-                serde_json::to_value(zone_balance(&budget, task_type.as_deref()))
+                serde_json::to_value(zone_balance(&snapshot.budget, task_type.as_deref()))
                     .unwrap_or_default();
 
             // Token breakdown
-            let tool_tokens = budget
+            let tool_tokens = snapshot
+                .budget
                 .get("tool_schemas")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            let non_tool_tokens: i64 = budget
+            let non_tool_tokens: i64 = snapshot
+                .budget
                 .as_object()
                 .map(|o| {
                     o.iter()
@@ -581,34 +961,31 @@ impl IntrospectionService for DatabaseIntrospectionService {
         }
 
         // Relevance + pollution
-        let scores = parse_relevance_scores(&relevance_raw);
-        if !scores.is_empty() {
+        if !snapshot.relevance_scores.is_empty() {
             result["relevance"] =
-                serde_json::to_value(relevance_quality(&scores)).unwrap_or_default();
-            result["pollution"] =
-                serde_json::to_value(pollution_ratio(&scores)).unwrap_or_default();
+                serde_json::to_value(relevance_quality(&snapshot.relevance_scores))
+                    .unwrap_or_default();
+            result["pollution"] = serde_json::to_value(pollution_ratio(&snapshot.relevance_scores))
+                .unwrap_or_default();
         }
 
         // Layer 2 & 3
         if detail || raw {
-            let events: Option<String> = row.try_get("selected_events").ok();
-            let code: Option<String> = row.try_get("code_context").ok();
-            let skills: Option<String> = row.try_get("skill_definitions").ok();
-            let docs: Option<String> = row.try_get("documentation").ok();
+            let contents = context_snapshot_content_from_row(&row)?;
 
             result["contents"] = summarize_contents(
-                events.as_deref(),
-                code.as_deref(),
-                skills.as_deref(),
-                docs.as_deref(),
+                contents.selected_events.as_deref(),
+                contents.code_context.as_deref(),
+                contents.skill_definitions.as_deref(),
+                contents.documentation.as_deref(),
             );
 
             if raw {
                 result["raw"] = raw_contents(
-                    events.as_deref(),
-                    code.as_deref(),
-                    skills.as_deref(),
-                    docs.as_deref(),
+                    contents.selected_events.as_deref(),
+                    contents.code_context.as_deref(),
+                    contents.skill_definitions.as_deref(),
+                    contents.documentation.as_deref(),
                     raw_token_budget,
                 );
             }
@@ -651,8 +1028,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
 
         let mut means = Vec::new();
         for r in rows.iter().rev() {
-            let raw: String = r.try_get("relevance_scores").unwrap_or_default();
-            let scores = parse_relevance_scores(&raw);
+            let scores = retrieval_quality_scores_from_row(r)?;
             let q = relevance_quality(&scores);
             if let Some(m) = q.mean {
                 means.push(m);
@@ -722,20 +1098,8 @@ impl IntrospectionService for DatabaseIntrospectionService {
 
         let decisions: Vec<Value> = rows
             .iter()
-            .map(|r| {
-                let output_json: String = r.try_get("output_json").unwrap_or_else(|_| "{}".into());
-                let output: Value =
-                    serde_json::from_str(&output_json).unwrap_or(Value::Object(Default::default()));
-                serde_json::json!({
-                    "decision_id": r.try_get::<String, _>("decision_id").unwrap_or_default(),
-                    "event_id": r.try_get::<String, _>("event_id").unwrap_or_default(),
-                    "decision_type": r.try_get::<String, _>("decision_type").unwrap_or_default(),
-                    "model_used": r.try_get::<Option<String>, _>("model_used").unwrap_or(None),
-                    "created_at": r.try_get::<String, _>("created_at").unwrap_or_default(),
-                    "output": output,
-                })
-            })
-            .collect();
+            .map(decision_trace_row_from_row)
+            .collect::<ServiceResult<_>>()?;
 
         Ok(serde_json::json!({
             "schema_version": 1,
@@ -758,10 +1122,10 @@ impl IntrospectionService for DatabaseIntrospectionService {
 
         let agg = query(
             "SELECT \
-               SUM(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 ELSE 0 END) AS tool_total_calls, \
-               SUM(CASE WHEN event_type = 'tool_error' THEN 1 ELSE 0 END) AS tool_fail_count, \
-               SUM(CASE WHEN event_type IN ('ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END) AS ask_user_total_calls, \
-               SUM(CASE WHEN event_type IN ('ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END) AS ask_user_fail_count \
+               COALESCE(SUM(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 ELSE 0 END), 0) AS tool_total_calls, \
+               COALESCE(SUM(CASE WHEN event_type = 'tool_error' THEN 1 ELSE 0 END), 0) AS tool_fail_count, \
+               COALESCE(SUM(CASE WHEN event_type IN ('ask_user_submitted', 'ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END), 0) AS ask_user_total_calls, \
+               COALESCE(SUM(CASE WHEN event_type IN ('ask_user_cancelled', 'ask_user_timeout', 'ask_user_error') THEN 1 ELSE 0 END), 0) AS ask_user_fail_count \
               FROM agent_events \
               WHERE user_id = ? \
                 AND (skill_name = ? OR meta_tool_name = ?) \
@@ -775,23 +1139,20 @@ impl IntrospectionService for DatabaseIntrospectionService {
         .await
         .map_err(internal_error)?;
 
-        let tool_total_calls: i64 = agg.try_get("tool_total_calls").unwrap_or(0);
-        let tool_fail_count: i64 = agg.try_get("tool_fail_count").unwrap_or(0);
-        let ask_user_total_calls: i64 = agg.try_get("ask_user_total_calls").unwrap_or(0);
-        let ask_user_fail_count: i64 = agg.try_get("ask_user_fail_count").unwrap_or(0);
-        let (total_calls, fail_count) = if is_ask_user && ask_user_total_calls > 0 {
-            (ask_user_total_calls, ask_user_fail_count)
+        let agg = tool_history_agg_from_row(&agg)?;
+        let (total_calls, fail_count) = if is_ask_user && agg.ask_user_total_calls > 0 {
+            (agg.ask_user_total_calls, agg.ask_user_fail_count)
         } else {
-            (tool_total_calls, tool_fail_count)
+            (agg.tool_total_calls, agg.tool_fail_count)
         };
-        let ok_count = (total_calls - fail_count).max(0);
+        let ok_count = total_calls - fail_count;
         let success_rate = if total_calls > 0 {
             (ok_count as f64) / (total_calls as f64)
         } else {
             0.0
         };
 
-        let failures = if is_ask_user && ask_user_total_calls > 0 {
+        let failures = if is_ask_user && agg.ask_user_total_calls > 0 {
             query(
                 "SELECT session_id, \
                         SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 200) AS error_preview, \
@@ -833,14 +1194,8 @@ impl IntrospectionService for DatabaseIntrospectionService {
 
         let recent_failures: Vec<Value> = failures
             .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "session_id": r.try_get::<String, _>("session_id").unwrap_or_default(),
-                    "error_preview": r.try_get::<String, _>("error_preview").unwrap_or_default(),
-                    "created_at": r.try_get::<String, _>("created_at").unwrap_or_default(),
-                })
-            })
-            .collect();
+            .map(tool_history_failure_from_row)
+            .collect::<ServiceResult<_>>()?;
 
         let ask_user_summary = if is_ask_user {
             let rows = query(
@@ -889,20 +1244,8 @@ impl IntrospectionService for DatabaseIntrospectionService {
             };
             let history_rows = rows
                 .iter()
-                .map(|row| AskUserHistoryRow {
-                    session_id: row.try_get::<String, _>("session_id").unwrap_or_default(),
-                    event_type: row.try_get::<String, _>("event_type").unwrap_or_default(),
-                    created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
-                    metadata: serde_json::from_str(
-                        &row.try_get::<String, _>("metadata_json")
-                            .unwrap_or_else(|_| "{}".into()),
-                    )
-                    .unwrap_or(Value::Null),
-                    content_preview: row
-                        .try_get::<String, _>("content_preview")
-                        .unwrap_or_default(),
-                })
-                .collect::<Vec<_>>();
+                .map(ask_user_history_row_from_row)
+                .collect::<ServiceResult<Vec<_>>>()?;
             Some(build_ask_user_history_summary(&history_rows))
         } else {
             None
@@ -945,10 +1288,8 @@ impl IntrospectionService for DatabaseIntrospectionService {
         .await
         .map_err(internal_error)?;
 
-        let original_intent: String = first
-            .as_ref()
-            .and_then(|r| r.try_get::<String, _>("preview").ok())
-            .unwrap_or_default();
+        let original_intent =
+            optional_drift_preview_from_row(first.as_ref(), "drift_original_intent_row")?;
 
         // Current focus: last non-error event.
         let last = query(
@@ -963,10 +1304,8 @@ impl IntrospectionService for DatabaseIntrospectionService {
         .await
         .map_err(internal_error)?;
 
-        let current_focus: String = last
-            .as_ref()
-            .and_then(|r| r.try_get::<String, _>("preview").ok())
-            .unwrap_or_default();
+        let current_focus =
+            optional_drift_preview_from_row(last.as_ref(), "drift_current_focus_row")?;
 
         let (drift_score, drift_level, signals) = compute_drift(&original_intent, &current_focus);
 
@@ -1110,6 +1449,1224 @@ fn raw_contents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeIntrospectionSkillRow {
+        failed_column: Option<&'static str>,
+        empty_column: Option<&'static str>,
+        description: &'static str,
+        category: &'static str,
+    }
+
+    impl FakeIntrospectionSkillRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                empty_column: None,
+                description: "Review Rust changes",
+                category: "engineering",
+            }
+        }
+
+        fn without_registry_metadata() -> Self {
+            Self {
+                description: "",
+                category: "",
+                ..Self::complete()
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn empty_on(column: &'static str) -> Self {
+            Self {
+                empty_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn text(&self, column: &str, value: &'static str) -> String {
+            if self.empty_column == Some(column) {
+                String::new()
+            } else {
+                value.to_string()
+            }
+        }
+    }
+
+    impl IntrospectionRow for FakeIntrospectionSkillRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Ok(match column {
+                "skill_name" => self.text(column, "code-review"),
+                "skill_version" => self.text(column, "1.2.3"),
+                "version" => self.text(column, "2.0.0"),
+                "description" => self.text(column, self.description),
+                "category" => self.text(column, self.category),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+    }
+
+    struct FakeDecisionTraceRow {
+        failed_column: Option<&'static str>,
+        empty_column: Option<&'static str>,
+        output_json: &'static str,
+        model_used: Option<&'static str>,
+    }
+
+    impl FakeDecisionTraceRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                empty_column: None,
+                output_json: r#"{"visible_tools":["bash"],"reason":"inspect"}"#,
+                model_used: Some("glm-5.2"),
+            }
+        }
+
+        fn without_model() -> Self {
+            Self {
+                model_used: None,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn empty_on(column: &'static str) -> Self {
+            Self {
+                empty_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_output_json(output_json: &'static str) -> Self {
+            Self {
+                output_json,
+                ..Self::complete()
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn text(&self, column: &str, value: &'static str) -> String {
+            if self.empty_column == Some(column) {
+                String::new()
+            } else {
+                value.to_string()
+            }
+        }
+    }
+
+    impl IntrospectionRow for FakeDecisionTraceRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Ok(match column {
+                "decision_id" => self.text(column, "decision-1"),
+                "event_id" => self.text(column, "event-1"),
+                "decision_type" => self.text(column, "tool_surface"),
+                "output_json" => self.text(column, self.output_json),
+                "created_at" => self.text(column, "2026-06-26T12:00:00"),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Ok(match column {
+                "model_used" => self.model_used.map(str::to_string),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+    }
+
+    struct FakeToolHistoryRow {
+        failed_column: Option<&'static str>,
+        empty_column: Option<&'static str>,
+        tool_total_calls: i64,
+        tool_fail_count: i64,
+        ask_user_total_calls: i64,
+        ask_user_fail_count: i64,
+        metadata_json: &'static str,
+        error_preview: &'static str,
+        content_preview: &'static str,
+    }
+
+    impl FakeToolHistoryRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                empty_column: None,
+                tool_total_calls: 5,
+                tool_fail_count: 2,
+                ask_user_total_calls: 3,
+                ask_user_fail_count: 1,
+                metadata_json: r#"{"ask_user":{"prompt":{"question_count":1},"response":{"outcome":"submitted"}}}"#,
+                error_preview: "permission denied",
+                content_preview: "ask_user submitted",
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn empty_on(column: &'static str) -> Self {
+            Self {
+                empty_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_counts(
+            tool_total_calls: i64,
+            tool_fail_count: i64,
+            ask_user_total_calls: i64,
+            ask_user_fail_count: i64,
+        ) -> Self {
+            Self {
+                tool_total_calls,
+                tool_fail_count,
+                ask_user_total_calls,
+                ask_user_fail_count,
+                ..Self::complete()
+            }
+        }
+
+        fn with_metadata_json(metadata_json: &'static str) -> Self {
+            Self {
+                metadata_json,
+                ..Self::complete()
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn text(&self, column: &str, value: &'static str) -> String {
+            if self.empty_column == Some(column) {
+                String::new()
+            } else {
+                value.to_string()
+            }
+        }
+    }
+
+    impl IntrospectionRow for FakeToolHistoryRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Ok(match column {
+                "session_id" => self.text(column, "session-1"),
+                "error_preview" => self.text(column, self.error_preview),
+                "created_at" => self.text(column, "2026-06-26T12:00:00"),
+                "event_type" => self.text(column, "ask_user_submitted"),
+                "metadata_json" => self.text(column, self.metadata_json),
+                "content_preview" => self.text(column, self.content_preview),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "tool_total_calls" => Ok(self.tool_total_calls),
+                "tool_fail_count" => Ok(self.tool_fail_count),
+                "ask_user_total_calls" => Ok(self.ask_user_total_calls),
+                "ask_user_fail_count" => Ok(self.ask_user_fail_count),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+    }
+
+    struct FakeRetrievalQualityRow {
+        failed_column: Option<&'static str>,
+        relevance_scores: &'static str,
+    }
+
+    impl FakeRetrievalQualityRow {
+        fn with_scores(relevance_scores: &'static str) -> Self {
+            Self {
+                failed_column: None,
+                relevance_scores,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                relevance_scores: r#"{"memory":0.8}"#,
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl IntrospectionRow for FakeRetrievalQualityRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "relevance_scores" => Ok(self.relevance_scores.to_string()),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+    }
+
+    struct FakeContextSnapshotCountRow {
+        failed_column: Option<&'static str>,
+        cnt: i64,
+    }
+
+    impl FakeContextSnapshotCountRow {
+        fn with_count(cnt: i64) -> Self {
+            Self {
+                failed_column: None,
+                cnt,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                cnt: 3,
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl IntrospectionRow for FakeContextSnapshotCountRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "cnt" => Ok(self.cnt),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+    }
+
+    struct FakeContextSnapshotRow {
+        failed_column: Option<&'static str>,
+        empty_column: Option<&'static str>,
+        token_budget: &'static str,
+        relevance_scores: &'static str,
+        task_type: Option<&'static str>,
+        llm_response_id: Option<&'static str>,
+        total_tokens: Option<i64>,
+        assembly_time_ms: Option<i64>,
+        selected_events: Option<&'static str>,
+        code_context: Option<&'static str>,
+        skill_definitions: Option<&'static str>,
+        documentation: Option<&'static str>,
+    }
+
+    impl FakeContextSnapshotRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                empty_column: None,
+                token_budget: r#"{"tool_schemas":10,"history":20}"#,
+                relevance_scores: r#"{"memory":0.8,"noise":0.2}"#,
+                task_type: Some("debugging"),
+                llm_response_id: Some("llm-1"),
+                total_tokens: Some(30),
+                assembly_time_ms: Some(12),
+                selected_events: Some(r#"[{"event_type":"user_query"}]"#),
+                code_context: Some(r#"[{"file":"src/main.rs"}]"#),
+                skill_definitions: Some(r#"[{"skill_name":"code-review"}]"#),
+                documentation: Some(r#"[{"source":"README.md"}]"#),
+            }
+        }
+
+        fn without_optional_values() -> Self {
+            Self {
+                task_type: None,
+                llm_response_id: None,
+                total_tokens: None,
+                assembly_time_ms: None,
+                selected_events: None,
+                code_context: None,
+                skill_definitions: None,
+                documentation: None,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn empty_on(column: &'static str) -> Self {
+            Self {
+                empty_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_token_budget(token_budget: &'static str) -> Self {
+            Self {
+                token_budget,
+                ..Self::complete()
+            }
+        }
+
+        fn with_relevance_scores(relevance_scores: &'static str) -> Self {
+            Self {
+                relevance_scores,
+                ..Self::complete()
+            }
+        }
+
+        fn with_optional_i64(column: &'static str, value: Option<i64>) -> Self {
+            let mut row = Self::complete();
+            match column {
+                "total_tokens" => row.total_tokens = value,
+                "assembly_time_ms" => row.assembly_time_ms = value,
+                _ => unreachable!("unexpected optional i64 column: {column}"),
+            }
+            row
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn text(&self, column: &str, value: &'static str) -> String {
+            if self.empty_column == Some(column) {
+                String::new()
+            } else {
+                value.to_string()
+            }
+        }
+    }
+
+    impl IntrospectionRow for FakeContextSnapshotRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Ok(match column {
+                "context_capture_id" => self.text(column, "capture-1"),
+                "token_budget" => self.text(column, self.token_budget),
+                "relevance_scores" => self.text(column, self.relevance_scores),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Ok(match column {
+                "task_type" => self.task_type,
+                "llm_response_id" => self.llm_response_id,
+                "selected_events" => self.selected_events,
+                "code_context" => self.code_context,
+                "skill_definitions" => self.skill_definitions,
+                "documentation" => self.documentation,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .map(|value| self.text(column, value)))
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "total_tokens" => Ok(self.total_tokens),
+                "assembly_time_ms" => Ok(self.assembly_time_ms),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    struct FakeTokenUsageRow {
+        failed_column: Option<&'static str>,
+        empty_column: Option<&'static str>,
+        token_usage: &'static str,
+    }
+
+    impl FakeTokenUsageRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                empty_column: None,
+                token_usage: r#"{"input_tokens":100,"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":20,"total_tokens":120}"#,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn empty_on(column: &'static str) -> Self {
+            Self {
+                empty_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_token_usage(token_usage: &'static str) -> Self {
+            Self {
+                token_usage,
+                ..Self::complete()
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn text(&self, column: &str, value: &'static str) -> String {
+            if self.empty_column == Some(column) {
+                String::new()
+            } else {
+                value.to_string()
+            }
+        }
+    }
+
+    impl IntrospectionRow for FakeTokenUsageRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Ok(match column {
+                "event_id" => self.text(column, "llm-1"),
+                "token_usage" => self.text(column, self.token_usage),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+    }
+
+    struct FakeContextTrendResponseEventRow {
+        failed_column: Option<&'static str>,
+        empty_column: Option<&'static str>,
+    }
+
+    impl FakeContextTrendResponseEventRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                empty_column: None,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn empty_on(column: &'static str) -> Self {
+            Self {
+                empty_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl IntrospectionRow for FakeContextTrendResponseEventRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "response_event_id" => {
+                    if self.empty_column == Some(column) {
+                        Ok(String::new())
+                    } else {
+                        Ok("llm-1".to_string())
+                    }
+                }
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+    }
+
+    struct FakeDriftPreviewRow {
+        failed_column: Option<&'static str>,
+        preview: &'static str,
+    }
+
+    impl FakeDriftPreviewRow {
+        fn with_preview(preview: &'static str) -> Self {
+            Self {
+                failed_column: None,
+                preview,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                preview: "initial task",
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl IntrospectionRow for FakeDriftPreviewRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "preview" => Ok(self.preview.to_string()),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+    }
+
+    fn assert_introspection_internal_error_mentions(
+        result: ServiceResult<impl std::fmt::Debug>,
+        needle: &str,
+    ) {
+        let (status, axum::Json(body)) = result.expect_err("decode should fail");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.detail.contains(needle),
+            "introspection decode error should identify `{needle}`: {:?}",
+            body.detail
+        );
+    }
+
+    #[test]
+    fn installed_skill_row_decode_preserves_values_and_fails_loudly() {
+        let skill = installed_skill_info_from_row(&FakeIntrospectionSkillRow::complete()).unwrap();
+        assert_eq!(skill.name, "code-review");
+        assert_eq!(skill.version, "1.2.3");
+        assert_eq!(skill.description, "Review Rust changes");
+        assert_eq!(skill.category, "engineering");
+
+        let skill =
+            installed_skill_info_from_row(&FakeIntrospectionSkillRow::without_registry_metadata())
+                .unwrap();
+        assert_eq!(skill.description, "");
+        assert_eq!(skill.category, "");
+
+        for column in ["skill_name", "skill_version", "description", "category"] {
+            assert_introspection_internal_error_mentions(
+                installed_skill_info_from_row(&FakeIntrospectionSkillRow::fail_on(column)),
+                column,
+            );
+        }
+
+        for column in ["skill_name", "skill_version"] {
+            assert_introspection_internal_error_mentions(
+                installed_skill_info_from_row(&FakeIntrospectionSkillRow::empty_on(column)),
+                "expected non-empty string",
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_skill_row_decode_preserves_values_and_fails_loudly() {
+        let skill = cloud_skill_info_from_row(&FakeIntrospectionSkillRow::complete()).unwrap();
+        assert_eq!(skill.name, "code-review");
+        assert_eq!(skill.version, "2.0.0");
+        assert_eq!(skill.description, "Review Rust changes");
+        assert_eq!(skill.category, "engineering");
+
+        let skill =
+            cloud_skill_info_from_row(&FakeIntrospectionSkillRow::without_registry_metadata())
+                .unwrap();
+        assert_eq!(skill.description, "");
+        assert_eq!(skill.category, "");
+
+        for column in ["skill_name", "version", "description", "category"] {
+            assert_introspection_internal_error_mentions(
+                cloud_skill_info_from_row(&FakeIntrospectionSkillRow::fail_on(column)),
+                column,
+            );
+        }
+
+        for column in ["skill_name", "version"] {
+            assert_introspection_internal_error_mentions(
+                cloud_skill_info_from_row(&FakeIntrospectionSkillRow::empty_on(column)),
+                "expected non-empty string",
+            );
+        }
+    }
+
+    #[test]
+    fn decision_trace_row_decode_preserves_values_and_fails_loudly() {
+        let decision = decision_trace_row_from_row(&FakeDecisionTraceRow::complete()).unwrap();
+        assert_eq!(decision["decision_id"], "decision-1");
+        assert_eq!(decision["event_id"], "event-1");
+        assert_eq!(decision["decision_type"], "tool_surface");
+        assert_eq!(decision["model_used"], "glm-5.2");
+        assert_eq!(decision["created_at"], "2026-06-26T12:00:00");
+        assert_eq!(
+            decision["output"],
+            serde_json::json!({"visible_tools":["bash"],"reason":"inspect"})
+        );
+
+        let decision = decision_trace_row_from_row(&FakeDecisionTraceRow::without_model()).unwrap();
+        assert!(decision["model_used"].is_null());
+
+        for column in [
+            "decision_id",
+            "event_id",
+            "decision_type",
+            "model_used",
+            "output_json",
+            "created_at",
+        ] {
+            assert_introspection_internal_error_mentions(
+                decision_trace_row_from_row(&FakeDecisionTraceRow::fail_on(column)),
+                column,
+            );
+        }
+
+        for column in ["decision_id", "event_id", "decision_type", "created_at"] {
+            assert_introspection_internal_error_mentions(
+                decision_trace_row_from_row(&FakeDecisionTraceRow::empty_on(column)),
+                "expected non-empty string",
+            );
+        }
+
+        assert_introspection_internal_error_mentions(
+            decision_trace_row_from_row(&FakeDecisionTraceRow::with_output_json("{not-json")),
+            "output_json",
+        );
+    }
+
+    #[test]
+    fn tool_history_agg_row_decode_preserves_values_and_fails_loudly() {
+        let agg = tool_history_agg_from_row(&FakeToolHistoryRow::complete()).unwrap();
+        assert_eq!(
+            agg,
+            ToolHistoryAgg {
+                tool_total_calls: 5,
+                tool_fail_count: 2,
+                ask_user_total_calls: 3,
+                ask_user_fail_count: 1,
+            }
+        );
+
+        for column in [
+            "tool_total_calls",
+            "tool_fail_count",
+            "ask_user_total_calls",
+            "ask_user_fail_count",
+        ] {
+            assert_introspection_internal_error_mentions(
+                tool_history_agg_from_row(&FakeToolHistoryRow::fail_on(column)),
+                column,
+            );
+        }
+
+        for (row, needle) in [
+            (
+                FakeToolHistoryRow::with_counts(-1, 0, 0, 0),
+                "tool_total_calls",
+            ),
+            (
+                FakeToolHistoryRow::with_counts(1, 2, 0, 0),
+                "tool_fail_count",
+            ),
+            (
+                FakeToolHistoryRow::with_counts(0, 0, -1, 0),
+                "ask_user_total_calls",
+            ),
+            (
+                FakeToolHistoryRow::with_counts(0, 0, 1, 2),
+                "ask_user_fail_count",
+            ),
+        ] {
+            assert_introspection_internal_error_mentions(tool_history_agg_from_row(&row), needle);
+        }
+    }
+
+    #[test]
+    fn tool_history_failure_row_decode_preserves_values_and_fails_loudly() {
+        let failure = tool_history_failure_from_row(&FakeToolHistoryRow::complete()).unwrap();
+        assert_eq!(failure["session_id"], "session-1");
+        assert_eq!(failure["error_preview"], "permission denied");
+        assert_eq!(failure["created_at"], "2026-06-26T12:00:00");
+
+        for column in ["session_id", "error_preview", "created_at"] {
+            assert_introspection_internal_error_mentions(
+                tool_history_failure_from_row(&FakeToolHistoryRow::fail_on(column)),
+                column,
+            );
+        }
+
+        for column in ["session_id", "created_at"] {
+            assert_introspection_internal_error_mentions(
+                tool_history_failure_from_row(&FakeToolHistoryRow::empty_on(column)),
+                "expected non-empty string",
+            );
+        }
+    }
+
+    #[test]
+    fn ask_user_history_row_decode_preserves_values_and_fails_loudly() {
+        let row = ask_user_history_row_from_row(&FakeToolHistoryRow::complete()).unwrap();
+        assert_eq!(row.session_id, "session-1");
+        assert_eq!(row.event_type, "ask_user_submitted");
+        assert_eq!(row.created_at, "2026-06-26T12:00:00");
+        assert_eq!(row.metadata["ask_user"]["response"]["outcome"], "submitted");
+        assert_eq!(row.content_preview, "ask_user submitted");
+
+        for column in [
+            "session_id",
+            "event_type",
+            "created_at",
+            "metadata_json",
+            "content_preview",
+        ] {
+            assert_introspection_internal_error_mentions(
+                ask_user_history_row_from_row(&FakeToolHistoryRow::fail_on(column)),
+                column,
+            );
+        }
+
+        for column in ["session_id", "event_type", "created_at"] {
+            assert_introspection_internal_error_mentions(
+                ask_user_history_row_from_row(&FakeToolHistoryRow::empty_on(column)),
+                "expected non-empty string",
+            );
+        }
+
+        assert_introspection_internal_error_mentions(
+            ask_user_history_row_from_row(&FakeToolHistoryRow::with_metadata_json("{not-json")),
+            "metadata_json",
+        );
+    }
+
+    #[test]
+    fn retrieval_quality_row_decode_preserves_scores_and_fails_loudly() {
+        let scores = retrieval_quality_scores_from_row(&FakeRetrievalQualityRow::with_scores(
+            r#"{"memory":0.8,"noise":0.2}"#,
+        ))
+        .unwrap();
+        assert_eq!(scores.get("memory"), Some(&0.8));
+        assert_eq!(scores.get("noise"), Some(&0.2));
+
+        let empty =
+            retrieval_quality_scores_from_row(&FakeRetrievalQualityRow::with_scores("{}")).unwrap();
+        assert!(empty.is_empty());
+
+        assert_introspection_internal_error_mentions(
+            retrieval_quality_scores_from_row(&FakeRetrievalQualityRow::fail_on(
+                "relevance_scores",
+            )),
+            "relevance_scores",
+        );
+
+        for raw in [
+            "{not-json",
+            "[]",
+            r#"{"memory":"high"}"#,
+            r#"{"memory":1.2}"#,
+            r#"{"memory":-0.1}"#,
+        ] {
+            assert_introspection_internal_error_mentions(
+                retrieval_quality_scores_from_row(&FakeRetrievalQualityRow::with_scores(raw)),
+                "relevance_scores",
+            );
+        }
+    }
+
+    #[test]
+    fn context_snapshot_count_row_decode_preserves_value_and_fails_loudly() {
+        let count = introspection_row_non_negative_i64(
+            &FakeContextSnapshotCountRow::with_count(3),
+            "context_snapshot_count_row",
+            "cnt",
+        )
+        .unwrap();
+        assert_eq!(count, 3);
+
+        assert_introspection_internal_error_mentions(
+            introspection_row_non_negative_i64(
+                &FakeContextSnapshotCountRow::fail_on("cnt"),
+                "context_snapshot_count_row",
+                "cnt",
+            ),
+            "cnt",
+        );
+        assert_introspection_internal_error_mentions(
+            introspection_row_non_negative_i64(
+                &FakeContextSnapshotCountRow::with_count(-1),
+                "context_snapshot_count_row",
+                "cnt",
+            ),
+            "non-negative integer",
+        );
+    }
+
+    #[test]
+    fn context_snapshot_core_row_decode_preserves_values_and_fails_loudly() {
+        let row = context_snapshot_core_from_row(&FakeContextSnapshotRow::complete()).unwrap();
+        assert_eq!(row.snapshot_id, "capture-1");
+        assert_eq!(row.task_type.as_deref(), Some("debugging"));
+        assert_eq!(row.ctx_managed_tokens, Some(30));
+        assert_eq!(row.assembly_ms, Some(12));
+        assert_eq!(row.budget["tool_schemas"], 10);
+        assert_eq!(row.relevance_scores.get("memory"), Some(&0.8));
+        assert_eq!(row.llm_response_id.as_deref(), Some("llm-1"));
+
+        let row =
+            context_snapshot_core_from_row(&FakeContextSnapshotRow::without_optional_values())
+                .unwrap();
+        assert_eq!(row.task_type, None);
+        assert_eq!(row.ctx_managed_tokens, None);
+        assert_eq!(row.assembly_ms, None);
+        assert_eq!(row.llm_response_id, None);
+
+        for column in [
+            "context_capture_id",
+            "task_type",
+            "total_tokens",
+            "assembly_time_ms",
+            "token_budget",
+            "relevance_scores",
+            "llm_response_id",
+        ] {
+            assert_introspection_internal_error_mentions(
+                context_snapshot_core_from_row(&FakeContextSnapshotRow::fail_on(column)),
+                column,
+            );
+        }
+
+        assert_introspection_internal_error_mentions(
+            context_snapshot_core_from_row(&FakeContextSnapshotRow::empty_on("context_capture_id")),
+            "expected non-empty string",
+        );
+
+        for raw_budget in ["{not-json", "[]"] {
+            assert_introspection_internal_error_mentions(
+                context_snapshot_core_from_row(&FakeContextSnapshotRow::with_token_budget(
+                    raw_budget,
+                )),
+                "token_budget",
+            );
+        }
+
+        for raw_scores in [
+            "{not-json",
+            "[]",
+            r#"{"memory":"high"}"#,
+            r#"{"memory":1.2}"#,
+        ] {
+            assert_introspection_internal_error_mentions(
+                context_snapshot_core_from_row(&FakeContextSnapshotRow::with_relevance_scores(
+                    raw_scores,
+                )),
+                "relevance_scores",
+            );
+        }
+
+        for column in ["total_tokens", "assembly_time_ms"] {
+            assert_introspection_internal_error_mentions(
+                context_snapshot_core_from_row(&FakeContextSnapshotRow::with_optional_i64(
+                    column,
+                    Some(-1),
+                )),
+                column,
+            );
+        }
+    }
+
+    #[test]
+    fn context_snapshot_content_row_decode_preserves_values_and_fails_loudly() {
+        let content =
+            context_snapshot_content_from_row(&FakeContextSnapshotRow::complete()).unwrap();
+        assert_eq!(
+            content.selected_events.as_deref(),
+            Some(r#"[{"event_type":"user_query"}]"#)
+        );
+        assert_eq!(
+            content.code_context.as_deref(),
+            Some(r#"[{"file":"src/main.rs"}]"#)
+        );
+        assert_eq!(
+            content.skill_definitions.as_deref(),
+            Some(r#"[{"skill_name":"code-review"}]"#)
+        );
+        assert_eq!(
+            content.documentation.as_deref(),
+            Some(r#"[{"source":"README.md"}]"#)
+        );
+
+        let content =
+            context_snapshot_content_from_row(&FakeContextSnapshotRow::without_optional_values())
+                .unwrap();
+        assert!(content.selected_events.is_none());
+        assert!(content.code_context.is_none());
+        assert!(content.skill_definitions.is_none());
+        assert!(content.documentation.is_none());
+
+        for column in [
+            "selected_events",
+            "code_context",
+            "skill_definitions",
+            "documentation",
+        ] {
+            assert_introspection_internal_error_mentions(
+                context_snapshot_content_from_row(&FakeContextSnapshotRow::fail_on(column)),
+                column,
+            );
+        }
+    }
+
+    #[test]
+    fn token_usage_event_row_decode_preserves_values_and_fails_loudly() {
+        let row = token_usage_event_from_row(&FakeTokenUsageRow::complete()).unwrap();
+        assert_eq!(row.event_id, "llm-1");
+        assert_eq!(row.token_usage["input_tokens"], 100);
+        assert_eq!(row.token_usage["total_tokens"], 120);
+
+        for column in ["event_id", "token_usage"] {
+            assert_introspection_internal_error_mentions(
+                token_usage_event_from_row(&FakeTokenUsageRow::fail_on(column)),
+                column,
+            );
+        }
+
+        assert_introspection_internal_error_mentions(
+            token_usage_event_from_row(&FakeTokenUsageRow::empty_on("event_id")),
+            "expected non-empty string",
+        );
+
+        for raw in ["{not-json", "[]"] {
+            assert_introspection_internal_error_mentions(
+                token_usage_event_from_row(&FakeTokenUsageRow::with_token_usage(raw)),
+                "token_usage",
+            );
+        }
+    }
+
+    #[test]
+    fn context_trend_response_event_row_decode_preserves_value_and_fails_loudly() {
+        let event_id =
+            context_trend_response_event_id_from_row(&FakeContextTrendResponseEventRow::complete())
+                .unwrap();
+        assert_eq!(event_id, "llm-1");
+
+        assert_introspection_internal_error_mentions(
+            context_trend_response_event_id_from_row(&FakeContextTrendResponseEventRow::fail_on(
+                "response_event_id",
+            )),
+            "response_event_id",
+        );
+        assert_introspection_internal_error_mentions(
+            context_trend_response_event_id_from_row(&FakeContextTrendResponseEventRow::empty_on(
+                "response_event_id",
+            )),
+            "expected non-empty string",
+        );
+    }
+
+    #[test]
+    fn drift_preview_row_decode_preserves_optional_absence_and_fails_loudly() {
+        let missing =
+            optional_drift_preview_from_row(None::<&FakeDriftPreviewRow>, "drift_preview_row")
+                .unwrap();
+        assert_eq!(missing, "");
+
+        let preview = optional_drift_preview_from_row(
+            Some(&FakeDriftPreviewRow::with_preview("initial task")),
+            "drift_preview_row",
+        )
+        .unwrap();
+        assert_eq!(preview, "initial task");
+
+        let empty = optional_drift_preview_from_row(
+            Some(&FakeDriftPreviewRow::with_preview("")),
+            "drift_preview_row",
+        )
+        .unwrap();
+        assert_eq!(empty, "");
+
+        assert_introspection_internal_error_mentions(
+            optional_drift_preview_from_row(
+                Some(&FakeDriftPreviewRow::fail_on("preview")),
+                "drift_preview_row",
+            ),
+            "preview",
+        );
+    }
 
     // ── summarize_contents ──────────────────────────────────────────────
 
@@ -1385,6 +2942,29 @@ mod tests {
         assert!(svc.get_retrieval_quality("u1", "s1", 5).await.is_err());
     }
 
+    #[test]
+    fn context_snapshot_usage_sampling_is_anchored_to_selected_response() {
+        let source = include_str!("database.rs");
+        let body = source
+            .split("async fn get_context_snapshot")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn get_retrieval_quality").next())
+            .expect("get_context_snapshot body");
+
+        assert!(
+            body.contains("WHERE session_id = ? AND user_id = ? AND event_id = ?"),
+            "current token usage must be loaded by the selected snapshot response id"
+        );
+        assert!(
+            body.contains("anchor.event_id = ?") && body.contains("ORDER BY e.created_at DESC"),
+            "trend sampling must use a recent window anchored to the selected response"
+        );
+        assert!(
+            body.contains("trend_usage_rows.first()"),
+            "fallback current usage should use the newest sampled row, not the oldest row"
+        );
+    }
+
     // ── Query type serde defaults ───────────────────────────────────────
 
     #[test]
@@ -1392,7 +2972,7 @@ mod tests {
         use super::super::ContextTrendQuery;
         let q: ContextTrendQuery = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
         assert_eq!(q.turns, 10);
-        assert_eq!(q.context_window, 128000);
+        assert_eq!(q.context_window, 200000);
     }
 
     #[test]

@@ -734,8 +734,7 @@ pub(crate) async fn handle_state_command(
             let pre_messages = {
                 let mut msgs =
                     crate::cli::session::session_projection::history_as_messages(&state.history);
-                let limit = astra_runtime::prompts::budget_for_model(state.model.as_deref())
-                    .effective_input_limit() as u64;
+                let limit = state.context_budget.effective_input_limit() as u64;
                 let budget = TokenBudget {
                     max_prompt_tokens: limit,
                     last_measured_tokens: limit.saturating_add(1),

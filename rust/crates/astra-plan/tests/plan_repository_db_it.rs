@@ -77,10 +77,10 @@ async fn cleanup_plans(pool: &sqlx::Pool<sqlx::MySql>, prefix: &str) {
             .await;
 }
 
-async fn cleanup_sessions(pool: &sqlx::Pool<sqlx::MySql>, prefix: &str) {
-    let like = format!("{prefix}%");
-    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id LIKE ?")
-        .bind(&like)
+async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_id: &str) {
+    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+        .bind(session_id)
+        .bind(user_id)
         .execute(pool)
         .await;
 }
@@ -129,7 +129,7 @@ async fn save_load_roundtrip_persists_goal_owner_and_subtasks() {
     cleanup_plans(&pool, &plan_id).await;
 
     let mut state = make_state_with_subtasks(&user, "ship feature X", &["a", "b", "c"]);
-    repo.save(&plan_id, &mut state, None)
+    repo.save(&user, &plan_id, &mut state, None)
         .await
         .expect("initial save");
 
@@ -137,7 +137,7 @@ async fn save_load_roundtrip_persists_goal_owner_and_subtasks() {
     // so downstream optimistic-concurrency checks have a baseline.
     assert!(state.version >= 1, "version should be bumped on save");
 
-    let loaded = repo.load(&plan_id).await.expect("load");
+    let loaded = repo.load(&user, &plan_id).await.expect("load");
     assert_eq!(loaded.goal, "ship feature X");
     assert_eq!(loaded.created_by.as_deref(), Some(user.as_str()));
     assert_eq!(loaded.plan.subtasks.len(), 3);
@@ -157,10 +157,10 @@ async fn load_owned_returns_not_found_for_wrong_user_no_403_leak() {
     cleanup_plans(&pool, &plan_id).await;
 
     let mut state = make_state_with_goal(&owner, "secret plan");
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&owner, &plan_id, &mut state, None).await.unwrap();
 
     let err = repo
-        .load_owned(&plan_id, &other)
+        .load(&other, &plan_id)
         .await
         .expect_err("other user must get NotFound");
     assert!(
@@ -169,8 +169,37 @@ async fn load_owned_returns_not_found_for_wrong_user_no_403_leak() {
     );
 
     // And the owner still sees it.
-    let ok = repo.load_owned(&plan_id, &owner).await.expect("owner load");
+    let ok = repo.load(&owner, &plan_id).await.expect("owner load");
     assert_eq!(ok.goal, "secret plan");
+
+    cleanup_plans(&pool, &plan_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn same_plan_id_isolated_between_users() {
+    let (repo, pool) = setup_repo().await;
+    let user_a = format!("u-a-{}", Uuid::new_v4().simple());
+    let user_b = format!("u-b-{}", Uuid::new_v4().simple());
+    let plan_id = format!("pit-shared-{}", Uuid::new_v4().simple());
+    cleanup_plans(&pool, &plan_id).await;
+
+    let mut state_a = make_state_with_goal(&user_a, "owner A goal");
+    let mut state_b = make_state_with_goal(&user_b, "owner B goal");
+
+    repo.save(&user_a, &plan_id, &mut state_a, None)
+        .await
+        .expect("save user A plan");
+    repo.save(&user_b, &plan_id, &mut state_b, None)
+        .await
+        .expect("same plan_id under another owner must not conflict");
+
+    let loaded_a = repo.load(&user_a, &plan_id).await.expect("load user A");
+    let loaded_b = repo.load(&user_b, &plan_id).await.expect("load user B");
+    assert_eq!(loaded_a.goal, "owner A goal");
+    assert_eq!(loaded_b.goal, "owner B goal");
+    assert_eq!(loaded_a.created_by.as_deref(), Some(user_a.as_str()));
+    assert_eq!(loaded_b.created_by.as_deref(), Some(user_b.as_str()));
 
     cleanup_plans(&pool, &plan_id).await;
 }
@@ -194,7 +223,7 @@ async fn concurrent_saves_at_same_expected_version_have_exactly_one_winner() {
 
     // Seed so all contenders observe the same starting version.
     let mut seed = make_state_with_goal(&user, "seed");
-    repo.save(&plan_id, &mut seed, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut seed, None).await.unwrap();
     let base_version = seed.version;
 
     const CONTENDERS: usize = 32;
@@ -207,7 +236,7 @@ async fn concurrent_saves_at_same_expected_version_have_exactly_one_winner() {
         handles.push(tokio::spawn(async move {
             let mut s = make_state_with_goal(&user, &format!("contender-{i}"));
             s.version = base_version;
-            repo.save(&plan_id, &mut s, Some(base_version)).await
+            repo.save(&user, &plan_id, &mut s, Some(base_version)).await
         }));
     }
 
@@ -233,7 +262,7 @@ async fn concurrent_saves_at_same_expected_version_have_exactly_one_winner() {
     );
 
     // The stored row must reflect the single winner's version.
-    let final_state = repo.load(&plan_id).await.unwrap();
+    let final_state = repo.load(&user, &plan_id).await.unwrap();
     assert_eq!(
         final_state.version,
         base_version + 1,
@@ -257,23 +286,25 @@ async fn save_rejects_stale_expected_version_with_conflict() {
     cleanup_plans(&pool, &plan_id).await;
 
     let mut a = make_state_with_goal(&user, "original goal");
-    repo.save(&plan_id, &mut a, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut a, None).await.unwrap();
     let v_first = a.version;
 
     // Writer B saves with the correct version → bumps to v_first + 1.
-    let mut b = repo.load(&plan_id).await.unwrap();
+    let mut b = repo.load(&user, &plan_id).await.unwrap();
     assert_eq!(
         b.version, v_first,
         "load() must return the column version, not a stale one baked into plan_json",
     );
     b.goal = "goal edited by B".into();
-    repo.save(&plan_id, &mut b, Some(v_first)).await.unwrap();
+    repo.save(&user, &plan_id, &mut b, Some(v_first))
+        .await
+        .unwrap();
     assert!(b.version > v_first);
 
     // Writer A still thinks version is v_first. Save must fail with conflict.
     a.goal = "stale edit by A".into();
     let err = repo
-        .save(&plan_id, &mut a, Some(v_first))
+        .save(&user, &plan_id, &mut a, Some(v_first))
         .await
         .expect_err("stale write must conflict");
     // `PlanLoadError::conflict` returns the typed Conflict variant; handler maps to 409.
@@ -284,7 +315,7 @@ async fn save_rejects_stale_expected_version_with_conflict() {
     );
 
     // Storage reflects B's version, not A's.
-    let final_state = repo.load(&plan_id).await.unwrap();
+    let final_state = repo.load(&user, &plan_id).await.unwrap();
     assert_eq!(final_state.goal, "goal edited by B");
     assert!(
         final_state.version > v_first,
@@ -306,12 +337,13 @@ async fn set_active_plan_enforces_single_session_invariant() {
     let plan_id = format!("pit-act-{}", Uuid::new_v4().simple());
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-").await;
+    cleanup_session(&pool, &sess_a, &user).await;
+    cleanup_session(&pool, &sess_b, &user).await;
     ensure_session(&pool, &sess_a, &user).await;
     ensure_session(&pool, &sess_b, &user).await;
 
     let mut state = make_state_with_goal(&user, "linked plan");
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
 
     // Session A takes the plan.
     repo.set_active_plan(&user, &sess_a, Some(&plan_id))
@@ -354,7 +386,8 @@ async fn set_active_plan_enforces_single_session_invariant() {
     );
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-").await;
+    cleanup_session(&pool, &sess_a, &user).await;
+    cleanup_session(&pool, &sess_b, &user).await;
 }
 
 #[tokio::test]
@@ -365,44 +398,57 @@ async fn step_runs_are_append_only_and_list_in_recency_order() {
     let sess = format!("sit-run-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-run-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-run-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     let mut state = make_state_with_subtasks(&user, "runs", &["s1", "s2"]);
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
 
     let run1 = repo
-        .record_step_run(NewStepRun {
-            plan_id: &plan_id,
-            subtask_id: "s1",
-            attempt: 1,
-            status: TaskStatus::InProgress,
-            session_id: &sess,
-            request_id: "req-1",
-        })
+        .record_step_run(
+            &user,
+            NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: "s1",
+                attempt: 1,
+                status: TaskStatus::InProgress,
+                session_id: &sess,
+                request_id: "req-1",
+            },
+        )
         .await
         .expect("record attempt 1");
     let run2 = repo
-        .record_step_run(NewStepRun {
-            plan_id: &plan_id,
-            subtask_id: "s1",
-            attempt: 2,
-            status: TaskStatus::InProgress,
-            session_id: &sess,
-            request_id: "req-2",
-        })
+        .record_step_run(
+            &user,
+            NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: "s1",
+                attempt: 2,
+                status: TaskStatus::InProgress,
+                session_id: &sess,
+                request_id: "req-2",
+            },
+        )
         .await
         .expect("record attempt 2");
     assert_ne!(run1, run2, "run_ids must be distinct");
 
     // Finalize run1 as failed → append-only: run2 is still in progress.
-    repo.finalize_step_run(&plan_id, &run1, TaskStatus::Failed, Some("boom"), None)
-        .await
-        .expect("finalize run1");
+    repo.finalize_step_run(
+        &user,
+        &plan_id,
+        &run1,
+        TaskStatus::Failed,
+        Some("boom"),
+        None,
+    )
+    .await
+    .expect("finalize run1");
 
     // Second finalize of the same run_id must be rejected (once-only semantics).
     let err = repo
-        .finalize_step_run(&plan_id, &run1, TaskStatus::Completed, None, None)
+        .finalize_step_run(&user, &plan_id, &run1, TaskStatus::Completed, None, None)
         .await
         .expect_err("double-finalize must fail");
     assert!(
@@ -412,7 +458,7 @@ async fn step_runs_are_append_only_and_list_in_recency_order() {
 
     // Listing newest-first. run2 (later insert) comes before run1.
     let listed = repo
-        .list_step_runs(&plan_id, Some("s1"), 10)
+        .list_step_runs(&user, &plan_id, Some("s1"), 10)
         .await
         .expect("list runs");
     assert_eq!(listed.len(), 2, "both attempts must be returned");
@@ -423,23 +469,32 @@ async fn step_runs_are_append_only_and_list_in_recency_order() {
     assert_eq!(listed[1].error.as_deref(), Some("boom"));
 
     // Cross-subtask list is isolated.
-    repo.record_step_run(NewStepRun {
-        plan_id: &plan_id,
-        subtask_id: "s2",
-        attempt: 1,
-        status: TaskStatus::InProgress,
-        session_id: &sess,
-        request_id: "req-s2",
-    })
+    repo.record_step_run(
+        &user,
+        NewStepRun {
+            plan_id: &plan_id,
+            subtask_id: "s2",
+            attempt: 1,
+            status: TaskStatus::InProgress,
+            session_id: &sess,
+            request_id: "req-s2",
+        },
+    )
     .await
     .unwrap();
-    let s1_only = repo.list_step_runs(&plan_id, Some("s1"), 10).await.unwrap();
+    let s1_only = repo
+        .list_step_runs(&user, &plan_id, Some("s1"), 10)
+        .await
+        .unwrap();
     assert_eq!(s1_only.len(), 2, "subtask filter must isolate s1");
-    let all = repo.list_step_runs(&plan_id, None, 10).await.unwrap();
+    let all = repo
+        .list_step_runs(&user, &plan_id, None, 10)
+        .await
+        .unwrap();
     assert_eq!(all.len(), 3);
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-run-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }
 
 #[tokio::test]
@@ -450,31 +505,37 @@ async fn step_run_unknown_status_fails_closed_on_get_and_list() {
     let sess = format!("sit-corrupt-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-corrupt-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-corrupt-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     let mut state = make_state_with_subtasks(&user, "corrupt status", &["s1"]);
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
     let run_id = repo
-        .record_step_run(NewStepRun {
-            plan_id: &plan_id,
-            subtask_id: "s1",
-            attempt: 1,
-            status: TaskStatus::InProgress,
-            session_id: &sess,
-            request_id: "req-corrupt",
-        })
+        .record_step_run(
+            &user,
+            NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: "s1",
+                attempt: 1,
+                status: TaskStatus::InProgress,
+                session_id: &sess,
+                request_id: "req-corrupt",
+            },
+        )
         .await
         .expect("record step run");
 
-    sqlx::query("UPDATE plan_step_runs SET status = 'unknown_status' WHERE run_id = ?")
-        .bind(&run_id)
-        .execute(&pool)
-        .await
-        .expect("corrupt step-run status");
+    sqlx::query(
+        "UPDATE plan_step_runs SET status = 'unknown_status' WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run_id)
+    .execute(&pool)
+    .await
+    .expect("corrupt step-run status");
 
     let get_err = repo
-        .get_step_run(&plan_id, &run_id)
+        .get_step_run(&user, &plan_id, &run_id)
         .await
         .expect_err("get_step_run must reject unknown persisted statuses");
     assert!(
@@ -487,7 +548,7 @@ async fn step_run_unknown_status_fails_closed_on_get_and_list() {
     );
 
     let list_err = repo
-        .list_step_runs(&plan_id, Some("s1"), 10)
+        .list_step_runs(&user, &plan_id, Some("s1"), 10)
         .await
         .expect_err("list_step_runs must reject unknown persisted statuses");
     assert!(
@@ -496,7 +557,7 @@ async fn step_run_unknown_status_fails_closed_on_get_and_list() {
     );
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-corrupt-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }
 
 #[tokio::test]
@@ -511,37 +572,43 @@ async fn finalize_step_run_rejects_cross_plan_run_id() {
     let plan_a = format!("pit-cross-a-{}", Uuid::new_v4().simple());
     let plan_b = format!("pit-cross-b-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, "pit-cross").await;
-    cleanup_sessions(&pool, "sit-cross-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     // Seed both plans with a pending subtask.
     let mut state_a = make_state_with_subtasks(&user, "plan A", &["s1"]);
     let mut state_b = make_state_with_subtasks(&user, "plan B", &["s1"]);
-    repo.save(&plan_a, &mut state_a, None).await.unwrap();
-    repo.save(&plan_b, &mut state_b, None).await.unwrap();
+    repo.save(&user, &plan_a, &mut state_a, None).await.unwrap();
+    repo.save(&user, &plan_b, &mut state_b, None).await.unwrap();
 
     // Start a run in plan B — attacker knows this run_id somehow.
     let run_id_b = repo
-        .record_step_run(NewStepRun {
-            plan_id: &plan_b,
-            subtask_id: "s1",
-            attempt: 1,
-            status: TaskStatus::InProgress,
-            session_id: &sess,
-            request_id: "req-b",
-        })
+        .record_step_run(
+            &user,
+            NewStepRun {
+                plan_id: &plan_b,
+                subtask_id: "s1",
+                attempt: 1,
+                status: TaskStatus::InProgress,
+                session_id: &sess,
+                request_id: "req-b",
+            },
+        )
         .await
         .unwrap();
 
     // Finalizing run_id_b under plan_a must fail, and the row must remain
     // unfinalized in plan B (unchanged status + finished_at).
     let err = repo
-        .finalize_step_run(&plan_a, &run_id_b, TaskStatus::Completed, None, None)
+        .finalize_step_run(&user, &plan_a, &run_id_b, TaskStatus::Completed, None, None)
         .await
         .expect_err("cross-plan finalize must be rejected");
     assert!(matches!(err, PlanLoadError::NotFound(_)));
 
-    let runs = repo.list_step_runs(&plan_b, Some("s1"), 10).await.unwrap();
+    let runs = repo
+        .list_step_runs(&user, &plan_b, Some("s1"), 10)
+        .await
+        .unwrap();
     let row = runs
         .iter()
         .find(|r| r.run_id == run_id_b)
@@ -557,12 +624,12 @@ async fn finalize_step_run_rejects_cross_plan_run_id() {
     );
 
     // Sanity: finalize under the correct plan works.
-    repo.finalize_step_run(&plan_b, &run_id_b, TaskStatus::Completed, None, None)
+    repo.finalize_step_run(&user, &plan_b, &run_id_b, TaskStatus::Completed, None, None)
         .await
         .expect("legitimate finalize under correct plan_id");
 
     cleanup_plans(&pool, "pit-cross").await;
-    cleanup_sessions(&pool, "sit-cross-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }
 
 #[tokio::test]
@@ -573,14 +640,15 @@ async fn record_completed_step_run_lands_row_already_finalized() {
     let sess = format!("sit-1shot-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-1shot-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-1shot-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     let mut state = make_state_with_subtasks(&user, "one-shot", &["s1"]);
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
 
     let run_id = repo
         .record_completed_step_run(
+            &user,
             NewStepRun {
                 plan_id: &plan_id,
                 subtask_id: "s1",
@@ -595,7 +663,10 @@ async fn record_completed_step_run_lands_row_already_finalized() {
         .await
         .expect("one-shot insert");
 
-    let runs = repo.list_step_runs(&plan_id, Some("s1"), 10).await.unwrap();
+    let runs = repo
+        .list_step_runs(&user, &plan_id, Some("s1"), 10)
+        .await
+        .unwrap();
     let row = runs.iter().find(|r| r.run_id == run_id).expect("run");
     assert_eq!(row.status, TaskStatus::Completed);
     assert!(
@@ -605,7 +676,7 @@ async fn record_completed_step_run_lands_row_already_finalized() {
     assert_eq!(row.artifact_ref.as_deref(), Some("artifact-xyz"));
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-1shot-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }
 
 #[tokio::test]
@@ -616,30 +687,33 @@ async fn delete_cascades_step_runs_and_clears_active_plan_id() {
     let sess = format!("sit-del-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-del-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-del-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     let mut state = make_state_with_subtasks(&user, "del", &["s1"]);
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
     repo.set_active_plan(&user, &sess, Some(&plan_id))
         .await
         .unwrap();
     let _ = repo
-        .record_step_run(NewStepRun {
-            plan_id: &plan_id,
-            subtask_id: "s1",
-            attempt: 1,
-            status: TaskStatus::InProgress,
-            session_id: &sess,
-            request_id: "req",
-        })
+        .record_step_run(
+            &user,
+            NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: "s1",
+                attempt: 1,
+                status: TaskStatus::InProgress,
+                session_id: &sess,
+                request_id: "req",
+            },
+        )
         .await
         .unwrap();
 
-    repo.delete(&plan_id).await.expect("delete");
+    repo.delete(&user, &plan_id).await.expect("delete");
 
     // Step runs must be gone.
-    let remaining = repo.list_step_runs(&plan_id, None, 10).await;
+    let remaining = repo.list_step_runs(&user, &plan_id, None, 10).await;
     // Delete removed the plan; list_step_runs doesn't gate on plan existence, so
     // an empty Vec is the expected result. If the impl returns Err that's also
     // acceptable as long as it's not a silent success carrying stale rows.
@@ -656,11 +730,14 @@ async fn delete_cascades_step_runs_and_clears_active_plan_id() {
     );
 
     // Second delete returns NotFound.
-    let err = repo.delete(&plan_id).await.expect_err("second delete");
+    let err = repo
+        .delete(&user, &plan_id)
+        .await
+        .expect_err("second delete");
     assert!(matches!(err, PlanLoadError::NotFound(_)));
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-del-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }
 
 #[tokio::test]
@@ -681,11 +758,12 @@ async fn list_for_user_reads_subtask_count_from_denormalized_column_not_plan_jso
     cleanup_plans(&pool, &plan_id).await;
 
     let mut state = make_state_with_subtasks(&user, "count test", &["a", "b", "c", "d", "e"]);
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
 
     // Corrupt plan_json but keep subtask_count intact.
-    sqlx::query("UPDATE plans SET plan_json = ? WHERE plan_id = ?")
+    sqlx::query("UPDATE plans SET plan_json = ? WHERE user_id = ? AND plan_id = ?")
         .bind("{not-a-plan_json}")
+        .bind(&user)
         .bind(&plan_id)
         .execute(&pool)
         .await
@@ -733,13 +811,13 @@ async fn save_with_none_expected_version_on_existing_row_detects_concurrent_edit
 
     // Seed a plan so the row exists.
     let mut seed = make_state_with_goal(&user, "seeded");
-    repo.save(&plan_id, &mut seed, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut seed, None).await.unwrap();
 
     // A second save with None expected_version must NOT silently succeed on
     // the existing row — that's the re-link bug. Expected behavior: Conflict.
     let mut rogue = make_state_with_goal(&user, "rogue re-link");
     let err = repo
-        .save(&plan_id, &mut rogue, None)
+        .save(&user, &plan_id, &mut rogue, None)
         .await
         .expect_err("save(..., None) on an existing plan_id must reject with Conflict");
     assert!(
@@ -748,10 +826,10 @@ async fn save_with_none_expected_version_on_existing_row_detects_concurrent_edit
     );
 
     // Legitimate re-link: load, then save with the observed version. Succeeds.
-    let mut loaded = repo.load(&plan_id).await.unwrap();
+    let mut loaded = repo.load(&user, &plan_id).await.unwrap();
     loaded.goal = "legitimate re-link".into();
     let observed = loaded.version;
-    repo.save(&plan_id, &mut loaded, Some(observed))
+    repo.save(&user, &plan_id, &mut loaded, Some(observed))
         .await
         .expect("load+save with observed version is the supported re-link path");
     assert!(
@@ -772,13 +850,15 @@ async fn save_maintains_subtask_count_column_on_update() {
     cleanup_plans(&pool, &plan_id).await;
 
     let mut state = make_state_with_subtasks(&user, "growing", &["a", "b"]);
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
 
-    let count: i64 = sqlx::query_scalar("SELECT subtask_count FROM plans WHERE plan_id = ?")
-        .bind(&plan_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT subtask_count FROM plans WHERE user_id = ? AND plan_id = ?")
+            .bind(&user)
+            .bind(&plan_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(count, 2);
 
     // Add a third subtask and save again.
@@ -792,15 +872,17 @@ async fn save_maintains_subtask_count_column_on_update() {
             ..Default::default()
         });
     let expected = state.version;
-    repo.save(&plan_id, &mut state, Some(expected))
+    repo.save(&user, &plan_id, &mut state, Some(expected))
         .await
         .unwrap();
 
-    let count: i64 = sqlx::query_scalar("SELECT subtask_count FROM plans WHERE plan_id = ?")
-        .bind(&plan_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT subtask_count FROM plans WHERE user_id = ? AND plan_id = ?")
+            .bind(&user)
+            .bind(&plan_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(count, 3, "subtask_count must track updates");
 
     cleanup_plans(&pool, &plan_id).await;
@@ -815,27 +897,26 @@ async fn list_for_user_filters_by_session_and_phase() {
     let prefix = format!("pit-ls-{}-", Uuid::new_v4().simple());
 
     cleanup_plans(&pool, &prefix).await;
-    cleanup_sessions(&pool, "sit-la-").await;
-    cleanup_sessions(&pool, "sit-lb-").await;
+    cleanup_session(&pool, &sess_a, &user).await;
     ensure_session(&pool, &sess_a, &user).await;
 
     // Plan 1: session_a, planning (no subtasks).
     let p1 = format!("{prefix}1");
     let mut s1 = make_state_with_goal(&user, "p1");
     s1.session_hint = Some(sess_a.clone());
-    repo.save(&p1, &mut s1, None).await.unwrap();
+    repo.save(&user, &p1, &mut s1, None).await.unwrap();
 
     // Plan 2: no session, refining (has subtasks but none completed).
     let p2 = format!("{prefix}2");
     let mut s2 = make_state_with_subtasks(&user, "p2", &["a", "b"]);
-    repo.save(&p2, &mut s2, None).await.unwrap();
+    repo.save(&user, &p2, &mut s2, None).await.unwrap();
 
     // Plan 3: session_a, executing (one subtask completed).
     let p3 = format!("{prefix}3");
     let mut s3 = make_state_with_subtasks(&user, "p3", &["a", "b"]);
     s3.plan.subtasks[0].status = TaskStatus::Completed;
     s3.session_hint = Some(sess_a.clone());
-    repo.save(&p3, &mut s3, None).await.unwrap();
+    repo.save(&user, &p3, &mut s3, None).await.unwrap();
 
     // No filter → all three.
     let all = repo
@@ -894,7 +975,7 @@ async fn list_for_user_filters_by_session_and_phase() {
     );
 
     cleanup_plans(&pool, &prefix).await;
-    cleanup_sessions(&pool, "sit-la-").await;
+    cleanup_session(&pool, &sess_a, &user).await;
 }
 
 #[tokio::test]
@@ -907,7 +988,7 @@ async fn plan_resume_hint_for_session_returns_active_plans_digest() {
     let sess = format!("sit-hint-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-hint-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-hint-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     // No plan yet → hint is None.
@@ -918,7 +999,7 @@ async fn plan_resume_hint_for_session_returns_active_plans_digest() {
     let mut state = make_state_with_subtasks(&user, "Ship auth overhaul", &["a", "b", "c"]);
     state.plan.subtasks[0].status = TaskStatus::Completed;
     state.plan.subtasks[1].status = TaskStatus::InProgress;
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
     repo.set_active_plan(&user, &sess, Some(&plan_id))
         .await
         .unwrap();
@@ -945,7 +1026,7 @@ async fn plan_resume_hint_for_session_returns_active_plans_digest() {
     );
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-hint-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }
 
 #[tokio::test]
@@ -956,14 +1037,14 @@ async fn session_hint_round_trips_through_load() {
     let sess = format!("sit-hint-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-hint-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-hint-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     let mut s = make_state_with_goal(&user, "pinned");
     s.session_hint = Some(sess.clone());
-    repo.save(&plan_id, &mut s, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut s, None).await.unwrap();
 
-    let loaded = repo.load(&plan_id).await.unwrap();
+    let loaded = repo.load(&user, &plan_id).await.unwrap();
     assert_eq!(
         loaded.session_hint.as_deref(),
         Some(sess.as_str()),
@@ -971,7 +1052,7 @@ async fn session_hint_round_trips_through_load() {
     );
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-hint-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }
 
 // ── Deep-review regressions (round 2) ────────────────────────────────────────
@@ -987,26 +1068,30 @@ async fn abort_open_step_runs_closes_unfinished_attempts_for_subtask() {
     let sess = format!("sit-abort-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-abort-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-abort-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     let mut state = make_state_with_subtasks(&user, "abort", &["a", "b"]);
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
 
     // Open one in-flight run per subtask, plus one already-finalized on `a`.
     let run_a_open = repo
-        .record_step_run(NewStepRun {
-            plan_id: &plan_id,
-            subtask_id: "a",
-            attempt: 1,
-            status: TaskStatus::InProgress,
-            session_id: &sess,
-            request_id: "req-a",
-        })
+        .record_step_run(
+            &user,
+            NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: "a",
+                attempt: 1,
+                status: TaskStatus::InProgress,
+                session_id: &sess,
+                request_id: "req-a",
+            },
+        )
         .await
         .unwrap();
     let run_a_done = repo
         .record_completed_step_run(
+            &user,
             NewStepRun {
                 plan_id: &plan_id,
                 subtask_id: "a",
@@ -1021,26 +1106,32 @@ async fn abort_open_step_runs_closes_unfinished_attempts_for_subtask() {
         .await
         .unwrap();
     let run_b_open = repo
-        .record_step_run(NewStepRun {
-            plan_id: &plan_id,
-            subtask_id: "b",
-            attempt: 1,
-            status: TaskStatus::InProgress,
-            session_id: &sess,
-            request_id: "req-b",
-        })
+        .record_step_run(
+            &user,
+            NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: "b",
+                attempt: 1,
+                status: TaskStatus::InProgress,
+                session_id: &sess,
+                request_id: "req-b",
+            },
+        )
         .await
         .unwrap();
 
     // Abort only "a"'s open runs. Must finalize `run_a_open` (cancelled) but
     // leave `run_b_open` untouched and `run_a_done` untouched.
     let aborted = repo
-        .abort_open_step_runs(&plan_id, &["a".to_string()])
+        .abort_open_step_runs(&user, &plan_id, &["a".to_string()])
         .await
         .expect("abort_open_step_runs");
     assert_eq!(aborted, 1, "exactly one open run on `a` must be aborted");
 
-    let rows_a = repo.list_step_runs(&plan_id, Some("a"), 10).await.unwrap();
+    let rows_a = repo
+        .list_step_runs(&user, &plan_id, Some("a"), 10)
+        .await
+        .unwrap();
     let open_a = rows_a
         .iter()
         .find(|r| r.run_id == run_a_open)
@@ -1064,7 +1155,10 @@ async fn abort_open_step_runs_closes_unfinished_attempts_for_subtask() {
         "already-finalized run must not be re-touched"
     );
 
-    let rows_b = repo.list_step_runs(&plan_id, Some("b"), 10).await.unwrap();
+    let rows_b = repo
+        .list_step_runs(&user, &plan_id, Some("b"), 10)
+        .await
+        .unwrap();
     let open_b = rows_b
         .iter()
         .find(|r| r.run_id == run_b_open)
@@ -1075,7 +1169,7 @@ async fn abort_open_step_runs_closes_unfinished_attempts_for_subtask() {
     );
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-abort-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }
 
 /// Two simultaneous `record_step_run` calls with the same (plan_id,
@@ -1090,34 +1184,40 @@ async fn record_step_run_rejects_duplicate_plan_subtask_attempt_tuple() {
     let sess = format!("sit-dup-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-dup-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-dup-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     let mut state = make_state_with_subtasks(&user, "dup", &["x"]);
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
 
     // First insert wins.
-    repo.record_step_run(NewStepRun {
-        plan_id: &plan_id,
-        subtask_id: "x",
-        attempt: 1,
-        status: TaskStatus::InProgress,
-        session_id: &sess,
-        request_id: "req-1",
-    })
-    .await
-    .expect("first insert ok");
-
-    // Second insert with identical (plan_id, subtask_id, attempt) must error.
-    let err = repo
-        .record_step_run(NewStepRun {
+    repo.record_step_run(
+        &user,
+        NewStepRun {
             plan_id: &plan_id,
             subtask_id: "x",
             attempt: 1,
             status: TaskStatus::InProgress,
             session_id: &sess,
-            request_id: "req-2",
-        })
+            request_id: "req-1",
+        },
+    )
+    .await
+    .expect("first insert ok");
+
+    // Second insert with identical (plan_id, subtask_id, attempt) must error.
+    let err = repo
+        .record_step_run(
+            &user,
+            NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: "x",
+                attempt: 1,
+                status: TaskStatus::InProgress,
+                session_id: &sess,
+                request_id: "req-2",
+            },
+        )
         .await
         .expect_err("duplicate attempt tuple must be rejected");
     // Error variant should be Conflict (unique constraint violated).
@@ -1127,17 +1227,19 @@ async fn record_step_run_rejects_duplicate_plan_subtask_attempt_tuple() {
     );
 
     // Verify via raw SELECT that there is exactly one row.
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ? AND attempt = ?")
-            .bind(&plan_id)
-            .bind(1_i32)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM plan_step_runs WHERE user_id = ? AND plan_id = ? AND attempt = ?",
+    )
+    .bind(&user)
+    .bind(&plan_id)
+    .bind(1_i32)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(count, 1, "only the first attempt=1 row must persist");
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-dup-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }
 
 /// Pagination stability: with identical `started_at` values, `list_step_runs`
@@ -1151,11 +1253,11 @@ async fn list_step_runs_order_is_stable_on_identical_started_at() {
     let sess = format!("sit-stab-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-stab-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-stab-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     let mut state = make_state_with_subtasks(&user, "stab", &["x"]);
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
 
     // Record several runs with DIFFERENT attempt numbers (the unique index
     // forbids duplicate tuples) but clamp started_at to the same value via a
@@ -1164,30 +1266,44 @@ async fn list_step_runs_order_is_stable_on_identical_started_at() {
     let mut run_ids = Vec::new();
     for attempt in 1..=5 {
         let rid = repo
-            .record_step_run(NewStepRun {
-                plan_id: &plan_id,
-                subtask_id: "x",
-                attempt,
-                status: TaskStatus::InProgress,
-                session_id: &sess,
-                request_id: "req",
-            })
+            .record_step_run(
+                &user,
+                NewStepRun {
+                    plan_id: &plan_id,
+                    subtask_id: "x",
+                    attempt,
+                    status: TaskStatus::InProgress,
+                    session_id: &sess,
+                    request_id: "req",
+                },
+            )
             .await
             .unwrap();
         run_ids.push(rid);
     }
     sqlx::query(
-        "UPDATE plan_step_runs SET started_at = '2026-01-01 00:00:00.000000' WHERE plan_id = ?",
+        "UPDATE plan_step_runs SET started_at = '2026-01-01 00:00:00.000000' \
+         WHERE user_id = ? AND plan_id = ?",
     )
+    .bind(&user)
     .bind(&plan_id)
     .execute(&pool)
     .await
     .unwrap();
 
     // List three times; expect identical ordering each call.
-    let first = repo.list_step_runs(&plan_id, Some("x"), 10).await.unwrap();
-    let second = repo.list_step_runs(&plan_id, Some("x"), 10).await.unwrap();
-    let third = repo.list_step_runs(&plan_id, Some("x"), 10).await.unwrap();
+    let first = repo
+        .list_step_runs(&user, &plan_id, Some("x"), 10)
+        .await
+        .unwrap();
+    let second = repo
+        .list_step_runs(&user, &plan_id, Some("x"), 10)
+        .await
+        .unwrap();
+    let third = repo
+        .list_step_runs(&user, &plan_id, Some("x"), 10)
+        .await
+        .unwrap();
     let first_ids: Vec<_> = first.iter().map(|r| r.run_id.clone()).collect();
     let second_ids: Vec<_> = second.iter().map(|r| r.run_id.clone()).collect();
     let third_ids: Vec<_> = third.iter().map(|r| r.run_id.clone()).collect();
@@ -1205,7 +1321,7 @@ async fn list_step_runs_order_is_stable_on_identical_started_at() {
     );
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-stab-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }
 
 /// `record_completed_step_run` must also respect the (plan_id, subtask_id,
@@ -1219,14 +1335,15 @@ async fn record_completed_step_run_rejects_duplicate_attempt_tuple() {
     let sess = format!("sit-cdup-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-cdup-{}", Uuid::new_v4().simple());
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-cdup-").await;
+    cleanup_session(&pool, &sess, &user).await;
     ensure_session(&pool, &sess, &user).await;
 
     let mut state = make_state_with_subtasks(&user, "cdup", &["y"]);
-    repo.save(&plan_id, &mut state, None).await.unwrap();
+    repo.save(&user, &plan_id, &mut state, None).await.unwrap();
 
     // First completed-shortcut wins.
     repo.record_completed_step_run(
+        &user,
         NewStepRun {
             plan_id: &plan_id,
             subtask_id: "y",
@@ -1244,6 +1361,7 @@ async fn record_completed_step_run_rejects_duplicate_attempt_tuple() {
     // Same tuple again via the shortcut path must reject.
     let err = repo
         .record_completed_step_run(
+            &user,
             NewStepRun {
                 plan_id: &plan_id,
                 subtask_id: "y",
@@ -1263,5 +1381,5 @@ async fn record_completed_step_run_rejects_duplicate_attempt_tuple() {
     );
 
     cleanup_plans(&pool, &plan_id).await;
-    cleanup_sessions(&pool, "sit-cdup-").await;
+    cleanup_session(&pool, &sess, &user).await;
 }

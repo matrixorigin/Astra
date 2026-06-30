@@ -21,10 +21,8 @@ pub struct SandboxRecord {
     pub description: String,
     pub created_by: String,
     pub created_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
+    pub status: String,
+    pub user_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -133,14 +131,7 @@ impl SandboxService for DatabaseSandboxService {
         .await
         .map_err(internal_error)?;
 
-        Ok(SandboxRecord {
-            sandbox_name: request.name,
-            description: request.description,
-            created_by: user_id.clone(),
-            created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-            status: Some("active".into()),
-            user_id: Some(user_id),
-        })
+        self.get_sandbox(request.name, user_id).await
     }
 
     async fn list_sandboxes(
@@ -151,8 +142,7 @@ impl SandboxService for DatabaseSandboxService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let pat = pattern.unwrap_or_else(|| "%".into());
         let rows = query(
-            "SELECT sandbox_name, IFNULL(description, '') AS description, \
-              IFNULL(created_by, '') AS created_by, user_id, status, \
+            "SELECT sandbox_name, description, created_by, user_id, status, \
               DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
               FROM infra_sandbox_metadata \
               WHERE user_id = ? AND sandbox_name LIKE ? \
@@ -165,18 +155,7 @@ impl SandboxService for DatabaseSandboxService {
         .await
         .map_err(internal_error)?;
 
-        let mut sandboxes = Vec::with_capacity(rows.len());
-        for row in rows {
-            sandboxes.push(SandboxRecord {
-                sandbox_name: row.try_get("sandbox_name").map_err(internal_error)?,
-                description: row.try_get("description").unwrap_or_default(),
-                created_by: row.try_get("created_by").unwrap_or_default(),
-                created_at: row.try_get("created_at").unwrap_or_default(),
-                status: row.try_get("status").ok(),
-                user_id: row.try_get("user_id").ok(),
-            });
-        }
-        Ok(sandboxes)
+        rows.into_iter().map(sandbox_record_from_row).collect()
     }
 
     async fn get_sandbox(
@@ -186,8 +165,7 @@ impl SandboxService for DatabaseSandboxService {
     ) -> Result<SandboxRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let row = query(
-            "SELECT sandbox_name, IFNULL(description, '') AS description, \
-              IFNULL(created_by, '') AS created_by, user_id, status, \
+            "SELECT sandbox_name, description, created_by, user_id, status, \
               DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
               FROM infra_sandbox_metadata WHERE sandbox_name = ? AND user_id = ?",
         )
@@ -203,14 +181,7 @@ impl SandboxService for DatabaseSandboxService {
                 format!("Sandbox '{}' not found", name),
             )
         })?;
-        Ok(SandboxRecord {
-            sandbox_name: row.try_get("sandbox_name").map_err(internal_error)?,
-            description: row.try_get("description").unwrap_or_default(),
-            created_by: row.try_get("created_by").unwrap_or_default(),
-            created_at: row.try_get("created_at").unwrap_or_default(),
-            status: row.try_get("status").ok(),
-            user_id: row.try_get("user_id").ok(),
-        })
+        sandbox_record_from_row(row)
     }
 
     async fn delete_sandbox(
@@ -242,6 +213,34 @@ impl SandboxService for DatabaseSandboxService {
             .map_err(internal_error)?;
         Ok(())
     }
+}
+
+fn sandbox_record_from_row(
+    row: sqlx::mysql::MySqlRow,
+) -> Result<SandboxRecord, (StatusCode, Json<ErrorResponse>)> {
+    let status = required_sandbox_string(&row, "status")?;
+    if status != "active" {
+        return Err(internal_error(format!(
+            "invalid infra_sandbox_metadata.status: {status}"
+        )));
+    }
+    Ok(SandboxRecord {
+        sandbox_name: required_sandbox_string(&row, "sandbox_name")?,
+        description: required_sandbox_string(&row, "description")?,
+        created_by: required_sandbox_string(&row, "created_by")?,
+        created_at: required_sandbox_string(&row, "created_at")?,
+        status,
+        user_id: required_sandbox_string(&row, "user_id")?,
+    })
+}
+
+fn required_sandbox_string(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    row.try_get::<String, _>(column).map_err(|error| {
+        internal_error(format!("invalid infra_sandbox_metadata.{column}: {error}"))
+    })
 }
 
 // ── Noop implementation ──────────────────────────────────────────────────────
@@ -299,29 +298,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sandbox_record_skip_serializing_none_fields() {
+    fn sandbox_record_includes_required_fields() {
         let rec = SandboxRecord {
             sandbox_name: "sb1".into(),
             description: "test".into(),
             created_by: "u1".into(),
             created_at: "now".into(),
-            status: None,
-            user_id: None,
-        };
-        let json = serde_json::to_string(&rec).unwrap();
-        assert!(!json.contains("status"));
-        assert!(!json.contains("user_id"));
-    }
-
-    #[test]
-    fn sandbox_record_includes_present_fields() {
-        let rec = SandboxRecord {
-            sandbox_name: "sb1".into(),
-            description: "test".into(),
-            created_by: "u1".into(),
-            created_at: "now".into(),
-            status: Some("running".into()),
-            user_id: Some("u1".into()),
+            status: "active".into(),
+            user_id: "u1".into(),
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("status"));
@@ -342,8 +326,8 @@ mod tests {
             description: "desc".into(),
             created_by: "u1".into(),
             created_at: "2024-01-01".into(),
-            status: Some("active".into()),
-            user_id: Some("u1".into()),
+            status: "active".into(),
+            user_id: "u1".into(),
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: SandboxRecord = serde_json::from_str(&json).unwrap();

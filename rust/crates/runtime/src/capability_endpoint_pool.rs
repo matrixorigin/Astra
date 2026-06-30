@@ -3,11 +3,24 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const REGISTERED_ENDPOINT_RPC_CONCURRENCY: usize = 128;
+/// Default max concurrent RPCs per registered endpoint URL.
+/// Override with `ASTRA_ENDPOINT_RPC_CONCURRENCY` env var.
+const DEFAULT_REGISTERED_ENDPOINT_RPC_CONCURRENCY: usize = 128;
+
+fn registered_endpoint_rpc_concurrency() -> usize {
+    static CELL: OnceLock<usize> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("ASTRA_ENDPOINT_RPC_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_REGISTERED_ENDPOINT_RPC_CONCURRENCY)
+    })
+}
 
 #[cfg(test)]
 pub(crate) const REGISTERED_ENDPOINT_RPC_CONCURRENCY_FOR_TESTS: usize =
-    REGISTERED_ENDPOINT_RPC_CONCURRENCY;
+    DEFAULT_REGISTERED_ENDPOINT_RPC_CONCURRENCY;
 
 static REGISTERED_ENDPOINT_SEMAPHORES: OnceLock<std::sync::Mutex<HashMap<String, Arc<Semaphore>>>> =
     OnceLock::new();
@@ -24,7 +37,7 @@ pub(crate) fn try_acquire_endpoint_permit(
         });
         guard
             .entry(endpoint_url.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(REGISTERED_ENDPOINT_RPC_CONCURRENCY)))
+            .or_insert_with(|| Arc::new(Semaphore::new(registered_endpoint_rpc_concurrency())))
             .clone()
     };
 
@@ -41,7 +54,7 @@ mod tests {
     fn endpoint_pool_rejects_acquire_after_limit() {
         let endpoint = format!("https://capabilities.example.test/{}", uuid::Uuid::new_v4());
         let mut permits = Vec::new();
-        for _ in 0..REGISTERED_ENDPOINT_RPC_CONCURRENCY {
+        for _ in 0..registered_endpoint_rpc_concurrency() {
             permits.push(
                 try_acquire_endpoint_permit(&endpoint).expect("permit within endpoint limit"),
             );

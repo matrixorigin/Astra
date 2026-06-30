@@ -5,9 +5,9 @@ use astra_services::runs::SelectedModelRequest;
 
 /// Typed representation of the incoming chat turn request payload.
 ///
-/// All fields use `Option<serde_json::Value>` for defensive deserialization —
-/// if the client sends a field with an unexpected type (e.g., `"messages": 42`),
-/// the whole request still parses correctly instead of failing outright.
+/// All fields use `Option<serde_json::Value>` so bridge preparation can admit
+/// the raw JSON payload first, emit targeted validation errors for malformed
+/// fields, and reject bad payloads before session state is read or mutated.
 /// Typed accessor methods provide the same safety as manual `.get()?.as_str()?`
 /// chains but with named fields and compile-time discoverability.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -290,6 +290,45 @@ fn validate_selected_model_shape(
     Ok(())
 }
 
+fn validate_bridge_payload_fields(
+    payload: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    match payload.get("messages") {
+        Some(serde_json::Value::Array(_)) => {}
+        Some(_) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "bridge payload field `messages` must be an array",
+            ));
+        }
+        None => {}
+    }
+
+    for (field, value) in [
+        ("tool_results", payload.get("tool_results")),
+        ("edge_tools", payload.get("edge_tools")),
+    ] {
+        if value.is_some_and(|value| !value.is_array()) {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("bridge payload field `{field}` must be an array"),
+            ));
+        }
+    }
+
+    if payload
+        .get("edge_profile")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bridge payload field `edge_profile` must be an object",
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 struct ExplicitBridgeTurnIdentity {
     session_turn: u32,
@@ -341,7 +380,14 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     body: Bytes,
     trusted_session_id_override: Option<&str>,
 ) -> Result<PreparedChatTurnBridgeRequest, (StatusCode, Json<ErrorResponse>)> {
-    let Ok(mut request) = serde_json::from_slice::<ChatTurnRequestBody>(&body) else {
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
+    };
+    let Some(payload_object) = payload.as_object() else {
+        return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
+    };
+    validate_bridge_payload_fields(payload_object)?;
+    let Ok(mut request) = serde_json::from_value::<ChatTurnRequestBody>(payload) else {
         return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
     };
     validate_selected_model_shape(&request)?;
@@ -417,7 +463,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
                 has_tool_results,
                 explicit_turn_identity.as_ref(),
             )
-            .await;
+            .await?;
             (
                 Some(chain_id),
                 Some(event_id),
@@ -536,7 +582,7 @@ async fn prepare_chat_turn_bridge_identifiers(
     messages: &[serde_json::Value],
     has_tool_results: bool,
     explicit_identity: Option<&ExplicitBridgeTurnIdentity>,
-) -> (String, String, u32) {
+) -> Result<(String, String, u32), (StatusCode, Json<ErrorResponse>)> {
     if let Some(identity) = explicit_identity {
         let now = current_unix_seconds();
         let cache_key = bridge_cache_key(user_id, session_id);
@@ -555,11 +601,11 @@ async fn prepare_chat_turn_bridge_identifiers(
             serde_json::json!(identity.session_turn),
         );
         cache.insert(cache_key, updated_entry, now);
-        return (
+        return Ok((
             identity.turn_chain_id.clone(),
             identity.user_query_event_id.clone(),
             identity.session_turn,
-        );
+        ));
     }
     let inferred_session_turn = crate::server::session_turn::infer_session_turn(
         state.shared_pool.as_ref(),
@@ -582,13 +628,16 @@ async fn prepare_chat_turn_bridge_identifiers(
         &new_user_query_event_id,
     );
     let session_turn = if is_continuation {
-        prev_entry
-            .as_ref()
-            .and_then(|entry| entry.get("session_turn"))
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|turn| u32::try_from(turn).ok())
-            .filter(|turn| *turn > 0)
-            .unwrap_or(inferred_session_turn)
+        let cached_turn = match prev_entry.as_ref() {
+            Some(entry) => cached_bridge_session_turn(entry).map_err(|error| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("bridge cache session_turn is corrupt: {error}"),
+                )
+            })?,
+            None => None,
+        };
+        cached_turn.unwrap_or(inferred_session_turn)
     } else {
         inferred_session_turn
     };
@@ -603,7 +652,21 @@ async fn prepare_chat_turn_bridge_identifiers(
     );
     updated_entry.insert("session_turn".to_string(), serde_json::json!(session_turn));
     cache.insert(cache_key, updated_entry, now);
-    (turn_chain_id, user_query_event_id, session_turn)
+    Ok((turn_chain_id, user_query_event_id, session_turn))
+}
+
+fn cached_bridge_session_turn(
+    entry: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<u32>, String> {
+    let Some(value) = entry.get("session_turn") else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .and_then(|turn| u32::try_from(turn).ok())
+        .filter(|turn| *turn > 0)
+        .map(Some)
+        .ok_or_else(|| format!("expected positive u32, got {value}"))
 }
 
 fn bridge_turn_is_continuation(messages: &[serde_json::Value], has_tool_results: bool) -> bool {
@@ -756,7 +819,10 @@ mod tests {
     use async_trait::async_trait;
     use axum::{Json, http::StatusCode};
     use serde_json::json;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use crate::{
         AppState, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, SessionActivityRecord,
@@ -877,6 +943,105 @@ mod tests {
             _user_id: String,
             _limit: u32,
             _cursor: Option<astra_services::auth::SessionActivityCursor>,
+        ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionActivityRecord {
+                session_id: String::new(),
+                activities: vec![],
+                total: 0,
+                limit: 1,
+                next_cursor: None,
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingSessionService {
+        create_calls: Arc<AtomicUsize>,
+        get_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingSessionService {
+        fn create_calls(&self) -> usize {
+            self.create_calls.load(Ordering::SeqCst)
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl SessionService for CountingSessionService {
+        async fn create_session(
+            &self,
+            user_id: String,
+            request: SessionCreateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.create_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SessionRecord {
+                session_id: "counting-created".to_string(),
+                user_id,
+                agent_id: request.agent_id,
+                title: Some("Created".to_string()),
+                metadata: request.metadata.unwrap_or_default(),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00".to_string(),
+                updated_at: Some("2026-01-01T00:00:00".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn list_sessions(
+            &self,
+            _filter: SessionListFilter,
+        ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn get_session(
+            &self,
+            session_id: String,
+            user_id: String,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SessionRecord {
+                session_id,
+                user_id,
+                agent_id: None,
+                title: Some("Existing".to_string()),
+                metadata: serde_json::Map::new(),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00".to_string(),
+                updated_at: Some("2026-01-01T00:00:00".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn update_session(
+            &self,
+            session_id: String,
+            user_id: String,
+            _request: SessionUpdateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_session(session_id, user_id).await
+        }
+
+        async fn delete_session(
+            &self,
+            _session_id: String,
+            _user_id: String,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            Ok(())
+        }
+
+        async fn get_session_activity(
+            &self,
+            _session_id: String,
+            _user_id: String,
+            _limit: u32,
+            _cursor: Option<astra_services::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
@@ -1058,6 +1223,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_body_allows_missing_messages_as_empty_without_session_side_effects() {
+        let session_service = CountingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service.clone()));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "selected_model": selected_model()
+            }))
+            .expect("body should serialize"),
+        );
+
+        let prepared =
+            prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
+                .await
+                .expect("missing messages should default to an empty message slice");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&prepared.body).expect("prepared payload should be json");
+
+        assert!(payload.get("messages").is_none());
+        assert_eq!(prepared.trusted_session_id.as_deref(), Some("bound-session"));
+        assert_eq!(session_service.create_calls(), 0);
+        assert_eq!(session_service.get_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_body_rejects_wrong_payload_field_types_before_session_lookup() {
+        let session_service = CountingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service.clone()));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "selected_model": selected_model(),
+                "session_id": "existing-session",
+                "messages": [{"role": "user", "content": "hello"}],
+                "edge_tools": {"name": "bash"}
+            }))
+            .expect("body should serialize"),
+        );
+
+        let (status, body) =
+            match prepare_chat_turn_bridge_body(&state, &test_user(), body, None).await {
+                Ok(_) => panic!("malformed edge_tools must fail before session lookup"),
+                Err(error) => error,
+            };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0.detail,
+            "bridge payload field `edge_tools` must be an array"
+        );
+        assert_eq!(session_service.create_calls(), 0);
+        assert_eq!(session_service.get_calls(), 0);
+    }
+
+    #[tokio::test]
     async fn prepare_body_reuses_cached_session_turn_for_continuation() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let now = current_unix_seconds();
@@ -1089,6 +1309,42 @@ mod tests {
         assert_eq!(prepared.session_turn.as_deref(), Some("6"));
         assert_eq!(prepared.turn_chain_id.as_deref(), Some("chain-6"));
         assert_eq!(prepared.user_query_event_id.as_deref(), Some("query-6"));
+    }
+
+    #[tokio::test]
+    async fn prepare_body_rejects_corrupt_cached_session_turn_for_continuation() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let now = current_unix_seconds();
+        {
+            let mut cache = state.chat_turn_bridge_cache.lock().await;
+            let mut entry = serde_json::Map::new();
+            entry.insert("turn_chain_id".to_string(), json!("chain-corrupt"));
+            entry.insert("user_query_event_id".to_string(), json!("query-corrupt"));
+            entry.insert("session_turn".to_string(), json!("not-a-turn"));
+            cache.insert(bridge_cache_key("u1", "bound-session"), entry, now);
+        }
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "selected_model": selected_model(),
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
+                    {"role": "tool", "tool_call_id": "call-1", "content": "done"}
+                ],
+                "tool_results": [{"name": "bash", "output": "done"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let (status, body) =
+            match prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
+                .await
+            {
+                Ok(_) => panic!("corrupt cached session_turn must not be silently inferred"),
+                Err(error) => error,
+            };
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.0.detail.contains("bridge cache session_turn"));
     }
 
     #[tokio::test]
@@ -1513,6 +1769,51 @@ mod tests {
     }
 
     #[test]
+    fn bridge_payload_field_validation_contract() {
+        for (raw, expected_detail) in [
+            (r#"{}"#, None),
+            (
+                r#"{"messages":null}"#,
+                Some("bridge payload field `messages` must be an array"),
+            ),
+            (
+                r#"{"messages":{}}"#,
+                Some("bridge payload field `messages` must be an array"),
+            ),
+            (
+                r#"{"messages":[],"tool_results":null}"#,
+                Some("bridge payload field `tool_results` must be an array"),
+            ),
+            (
+                r#"{"messages":[],"edge_tools":{}}"#,
+                Some("bridge payload field `edge_tools` must be an array"),
+            ),
+            (
+                r#"{"messages":[],"edge_profile":[]}"#,
+                Some("bridge payload field `edge_profile` must be an object"),
+            ),
+            (r#"{"messages":[]}"#, None),
+            (
+                r#"{"messages":[],"tool_results":[],"edge_tools":[],"edge_profile":{}}"#,
+                None,
+            ),
+        ] {
+            let payload: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let payload = payload.as_object().expect("test payload must be object");
+            match expected_detail {
+                Some(detail) => {
+                    let (status, body) = validate_bridge_payload_fields(payload).unwrap_err();
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
+                    assert_eq!(body.0.detail, detail, "{raw}");
+                }
+                None => validate_bridge_payload_fields(payload).unwrap_or_else(|err| {
+                    panic!("{raw} should be valid, got {:?}", err.1.0.detail)
+                }),
+            }
+        }
+    }
+
+    #[test]
     fn typed_request_mutators_only_touch_their_fields() {
         let mut request = ChatTurnRequestBody::default();
         request.set_session_id("new-sess");
@@ -1581,6 +1882,33 @@ mod tests {
 
             assert_eq!(entry.get("rules"), expected.as_ref());
             assert_eq!(field, expected);
+        }
+    }
+
+    #[test]
+    fn cached_bridge_session_turn_preserves_valid_and_rejects_corrupt_values() {
+        let mut entry = serde_json::Map::new();
+        assert_eq!(
+            cached_bridge_session_turn(&entry).expect("missing session_turn is absent"),
+            None
+        );
+
+        entry.insert("session_turn".to_string(), json!(7));
+        assert_eq!(
+            cached_bridge_session_turn(&entry).expect("valid session_turn"),
+            Some(7)
+        );
+
+        for value in [
+            json!(0),
+            json!(-1),
+            json!("7"),
+            json!(u64::from(u32::MAX) + 1),
+        ] {
+            entry.insert("session_turn".to_string(), value);
+            let err = cached_bridge_session_turn(&entry)
+                .expect_err("corrupt cached session_turn must fail loud");
+            assert!(err.contains("expected positive u32"));
         }
     }
 

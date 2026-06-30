@@ -6,7 +6,7 @@
 
 use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -14,6 +14,18 @@ use crate::coordination::{
     AgentProfile, AgentProfileRegistry, AgentTier, AggregationStrategy, CoordinationPattern,
     DelegationRequest, PipelineStage,
 };
+
+const MAX_TEAM_LIST_ROWS: usize = 200;
+const TEAM_LIST_SELECT_SQL: &str = "\
+    SELECT team_id, user_id, name, description, coordination, \
+           members_json, context_json, worktree_mode, \
+           budget_json, max_parallel, \
+           CAST(created_at AS CHAR) AS created_at, \
+           CAST(updated_at AS CHAR) AS updated_at \
+    FROM team_definitions \
+    WHERE user_id = ? \
+    ORDER BY name \
+    LIMIT ?";
 
 // ─── Team Definition Types ──────────────────────────────────────────────────
 
@@ -447,6 +459,14 @@ fn parse_aggregation(s: &str) -> AggregationStrategy {
     }
 }
 
+fn validate_optional_json(label: &'static str, raw: Option<&str>) -> Result<(), String> {
+    if let Some(raw) = raw {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|error| format!("{label} must be valid JSON: {error}"))?;
+    }
+    Ok(())
+}
+
 // ─── Persistence Trait ──────────────────────────────────────────────────────
 
 /// CRUD operations for team definitions, execution history, and snapshots.
@@ -602,6 +622,7 @@ impl TeamPersistenceService for InMemoryTeamStore {
             .map(|(_, v)| v.clone())
             .collect();
         teams.sort_by(|a, b| a.name.cmp(&b.name));
+        teams.truncate(MAX_TEAM_LIST_ROWS);
         Ok(teams)
     }
 
@@ -661,6 +682,7 @@ impl TeamPersistenceService for InMemoryTeamStore {
         status: &str,
         result_json: Option<&str>,
     ) -> Result<(), String> {
+        validate_optional_json("team execution result_json", result_json)?;
         let mut execs = self.executions.write().map_err(|e| e.to_string())?;
         if let Some(rec) = execs.iter_mut().find(|r| r.execution_id == execution_id) {
             rec.status = status.to_string();
@@ -862,7 +884,9 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         let row = sqlx::query(
             "SELECT team_id, user_id, name, description, coordination, \
                     members_json, context_json, worktree_mode, \
-                    budget_json, max_parallel, created_at, updated_at \
+                    budget_json, max_parallel, \
+                    CAST(created_at AS CHAR) AS created_at, \
+                    CAST(updated_at AS CHAR) AS updated_at \
              FROM team_definitions WHERE user_id = ? AND name = ?",
         )
         .bind(user_id)
@@ -888,7 +912,9 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         let row = sqlx::query(
             "SELECT team_id, user_id, name, description, coordination, \
                     members_json, context_json, worktree_mode, \
-                    budget_json, max_parallel, created_at, updated_at \
+                    budget_json, max_parallel, \
+                    CAST(created_at AS CHAR) AS created_at, \
+                    CAST(updated_at AS CHAR) AS updated_at \
              FROM team_definitions WHERE user_id = ? AND team_id = ?",
         )
         .bind(user_id)
@@ -907,16 +933,12 @@ impl TeamPersistenceService for MatrixOneTeamStore {
     }
 
     async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamDefinition>, String> {
-        let rows = sqlx::query(
-            "SELECT team_id, user_id, name, description, coordination, \
-                    members_json, context_json, worktree_mode, \
-                    budget_json, max_parallel, created_at, updated_at \
-             FROM team_definitions WHERE user_id = ? ORDER BY name",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("team SELECT ALL failed: {e}"))?;
+        let rows = sqlx::query(TEAM_LIST_SELECT_SQL)
+            .bind(user_id)
+            .bind(MAX_TEAM_LIST_ROWS as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("team list failed: {e}"))?;
 
         let mut teams = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -989,6 +1011,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         status: &str,
         result_json: Option<&str>,
     ) -> Result<(), String> {
+        validate_optional_json("team execution result_json", result_json)?;
         sqlx::query(
             "UPDATE team_execution_history SET \
                  status       = ?, \
@@ -1010,8 +1033,6 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         team_id: &str,
         limit: u32,
     ) -> Result<Vec<TeamExecutionRecord>, String> {
-        use sqlx::Row;
-
         let rows = sqlx::query(
             "SELECT execution_id, team_id, user_id, `task`, status, \
                     result_json, CAST(started_at AS CHAR) AS started_at, \
@@ -1029,16 +1050,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
 
         let mut records = Vec::with_capacity(rows.len());
         for row in &rows {
-            records.push(TeamExecutionRecord {
-                execution_id: row.get("execution_id"),
-                team_id: row.get("team_id"),
-                user_id: row.get("user_id"),
-                task: row.get("task"),
-                status: row.get("status"),
-                result_json: row.try_get("result_json").ok(),
-                started_at: row.try_get::<String, _>("started_at").unwrap_or_default(),
-                completed_at: row.try_get::<String, _>("completed_at").ok(),
-            });
+            records.push(row_to_team_execution_record(row)?);
         }
         Ok(records)
     }
@@ -1071,11 +1083,10 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         user_id: &str,
         limit: u32,
     ) -> Result<Vec<TeamSnapshotRecord>, String> {
-        use sqlx::Row;
-
         let rows = sqlx::query(
             "SELECT snapshot_id, team_name, user_id, label, git_commit, \
-                    session_id, team_definition_json, created_at \
+                    session_id, team_definition_json, \
+                    CAST(created_at AS CHAR) AS created_at \
              FROM team_snapshots \
              WHERE user_id = ? AND team_name = ? \
              ORDER BY created_at DESC \
@@ -1090,16 +1101,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
 
         let mut records = Vec::with_capacity(rows.len());
         for row in &rows {
-            records.push(TeamSnapshotRecord {
-                snapshot_id: row.get("snapshot_id"),
-                team_name: row.get("team_name"),
-                user_id: row.get("user_id"),
-                label: row.try_get::<String, _>("label").unwrap_or_default(),
-                git_commit: row.try_get("git_commit").ok(),
-                session_id: row.try_get("session_id").ok(),
-                team_definition_json: row.try_get("team_definition_json").ok(),
-                created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
-            });
+            records.push(row_to_team_snapshot_record(row)?);
         }
         Ok(records)
     }
@@ -1109,11 +1111,10 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         snapshot_id: &str,
         user_id: &str,
     ) -> Result<Option<TeamSnapshotRecord>, String> {
-        use sqlx::Row;
-
         let row = sqlx::query(
             "SELECT snapshot_id, team_name, user_id, label, git_commit, \
-                    session_id, team_definition_json, created_at \
+                    session_id, team_definition_json, \
+                    CAST(created_at AS CHAR) AS created_at \
              FROM team_snapshots \
              WHERE snapshot_id = ? AND user_id = ?",
         )
@@ -1123,16 +1124,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         .await
         .map_err(|e| format!("snapshot SELECT failed: {e}"))?;
 
-        Ok(row.map(|r| TeamSnapshotRecord {
-            snapshot_id: r.get("snapshot_id"),
-            team_name: r.get("team_name"),
-            user_id: r.get("user_id"),
-            label: r.try_get::<String, _>("label").unwrap_or_default(),
-            git_commit: r.try_get("git_commit").ok(),
-            session_id: r.try_get("session_id").ok(),
-            team_definition_json: r.try_get("team_definition_json").ok(),
-            created_at: r.try_get::<String, _>("created_at").unwrap_or_default(),
-        }))
+        row.as_ref().map(row_to_team_snapshot_record).transpose()
     }
 
     async fn delete_snapshot(&self, snapshot_id: &str, user_id: &str) -> Result<bool, String> {
@@ -1146,40 +1138,80 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         Ok(result.rows_affected() > 0)
     }
 }
-fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition, String> {
+
+fn row_decode_error(
+    table: &'static str,
+    column: &'static str,
+    error: impl std::fmt::Display,
+) -> String {
+    format!("{table} row decode column `{column}`: {error}")
+}
+
+fn row_string(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<String, String> {
     use sqlx::Row;
 
-    let team_id: String = row.get("team_id");
-    let user_id: String = row.get("user_id");
-    let name: String = row.get("name");
-    let description: String = row.try_get("description").unwrap_or_default();
-    let coord_json: String = row.get("coordination");
-    let members_str: String = row.get("members_json");
-    let context_str: String = row.try_get("context_json").unwrap_or_default();
-    let wt_str: String = row
-        .try_get("worktree_mode")
-        .unwrap_or_else(|_| "shared".to_string());
-    let budget_str: Option<String> = row.try_get("budget_json").unwrap_or(None);
-    let max_parallel: u32 = row.try_get::<u32, _>("max_parallel").unwrap_or(0);
-    let created_at: String = row.try_get::<String, _>("created_at").unwrap_or_default();
-    let updated_at: String = row.try_get::<String, _>("updated_at").unwrap_or_default();
+    row.try_get::<String, _>(column)
+        .map_err(|error| row_decode_error(table, column, error))
+}
 
-    let coordination: TeamCoordination =
-        serde_json::from_str(&coord_json).map_err(|e| format!("bad coordination JSON: {e}"))?;
-    let members: Vec<TeamMemberDef> =
-        serde_json::from_str(&members_str).map_err(|e| format!("bad members JSON: {e}"))?;
-    let context: HashMap<String, String> = if context_str.is_empty() {
-        HashMap::new()
-    } else {
-        serde_json::from_str(&context_str).map_err(|e| format!("bad context JSON: {e}"))?
-    };
-    let worktree_mode: WorktreeMode = serde_json::from_str(&format!("\"{wt_str}\""))
-        .map_err(|e| format!("invalid worktree_mode {wt_str:?}: {e}"))?;
+fn row_optional_string(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<Option<String>, String> {
+    use sqlx::Row;
+
+    row.try_get::<Option<String>, _>(column)
+        .map_err(|error| row_decode_error(table, column, error))
+}
+
+fn row_u32(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<u32, String> {
+    use sqlx::Row;
+
+    row.try_get::<u32, _>(column)
+        .map_err(|error| row_decode_error(table, column, error))
+}
+
+fn parse_row_json<T: DeserializeOwned>(
+    table: &'static str,
+    column: &'static str,
+    raw: &str,
+) -> Result<T, String> {
+    serde_json::from_str(raw).map_err(|error| row_decode_error(table, column, error))
+}
+
+fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition, String> {
+    const TABLE: &str = "team_definitions";
+
+    let team_id = row_string(row, TABLE, "team_id")?;
+    let user_id = row_string(row, TABLE, "user_id")?;
+    let name = row_string(row, TABLE, "name")?;
+    let description = row_string(row, TABLE, "description")?;
+    let coord_json = row_string(row, TABLE, "coordination")?;
+    let members_str = row_string(row, TABLE, "members_json")?;
+    let context_str = row_string(row, TABLE, "context_json")?;
+    let wt_str = row_string(row, TABLE, "worktree_mode")?;
+    let budget_str = row_optional_string(row, TABLE, "budget_json")?;
+    let max_parallel = row_u32(row, TABLE, "max_parallel")?;
+    let created_at = row_string(row, TABLE, "created_at")?;
+    let updated_at = row_string(row, TABLE, "updated_at")?;
+
+    let coordination: TeamCoordination = parse_row_json(TABLE, "coordination", &coord_json)?;
+    let members: Vec<TeamMemberDef> = parse_row_json(TABLE, "members_json", &members_str)?;
+    let context: HashMap<String, String> = parse_row_json(TABLE, "context_json", &context_str)?;
+    let worktree_mode: WorktreeMode =
+        parse_row_json(TABLE, "worktree_mode", &format!("\"{wt_str}\""))?;
     let budget: Option<TeamBudget> = budget_str
-        .filter(|s| !s.is_empty())
-        .map(|s| serde_json::from_str(&s))
-        .transpose()
-        .map_err(|e| format!("bad budget JSON: {e}"))?;
+        .map(|raw| parse_row_json(TABLE, "budget_json", &raw))
+        .transpose()?;
 
     Ok(TeamDefinition {
         team_id,
@@ -1194,6 +1226,38 @@ fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition,
         max_parallel,
         created_at,
         updated_at,
+    })
+}
+
+fn row_to_team_execution_record(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<TeamExecutionRecord, String> {
+    const TABLE: &str = "team_execution_history";
+
+    Ok(TeamExecutionRecord {
+        execution_id: row_string(row, TABLE, "execution_id")?,
+        team_id: row_string(row, TABLE, "team_id")?,
+        user_id: row_string(row, TABLE, "user_id")?,
+        task: row_string(row, TABLE, "task")?,
+        status: row_string(row, TABLE, "status")?,
+        result_json: row_optional_string(row, TABLE, "result_json")?,
+        started_at: row_string(row, TABLE, "started_at")?,
+        completed_at: row_optional_string(row, TABLE, "completed_at")?,
+    })
+}
+
+fn row_to_team_snapshot_record(row: &sqlx::mysql::MySqlRow) -> Result<TeamSnapshotRecord, String> {
+    const TABLE: &str = "team_snapshots";
+
+    Ok(TeamSnapshotRecord {
+        snapshot_id: row_string(row, TABLE, "snapshot_id")?,
+        team_name: row_string(row, TABLE, "team_name")?,
+        user_id: row_string(row, TABLE, "user_id")?,
+        label: row_string(row, TABLE, "label")?,
+        git_commit: row_optional_string(row, TABLE, "git_commit")?,
+        session_id: row_optional_string(row, TABLE, "session_id")?,
+        team_definition_json: row_optional_string(row, TABLE, "team_definition_json")?,
+        created_at: row_string(row, TABLE, "created_at")?,
     })
 }
 
@@ -1500,6 +1564,47 @@ mod tests {
         let store = InMemoryTeamStore::with_builtins("u1");
         let teams = store.list_teams("u2").await.unwrap();
         assert!(teams.is_empty());
+    }
+
+    #[test]
+    fn matrixone_team_list_sql_is_bounded() {
+        assert_eq!(MAX_TEAM_LIST_ROWS, 200);
+        assert!(
+            TEAM_LIST_SELECT_SQL
+                .to_ascii_uppercase()
+                .contains("LIMIT ?"),
+            "team list must not read all team_definitions rows for a user"
+        );
+        assert!(
+            TEAM_LIST_SELECT_SQL.contains("ORDER BY name"),
+            "bounded team list must keep deterministic ordering"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_list_teams_is_bounded_and_sorted() {
+        let store = InMemoryTeamStore::new();
+        for idx in (0..(MAX_TEAM_LIST_ROWS + 5)).rev() {
+            let mut team = test_team();
+            team.team_id = format!("team-{idx:03}");
+            team.name = format!("team-{idx:03}");
+            store.save_team(&team).await.unwrap();
+        }
+
+        let teams = store.list_teams("user-1").await.unwrap();
+        assert_eq!(teams.len(), MAX_TEAM_LIST_ROWS);
+        assert_eq!(
+            teams.first().map(|team| team.name.as_str()),
+            Some("team-000")
+        );
+        assert_eq!(
+            teams.last().map(|team| team.name.as_str()),
+            Some("team-199")
+        );
+        assert!(
+            teams.iter().all(|team| team.name.as_str() < "team-200"),
+            "list should return the first bounded page in name order"
+        );
     }
 
     // ── Builtins ──

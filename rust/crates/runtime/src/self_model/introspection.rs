@@ -22,7 +22,7 @@ fn default_turns() -> i32 {
     10
 }
 fn default_context_window() -> i64 {
-    128000
+    200000
 }
 fn default_retrieval_turns() -> i32 {
     5
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn default_functions() {
         assert_eq!(default_turns(), 10);
-        assert_eq!(default_context_window(), 128000);
+        assert_eq!(default_context_window(), 200000);
         assert_eq!(default_retrieval_turns(), 5);
         assert_eq!(default_raw_token_budget(), 2000);
     }
@@ -209,7 +209,7 @@ mod tests {
         let q: ContextTrendQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.session_id, "s1");
         assert_eq!(q.turns, 10);
-        assert_eq!(q.context_window, 128000);
+        assert_eq!(q.context_window, 200000);
     }
 
     #[test]

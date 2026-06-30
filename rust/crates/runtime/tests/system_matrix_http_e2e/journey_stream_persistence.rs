@@ -112,11 +112,14 @@ pub async fn run_stream_session_and_run_status() {
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
     // ── Verify session row exists in DB ──
-    let row = sqlx::query("SELECT user_id, status FROM agent_sessions WHERE session_id = ?")
-        .bind(&session_id)
-        .fetch_optional(pool)
-        .await
-        .expect("select agent_sessions");
+    let row = sqlx::query(
+        "SELECT user_id, status FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .expect("select agent_sessions");
     let row = row.expect("agent_sessions row should exist after POST /sessions");
     assert_eq!(
         row.try_get::<String, _>("user_id").ok().as_deref(),
@@ -180,7 +183,7 @@ pub async fn run_stream_session_and_run_status() {
     );
 
     // ── Cleanup ──
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -339,7 +342,7 @@ pub async fn run_stream_context_trace_persistence() {
     );
 
     // ── Cleanup ──
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -541,6 +544,6 @@ pub async fn run_stream_multi_turn_persistence() {
     }
 
     // ── Cleanup ──
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
     ctx.pool.close().await;
 }

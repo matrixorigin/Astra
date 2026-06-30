@@ -360,7 +360,7 @@ fn observation_tools_are_always_load_and_not_deferred() {
     }
 
     let manifest = surface
-        .deferred_manifest(Some("gpt-4o"))
+        .deferred_manifest_with_context_window(Some(200_000))
         .expect("default surface should still have other deferred tools");
     for tool in ["introspect", "reflect"] {
         assert!(
@@ -445,13 +445,13 @@ fn deferred_manifest_is_atomic_text_budget_and_names() {
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
     let manifest = surface
-        .deferred_manifest(Some("gpt-4o"))
+        .deferred_manifest_with_context_window(Some(200_000))
         .expect("default surface should have deferred tools");
 
     assert!(manifest.text.contains("<deferred-tools>"));
     assert_eq!(
         manifest.context_window,
-        crate::prompts::budget_for_model(Some("gpt-4o")).model_limit
+        crate::prompts::DEFAULT_CONTEXT_WINDOW_TOKENS
     );
     assert_eq!(
         manifest.names,
@@ -486,7 +486,7 @@ fn deferred_manifest_names_follow_rendered_budget_subset() {
     let surface = ToolSurface::build(schemas, &cfg, &[]);
 
     let manifest = surface
-        .deferred_manifest(Some("gpt-3.5-turbo"))
+        .deferred_manifest_with_context_window(Some(16_000))
         .expect("large deferred surface should render a budgeted subset");
     let all_deferred_names: Vec<String> = surface
         .deferred()
@@ -580,7 +580,9 @@ fn deferred_manifest_is_absent_when_every_tool_is_visible() {
         "all visible tools must be removed from deferred"
     );
     assert!(
-        surface.deferred_manifest(Some("gpt-4o")).is_none(),
+        surface
+            .deferred_manifest_with_context_window(Some(200_000))
+            .is_none(),
         "no deferred prompt block should be rendered when every tool is already visible"
     );
 }

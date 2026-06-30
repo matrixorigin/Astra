@@ -873,6 +873,7 @@ mod tests {
             .expect("start durable run");
         engine
             .append_event(
+                "u1",
                 "run-durable-http",
                 json!({"event_type": "text_done", "data": {"full_text": "durable final answer"}}),
             )
@@ -880,13 +881,20 @@ mod tests {
             .expect("persist text_done");
         engine
             .append_event(
+                "u1",
                 "run-durable-http",
                 json!({"event_type": "run_finished", "data": {"prompt_tokens": 2, "completion_tokens": 1}}),
             )
             .await
             .expect("persist run_finished");
         engine
-            .persist_status("run-durable-http", astra_core::STATUS_COMPLETED, None, None)
+            .persist_status(
+                "u1",
+                "run-durable-http",
+                astra_core::STATUS_COMPLETED,
+                None,
+                None,
+            )
             .await
             .expect("mark completed");
 
@@ -960,6 +968,7 @@ mod tests {
             .expect("start durable run");
         engine
             .append_event(
+                "u1",
                 "run-projection-http",
                 json!({
                     "event_type": "workspace_bound",
@@ -987,6 +996,7 @@ mod tests {
             .expect("persist binding event");
         engine
             .append_event(
+                "u1",
                 "run-projection-http",
                 json!({"event_type": "injection_freshness", "data": {"fingerprint": "secret"}}),
             )
@@ -994,6 +1004,7 @@ mod tests {
             .expect("persist internal event");
         engine
             .append_event(
+                "u1",
                 "run-projection-http",
                 json!({"event_type": "text_done", "data": {"full_text": "durable answer"}}),
             )
@@ -1001,6 +1012,7 @@ mod tests {
             .expect("persist final answer");
         engine
             .append_event(
+                "u1",
                 "run-projection-http",
                 json!({"event_type": "run_error", "data": {"error": "boom"}}),
             )
@@ -1008,17 +1020,19 @@ mod tests {
             .expect("persist error");
         engine
             .append_event(
+                "u1",
                 "run-projection-http",
                 json!({"event_type": "run_finished", "data": {"prompt_tokens": 5, "completion_tokens": 2}}),
             )
             .await
             .expect("persist run finished");
         engine
-            .persist_usage("run-projection-http", 5, 2, 0)
+            .persist_usage("u1", "run-projection-http", 5, 2, 0)
             .await
             .expect("persist usage");
         engine
             .persist_checkpoint(
+                "u1",
                 "run-projection-http",
                 r#"{"version":"checkpoint_v3","graceful":true,"last_batch_id":"batch-run-projection"}"#,
             )
@@ -1026,6 +1040,7 @@ mod tests {
             .expect("persist checkpoint");
         engine
             .persist_status(
+                "u1",
                 "run-projection-http",
                 astra_core::STATUS_FAILED,
                 None,
@@ -1134,7 +1149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_run_projection_http_rejects_foreign_run() {
+    async fn get_run_projection_http_hides_foreign_run() {
         use crate::server::run::engine::RunEngine;
         use crate::server::run::lifecycle::AgenticRunLifecycleService;
         use astra_services::runs::InMemoryRunStateStore;
@@ -1172,6 +1187,6 @@ mod tests {
             .await
             .expect("response should be returned");
 
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

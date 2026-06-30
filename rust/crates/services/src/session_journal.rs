@@ -17,6 +17,8 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
+use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
+
 use crate::{OwnerScope, SessionArtifactStore};
 
 thread_local! {
@@ -1084,6 +1086,21 @@ fn normalize_optional_str(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn normalize_tool_call_records(records: Vec<ToolCallRecord>) -> Vec<ToolCallRecord> {
+    records
+        .into_iter()
+        .filter_map(|mut record| {
+            let name = record.name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            record.name = name.to_string();
+            record.original_tool_name = normalize_optional_name(record.original_tool_name);
+            Some(record)
+        })
+        .collect()
+}
+
 #[inline]
 fn is_false(b: &bool) -> bool {
     !*b
@@ -1118,7 +1135,9 @@ pub struct JournalEvent {
     /// Number of material tool executions in this turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_count: Option<u32>,
-    /// Prompt tokens used.
+    /// Fresh input tokens used. Prompt-cache read/write buckets are carried in
+    /// `cache_read_tokens` / `cache_creation_tokens`; add all three for the
+    /// billable input total.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in: Option<u64>,
     /// Completion tokens used.
@@ -1579,6 +1598,7 @@ impl JournalWriter {
 pub struct LlmRoundRecord {
     pub ttft_ms: Option<u64>,
     pub duration_ms: u64,
+    /// Fresh input tokens for this provider call. Cache buckets are disjoint.
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
@@ -3460,6 +3480,9 @@ impl JournalEvent {
         tools_used: Vec<String>,
         budget_used: u32,
     ) -> Self {
+        let visible_tools = normalize_name_list(&visible_tools);
+        let selected_skills = normalize_name_list(&selected_skills);
+        let tools_used = normalize_name_list(&tools_used);
         self.visible_tools = Some(visible_tools);
         if !selected_skills.is_empty() {
             self.selected_skills = Some(selected_skills);
@@ -3477,6 +3500,7 @@ impl JournalEvent {
 
     /// Attach per-tool-call audit records to a turn event.
     pub fn with_tool_calls(mut self, records: Vec<ToolCallRecord>) -> Self {
+        let records = normalize_tool_call_records(records);
         if !records.is_empty() {
             self.tool_calls = Some(records);
         }
@@ -3526,6 +3550,7 @@ impl JournalEvent {
         confidence: f64,
         avoid_tools: &[String],
     ) -> Self {
+        let avoid_tools = normalize_name_list(avoid_tools);
         let mut evt = Self::base(JournalEventType::StallDetected, session_id);
         evt.turn = Some(turn);
         evt.stall_type = Some(stall_type.to_string());
@@ -3632,23 +3657,25 @@ impl JournalEvent {
         force_stop: bool,
         nudge_count: usize,
         total_errors: usize,
-        health_avoidance_count: usize,
         total_timeouts: usize,
         timeout_dominant_tools: &[String],
         total_cache_hits: usize,
         flaky_count: usize,
     ) -> Self {
+        let avoid_tools = normalize_name_list(avoid_tools);
+        let health_avoidance_tools = normalize_name_list(health_avoidance_tools);
+        let timeout_dominant_tools = normalize_name_list(timeout_dominant_tools);
         let non_timeout_errors = total_errors.saturating_sub(total_timeouts);
         let avoid_reason_codes = Self::turn_guard_avoid_reason_codes(
-            avoid_tools,
-            health_avoidance_tools,
-            timeout_dominant_tools,
+            &avoid_tools,
+            &health_avoidance_tools,
+            &timeout_dominant_tools,
             nudge_count,
             non_timeout_errors,
         );
         let avoid_reason_summary = Self::turn_guard_avoid_reason_summary(
-            health_avoidance_tools,
-            timeout_dominant_tools,
+            &health_avoidance_tools,
+            &timeout_dominant_tools,
             nudge_count,
             non_timeout_errors,
             total_timeouts,
@@ -3670,7 +3697,7 @@ impl JournalEvent {
             "nudge_count": nudge_count,
             "total_errors": total_errors,
             "non_timeout_errors": non_timeout_errors,
-            "health_avoidance_count": health_avoidance_count,
+            "health_avoidance_count": health_avoidance_tools.len(),
             "total_timeouts": total_timeouts,
             "total_cache_hits": total_cache_hits,
             "flaky_tools": flaky_count,
@@ -5313,15 +5340,32 @@ mod tests {
             1234,
         )
         .with_tool_surface(
-            vec!["bash".into(), "github".into(), "read_file".into()],
-            vec!["tune-performance".into()],
-            vec!["github".into()],
+            vec![
+                "bash".into(),
+                " github ".into(),
+                "github".into(),
+                "".into(),
+                "read_file".into(),
+            ],
+            vec![
+                " tune-performance ".into(),
+                "tune-performance".into(),
+                " ".into(),
+            ],
+            vec![" github ".into(), "github".into(), "".into()],
             45,
         )
         .with_budget_pressure(0.6);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.visible_tools.as_ref().unwrap().len(), 3);
+        assert_eq!(
+            parsed.visible_tools.as_ref().unwrap(),
+            &vec![
+                "bash".to_string(),
+                "github".to_string(),
+                "read_file".to_string()
+            ]
+        );
         assert_eq!(
             parsed.selected_skills.as_ref().unwrap(),
             &["tune-performance"]
@@ -5434,25 +5478,42 @@ mod tests {
             800,
         )
         .with_tool_surface(vec!["github".into()], vec![], vec!["github".into()], 20)
-        .with_tool_calls(vec![ToolCallRecord {
-            name: "github".into(),
-            ok: true,
-            ms: 761,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: Some("owner/repo".into()),
-            result_preview: None,
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        }]);
+        .with_tool_calls(vec![
+            ToolCallRecord {
+                name: " github ".into(),
+                ok: true,
+                ms: 761,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: Some("owner/repo".into()),
+                result_preview: None,
+                file_path: None,
+                surgically_removed: None,
+                original_tool_name: Some(" github ".into()),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: " ".into(),
+                ok: false,
+                ms: 1,
+                error: Some("blank tool name".into()),
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+                file_path: None,
+                surgically_removed: None,
+                original_tool_name: Some(" ".into()),
+                ..Default::default()
+            },
+        ]);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         let calls = parsed.tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "github");
+        assert_eq!(calls[0].original_tool_name.as_deref(), Some("github"));
         assert!(calls[0].ok);
         assert_eq!(calls[0].ms, 761);
     }
@@ -5516,12 +5577,11 @@ mod tests {
             3,
             "warning",
             &["Stall detected: repeated bash calls".to_string()],
-            &["bash".to_string()],
-            &["bash".to_string()],
+            &[" bash ".to_string(), "bash".to_string(), "".to_string()],
+            &[" bash ".to_string(), "bash".to_string(), " ".to_string()],
             false,
             1,
             2,
-            1,
             0, // total_timeouts
             &[],
             0, // total_cache_hits
@@ -5574,7 +5634,6 @@ mod tests {
             true,
             3,
             5,
-            2,
             2, // total_timeouts
             &["bash".to_string()],
             1, // total_cache_hits
@@ -5613,7 +5672,6 @@ mod tests {
             false,
             0,
             1,
-            0,
             0,
             &[],
             0,
@@ -5706,7 +5764,12 @@ mod tests {
                 "repetition_stall",
                 2,
                 0.7,
-                &["bash".to_string(), "grep".to_string()],
+                &[
+                    " bash ".to_string(),
+                    "bash".to_string(),
+                    "".to_string(),
+                    "grep".to_string(),
+                ],
             );
             assert_eq!(evt.event_type, JournalEventType::StallDetected);
             assert_eq!(evt.turn, Some(5));
@@ -5714,7 +5777,7 @@ mod tests {
             let meta = evt.metadata.unwrap();
             assert_eq!(meta["nudge_count"], 2);
             assert_eq!(meta["confidence"], 0.7);
-            assert_eq!(meta["avoid_tools"][0], "bash");
+            assert_eq!(meta["avoid_tools"], serde_json::json!(["bash", "grep"]));
         }
 
         // --- stall_detected JSON roundtrip ---
@@ -6437,7 +6500,6 @@ mod tests {
                 false,
                 1,
                 2,
-                1,
                 0,
                 &[],
                 0,
@@ -6481,7 +6543,6 @@ mod tests {
                 3,
                 5,
                 2,
-                2,
                 &["bash".to_string()],
                 1,
                 1,
@@ -6518,7 +6579,6 @@ mod tests {
                 false,
                 0,
                 1,
-                0,
                 0,
                 &[],
                 0,
@@ -6606,7 +6666,12 @@ mod tests {
                 "repetition_stall",
                 2,
                 0.7,
-                &["bash".to_string(), "grep".to_string()],
+                &[
+                    " bash ".to_string(),
+                    "bash".to_string(),
+                    "".to_string(),
+                    "grep".to_string(),
+                ],
             );
             assert_eq!(evt.event_type, JournalEventType::StallDetected);
             assert_eq!(evt.turn, Some(5));
@@ -6614,7 +6679,7 @@ mod tests {
             let meta = evt.metadata.unwrap();
             assert_eq!(meta["nudge_count"], 2);
             assert_eq!(meta["confidence"], 0.7);
-            assert_eq!(meta["avoid_tools"][0], "bash");
+            assert_eq!(meta["avoid_tools"], serde_json::json!(["bash", "grep"]));
         }
 
         // ── stall_detected: JSON roundtrip ──

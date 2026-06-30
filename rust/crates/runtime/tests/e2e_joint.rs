@@ -361,7 +361,7 @@ impl RunLifecycleService for JointRunLifecycle {
         let run = self
             .store()
             .await
-            .load_run(&run_id)
+            .load_run(&user_id, &run_id)
             .await
             .map_err(service_unavailable)?
             .ok_or_else(|| not_found("run not found"))?;
@@ -390,7 +390,7 @@ impl RunLifecycleService for JointRunLifecycle {
         let run = self
             .store()
             .await
-            .load_run(&run_id)
+            .load_run(&user_id, &run_id)
             .await
             .map_err(service_unavailable)?
             .ok_or_else(|| not_found("run not found"))?;
@@ -403,11 +403,11 @@ impl RunLifecycleService for JointRunLifecycle {
     async fn cancel_run(
         &self,
         run_id: String,
-        _user_id: String,
+        user_id: String,
     ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
         self.store()
             .await
-            .update_run_status(&run_id, "cancelled", None, None)
+            .update_run_status(&user_id, &run_id, "cancelled", None, None)
             .await
             .map_err(service_unavailable)?;
         Ok(CancelRunRecord {
@@ -438,7 +438,7 @@ impl RunLifecycleService for JointRunLifecycle {
     ) -> Result<RunInputRecord, (StatusCode, Json<ErrorResponse>)> {
         let store = self.store().await;
         let run = store
-            .load_run(&run_id)
+            .load_run(&user_id, &run_id)
             .await
             .map_err(service_unavailable)?
             .ok_or_else(|| not_found("run not found"))?;
@@ -452,6 +452,7 @@ impl RunLifecycleService for JointRunLifecycle {
         if !duplicate {
             store
                 .append_event(
+                    &user_id,
                     &run_id,
                     json!({
                         "event_type": "user_input",
@@ -462,11 +463,12 @@ impl RunLifecycleService for JointRunLifecycle {
                 .await
                 .map_err(service_unavailable)?;
             store
-                .update_run_status(&run_id, "running", None, None)
+                .update_run_status(&user_id, &run_id, "running", None, None)
                 .await
                 .map_err(service_unavailable)?;
             store
                 .append_event(
+                    &user_id,
                     &run_id,
                     json!({"event_type": "run_resumed", "data": {"source": "approval_input"}}),
                 )
@@ -483,11 +485,11 @@ impl RunLifecycleService for JointRunLifecycle {
     async fn pause_run(
         &self,
         run_id: String,
-        _user_id: String,
+        user_id: String,
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
         self.store()
             .await
-            .update_run_status(&run_id, "waiting", Some("user"), None)
+            .update_run_status(&user_id, &run_id, "waiting", Some("user"), None)
             .await
             .map_err(service_unavailable)?;
         Ok(RunMutationRecord {
@@ -902,8 +904,11 @@ async fn e2e_joint_1_s01_rust_60_turn_refactor_chain() {
         "S01 token savings must be >=50%; naive={naive_tokens}, actual={actual_tokens}"
     );
     let artifact_refs = sqlx::query(
-        "SELECT referenced_by_manifest_count FROM session_artifacts WHERE artifact_id = ?",
+        "SELECT referenced_by_manifest_count FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
     )
+    .bind(&user_id)
+    .bind(&session_id)
     .bind(&artifact_id)
     .fetch_one(pool.get())
     .await
@@ -914,13 +919,18 @@ async fn e2e_joint_1_s01_rust_60_turn_refactor_chain() {
         artifact_refs >= 1,
         "S01 large cargo artifact must be referenced by manifest, got {artifact_refs}"
     );
-    sqlx::query("UPDATE session_artifacts SET status = 'expired' WHERE artifact_id = ?")
-        .bind(&artifact_id)
-        .execute(pool.get())
-        .await
-        .expect("S01 must be able to expire artifact for placeholder rendering");
+    sqlx::query(
+        "UPDATE session_artifacts SET status = 'expired'
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .execute(pool.get())
+    .await
+    .expect("S01 must be able to expire artifact for placeholder rendering");
     let rendered = manifest_store
-        .render_artifact_manifest_item(&artifact_id, None)
+        .render_artifact_manifest_item(&user_id, &session_id, &artifact_id, None)
         .await
         .expect("S01 expired artifact renderer must use persisted summary");
     assert!(
@@ -965,6 +975,7 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         let store = shared_store.read().await.clone();
         store
             .append_event(
+                &user_id,
                 &run_id,
                 json!({
                     "event_type": "assistant_delta",
@@ -979,8 +990,9 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
                 "UPDATE agent_runs
                  SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND),
                      updated_at = NOW(6)
-                 WHERE run_id = ?",
+                 WHERE user_id = ? AND run_id = ?",
             )
+            .bind(&user_id)
             .bind(&run_id)
             .execute(pool.get())
             .await
@@ -988,7 +1000,7 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
             let replacement =
                 DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("joint-pod-b");
             let won = replacement
-                .acquire_owner_lease(&run_id, "joint-pod-b", Duration::from_secs(30))
+                .acquire_owner_lease(&user_id, &run_id, "joint-pod-b", Duration::from_secs(30))
                 .await
                 .expect("S04 replacement pod must attempt lease takeover");
             assert!(
@@ -1002,11 +1014,12 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
             let approval_id = id("approval");
             let store = shared_store.read().await.clone();
             store
-                .update_run_status(&run_id, "waiting", Some("approval"), None)
+                .update_run_status(&user_id, &run_id, "waiting", Some("approval"), None)
                 .await
                 .expect("S04 approval pause must persist waiting status");
             store
                 .append_event(
+                    &user_id,
                     &run_id,
                     json!({
                         "event_type": "approval_request",
@@ -1040,13 +1053,14 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
     let store = shared_store.read().await.clone();
     store
         .append_event(
+            &user_id,
             &run_id,
             json!({"event_type": "run_finished", "data": {"status": "completed"}}),
         )
         .await
         .expect("S04 final run_finished event must persist");
     store
-        .update_run_status(&run_id, "completed", None, None)
+        .update_run_status(&user_id, &run_id, "completed", None, None)
         .await
         .expect("S04 final completed status must persist");
     absorb_sse_events(
@@ -1118,12 +1132,13 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         .await
         .expect("S07 durable run insert must succeed");
     store
-        .update_run_status(&run_id, "waiting", Some("approval"), None)
+        .update_run_status(&user_id, &run_id, "waiting", Some("approval"), None)
         .await
         .expect("S07 approval waiting status must persist");
     let approval_id = id("approval");
     store
         .append_event(
+            &user_id,
             &run_id,
             json!({
                 "event_type": "approval_request",
@@ -1153,11 +1168,11 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     for pod in ["joint-approval-b", "joint-approval-c"] {
         let replacement = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(pod);
         let _ = replacement
-            .acquire_owner_lease(&run_id, pod, Duration::from_secs(30))
+            .acquire_owner_lease(&user_id, &run_id, pod, Duration::from_secs(30))
             .await
             .expect("S07 replacement pod lease acquisition query must succeed");
         let loaded = replacement
-            .load_run(&run_id)
+            .load_run(&user_id, &run_id)
             .await
             .expect("S07 replacement pod must load durable run")
             .expect("S07 durable run must exist after restart");
@@ -1240,20 +1255,22 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     let final_store = shared_store.read().await.clone();
     final_store
         .append_event(
-            &run_id,
+                    &user_id,
+                    &run_id,
             json!({"event_type": "pre_execute_check", "data": {"approval_id": approval_id, "condition_passed": true}}),
         )
         .await
         .expect("S07 pre_execute condition check event must persist");
     final_store
         .append_event(
+            &user_id,
             &run_id,
             json!({"event_type": "run_finished", "data": {"status": "completed"}}),
         )
         .await
         .expect("S07 run_finished must persist");
     final_store
-        .update_run_status(&run_id, "completed", None, None)
+        .update_run_status(&user_id, &run_id, "completed", None, None)
         .await
         .expect("S07 completed status must persist");
 
@@ -1544,9 +1561,10 @@ async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
     );
     let bubble_count = sqlx::query(
         "SELECT COUNT(*) AS c FROM session_state_item_events
-         WHERE session_id = ? AND mutation = 'bubble_up'",
+         WHERE session_id = ? AND user_id = ? AND mutation = 'bubble_up'",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .expect("S10 bubble_up event count query must succeed")
@@ -1643,6 +1661,7 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
         .expect("S14 durable active run insert must succeed");
     store
         .append_event(
+            &user_id,
             &run_id,
             json!({"event_type": "assistant_delta", "data": {"text": "active replay"}}),
         )

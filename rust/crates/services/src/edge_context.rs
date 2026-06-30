@@ -38,11 +38,13 @@ pub struct EdgeContext {
 
 impl EdgeContext {
     /// Extract from a raw `serde_json::Map` (the `context` field of `ChatRequestData`).
-    pub fn from_context_map(map: &serde_json::Map<String, serde_json::Value>) -> Self {
-        serde_json::from_value(serde_json::Value::Object(map.clone())).unwrap_or_default()
+    pub fn from_context_map(
+        map: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(serde_json::Value::Object(map.clone()))
     }
 
-    /// Convert to the legacy `Map<String, Value>` for backward compatibility.
+    /// Serialize back to the raw `context` map shape used on the wire.
     pub fn to_context_map(&self) -> serde_json::Map<String, serde_json::Value> {
         match serde_json::to_value(self) {
             Ok(serde_json::Value::Object(map)) => map,
@@ -115,7 +117,7 @@ pub struct EdgeProfile {
 }
 
 impl EdgeProfile {
-    /// Convert to a `Map<String, Value>` for backward compatibility.
+    /// Serialize to the raw profile map embedded in `context.edge_profile`.
     pub fn to_map(&self) -> serde_json::Map<String, serde_json::Value> {
         match serde_json::to_value(self) {
             Ok(serde_json::Value::Object(map)) => map,
@@ -143,7 +145,7 @@ mod tests {
     #[test]
     fn edge_context_from_empty_map() {
         let map = serde_json::Map::new();
-        let ctx = EdgeContext::from_context_map(&map);
+        let ctx = EdgeContext::from_context_map(&map).expect("empty map should parse");
         assert!(!ctx.has_tools());
         assert_eq!(ctx.tool_count(), 0);
         assert!(ctx.tool_names().is_empty());
@@ -169,7 +171,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = EdgeContext::from_context_map(&map);
+        let ctx = EdgeContext::from_context_map(&map).expect("full map should parse");
         assert!(ctx.has_tools());
         assert_eq!(ctx.tool_count(), 2);
         assert_eq!(ctx.tool_names(), vec!["bash", "write_file"]);
@@ -193,7 +195,7 @@ mod tests {
         };
 
         let map = ctx.to_context_map();
-        let restored = EdgeContext::from_context_map(&map);
+        let restored = EdgeContext::from_context_map(&map).expect("round-trip map should parse");
         assert_eq!(restored.tool_count(), 1);
         assert_eq!(restored.edge_profile.cwd.as_deref(), Some("/tmp"));
     }
@@ -209,9 +211,25 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = EdgeContext::from_context_map(&map);
+        let ctx = EdgeContext::from_context_map(&map).expect("map with extra fields should parse");
         assert_eq!(ctx.extra.get("custom_field").unwrap(), "hello");
         assert_eq!(ctx.extra.get("another").unwrap(), 42);
+    }
+
+    #[test]
+    fn edge_context_rejects_malformed_typed_fields() {
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            r#"{
+                "edge_tools": {"not": "an array"},
+                "edge_profile": {"cwd": 42}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(
+            EdgeContext::from_context_map(&map).is_err(),
+            "malformed typed edge context fields must not silently default"
+        );
     }
 
     #[test]

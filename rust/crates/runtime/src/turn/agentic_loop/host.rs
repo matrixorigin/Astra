@@ -616,7 +616,11 @@ pub(crate) fn build_introspect_snapshot(
         total_output_tokens: state.total_completion,
         cache_read_tokens: state.total_cache_read,
         cache_creation_tokens: state.total_cache_creation,
+        estimated_input_tokens: introspect_estimated_input_tokens(state),
+        effective_input_budget_tokens: state.max_turn_input_tokens,
+        context_window_tokens: 0,
         recent_rounds,
+        step_latency: step_latency_snapshot_entries(&state.step_recorder),
         volatile_pending,
         stall_state,
         injection_freshness: Vec::new(),
@@ -633,16 +637,41 @@ pub(crate) fn build_introspect_snapshot(
     snapshot
 }
 
+fn step_latency_snapshot_entries(
+    step_recorder: &astra_pipeline::step_recorder::StepRecorder,
+) -> Vec<astra_turn_core::introspect::StepLatencySnapshotEntry> {
+    astra_pipeline::trace_query::TraceQuery::step_latency_breakdown_from_events(
+        step_recorder.events(),
+    )
+    .into_iter()
+    .map(
+        |entry| astra_turn_core::introspect::StepLatencySnapshotEntry {
+            step_id: entry.step_id,
+            total_ms: entry.total_ms,
+            pre_tool_wait_ms: entry.pre_tool_wait_ms,
+            first_tool_name: entry.first_tool_name,
+            tool_call_count: entry.tool_call_count,
+            skipped_tool_count: entry.skipped_tool_count,
+            tool_execution_ms: entry.tool_execution_ms,
+            max_tool_execution_ms: entry.max_tool_execution_ms,
+            terminal_event_kind: entry.terminal_event_kind,
+            dominant_phase: entry.dominant_phase.as_str().to_string(),
+        },
+    )
+    .collect()
+}
+
 pub(crate) fn introspect_token_pressure(state: &AgenticLoopState) -> f64 {
     if state.max_turn_input_tokens == 0 {
         return 0.0;
     }
-    let fresh_estimate = crate::prompts::estimate_tokens(
-        &state.messages,
-        state.pinned_tool_schema_tokens as usize,
-        0,
-    ) as u64;
+    let fresh_estimate = introspect_estimated_input_tokens(state);
     fresh_estimate as f64 / state.max_turn_input_tokens as f64
+}
+
+fn introspect_estimated_input_tokens(state: &AgenticLoopState) -> u64 {
+    crate::prompts::estimate_tokens(&state.messages, state.pinned_tool_schema_tokens as usize, 0)
+        as u64
 }
 
 // ─── Loop state sub-structs ──────────────────────────────────────────────────

@@ -397,7 +397,15 @@ fn model_gateway_from_row(
     row: sqlx::mysql::MySqlRow,
 ) -> Result<ModelGatewayRecord, (StatusCode, Json<ErrorResponse>)> {
     let protocol: String = row.try_get("model_protocol").map_err(internal_error)?;
-    let metadata_raw: Option<String> = row.try_get("metadata_json").ok().flatten();
+    let metadata_raw: Option<String> = row.try_get("metadata_json").map_err(internal_error)?;
+    let metadata = metadata_raw
+        .as_deref()
+        .map(|raw| {
+            serde_json::from_str(raw).map_err(|error| {
+                internal_error(format!("invalid model_gateways.metadata_json: {error}"))
+            })
+        })
+        .transpose()?;
     Ok(ModelGatewayRecord {
         id: row.try_get("id").map_err(internal_error)?,
         resolve_url: row.try_get("resolve_url").map_err(internal_error)?,
@@ -405,11 +413,7 @@ fn model_gateway_from_row(
         status: ModelGatewayStatus::from_db_value(
             &row.try_get::<String, _>("status").map_err(internal_error)?,
         )?,
-        metadata: metadata_raw
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(internal_error)?,
+        metadata,
         created_at: row_datetime_string(&row, "created_at")?,
         updated_at: row_datetime_string(&row, "updated_at")?,
         disabled_at: row_datetime_string_opt(&row, "disabled_at")?,

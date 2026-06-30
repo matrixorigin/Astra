@@ -2733,12 +2733,9 @@ esac
             Err("MCP tools must not poll edge dispatch".to_string())
         }
 
-        async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
-            Err("MCP tools must not mark edge dispatch".to_string())
-        }
-
         async fn deliver_result(
             &self,
+            _user_id: &str,
             _request_id: &str,
             _edge_agent_id: &str,
             _result_json: &str,
@@ -2746,12 +2743,18 @@ esac
             Err("MCP tools must not deliver edge dispatch results".to_string())
         }
 
-        async fn fail_dispatch(&self, _request_id: &str, _reason: &str) -> Result<bool, String> {
+        async fn fail_dispatch(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _reason: &str,
+        ) -> Result<bool, String> {
             Err("MCP tools must not fail edge dispatch results".to_string())
         }
 
         async fn wait_result(
             &self,
+            _user_id: &str,
             _request_id: &str,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
@@ -2822,12 +2825,9 @@ esac
             Ok(Vec::new())
         }
 
-        async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
-            Ok(())
-        }
-
         async fn deliver_result(
             &self,
+            _user_id: &str,
             _request_id: &str,
             _edge_agent_id: &str,
             _result_json: &str,
@@ -2835,12 +2835,18 @@ esac
             Ok(true)
         }
 
-        async fn fail_dispatch(&self, _request_id: &str, _reason: &str) -> Result<bool, String> {
+        async fn fail_dispatch(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _reason: &str,
+        ) -> Result<bool, String> {
             Ok(true)
         }
 
         async fn wait_result(
             &self,
+            _user_id: &str,
             _request_id: &str,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
@@ -2877,12 +2883,9 @@ esac
             Ok(Vec::new())
         }
 
-        async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
-            Ok(())
-        }
-
         async fn deliver_result(
             &self,
+            _user_id: &str,
             _request_id: &str,
             _edge_agent_id: &str,
             _result_json: &str,
@@ -2890,7 +2893,12 @@ esac
             Ok(true)
         }
 
-        async fn fail_dispatch(&self, _request_id: &str, reason: &str) -> Result<bool, String> {
+        async fn fail_dispatch(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            reason: &str,
+        ) -> Result<bool, String> {
             self.failed_reasons
                 .lock()
                 .expect("failed reasons lock")
@@ -2900,6 +2908,7 @@ esac
 
         async fn wait_result(
             &self,
+            _user_id: &str,
             _request_id: &str,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
@@ -5760,25 +5769,22 @@ esac
     impl astra_plan::PlanRepository for QueryCountingPlanRepo {
         async fn save(
             &self,
+            user_id: &str,
             plan_id: &str,
             state: &mut astra_plan::PlanModeState,
             expected_version: Option<u64>,
         ) -> Result<(), astra_plan::PlanLoadError> {
-            self.inner.save(plan_id, state, expected_version).await
+            self.inner
+                .save(user_id, plan_id, state, expected_version)
+                .await
         }
         async fn load(
             &self,
+            user_id: &str,
             plan_id: &str,
         ) -> Result<astra_plan::PlanModeState, astra_plan::PlanLoadError> {
             self.load_calls.fetch_add(1, Ordering::Relaxed);
-            self.inner.load(plan_id).await
-        }
-        async fn load_owned(
-            &self,
-            plan_id: &str,
-            user_id: &str,
-        ) -> Result<astra_plan::PlanModeState, astra_plan::PlanLoadError> {
-            self.inner.load_owned(plan_id, user_id).await
+            self.inner.load(user_id, plan_id).await
         }
         async fn list_for_user(
             &self,
@@ -5787,8 +5793,12 @@ esac
         ) -> Result<Vec<astra_plan::SavedPlanInfo>, astra_plan::PlanLoadError> {
             self.inner.list_for_user(user_id, filter).await
         }
-        async fn delete(&self, plan_id: &str) -> Result<(), astra_plan::PlanLoadError> {
-            self.inner.delete(plan_id).await
+        async fn delete(
+            &self,
+            user_id: &str,
+            plan_id: &str,
+        ) -> Result<(), astra_plan::PlanLoadError> {
+            self.inner.delete(user_id, plan_id).await
         }
         async fn set_active_plan(
             &self,
@@ -5812,22 +5822,25 @@ esac
         }
         async fn record_step_run(
             &self,
+            _user_id: &str,
             input: astra_plan::NewStepRun<'_>,
         ) -> Result<String, astra_plan::PlanLoadError> {
-            self.inner.record_step_run(input).await
+            self.inner.record_step_run(_user_id, input).await
         }
         async fn record_completed_step_run(
             &self,
+            user_id: &str,
             input: astra_plan::NewStepRun<'_>,
             error: Option<&str>,
             artifact_ref: Option<&str>,
         ) -> Result<String, astra_plan::PlanLoadError> {
             self.inner
-                .record_completed_step_run(input, error, artifact_ref)
+                .record_completed_step_run(user_id, input, error, artifact_ref)
                 .await
         }
         async fn finalize_step_run(
             &self,
+            user_id: &str,
             plan_id: &str,
             run_id: &str,
             status: astra_services::task_orchestrator::TaskStatus,
@@ -5835,33 +5848,41 @@ esac
             artifact_ref: Option<&str>,
         ) -> Result<(), astra_plan::PlanLoadError> {
             self.inner
-                .finalize_step_run(plan_id, run_id, status, error, artifact_ref)
+                .finalize_step_run(user_id, plan_id, run_id, status, error, artifact_ref)
                 .await
         }
         async fn get_step_run(
             &self,
+            user_id: &str,
             plan_id: &str,
             run_id: &str,
         ) -> Result<astra_plan::PlanStepRun, astra_plan::PlanLoadError> {
-            self.inner.get_step_run(plan_id, run_id).await
+            self.inner.get_step_run(user_id, plan_id, run_id).await
         }
         async fn list_step_runs(
             &self,
+            user_id: &str,
             plan_id: &str,
             subtask_id: Option<&str>,
             limit: i32,
         ) -> Result<Vec<astra_plan::PlanStepRun>, astra_plan::PlanLoadError> {
-            self.inner.list_step_runs(plan_id, subtask_id, limit).await
+            self.inner
+                .list_step_runs(user_id, plan_id, subtask_id, limit)
+                .await
         }
         async fn abort_open_step_runs(
             &self,
+            user_id: &str,
             plan_id: &str,
             subtask_ids: &[String],
         ) -> Result<u64, astra_plan::PlanLoadError> {
-            self.inner.abort_open_step_runs(plan_id, subtask_ids).await
+            self.inner
+                .abort_open_step_runs(user_id, plan_id, subtask_ids)
+                .await
         }
         async fn save_existing_and_abort_open_step_runs(
             &self,
+            user_id: &str,
             plan_id: &str,
             state: &mut astra_plan::PlanModeState,
             expected_version: u64,
@@ -5869,6 +5890,7 @@ esac
         ) -> Result<u64, astra_plan::PlanLoadError> {
             self.inner
                 .save_existing_and_abort_open_step_runs(
+                    user_id,
                     plan_id,
                     state,
                     expected_version,
@@ -6163,6 +6185,7 @@ esac
     impl astra_plan::PlanRepository for InMemoryPlanRepo {
         async fn save(
             &self,
+            _user_id: &str,
             plan_id: &str,
             state: &mut astra_plan::PlanModeState,
             _expected_version: Option<u64>,
@@ -6173,6 +6196,7 @@ esac
         }
         async fn load(
             &self,
+            _user_id: &str,
             plan_id: &str,
         ) -> Result<astra_plan::PlanModeState, astra_plan::PlanLoadError> {
             let guard = self.plan_state.read().await;
@@ -6181,13 +6205,6 @@ esac
                 _ => Err(astra_plan::PlanLoadError::NotFound(plan_id.into())),
             }
         }
-        async fn load_owned(
-            &self,
-            plan_id: &str,
-            _user_id: &str,
-        ) -> Result<astra_plan::PlanModeState, astra_plan::PlanLoadError> {
-            self.load(plan_id).await
-        }
         async fn list_for_user(
             &self,
             _user_id: &str,
@@ -6195,7 +6212,11 @@ esac
         ) -> Result<Vec<astra_plan::SavedPlanInfo>, astra_plan::PlanLoadError> {
             Ok(vec![])
         }
-        async fn delete(&self, _plan_id: &str) -> Result<(), astra_plan::PlanLoadError> {
+        async fn delete(
+            &self,
+            _user_id: &str,
+            _plan_id: &str,
+        ) -> Result<(), astra_plan::PlanLoadError> {
             Ok(())
         }
         async fn set_active_plan(
@@ -6216,12 +6237,14 @@ esac
         }
         async fn record_step_run(
             &self,
+            _user_id: &str,
             _input: astra_plan::NewStepRun<'_>,
         ) -> Result<String, astra_plan::PlanLoadError> {
             Ok(uuid::Uuid::new_v4().to_string())
         }
         async fn record_completed_step_run(
             &self,
+            _user_id: &str,
             _input: astra_plan::NewStepRun<'_>,
             _error: Option<&str>,
             _artifact_ref: Option<&str>,
@@ -6230,6 +6253,7 @@ esac
         }
         async fn finalize_step_run(
             &self,
+            _user_id: &str,
             _plan_id: &str,
             _run_id: &str,
             _status: astra_services::task_orchestrator::TaskStatus,
@@ -6244,6 +6268,7 @@ esac
         // actually stores runs) instead of `InMemoryPlanRepo`.
         async fn get_step_run(
             &self,
+            _user_id: &str,
             _plan_id: &str,
             run_id: &str,
         ) -> Result<astra_plan::PlanStepRun, astra_plan::PlanLoadError> {
@@ -6251,6 +6276,7 @@ esac
         }
         async fn list_step_runs(
             &self,
+            _user_id: &str,
             _plan_id: &str,
             _subtask_id: Option<&str>,
             _limit: i32,
@@ -6259,6 +6285,7 @@ esac
         }
         async fn abort_open_step_runs(
             &self,
+            _user_id: &str,
             _plan_id: &str,
             _subtask_ids: &[String],
         ) -> Result<u64, astra_plan::PlanLoadError> {
@@ -6266,6 +6293,7 @@ esac
         }
         async fn save_existing_and_abort_open_step_runs(
             &self,
+            _user_id: &str,
             plan_id: &str,
             state: &mut astra_plan::PlanModeState,
             expected_version: u64,
@@ -6306,7 +6334,7 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        repo.save("plan-guard-test", &mut state, None)
+        repo.save("test-user", "plan-guard-test", &mut state, None)
             .await
             .unwrap();
         // Pin the plan as active for the session.
@@ -6381,7 +6409,7 @@ esac
                     ..Default::default()
                 });
         }
-        repo.save("plan-visible-task", &mut state, None)
+        repo.save("alice", "plan-visible-task", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan("alice", "visible-session", Some("plan-visible-task"))
@@ -6441,7 +6469,7 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        repo.save("plan-rollback-task-board", &mut state, None)
+        repo.save("alice", "plan-rollback-task-board", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan(
@@ -6555,7 +6583,7 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        repo.save("plan-reload-fails", &mut state, None)
+        repo.save("alice", "plan-reload-fails", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan("alice", "reload-fails-session", Some("plan-reload-fails"))
@@ -6618,7 +6646,7 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        repo.save("plan-title-collision", &mut state, None)
+        repo.save("alice", "plan-title-collision", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan("alice", "collision-session", Some("plan-title-collision"))
@@ -6689,7 +6717,7 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        repo.save("plan-reuse-cli-tree", &mut state, None)
+        repo.save("alice", "plan-reuse-cli-tree", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan("alice", "reuse-session", Some("plan-reuse-cli-tree"))
@@ -6766,7 +6794,7 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        repo.save("plan-repeat-server", &mut state, None)
+        repo.save("alice", "plan-repeat-server", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan("alice", "repeat-server-session", Some("plan-repeat-server"))
@@ -6863,7 +6891,7 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        repo.save("plan-new-visible-goal", &mut state, None)
+        repo.save("alice", "plan-new-visible-goal", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan(
@@ -6956,13 +6984,13 @@ esac
                 ..Default::default()
             });
         let stale_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-        repo.save("plan-same-id-new-steps", &mut state, None)
+        repo.save("alice", "plan-same-id-new-steps", &mut state, None)
             .await
             .unwrap();
 
         state.plan.subtasks[0].title = "new task board sync".into();
         let _fresh_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-        repo.save("plan-same-id-new-steps", &mut state, None)
+        repo.save("alice", "plan-same-id-new-steps", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan("alice", "same-id-session", Some("plan-same-id-new-steps"))
@@ -7061,7 +7089,7 @@ esac
                 ..Default::default()
             });
         let stale_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-        repo.save("plan-same-id-new-deps", &mut state, None)
+        repo.save("alice", "plan-same-id-new-deps", &mut state, None)
             .await
             .unwrap();
 
@@ -7071,7 +7099,7 @@ esac
             stale_fingerprint, fresh_fingerprint,
             "dependency changes must affect task-board fingerprint"
         );
-        repo.save("plan-same-id-new-deps", &mut state, None)
+        repo.save("alice", "plan-same-id-new-deps", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan("alice", "same-deps-session", Some("plan-same-id-new-deps"))
@@ -7162,7 +7190,7 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        repo.save("plan-reject-test", &mut state, None)
+        repo.save("alice", "plan-reject-test", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan("alice", "reject-session", Some("plan-reject-test"))
@@ -7191,7 +7219,7 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state =
             astra_plan::PlanModeState::new_with_owner("empty plan".into(), "alice".into());
-        repo.save("plan-empty-test", &mut state, None)
+        repo.save("alice", "plan-empty-test", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan("alice", "empty-session", Some("plan-empty-test"))
@@ -7303,7 +7331,7 @@ esac
                 status: astra_services::task_orchestrator::TaskStatus::Pending,
                 ..Default::default()
             });
-        repo.save("plan-reject-lock-test", &mut state, None)
+        repo.save("alice", "plan-reject-lock-test", &mut state, None)
             .await
             .unwrap();
         repo.set_active_plan(

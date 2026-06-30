@@ -47,7 +47,7 @@ S08 的核心矛盾是「单次 tool 输出体积 × 长尾结构 × 历史回�
 | 编号 | 压测方式 |
 | --- | --- |
 | **A9** | T3 的 3GB pg_dump、T7 的 800MB slowlog **绝不进 prompt**；必须作为 `session_tool_outputs` 一行 + `session_artifacts` 一行双投影落库：`byte_size` 精确到字节、`content_hash` 走规范化（见 §8 建议 3）后的 sha256、`artifact_ref` 指向 OSS 对象、`preview_text ≤ 1000 字符`且末尾带 `truncated at X bytes, full in artifact Y`。T5 的 1000 个 file scan 结果要在单行聚合 preview（TopN 摘要 + 计数），而不是拼接 1000 行原文。`tool_previews` zone 每轮 ≤ 1500 tokens 硬上限。 |
-| **A3** | T12 用户刷新页面、UI 重绘 tool 时间轴时，**只**查 `session_transcript_items` + `session_tool_outputs` 两个索引投影（`idx_tool_outputs_session_created`），**不**打开 artifact 原文；即使会话里有 3GB + 800MB 两块巨无霸，first-paint 也要在 500ms 内完成。热路径绝不扫 JSON、绝不拉 raw。展开某一条 tool output 时才按需 GET artifact（presigned URL 直连 OSS，不走 API server）。 |
+| **A3** | T12 用户刷新页面、UI 重绘 tool 时间轴时，**只**查 `session_transcript_items` + `session_tool_outputs` 两个索引投影（`idx_tool_outputs_user_session_created`），**不**打开 artifact 原文；即使会话里有 3GB + 800MB 两块巨无霸，first-paint 也要在 500ms 内完成。热路径绝不扫 JSON、绝不拉 raw。展开某一条 tool output 时才按需 GET artifact（presigned URL 直连 OSS，不走 API server）。 |
 | **A10** | T8 老陈问「第 3 条慢查询为啥慢」时，检索走三级：（1）structured filter：`WHERE session_id=? AND tool_name='slow_query_analyzer' ORDER BY created_at DESC LIMIT 1` 命中 `idx_tool_outputs_tool_created`；（2）拿到 `artifact_ref` 后走 artifact 内的 chunk 索引（query_rank=3 的 offset），按需加载那一段 EXPLAIN plan + 调用栈，**不** load 800MB 全部。T9 问 "FK 报错在哪个文件" 时走 tier 2：`MATCH(preview_text) AGAINST ('foreign key')`，返回文件列表；vector 检索在本场景**不触发**（有精确关键词时不浪费）。 |
 
 ## 3. 会话时间线
@@ -338,8 +338,8 @@ created_at, preview_text, payload_ref FROM session_transcript_items
 WHERE session_id=? AND is_deleted=FALSE ORDER BY item_seq DESC
 LIMIT 50`；（2）对其中 `item_type='tool_result'` 的条目再一次
 `SELECT output_id, tool_name, status, byte_size, preview_text,
-artifact_ref FROM session_tool_outputs WHERE session_id=? AND
-output_id IN (?)`，命中 `idx_tool_outputs_session_created`。两查询
+artifact_ref FROM session_tool_outputs WHERE user_id=? AND session_id=? AND
+output_id IN (?)`，命中 `idx_tool_outputs_user_session_created`。两查询
 合计 ~3ms，读回约 50 行 × 平均 800 字节 preview = 40KB 传输。
 3GB pg_dump、800MB slowlog、56MB scan_detail、180KB 报告等
 artifact **一个字节都不读**。UI 把 tool output 条目渲染为"卡片折

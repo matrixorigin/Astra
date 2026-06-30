@@ -413,6 +413,15 @@ impl RenderPolicy {
         !matches!(self, Self::Stream)
     }
 
+    /// True when terminal final text should be suppressed.
+    ///
+    /// PlanDecompose suppresses streaming deltas only. The agentic loop host
+    /// must still render the final answer/interruption once the turn settles;
+    /// otherwise plan-mode aborts look like silent stops.
+    pub fn suppress_final_text(self) -> bool {
+        matches!(self, Self::Silent)
+    }
+
     /// True when tool UI (spinners, progress) should be suppressed.
     pub fn suppress_tool_ui(self) -> bool {
         matches!(self, Self::FinalOnly | Self::Silent)
@@ -6450,6 +6459,14 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn plan_decompose_defers_but_does_not_suppress_final_text() {
+        assert!(RenderPolicy::PlanDecompose.suppress_text());
+        assert!(!RenderPolicy::PlanDecompose.suppress_final_text());
+        assert!(!RenderPolicy::FinalOnly.suppress_final_text());
+        assert!(RenderPolicy::Silent.suppress_final_text());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn blocking_bash_execution_yields_to_runtime_ticks() {

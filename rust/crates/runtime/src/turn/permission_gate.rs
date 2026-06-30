@@ -13,6 +13,15 @@ use astra_messaging::router::AgentMailbox;
 use astra_turn_core::permission::engine::{DecisionSource, HardDecision, evaluate_permission};
 use astra_turn_core::tool_argument_hints::normalize_llm_function_arguments;
 
+fn normalized_tool_args(tool_name: &str, args: Option<&str>) -> Result<serde_json::Value, String> {
+    let Some(raw) = args else {
+        return Ok(serde_json::json!({}));
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|e| format!("invalid JSON arguments for tool '{tool_name}': {e}"))?;
+    Ok(normalize_llm_function_arguments(&parsed))
+}
+
 /// Result of a permission check.
 #[derive(Debug, Clone)]
 pub enum PermissionCheckResult {
@@ -61,10 +70,15 @@ pub async fn check_tool_permission(
         };
     };
 
-    let normalized_args = args
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .map(|parsed| normalize_llm_function_arguments(&parsed))
-        .unwrap_or_else(|| serde_json::json!({}));
+    let normalized_args = match normalized_tool_args(tool_name, args) {
+        Ok(args) => args,
+        Err(reason) => {
+            ctx.write()
+                .await
+                .record_blocked_tool_with_reason(tool_name, Some(&reason));
+            return PermissionCheckResult::Denied { reason };
+        }
+    };
     let prompt = {
         let ctx_guard = ctx.read().await;
         let envelope = evaluate_permission(tool_name, &normalized_args, &ctx_guard);
@@ -188,10 +202,17 @@ pub async fn check_tool_permission_in_plan_mode(
     timeout: Duration,
     plan_mode_active: bool,
 ) -> PermissionCheckResult {
-    let normalized_args = args
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .map(|parsed| normalize_llm_function_arguments(&parsed))
-        .unwrap_or_else(|| serde_json::json!({}));
+    let normalized_args = match normalized_tool_args(tool_name, args) {
+        Ok(args) => args,
+        Err(reason) => {
+            if let Some(ctx) = permission_context {
+                ctx.write()
+                    .await
+                    .record_blocked_tool_with_reason(tool_name, Some(&reason));
+            }
+            return PermissionCheckResult::Denied { reason };
+        }
+    };
 
     if plan_mode_active
         && crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool_name, &normalized_args)
@@ -251,6 +272,81 @@ mod tests {
             }
             other => panic!("missing permission context must deny, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_fail_closed() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: None,
+            is_background: false,
+            ..Default::default()
+        };
+        let ctx = PermissionSyncContext::shared(inherited);
+
+        let result = check_tool_permission(
+            "bash",
+            Some("{not-json"),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        match result {
+            PermissionCheckResult::Denied { reason } => {
+                assert!(
+                    reason.contains("invalid JSON arguments for tool 'bash'"),
+                    "invalid args should fail closed with context: {reason}"
+                );
+            }
+            other => panic!("invalid tool arguments must deny, got {other:?}"),
+        }
+
+        let telemetry = ctx.read().await.telemetry();
+        assert_eq!(telemetry.tools_blocked, 1);
+        assert_eq!(telemetry.recent_denials, vec!["bash".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_wrapper_invalid_tool_arguments_fail_closed() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: None,
+            is_background: false,
+            ..Default::default()
+        };
+        let ctx = PermissionSyncContext::shared(inherited);
+
+        let result = check_tool_permission_in_plan_mode(
+            "read_file",
+            Some("["),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+            true,
+        )
+        .await;
+
+        match result {
+            PermissionCheckResult::Denied { reason } => {
+                assert!(
+                    reason.contains("invalid JSON arguments for tool 'read_file'"),
+                    "plan-mode wrapper should fail closed before fallback parsing: {reason}"
+                );
+            }
+            other => panic!("invalid plan-mode tool arguments must deny, got {other:?}"),
+        }
+
+        let telemetry = ctx.read().await.telemetry();
+        assert_eq!(telemetry.tools_blocked, 1);
+        assert_eq!(telemetry.recent_denials, vec!["read_file".to_string()]);
     }
 
     #[tokio::test]

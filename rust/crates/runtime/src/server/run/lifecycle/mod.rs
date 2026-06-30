@@ -104,6 +104,7 @@ use astra_runtime_env::{
     WorkspaceProvisionErrorKind as RuntimeWorkspaceProvisionErrorKind,
     WorkspaceProvisionRequest as RuntimeWorkspaceProvisionRequest, WorkspaceProvisioner,
     WorkspaceRecord as RuntimeWorkspaceRecord, WorkspaceSource as RuntimeWorkspaceSource,
+    validate_workspace_id,
 };
 
 use crate::orchestration::spawner::{
@@ -2131,7 +2132,7 @@ impl AgenticRunLifecycleService {
 
     async fn persist_graceful_shutdown_checkpoints(&self) {
         let engine = &self.run_engine;
-        let run_ids = {
+        let runs_to_checkpoint = {
             let runs = self.runs.read().await;
             runs.values()
                 .filter(|run| {
@@ -2140,10 +2141,10 @@ impl AgenticRunLifecycleService {
                         RunStatus::Running | RunStatus::Waiting | RunStatus::Paused
                     )
                 })
-                .map(|run| run.run_id.clone())
+                .map(|run| (run.user_id.clone(), run.run_id.clone()))
                 .collect::<Vec<_>>()
         };
-        for run_id in run_ids {
+        for (user_id, run_id) in runs_to_checkpoint {
             let checkpoint = json!({
                 "version": "checkpoint_v1",
                 "graceful": true,
@@ -2152,7 +2153,7 @@ impl AgenticRunLifecycleService {
             });
             astra_core::log_persist!(
                 engine
-                    .persist_checkpoint(&run_id, &checkpoint.to_string())
+                    .persist_checkpoint(&user_id, &run_id, &checkpoint.to_string())
                     .await,
                 "run_lifecycle",
                 &run_id,
@@ -2161,6 +2162,7 @@ impl AgenticRunLifecycleService {
             astra_core::log_persist!(
                 engine
                     .append_event(
+                        &user_id,
                         &run_id,
                         json!({"event_type": "run_checkpointed_for_shutdown", "data": {}})
                     )
@@ -2200,7 +2202,7 @@ impl AgenticRunLifecycleService {
     fn build_tracked_run_state(
         run_id: String,
         session_id: String,
-        _user_id: String,
+        user_id: String,
     ) -> (
         RunState,
         Arc<AtomicBool>,
@@ -2212,6 +2214,7 @@ impl AgenticRunLifecycleService {
         let llm_cancel_token = Arc::new(CancellationToken::new());
         let run_state = RunState {
             run_id,
+            user_id,
             session_id,
             status: RunStatus::Running,
             events: vec![json!({"event_type": "run_started", "data": {}})],
@@ -2294,11 +2297,11 @@ impl AgenticRunLifecycleService {
             })
     }
 
-    async fn fail_started_run_before_spawn(&self, run_id: &str, message: &str) {
+    async fn fail_started_run_before_spawn(&self, user_id: &str, run_id: &str, message: &str) {
         self.runs.write().await.remove(run_id);
         astra_core::log_persist!(
             self.run_engine
-                .persist_status(run_id, STATUS_FAILED, None, Some(message))
+                .persist_status(user_id, run_id, STATUS_FAILED, None, Some(message))
                 .await,
             "run_lifecycle",
             run_id,
@@ -3233,6 +3236,16 @@ impl AgenticRunLifecycleService {
                 RequestConstraints::default()
             }
         };
+        let edge_context = match Self::extract_edge_context(request) {
+            Ok(context) => context,
+            Err(err) => {
+                tracing::error!(
+                    error = %err.1.0.detail,
+                    "edge context failed validation in test-only build_initial_state; production callers reject this before agent start",
+                );
+                EdgeContext::default()
+            }
+        };
         self.build_initial_state_inner(
             user_id,
             request,
@@ -3242,6 +3255,7 @@ impl AgenticRunLifecycleService {
             execution_bindings,
             cancel_token,
             request_constraints,
+            &edge_context,
             None,
             None,
             None,
@@ -3258,6 +3272,7 @@ impl AgenticRunLifecycleService {
         execution_bindings: Option<&ExecutionBindingSnapshot>,
         cancel_token: Option<Arc<CancellationToken>>,
         request_constraints: RequestConstraints,
+        edge_context: &EdgeContext,
         edge_profile_override: Option<&Map<String, Value>>,
         request_scoped_skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
@@ -3327,10 +3342,9 @@ impl AgenticRunLifecycleService {
                 requested_budget,
             );
         let max_turns = agentic_turn_budget.initial_turns;
-        let edge_ctx = Self::extract_edge_context(request);
         // Use edge profile's git_root/cwd if available; fall back to provisioned
         // server workspace so web-agent sessions still load stop-hooks.yaml.
-        let project_root_buf = project_root_for_stop_hooks(&edge_ctx)
+        let project_root_buf = project_root_for_stop_hooks(edge_context)
             .or_else(|| workspace_override.map(|p| p.to_path_buf()));
         let hook_sets = project_root_buf
             .as_ref()
@@ -3375,10 +3389,10 @@ impl AgenticRunLifecycleService {
 
         // Build the server-side skill fork executor so skills with
         // execution_context: Fork can run in isolated sub-agent loops.
-        let edge_tools = Self::extract_edge_tools(request);
+        let edge_tools = edge_context.edge_tools.clone();
         let edge_profile = edge_profile_override
             .cloned()
-            .unwrap_or_else(|| Self::extract_edge_profile(request));
+            .unwrap_or_else(|| edge_context.edge_profile.to_map());
         let skill_executor = build_server_skill_executor(
             &self.matrixone,
             &self.encryptor,
@@ -3604,33 +3618,36 @@ impl AgenticRunLifecycleService {
     }
     /// Extract edge tools from the request context, or provide empty defaults.
     /// Parse the request context into a typed [`EdgeContext`].
-    fn extract_edge_context(request: &ChatRequestData) -> EdgeContext {
-        request
-            .context
-            .as_ref()
-            .map(EdgeContext::from_context_map)
-            .unwrap_or_default()
+    fn extract_edge_context(
+        request: &ChatRequestData,
+    ) -> Result<EdgeContext, (StatusCode, Json<ErrorResponse>)> {
+        request.context.as_ref().map_or_else(
+            || Ok(EdgeContext::default()),
+            |context| {
+                EdgeContext::from_context_map(context).map_err(|error| {
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid edge context: {error}"),
+                    )
+                })
+            },
+        )
     }
 
     /// Extract edge tools from the request context, or provide empty defaults.
-    fn extract_edge_tools(request: &ChatRequestData) -> Vec<Value> {
-        Self::extract_edge_context(request).edge_tools
+    #[cfg(test)]
+    fn extract_edge_tools(
+        request: &ChatRequestData,
+    ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
+        Ok(Self::extract_edge_context(request)?.edge_tools)
     }
 
     /// Extract edge profile from the request context, or provide empty defaults.
-    fn extract_edge_profile(request: &ChatRequestData) -> Map<String, Value> {
-        let mut profile = Self::extract_edge_context(request).edge_profile.to_map();
-        if let Some(raw_profile) = request
-            .context
-            .as_ref()
-            .and_then(|context| context.get("edge_profile"))
-            .and_then(Value::as_object)
-        {
-            for (key, value) in raw_profile {
-                profile.insert(key.clone(), value.clone());
-            }
-        }
-        profile
+    #[cfg(test)]
+    fn extract_edge_profile(
+        request: &ChatRequestData,
+    ) -> Result<Map<String, Value>, (StatusCode, Json<ErrorResponse>)> {
+        Ok(Self::extract_edge_context(request)?.edge_profile.to_map())
     }
 
     /// Provision a cloud workspace record for orchestrator-managed workspaces.
@@ -3748,6 +3765,19 @@ impl AgenticRunLifecycleService {
             .await
         {
             Ok(()) => {
+                if let Some(store) = workspace_record_store.as_ref()
+                    && let Err(error) = store
+                        .delete_workspace_record(user_id, &record.workspace_id)
+                        .await
+                {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        workspace_id = %record.workspace_id,
+                        run_id = %run_id,
+                        error = %error,
+                        "cleaned provisioned cloud workspace but failed to remove workspace record"
+                    );
+                }
                 tracing::info!(
                     target: "astra_runtime::run_lifecycle",
                     workspace_id = %record.workspace_id,
@@ -3921,22 +3951,17 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         user_id: &str,
     ) -> Result<Option<DurableRunRecord>, (StatusCode, Json<ErrorResponse>)> {
-        let run = self.run_engine.load_run(run_id).await.map_err(|error| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Failed to load durable run state: {error}"),
-            )
-        })?;
-
-        let Some(run) = run else {
-            return Ok(None);
-        };
-
-        if run.user_id != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
-        }
-
-        Ok(Some(run))
+        let run = self
+            .run_engine
+            .load_run(user_id, run_id)
+            .await
+            .map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to load durable run state: {error}"),
+                )
+            })?;
+        Ok(run)
     }
 
     async fn require_durable_run_for_user(
@@ -4554,13 +4579,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let agent_binding_mode = request.agent_binding.is_some();
-        let edge_tools = Self::extract_edge_tools(&request);
+        let edge_context = Self::extract_edge_context(&request)?;
+        let edge_tools = edge_context.edge_tools.clone();
         let server_side_tool_catalog = !agent_binding_mode && edge_tools.is_empty();
         let runtime_capabilities = self
             .prepare_runtime_capabilities(&request, &request_constraints)
             .await?;
         let requires_runtime_mcp_executor = runtime_capabilities.mcp_bundle.is_some();
-        let mut edge_profile = Self::extract_edge_profile(&request);
+        let mut edge_profile = edge_context.edge_profile.to_map();
         Self::apply_agent_binding_prompt_override(
             &mut edge_profile,
             runtime_capabilities.agent_binding.as_ref(),
@@ -4725,6 +4751,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             execution_bindings.as_ref(),
             Some(llm_cancel_token.clone()),
             request_constraints.clone(),
+            &edge_context,
             Some(&edge_profile),
             runtime_capabilities.request_scoped_skill_resolver.clone(),
             runtime_capabilities.agent_binding.as_ref(),
@@ -4796,7 +4823,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Err(error) => {
                     let message =
                         format!("tool executor setup failed after durable run start: {error}");
-                    self.fail_started_run_before_spawn(&run_id, &message).await;
+                    self.fail_started_run_before_spawn(&user_id, &run_id, &message)
+                        .await;
                     if let Some(record) = cloud_workspace_record.as_ref() {
                         self.cleanup_cloud_workspace_after_failed_start(
                             &user_id,
@@ -5002,6 +5030,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             Ok(permit) => permit,
             Err(_elapsed) => {
                 self.fail_started_run_before_spawn(
+                    &user_id,
                     &run_id,
                     "server capacity timeout before agentic loop start",
                 )
@@ -5074,6 +5103,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         astra_core::log_persist!(
                             run_engine
                                 .persist_status(
+                                    &bg_user_id,
                                     &bg_run_id,
                                     astra_core::STATUS_FAILED,
                                     None,
@@ -5151,6 +5181,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if persist_status_update
                     && should_preserve_manual_pause_from_durable(
                         &run_engine,
+                        &bg_user_id,
                         &bg_run_id,
                         &final_status,
                     )
@@ -5177,6 +5208,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     astra_core::log_persist!(
                         run_engine
                             .persist_status(
+                                &bg_user_id,
                                 &bg_run_id,
                                 persisted_status.as_str(),
                                 None,
@@ -5191,8 +5223,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 astra_core::log_persist!(
                     run_engine
                         .persist_usage(
+                            &bg_user_id,
                             &bg_run_id,
-                            loop_state.total_prompt,
+                            loop_state.provider_input_tokens(),
                             loop_state.total_completion,
                             loop_state.total_tool_calls,
                         )
@@ -5211,7 +5244,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if persist_terminal_events && !terminal_events.is_empty() {
                     astra_core::log_persist!(
                         run_engine
-                            .append_events_batch(&bg_run_id, &terminal_events)
+                            .append_events_batch(&bg_user_id, &bg_run_id, &terminal_events)
                             .await,
                         "run_lifecycle",
                         &bg_run_id,
@@ -5301,13 +5334,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let agent_binding_mode = request.agent_binding.is_some();
-        let edge_tools = Self::extract_edge_tools(&request);
+        let edge_context = Self::extract_edge_context(&request)?;
+        let edge_tools = edge_context.edge_tools.clone();
         let server_side_tool_catalog = !agent_binding_mode && edge_tools.is_empty();
         let runtime_capabilities = self
             .prepare_runtime_capabilities(&request, &request_constraints)
             .await?;
         let requires_runtime_mcp_executor = runtime_capabilities.mcp_bundle.is_some();
-        let mut edge_profile = Self::extract_edge_profile(&request);
+        let mut edge_profile = edge_context.edge_profile.to_map();
         Self::apply_agent_binding_prompt_override(
             &mut edge_profile,
             runtime_capabilities.agent_binding.as_ref(),
@@ -5411,6 +5445,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             execution_bindings.as_ref(),
             Some(llm_cancel_token.clone()),
             request_constraints.clone(),
+            &edge_context,
             Some(&edge_profile),
             runtime_capabilities.request_scoped_skill_resolver.clone(),
             runtime_capabilities.agent_binding.as_ref(),
@@ -5550,6 +5585,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ) {
                 if event_tx.send(event).await.is_err() {
                     self.fail_started_run_before_spawn(
+                        &user_id,
                         &run_id,
                         "failed to start streaming run event stream",
                     )
@@ -5613,7 +5649,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     let message = format!(
                         "streaming tool executor setup failed after durable run start: {error}"
                     );
-                    self.fail_started_run_before_spawn(&run_id, &message).await;
+                    self.fail_started_run_before_spawn(&user_id, &run_id, &message)
+                        .await;
                     if let Some(record) = cloud_workspace_record.as_ref() {
                         self.cleanup_cloud_workspace_after_failed_start(
                             &user_id,
@@ -5765,6 +5802,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             Ok(permit) => permit,
             Err(_elapsed) => {
                 self.fail_started_run_before_spawn(
+                    &user_id,
                     &run_id,
                     "server capacity timeout before streaming agentic loop start",
                 )
@@ -5878,6 +5916,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if persist_status_update
                     && should_preserve_manual_pause_from_durable(
                         &run_engine,
+                        &bg_user_id,
                         &bg_run_id,
                         &final_status,
                     )
@@ -5913,6 +5952,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     astra_core::log_persist!(
                         run_engine
                             .persist_status(
+                                &bg_user_id,
                                 &bg_run_id,
                                 persisted_status.as_str(),
                                 None,
@@ -5930,8 +5970,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 astra_core::log_persist!(
                     run_engine
                         .persist_usage(
+                            &bg_user_id,
                             &bg_run_id,
-                            state.total_prompt,
+                            state.provider_input_tokens(),
                             state.total_completion,
                             state.total_tool_calls,
                         )
@@ -5945,7 +5986,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if persist_streaming_events && !streaming_events_for_durable.is_empty() {
                     astra_core::log_persist!(
                         run_engine
-                            .append_events_batch(&bg_run_id, &streaming_events_for_durable)
+                            .append_events_batch(
+                                &bg_user_id,
+                                &bg_run_id,
+                                &streaming_events_for_durable,
+                            )
                             .await,
                         "run_lifecycle",
                         &bg_run_id,
@@ -6033,7 +6078,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
         let projection = self
             .run_engine
-            .load_run_projection(&run_id)
+            .load_run_projection(&user_id, &run_id)
             .await
             .map_err(|error| {
                 error_response(
@@ -6043,7 +6088,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             })?;
         let latest_checkpoint = self
             .run_engine
-            .load_latest_checkpoint(&run_id, None)
+            .load_latest_checkpoint(&user_id, &run_id, None)
             .await
             .map_err(|error| {
                 error_response(
@@ -6284,7 +6329,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .map_err(|_| Self::run_state_conflict("submit input to", &durable.status))?;
 
         self.run_engine
-            .append_event(&run_id, event.clone())
+            .append_event(&user_id, &run_id, event.clone())
             .await
             .map_err(|error| Self::durable_persist_error("input", error))?;
 
@@ -6305,7 +6350,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 },
             ) {
                 self.run_engine
-                    .mark_user_inputs_released(&run_id, &[event_index])
+                    .mark_user_inputs_released(&user_id, &run_id, &[event_index])
                     .await
                     .map_err(|error| {
                         Self::durable_persist_error("input release rollback", error)
@@ -6319,6 +6364,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let status_updated = self
             .run_engine
             .persist_status_if_current(
+                &user_id,
                 &run_id,
                 &[STATUS_RUNNING, STATUS_INPUT_QUEUED, STATUS_WAITING],
                 STATUS_INPUT_QUEUED,
@@ -6340,7 +6386,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 },
             ) {
                 self.run_engine
-                    .mark_user_inputs_released(&run_id, &[event_index])
+                    .mark_user_inputs_released(&user_id, &run_id, &[event_index])
                     .await
                     .map_err(|error| {
                         Self::durable_persist_error("input release rollback", error)
@@ -6356,7 +6402,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             "data": { "waiting_for": "user_input" },
         });
         self.run_engine
-            .append_event(&run_id, input_queued_event.clone())
+            .append_event(&user_id, &run_id, input_queued_event.clone())
             .await
             .map_err(|error| Self::durable_persist_error("input queued event", error))?;
         let mut stream_input_queued_event = input_queued_event.clone();
@@ -6415,12 +6461,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let cancel_event = json!({"event_type": "run_finished", "data": {"cancelled": true}});
         self.run_engine
-            .persist_status(&run_id, STATUS_CANCELLED, None, None)
+            .persist_status(&user_id, &run_id, STATUS_CANCELLED, None, None)
             .await
             .map_err(|error| Self::durable_persist_error("cancel status", error))?;
         let append_result = self
             .run_engine
-            .append_event(&run_id, cancel_event.clone())
+            .append_event(&user_id, &run_id, cancel_event.clone())
             .await;
 
         {
@@ -6436,7 +6482,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         if let Some(de) = &self.delegation_engine {
-            de.cancel_children_of(&run_id).await;
+            de.cancel_children_of(&user_id, &run_id).await;
         }
         append_result.map_err(|error| Self::durable_persist_error("cancel event", error))?;
         Self::schedule_run_eviction(&self.runs, run_id.clone());
@@ -6445,6 +6491,42 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             run_id,
             status: STATUS_CANCELLED.to_string(),
         })
+    }
+
+    async fn cancel_session_runs(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<Vec<CancelRunRecord>, (StatusCode, Json<ErrorResponse>)> {
+        let mut cancelled = Vec::new();
+        let mut seen = HashSet::new();
+        loop {
+            let Some(run) = self
+                .run_engine
+                .find_blocking_session_run(&user_id, &session_id)
+                .await
+                .map_err(|error| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Failed to find blocking session run: {error}"),
+                    )
+                })?
+            else {
+                break;
+            };
+
+            if !seen.insert(run.run_id.clone()) {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "session cancel made no progress while cancelling run {}",
+                        run.run_id
+                    ),
+                ));
+            }
+            cancelled.push(self.cancel_run(run.run_id, user_id.clone()).await?);
+        }
+        Ok(cancelled)
     }
 
     async fn list_runs(
@@ -6490,14 +6572,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Always write to DB first — the source of truth for cross-pod control.
         if let Err(error) = self
             .run_engine
-            .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
+            .persist_status(&user_id, &run_id, STATUS_PAUSED, Some("user_resume"), None)
             .await
         {
             return Err(Self::durable_persist_error("pause status", error));
         }
         if let Err(error) = self
             .run_engine
-            .append_event(&run_id, pause_event.clone())
+            .append_event(&user_id, &run_id, pause_event.clone())
             .await
         {
             // Rollback DB status. Ignore rollback failures — durable state
@@ -6506,7 +6588,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // LR/checkpoint logic handles reconciliation.
             let _ = self
                 .run_engine
-                .persist_status(&run_id, STATUS_RUNNING, None, None)
+                .persist_status(&user_id, &run_id, STATUS_RUNNING, None, None)
                 .await;
             return Err(Self::durable_persist_error("pause event", error));
         }
@@ -6522,7 +6604,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
         if let Some(de) = &self.delegation_engine {
-            de.pause_children_of(&run_id).await;
+            de.pause_children_of(&user_id, &run_id).await;
         }
         Ok(RunMutationRecord {
             run_id,
@@ -6543,7 +6625,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         if has_buffered_terminal_completion(&durable.events) {
             self.run_engine
-                .persist_status(&run_id, STATUS_COMPLETED, None, None)
+                .persist_status(&user_id, &run_id, STATUS_COMPLETED, None, None)
                 .await
                 .map_err(|error| Self::durable_persist_error("resume completed status", error))?;
             {
@@ -6567,19 +6649,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Always write to DB first — the source of truth for cross-pod control.
         if let Err(error) = self
             .run_engine
-            .persist_status(&run_id, STATUS_RUNNING, None, None)
+            .persist_status(&user_id, &run_id, STATUS_RUNNING, None, None)
             .await
         {
             return Err(Self::durable_persist_error("resume status", error));
         }
         if let Err(error) = self
             .run_engine
-            .append_event(&run_id, resume_event.clone())
+            .append_event(&user_id, &run_id, resume_event.clone())
             .await
         {
             let _ = self
                 .run_engine
-                .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
+                .persist_status(&user_id, &run_id, STATUS_PAUSED, Some("user_resume"), None)
                 .await;
             return Err(Self::durable_persist_error("resume event", error));
         }
@@ -6595,7 +6677,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
         if let Some(de) = &self.delegation_engine {
-            de.resume_children_of(&run_id).await;
+            de.resume_children_of(&user_id, &run_id).await;
         }
         Ok(RunMutationRecord {
             run_id,
@@ -7110,35 +7192,17 @@ impl ServerSubRunExecutor {
         session_id: &str,
         run_id: &str,
     ) -> Result<std::path::PathBuf, String> {
-        let sanitize = |s: &str| -> String {
-            s.chars()
-                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-                .collect()
-        };
-        let safe_session = sanitize(session_id);
-        let safe_run = sanitize(run_id);
-        if safe_session.is_empty() {
-            return Err(format!(
-                "session_id {session_id:?} contains no valid characters for workspace path"
-            ));
-        }
-        if safe_run.is_empty() {
-            return Err(format!(
-                "run_id {run_id:?} contains no valid characters for workspace path"
-            ));
-        }
+        validate_workspace_id(session_id)
+            .map_err(|source| format!("invalid sub-run session_id: {source}"))?;
+        validate_workspace_id(run_id)
+            .map_err(|source| format!("invalid sub-run run_id: {source}"))?;
 
         let base = std::env::var("ASTRA_SERVER_WORKSPACES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir().join("astra-workspaces"));
-        let workspace = base.join(&safe_session).join(&safe_run);
-        if let Err(error) = std::fs::create_dir_all(&workspace) {
-            tracing::warn!(
-                error = %error,
-                workspace = %workspace.display(),
-                "failed to create run workspace directory"
-            );
-        }
+        let workspace = base.join(session_id).join(run_id);
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create run workspace directory: {error}"))?;
         Ok(workspace)
     }
 }
@@ -7592,6 +7656,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             server_subrun_live_reason(&outcome, &loop_state),
         );
 
+        let prompt_tokens = loop_state.provider_input_tokens();
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => {
                 let status = if loop_state.interruption.is_some() {
@@ -7609,7 +7674,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         Some(loop_state.final_text)
                     },
                     error: None,
-                    prompt_tokens: loop_state.total_prompt,
+                    prompt_tokens,
                     completion_tokens: loop_state.total_completion,
                     tool_calls: loop_state.total_tool_calls,
                 })
@@ -7627,7 +7692,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         Some(loop_state.final_text)
                     },
                     error: None,
-                    prompt_tokens: loop_state.total_prompt,
+                    prompt_tokens,
                     completion_tokens: loop_state.total_completion,
                     tool_calls: loop_state.total_tool_calls,
                 })
@@ -7639,7 +7704,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     status: STATUS_WAITING.to_string(),
                     output: Some(reason),
                     error: None,
-                    prompt_tokens: loop_state.total_prompt,
+                    prompt_tokens,
                     completion_tokens: loop_state.total_completion,
                     tool_calls: loop_state.total_tool_calls,
                 })
@@ -7650,7 +7715,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 status: STATUS_FAILED.to_string(),
                 output: None,
                 error: Some(err),
-                prompt_tokens: loop_state.total_prompt,
+                prompt_tokens,
                 completion_tokens: loop_state.total_completion,
                 tool_calls: loop_state.total_tool_calls,
             }),
@@ -7660,7 +7725,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 status: STATUS_FAILED.to_string(),
                 output: None,
                 error: Some(err.to_string()),
-                prompt_tokens: loop_state.total_prompt,
+                prompt_tokens,
                 completion_tokens: loop_state.total_completion,
                 tool_calls: loop_state.total_tool_calls,
             }),
@@ -8994,12 +9059,17 @@ mod tests {
             self.inner.insert_run(record).await
         }
 
-        async fn load_run(&self, run_id: &str) -> Result<Option<DurableRunRecord>, String> {
-            self.inner.load_run(run_id).await
+        async fn load_run(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<DurableRunRecord>, String> {
+            self.inner.load_run(user_id, run_id).await
         }
 
         async fn update_run_status(
             &self,
+            user_id: &str,
             run_id: &str,
             status: &str,
             waiting_for: Option<&str>,
@@ -9010,12 +9080,13 @@ mod tests {
                 return Err(format!("injected update_run_status failure on call {call}"));
             }
             self.inner
-                .update_run_status(run_id, status, waiting_for, error_message)
+                .update_run_status(user_id, run_id, status, waiting_for, error_message)
                 .await
         }
 
         async fn update_run_status_if_current(
             &self,
+            user_id: &str,
             run_id: &str,
             expected_statuses: &[&str],
             status: &str,
@@ -9030,6 +9101,7 @@ mod tests {
             }
             self.inner
                 .update_run_status_if_current(
+                    user_id,
                     run_id,
                     expected_statuses,
                     status,
@@ -9041,43 +9113,56 @@ mod tests {
 
         async fn update_run_usage(
             &self,
+            user_id: &str,
             run_id: &str,
             prompt_tokens: u64,
             completion_tokens: u64,
             tool_calls: u32,
         ) -> Result<bool, String> {
             self.inner
-                .update_run_usage(run_id, prompt_tokens, completion_tokens, tool_calls)
+                .update_run_usage(
+                    user_id,
+                    run_id,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                )
                 .await
         }
 
         async fn save_checkpoint(
             &self,
+            user_id: &str,
             run_id: &str,
             checkpoint_json: &str,
         ) -> Result<bool, String> {
-            self.inner.save_checkpoint(run_id, checkpoint_json).await
+            self.inner
+                .save_checkpoint(user_id, run_id, checkpoint_json)
+                .await
         }
 
         async fn load_latest_checkpoint(
             &self,
+            user_id: &str,
             run_id: &str,
             checkpoint_kind: Option<&str>,
         ) -> Result<Option<DurableRunCheckpointRecord>, String> {
             self.inner
-                .load_latest_checkpoint(run_id, checkpoint_kind)
+                .load_latest_checkpoint(user_id, run_id, checkpoint_kind)
                 .await
         }
 
         async fn load_run_projection(
             &self,
+            user_id: &str,
             run_id: &str,
         ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-            self.inner.load_run_projection(run_id).await
+            self.inner.load_run_projection(user_id, run_id).await
         }
 
         async fn append_events_batch(
             &self,
+            user_id: &str,
             run_id: &str,
             events: &[serde_json::Value],
         ) -> Result<(), String> {
@@ -9085,7 +9170,9 @@ mod tests {
             if self.fail_append_calls.contains(&call) {
                 return Err(format!("injected append_event failure on call {call}"));
             }
-            self.inner.append_events_batch(run_id, events).await
+            self.inner
+                .append_events_batch(user_id, run_id, events)
+                .await
         }
 
         async fn list_user_runs(
@@ -9117,13 +9204,21 @@ mod tests {
 
         async fn find_sub_runs(
             &self,
+            user_id: &str,
             delegation_id: &str,
         ) -> Result<Vec<DurableRunRecord>, String> {
-            self.inner.find_sub_runs(delegation_id).await
+            self.inner.find_sub_runs(user_id, delegation_id).await
         }
 
-        async fn update_retry_count(&self, run_id: &str, retry_count: u32) -> Result<bool, String> {
-            self.inner.update_retry_count(run_id, retry_count).await
+        async fn update_retry_count(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            retry_count: u32,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_retry_count(user_id, run_id, retry_count)
+                .await
         }
     }
 
@@ -9434,6 +9529,31 @@ mod tests {
         assert_eq!(executor.inherited_permissions.mode, PermissionMode::Deny);
     }
 
+    #[test]
+    fn provision_subrun_workspace_rejects_unsafe_identity_components() {
+        let executor = ServerSubRunExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        );
+
+        let session_error = executor
+            .provision_subrun_workspace("session/123", "run-123")
+            .expect_err("unsafe session id must fail instead of being sanitized");
+        assert!(
+            session_error.contains("invalid sub-run session_id"),
+            "unexpected session error: {session_error}"
+        );
+
+        let run_error = executor
+            .provision_subrun_workspace("session-123", "run/123")
+            .expect_err("unsafe run id must fail instead of being sanitized");
+        assert!(
+            run_error.contains("invalid sub-run run_id"),
+            "unexpected run error: {run_error}"
+        );
+    }
+
     struct FailingWorkspaceRecordStore;
 
     #[async_trait]
@@ -9461,6 +9581,16 @@ mod tests {
             _limit: u32,
         ) -> Result<Vec<StoredWorkspaceRecordEntry>, WorkspaceRecordStoreError> {
             Ok(Vec::new())
+        }
+
+        async fn delete_workspace_record(
+            &self,
+            _owner_id: &str,
+            _workspace_id: &str,
+        ) -> Result<bool, WorkspaceRecordStoreError> {
+            Err(WorkspaceRecordStoreError::Unavailable(
+                "injected workspace store failure".to_string(),
+            ))
         }
     }
 
@@ -9532,21 +9662,26 @@ mod tests {
         let record = test_cloud_workspace_record("workspace-1");
 
         ok(svc
-            .persist_workspace_record("user-1", "session-1", "run-1", &record)
+            .persist_workspace_record(
+                "00000000-0000-0000-0000-000000000001",
+                "session-1",
+                "run-1",
+                &record,
+            )
             .await);
 
         let loaded = store
-            .load_workspace_record("user-1", "workspace-1")
+            .load_workspace_record("00000000-0000-0000-0000-000000000001", "workspace-1")
             .await
             .expect("load workspace record")
             .expect("record");
-        assert_eq!(loaded.owner_id, "user-1");
+        assert_eq!(loaded.owner_id, "00000000-0000-0000-0000-000000000001");
         assert_eq!(loaded.session_id.as_deref(), Some("session-1"));
         assert_eq!(loaded.run_id.as_deref(), Some("run-1"));
         assert_eq!(loaded.record, record);
         assert!(
             store
-                .load_workspace_record("user-2", "workspace-1")
+                .load_workspace_record("00000000-0000-0000-0000-000000000002", "workspace-1")
                 .await
                 .expect("load workspace record")
                 .is_none(),
@@ -9560,7 +9695,12 @@ mod tests {
         let record = test_cloud_workspace_record("workspace-1");
 
         let error = err(svc
-            .persist_workspace_record("user-1", "session-1", "run-1", &record)
+            .persist_workspace_record(
+                "00000000-0000-0000-0000-000000000001",
+                "session-1",
+                "run-1",
+                &record,
+            )
             .await);
 
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
@@ -9580,7 +9720,7 @@ mod tests {
         let store = Arc::new(InMemoryWorkspaceRecordStore::new());
         store
             .upsert_workspace_record(StoredWorkspaceRecordEntry::new(
-                "user-2",
+                "00000000-0000-0000-0000-000000000002",
                 Some("session-2".to_string()),
                 Some("run-2".to_string()),
                 test_cloud_workspace_record("workspace-2"),
@@ -9591,7 +9731,12 @@ mod tests {
         let record = test_cloud_workspace_record("workspace-1");
 
         let error = err(svc
-            .persist_workspace_record("user-1", "session-1", "run-1", &record)
+            .persist_workspace_record(
+                "00000000-0000-0000-0000-000000000001",
+                "session-1",
+                "run-1",
+                &record,
+            )
             .await);
 
         assert_eq!(error.0, StatusCode::CONFLICT);
@@ -9612,7 +9757,7 @@ mod tests {
         record.root_or_volume_ref = "/definitely/missing/astra-cleanup-debt".to_string();
 
         svc.cleanup_cloud_workspace_after_failed_start(
-            "user-1",
+            "00000000-0000-0000-0000-000000000001",
             "session-1",
             "run-1",
             &record,
@@ -9621,7 +9766,7 @@ mod tests {
         .await;
 
         let debts = store
-            .list_cleanup_debts("user-1", 10)
+            .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
             .await
             .expect("list cleanup debts");
         assert_eq!(debts.len(), 1);
@@ -9642,7 +9787,7 @@ mod tests {
 
         AgenticRunLifecycleService::cleanup_cloud_workspace_after_terminal_run(
             Some(store.clone()),
-            "user-1",
+            "00000000-0000-0000-0000-000000000001",
             "session-1",
             "run-1",
             &record,
@@ -9651,7 +9796,7 @@ mod tests {
         .await;
 
         let debts = store
-            .list_cleanup_debts("user-1", 10)
+            .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
             .await
             .expect("list cleanup debts");
         assert_eq!(debts.len(), 1);
@@ -9663,6 +9808,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_removes_workspace_record_after_successful_terminal_cleanup() {
+        let store = Arc::new(InMemoryWorkspaceRecordStore::new());
+        let record = test_cloud_workspace_record("workspace-terminal-cleanup-success");
+        store
+            .upsert_workspace_record(StoredWorkspaceRecordEntry::new(
+                "00000000-0000-0000-0000-000000000001",
+                Some("session-1".to_string()),
+                Some("run-1".to_string()),
+                record.clone(),
+            ))
+            .await
+            .expect("store workspace record");
+
+        AgenticRunLifecycleService::cleanup_cloud_workspace_after_terminal_run(
+            Some(store.clone()),
+            "00000000-0000-0000-0000-000000000001",
+            "session-1",
+            "run-1",
+            &record,
+            &RunStatus::Completed,
+        )
+        .await;
+
+        assert!(
+            store
+                .load_workspace_record(
+                    "00000000-0000-0000-0000-000000000001",
+                    "workspace-terminal-cleanup-success"
+                )
+                .await
+                .expect("load workspace record")
+                .is_none(),
+            "successful cleanup must remove the workspace record"
+        );
+        assert!(
+            store
+                .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
+                .await
+                .expect("list cleanup debts")
+                .is_empty(),
+            "successful cleanup must not create cleanup debt"
+        );
+    }
+
+    #[tokio::test]
     async fn lifecycle_skips_cloud_workspace_cleanup_for_resumable_status() {
         let store = Arc::new(InMemoryWorkspaceRecordStore::new());
         let mut record = test_cloud_workspace_record("workspace-waiting-no-cleanup");
@@ -9671,7 +9861,7 @@ mod tests {
 
         AgenticRunLifecycleService::cleanup_cloud_workspace_after_terminal_run(
             Some(store.clone()),
-            "user-1",
+            "00000000-0000-0000-0000-000000000001",
             "session-1",
             "run-1",
             &record,
@@ -9681,7 +9871,7 @@ mod tests {
 
         assert!(
             store
-                .list_cleanup_debts("user-1", 10)
+                .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
                 .await
                 .expect("list cleanup debts")
                 .is_empty(),
@@ -11284,6 +11474,7 @@ mod tests {
     fn active_run_live_event_projection_is_bounded() {
         let mut run = RunState {
             run_id: "run-live-bound".to_string(),
+            user_id: "user-live-bound".to_string(),
             session_id: "session-live-bound".to_string(),
             status: RunStatus::Running,
             events: vec![
@@ -11371,6 +11562,7 @@ mod tests {
         let cancel_token = Arc::new(CancellationToken::new());
         let mut run = RunState {
             run_id: "run-1".into(),
+            user_id: "user-1".into(),
             session_id: "session-1".into(),
             status: RunStatus::Cancelled,
             events: vec![
@@ -11629,7 +11821,7 @@ mod tests {
 
         let durable = svc
             .run_engine
-            .load_run(&run.run_id)
+            .load_run("user-1", &run.run_id)
             .await
             .expect("load run")
             .expect("run exists");
@@ -11681,7 +11873,7 @@ mod tests {
 
         let durable = svc
             .run_engine
-            .load_run(&run.run_id)
+            .load_run("user-1", &run.run_id)
             .await
             .expect("load run")
             .expect("run exists");
@@ -11729,11 +11921,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_run_status_forbidden_for_other_user() {
+    async fn get_run_status_hides_foreign_run() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
         let e = err(svc.get_run_status(run.run_id, "user-2".into()).await);
-        assert_eq!(e.0, StatusCode::FORBIDDEN);
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -11760,6 +11952,37 @@ mod tests {
             svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_session_runs_cancels_active_run_for_that_session_only() {
+        let svc = test_service();
+        let mut session_a = test_request("task a");
+        session_a.session_id = Some("session-a".to_string());
+        let run_a = ok(svc.create_run("user-1".into(), session_a).await);
+
+        let mut session_b = test_request("task b");
+        session_b.session_id = Some("session-b".to_string());
+        let run_b = ok(svc.create_run("user-1".into(), session_b).await);
+
+        let cancelled = ok(svc
+            .cancel_session_runs("session-a".to_string(), "user-1".to_string())
+            .await);
+
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].run_id, run_a.run_id);
+        assert_eq!(cancelled[0].status, "cancelled");
+        assert_eq!(
+            svc.test_llm_cancel_token_is_cancelled(&run_a.run_id).await,
+            Some(true)
+        );
+        assert_eq!(
+            svc.test_llm_cancel_token_is_cancelled(&run_b.run_id).await,
+            Some(false),
+            "session cancel must not cancel runs from a different session"
+        );
+        let status_b = ok(svc.get_run_status(run_b.run_id, "user-1".into()).await);
+        assert_eq!(status_b.status, "running");
     }
 
     #[tokio::test(start_paused = true)]
@@ -11820,11 +12043,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_run_forbidden_for_other_user() {
+    async fn cancel_run_hides_foreign_run() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
         let e = err(svc.cancel_run(run.run_id, "user-2".into()).await);
-        assert_eq!(e.0, StatusCode::FORBIDDEN);
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -12050,14 +12273,18 @@ mod tests {
             interaction_mode: None,
             interactive_client: false,
         };
-        let tools = AgenticRunLifecycleService::extract_edge_tools(&req);
+        let tools = AgenticRunLifecycleService::extract_edge_tools(&req).expect("edge tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "bash");
     }
 
     #[test]
     fn extract_edge_tools_empty_when_no_context() {
-        assert!(AgenticRunLifecycleService::extract_edge_tools(&test_request("hi")).is_empty());
+        assert!(
+            AgenticRunLifecycleService::extract_edge_tools(&test_request("hi"))
+                .expect("empty edge tools")
+                .is_empty()
+        );
     }
 
     fn trusted_domains_for_tests() -> Vec<super::TrustedLlmDomain> {
@@ -12214,7 +12441,7 @@ mod tests {
             interaction_mode: None,
             interactive_client: false,
         };
-        let profile = AgenticRunLifecycleService::extract_edge_profile(&req);
+        let profile = AgenticRunLifecycleService::extract_edge_profile(&req).expect("edge profile");
         assert_eq!(profile["cwd"], "/tmp");
         assert_eq!(profile["git_branch"], "main");
         assert_eq!(profile["system_prompt_override"], "override text");
@@ -12332,7 +12559,9 @@ mod tests {
             binding: test_agent_binding_record(Some(3)),
             skill_resolver: Some(static_skill_resolver("binding-only")),
         };
-        let mut edge_profile = AgenticRunLifecycleService::extract_edge_profile(&req);
+        let edge_context =
+            AgenticRunLifecycleService::extract_edge_context(&req).expect("edge context");
+        let mut edge_profile = edge_context.edge_profile.to_map();
         AgenticRunLifecycleService::apply_agent_binding_prompt_override(
             &mut edge_profile,
             Some(&binding_context),
@@ -12348,6 +12577,7 @@ mod tests {
             None,
             None,
             RequestConstraints::default(),
+            &edge_context,
             Some(&edge_profile),
             None,
             Some(&binding_context),
@@ -12748,13 +12978,20 @@ mod tests {
         let svc = test_service_with_engine();
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
         svc.run_engine
-            .persist_status(&run.run_id, STATUS_PAUSED, Some("user_resume"), None)
+            .persist_status(
+                "user-1",
+                &run.run_id,
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+            )
             .await
             .unwrap();
 
         assert!(
             should_preserve_manual_pause_from_durable(
                 &svc.run_engine,
+                "user-1",
                 &run.run_id,
                 &RunStatus::Completed,
             )
@@ -12763,6 +13000,7 @@ mod tests {
         assert!(
             !should_preserve_manual_pause_from_durable(
                 &svc.run_engine,
+                "user-1",
                 &run.run_id,
                 &RunStatus::Failed,
             )
@@ -12791,11 +13029,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_run_forbidden_for_other_user() {
+    async fn pause_run_hides_foreign_run() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
         let e = err(svc.pause_run(run.run_id, "user-2".into()).await);
-        assert_eq!(e.0, StatusCode::FORBIDDEN);
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -12824,6 +13062,7 @@ mod tests {
         ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
         svc.run_engine
             .append_event(
+                "user-1",
                 &run.run_id,
                 json!({
                     "event_type": "run_finished",
@@ -12849,12 +13088,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_run_forbidden_for_other_user() {
+    async fn resume_run_hides_foreign_run() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
         ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
         let e = err(svc.resume_run(run.run_id, "user-2".into()).await);
-        assert_eq!(e.0, StatusCode::FORBIDDEN);
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -12902,7 +13141,11 @@ mod tests {
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
         let engine = &svc.run_engine;
-        let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(durable.user_id, "user-1");
         assert_eq!(durable.status, "running");
         assert_eq!(durable.session_id, run.session_id);
@@ -12917,7 +13160,11 @@ mod tests {
         let engine = &svc.run_engine;
         let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+                let durable = engine
+                    .load_run("user-1", &run.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 if durable.status != "running"
                     && matches!(
                         durable
@@ -12948,7 +13195,11 @@ mod tests {
         let engine = &svc.run_engine;
         let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
+                let durable = engine
+                    .load_run("user-1", &stream.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 if durable.status != "running"
                     && matches!(
                         durable
@@ -12981,7 +13232,11 @@ mod tests {
         let engine = &svc.run_engine;
         let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+                let durable = engine
+                    .load_run("user-1", &run.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 if matches!(
                     durable
                         .events
@@ -13008,12 +13263,20 @@ mod tests {
 
         ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
         let engine = &svc.run_engine;
-        let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(durable.status, "paused");
         assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
 
         ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
-        let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(durable.status, "running");
         assert!(durable.waiting_for.is_none());
     }
@@ -13024,7 +13287,7 @@ mod tests {
         let engine = &svc.run_engine;
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
-            .persist_status("run-1", STATUS_COMPLETED, None, None)
+            .persist_status("user-1", "run-1", STATUS_COMPLETED, None, None)
             .await
             .unwrap();
 
@@ -13041,7 +13304,7 @@ mod tests {
 
         let result = ok(svc.cancel_run("run-1".into(), "user-1".into()).await);
         assert_eq!(result.status, STATUS_CANCELLED);
-        let durable = engine.load_run("run-1").await.unwrap().unwrap();
+        let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(durable.status, STATUS_CANCELLED);
         assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
     }
@@ -13054,7 +13317,7 @@ mod tests {
 
         let result = ok(svc.pause_run("run-1".into(), "user-1".into()).await);
         assert_eq!(result.status, STATUS_PAUSED);
-        let durable = engine.load_run("run-1").await.unwrap().unwrap();
+        let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(durable.status, STATUS_PAUSED);
     }
 
@@ -13064,13 +13327,13 @@ mod tests {
         let engine = &svc.run_engine;
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
-            .persist_status("run-1", STATUS_PAUSED, Some("user_resume"), None)
+            .persist_status("user-1", "run-1", STATUS_PAUSED, Some("user_resume"), None)
             .await
             .unwrap();
 
         let result = ok(svc.resume_run("run-1".into(), "user-1".into()).await);
         assert_eq!(result.status, STATUS_RUNNING);
-        let durable = engine.load_run("run-1").await.unwrap().unwrap();
+        let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(durable.status, STATUS_RUNNING);
     }
 
@@ -13084,7 +13347,12 @@ mod tests {
         assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(e.1.0.detail.contains("pause event"));
 
-        let durable = svc.run_engine.load_run(&run.run_id).await.unwrap().unwrap();
+        let durable = svc
+            .run_engine
+            .load_run("user-1", &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(durable.status, STATUS_RUNNING);
         assert!(durable.waiting_for.is_none());
         assert_eq!(durable.events.len(), 1);
@@ -13110,7 +13378,12 @@ mod tests {
         assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(e.1.0.detail.contains("resume event"));
 
-        let durable = svc.run_engine.load_run(&run.run_id).await.unwrap().unwrap();
+        let durable = svc
+            .run_engine
+            .load_run("user-1", &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(durable.status, STATUS_PAUSED);
         assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
         assert_eq!(durable.events.len(), 2);
@@ -13131,13 +13404,13 @@ mod tests {
         let engine = &svc.run_engine;
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
-            .persist_status("run-1", STATUS_PAUSED, Some("user_resume"), None)
+            .persist_status("user-1", "run-1", STATUS_PAUSED, Some("user_resume"), None)
             .await
             .unwrap();
 
         let result = ok(svc.cancel_run("run-1".into(), "user-1".into()).await);
         assert_eq!(result.status, STATUS_CANCELLED);
-        let durable = engine.load_run("run-1").await.unwrap().unwrap();
+        let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(durable.status, STATUS_CANCELLED);
     }
 
@@ -13149,7 +13422,11 @@ mod tests {
             .stream_chat("user-1".into(), test_request("hello"))
             .await);
         let engine = &svc.run_engine;
-        let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", &stream.run_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         svc.runs.write().await.remove(&stream.run_id);
 
@@ -13173,6 +13450,7 @@ mod tests {
             .expect("start durable run");
         engine
             .append_event(
+                "user-1",
                 "run-durable-text",
                 json!({"event_type": "text_done", "data": {"full_text": "durable final answer"}}),
             )
@@ -13180,6 +13458,7 @@ mod tests {
             .expect("persist text_done");
         engine
             .append_event(
+                "user-1",
                 "run-durable-text",
                 json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
             )
@@ -13226,7 +13505,11 @@ mod tests {
             )
             .await);
 
-        let durable = engine.load_run("run-input").await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", "run-input")
+            .await
+            .unwrap()
+            .unwrap();
         let matching_inputs = durable
             .events
             .iter()
@@ -13248,7 +13531,7 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("run-terminal-input", STATUS_COMPLETED, None, None)
+            .persist_status("user-1", "run-terminal-input", STATUS_COMPLETED, None, None)
             .await
             .unwrap();
 
@@ -13275,6 +13558,7 @@ mod tests {
             .unwrap();
         engine
             .persist_status(
+                "user-1",
                 "run-queued-input",
                 STATUS_INPUT_QUEUED,
                 Some("user_input"),
@@ -13297,7 +13581,11 @@ mod tests {
 
         assert!(result.accepted);
         assert!(!result.duplicate);
-        let durable = engine.load_run("run-queued-input").await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", "run-queued-input")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(durable.status, STATUS_INPUT_QUEUED);
         assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
         assert!(durable.events.iter().any(|event| {
@@ -13314,7 +13602,7 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("run-paused-input", STATUS_PAUSED, None, None)
+            .persist_status("user-1", "run-paused-input", STATUS_PAUSED, None, None)
             .await
             .unwrap();
 
@@ -13352,7 +13640,11 @@ mod tests {
             .await);
 
         assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE);
-        let durable = engine.load_run("run-large-input").await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", "run-large-input")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             durable.events.iter().all(|event| {
                 event.get("idempotency_key").and_then(Value::as_str) != Some("key-large")
@@ -13384,7 +13676,11 @@ mod tests {
             .stream_chat("user-1".into(), test_request("hello"))
             .await);
         let engine = &svc.run_engine;
-        let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", &stream.run_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         svc.runs.write().await.remove(&stream.run_id);
 
@@ -13421,7 +13717,12 @@ mod tests {
     async fn lifecycle_run_creation_is_durable_by_default() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-        let durable = svc.run_engine.load_run(&run.run_id).await.unwrap().unwrap();
+        let durable = svc
+            .run_engine
+            .load_run("user-1", &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(durable.user_id, "user-1");
         assert_eq!(durable.session_id, run.session_id);
         assert_eq!(durable.status, STATUS_RUNNING);
@@ -13445,7 +13746,8 @@ mod tests {
             ..test_request("hello")
         };
 
-        let edge_ctx = AgenticRunLifecycleService::extract_edge_context(&req);
+        let edge_ctx =
+            AgenticRunLifecycleService::extract_edge_context(&req).expect("edge context");
         assert_eq!(edge_ctx.tool_count(), 1);
         assert_eq!(edge_ctx.tool_names(), vec!["bash"]);
         assert_eq!(edge_ctx.edge_profile.cwd.as_deref(), Some("/tmp"));
@@ -13455,43 +13757,70 @@ mod tests {
     #[test]
     fn extract_edge_context_from_empty_request() {
         let req = test_request("hello");
-        let edge_ctx = AgenticRunLifecycleService::extract_edge_context(&req);
+        let edge_ctx =
+            AgenticRunLifecycleService::extract_edge_context(&req).expect("edge context");
         assert!(!edge_ctx.has_tools());
         assert!(edge_ctx.edge_profile.cwd.is_none());
     }
 
     #[test]
-    fn extract_edge_tools_backward_compat() {
+    fn extract_edge_context_rejects_malformed_context() {
         let mut ctx = serde_json::Map::new();
-        ctx.insert(
-            "edge_tools".to_string(),
-            json!([
-                {"function": {"name": "bash"}},
-                {"function": {"name": "grep"}}
-            ]),
-        );
+        ctx.insert("edge_tools".to_string(), json!({"not": "an array"}));
         let req = ChatRequestData {
             context: Some(ctx),
             ..test_request("hello")
         };
-        let tools = AgenticRunLifecycleService::extract_edge_tools(&req);
-        assert_eq!(tools.len(), 2);
+
+        let error = AgenticRunLifecycleService::extract_edge_context(&req)
+            .expect_err("malformed edge context must fail loud");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(
+            error.1.0.detail.contains("invalid edge context"),
+            "unexpected error: {}",
+            error.1.0.detail
+        );
     }
 
-    #[test]
-    fn extract_edge_profile_backward_compat() {
+    #[tokio::test]
+    async fn create_run_rejects_malformed_edge_context_before_agent_start() {
+        let svc = test_service();
         let mut ctx = serde_json::Map::new();
-        ctx.insert(
-            "edge_profile".to_string(),
-            json!({"cwd": "/workspace", "os": "linux"}),
-        );
+        ctx.insert("edge_tools".to_string(), json!({"not": "an array"}));
         let req = ChatRequestData {
             context: Some(ctx),
             ..test_request("hello")
         };
-        let profile = AgenticRunLifecycleService::extract_edge_profile(&req);
-        assert_eq!(profile.get("cwd").unwrap(), "/workspace");
-        assert_eq!(profile.get("os").unwrap(), "linux");
+
+        let error = err(svc.create_run("user-1".into(), req).await);
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(
+            error.1.0.detail.contains("invalid edge context"),
+            "unexpected error: {}",
+            error.1.0.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_rejects_malformed_edge_context_before_agent_start() {
+        let svc = test_service();
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("edge_profile".to_string(), json!({"cwd": 42}));
+        let req = ChatRequestData {
+            context: Some(ctx),
+            ..test_request("hello")
+        };
+
+        let error = err(svc.stream_chat("user-1".into(), req).await);
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(
+            error.1.0.detail.contains("invalid edge context"),
+            "unexpected error: {}",
+            error.1.0.detail
+        );
     }
 
     // ─── Background spawning integration tests ──────────────────────────
@@ -13535,7 +13864,11 @@ mod tests {
         let engine = &svc.run_engine;
         let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+                let durable = engine
+                    .load_run("user-1", &run.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 if durable.status != "running" {
                     break durable;
                 }
@@ -13910,6 +14243,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn durable_run_usage_uses_provider_input_tokens() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production lifecycle source");
+        let mut checked_calls = 0;
+        let mut cursor = production;
+        while let Some(pos) = cursor.find(".persist_usage(") {
+            checked_calls += 1;
+            let snippet = &cursor[pos..cursor.len().min(pos + 360)];
+            assert!(
+                snippet.contains("provider_input_tokens()"),
+                "durable run usage has no cache-specific columns, so prompt totals must include cache read/write buckets: {snippet}"
+            );
+            assert!(
+                !snippet.contains("total_prompt,"),
+                "fresh-input-only totals would under-report prompt-cache-heavy runs: {snippet}"
+            );
+            cursor = &cursor[pos + ".persist_usage(".len()..];
+        }
+        assert!(
+            checked_calls >= 2,
+            "stream_chat must persist usage on terminal paths"
+        );
+    }
+
+    #[test]
+    fn server_subrun_agent_result_prompt_tokens_include_cache_buckets() {
+        let source = include_str!("mod.rs");
+        let fn_start = source
+            .find("impl SubRunExecutor for ServerSubRunExecutor")
+            .expect("server sub-run executor must exist");
+        let fn_end = source[fn_start..]
+            .find("// ─── Tests")
+            .map(|p| fn_start + p)
+            .expect("server sub-run executor body");
+        let fn_body = &source[fn_start..fn_end];
+
+        assert!(
+            fn_body.contains("let prompt_tokens = loop_state.provider_input_tokens();"),
+            "AgentResult has no cache-specific fields; prompt_tokens must represent provider input tokens"
+        );
+        assert!(
+            !fn_body.contains("prompt_tokens: loop_state.total_prompt"),
+            "fresh-input-only totals would under-report prompt-cache-heavy sub-runs"
+        );
+    }
+
     /// P1-C: build_server_skill_executor must accept and wire a cancel_token.
     /// Without this, skill sub-runs ignore parent cancellation.
     #[test]
@@ -14060,12 +14443,22 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("waiting-run", STATUS_WAITING, Some("tool_approval"), None)
+            .persist_status(
+                "user-1",
+                "waiting-run",
+                STATUS_WAITING,
+                Some("tool_approval"),
+                None,
+            )
             .await
             .unwrap();
 
         let result = ok(svc.cancel_run("waiting-run".into(), "user-1".into()).await);
-        let durable = engine.load_run("waiting-run").await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", "waiting-run")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result.status, STATUS_CANCELLED);
         assert_eq!(durable.status, STATUS_CANCELLED);
     }

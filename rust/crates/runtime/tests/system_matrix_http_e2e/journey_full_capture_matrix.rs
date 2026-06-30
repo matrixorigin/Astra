@@ -151,6 +151,6 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
         Some("Matrix capture verified.")
     );
 
-    cleanup_session_data(&ctx.pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }

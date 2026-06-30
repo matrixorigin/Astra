@@ -639,8 +639,8 @@ pub trait TaskStore: Send + Sync {
     ///
     /// Default impl loads all rows and filters in Rust — correct but
     /// ships the whole table over the wire. `MatrixOneTaskStore` overrides
-    /// this with a WHERE clause so the index
-    /// `idx_session_todos_session_status_updated` is used and only
+    /// this with a WHERE clause so the owner-bound
+    /// `idx_session_todos_owner_session_status_updated` index returns only
     /// matching rows are returned.
     async fn load_active(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
         Ok(self
@@ -1273,6 +1273,7 @@ pub const VALID_LIST_STATUS_FILTERS: &[&str] = &[
     "failed",
     "cancelled",
     "archived",
+    "deleted",
     "all",
     "active",
 ];
@@ -1351,7 +1352,7 @@ fn validate_parent_status_transition(
             | SessionTaskStatusKind::Archived
     ) {
         return Err(format!(
-            "task is already terminal ({previous_status}); create a new task for follow-up work, or use new_status='deleted' to remove it"
+            "task is already terminal ({previous_status}); create a new task for follow-up work, or use new_status='deleted' to hide it from active views while keeping an audit tombstone"
         ));
     }
     Ok(())
@@ -1376,7 +1377,7 @@ fn validate_subtask_status_transition(
         && new_status == SessionTaskStatusKind::Pending)
     {
         return Err(format!(
-            "subtask is already terminal ({previous_status}); create a new subtask for follow-up work, or use new_status='deleted' to remove it"
+            "subtask is already terminal ({previous_status}); create a new subtask for follow-up work, or use new_status='deleted' to hide it from active views while keeping an audit tombstone"
         ));
     }
     Ok(())
@@ -2876,13 +2877,21 @@ impl TaskManager {
 
                     if new_status == Some(SessionTaskStatusKind::Deleted) {
                         let Some(previous_status) = tasks
-                            .iter()
+                            .iter_mut()
                             .find(|t| t.id == task_id)
-                            .map(|t| t.status)
+                            .map(|task| {
+                                let previous_status = task.status;
+                                task.status = SessionTaskStatusKind::Deleted;
+                                task.updated_at = now.clone();
+                                if let Some(note) = reason.as_deref() {
+                                    let meta = task.metadata.get_or_insert_with(Default::default);
+                                    meta.insert("reason".to_string(), json!(note));
+                                }
+                                previous_status
+                            })
                         else {
                             return Err(format!("task '{}' not found", task_id));
                         };
-                        tasks.retain(|t| t.id != task_id);
                         let deleted_ids = HashSet::from([task_id.clone()]);
                         detach_task_dependency_edges(&mut tasks, &deleted_ids);
                         let response = prefix_summary(
@@ -2892,7 +2901,7 @@ impl TaskManager {
                                 "task_id": task_id,
                                 "previous_status": previous_status,
                                 "status": "deleted",
-                                "message": format!("Task '{}' deleted", task_id)
+                                "message": format!("Task '{}' hidden from active views; audit tombstone retained", task_id)
                             })
                             .to_string(),
                         );
@@ -5330,6 +5339,19 @@ mod tests {
             .await;
         let del_parsed: Value = serde_json::from_str(del.split_once('\n').unwrap().1).unwrap();
         assert_eq!(del_parsed["status"], "deleted", "{del}");
+        let deleted_task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(deleted_task.status, SessionTaskStatusKind::Deleted);
+        let deleted_list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "deleted"})).await).unwrap();
+        assert_eq!(deleted_list["count"], 1, "{deleted_list}");
+        let active_list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "active"})).await).unwrap();
+        assert_eq!(active_list["count"], 1, "{active_list}");
+        assert_eq!(active_list["tasks"][0]["id"], "task-2", "{active_list}");
+        let all_list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "all"})).await).unwrap();
+        assert_eq!(all_list["count"], 2, "{all_list}");
         let task_b: SessionTask =
             serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
         assert!(
@@ -6271,7 +6293,7 @@ mod tests {
     //
     // Pre-fix: `task.list(status_filter='active')` called
     // `store.load()` (all rows) then filtered in Rust. With 5 000
-    // tasks and the index `idx_session_todos_session_status_updated`,
+    // tasks and the index `idx_session_todos_owner_session_status_updated`,
     // the DB can answer "active only" in a single index scan instead
     // of shipping all rows to Rust. The `TaskStore::load_active`
     // default impl is a Rust-level fallback for in-memory stores;

@@ -70,7 +70,7 @@ async fn scalar_i64(pool: &sqlx::Pool<sqlx::MySql>, sql: &str, bind: &str) -> i6
         .fetch_one(pool)
         .await
         .expect("scalar query");
-    row.try_get::<i64, _>(0).unwrap_or(0)
+    row.try_get::<i64, _>(0).expect("decode scalar i64")
 }
 
 struct TestAuditFlusher {

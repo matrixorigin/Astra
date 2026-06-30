@@ -893,7 +893,7 @@ pub async fn run_saas_run_cross_user_isolation() {
     let (st_get, get_j) = get_json(app, &format!("/chat/runs/{run_id}"), Some(&auth_b), &[]).await;
     assert_eq!(
         st_get,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "B must not GET A run: {get_j}"
     );
 
@@ -901,7 +901,7 @@ pub async fn run_saas_run_cross_user_isolation() {
         post_empty(app, &format!("/chat/runs/{run_id}/pause"), Some(&auth_b)).await;
     assert_eq!(
         st_pause,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "B must not pause A run: {pause_j}"
     );
 

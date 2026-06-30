@@ -41,6 +41,21 @@ pub struct IntrospectSnapshot {
     pub total_output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// Current estimated input tokens for the live prompt/context. This is the
+    /// numerator used for token pressure and can differ from cumulative
+    /// provider input tokens.
+    #[serde(default)]
+    pub estimated_input_tokens: u64,
+    /// Effective per-turn input budget after model/config reserves. This is
+    /// not necessarily the full provider context window; callers should label
+    /// it as an effective input budget.
+    #[serde(default)]
+    pub effective_input_budget_tokens: u64,
+    /// Full provider context window for the active model, when the runtime has
+    /// registry metadata. This differs from `effective_input_budget_tokens`,
+    /// which keeps output/protocol headroom.
+    #[serde(default)]
+    pub context_window_tokens: u64,
 
     // ── Task #46: enhanced self-awareness ──
     /// Summary of the most recent LLM rounds (in-memory ring). Available
@@ -48,6 +63,11 @@ pub struct IntrospectSnapshot {
     /// `AgenticLoopState.recent_rounds`. Feeds `facet=recent`.
     #[serde(default)]
     pub recent_rounds: Vec<RoundSnapshotEntry>,
+    /// Per-step latency attribution derived from step events. Included in
+    /// diagnostic/full session renders and helps distinguish model wait from
+    /// tool/DB time.
+    #[serde(default)]
+    pub step_latency: Vec<StepLatencySnapshotEntry>,
     /// Currently-pending volatile injections scheduled for the next LLM
     /// call (tool-health warnings, working-set snapshots, stall nudges,
     /// …). Lets the agent answer "what runtime nudges am I about to
@@ -95,6 +115,21 @@ pub struct RoundSnapshotEntry {
     pub tool_call_names: Vec<String>,
     pub duration_ms: u64,
     pub finish_reason: Option<String>,
+}
+
+/// Per-step latency attribution surfaced through `introspect`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StepLatencySnapshotEntry {
+    pub step_id: String,
+    pub total_ms: Option<u64>,
+    pub pre_tool_wait_ms: Option<u64>,
+    pub first_tool_name: Option<String>,
+    pub tool_call_count: u32,
+    pub skipped_tool_count: u32,
+    pub tool_execution_ms: u64,
+    pub max_tool_execution_ms: u64,
+    pub terminal_event_kind: Option<String>,
+    pub dominant_phase: String,
 }
 
 /// Single entry in the volatile lane at introspect time.
@@ -289,6 +324,27 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
         out.push_str(model);
         out.push('\n');
     }
+    if s.context_window_tokens > 0 {
+        out.push_str(&format!(
+            "Provider context window: {} tokens\n",
+            s.context_window_tokens
+        ));
+    }
+    if s.effective_input_budget_tokens > 0 {
+        if s.estimated_input_tokens > 0 {
+            out.push_str(&format!(
+                "Effective input budget: {}/{} tokens ({:.0}% used)\n",
+                s.estimated_input_tokens,
+                s.effective_input_budget_tokens,
+                (s.estimated_input_tokens as f64 / s.effective_input_budget_tokens as f64) * 100.0,
+            ));
+        } else {
+            out.push_str(&format!(
+                "Effective input budget: {} tokens (usage estimate unavailable)\n",
+                s.effective_input_budget_tokens,
+            ));
+        }
+    }
     if !s.alerts.is_empty() {
         out.push_str("Alerts:\n");
         for alert in s.alerts.iter().take(3) {
@@ -327,6 +383,11 @@ fn render_full(s: &IntrospectSnapshot) -> String {
                 t.name, t.calls, t.errors, t.avg_ms, t.consecutive_failures, avoidance, last_fail
             ));
         }
+    }
+
+    if !s.step_latency.is_empty() {
+        out.push('\n');
+        out.push_str(&render_step_latency(s));
     }
 
     if s.alerts.len() > 3 {
@@ -397,8 +458,56 @@ pub fn render_recent_rounds(s: &IntrospectSnapshot) -> String {
     out
 }
 
-/// Render `facet=volatile` — what's queued in the volatile lane
-/// right now (about to ride the next LLM call's preamble).
+/// Render per-step attribution for model wait vs tools.
+pub fn render_step_latency(s: &IntrospectSnapshot) -> String {
+    if s.step_latency.is_empty() {
+        return "## Step Latency\n(No step latency data recorded yet.)".to_string();
+    }
+
+    let mut out = String::from(
+        "## Step Latency (model wait vs tools)\n\
+         | step | total | pre_tool | tool_ms | max_tool | calls | skipped | dominant | first_tool | terminal |\n\
+         |------|-------|----------|---------|----------|-------|---------|----------|------------|----------|\n",
+    );
+
+    let mut rows: Vec<&StepLatencySnapshotEntry> = s.step_latency.iter().rev().take(12).collect();
+    rows.reverse();
+    for entry in rows {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            entry.step_id,
+            fmt_opt_ms(entry.total_ms),
+            fmt_opt_ms(entry.pre_tool_wait_ms),
+            entry.tool_execution_ms,
+            entry.max_tool_execution_ms,
+            entry.tool_call_count,
+            entry.skipped_tool_count,
+            entry.dominant_phase,
+            entry.first_tool_name.as_deref().unwrap_or("-"),
+            entry.terminal_event_kind.as_deref().unwrap_or("-"),
+        ));
+    }
+
+    if let Some(last) = s.step_latency.last() {
+        out.push_str(&format!(
+            "\nLatest: dominant={} pre_tool={} tool_ms={} first_tool={}\n",
+            last.dominant_phase,
+            fmt_opt_ms(last.pre_tool_wait_ms),
+            last.tool_execution_ms,
+            last.first_tool_name.as_deref().unwrap_or("-"),
+        ));
+    }
+    out
+}
+
+fn fmt_opt_ms(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Render `facet=volatile` — what's queued in the volatile lane right now
+/// (about to ride the next LLM call's preamble).
 pub fn render_volatile_pending(s: &IntrospectSnapshot) -> String {
     if s.volatile_pending.is_empty() {
         return "## Volatile Lane\n(Empty — no pending runtime injections.)".to_string();
@@ -697,7 +806,11 @@ mod tests {
             total_output_tokens: 12_000,
             cache_read_tokens: 95_000,
             cache_creation_tokens: 8_000,
+            estimated_input_tokens: 132_000,
+            effective_input_budget_tokens: 800_000,
+            context_window_tokens: 1_000_000,
             recent_rounds: Vec::new(),
+            step_latency: Vec::new(),
             volatile_pending: Vec::new(),
             stall_state: StallSnapshotSummary::default(),
             injection_freshness: Vec::new(),
@@ -727,6 +840,8 @@ mod tests {
         assert!(output.contains("## Session Health"));
         assert!(output.contains("cache_regression"));
         assert!(output.contains("Current model: deepseek-v4-pro-official(thinking:high)"));
+        assert!(output.contains("Provider context window: 1000000 tokens"));
+        assert!(output.contains("Effective input budget: 132000/800000 tokens"));
         assert!(output.contains("Goal: implement streaming resume"));
         assert!(output.contains("### Turn-start session execution state"));
         // Should NOT contain full tool table
@@ -1062,6 +1177,52 @@ mod tests {
         // Summary line has cache-hit percentage.
         assert!(out.contains("Ring: 2 rounds"));
         assert!(out.contains("cache_hit"));
+    }
+
+    #[test]
+    fn render_step_latency_attributes_model_wait_vs_tool_time() {
+        let snap = IntrospectSnapshot {
+            step_latency: vec![StepLatencySnapshotEntry {
+                step_id: "turn-1-step-3".into(),
+                total_ms: Some(8_978),
+                pre_tool_wait_ms: Some(8_000),
+                first_tool_name: Some("bash".into()),
+                tool_call_count: 1,
+                skipped_tool_count: 0,
+                tool_execution_ms: 8,
+                max_tool_execution_ms: 8,
+                terminal_event_kind: Some("StepIncomplete".into()),
+                dominant_phase: "model_wait".into(),
+            }],
+            ..Default::default()
+        };
+
+        let out = render_step_latency(&snap);
+
+        assert!(out.contains("## Step Latency"));
+        assert!(out.contains("turn-1-step-3"));
+        assert!(out.contains(
+            "| turn-1-step-3 | 8978 | 8000 | 8 | 8 | 1 | 0 | model_wait | bash | StepIncomplete |"
+        ));
+        assert!(out.contains("Latest: dominant=model_wait pre_tool=8000 tool_ms=8"));
+    }
+
+    #[test]
+    fn render_step_latency_handles_minimal_entry() {
+        let snap = IntrospectSnapshot {
+            step_latency: vec![StepLatencySnapshotEntry {
+                step_id: "s1".into(),
+                total_ms: Some(250),
+                dominant_phase: "no_tool".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let out = render_step_latency(&snap);
+
+        assert!(out.contains("## Step Latency"));
+        assert!(out.contains("| s1 | 250 |"));
     }
 
     #[test]

@@ -368,7 +368,17 @@ fn spawn_data_cleanup(
                 }
                 _ = interval.tick() => {}
             }
-            let results = astra_services::cleanup_expired_data(pool.get(), &policy).await;
+            let results = match astra_services::cleanup_expired_data(pool.get(), &policy).await {
+                Ok(results) => results,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_runtime::cleanup",
+                        error = %error,
+                        "expired data cleanup failed"
+                    );
+                    continue;
+                }
+            };
             let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
             if total > 0 {
                 let detail = results

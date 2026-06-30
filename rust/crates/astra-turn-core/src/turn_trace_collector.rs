@@ -52,6 +52,16 @@ struct CollectorState {
     explanations: Vec<DecisionExplanation>,
 }
 
+pub struct ToolSurfaceDeferredInput<'a> {
+    pub visible_tools: &'a [String],
+    pub per_tool_costs: &'a [(String, u32)],
+    pub tools_available: u32,
+    pub latency_ms: u64,
+    pub deferred_active_tools: &'a [String],
+    pub deferred_available: u32,
+    pub deferred_omitted_tools: &'a [String],
+}
+
 impl TurnTraceCollector {
     /// Create a new collector for a turn.
     pub fn new(turn_id: impl Into<String>, session_id: impl Into<String>) -> Self {
@@ -116,22 +126,15 @@ impl TurnTraceCollector {
     }
 
     /// Record the concrete tool surface plus deferred activation telemetry.
-    pub fn record_tool_surface_with_deferred(
-        &self,
-        visible_tools: &[String],
-        per_tool_costs: &[(String, u32)],
-        tools_available: u32,
-        latency_ms: u64,
-        deferred_active_tools: &[String],
-        deferred_available: u32,
-    ) {
+    pub fn record_tool_surface_with_deferred(&self, input: ToolSurfaceDeferredInput<'_>) {
         let trace = build_tool_surface_trace_with_deferred(
-            tools_available,
-            visible_tools,
-            per_tool_costs,
-            latency_ms,
-            deferred_active_tools,
-            deferred_available,
+            input.tools_available,
+            input.visible_tools,
+            input.per_tool_costs,
+            input.latency_ms,
+            input.deferred_active_tools,
+            input.deferred_available,
+            input.deferred_omitted_tools,
         );
         let mut state = recover_rwlock_write(&self.inner);
         state.tools = Some(trace);
@@ -216,17 +219,15 @@ impl TurnTraceCollector {
             if budget.user_message_tokens > 0 {
                 existing.user_message_tokens = budget.user_message_tokens;
             }
-            let component_total = budget_component_total(existing);
-            existing.total_used = if component_total > 0 {
-                component_total
-            } else {
-                budget.total_used
-            };
+            if budget.total_used > 0 {
+                existing.total_used = budget.total_used;
+            } else if existing.total_used == 0 {
+                existing.total_used = budget_component_total(existing);
+            }
         } else {
             let mut budget = budget;
-            let component_total = budget_component_total(&budget);
-            if component_total > 0 {
-                budget.total_used = component_total;
+            if budget.total_used == 0 {
+                budget.total_used = budget_component_total(&budget);
             }
             state.token_budget = Some(budget);
         }
@@ -343,11 +344,12 @@ impl Clone for TurnTraceCollector {
 }
 
 fn budget_component_total(budget: &TokenBudgetTrace) -> u32 {
-    budget.system_prompt_tokens
-        + budget.history_tokens
-        + budget.memory_tokens
-        + budget.tool_schema_tokens
-        + budget.user_message_tokens
+    budget
+        .system_prompt_tokens
+        .saturating_add(budget.history_tokens)
+        .saturating_add(budget.memory_tokens)
+        .saturating_add(budget.tool_schema_tokens)
+        .saturating_add(budget.user_message_tokens)
 }
 
 #[cfg(test)]
@@ -387,14 +389,15 @@ mod tests {
     fn collector_records_deferred_activation_tool_surface_telemetry() {
         let collector = TurnTraceCollector::new("turn-1", "session-abc");
 
-        collector.record_tool_surface_with_deferred(
-            &["tool_search".to_string(), "web_fetch".to_string()],
-            &[("tool_search".into(), 90), ("web_fetch".into(), 220)],
-            2,
-            11,
-            &["web_fetch".to_string()],
-            5,
-        );
+        collector.record_tool_surface_with_deferred(ToolSurfaceDeferredInput {
+            visible_tools: &["tool_search".to_string(), "web_fetch".to_string()],
+            per_tool_costs: &[("tool_search".into(), 90), ("web_fetch".into(), 220)],
+            tools_available: 2,
+            latency_ms: 11,
+            deferred_active_tools: &["web_fetch".to_string()],
+            deferred_available: 5,
+            deferred_omitted_tools: &["github".to_string()],
+        });
 
         let trace = collector.finalize();
         assert_eq!(
@@ -402,6 +405,10 @@ mod tests {
             vec!["web_fetch".to_string()]
         );
         assert_eq!(trace.tools.deferred_available, 5);
+        assert_eq!(
+            trace.tools.deferred_omitted_tools,
+            vec!["github".to_string()]
+        );
         assert_eq!(trace.tools.surface_latency_ms, 11);
     }
 
@@ -424,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn record_token_budget_keeps_component_totals_consistent() {
+    fn record_token_budget_preserves_explicit_total_when_components_are_estimates() {
         let collector = TurnTraceCollector::new("turn-0", "s1");
         // First: CLI records component estimates
         collector.record_token_budget_estimate(14_000, 5_000, 0, 3_000, 200, 22_200, 128_000, 0.17);
@@ -438,8 +445,8 @@ mod tests {
         });
 
         let trace = collector.finalize();
-        // Total stays aligned with the persisted component breakdown.
-        assert_eq!(trace.token_budget.total_used, 22_200);
+        // The explicit runtime total wins; component fields are diagnostic estimates.
+        assert_eq!(trace.token_budget.total_used, 25_000);
         assert_eq!(trace.token_budget.budget_pressure, 0.20);
         assert!(trace.token_budget.compression_triggered);
         // Component estimates preserved (runtime sent zeros)
@@ -447,6 +454,20 @@ mod tests {
         assert_eq!(trace.token_budget.history_tokens, 5_000);
         assert_eq!(trace.token_budget.tool_schema_tokens, 3_000);
         assert_eq!(trace.token_budget.user_message_tokens, 200);
+    }
+
+    #[test]
+    fn token_budget_component_total_saturates() {
+        let collector = TurnTraceCollector::new("turn-0", "s1");
+
+        collector.record_token_budget(TokenBudgetTrace {
+            system_prompt_tokens: u32::MAX,
+            history_tokens: 1,
+            ..Default::default()
+        });
+
+        let trace = collector.finalize();
+        assert_eq!(trace.token_budget.total_used, u32::MAX);
     }
 
     #[test]

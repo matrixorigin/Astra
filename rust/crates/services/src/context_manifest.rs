@@ -1,7 +1,7 @@
+use crate::db_row::RowExt as ContextManifestDbRow;
 use astra_core::SharedPool;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -13,6 +13,7 @@ pub const DELEGATION_CHILD_FLOOR: u32 = 200;
 pub const RECENT_TAIL_BLOCKER_FLOOR: u32 = 1_600;
 pub const BENCHMARK_TOOL_PREVIEW_BUDGET: u32 = 2_500;
 pub const RECENT_TAIL_BENCHMARK_FLOOR: u32 = 1_600;
+pub const SYSTEM_TOOL_SCHEMAS_MAX: u32 = 3_400;
 pub const DELEGATION_MAX_RENDERED_CHILDREN: usize =
     (DELEGATION_ZONE_CAP / DELEGATION_CHILD_FLOOR) as usize;
 pub const SESSION_ARTIFACT_STATUS_EXPIRED: &str = "expired";
@@ -163,7 +164,7 @@ impl BudgetV1_8k {
             summary: 500,
             retrieved: 1000,
             tool_previews: 500,
-            system_tool_schemas: 3400,
+            system_tool_schemas: SYSTEM_TOOL_SCHEMAS_MAX,
             reserved_output: 500,
             safety_buffer: 200,
         }
@@ -465,9 +466,128 @@ pub enum ContextManifestError {
     UnsupportedRawRefScheme { scheme: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionArtifactManifestRow {
+    status: String,
+    content_json: String,
+    metadata: Option<String>,
+}
+
+fn context_manifest_decode_error(
+    operation: &'static str,
+    entity: &str,
+    column: &str,
+    source: sqlx::Error,
+) -> ContextManifestError {
+    ContextManifestError::Database {
+        operation,
+        entity: format!("{entity}.{column}"),
+        source,
+    }
+}
+
+fn context_manifest_invalid_value_error(
+    operation: &'static str,
+    entity: &str,
+    column: &str,
+    message: impl Into<String>,
+) -> ContextManifestError {
+    let source = sqlx::Error::Decode(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    )));
+    context_manifest_decode_error(operation, entity, column, source)
+}
+
+fn context_manifest_row_string(
+    row: &impl ContextManifestDbRow,
+    operation: &'static str,
+    entity: &str,
+    column: &str,
+) -> Result<String, ContextManifestError> {
+    row.string_column(column)
+        .map_err(|source| context_manifest_decode_error(operation, entity, column, source))
+}
+
+fn context_manifest_row_optional_string(
+    row: &impl ContextManifestDbRow,
+    operation: &'static str,
+    entity: &str,
+    column: &str,
+) -> Result<Option<String>, ContextManifestError> {
+    row.optional_string_column(column)
+        .map_err(|source| context_manifest_decode_error(operation, entity, column, source))
+}
+
+fn context_manifest_row_u32_at_least(
+    row: &impl ContextManifestDbRow,
+    operation: &'static str,
+    entity: &str,
+    column: &str,
+    min: i64,
+) -> Result<u32, ContextManifestError> {
+    let value = row
+        .i64_column(column)
+        .map_err(|source| context_manifest_decode_error(operation, entity, column, source))?;
+    if value < min {
+        return Err(context_manifest_invalid_value_error(
+            operation,
+            entity,
+            column,
+            format!("invalid {entity}.{column}: {value}; expected >= {min}"),
+        ));
+    }
+    u32::try_from(value).map_err(|_| {
+        context_manifest_invalid_value_error(
+            operation,
+            entity,
+            column,
+            format!(
+                "invalid {entity}.{column}: {value}; expected <= {}",
+                u32::MAX
+            ),
+        )
+    })
+}
+
+fn decode_preview_template_budget_row(
+    row: &impl ContextManifestDbRow,
+    tool_name: &str,
+) -> Result<u32, ContextManifestError> {
+    context_manifest_row_u32_at_least(
+        row,
+        "preview_template_lookup_decode",
+        tool_name,
+        "max_preview_bytes",
+        1,
+    )
+}
+
+fn decode_session_artifact_manifest_row(
+    row: &impl ContextManifestDbRow,
+    artifact_id: &str,
+) -> Result<SessionArtifactManifestRow, ContextManifestError> {
+    let operation = "render_manifest_artifact_decode";
+    Ok(SessionArtifactManifestRow {
+        status: context_manifest_row_string(row, operation, artifact_id, "status")?,
+        content_json: context_manifest_row_string(row, operation, artifact_id, "content_json")?,
+        metadata: context_manifest_row_optional_string(row, operation, artifact_id, "metadata")?,
+    })
+}
+
 #[derive(Clone)]
 pub struct DatabaseContextManifestStore {
     pool: SharedPool,
+}
+
+struct SessionEventInsert<'a> {
+    user_id: &'a str,
+    session_id: &'a str,
+    event_type: &'a str,
+    content: &'a str,
+    metadata: serde_json::Value,
+    operation: &'static str,
+    entity: &'a str,
 }
 
 impl DatabaseContextManifestStore {
@@ -475,8 +595,79 @@ impl DatabaseContextManifestStore {
         Self { pool }
     }
 
+    async fn insert_session_event_and_bump_count(
+        &self,
+        event: SessionEventInsert<'_>,
+    ) -> Result<String, ContextManifestError> {
+        let event_id = Uuid::new_v4().to_string();
+        let mut tx =
+            self.pool
+                .get()
+                .begin()
+                .await
+                .map_err(|source| ContextManifestError::Database {
+                    operation: event.operation,
+                    entity: event.entity.to_string(),
+                    source,
+                })?;
+        let insert_result = sqlx::query(
+            "INSERT INTO agent_events
+             (event_id, session_id, user_id, event_type, content, metadata, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(&event_id)
+        .bind(event.session_id)
+        .bind(event.user_id)
+        .bind(event.event_type)
+        .bind(event.content)
+        .bind(event.metadata.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| ContextManifestError::Database {
+            operation: event.operation,
+            entity: event.entity.to_string(),
+            source,
+        })?;
+        let inserted_events =
+            crate::storage::rows_affected_to_i64(insert_result.rows_affected(), event.operation)
+                .map_err(|source| ContextManifestError::Database {
+                    operation: event.operation,
+                    entity: event.entity.to_string(),
+                    source,
+                })?;
+        if inserted_events <= 0 {
+            return Err(ContextManifestError::Database {
+                operation: event.operation,
+                entity: event.entity.to_string(),
+                source: sqlx::Error::Protocol("session event insert affected no rows".into()),
+            });
+        }
+        crate::storage::add_agent_session_event_count_or_create(
+            &mut *tx,
+            event.session_id,
+            event.user_id,
+            inserted_events,
+            Some(&event_id),
+        )
+        .await
+        .map_err(|source| ContextManifestError::Database {
+            operation: event.operation,
+            entity: event.entity.to_string(),
+            source,
+        })?;
+        tx.commit()
+            .await
+            .map_err(|source| ContextManifestError::Database {
+                operation: event.operation,
+                entity: event.entity.to_string(),
+                source,
+            })?;
+        Ok(event_id)
+    }
+
     pub async fn normalize_reason(
         &self,
+        user_id: &str,
         proposed_reason: &str,
         session_id: &str,
         run_id: Option<&str>,
@@ -489,30 +680,22 @@ impl DatabaseContextManifestStore {
         if known {
             return Ok(proposed_reason.to_string());
         }
-        sqlx::query(
-            "INSERT INTO agent_events
-             (event_id, session_id, user_id, event_type, content, metadata, created_at)
-             VALUES (?, ?, '', 'manifest.reason_unknown', ?, ?, NOW(6))",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(session_id)
-        .bind(proposed_reason)
-        .bind(
-            serde_json::json!({
+        self.insert_session_event_and_bump_count(SessionEventInsert {
+            user_id,
+            session_id,
+            event_type: "manifest.reason_unknown",
+            content: proposed_reason,
+            metadata: serde_json::json!({
                 "proposed_reason": proposed_reason,
                 "turn_id": turn_id,
                 "run_id": run_id,
                 "component": component,
-            })
-            .to_string(),
-        )
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| ContextManifestError::Database {
+            }),
             operation: "manifest_reason_unknown_event",
-            entity: session_id.to_string(),
-            source,
-        })?;
+            entity: session_id,
+        })
+        .await
+        .map(|_| ())?;
         Ok("other".to_string())
     }
 
@@ -523,6 +706,7 @@ impl DatabaseContextManifestStore {
     ) -> Result<(), ContextManifestError> {
         let reason = self
             .normalize_reason(
+                &manifest.user_id,
                 &manifest.reason,
                 &manifest.session_id,
                 manifest.run_id.as_deref(),
@@ -612,10 +796,11 @@ impl DatabaseContextManifestStore {
                     "UPDATE session_artifacts
 	                     SET referenced_by_manifest_count = referenced_by_manifest_count + 1,
 	                         updated_at = NOW(6)
-	                     WHERE artifact_id = ? AND user_id = ?",
+	                     WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
                 )
-                .bind(&artifact_id)
                 .bind(&manifest.user_id)
+                .bind(&item.session_id)
+                .bind(&artifact_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|source| ContextManifestError::Database {
@@ -672,34 +857,24 @@ impl DatabaseContextManifestStore {
     ) -> Result<Option<RetrievalStage>, ContextManifestError> {
         let event_type = stage.event_type(reason);
         let next_stage = stage.next_stage();
-        sqlx::query(
-            "INSERT INTO agent_events
-             (event_id, session_id, user_id, event_type, content, metadata, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(session_id)
-        .bind(user_id)
-        .bind(&event_type)
-        .bind(reason)
-        .bind(
-            serde_json::json!({
+        self.insert_session_event_and_bump_count(SessionEventInsert {
+            user_id,
+            session_id,
+            event_type: &event_type,
+            content: reason,
+            metadata: serde_json::json!({
                 "run_id": run_id,
                 "stage": format!("{stage:?}"),
                 "reason": reason,
                 "elapsed_ms": elapsed_ms,
                 "sla_ms": stage.timeout_ms(),
                 "next_stage": next_stage.as_ref().map(|stage| format!("{stage:?}")),
-            })
-            .to_string(),
-        )
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| ContextManifestError::Database {
+            }),
             operation: "insert_retrieval_degrade_event",
-            entity: session_id.to_string(),
-            source,
-        })?;
+            entity: session_id,
+        })
+        .await
+        .map(|_| ())?;
         Ok(next_stage)
     }
 
@@ -725,47 +900,42 @@ impl DatabaseContextManifestStore {
             source,
         })?;
         if let Some(row) = row {
-            return Ok(row.try_get::<i64, _>("max_preview_bytes").unwrap_or(400) as u32);
+            return decode_preview_template_budget_row(&row, tool_name);
         }
 
-        sqlx::query(
-            "INSERT INTO agent_events
-             (event_id, session_id, user_id, event_type, content, metadata, created_at)
-             VALUES (?, ?, ?, 'preview_template_missing', ?, ?, NOW(6))",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(session_id)
-        .bind(user_id)
-        .bind(tool_name)
-        .bind(
-            serde_json::json!({
+        self.insert_session_event_and_bump_count(SessionEventInsert {
+            user_id,
+            session_id,
+            event_type: "preview_template_missing",
+            content: tool_name,
+            metadata: serde_json::json!({
                 "run_id": run_id,
                 "tool_name": tool_name,
                 "fallback_max_preview_bytes": 400,
-            })
-            .to_string(),
-        )
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| ContextManifestError::Database {
+            }),
             operation: "preview_template_missing_event",
-            entity: tool_name.to_string(),
-            source,
-        })?;
+            entity: tool_name,
+        })
+        .await
+        .map(|_| ())?;
         Ok(400)
     }
 
     pub async fn render_artifact_manifest_item(
         &self,
+        user_id: &str,
+        session_id: &str,
         artifact_id: &str,
         summary_hint: Option<&str>,
     ) -> Result<String, ContextManifestError> {
         let row = sqlx::query(
             "SELECT status, content_json, metadata
              FROM session_artifacts
-             WHERE artifact_id = ?
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
              LIMIT 1",
         )
+        .bind(user_id)
+        .bind(session_id)
         .bind(artifact_id)
         .fetch_optional(self.pool.get())
         .await
@@ -779,22 +949,20 @@ impl DatabaseContextManifestStore {
             return Ok(expired_artifact_placeholder(artifact_id, summary_hint));
         };
 
-        let status = row.try_get::<String, _>("status").unwrap_or_default();
-        let content_json = row.try_get::<String, _>("content_json").unwrap_or_default();
-        let metadata = row.try_get::<String, _>("metadata").ok();
+        let artifact_row = decode_session_artifact_manifest_row(&row, artifact_id)?;
         let summary = artifact_summary_for_placeholder(
             summary_hint,
-            metadata.as_deref(),
-            content_json.as_str(),
+            artifact_row.metadata.as_deref(),
+            artifact_row.content_json.as_str(),
         );
 
-        if !session_artifact_raw_payload_is_available(&status) {
+        if !session_artifact_raw_payload_is_available(&artifact_row.status) {
             return Ok(expired_artifact_placeholder(
                 artifact_id,
                 summary.as_deref(),
             ));
         }
-        Ok(summary.unwrap_or(content_json))
+        Ok(summary.unwrap_or(artifact_row.content_json))
     }
 }
 
@@ -883,6 +1051,103 @@ pub fn cross_session_retrieval_requires_user_filter(
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct FakeContextManifestRow {
+        failed_column: Option<&'static str>,
+        i64_overrides: Vec<(&'static str, i64)>,
+        metadata: Option<&'static str>,
+    }
+
+    impl FakeContextManifestRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                i64_overrides: Vec::new(),
+                metadata: Some(r#"{"summary":"metadata summary"}"#),
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_i64(column: &'static str, value: i64) -> Self {
+            Self {
+                i64_overrides: vec![(column, value)],
+                ..Self::complete()
+            }
+        }
+
+        fn with_metadata(metadata: Option<&'static str>) -> Self {
+            Self {
+                metadata,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ContextManifestDbRow for FakeContextManifestRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "status" => "active",
+                "content_json" => r#"{"summary":"content summary","body":"payload"}"#,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "metadata" => self.metadata.map(ToString::to_string),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if let Some((_, value)) = self
+                .i64_overrides
+                .iter()
+                .find(|(candidate, _)| *candidate == column)
+            {
+                return Ok(*value);
+            }
+            Ok(match column {
+                "max_preview_bytes" => 1024,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+    }
+
+    fn assert_context_manifest_db_error_mentions(
+        result: Result<impl std::fmt::Debug, ContextManifestError>,
+        needle: &str,
+    ) {
+        let error = result.expect_err("decode should fail");
+        match error {
+            ContextManifestError::Database { entity, source, .. } => {
+                assert!(
+                    entity.contains(needle) || source.to_string().contains(needle),
+                    "error should identify `{needle}`, got entity={entity}, source={source}"
+                );
+            }
+            other => panic!("expected database decode error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn session_artifact_status_helpers_treat_expired_as_non_downloadable() {
         assert_eq!(
@@ -901,5 +1166,75 @@ mod tests {
             expired_artifact_placeholder("artifact-1", Some("important preserved summary"));
         assert!(rendered.contains("historical, raw no longer available"));
         assert!(rendered.contains("important preserved summary"));
+    }
+
+    #[test]
+    fn preview_template_budget_decode_preserves_values_and_fails_loudly() {
+        assert_eq!(
+            decode_preview_template_budget_row(&FakeContextManifestRow::complete(), "bash")
+                .unwrap(),
+            1024
+        );
+
+        assert_context_manifest_db_error_mentions(
+            decode_preview_template_budget_row(
+                &FakeContextManifestRow::fail_on("max_preview_bytes"),
+                "bash",
+            ),
+            "max_preview_bytes",
+        );
+        assert_context_manifest_db_error_mentions(
+            decode_preview_template_budget_row(
+                &FakeContextManifestRow::with_i64("max_preview_bytes", 0),
+                "bash",
+            ),
+            "max_preview_bytes",
+        );
+        assert_context_manifest_db_error_mentions(
+            decode_preview_template_budget_row(
+                &FakeContextManifestRow::with_i64("max_preview_bytes", i64::from(u32::MAX) + 1),
+                "bash",
+            ),
+            "max_preview_bytes",
+        );
+    }
+
+    #[test]
+    fn session_artifact_manifest_row_decode_preserves_values_and_fails_loudly() {
+        let row =
+            decode_session_artifact_manifest_row(&FakeContextManifestRow::complete(), "artifact-1")
+                .expect("artifact manifest row decodes");
+        assert_eq!(row.status, "active");
+        assert_eq!(
+            row.metadata.as_deref(),
+            Some(r#"{"summary":"metadata summary"}"#)
+        );
+        assert_eq!(
+            artifact_summary_for_placeholder(None, row.metadata.as_deref(), &row.content_json)
+                .as_deref(),
+            Some("metadata summary")
+        );
+
+        let row = decode_session_artifact_manifest_row(
+            &FakeContextManifestRow::with_metadata(None),
+            "artifact-1",
+        )
+        .expect("NULL metadata is valid");
+        assert_eq!(row.metadata, None);
+        assert_eq!(
+            artifact_summary_for_placeholder(None, row.metadata.as_deref(), &row.content_json)
+                .as_deref(),
+            Some("content summary")
+        );
+
+        for column in ["status", "content_json", "metadata"] {
+            assert_context_manifest_db_error_mentions(
+                decode_session_artifact_manifest_row(
+                    &FakeContextManifestRow::fail_on(column),
+                    "artifact-1",
+                ),
+                column,
+            );
+        }
     }
 }

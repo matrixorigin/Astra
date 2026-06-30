@@ -383,7 +383,7 @@ async fn resolve_one_shot_model(
         Some(model.to_string())
     } else {
         match session_runtime::resolve_server_default_model(api, token).await {
-            session_runtime::ServerDefaultModel::Selected(model) => Some(model),
+            session_runtime::ServerDefaultModel::Selected(selection) => Some(selection.name),
             session_runtime::ServerDefaultModel::NoModels
             | session_runtime::ServerDefaultModel::Unavailable => None,
         }
@@ -481,6 +481,7 @@ fn print_one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode, jso
 }
 
 struct HeadlessTaskInput {
+    user_id: std::sync::Arc<String>,
     task_id: std::sync::Arc<String>,
     task_session_id: std::sync::Arc<String>,
     prompt: String,
@@ -497,6 +498,21 @@ struct HeadlessTaskOptions {
 }
 
 const NON_CANONICAL_TASK_SCOPE: &str = "no-session";
+
+async fn mark_headless_task_failed(
+    svc: &dyn astra_services::TaskService,
+    user_id: &str,
+    task_id: &str,
+    stored_error: &str,
+    returned_error: String,
+) -> String {
+    match svc.fail_task(user_id, task_id, stored_error).await {
+        Ok(()) => returned_error,
+        Err(fail_error) => {
+            format!("{returned_error}; additionally failed to persist failed status: {fail_error}")
+        }
+    }
+}
 
 async fn build_one_shot_task_manager(
     profile: Option<&str>,
@@ -529,6 +545,7 @@ async fn execute_headless_task_body(
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     let HeadlessTaskInput {
+        user_id,
         task_id,
         task_session_id,
         prompt,
@@ -576,7 +593,7 @@ async fn execute_headless_task_body(
         );
     }
 
-    svc.update_status(task_id.as_str(), TaskStatus::InProgress)
+    svc.update_status(user_id.as_str(), task_id.as_str(), TaskStatus::InProgress)
         .await?;
 
     let pipeline_modules = session_runtime::create_pipeline_modules_quiet(api, profile);
@@ -669,18 +686,26 @@ async fn execute_headless_task_body(
     {
         Ok(sr) => sr,
         Err(e) => {
-            let _ = svc.fail_task(task_id.as_str(), &e.error).await;
+            let error = e.error;
+            let returned_error = mark_headless_task_failed(
+                svc.as_ref(),
+                user_id.as_str(),
+                task_id.as_str(),
+                &error,
+                error.clone(),
+            )
+            .await;
             emit_task_event(
                 options.stream_events,
                 failed_task_notification_payload(
                     task_id.as_str(),
-                    &e.error,
+                    &returned_error,
                     "turn_error",
                     None,
                     None,
                 ),
             );
-            return Err(e.error);
+            return Err(returned_error);
         }
     };
 
@@ -711,6 +736,7 @@ async fn execute_headless_task_body(
     };
     let exit_code = match crate::cli::task::task_result_command::finalize_headless_task_result(
         svc.as_ref(),
+        user_id.as_str(),
         task_id.as_str(),
         &sr,
         Some(task_session_id.as_str()),
@@ -720,23 +746,26 @@ async fn execute_headless_task_body(
     {
         Ok(code) => code,
         Err(e) => {
-            let _ = svc
-                .fail_task(
-                    task_id.as_str(),
-                    &encode_task_failure_message("persistence_error", &e),
-                )
-                .await;
+            let stored_error = encode_task_failure_message("persistence_error", &e);
+            let returned_error = mark_headless_task_failed(
+                svc.as_ref(),
+                user_id.as_str(),
+                task_id.as_str(),
+                &stored_error,
+                e,
+            )
+            .await;
             emit_task_event(
                 options.stream_events,
                 failed_task_notification_payload(
                     task_id.as_str(),
-                    &e,
+                    &returned_error,
                     "task_record_error",
                     output_path_string.as_deref(),
                     sr.session_persistence_error.as_deref(),
                 ),
             );
-            return Err(e);
+            return Err(returned_error);
         }
     };
 
@@ -830,6 +859,7 @@ async fn execute_headless_task_run(
 
     execute_headless_task_body(
         HeadlessTaskInput {
+            user_id: std::sync::Arc::new(user_id),
             task_id: std::sync::Arc::new(task_id),
             task_session_id: std::sync::Arc::new(task_session_id),
             prompt,
@@ -965,6 +995,7 @@ async fn execute_task_worker_once(
             ).await?;
             execute_headless_task_body(
                 HeadlessTaskInput {
+                    user_id: user_id.clone(),
                     task_id: task_id.clone(),
                     task_session_id: task_session_id.clone(),
                     prompt,

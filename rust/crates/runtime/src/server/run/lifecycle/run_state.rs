@@ -179,13 +179,14 @@ pub fn should_preserve_manual_pause_on_completion(
 
 pub async fn should_preserve_manual_pause_from_durable(
     run_engine: &RunEngine,
+    user_id: &str,
     run_id: &str,
     final_status: &RunStatus,
 ) -> bool {
     if *final_status != RunStatus::Completed {
         return false;
     }
-    match run_engine.load_run(run_id).await {
+    match run_engine.load_run(user_id, run_id).await {
         Ok(Some(run)) => run.status == STATUS_PAUSED,
         Ok(None) => false,
         Err(error) => {
@@ -348,6 +349,7 @@ pub fn push_active_run_live_event(run: &mut RunState, event: Value) {
 /// Per-run state held in the lifecycle service.
 pub struct RunState {
     pub run_id: String,
+    pub user_id: String,
     pub session_id: String,
     pub status: RunStatus,
     pub events: Vec<Value>,

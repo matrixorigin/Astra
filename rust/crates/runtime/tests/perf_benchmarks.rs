@@ -126,9 +126,10 @@ async fn perf_benchmark_1_hot_path_query_under_50ms_p99() {
         let started = Instant::now();
         let row = sqlx::query(
             "SELECT COUNT(*) AS c
-             FROM session_artifacts FORCE INDEX (idx_session_artifacts_session_kind_created)
-             WHERE session_id = ? AND artifact_kind = 'cargo'",
+             FROM session_artifacts FORCE INDEX (idx_session_artifacts_owner_kind_order)
+             WHERE user_id = ? AND session_id = ? AND artifact_kind = 'cargo'",
         )
+        .bind(&user_id)
         .bind(&session_id)
         .fetch_one(pool.get())
         .await
@@ -179,9 +180,10 @@ async fn perf_benchmark_2_three_stage_retrieval_sla() {
 
     let structured = Instant::now();
     let structured_row = sqlx::query(
-        "SELECT chunk_id FROM session_history_chunks FORCE INDEX (idx_history_session_seq)
-         WHERE session_id = ? AND seq_start <= 42 AND seq_end >= 42 LIMIT 1",
+        "SELECT chunk_id FROM session_history_chunks FORCE INDEX (idx_history_owner_session_seq)
+         WHERE user_id = ? AND session_id = ? AND seq_start <= 42 AND seq_end >= 42 LIMIT 1",
     )
+    .bind(&user_id)
     .bind(&session_id)
     .fetch_optional(pool.get())
     .await
@@ -260,8 +262,9 @@ async fn perf_benchmark_3_one_thousand_tool_outputs_under_1000ms() {
     let elapsed_ms = millis(started);
     let count = sqlx::query(
         "SELECT COUNT(*) AS c FROM session_tool_outputs
-         WHERE session_id = ? AND run_id = ?",
+         WHERE user_id = ? AND session_id = ? AND run_id = ?",
     )
+    .bind(&user_id)
     .bind(&session_id)
     .bind(&run_id)
     .fetch_one(pool.get())

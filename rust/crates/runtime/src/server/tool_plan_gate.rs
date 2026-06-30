@@ -64,7 +64,7 @@ pub(crate) async fn recompute_plan_mode_snapshot(
     let Ok(Some(plan_id)) = repo.active_plan_for_session(user_id, session_id).await else {
         return (false, None);
     };
-    match repo.load_owned(&plan_id, user_id).await {
+    match repo.load(user_id, &plan_id).await {
         Ok(state) => {
             let has_subtasks = !state.plan.subtasks.is_empty();
             let any_in_progress = state.plan.subtasks.iter().any(|subtask| {
@@ -135,7 +135,7 @@ pub(crate) async fn execute_enter_plan_mode(
     const MAX_CAS_RETRIES: u32 = 3;
     let mut last_conflict: Option<String> = None;
     for _attempt in 0..MAX_CAS_RETRIES {
-        let (mut state, expected_version) = match repo.load(&plan_id).await {
+        let (mut state, expected_version) = match repo.load(user_id, &plan_id).await {
             Ok(mut state) => {
                 let version = state.version;
                 state.session_hint = Some(session_id.to_string());
@@ -150,7 +150,10 @@ pub(crate) async fn execute_enter_plan_mode(
             Err(error) => return format!("Error: load plan: {error}"),
         };
 
-        match repo.save(&plan_id, &mut state, expected_version).await {
+        match repo
+            .save(user_id, &plan_id, &mut state, expected_version)
+            .await
+        {
             Ok(()) => {
                 last_conflict = None;
                 break;
@@ -225,13 +228,13 @@ pub(crate) async fn execute_exit_plan_mode(
         const MAX_CAS_RETRIES: u32 = 3;
         let mut last_conflict: Option<String> = None;
         for _attempt in 0..MAX_CAS_RETRIES {
-            let mut state = match repo.load_owned(&active, user_id).await {
+            let mut state = match repo.load(user_id, &active).await {
                 Ok(state) => state,
                 Err(error) => return format!("Error: load active plan: {error}"),
             };
             state.plan_md = Some(plan_md.to_string());
             let expected = Some(state.version);
-            match repo.save(&active, &mut state, expected).await {
+            match repo.save(user_id, &active, &mut state, expected).await {
                 Ok(()) => {
                     last_conflict = None;
                     break;

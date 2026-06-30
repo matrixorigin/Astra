@@ -1,11 +1,14 @@
 //! Unified error classification for the astra-engine runtime.
 //!
-//! Every error in the system is classified exactly once at its source into an
-//! [`ErrorKind`]. No downstream code re-parses error strings — it pattern-matches
-//! on the kind instead.
+//! Every internal error should be classified exactly once at its source into an
+//! [`ErrorKind`]. Downstream code should pattern-match on the kind instead of
+//! re-parsing display strings.
 //!
-//! The only exception is [`classify_tool_output`]: external tools (bash, MCP)
-//! return unstructured strings, so one fallback classifier remains.
+//! Boundary outputs that are inherently unstructured still need explicit
+//! fallback classifiers:
+//! - [`classify_llm_error_message`] for provider / transport strings when the
+//!   caller did not receive structured metadata.
+//! - [`classify_tool_output`] for external tool output (bash, MCP).
 
 use serde::{Deserialize, Serialize};
 
@@ -417,11 +420,10 @@ impl ClassifiedError {
     /// Combines the error message with actionable guidance.
     #[must_use]
     pub fn llm_feedback(&self) -> String {
-        let message = strip_tool_binding_sentinel(&self.message);
         format!(
             "[{}] {}\n→ {}",
             self.kind.as_str(),
-            message,
+            self.message,
             self.kind.guidance()
         )
     }
@@ -429,12 +431,7 @@ impl ClassifiedError {
 
 impl std::fmt::Display for ClassifiedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "[{}] {}",
-            self.kind.as_str(),
-            strip_tool_binding_sentinel(&self.message)
-        )
+        write!(f, "[{}] {}", self.kind.as_str(), self.message)
     }
 }
 
@@ -465,38 +462,97 @@ impl From<String> for ClassifiedError {
     }
 }
 
-// ── Tool output fallback classifier ──────────────────────────────────────────
+// ── LLM error-message fallback classifier ────────────────────────────────────
 
-/// Legacy marker from older binding errors.
+/// Boundary fallback for context-window / prompt-too-long provider text.
 ///
-/// New internal binding failures should carry [`ErrorKind::ToolBinding`] as
-/// structured metadata at the source instead of embedding this token in text.
-/// The constant and stripper stay to sanitize persisted or in-flight messages
-/// from older sessions.
-pub const TOOL_BINDING_SENTINEL: &str = "[tool-binding]";
-
+/// This is not a general structured error classifier. Callers that already know
+/// the failure kind should construct [`ErrorKind::ContextWindow`] directly.
 #[must_use]
-pub fn strip_tool_binding_sentinel(message: &str) -> std::borrow::Cow<'_, str> {
-    if !message.contains(TOOL_BINDING_SENTINEL) {
-        return std::borrow::Cow::Borrowed(message);
-    }
-    std::borrow::Cow::Owned(
-        message
-            .replace(TOOL_BINDING_SENTINEL, "")
-            .trim_end()
-            .to_string(),
-    )
+pub fn is_llm_context_window_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    is_unstructured_llm_context_window_message_lower(&lower)
 }
 
-/// The ONLY string-matching classifier in the codebase.
+fn is_unstructured_llm_context_window_message_lower(lower: &str) -> bool {
+    lower.contains("context_length_exceeded")
+        || lower.contains("maximum context length")
+        || lower.contains("prompt is too long")
+        || lower.contains("too many tokens")
+        || lower.contains("input is too long")
+        || lower.contains("context window")
+        || is_max_tokens_context_limit_error(lower)
+}
+
+fn is_max_tokens_context_limit_error(lower: &str) -> bool {
+    lower.contains("max_tokens")
+        && (lower.contains("max_tokens limit")
+            || lower.contains("max_tokens exceeded")
+            || lower.contains("max_tokens is too large")
+            || lower.contains("max_tokens exceeds")
+            || ((lower.contains("context") || lower.contains("prompt"))
+                && (lower.contains("exceed") || lower.contains("too long"))))
+}
+
+fn is_rate_limit_error_lower(lower: &str) -> bool {
+    lower.contains("rate limit") || lower.contains("429") || lower.contains("too many requests")
+}
+
+/// Classify an unstructured LLM provider / transport error message.
+///
+/// This is the single fallback for LLM calls that cross a boundary without
+/// structured error metadata. New call sites should still prefer constructing
+/// [`ClassifiedError`] at the source.
+#[must_use]
+pub fn classify_llm_error_message(message: &str) -> ErrorKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("model selection is required")
+        || lower.contains("missing model selection")
+        || lower.contains("no concrete model was selected")
+    {
+        return ErrorKind::MissingModelSelection;
+    }
+    if is_rate_limit_error_lower(&lower) {
+        ErrorKind::RateLimit
+    } else if is_connection_pool_timeout(&lower) {
+        ErrorKind::ConnectionPoolExhausted
+    } else if is_unstructured_llm_context_window_message_lower(&lower) {
+        ErrorKind::ContextWindow
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        ErrorKind::StreamIdle
+    } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
+    {
+        ErrorKind::StreamTransport
+    } else if lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
+        || lower.contains("unauthorized")
+        || lower.contains("api key")
+        || lower.contains("could not validate credentials")
+        || lower.contains("invalid credentials")
+        || lower.contains("bad credentials")
+        || lower.contains("authentication failed")
+        || lower.contains("token expired")
+        || lower.contains("invalid token")
+        || lower.contains("security token included in the request is expired")
+    {
+        ErrorKind::Auth
+    } else if lower.contains("cancelled") || lower.contains("canceled") {
+        ErrorKind::Cancelled
+    } else {
+        ErrorKind::Unknown
+    }
+}
+
+// ── Tool output fallback classifier ──────────────────────────────────────────
+
+/// External tool-output fallback classifier.
 ///
 /// Used exclusively for external tool output (bash, MCP tools) where we don't
-/// control the error format. All other errors are constructed with the correct
-/// [`ErrorKind`] at their source.
-///
-/// Internal runtime errors must be constructed with their [`ErrorKind`] at the
-/// source. This fallback deliberately does not classify binding failures by
-/// parsing human-readable binding prose.
+/// control the error format. LLM provider / transport strings use
+/// [`classify_llm_error_message`]; internal runtime errors should be constructed
+/// with the correct [`ErrorKind`] at their source.
 ///
 /// For external categories, more specific patterns come first:
 /// ResourceLimit > DatabaseError > ToolTimeout > Network > Auth >
@@ -505,12 +561,6 @@ pub fn strip_tool_binding_sentinel(message: &str) -> std::borrow::Cow<'_, str> {
 #[must_use]
 pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     let lower = error_str.to_lowercase();
-
-    // Backward compatibility for persisted messages from sessions that emitted
-    // the legacy marker. New runtime code should not rely on this path.
-    if lower.contains(TOOL_BINDING_SENTINEL) {
-        return ErrorKind::ToolBinding;
-    }
 
     if lower.contains("model selection is required")
         || lower.contains("missing model selection")
@@ -555,6 +605,8 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         || lower.contains("deadlock")
         || lower.contains("matrixone pool timed out")
         || (lower.contains("column") && lower.contains("group by"))
+        || lower.contains("duplicate entry")
+        || lower.contains("foreign key constraint")
     {
         return ErrorKind::DatabaseError;
     }
@@ -633,6 +685,19 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     // unavailable; the same tool can succeed with corrected arguments.
     if is_tool_call_contract_error(&lower) {
         return ErrorKind::ToolInvalidArgs;
+    }
+
+    // Binding / protocol mismatches are surface-assembly bugs: the model was
+    // shown a tool whose executor was not actually attached. Record the error
+    // pressure but do not teach tool health that the tool itself is flaky.
+    if lower.contains("binding failure")
+        || lower.contains("tool binding")
+        || lower.contains("executor not bound")
+        || lower.contains("no executor attached")
+        || (lower.contains("not bound")
+            && (lower.contains("executor") || lower.contains("tool") || lower.contains("binding")))
+    {
+        return ErrorKind::ToolBinding;
     }
 
     // Unavailable — check BEFORE "not found" because "command not found" should
@@ -794,59 +859,6 @@ fn is_connection_pool_timeout(lower: &str) -> bool {
         || (lower.contains("pool timed out") && lower.contains("open connection"))
 }
 
-/// Classify an LLM error message into an [`ErrorKind`].
-///
-/// Canonical classifier used by the bridge, turn ingest, and any path that
-/// needs to map LLM-provider error strings to retry/recovery policy.  Keep
-/// this in sync with the actual provider error patterns observed in production.
-pub fn classify_llm_error(msg: &str) -> ErrorKind {
-    let lower = msg.to_lowercase();
-    if is_context_window_error(&lower) {
-        ErrorKind::ContextWindow
-    } else if lower.contains("rate") || lower.contains("429") {
-        ErrorKind::RateLimit
-    } else if is_connection_pool_timeout(&lower) {
-        ErrorKind::ConnectionPoolExhausted
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        ErrorKind::StreamIdle
-    } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
-    {
-        ErrorKind::StreamTransport
-    } else if lower.contains("401 unauthorized")
-        || lower.contains("status: 401")
-        || lower.contains("status code: 401")
-        || lower.contains("http 401")
-        || lower.contains("unauthorized")
-        || lower.contains("api key")
-        || lower.contains("could not validate credentials")
-        || lower.contains("invalid credentials")
-        || lower.contains("bad credentials")
-        || lower.contains("authentication failed")
-        || lower.contains("token expired")
-        || lower.contains("invalid token")
-        || lower.contains("security token included in the request is expired")
-    {
-        ErrorKind::Auth
-    } else if lower.contains("cancelled") || lower.contains("canceled") {
-        ErrorKind::Cancelled
-    } else {
-        ErrorKind::Unknown
-    }
-}
-
-/// Detect context-window / prompt-too-long errors in API response text.
-///
-/// The caller should already lower-case the input.
-pub fn is_context_window_error(lower: &str) -> bool {
-    lower.contains("context_length_exceeded")
-        || lower.contains("maximum context length")
-        || lower.contains("prompt is too long")
-        || lower.contains("too many tokens")
-        || lower.contains("input is too long")
-        || lower.contains("context window")
-        || lower.contains("max_tokens") && (lower.contains("exceed") || lower.contains("limit"))
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -987,23 +999,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_binding_sentinel_classifies_but_does_not_display() {
-        let raw = format!(
-            "Error: runtime binding unavailable {}",
-            TOOL_BINDING_SENTINEL
-        );
-        assert_eq!(classify_tool_output(&raw), ErrorKind::ToolBinding);
-
-        let error = ClassifiedError::new(ErrorKind::ToolBinding, raw);
-        let display = error.to_string();
-        let feedback = error.llm_feedback();
-        assert!(!display.contains(TOOL_BINDING_SENTINEL), "{display}");
-        assert!(!feedback.contains(TOOL_BINDING_SENTINEL), "{feedback}");
-        assert!(display.contains("runtime binding unavailable"));
-        assert!(feedback.contains("runtime binding unavailable"));
-    }
-
-    #[test]
     fn classified_error_from_string_roundtrip() {
         // Recover kind from [prefix] in Display string
         for kind in [
@@ -1037,6 +1032,82 @@ mod tests {
     fn classified_error_is_std_error() {
         let err = ClassifiedError::new(ErrorKind::Auth, "bad key");
         let _: &dyn std::error::Error = &err;
+    }
+
+    // ── classify_llm_error_message ──
+
+    #[test]
+    fn classify_llm_error_message_cases() {
+        let cases: &[(&str, ErrorKind)] = &[
+            (
+                "model selection is required",
+                ErrorKind::MissingModelSelection,
+            ),
+            (
+                "missing model selection for tool",
+                ErrorKind::MissingModelSelection,
+            ),
+            (
+                "no concrete model was selected",
+                ErrorKind::MissingModelSelection,
+            ),
+            ("context_length_exceeded", ErrorKind::ContextWindow),
+            ("maximum context length is 128000", ErrorKind::ContextWindow),
+            ("prompt is too long", ErrorKind::ContextWindow),
+            ("too many tokens in the input", ErrorKind::ContextWindow),
+            ("input is too long for this model", ErrorKind::ContextWindow),
+            ("context window exceeded", ErrorKind::ContextWindow),
+            ("max_tokens limit exceeded", ErrorKind::ContextWindow),
+            ("rate limit exceeded", ErrorKind::RateLimit),
+            ("error 429: too many requests", ErrorKind::RateLimit),
+            (
+                "Error: pool timed out while waiting for an open connection",
+                ErrorKind::ConnectionPoolExhausted,
+            ),
+            (
+                "rate limit exceeded for max_tokens setting",
+                ErrorKind::RateLimit,
+            ),
+            (
+                "rate limit exceeded while pool timed out waiting for an open connection",
+                ErrorKind::RateLimit,
+            ),
+            ("request timed out", ErrorKind::StreamIdle),
+            ("connection refused", ErrorKind::StreamTransport),
+            (
+                "LLM stream transport error: connection reset",
+                ErrorKind::StreamTransport,
+            ),
+            ("401 unauthorized", ErrorKind::Auth),
+            ("Error: Could not validate credentials", ErrorKind::Auth),
+            ("invalid credentials", ErrorKind::Auth),
+            ("bad credentials", ErrorKind::Auth),
+            ("token expired", ErrorKind::Auth),
+            ("invalid token", ErrorKind::Auth),
+            ("authentication failed", ErrorKind::Auth),
+            (
+                "The security token included in the request is expired",
+                ErrorKind::Auth,
+            ),
+            ("LLM call cancelled", ErrorKind::Cancelled),
+            ("something went wrong", ErrorKind::Unknown),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                classify_llm_error_message(input),
+                *expected,
+                "classify_llm_error_message({input:?}) should be {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_llm_context_window_error_is_case_insensitive() {
+        assert!(is_llm_context_window_error("MAX_TOKENS LIMIT EXCEEDED"));
+        assert!(!is_llm_context_window_error("rate limit exceeded"));
+        assert!(!is_llm_context_window_error("internal server error"));
+        assert!(!is_llm_context_window_error(""));
     }
 
     // ── classify_tool_output ──
@@ -1124,11 +1195,25 @@ mod tests {
                 "restore_snapshot_state is not supported for this store",
                 ErrorKind::ToolUnavailable,
             ),
-            // Legacy ToolBinding marker. New internal binding failures carry
-            // ErrorKind structurally instead of relying on this classifier.
+            // ToolBinding
             (
-                "Error: runtime binding unavailable [tool-binding]",
+                "binding failure: tool `reflect` has no executor",
                 ErrorKind::ToolBinding,
+            ),
+            (
+                "tool binding mismatch: requested introspect executor not bound",
+                ErrorKind::ToolBinding,
+            ),
+            (
+                "Error: tool binding failed for agent_fanout: no executor",
+                ErrorKind::ToolBinding,
+            ),
+            // "not available" still belongs to ToolUnavailable. It is a tool
+            // availability contract error, not a bound-surface/executor
+            // mismatch.
+            (
+                "Error: tool agent_fanout is not available in this turn",
+                ErrorKind::ToolUnavailable,
             ),
             // Unknown
             (
@@ -1241,6 +1326,8 @@ mod tests {
             "sqlx: connection pool timed out",
             "deadlock detected on table x",
             "matrixone pool timed out: query cancelled",
+            "duplicate entry for key 'PRIMARY'",
+            "foreign key constraint fails",
         ] {
             assert_eq!(classify_tool_output(st), ErrorKind::DatabaseError);
         }
@@ -1272,139 +1359,10 @@ mod tests {
         }
     }
 
-    // ── classify_llm_error ──────────────────────────────────────────────────
-
-    #[test]
-    fn classify_llm_error_rate_limit() {
-        assert_eq!(
-            classify_llm_error("rate limit exceeded"),
-            ErrorKind::RateLimit
-        );
-        assert_eq!(
-            classify_llm_error("error 429: too many requests"),
-            ErrorKind::RateLimit
-        );
-        assert_eq!(
-            classify_llm_error("Rate limiting active"),
-            ErrorKind::RateLimit
-        );
-    }
-
-    #[test]
-    fn classify_llm_error_pool_timeout_is_connection_pool_exhausted() {
-        assert_eq!(
-            classify_llm_error("Error: pool timed out while waiting for an open connection"),
-            ErrorKind::ConnectionPoolExhausted
-        );
-        assert_eq!(
-            classify_llm_error("connection pool timed out"),
-            ErrorKind::ConnectionPoolExhausted
-        );
-        assert_eq!(
-            classify_llm_error("pool timed out waiting for an open connection"),
-            ErrorKind::ConnectionPoolExhausted
-        );
-    }
-
-    #[test]
-    fn classify_llm_error_timeout_is_stream_idle() {
-        assert_eq!(
-            classify_llm_error("request timed out"),
-            ErrorKind::StreamIdle
-        );
-        assert_eq!(
-            classify_llm_error("connection timed out"),
-            ErrorKind::StreamIdle
-        );
-    }
-
-    #[test]
-    fn classify_llm_error_transport() {
-        assert_eq!(
-            classify_llm_error("connection refused"),
-            ErrorKind::StreamTransport
-        );
-        assert_eq!(
-            classify_llm_error("transport error"),
-            ErrorKind::StreamTransport
-        );
-        assert_eq!(
-            classify_llm_error("network unreachable"),
-            ErrorKind::StreamTransport
-        );
-    }
-
-    #[test]
-    fn classify_llm_error_auth() {
-        assert_eq!(classify_llm_error("401 unauthorized"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("HTTP 401"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("unauthorized access"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("invalid api key"), ErrorKind::Auth);
-        assert_eq!(
-            classify_llm_error("Error: Could not validate credentials"),
-            ErrorKind::Auth
-        );
-        assert_eq!(
-            classify_llm_error("could not validate credentials for user xyz"),
-            ErrorKind::Auth
-        );
-        assert_eq!(classify_llm_error("invalid credentials"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("bad credentials"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("token expired"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("invalid token"), ErrorKind::Auth);
-        assert_eq!(classify_llm_error("authentication failed"), ErrorKind::Auth);
-        assert_eq!(
-            classify_llm_error("The security token included in the request is expired"),
-            ErrorKind::Auth
-        );
-    }
-
-    #[test]
-    fn classify_llm_error_cancelled() {
-        assert_eq!(
-            classify_llm_error("LLM call cancelled"),
-            ErrorKind::Cancelled
-        );
-        assert_eq!(classify_llm_error("request canceled"), ErrorKind::Cancelled);
-    }
-
-    #[test]
-    fn classify_llm_error_unknown() {
-        assert_eq!(
-            classify_llm_error("something went wrong"),
-            ErrorKind::Unknown
-        );
-        assert_eq!(classify_llm_error(""), ErrorKind::Unknown);
-    }
-
-    #[test]
-    fn classify_llm_error_case_insensitive() {
-        assert_eq!(classify_llm_error("RATE LIMIT"), ErrorKind::RateLimit);
-        assert_eq!(classify_llm_error("Timeout"), ErrorKind::StreamIdle);
-        assert_eq!(classify_llm_error("UNAUTHORIZED"), ErrorKind::Auth);
-    }
-
-    // ── is_context_window_error ─────────────────────────────────────────────
-
-    #[test]
-    fn is_context_window_error_detects_all_patterns() {
-        assert!(is_context_window_error("context_length_exceeded"));
-        assert!(is_context_window_error("maximum context length is 128000"));
-        assert!(is_context_window_error("prompt is too long"));
-        assert!(is_context_window_error("too many tokens in the input"));
-        assert!(is_context_window_error("input is too long for this model"));
-        assert!(is_context_window_error("context window exceeded"));
-        assert!(is_context_window_error("max_tokens limit exceeded"));
-        // Negative cases
-        assert!(!is_context_window_error("rate limit exceeded"));
-        assert!(!is_context_window_error("internal server error"));
-        assert!(!is_context_window_error(""));
-    }
-
     #[test]
     fn context_window_error_detected_in_llm_error_format() {
         let api_body = r#"{"error":{"message":"This model's maximum context length is 128000 tokens","type":"invalid_request_error"}}"#;
         let err = format!("LLM error 400: {api_body}");
-        assert!(is_context_window_error(&err.to_lowercase()));
+        assert!(is_llm_context_window_error(&err));
     }
 }

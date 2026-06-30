@@ -9,7 +9,8 @@
 //!      tasks and must see it.
 //!   4. Snapshot → mutate → restore round-trips through MO (turn rollback
 //!      path).
-//!   5. `status=deleted` soft-removes; `status=cancelled` is distinct.
+//!   5. `status=deleted` hides from active views but remains auditable;
+//!      `status=cancelled` is distinct.
 //!
 //! Gated by `ASTRA_TEST_DB_IT=1` (ignored by default). Safe to run in
 //! parallel with other suite tests: every test generates a unique
@@ -44,17 +45,26 @@ async fn bootstrap_pool() -> sqlx::Pool<sqlx::MySql> {
         .expect("connect matrixone")
 }
 
-async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
-    let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
+async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_id: &str) {
+    let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ? AND user_id = ?")
         .bind(session_id)
+        .bind(user_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
+    let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ? AND user_id = ?")
         .bind(session_id)
+        .bind(user_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+    let _ =
+        sqlx::query("DELETE FROM session_todo_idempotency WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
         .bind(session_id)
+        .bind(user_id)
         .execute(pool)
         .await;
 }
@@ -72,7 +82,7 @@ async fn create_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_i
 }
 
 async fn prepare_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_id: &str) {
-    cleanup(pool, session_id).await;
+    cleanup(pool, session_id, user_id).await;
     create_session(pool, session_id, user_id).await;
 }
 
@@ -114,7 +124,7 @@ async fn edge_created_task_visible_on_cloud() {
         "task id counter must carry the same owner as session_todos"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -184,7 +194,8 @@ async fn matrixone_task_store_uses_owner_bound_counter_without_touching_foreign_
     .expect("count owner todos");
     assert_eq!(owner_rows, 1, "owner create must insert an owner task row");
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &owner_user_id).await;
+    cleanup(&pool, &session_id, &other_user_id).await;
 }
 
 #[tokio::test]
@@ -240,7 +251,7 @@ async fn unknown_task_fields_are_rejected_through_matrixone_store() {
         "MatrixOne-backed archive must reject typo fields: {archive_typo}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -286,7 +297,7 @@ async fn matrixone_update_title_refuses_duplicate_open_task() {
         "active list should retain the two distinct open task titles: {list}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -323,7 +334,7 @@ async fn snapshot_restore_roundtrips_through_mo() {
     let recreate = mgr.create(&json!({"title": "t2-again"})).await;
     assert!(recreate.contains("task-3"), "{recreate}");
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -359,7 +370,7 @@ async fn snapshot_restore_uses_existing_rows_when_matrixone_counter_is_zero() {
         "corrupt MatrixOne counter should be surfaced explicitly: {err}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -429,7 +440,7 @@ async fn matrixone_restore_snapshot_rolls_back_counter_when_task_insert_fails() 
         "failed MatrixOne restore must leave existing task rows intact: {list}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -504,9 +515,9 @@ async fn load_open_sessions_is_bounded_open_work_and_user_scoped() {
         "only this user's open work should appear: {rows:?}"
     );
 
-    for session_id in [&session_a, &session_b, &session_other] {
-        cleanup(&pool, session_id).await;
-    }
+    cleanup(&pool, &session_a, &user_id).await;
+    cleanup(&pool, &session_b, &user_id).await;
+    cleanup(&pool, &session_other, &other_user).await;
 }
 
 #[tokio::test]
@@ -586,7 +597,7 @@ async fn active_list_includes_paused_open_work_in_matrixone() {
         "MatrixOne active list should exclude terminal history: {active}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -633,7 +644,7 @@ async fn snapshot_restore_after_cross_client_allocations_rejects_stale_snapshot_
         "stale restore rejection must preserve later cross-client writes: {final_list}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -666,17 +677,30 @@ async fn deleted_and_cancelled_are_distinct_transitions() {
     assert!(delete.contains("\"status\":\"deleted\""), "{delete}");
     let after_delete = mgr.get(&json!({"task_id": "task-2"})).await;
     assert!(
-        after_delete.contains("not found"),
-        "deleted task should be soft-removed: {after_delete}"
+        after_delete.contains("\"status\":\"deleted\""),
+        "deleted task should retain an audit tombstone: {after_delete}"
     );
 
-    // After delete, task-1 (cancelled) is still present — cancel ≠ delete.
+    // After delete, both terminal states remain auditable — cancel ≠ delete.
     let list = mgr.list(&json!({"status_filter": "all"})).await;
     assert!(
         list.contains("to-cancel"),
         "cancelled task still listed: {list}"
     );
-    assert!(!list.contains("to-delete"), "deleted task leaked: {list}");
+    assert!(
+        list.contains("to-delete"),
+        "deleted task tombstone missing from audit view: {list}"
+    );
+    let active = mgr.list(&json!({"status_filter": "active"})).await;
+    assert!(
+        !active.contains("to-delete"),
+        "deleted task leaked into active view: {active}"
+    );
+    let deleted = mgr.list(&json!({"status_filter": "deleted"})).await;
+    assert!(
+        deleted.contains("to-delete"),
+        "deleted filter should include deleted task: {deleted}"
+    );
 
     let cancelled = mgr.list(&json!({"status_filter": "cancelled"})).await;
     assert!(
@@ -688,7 +712,7 @@ async fn deleted_and_cancelled_are_distinct_transitions() {
         "cancelled filter should not include deleted task: {cancelled}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -772,8 +796,8 @@ async fn bulk_archive_is_scoped_to_current_session_even_with_user_store() {
         "other session's completed task must not be archived by session_a cleanup: {completed_b}"
     );
 
-    cleanup(&pool, &session_a).await;
-    cleanup(&pool, &session_b).await;
+    cleanup(&pool, &session_a, &user_id).await;
+    cleanup(&pool, &session_b, &user_id).await;
 }
 
 #[tokio::test]
@@ -815,7 +839,7 @@ async fn dependency_edges_remain_symmetric_across_matrixone_clients() {
     assert!(producer.blocks.is_empty(), "{producer:?}");
     assert!(consumer.blocked_by.is_empty(), "{consumer:?}");
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -865,7 +889,7 @@ async fn blocked_task_cannot_start_until_dependency_completes_in_matrixone() {
         "{started}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -908,7 +932,7 @@ async fn in_progress_task_rejects_new_unresolved_blocker_in_matrixone() {
         "rejected MatrixOne blocker edge must not persist: {task:?}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -944,7 +968,7 @@ async fn dangling_blocked_by_dependency_blocks_start_in_matrixone() {
         "MatrixOne dangling blocked_by should block start with an actionable error: {out}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -982,7 +1006,7 @@ async fn corrupt_dependency_json_fails_closed_in_matrixone() {
         "MatrixOne corrupt blocked_by must fail closed instead of clearing dependencies: {out}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -1030,7 +1054,7 @@ async fn matrixone_load_rejects_unknown_persisted_task_status() {
         "unknown persisted statuses should not leak into active MatrixOne loads: {active:?}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -1092,7 +1116,7 @@ async fn subtask_depends_on_blocks_out_of_order_start_in_matrixone() {
         "{started}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -1138,7 +1162,7 @@ async fn second_in_progress_task_is_rejected_across_matrixone_clients() {
         "{second}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -1184,7 +1208,7 @@ async fn archive_detaches_dependency_edges_through_matrixone_store() {
         "MatrixOne archive should unblock open dependents: {consumer:?}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }
 
 #[tokio::test]
@@ -1226,8 +1250,8 @@ async fn load_all_sessions_is_scoped_to_user_store() {
         "user A must not see user B's session via load_all_sessions: {session_ids:?}"
     );
 
-    cleanup(&pool, &session_a).await;
-    cleanup(&pool, &session_b).await;
+    cleanup(&pool, &session_a, &user_a).await;
+    cleanup(&pool, &session_b, &user_b).await;
 }
 
 /// Regression: `next_task_id` must work under concurrent callers sharing
@@ -1284,5 +1308,5 @@ async fn concurrent_next_task_id_is_unique() {
         "concurrent next_task_id returned duplicates or gaps: {ids:?}"
     );
 
-    cleanup(&pool, &session_id).await;
+    cleanup(&pool, &session_id, &user_id).await;
 }

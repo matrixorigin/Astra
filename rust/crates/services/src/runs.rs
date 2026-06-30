@@ -15,6 +15,8 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::db_row::RowExt as RunStateDbRow;
+
 pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
 pub const SSE_HEARTBEAT_INTERVAL_SECS: u64 = 15;
 
@@ -82,6 +84,17 @@ pub trait RunLifecycleService: Send + Sync {
         run_id: String,
         user_id: String,
     ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    async fn cancel_session_runs(
+        &self,
+        _session_id: String,
+        _user_id: String,
+    ) -> Result<Vec<CancelRunRecord>, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Session run cancellation not supported",
+        ))
+    }
 
     async fn list_runs(
         &self,
@@ -817,12 +830,17 @@ pub trait RunStateStore: Send + Sync {
     /// Insert a new run record.
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String>;
 
-    /// Load a run by ID.
-    async fn load_run(&self, run_id: &str) -> Result<Option<DurableRunRecord>, String>;
+    /// Load a run owned by a user.
+    async fn load_run(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String>;
 
     /// Update run status and optional fields.
     async fn update_run_status(
         &self,
+        user_id: &str,
         run_id: &str,
         status: &str,
         waiting_for: Option<&str>,
@@ -835,6 +853,7 @@ pub trait RunStateStore: Send + Sync {
     /// a stale load must not overwrite a newer pause/cancel/terminal status.
     async fn update_run_status_if_current(
         &self,
+        user_id: &str,
         run_id: &str,
         expected_statuses: &[&str],
         status: &str,
@@ -845,6 +864,7 @@ pub trait RunStateStore: Send + Sync {
     /// Update token/tool counts.
     async fn update_run_usage(
         &self,
+        user_id: &str,
         run_id: &str,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -852,11 +872,17 @@ pub trait RunStateStore: Send + Sync {
     ) -> Result<bool, String>;
 
     /// Save checkpoint JSON for crash recovery.
-    async fn save_checkpoint(&self, run_id: &str, checkpoint_json: &str) -> Result<bool, String>;
+    async fn save_checkpoint(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        checkpoint_json: &str,
+    ) -> Result<bool, String>;
 
     /// Load the newest checkpoint for a run, optionally filtered by kind.
     async fn load_latest_checkpoint(
         &self,
+        user_id: &str,
         run_id: &str,
         checkpoint_kind: Option<&str>,
     ) -> Result<Option<DurableRunCheckpointRecord>, String>;
@@ -864,6 +890,7 @@ pub trait RunStateStore: Send + Sync {
     /// Load the current typed display projection for a durable run.
     async fn load_run_projection(
         &self,
+        user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunDisplayProjectionRecord>, String>;
 
@@ -871,14 +898,20 @@ pub trait RunStateStore: Send + Sync {
     /// path. Single-event callers should use `append_event` which delegates here.
     async fn append_events_batch(
         &self,
+        user_id: &str,
         run_id: &str,
         events: &[serde_json::Value],
     ) -> Result<(), String>;
 
     /// Append a single event. Default implementation delegates to
     /// `append_events_batch`.
-    async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
-        self.append_events_batch(run_id, &[event]).await
+    async fn append_event(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        event: serde_json::Value,
+    ) -> Result<(), String> {
+        self.append_events_batch(user_id, run_id, &[event]).await
     }
 
     /// List runs for a user with pagination.
@@ -912,10 +945,19 @@ pub trait RunStateStore: Send + Sync {
     ) -> Result<Option<DurableRunRecord>, String>;
 
     /// Find all sub-runs belonging to a delegation.
-    async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String>;
+    async fn find_sub_runs(
+        &self,
+        user_id: &str,
+        delegation_id: &str,
+    ) -> Result<Vec<DurableRunRecord>, String>;
 
     /// Update the retry count for a run (verification gate retries).
-    async fn update_retry_count(&self, run_id: &str, retry_count: u32) -> Result<bool, String>;
+    async fn update_retry_count(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        retry_count: u32,
+    ) -> Result<bool, String>;
 }
 
 /// In-memory run state store for tests and single-process deployments.
@@ -1165,13 +1207,21 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(())
     }
 
-    async fn load_run(&self, run_id: &str) -> Result<Option<DurableRunRecord>, String> {
+    async fn load_run(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String> {
         let runs = self.runs.read().await;
-        Ok(runs.get(run_id).cloned())
+        Ok(runs
+            .get(run_id)
+            .filter(|run| run.user_id == user_id)
+            .cloned())
     }
 
     async fn update_run_status(
         &self,
+        user_id: &str,
         run_id: &str,
         status: &str,
         waiting_for: Option<&str>,
@@ -1180,13 +1230,17 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
-                run.status = status.to_string();
-                run.waiting_for = waiting_for.map(ToString::to_string);
-                if let Some(msg) = error_message {
-                    run.error_message = Some(msg.to_string());
+                if run.user_id != user_id {
+                    None
+                } else {
+                    run.status = status.to_string();
+                    run.waiting_for = waiting_for.map(ToString::to_string);
+                    if let Some(msg) = error_message {
+                        run.error_message = Some(msg.to_string());
+                    }
+                    run.updated_at = chrono::Utc::now().to_rfc3339();
+                    Some(run.clone())
                 }
-                run.updated_at = chrono::Utc::now().to_rfc3339();
-                Some(run.clone())
             } else {
                 None
             }
@@ -1201,6 +1255,7 @@ impl RunStateStore for InMemoryRunStateStore {
 
     async fn update_run_status_if_current(
         &self,
+        user_id: &str,
         run_id: &str,
         expected_statuses: &[&str],
         status: &str,
@@ -1213,7 +1268,7 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
-                if !expected_statuses.contains(&run.status.as_str()) {
+                if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
                     None
                 } else {
                     run.status = status.to_string();
@@ -1238,6 +1293,7 @@ impl RunStateStore for InMemoryRunStateStore {
 
     async fn update_run_usage(
         &self,
+        user_id: &str,
         run_id: &str,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -1246,11 +1302,15 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
-                run.total_prompt_tokens = prompt_tokens;
-                run.total_completion_tokens = completion_tokens;
-                run.total_tool_calls = tool_calls;
-                run.updated_at = chrono::Utc::now().to_rfc3339();
-                Some(run.clone())
+                if run.user_id != user_id {
+                    None
+                } else {
+                    run.total_prompt_tokens = prompt_tokens;
+                    run.total_completion_tokens = completion_tokens;
+                    run.total_tool_calls = tool_calls;
+                    run.updated_at = chrono::Utc::now().to_rfc3339();
+                    Some(run.clone())
+                }
             } else {
                 None
             }
@@ -1263,12 +1323,20 @@ impl RunStateStore for InMemoryRunStateStore {
         }
     }
 
-    async fn save_checkpoint(&self, run_id: &str, checkpoint_json: &str) -> Result<bool, String> {
+    async fn save_checkpoint(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        checkpoint_json: &str,
+    ) -> Result<bool, String> {
         let (run, checkpoint) = {
             let mut runs = self.runs.write().await;
             let Some(run) = runs.get_mut(run_id) else {
                 return Ok(false);
             };
+            if run.user_id != user_id {
+                return Ok(false);
+            }
             let (checkpoint_kind, checkpoint_version, idempotency_key) =
                 checkpoint_metadata(run_id, checkpoint_json)?;
             run.checkpoint_json = Some(checkpoint_json.to_string());
@@ -1305,9 +1373,18 @@ impl RunStateStore for InMemoryRunStateStore {
 
     async fn load_latest_checkpoint(
         &self,
+        user_id: &str,
         run_id: &str,
         checkpoint_kind: Option<&str>,
     ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+        let runs = self.runs.read().await;
+        let Some(run) = runs.get(run_id) else {
+            return Ok(None);
+        };
+        if run.user_id != user_id {
+            return Ok(None);
+        }
+        drop(runs);
         let checkpoints = self.checkpoints.read().await;
         let mut matches = checkpoints
             .get(run_id)
@@ -1328,14 +1405,19 @@ impl RunStateStore for InMemoryRunStateStore {
 
     async fn load_run_projection(
         &self,
+        user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
         let projections = self.projections.read().await;
-        Ok(projections.get(run_id).cloned())
+        Ok(projections
+            .get(run_id)
+            .filter(|projection| projection.user_id == user_id)
+            .cloned())
     }
 
     async fn append_events_batch(
         &self,
+        user_id: &str,
         run_id: &str,
         events: &[serde_json::Value],
     ) -> Result<(), String> {
@@ -1348,6 +1430,9 @@ impl RunStateStore for InMemoryRunStateStore {
             let Some(run) = runs.get_mut(run_id) else {
                 return Err(format!("run not found while appending events: {run_id}"));
             };
+            if run.user_id != user_id {
+                return Err(format!("run not found while appending events: {run_id}"));
+            }
             let start_idx = run.events.len() as i64;
             run.events.extend(events.iter().cloned());
             run.last_event_idx = start_idx + events.len() as i64 - 1;
@@ -1430,18 +1515,30 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(matches.into_iter().next())
     }
 
-    async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String> {
+    async fn find_sub_runs(
+        &self,
+        user_id: &str,
+        delegation_id: &str,
+    ) -> Result<Vec<DurableRunRecord>, String> {
         let runs = self.runs.read().await;
         Ok(runs
             .values()
-            .filter(|r| r.delegation_id.as_deref() == Some(delegation_id))
+            .filter(|r| r.user_id == user_id && r.delegation_id.as_deref() == Some(delegation_id))
             .cloned()
             .collect())
     }
 
-    async fn update_retry_count(&self, run_id: &str, retry_count: u32) -> Result<bool, String> {
+    async fn update_retry_count(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        retry_count: u32,
+    ) -> Result<bool, String> {
         let mut runs = self.runs.write().await;
         if let Some(run) = runs.get_mut(run_id) {
+            if run.user_id != user_id {
+                return Ok(false);
+            }
             run.retry_count = retry_count;
             run.updated_at = chrono::Utc::now().to_rfc3339();
             Ok(true)
@@ -1591,22 +1688,8 @@ impl DatabaseRunStateStore {
                 db_error("load_tool_preview_contracts", "preview_templates", source)
             })?;
         for row in rows {
-            let tool_name = row.try_get::<String, _>("tool_name").unwrap_or_default();
-            let max_preview_bytes = row
-                .try_get::<i64, _>("max_preview_bytes")
-                .unwrap_or(FALLBACK_PREVIEW_BYTES as i64)
-                .max(1) as usize;
-            let normalize_version = row
-                .try_get::<String, _>("normalize_version")
-                .unwrap_or_else(|_| "raw_v1".to_string());
-            contracts.insert(
-                tool_name,
-                ToolPreviewContract {
-                    max_preview_bytes,
-                    normalize_version,
-                    found: true,
-                },
-            );
+            let (tool_name, contract) = decode_tool_preview_contract_row(&row)?;
+            contracts.insert(tool_name, contract);
         }
         Ok(contracts)
     }
@@ -1625,12 +1708,24 @@ impl DatabaseRunStateStore {
         if missing.is_empty() {
             return Ok(());
         }
+        let missing_events = missing
+            .into_iter()
+            .map(|tool_name| (tool_name, Uuid::new_v4().to_string()))
+            .collect::<Vec<_>>();
+        let last_event_id = missing_events.last().map(|(_, event_id)| event_id.as_str());
+        let mut tx = self.pool.get().begin().await.map_err(|source| {
+            db_error(
+                "begin_record_preview_template_missing_for_tools",
+                run_id,
+                source,
+            )
+        })?;
         let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "INSERT INTO agent_events
              (event_id, session_id, user_id, event_type, content, metadata, meta_tool_name, created_at) ",
         );
-        builder.push_values(missing.iter(), |mut row, tool_name| {
-            row.push_bind(Uuid::new_v4().to_string())
+        builder.push_values(missing_events.iter(), |mut row, (tool_name, event_id)| {
+            row.push_bind(event_id)
                 .push_bind(session_id)
                 .push_bind(user_id)
                 .push_bind("preview_template_missing")
@@ -1646,18 +1741,40 @@ impl DatabaseRunStateStore {
                 .push_bind(tool_name)
                 .push("NOW(6)");
         });
-        builder
-            .build()
-            .execute(self.pool.get())
+        let insert_result = builder.build().execute(&mut *tx).await.map_err(|source| {
+            db_error("record_preview_template_missing_for_tools", run_id, source)
+        })?;
+        let inserted_events = crate::storage::rows_affected_to_i64(
+            insert_result.rows_affected(),
+            "record_preview_template_missing_for_tools",
+        )
+        .map_err(|source| db_error("record_preview_template_missing_for_tools", run_id, source))?;
+        if inserted_events > 0 {
+            crate::storage::add_agent_session_event_count_or_create(
+                &mut *tx,
+                session_id,
+                user_id,
+                inserted_events,
+                last_event_id,
+            )
             .await
             .map_err(|source| {
-                db_error("record_preview_template_missing_for_tools", run_id, source)
+                db_error(
+                    "record_preview_template_missing_event_count_delta",
+                    run_id,
+                    source,
+                )
             })?;
+        }
+        tx.commit()
+            .await
+            .map_err(|source| db_error("commit_preview_template_missing_events", run_id, source))?;
         Ok(())
     }
 
     pub async fn acquire_owner_lease(
         &self,
+        user_id: &str,
         run_id: &str,
         owner_pod_id: &str,
         ttl: Duration,
@@ -1670,11 +1787,13 @@ impl DatabaseRunStateStore {
                  owner_lease_expires_at = ?,
                  run_generation = run_generation + 1,
                  updated_at = NOW(6)
-             WHERE run_id = ?
+             WHERE user_id = ?
+               AND run_id = ?
                AND (owner_pod_id IS NULL OR owner_pod_id = ? OR owner_lease_expires_at < NOW(6))",
         )
         .bind(owner_pod_id)
         .bind(lease_expires_at.naive_utc())
+        .bind(user_id)
         .bind(run_id)
         .bind(owner_pod_id)
         .execute(self.pool.get())
@@ -1802,28 +1921,37 @@ impl DatabaseRunStateStore {
         Ok(())
     }
 
-    async fn load_run_metadata(&self, run_id: &str) -> DbStoreResult<Option<DurableRunRecord>> {
-        let sql = format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE run_id = ?");
+    async fn load_run_metadata_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<Option<DurableRunRecord>> {
+        let sql = format!(
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ?"
+        );
         let row = sqlx::query(&sql)
+            .bind(user_id)
             .bind(run_id)
             .fetch_optional(self.pool.get())
             .await
-            .map_err(|source| db_error("load_run_metadata", run_id, source))?;
+            .map_err(|source| db_error("load_run_metadata_for_user", run_id, source))?;
         row.map(run_record_from_row).transpose()
     }
 
-    async fn load_run_projection_metadata(
+    async fn load_run_projection_metadata_for_user(
         &self,
+        user_id: &str,
         run_id: &str,
     ) -> DbStoreResult<Option<DurableRunDisplayProjectionRecord>> {
         let sql = format!(
-            "SELECT {RUN_DISPLAY_PROJECTION_COLUMNS} FROM run_display_projections WHERE run_id = ?"
+            "SELECT {RUN_DISPLAY_PROJECTION_COLUMNS} FROM run_display_projections WHERE user_id = ? AND run_id = ?"
         );
         let row = sqlx::query(&sql)
+            .bind(user_id)
             .bind(run_id)
             .fetch_optional(self.pool.get())
             .await
-            .map_err(|source| db_error("load_run_projection", run_id, source))?;
+            .map_err(|source| db_error("load_run_projection_for_user", run_id, source))?;
         row.map(run_projection_record_from_row).transpose()
     }
 
@@ -1874,16 +2002,19 @@ impl DatabaseRunStateStore {
         Ok(())
     }
 
-    async fn sync_projection(
+    async fn sync_projection_for_user(
         &self,
+        user_id: &str,
         run_id: &str,
         latest_event_type: Option<&str>,
         latest_checkpoint: Option<&DurableRunCheckpointRecord>,
     ) -> DbStoreResult<()> {
-        let Some(run) = self.load_run_metadata(run_id).await? else {
+        let Some(run) = self.load_run_metadata_for_user(user_id, run_id).await? else {
             return Ok(());
         };
-        let existing = self.load_run_projection_metadata(run_id).await?;
+        let existing = self
+            .load_run_projection_metadata_for_user(user_id, run_id)
+            .await?;
         let projection = build_run_display_projection(
             &run,
             latest_event_type.map(ToOwned::to_owned).or_else(|| {
@@ -1906,28 +2037,37 @@ impl DatabaseRunStateStore {
 
     /// Allocate a contiguous block of `count` event indices in one CAS operation.
     /// Returns the starting index. The caller owns [start, start+count).
-    async fn allocate_event_indices_batch(&self, run_id: &str, count: i64) -> DbStoreResult<i64> {
+    async fn allocate_event_indices_batch_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        count: i64,
+    ) -> DbStoreResult<i64> {
         if count <= 0 {
             return Ok(0);
         }
         for attempt in 0u32..64 {
-            let row = sqlx::query("SELECT last_event_idx FROM agent_runs WHERE run_id = ?")
-                .bind(run_id)
-                .fetch_one(self.pool.get())
-                .await
-                .map_err(|source| db_error("select_last_event_idx", run_id, source))?;
+            let row = sqlx::query(
+                "SELECT last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(user_id)
+            .bind(run_id)
+            .fetch_one(self.pool.get())
+            .await
+            .map_err(|source| db_error("select_last_event_idx_for_user", run_id, source))?;
             let current: i64 = row.get(0);
             let result = sqlx::query(
                 "UPDATE agent_runs
                  SET last_event_idx = last_event_idx + ?
-                 WHERE run_id = ? AND last_event_idx = ?",
+                 WHERE user_id = ? AND run_id = ? AND last_event_idx = ?",
             )
             .bind(count)
+            .bind(user_id)
             .bind(run_id)
             .bind(current)
             .execute(self.pool.get())
             .await
-            .map_err(|source| db_error("cas_increment_last_event_idx", run_id, source))?;
+            .map_err(|source| db_error("cas_increment_last_event_idx_for_user", run_id, source))?;
             if result.rows_affected() == 1 {
                 return Ok(current + 1);
             }
@@ -1938,7 +2078,7 @@ impl DatabaseRunStateStore {
             tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter_ms)).await;
         }
         Err(db_error(
-            "allocate_event_indices_batch",
+            "allocate_event_indices_batch_for_user",
             run_id,
             sqlx::Error::Protocol("run counter CAS exhausted".to_string()),
         ))
@@ -1947,14 +2087,26 @@ impl DatabaseRunStateStore {
     /// Append multiple events in a single batch, minimizing DB round-trips.
     /// Loads run metadata once, allocates all indices in one CAS, does one
     /// bulk INSERT, one last_event_idx UPDATE, and one projection sync.
-    async fn append_events_batch(
+    async fn append_events_batch_for_user(
         &self,
+        user_id: &str,
         run_id: &str,
         events: &[serde_json::Value],
     ) -> DbStoreResult<()> {
         if events.is_empty() {
             return Ok(());
         }
+
+        let run = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await?
+            .ok_or_else(|| {
+                db_error(
+                    "load_run_for_batch_append",
+                    run_id,
+                    sqlx::Error::RowNotFound,
+                )
+            })?;
 
         // ── Idempotency dedup ──
         // Pre-filter events whose idempotency_key already exists (optimization).
@@ -1967,21 +2119,31 @@ impl DatabaseRunStateStore {
             .collect();
 
         let existing: std::collections::HashSet<String> = if !idem_keys.is_empty() {
-            let ph = idem_keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "SELECT idempotency_key FROM agent_run_events WHERE run_id = ? AND idempotency_key IN ({})",
-                ph
+            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "SELECT idempotency_key FROM agent_run_events WHERE user_id = ",
             );
-            let mut q = sqlx::query(&sql).bind(run_id);
+            builder.push_bind(user_id);
+            builder.push(" AND run_id = ");
+            builder.push_bind(run_id);
+            builder.push(" AND idempotency_key IN (");
+            let mut separated = builder.separated(", ");
             for k in &idem_keys {
-                q = q.bind(k);
+                separated.push_bind(k);
             }
-            q.fetch_all(self.pool.get())
+            separated.push_unseparated(")");
+            let rows = builder
+                .build()
+                .fetch_all(self.pool.get())
                 .await
-                .map_err(|source| db_error("lookup_batch_idempotency", run_id, source))?
-                .iter()
-                .map(|r: &sqlx::mysql::MySqlRow| r.get::<String, _>("idempotency_key"))
-                .collect()
+                .map_err(|source| db_error("lookup_batch_idempotency", run_id, source))?;
+            let mut existing = std::collections::HashSet::with_capacity(rows.len());
+            for row in rows {
+                let key: String = row
+                    .try_get("idempotency_key")
+                    .map_err(|source| db_error("decode_batch_idempotency_key", run_id, source))?;
+                existing.insert(key);
+            }
+            existing
         } else {
             std::collections::HashSet::new()
         };
@@ -1999,32 +2161,10 @@ impl DatabaseRunStateStore {
             return Ok(());
         }
 
-        // Load run metadata once for the whole batch.
-        let run = self.load_run_metadata(run_id).await?.ok_or_else(|| {
-            db_error(
-                "load_run_for_batch_append",
-                run_id,
-                sqlx::Error::RowNotFound,
-            )
-        })?;
-
         // Allocate all indices in one CAS.
         let start_idx = self
-            .allocate_event_indices_batch(run_id, events.len() as i64)
+            .allocate_event_indices_batch_for_user(user_id, run_id, events.len() as i64)
             .await?;
-
-        // Build bulk INSERT. MatrixOne / MySQL supports multi-row VALUES.
-        // Column list is defined once; the number of `?` placeholders per row
-        // (12) is derived from BatchEventRow's field count (created_at uses NOW(6)).
-        const EVENT_INSERT_COLUMNS: &str =
-            "(id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
-              idempotency_key, event_hash, producer_pod_id, payload_json, created_at)";
-        let mut query = String::from("INSERT IGNORE INTO agent_run_events ");
-        query.push_str(EVENT_INSERT_COLUMNS);
-        query.push_str(" VALUES ");
-
-        // Number of bind placeholders must match column count (13 cols, 1 is NOW(6)).
-        const BIND_COUNT: usize = 12;
 
         #[derive(Debug)]
         struct BatchEventRow {
@@ -2042,44 +2182,9 @@ impl DatabaseRunStateStore {
             payload_json: String,
         }
 
-        impl BatchEventRow {
-            fn bind_all<'q>(
-                &'q self,
-                mut exec: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
-            ) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
-                exec = exec
-                    .bind(&self.id)
-                    .bind(&self.run_id)
-                    .bind(self.event_idx)
-                    .bind(&self.user_id)
-                    .bind(&self.session_id)
-                    .bind(&self.event_type)
-                    .bind(&self.event_id)
-                    .bind(&self.agent_id)
-                    .bind(&self.idempotency_key)
-                    .bind(&self.event_hash)
-                    .bind(&self.producer_pod_id)
-                    .bind(&self.payload_json);
-                exec
-            }
-        }
-
         let mut rows: Vec<BatchEventRow> = Vec::with_capacity(events.len());
 
         for (i, event) in events.iter().enumerate() {
-            if i > 0 {
-                query.push_str(", ");
-            }
-            // Build one row's placeholders: BIND_COUNT `?`s + `NOW(6)` for created_at.
-            query.push('(');
-            for j in 0..BIND_COUNT {
-                if j > 0 {
-                    query.push_str(", ");
-                }
-                query.push('?');
-            }
-            query.push_str(", NOW(6))");
-
             let payload_json = serde_json::to_string(event).map_err(|source| {
                 DatabaseRunStateStoreError::Json {
                     operation: "serialize_run_event_batch",
@@ -2110,11 +2215,28 @@ impl DatabaseRunStateStore {
             });
         }
 
-        let mut exec = sqlx::query(&query);
-        for row in &rows {
-            exec = row.bind_all(exec);
-        }
-        match exec.execute(self.pool.get()).await {
+        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT IGNORE INTO agent_run_events \
+             (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id, \
+              idempotency_key, event_hash, producer_pod_id, payload_json, created_at) ",
+        );
+        builder.push_values(rows.iter(), |mut row, event| {
+            row.push_bind(&event.id)
+                .push_bind(&event.run_id)
+                .push_bind(event.event_idx)
+                .push_bind(&event.user_id)
+                .push_bind(&event.session_id)
+                .push_bind(&event.event_type)
+                .push_bind(&event.event_id)
+                .push_bind(&event.agent_id)
+                .push_bind(&event.idempotency_key)
+                .push_bind(&event.event_hash)
+                .push_bind(&event.producer_pod_id)
+                .push_bind(&event.payload_json)
+                .push("NOW(6)");
+        });
+
+        match builder.build().execute(self.pool.get()).await {
             Ok(_) => {}
             Err(sqlx::Error::Database(db_err)) => {
                 // MySQL error 1062 / SQLSTATE 23000 = duplicate key.
@@ -2147,16 +2269,21 @@ impl DatabaseRunStateStore {
         // creating gaps. The allocated range is monotonic and correct.
         let last_idx = start_idx + events.len() as i64 - 1;
         sqlx::query(
-            "UPDATE agent_runs SET last_event_idx = CASE WHEN ? > last_event_idx THEN ? ELSE last_event_idx END, updated_at = NOW(6) WHERE run_id = ?",
+            "UPDATE agent_runs
+             SET last_event_idx = CASE WHEN ? > last_event_idx THEN ? ELSE last_event_idx END,
+                 updated_at = NOW(6)
+             WHERE user_id = ? AND run_id = ?",
         )
         .bind(last_idx)
         .bind(last_idx)
+        .bind(user_id)
         .bind(run_id)
         .execute(self.pool.get())
         .await
         .map_err(|source| db_error("update_run_last_event_idx_batch", run_id, source))?;
 
-        self.sync_projection(run_id, None, None).await?;
+        self.sync_projection_for_user(user_id, run_id, None, None)
+            .await?;
 
         Ok(())
     }
@@ -2168,7 +2295,7 @@ impl RunStateStore for DatabaseRunStateStore {
         if (record.root_run_id.is_none() || record.ancestor_path.is_none())
             && let Some(parent_run_id) = record.parent_run_id.as_deref()
             && let Some(parent) = self
-                .load_run_metadata(parent_run_id)
+                .load_run_metadata_for_user(&record.user_id, parent_run_id)
                 .await
                 .map_err(|e| e.to_string())?
         {
@@ -2322,11 +2449,12 @@ impl RunStateStore for DatabaseRunStateStore {
         }
 
         if !events.is_empty() {
-            self.append_events_batch(&record.run_id, &events)
+            self.append_events_batch_for_user(&record.user_id, &record.run_id, &events)
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        self.sync_projection(
+        self.sync_projection_for_user(
+            &record.user_id,
             &record.run_id,
             record.events.last().map(extract_event_type).as_deref(),
             None,
@@ -2336,9 +2464,13 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(())
     }
 
-    async fn load_run(&self, run_id: &str) -> Result<Option<DurableRunRecord>, String> {
+    async fn load_run(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String> {
         let Some(mut run) = self
-            .load_run_metadata(run_id)
+            .load_run_metadata_for_user(user_id, run_id)
             .await
             .map_err(|e| e.to_string())?
         else {
@@ -2346,8 +2478,11 @@ impl RunStateStore for DatabaseRunStateStore {
         };
 
         let rows = sqlx::query(
-            "SELECT payload_json, event_idx FROM agent_run_events WHERE run_id = ? ORDER BY event_idx ASC",
+            "SELECT payload_json, event_idx FROM agent_run_events
+             WHERE user_id = ? AND run_id = ?
+             ORDER BY event_idx ASC",
         )
+        .bind(&run.user_id)
         .bind(run_id)
         .fetch_all(self.pool.get())
         .await
@@ -2355,23 +2490,15 @@ impl RunStateStore for DatabaseRunStateStore {
 
         run.events = rows
             .into_iter()
-            .filter_map(|row| {
-                let payload = row.try_get::<String, _>("payload_json").ok()?;
-                let mut value = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
-                if let Some(obj) = value.as_object_mut()
-                    && !obj.contains_key("index")
-                    && let Ok(event_idx) = row.try_get::<i64, _>("event_idx")
-                {
-                    obj.insert("index".to_string(), serde_json::json!(event_idx));
-                }
-                Some(value)
-            })
-            .collect();
+            .map(|row| decode_run_event_payload(&row, run_id))
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
         Ok(Some(run))
     }
 
     async fn update_run_status(
         &self,
+        user_id: &str,
         run_id: &str,
         status: &str,
         waiting_for: Option<&str>,
@@ -2381,11 +2508,12 @@ impl RunStateStore for DatabaseRunStateStore {
             sqlx::query(
                 "UPDATE agent_runs
                  SET status = ?, waiting_for = ?, error_message = ?, updated_at = NOW(6)
-                 WHERE run_id = ?",
+                 WHERE user_id = ? AND run_id = ?",
             )
             .bind(status)
             .bind(waiting_for)
             .bind(error_message)
+            .bind(user_id)
             .bind(run_id)
             .execute(self.pool.get())
             .await
@@ -2394,17 +2522,18 @@ impl RunStateStore for DatabaseRunStateStore {
             sqlx::query(
                 "UPDATE agent_runs
                  SET status = ?, waiting_for = ?, updated_at = NOW(6)
-                 WHERE run_id = ?",
+                 WHERE user_id = ? AND run_id = ?",
             )
             .bind(status)
             .bind(waiting_for)
+            .bind(user_id)
             .bind(run_id)
             .execute(self.pool.get())
             .await
             .map_err(|source| db_error("update_run_status", run_id, source).to_string())?
         };
         if result.rows_affected() > 0 {
-            self.sync_projection(run_id, None, None)
+            self.sync_projection_for_user(user_id, run_id, None, None)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -2413,6 +2542,7 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn update_run_status_if_current(
         &self,
+        user_id: &str,
         run_id: &str,
         expected_statuses: &[&str],
         status: &str,
@@ -2422,35 +2552,33 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
-        let predicates = std::iter::repeat_n("?", expected_statuses.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = if error_message.is_some() {
-            format!(
-                "UPDATE agent_runs
-                 SET status = ?, waiting_for = ?, error_message = ?, updated_at = NOW(6)
-                 WHERE run_id = ? AND status IN ({predicates})"
-            )
-        } else {
-            format!(
-                "UPDATE agent_runs
-                 SET status = ?, waiting_for = ?, updated_at = NOW(6)
-                 WHERE run_id = ? AND status IN ({predicates})"
-            )
-        };
-        let mut query = sqlx::query(&sql).bind(status).bind(waiting_for);
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
+        query.push_bind(status);
+        query.push(", waiting_for = ");
+        query.push_bind(waiting_for);
         if let Some(error_message) = error_message {
-            query = query.bind(error_message);
+            query.push(", error_message = ");
+            query.push_bind(error_message);
         }
-        query = query.bind(run_id);
+        query.push(", updated_at = NOW(6) WHERE user_id = ");
+        query.push_bind(user_id);
+        query.push(" AND run_id = ");
+        query.push_bind(run_id);
+        query.push(" AND status IN (");
+        let mut separated = query.separated(", ");
         for expected in expected_statuses {
-            query = query.bind(*expected);
+            separated.push_bind(*expected);
         }
-        let result = query.execute(self.pool.get()).await.map_err(|source| {
-            db_error("update_run_status_if_current", run_id, source).to_string()
-        })?;
+        separated.push_unseparated(")");
+        let result = query
+            .build()
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("update_run_status_if_current", run_id, source).to_string()
+            })?;
         if result.rows_affected() > 0 {
-            self.sync_projection(run_id, None, None)
+            self.sync_projection_for_user(user_id, run_id, None, None)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -2459,6 +2587,7 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn update_run_usage(
         &self,
+        user_id: &str,
         run_id: &str,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -2467,26 +2596,32 @@ impl RunStateStore for DatabaseRunStateStore {
         let result = sqlx::query(
             "UPDATE agent_runs
              SET total_prompt_tokens = ?, total_completion_tokens = ?, total_tool_calls = ?, updated_at = NOW(6)
-             WHERE run_id = ?",
+             WHERE user_id = ? AND run_id = ?",
         )
         .bind(prompt_tokens as i64)
         .bind(completion_tokens as i64)
         .bind(tool_calls as i64)
+        .bind(user_id)
         .bind(run_id)
         .execute(self.pool.get())
         .await
         .map_err(|source| db_error("update_run_usage", run_id, source).to_string())?;
         if result.rows_affected() > 0 {
-            self.sync_projection(run_id, None, None)
+            self.sync_projection_for_user(user_id, run_id, None, None)
                 .await
                 .map_err(|e| e.to_string())?;
         }
         Ok(result.rows_affected() > 0)
     }
 
-    async fn save_checkpoint(&self, run_id: &str, checkpoint_json: &str) -> Result<bool, String> {
+    async fn save_checkpoint(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        checkpoint_json: &str,
+    ) -> Result<bool, String> {
         let Some(run) = self
-            .load_run_metadata(run_id)
+            .load_run_metadata_for_user(user_id, run_id)
             .await
             .map_err(|e| e.to_string())?
         else {
@@ -2528,10 +2663,11 @@ impl RunStateStore for DatabaseRunStateStore {
         let result = sqlx::query(
             "UPDATE agent_runs
              SET checkpoint_version = ?, checkpoint_json = ?, updated_at = NOW(6)
-             WHERE run_id = ? AND status NOT IN ('completed', 'failed')",
+             WHERE user_id = ? AND run_id = ? AND status NOT IN ('completed', 'failed')",
         )
         .bind(&checkpoint_version)
         .bind(checkpoint_json)
+        .bind(user_id)
         .bind(run_id)
         .execute(&mut *tx)
         .await
@@ -2546,7 +2682,8 @@ impl RunStateStore for DatabaseRunStateStore {
         tx.commit()
             .await
             .map_err(|source| db_error("commit_save_checkpoint", run_id, source).to_string())?;
-        self.sync_projection(
+        self.sync_projection_for_user(
+            user_id,
             run_id,
             None,
             Some(&DurableRunCheckpointRecord {
@@ -2569,19 +2706,29 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn load_latest_checkpoint(
         &self,
+        user_id: &str,
         run_id: &str,
         checkpoint_kind: Option<&str>,
     ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+        let Some(_run) = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+
         let row = if let Some(checkpoint_kind) = checkpoint_kind {
             sqlx::query(
                 "SELECT checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind,
                         checkpoint_version, idempotency_key, checkpoint_json,
                         DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
                  FROM run_checkpoints
-                 WHERE run_id = ? AND checkpoint_kind = ?
+                 WHERE user_id = ? AND run_id = ? AND checkpoint_kind = ?
                  ORDER BY created_at DESC, checkpoint_id DESC
                  LIMIT 1",
             )
+            .bind(user_id)
             .bind(run_id)
             .bind(checkpoint_kind)
             .fetch_optional(self.pool.get())
@@ -2593,34 +2740,27 @@ impl RunStateStore for DatabaseRunStateStore {
                         checkpoint_version, idempotency_key, checkpoint_json,
                         DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
                  FROM run_checkpoints
-                 WHERE run_id = ?
+                 WHERE user_id = ? AND run_id = ?
                  ORDER BY created_at DESC, checkpoint_id DESC
                  LIMIT 1",
             )
+            .bind(user_id)
             .bind(run_id)
             .fetch_optional(self.pool.get())
             .await
             .map_err(|source| db_error("load_latest_checkpoint", run_id, source).to_string())?
         };
-        Ok(row.map(|row| DurableRunCheckpointRecord {
-            checkpoint_id: row.try_get("checkpoint_id").unwrap_or_default(),
-            run_id: row.try_get("run_id").unwrap_or_default(),
-            user_id: row.try_get("user_id").unwrap_or_default(),
-            session_id: row.try_get("session_id").unwrap_or_default(),
-            node_seq: row.try_get("node_seq").unwrap_or(0),
-            checkpoint_kind: row.try_get("checkpoint_kind").unwrap_or_default(),
-            checkpoint_version: row.try_get("checkpoint_version").unwrap_or_default(),
-            idempotency_key: row.try_get("idempotency_key").unwrap_or_default(),
-            checkpoint_json: row.try_get("checkpoint_json").unwrap_or_default(),
-            created_at: row.try_get("created_at").unwrap_or_default(),
-        }))
+        row.map(|row| decode_run_checkpoint_record_from_row(&row))
+            .transpose()
+            .map_err(|e| e.to_string())
     }
 
     async fn load_run_projection(
         &self,
+        user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        self.load_run_projection_metadata(run_id)
+        self.load_run_projection_metadata_for_user(user_id, run_id)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2630,10 +2770,11 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn append_events_batch(
         &self,
+        user_id: &str,
         run_id: &str,
         events: &[serde_json::Value],
     ) -> Result<(), String> {
-        DatabaseRunStateStore::append_events_batch(self, run_id, events)
+        DatabaseRunStateStore::append_events_batch_for_user(self, user_id, run_id, events)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2649,7 +2790,8 @@ impl RunStateStore for DatabaseRunStateStore {
             .fetch_one(self.pool.get())
             .await
             .map_err(|source| db_error("count_user_runs", user_id, source).to_string())?;
-        let total = total_row.try_get::<i64, _>("total").unwrap_or(0);
+        let total = run_row_non_negative_i64(&total_row, "count_user_runs", "agent_runs", "total")
+            .map_err(|e| e.to_string())?;
         let sql = format!(
             "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
              WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?"
@@ -2746,12 +2888,17 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|e| e.to_string())
     }
 
-    async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String> {
+    async fn find_sub_runs(
+        &self,
+        user_id: &str,
+        delegation_id: &str,
+    ) -> Result<Vec<DurableRunRecord>, String> {
         let sql = format!(
             "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
-             WHERE delegation_id = ? ORDER BY depth ASC, created_at ASC"
+             WHERE user_id = ? AND delegation_id = ? ORDER BY depth ASC, created_at ASC"
         );
         let rows = sqlx::query(&sql)
+            .bind(user_id)
             .bind(delegation_id)
             .fetch_all(self.pool.get())
             .await
@@ -2762,11 +2909,19 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|e| e.to_string())
     }
 
-    async fn update_retry_count(&self, run_id: &str, retry_count: u32) -> Result<bool, String> {
+    async fn update_retry_count(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        retry_count: u32,
+    ) -> Result<bool, String> {
         let result = sqlx::query(
-            "UPDATE agent_runs SET retry_count = ?, updated_at = NOW(6) WHERE run_id = ?",
+            "UPDATE agent_runs
+             SET retry_count = ?, updated_at = NOW(6)
+             WHERE user_id = ? AND run_id = ?",
         )
         .bind(retry_count as i64)
+        .bind(user_id)
         .bind(run_id)
         .execute(self.pool.get())
         .await
@@ -2802,6 +2957,164 @@ fn db_error(
         entity: entity.into(),
         source,
     }
+}
+
+fn db_decode_error(
+    operation: &'static str,
+    table: &str,
+    column: &str,
+    source: sqlx::Error,
+) -> DatabaseRunStateStoreError {
+    db_error(operation, format!("{table}.{column}"), source)
+}
+
+fn invalid_database_value_error(
+    operation: &'static str,
+    table: &str,
+    column: &str,
+    message: impl Into<String>,
+) -> DatabaseRunStateStoreError {
+    let source = sqlx::Error::Decode(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    )));
+    db_decode_error(operation, table, column, source)
+}
+
+fn run_row_string(
+    row: &impl RunStateDbRow,
+    operation: &'static str,
+    table: &str,
+    column: &str,
+) -> DbStoreResult<String> {
+    row.string_column(column)
+        .map_err(|source| db_decode_error(operation, table, column, source))
+}
+
+fn run_row_optional_string(
+    row: &impl RunStateDbRow,
+    operation: &'static str,
+    table: &str,
+    column: &str,
+) -> DbStoreResult<Option<String>> {
+    row.optional_string_column(column)
+        .map_err(|source| db_decode_error(operation, table, column, source))
+}
+
+fn run_row_datetime_string(
+    row: &impl RunStateDbRow,
+    operation: &'static str,
+    table: &str,
+    column: &str,
+) -> DbStoreResult<String> {
+    row.datetime_string_column(column)
+        .map_err(|source| db_decode_error(operation, table, column, source))
+}
+
+fn run_row_optional_datetime_string(
+    row: &impl RunStateDbRow,
+    operation: &'static str,
+    table: &str,
+    column: &str,
+) -> DbStoreResult<Option<String>> {
+    row.optional_datetime_string_column(column)
+        .map_err(|source| db_decode_error(operation, table, column, source))
+}
+
+fn run_row_i64(
+    row: &impl RunStateDbRow,
+    operation: &'static str,
+    table: &str,
+    column: &str,
+) -> DbStoreResult<i64> {
+    row.i64_column(column)
+        .map_err(|source| db_decode_error(operation, table, column, source))
+}
+
+fn run_row_at_least_i64(
+    row: &impl RunStateDbRow,
+    operation: &'static str,
+    table: &str,
+    column: &str,
+    min: i64,
+) -> DbStoreResult<i64> {
+    let value = run_row_i64(row, operation, table, column)?;
+    if value < min {
+        return Err(invalid_database_value_error(
+            operation,
+            table,
+            column,
+            format!("invalid {table}.{column}: {value}; expected >= {min}"),
+        ));
+    }
+    Ok(value)
+}
+
+fn run_row_non_negative_i64(
+    row: &impl RunStateDbRow,
+    operation: &'static str,
+    table: &str,
+    column: &str,
+) -> DbStoreResult<i64> {
+    run_row_at_least_i64(row, operation, table, column, 0)
+}
+
+fn run_row_u64(
+    row: &impl RunStateDbRow,
+    operation: &'static str,
+    table: &str,
+    column: &str,
+) -> DbStoreResult<u64> {
+    Ok(run_row_non_negative_i64(row, operation, table, column)? as u64)
+}
+
+fn run_row_u32(
+    row: &impl RunStateDbRow,
+    operation: &'static str,
+    table: &str,
+    column: &str,
+) -> DbStoreResult<u32> {
+    let value = run_row_non_negative_i64(row, operation, table, column)?;
+    u32::try_from(value).map_err(|_| {
+        invalid_database_value_error(
+            operation,
+            table,
+            column,
+            format!(
+                "invalid {table}.{column}: {value}; expected <= {}",
+                u32::MAX
+            ),
+        )
+    })
+}
+
+fn decode_tool_preview_contract_row(
+    row: &impl RunStateDbRow,
+) -> DbStoreResult<(String, ToolPreviewContract)> {
+    let operation = "decode_tool_preview_contract_row";
+    let table = "preview_template_registry";
+    let tool_name = run_row_string(row, operation, table, "tool_name")?;
+    let max_preview_bytes = run_row_at_least_i64(row, operation, table, "max_preview_bytes", 1)?;
+    let max_preview_bytes = usize::try_from(max_preview_bytes).map_err(|_| {
+        invalid_database_value_error(
+            operation,
+            table,
+            "max_preview_bytes",
+            format!(
+                "invalid {table}.max_preview_bytes: {max_preview_bytes}; expected <= {}",
+                usize::MAX
+            ),
+        )
+    })?;
+    let normalize_version = run_row_string(row, operation, table, "normalize_version")?;
+    Ok((
+        tool_name,
+        ToolPreviewContract {
+            max_preview_bytes,
+            normalize_version,
+            found: true,
+        },
+    ))
 }
 
 fn default_owner_pod_id() -> String {
@@ -2868,54 +3181,69 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
 }
 
 fn run_record_from_row(row: sqlx::mysql::MySqlRow) -> DbStoreResult<DurableRunRecord> {
-    let run_id = row
-        .try_get::<String, _>("run_id")
-        .map_err(|source| db_error("decode_run_row.run_id", "agent_runs".to_string(), source))?;
+    decode_run_record_from_row(&row)
+}
+
+fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<DurableRunRecord> {
+    let operation = "decode_run_row";
+    let table = "agent_runs";
+    let run_id = run_row_string(row, operation, table, "run_id")?;
     Ok(DurableRunRecord {
-        user_id: row.try_get("user_id").unwrap_or_default(),
-        session_id: row.try_get("session_id").unwrap_or_default(),
-        parent_run_id: row.try_get("parent_run_id").ok(),
-        root_run_id: row.try_get("root_run_id").ok(),
-        ancestor_path: row.try_get("ancestor_path").ok(),
-        depth: row.try_get::<i64, _>("depth").unwrap_or(0).max(0) as u32,
-        delegation_id: row.try_get("delegation_id").ok(),
-        agent_id: row.try_get("agent_id").ok(),
-        retry_of: row.try_get("retry_of").ok(),
-        retry_scope: row.try_get("retry_scope").ok(),
-        status: row.try_get("status").unwrap_or_default(),
-        waiting_for: row.try_get("waiting_for").ok(),
-        owner_pod_id: row.try_get("owner_pod_id").ok(),
-        owner_lease_expires_at: datetime_string(&row, "owner_lease_expires_at"),
-        run_generation: row.try_get::<i64, _>("run_generation").unwrap_or(0).max(0) as u64,
-        last_event_idx: row.try_get::<i64, _>("last_event_idx").unwrap_or(-1),
-        checkpoint_version: row.try_get("checkpoint_version").ok(),
-        checkpoint_json: row.try_get("checkpoint_json").ok(),
-        error_code: row.try_get("error_code").ok(),
-        error_message: row.try_get("error_message").ok(),
-        retry_count: row.try_get::<i64, _>("retry_count").unwrap_or(0).max(0) as u32,
-        total_prompt_tokens: row
-            .try_get::<i64, _>("total_prompt_tokens")
-            .unwrap_or(0)
-            .max(0) as u64,
-        total_completion_tokens: row
-            .try_get::<i64, _>("total_completion_tokens")
-            .unwrap_or(0)
-            .max(0) as u64,
-        total_tool_calls: row
-            .try_get::<i64, _>("total_tool_calls")
-            .unwrap_or(0)
-            .max(0) as u32,
-        agent_binding_id: row.try_get("agent_binding_id").ok(),
-        agent_binding_name: row.try_get("agent_binding_name").ok(),
-        agent_binding_schema_version: row.try_get("agent_binding_schema_version").ok(),
-        selected_model_json: row.try_get("selected_model_json").ok(),
-        selected_model_name: row.try_get("selected_model_name").ok(),
-        selected_model_gateway: row.try_get("selected_model_gateway").ok(),
-        capability_server_refs_json: row.try_get("capability_server_refs_json").ok(),
-        runtime_profile: row.try_get("runtime_profile").ok(),
+        user_id: run_row_string(row, operation, table, "user_id")?,
+        session_id: run_row_string(row, operation, table, "session_id")?,
+        parent_run_id: run_row_optional_string(row, operation, table, "parent_run_id")?,
+        root_run_id: run_row_optional_string(row, operation, table, "root_run_id")?,
+        ancestor_path: run_row_optional_string(row, operation, table, "ancestor_path")?,
+        depth: run_row_u32(row, operation, table, "depth")?,
+        delegation_id: run_row_optional_string(row, operation, table, "delegation_id")?,
+        agent_id: run_row_optional_string(row, operation, table, "agent_id")?,
+        retry_of: run_row_optional_string(row, operation, table, "retry_of")?,
+        retry_scope: run_row_optional_string(row, operation, table, "retry_scope")?,
+        status: run_row_string(row, operation, table, "status")?,
+        waiting_for: run_row_optional_string(row, operation, table, "waiting_for")?,
+        owner_pod_id: run_row_optional_string(row, operation, table, "owner_pod_id")?,
+        owner_lease_expires_at: run_row_optional_datetime_string(
+            row,
+            operation,
+            table,
+            "owner_lease_expires_at",
+        )?,
+        run_generation: run_row_u64(row, operation, table, "run_generation")?,
+        last_event_idx: run_row_at_least_i64(row, operation, table, "last_event_idx", -1)?,
+        checkpoint_version: run_row_optional_string(row, operation, table, "checkpoint_version")?,
+        checkpoint_json: run_row_optional_string(row, operation, table, "checkpoint_json")?,
+        error_code: run_row_optional_string(row, operation, table, "error_code")?,
+        error_message: run_row_optional_string(row, operation, table, "error_message")?,
+        retry_count: run_row_u32(row, operation, table, "retry_count")?,
+        total_prompt_tokens: run_row_u64(row, operation, table, "total_prompt_tokens")?,
+        total_completion_tokens: run_row_u64(row, operation, table, "total_completion_tokens")?,
+        total_tool_calls: run_row_u32(row, operation, table, "total_tool_calls")?,
+        agent_binding_id: run_row_optional_string(row, operation, table, "agent_binding_id")?,
+        agent_binding_name: run_row_optional_string(row, operation, table, "agent_binding_name")?,
+        agent_binding_schema_version: run_row_optional_string(
+            row,
+            operation,
+            table,
+            "agent_binding_schema_version",
+        )?,
+        selected_model_json: run_row_optional_string(row, operation, table, "selected_model_json")?,
+        selected_model_name: run_row_optional_string(row, operation, table, "selected_model_name")?,
+        selected_model_gateway: run_row_optional_string(
+            row,
+            operation,
+            table,
+            "selected_model_gateway",
+        )?,
+        capability_server_refs_json: run_row_optional_string(
+            row,
+            operation,
+            table,
+            "capability_server_refs_json",
+        )?,
+        runtime_profile: run_row_optional_string(row, operation, table, "runtime_profile")?,
         events: Vec::new(),
-        created_at: datetime_string(&row, "created_at").unwrap_or_default(),
-        updated_at: datetime_string(&row, "updated_at").unwrap_or_default(),
+        created_at: run_row_datetime_string(row, operation, table, "created_at")?,
+        updated_at: run_row_datetime_string(row, operation, table, "updated_at")?,
         run_id,
     })
 }
@@ -2923,47 +3251,96 @@ fn run_record_from_row(row: sqlx::mysql::MySqlRow) -> DbStoreResult<DurableRunRe
 fn run_projection_record_from_row(
     row: sqlx::mysql::MySqlRow,
 ) -> DbStoreResult<DurableRunDisplayProjectionRecord> {
-    let run_id = row.try_get::<String, _>("run_id").map_err(|source| {
-        db_error(
-            "decode_run_projection_row.run_id",
-            "run_display_projections",
-            source,
-        )
-    })?;
+    decode_run_display_projection_record_from_row(&row)
+}
+
+fn decode_run_display_projection_record_from_row(
+    row: &impl RunStateDbRow,
+) -> DbStoreResult<DurableRunDisplayProjectionRecord> {
+    let operation = "decode_run_projection_row";
+    let table = "run_display_projections";
+    let run_id = run_row_string(row, operation, table, "run_id")?;
     Ok(DurableRunDisplayProjectionRecord {
         run_id,
-        user_id: row.try_get("user_id").unwrap_or_default(),
-        session_id: row.try_get("session_id").unwrap_or_default(),
-        status: row.try_get("status").unwrap_or_default(),
-        waiting_for: row.try_get("waiting_for").ok(),
-        error_message: row.try_get("error_message").ok(),
-        projection_event_idx: row.try_get::<i64, _>("projection_event_idx").unwrap_or(-1),
-        latest_event_type: row.try_get("latest_event_type").ok(),
-        latest_checkpoint_id: row.try_get("latest_checkpoint_id").ok(),
-        latest_checkpoint_kind: row.try_get("latest_checkpoint_kind").ok(),
-        latest_checkpoint_version: row.try_get("latest_checkpoint_version").ok(),
-        total_prompt_tokens: row
-            .try_get::<i64, _>("total_prompt_tokens")
-            .unwrap_or(0)
-            .max(0) as u64,
-        total_completion_tokens: row
-            .try_get::<i64, _>("total_completion_tokens")
-            .unwrap_or(0)
-            .max(0) as u64,
-        total_tool_calls: row
-            .try_get::<i64, _>("total_tool_calls")
-            .unwrap_or(0)
-            .max(0) as u32,
-        projection_hash: row.try_get("projection_hash").unwrap_or_default(),
-        updated_at: datetime_string(&row, "updated_at").unwrap_or_default(),
+        user_id: run_row_string(row, operation, table, "user_id")?,
+        session_id: run_row_string(row, operation, table, "session_id")?,
+        status: run_row_string(row, operation, table, "status")?,
+        waiting_for: run_row_optional_string(row, operation, table, "waiting_for")?,
+        error_message: run_row_optional_string(row, operation, table, "error_message")?,
+        projection_event_idx: run_row_at_least_i64(
+            row,
+            operation,
+            table,
+            "projection_event_idx",
+            -1,
+        )?,
+        latest_event_type: run_row_optional_string(row, operation, table, "latest_event_type")?,
+        latest_checkpoint_id: run_row_optional_string(
+            row,
+            operation,
+            table,
+            "latest_checkpoint_id",
+        )?,
+        latest_checkpoint_kind: run_row_optional_string(
+            row,
+            operation,
+            table,
+            "latest_checkpoint_kind",
+        )?,
+        latest_checkpoint_version: run_row_optional_string(
+            row,
+            operation,
+            table,
+            "latest_checkpoint_version",
+        )?,
+        total_prompt_tokens: run_row_u64(row, operation, table, "total_prompt_tokens")?,
+        total_completion_tokens: run_row_u64(row, operation, table, "total_completion_tokens")?,
+        total_tool_calls: run_row_u32(row, operation, table, "total_tool_calls")?,
+        projection_hash: run_row_string(row, operation, table, "projection_hash")?,
+        updated_at: run_row_datetime_string(row, operation, table, "updated_at")?,
     })
 }
 
-fn datetime_string(row: &sqlx::mysql::MySqlRow, column: &str) -> Option<String> {
-    row.try_get::<chrono::NaiveDateTime, _>(column)
-        .ok()
-        .map(|dt| dt.to_string())
-        .or_else(|| row.try_get::<String, _>(column).ok())
+fn decode_run_checkpoint_record_from_row(
+    row: &impl RunStateDbRow,
+) -> DbStoreResult<DurableRunCheckpointRecord> {
+    let operation = "decode_run_checkpoint_row";
+    let table = "run_checkpoints";
+    Ok(DurableRunCheckpointRecord {
+        checkpoint_id: run_row_string(row, operation, table, "checkpoint_id")?,
+        run_id: run_row_string(row, operation, table, "run_id")?,
+        user_id: run_row_string(row, operation, table, "user_id")?,
+        session_id: run_row_string(row, operation, table, "session_id")?,
+        node_seq: run_row_non_negative_i64(row, operation, table, "node_seq")?,
+        checkpoint_kind: run_row_string(row, operation, table, "checkpoint_kind")?,
+        checkpoint_version: run_row_string(row, operation, table, "checkpoint_version")?,
+        idempotency_key: run_row_string(row, operation, table, "idempotency_key")?,
+        checkpoint_json: run_row_string(row, operation, table, "checkpoint_json")?,
+        created_at: run_row_datetime_string(row, operation, table, "created_at")?,
+    })
+}
+
+fn decode_run_event_payload(
+    row: &impl RunStateDbRow,
+    run_id: &str,
+) -> DbStoreResult<serde_json::Value> {
+    let operation = "decode_run_event_row";
+    let table = "agent_run_events";
+    let payload = run_row_string(row, operation, table, "payload_json")?;
+    let event_idx = run_row_non_negative_i64(row, operation, table, "event_idx")?;
+    let mut value = serde_json::from_str::<serde_json::Value>(&payload).map_err(|source| {
+        DatabaseRunStateStoreError::Json {
+            operation: "decode_run_event_payload",
+            entity: format!("{table}.payload_json:{run_id}:{event_idx}"),
+            source,
+        }
+    })?;
+    if let Some(obj) = value.as_object_mut()
+        && !obj.contains_key("index")
+    {
+        obj.insert("index".to_string(), serde_json::json!(event_idx));
+    }
+    Ok(value)
 }
 
 pub fn extract_event_type(event: &serde_json::Value) -> String {
@@ -3582,6 +3959,184 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FakeRunStateRow {
+        failed_column: Option<&'static str>,
+        i64_overrides: Vec<(&'static str, i64)>,
+        payload_json: &'static str,
+    }
+
+    impl FakeRunStateRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                i64_overrides: Vec::new(),
+                payload_json: r#"{"event_type":"text_delta","content":"hi"}"#,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_i64(column: &'static str, value: i64) -> Self {
+            Self {
+                i64_overrides: vec![(column, value)],
+                ..Self::complete()
+            }
+        }
+
+        fn with_payload_json(payload_json: &'static str) -> Self {
+            Self {
+                payload_json,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl RunStateDbRow for FakeRunStateRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "run_id" => "run-1",
+                "user_id" => "user-1",
+                "session_id" => "session-1",
+                "status" => STATUS_RUNNING,
+                "checkpoint_id" => "checkpoint-1",
+                "checkpoint_kind" => "resume",
+                "checkpoint_version" => "checkpoint_v2",
+                "idempotency_key" => "checkpoint:run-1:resume:batch-1",
+                "checkpoint_json" => r#"{"version":"checkpoint_v2"}"#,
+                "projection_hash" => "hash-1",
+                "payload_json" => self.payload_json,
+                "tool_name" => "bash",
+                "normalize_version" => "raw_v2",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "parent_run_id" => Some("parent-run".to_string()),
+                "root_run_id" => Some("root-run".to_string()),
+                "ancestor_path" => Some("root-run/run-1".to_string()),
+                "delegation_id" => Some("delegation-1".to_string()),
+                "agent_id" => Some("agent-1".to_string()),
+                "retry_of" => Some("retry-source".to_string()),
+                "retry_scope" => Some("node".to_string()),
+                "waiting_for" => None,
+                "owner_pod_id" => Some("pod-1".to_string()),
+                "checkpoint_version" => Some("checkpoint_v2".to_string()),
+                "checkpoint_json" => Some(r#"{"version":"checkpoint_v2"}"#.to_string()),
+                "error_code" => None,
+                "error_message" => None,
+                "agent_binding_id" => Some("binding-1".to_string()),
+                "agent_binding_name" => Some("binding".to_string()),
+                "agent_binding_schema_version" => Some("v1".to_string()),
+                "selected_model_json" => Some(r#"{"name":"model"}"#.to_string()),
+                "selected_model_name" => Some("model".to_string()),
+                "selected_model_gateway" => Some("gateway".to_string()),
+                "capability_server_refs_json" => Some("[]".to_string()),
+                "runtime_profile" => Some("default".to_string()),
+                "latest_event_type" => Some("text_delta".to_string()),
+                "latest_checkpoint_id" => Some("checkpoint-1".to_string()),
+                "latest_checkpoint_kind" => Some("resume".to_string()),
+                "latest_checkpoint_version" => Some("checkpoint_v2".to_string()),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if let Some((_, value)) = self
+                .i64_overrides
+                .iter()
+                .find(|(candidate, _)| *candidate == column)
+            {
+                return Ok(*value);
+            }
+            Ok(match column {
+                "depth" => 2,
+                "run_generation" => 3,
+                "last_event_idx" => 4,
+                "retry_count" => 1,
+                "total_prompt_tokens" => 100,
+                "total_completion_tokens" => 25,
+                "total_tool_calls" => 6,
+                "node_seq" => 4,
+                "projection_event_idx" => 4,
+                "total" => 11,
+                "event_idx" => 9,
+                "max_preview_bytes" => 1024,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn datetime_string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "created_at" => "2026-06-26 12:00:00",
+                "updated_at" => "2026-06-26 12:01:00",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_datetime_string_column(
+            &self,
+            column: &str,
+        ) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "owner_lease_expires_at" => Some("2026-06-26 12:02:00".to_string()),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+    }
+
+    fn assert_run_db_error_mentions(
+        result: Result<impl std::fmt::Debug, DatabaseRunStateStoreError>,
+        needle: &str,
+    ) {
+        let error = result.expect_err("decode should fail");
+        match error {
+            DatabaseRunStateStoreError::Database { entity, source, .. } => {
+                assert!(
+                    entity.contains(needle) || source.to_string().contains(needle),
+                    "error should identify `{needle}`, got entity={entity}, source={source}"
+                );
+            }
+            other => panic!("expected database decode error, got {other:?}"),
+        }
+    }
+
+    fn assert_run_json_error(result: Result<impl std::fmt::Debug, DatabaseRunStateStoreError>) {
+        let error = result.expect_err("decode should fail");
+        assert!(
+            matches!(
+                error,
+                DatabaseRunStateStoreError::Json {
+                    operation: "decode_run_event_payload",
+                    ..
+                }
+            ),
+            "expected run event payload JSON decode error, got {error:?}"
+        );
+    }
+
     fn make_event(event_type: &str, data: serde_json::Value) -> serde_json::Value {
         json!({"event_type": event_type, "data": data})
     }
@@ -3675,6 +4230,301 @@ mod tests {
         assert_eq!(
             durable_run_status_to_subrun_state("mystery"),
             SubRunState::Failed
+        );
+    }
+
+    #[test]
+    fn run_record_row_decode_preserves_database_values_and_fails_loudly() {
+        let record = decode_run_record_from_row(&FakeRunStateRow::complete()).unwrap();
+        assert_eq!(record.run_id, "run-1");
+        assert_eq!(record.user_id, "user-1");
+        assert_eq!(record.session_id, "session-1");
+        assert_eq!(record.parent_run_id.as_deref(), Some("parent-run"));
+        assert_eq!(record.root_run_id.as_deref(), Some("root-run"));
+        assert_eq!(record.ancestor_path.as_deref(), Some("root-run/run-1"));
+        assert_eq!(record.depth, 2);
+        assert_eq!(record.status, STATUS_RUNNING);
+        assert_eq!(record.run_generation, 3);
+        assert_eq!(record.last_event_idx, 4);
+        assert_eq!(record.retry_count, 1);
+        assert_eq!(record.total_prompt_tokens, 100);
+        assert_eq!(record.total_completion_tokens, 25);
+        assert_eq!(record.total_tool_calls, 6);
+        assert_eq!(
+            record.owner_lease_expires_at.as_deref(),
+            Some("2026-06-26 12:02:00")
+        );
+        assert_eq!(record.created_at, "2026-06-26 12:00:00");
+        assert_eq!(record.updated_at, "2026-06-26 12:01:00");
+
+        for column in [
+            "run_id",
+            "user_id",
+            "session_id",
+            "parent_run_id",
+            "root_run_id",
+            "ancestor_path",
+            "depth",
+            "delegation_id",
+            "agent_id",
+            "retry_of",
+            "retry_scope",
+            "status",
+            "waiting_for",
+            "owner_pod_id",
+            "owner_lease_expires_at",
+            "run_generation",
+            "last_event_idx",
+            "checkpoint_version",
+            "checkpoint_json",
+            "error_code",
+            "error_message",
+            "retry_count",
+            "total_prompt_tokens",
+            "total_completion_tokens",
+            "total_tool_calls",
+            "agent_binding_id",
+            "agent_binding_name",
+            "agent_binding_schema_version",
+            "selected_model_json",
+            "selected_model_name",
+            "selected_model_gateway",
+            "capability_server_refs_json",
+            "runtime_profile",
+            "created_at",
+            "updated_at",
+        ] {
+            assert_run_db_error_mentions(
+                decode_run_record_from_row(&FakeRunStateRow::fail_on(column)),
+                column,
+            );
+        }
+    }
+
+    #[test]
+    fn run_record_row_decode_rejects_invalid_numeric_database_values() {
+        for column in [
+            "depth",
+            "run_generation",
+            "retry_count",
+            "total_prompt_tokens",
+            "total_completion_tokens",
+            "total_tool_calls",
+        ] {
+            assert_run_db_error_mentions(
+                decode_run_record_from_row(&FakeRunStateRow::with_i64(column, -1)),
+                column,
+            );
+        }
+
+        assert_run_db_error_mentions(
+            decode_run_record_from_row(&FakeRunStateRow::with_i64("last_event_idx", -2)),
+            "last_event_idx",
+        );
+        assert_eq!(
+            decode_run_record_from_row(&FakeRunStateRow::with_i64("last_event_idx", -1))
+                .unwrap()
+                .last_event_idx,
+            -1
+        );
+        assert_run_db_error_mentions(
+            decode_run_record_from_row(&FakeRunStateRow::with_i64(
+                "depth",
+                i64::from(u32::MAX) + 1,
+            )),
+            "depth",
+        );
+    }
+
+    #[test]
+    fn run_checkpoint_row_decode_preserves_values_and_fails_loudly() {
+        let checkpoint = decode_run_checkpoint_record_from_row(&FakeRunStateRow::complete())
+            .expect("checkpoint row decodes");
+        assert_eq!(checkpoint.checkpoint_id, "checkpoint-1");
+        assert_eq!(checkpoint.run_id, "run-1");
+        assert_eq!(checkpoint.user_id, "user-1");
+        assert_eq!(checkpoint.session_id, "session-1");
+        assert_eq!(checkpoint.node_seq, 4);
+        assert_eq!(checkpoint.checkpoint_kind, "resume");
+        assert_eq!(checkpoint.checkpoint_version, "checkpoint_v2");
+        assert_eq!(checkpoint.created_at, "2026-06-26 12:00:00");
+
+        for column in [
+            "checkpoint_id",
+            "run_id",
+            "user_id",
+            "session_id",
+            "node_seq",
+            "checkpoint_kind",
+            "checkpoint_version",
+            "idempotency_key",
+            "checkpoint_json",
+            "created_at",
+        ] {
+            assert_run_db_error_mentions(
+                decode_run_checkpoint_record_from_row(&FakeRunStateRow::fail_on(column)),
+                column,
+            );
+        }
+        assert_run_db_error_mentions(
+            decode_run_checkpoint_record_from_row(&FakeRunStateRow::with_i64("node_seq", -1)),
+            "node_seq",
+        );
+    }
+
+    #[test]
+    fn run_projection_row_decode_preserves_values_and_fails_loudly() {
+        let projection =
+            decode_run_display_projection_record_from_row(&FakeRunStateRow::complete())
+                .expect("projection row decodes");
+        assert_eq!(projection.run_id, "run-1");
+        assert_eq!(projection.user_id, "user-1");
+        assert_eq!(projection.session_id, "session-1");
+        assert_eq!(projection.status, STATUS_RUNNING);
+        assert_eq!(projection.projection_event_idx, 4);
+        assert_eq!(projection.latest_event_type.as_deref(), Some("text_delta"));
+        assert_eq!(projection.total_prompt_tokens, 100);
+        assert_eq!(projection.total_completion_tokens, 25);
+        assert_eq!(projection.total_tool_calls, 6);
+        assert_eq!(projection.projection_hash, "hash-1");
+        assert_eq!(projection.updated_at, "2026-06-26 12:01:00");
+
+        for column in [
+            "run_id",
+            "user_id",
+            "session_id",
+            "status",
+            "waiting_for",
+            "error_message",
+            "projection_event_idx",
+            "latest_event_type",
+            "latest_checkpoint_id",
+            "latest_checkpoint_kind",
+            "latest_checkpoint_version",
+            "total_prompt_tokens",
+            "total_completion_tokens",
+            "total_tool_calls",
+            "projection_hash",
+            "updated_at",
+        ] {
+            assert_run_db_error_mentions(
+                decode_run_display_projection_record_from_row(&FakeRunStateRow::fail_on(column)),
+                column,
+            );
+        }
+
+        assert_run_db_error_mentions(
+            decode_run_display_projection_record_from_row(&FakeRunStateRow::with_i64(
+                "projection_event_idx",
+                -2,
+            )),
+            "projection_event_idx",
+        );
+        assert_eq!(
+            decode_run_display_projection_record_from_row(&FakeRunStateRow::with_i64(
+                "projection_event_idx",
+                -1,
+            ))
+            .unwrap()
+            .projection_event_idx,
+            -1
+        );
+    }
+
+    #[test]
+    fn tool_preview_contract_row_decode_preserves_values_and_fails_loudly() {
+        let (tool_name, contract) = decode_tool_preview_contract_row(&FakeRunStateRow::complete())
+            .expect("preview contract decodes");
+        assert_eq!(tool_name, "bash");
+        assert_eq!(contract.max_preview_bytes, 1024);
+        assert_eq!(contract.normalize_version, "raw_v2");
+        assert!(contract.found);
+
+        for column in ["tool_name", "max_preview_bytes", "normalize_version"] {
+            assert_run_db_error_mentions(
+                decode_tool_preview_contract_row(&FakeRunStateRow::fail_on(column)),
+                column,
+            );
+        }
+        assert_run_db_error_mentions(
+            decode_tool_preview_contract_row(&FakeRunStateRow::with_i64("max_preview_bytes", 0)),
+            "max_preview_bytes",
+        );
+    }
+
+    #[test]
+    fn run_counter_and_event_payload_decoders_fail_loudly() {
+        assert_eq!(
+            run_row_non_negative_i64(
+                &FakeRunStateRow::complete(),
+                "count_user_runs",
+                "agent_runs",
+                "total",
+            )
+            .unwrap(),
+            11
+        );
+        assert_run_db_error_mentions(
+            run_row_non_negative_i64(
+                &FakeRunStateRow::fail_on("total"),
+                "count_user_runs",
+                "agent_runs",
+                "total",
+            ),
+            "total",
+        );
+        assert_run_db_error_mentions(
+            run_row_non_negative_i64(
+                &FakeRunStateRow::with_i64("total", -1),
+                "count_user_runs",
+                "agent_runs",
+                "total",
+            ),
+            "total",
+        );
+
+        let event = decode_run_event_payload(&FakeRunStateRow::complete(), "run-1").unwrap();
+        assert_eq!(event["event_type"], "text_delta");
+        assert_eq!(event["index"], 9);
+
+        assert_run_db_error_mentions(
+            decode_run_event_payload(&FakeRunStateRow::fail_on("payload_json"), "run-1"),
+            "payload_json",
+        );
+        assert_run_db_error_mentions(
+            decode_run_event_payload(&FakeRunStateRow::fail_on("event_idx"), "run-1"),
+            "event_idx",
+        );
+        assert_run_db_error_mentions(
+            decode_run_event_payload(&FakeRunStateRow::with_i64("event_idx", -1), "run-1"),
+            "event_idx",
+        );
+        assert_run_json_error(decode_run_event_payload(
+            &FakeRunStateRow::with_payload_json("{not-json"),
+            "run-1",
+        ));
+    }
+
+    #[test]
+    fn acquire_owner_lease_update_is_owner_bound() {
+        let source = include_str!("runs.rs");
+        let body = source
+            .split("pub async fn acquire_owner_lease(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn insert_tool_output_batch").next())
+            .expect("acquire_owner_lease body");
+
+        assert!(
+            body.contains("user_id: &str"),
+            "lease acquisition must take the owner boundary explicitly"
+        );
+        assert!(
+            body.contains("WHERE user_id = ?") && body.contains("AND run_id = ?"),
+            "lease acquisition must not update agent_runs by bare run_id"
+        );
+        assert!(
+            !body.contains("WHERE run_id = ?"),
+            "lease acquisition must not retain the old ownerless predicate"
         );
     }
 
@@ -4464,11 +5314,11 @@ mod tests {
             make_event("text_delta", json!({"chunk": "done"})),
         ];
         store
-            .append_events_batch("batch-order", &events)
+            .append_events_batch("u1", "batch-order", &events)
             .await
             .unwrap();
 
-        let loaded = store.load_run("batch-order").await.unwrap().unwrap();
+        let loaded = store.load_run("u1", "batch-order").await.unwrap().unwrap();
         assert_eq!(loaded.events.len(), 3);
         assert_eq!(loaded.events[0]["event_type"], "tool_call");
         assert_eq!(loaded.events[1]["event_type"], "tool_result");
@@ -4482,9 +5332,12 @@ mod tests {
         let run = durable_run_record("batch-empty");
         store.insert_run(run).await.unwrap();
 
-        store.append_events_batch("batch-empty", &[]).await.unwrap();
+        store
+            .append_events_batch("u1", "batch-empty", &[])
+            .await
+            .unwrap();
 
-        let loaded = store.load_run("batch-empty").await.unwrap().unwrap();
+        let loaded = store.load_run("u1", "batch-empty").await.unwrap().unwrap();
         assert_eq!(loaded.events.len(), 0);
         assert_eq!(loaded.last_event_idx, -1); // unchanged
     }
@@ -4495,16 +5348,117 @@ mod tests {
         let event = make_event("tool_result", json!({"output": "orphan"}));
 
         let batch_error = store
-            .append_events_batch("missing-run", std::slice::from_ref(&event))
+            .append_events_batch("u1", "missing-run", std::slice::from_ref(&event))
             .await
             .expect_err("non-empty batch append to unknown run must fail");
         assert!(batch_error.contains("run not found"));
 
         let single_error = store
-            .append_event("missing-run", event)
+            .append_event("u1", "missing-run", event)
             .await
             .expect_err("single append delegates to batch and must also fail");
         assert!(single_error.contains("run not found"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_run_store_rejects_wrong_owner_operations() {
+        let store = InMemoryRunStateStore::new();
+        let mut run = durable_run_record("owner-bound");
+        run.delegation_id = Some("delegation-1".to_string());
+        store.insert_run(run).await.unwrap();
+
+        assert!(store.load_run("u2", "owner-bound").await.unwrap().is_none());
+        assert!(
+            store
+                .load_run_projection("u2", "owner-bound")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_latest_checkpoint("u2", "owner-bound", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            !store
+                .update_run_status("u2", "owner-bound", "completed", None, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_run_status_if_current(
+                    "u2",
+                    "owner-bound",
+                    &["running"],
+                    "completed",
+                    None,
+                    None
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_run_usage("u2", "owner-bound", 10, 5, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .save_checkpoint(
+                    "u2",
+                    "owner-bound",
+                    r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"wrong-owner"}"#,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_retry_count("u2", "owner-bound", 3)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .find_sub_runs("u2", "delegation-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let append_error = store
+            .append_event(
+                "u2",
+                "owner-bound",
+                make_event("tool_result", json!({"output": "wrong owner"})),
+            )
+            .await
+            .expect_err("wrong-owner append must not mutate the run");
+        assert!(append_error.contains("run not found"));
+
+        let loaded = store.load_run("u1", "owner-bound").await.unwrap().unwrap();
+        assert_eq!(loaded.status, "running");
+        assert_eq!(loaded.total_prompt_tokens, 0);
+        assert_eq!(loaded.total_completion_tokens, 0);
+        assert_eq!(loaded.total_tool_calls, 0);
+        assert_eq!(loaded.retry_count, 0);
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+        assert!(loaded.checkpoint_json.is_none());
+        assert_eq!(
+            store
+                .find_sub_runs("u1", "delegation-1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -4514,11 +5468,15 @@ mod tests {
         store.insert_run(run).await.unwrap();
 
         store
-            .append_events_batch("batch-single", &[make_event("run_started", json!({}))])
+            .append_events_batch(
+                "u1",
+                "batch-single",
+                &[make_event("run_started", json!({}))],
+            )
             .await
             .unwrap();
 
-        let loaded = store.load_run("batch-single").await.unwrap().unwrap();
+        let loaded = store.load_run("u1", "batch-single").await.unwrap().unwrap();
         assert_eq!(loaded.events.len(), 1);
         assert_eq!(loaded.last_event_idx, 0);
     }
@@ -4543,15 +5501,22 @@ mod tests {
             .unwrap();
 
         store_batch
-            .append_events_batch("r-batch", &events)
+            .append_events_batch("u1", "r-batch", &events)
             .await
             .unwrap();
         for e in &events {
-            store_seq.append_event("r-seq", e.clone()).await.unwrap();
+            store_seq
+                .append_event("u1", "r-seq", e.clone())
+                .await
+                .unwrap();
         }
 
-        let batch = store_batch.load_run("r-batch").await.unwrap().unwrap();
-        let seq = store_seq.load_run("r-seq").await.unwrap().unwrap();
+        let batch = store_batch
+            .load_run("u1", "r-batch")
+            .await
+            .unwrap()
+            .unwrap();
+        let seq = store_seq.load_run("u1", "r-seq").await.unwrap().unwrap();
         assert_eq!(batch.events.len(), seq.events.len());
         assert_eq!(batch.last_event_idx, seq.last_event_idx);
         for (i, (be, se)) in batch.events.iter().zip(seq.events.iter()).enumerate() {

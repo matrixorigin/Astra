@@ -1,7 +1,7 @@
 //! Execution-time helpers for prompting and subtask scheduling.
 
 use astra_services::{
-    durable_task::VerifierKind,
+    VerifierKind,
     task_orchestrator::{SubtaskPlan, TaskPlan},
 };
 

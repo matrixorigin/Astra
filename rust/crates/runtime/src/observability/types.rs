@@ -206,7 +206,7 @@ pub struct QueryBehavior {
 /// the authoritative hash/bytes while the CLI-side preview stays
 /// empty for that channel.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct BridgeInjectionTexts<'a> {
+pub struct BridgeInjectionPreviews<'a> {
     pub lessons: &'a str,
     pub volatile: &'a str,
     pub memoria_insights: &'a str,
@@ -219,7 +219,7 @@ pub struct BridgeInjectionTexts<'a> {
     pub tool_round_guidance: &'a str,
 }
 
-impl BridgeInjectionTexts<'_> {
+impl BridgeInjectionPreviews<'_> {
     pub const EMPTY: Self = Self {
         lessons: "",
         volatile: "",

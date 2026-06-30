@@ -147,6 +147,9 @@ pub(crate) struct MemoriaContext<'a> {
     /// the summary client is constructed by the caller and injected below;
     /// this module stays decoupled from HTTP credentials.
     pub model_name: &'a str,
+    /// Registry/model-config context window. `None` means use the generic
+    /// 200K default; never infer this from the model name.
+    pub context_window: Option<u32>,
     /// Optional HTTP client for Memoria retrieval. `None` = skip retrieval,
     /// fall back to pure truncation.
     pub memoria_client: Option<&'a dyn MemoriaClient>,
@@ -203,6 +206,10 @@ impl BudgetOverrides {
 }
 
 impl<'a> MemoriaContext<'a> {
+    fn context_budget(&self) -> crate::prompts::ContextBudget {
+        crate::prompts::budget_for_model_with_override(Some(self.model_name), self.context_window)
+    }
+
     /// Run Memoria-based history compaction. Returns the full `CompactResult`
     /// so callers can react to `boundary.is_some()` (e.g. for the P2
     /// compaction context note).
@@ -231,7 +238,7 @@ impl<'a> MemoriaContext<'a> {
         visible_tools: &[Value],
         overrides: BudgetOverrides,
     ) -> CompactResult {
-        let budget = crate::prompts::budget_for_model(Some(self.model_name));
+        let budget = self.context_budget();
         // `current_tokens` is a pressure signal for Memoria retrieval; the
         // authoritative compaction tier is `self.tier` (or the override). The
         // cache-aware estimate just tunes retrieval aggressiveness, so we
@@ -753,6 +760,23 @@ mod tests {
         assert!(o.keep_recent_turns.is_none());
         assert!(o.current_tokens.is_none());
         assert!(o.tier.is_none());
+    }
+
+    #[test]
+    fn memoria_context_budget_uses_configured_context_window() {
+        let ctx = MemoriaContext {
+            session_id: "sid-1m",
+            model_name: "deepseek-v4-pro-official",
+            context_window: Some(1_000_000),
+            memoria_client: None,
+            summary_client: None,
+            tier: CompactionTier::Normal,
+            session_facts: None,
+            turn_number: 0,
+            observatory: None,
+        };
+
+        assert_eq!(ctx.context_budget().model_limit, 1_000_000);
     }
 
     #[test]

@@ -166,8 +166,11 @@ async fn l2_14_cold_start_known_zero_with_active_run_requires_replay() {
     .await;
 
     let transcript_hwm = sqlx::query(
-        "SELECT COALESCE(MAX(item_seq), 0) AS hwm FROM session_transcript_items WHERE session_id = ?",
+        "SELECT COALESCE(MAX(item_seq), 0) AS hwm
+         FROM session_transcript_items
+         WHERE user_id = ? AND session_id = ?",
     )
+    .bind(&user_id)
     .bind(&session_id)
     .fetch_one(pool.get())
     .await
@@ -392,10 +395,11 @@ async fn l3_4_s03_four_device_switches_restore_ordered_transcript() {
 
     let rows = sqlx::query(
         "SELECT item_seq, content FROM session_transcript_items
-         WHERE session_id = ? AND item_seq < ?
+         WHERE user_id = ? AND session_id = ? AND item_seq < ?
          ORDER BY item_seq DESC
          LIMIT 4",
     )
+    .bind(&user_id)
     .bind(&session_id)
     .bind(i64::MAX)
     .fetch_all(pool.get())

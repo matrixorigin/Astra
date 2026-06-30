@@ -5,19 +5,12 @@ use std::time::Duration;
 use serde_json::Value;
 use sqlx::{MySql, query};
 
+use astra_core::canonical_names::metadata_tool_name;
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnDecisionAuditRecord, TurnSkillSelectionRecord, TurnToolEventRecord,
 };
 use astra_turn_core::hook_plans::SnapshotLinkPlan;
 use astra_turn_core::trace_event::TraceEvent;
-
-fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String> {
-    metadata
-        .and_then(|v| v.get("tool_name").or_else(|| v.get("name")))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
-}
 
 fn metadata_duration_ms(metadata: Option<&serde_json::Value>) -> Option<i32> {
     metadata
@@ -30,10 +23,163 @@ fn mysql_datetime(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 
+const INSERT_CORE_TURN_EVENT_SQL: &str = "INSERT IGNORE INTO agent_events \
+         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
+          parent_event_id, causal_chain_id, turn_seq, token_usage, llm_model_used, llm_params, reasoning_content, \
+          token_input, token_output, token_total, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())";
+
+#[derive(Debug, PartialEq)]
+struct CoreTurnEventInsertValues {
+    turn_seq: Option<i64>,
+    token_usage_json: Option<String>,
+    llm_params_json: Option<String>,
+    token_input: Option<i64>,
+    token_output: Option<i64>,
+    token_total: Option<i64>,
+}
+
+#[derive(Debug, PartialEq)]
+struct TraceEventInsertValues {
+    token_usage_json: Option<String>,
+    token_input: Option<i64>,
+    token_output: Option<i64>,
+    token_total: Option<i64>,
+    metadata_json: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanonicalTokenUsageColumns {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_creation_tokens: i64,
+    token_input: i64,
+    token_output: i64,
+    token_total: i64,
+}
+
+fn token_usage_protocol_error(message: impl Into<String>) -> sqlx::Error {
+    sqlx::Error::Protocol(message.into())
+}
+
+fn canonical_token_count(value: &Value, field: &str) -> Result<i64, sqlx::Error> {
+    let raw = value.get(field).ok_or_else(|| {
+        token_usage_protocol_error(format!("token_usage missing canonical field `{field}`"))
+    })?;
+    let Some(raw) = raw.as_i64() else {
+        return Err(token_usage_protocol_error(format!(
+            "token_usage field `{field}` must be a non-negative integer, got {raw}"
+        )));
+    };
+    if raw < 0 {
+        return Err(token_usage_protocol_error(format!(
+            "token_usage field `{field}` must be non-negative, got {raw}"
+        )));
+    }
+    Ok(raw)
+}
+
+fn canonical_token_usage_columns(
+    token_usage: Option<&Value>,
+) -> Result<Option<CanonicalTokenUsageColumns>, sqlx::Error> {
+    let Some(value) = token_usage else {
+        return Ok(None);
+    };
+    if !value.is_object() {
+        return Err(token_usage_protocol_error(format!(
+            "token_usage must be a canonical JSON object, got {value}"
+        )));
+    }
+    let input = canonical_token_count(value, "input_tokens")?;
+    let cached = canonical_token_count(value, "cached_input_tokens")?;
+    let creation = canonical_token_count(value, "cache_creation_tokens")?;
+    let output = canonical_token_count(value, "output_tokens")?;
+    let total = canonical_token_count(value, "total_tokens")?;
+    let token_input = input
+        .checked_add(cached)
+        .and_then(|value| value.checked_add(creation))
+        .ok_or_else(|| token_usage_protocol_error("token_usage input column overflow"))?;
+    let expected_total = token_input
+        .checked_add(output)
+        .ok_or_else(|| token_usage_protocol_error("token_usage total column overflow"))?;
+    if total != expected_total {
+        return Err(token_usage_protocol_error(format!(
+            "token_usage total_tokens mismatch: expected {expected_total}, got {total}"
+        )));
+    }
+    Ok(Some(CanonicalTokenUsageColumns {
+        input_tokens: input,
+        cached_input_tokens: cached,
+        cache_creation_tokens: creation,
+        token_input,
+        token_output: output,
+        token_total: total,
+    }))
+}
+
+fn persisted_token_usage_json(
+    token_usage: Option<&Value>,
+    usage: Option<CanonicalTokenUsageColumns>,
+) -> Option<String> {
+    let token_usage = token_usage?;
+    let usage = usage?;
+    let mut token_usage = token_usage.clone();
+    if let Value::Object(ref mut obj) = token_usage {
+        obj.insert("input_tokens".into(), Value::from(usage.input_tokens));
+        obj.insert(
+            "cached_input_tokens".into(),
+            Value::from(usage.cached_input_tokens),
+        );
+        obj.insert(
+            "cache_creation_tokens".into(),
+            Value::from(usage.cache_creation_tokens),
+        );
+        obj.insert("output_tokens".into(), Value::from(usage.token_output));
+        obj.insert("total_tokens".into(), Value::from(usage.token_total));
+        obj.insert("prompt".into(), Value::from(usage.token_input));
+        obj.insert("completion".into(), Value::from(usage.token_output));
+        obj.insert("cache_read".into(), Value::from(usage.cached_input_tokens));
+        obj.insert(
+            "cache_write".into(),
+            Value::from(usage.cache_creation_tokens),
+        );
+        obj.insert("total".into(), Value::from(usage.token_total));
+    }
+    Some(token_usage.to_string())
+}
+
+fn core_turn_event_insert_values(
+    event: &TurnCoreEventRecord,
+) -> Result<CoreTurnEventInsertValues, sqlx::Error> {
+    let usage = canonical_token_usage_columns(event.token_usage.as_ref())?;
+    Ok(CoreTurnEventInsertValues {
+        turn_seq: event.turn_seq,
+        token_usage_json: persisted_token_usage_json(event.token_usage.as_ref(), usage),
+        llm_params_json: event.llm_params.as_ref().map(serde_json::Value::to_string),
+        token_input: usage.map(|usage| usage.token_input),
+        token_output: usage.map(|usage| usage.token_output),
+        token_total: usage.map(|usage| usage.token_total),
+    })
+}
+
+fn trace_event_insert_values(event: &TraceEvent) -> Result<TraceEventInsertValues, sqlx::Error> {
+    let usage = canonical_token_usage_columns(event.token_usage.as_ref())?;
+    Ok(TraceEventInsertValues {
+        token_usage_json: persisted_token_usage_json(event.token_usage.as_ref(), usage),
+        token_input: usage.map(|usage| usage.token_input),
+        token_output: usage.map(|usage| usage.token_output),
+        token_total: usage.map(|usage| usage.token_total),
+        metadata_json: event.metadata.to_string(),
+        created_at: mysql_datetime(event.created_at),
+    })
+}
+
 pub(crate) async fn insert_trace_event(
     tx: &mut sqlx::Transaction<'_, MySql>,
     event: &TraceEvent,
 ) -> Result<bool, sqlx::Error> {
+    let values = trace_event_insert_values(event)?;
     let result = query(
         "INSERT IGNORE INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
@@ -60,45 +206,24 @@ pub(crate) async fn insert_trace_event(
     .bind(&event.tool_call_id)
     .bind(&event.parent_agent_id)
     .bind(&event.trace_kind)
-    .bind(event.token_usage.as_ref().map(serde_json::Value::to_string))
+    .bind(values.token_usage_json)
     .bind(&event.llm_model_used)
     .bind(&event.reasoning_content)
-    .bind(event.token_usage.as_ref().and_then(|v| {
-        let prompt = v
-            .get("prompt")
-            .or_else(|| v.get("input_tokens"))
-            .and_then(Value::as_i64)?;
-        let cached = v
-            .get("cached_input_tokens")
-            .or_else(|| v.get("cache_read_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let creation = v
-            .get("cache_creation_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        Some(prompt + cached + creation)
-    }))
-    .bind(event.token_usage.as_ref().and_then(|v| {
-        v.get("completion")
-            .or_else(|| v.get("output_tokens"))
-            .and_then(Value::as_i64)
-    }))
-    .bind(event.token_usage.as_ref().and_then(|v| {
-        v.get("total")
-            .or_else(|| v.get("total_tokens"))
-            .and_then(Value::as_i64)
-    }))
+    .bind(values.token_input)
+    .bind(values.token_output)
+    .bind(values.token_total)
     .bind(&event.meta_tool_name)
     .bind(event.meta_duration_ms)
-    .bind(Some(event.metadata.to_string()))
-    .bind(mysql_datetime(event.created_at))
+    .bind(values.metadata_json)
+    .bind(values.created_at)
     .execute(&mut **tx)
     .await?;
     let inserted = result.rows_affected() > 0;
     if inserted {
         insert_agent_event_edges(
             &mut **tx,
+            &event.user_id,
+            &event.session_id,
             &event.event_id,
             event.parent_event_id.as_deref(),
             event
@@ -116,44 +241,33 @@ pub(crate) async fn insert_core_turn_event(
     tx: &mut sqlx::Transaction<'_, MySql>,
     event: &TurnCoreEventRecord,
 ) -> Result<bool, sqlx::Error> {
-    let result = query(
-        "INSERT IGNORE INTO agent_events \
-         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-          parent_event_id, causal_chain_id, turn_seq, token_usage, llm_model_used, llm_params, reasoning_content, \
-          token_input, token_output, token_total, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-    )
-    .bind(&event.event_id)
-    .bind(&event.session_id)
-    .bind(&event.user_id)
-    .bind(event.agent_id.as_deref().unwrap_or("astra-cli"))
-    .bind(env!("CARGO_PKG_VERSION"))
-    .bind(&event.event_type)
-    .bind(&event.content)
-    .bind(&event.parent_event_id)
-    .bind(&event.causal_chain_id)
-    .bind(event.turn_seq)
-    .bind(event.token_usage.as_ref().map(serde_json::Value::to_string))
-    .bind(&event.llm_model_used)
-    .bind(event.llm_params.as_ref().map(serde_json::Value::to_string))
-    .bind(&event.reasoning_content)
-    // `token_usage` uses the canonical shape produced by
-    // `turn::token_usage::TokenUsage::to_json_map`. The `input_tokens` column
-    // records billable input = fresh + cached + creation.
-    .bind(event.token_usage.as_ref().and_then(|v| {
-        let input = v.get("input_tokens").and_then(Value::as_i64)?;
-        let cached = v.get("cached_input_tokens").and_then(Value::as_i64).unwrap_or(0);
-        let creation = v.get("cache_creation_tokens").and_then(Value::as_i64).unwrap_or(0);
-        Some(input + cached + creation)
-    }))
-    .bind(event.token_usage.as_ref().and_then(|v| v.get("output_tokens")).and_then(|v| v.as_i64()))
-    .bind(event.token_usage.as_ref().and_then(|v| v.get("total_tokens")).and_then(|v| v.as_i64()))
-    .execute(&mut **tx)
-    .await?;
+    let values = core_turn_event_insert_values(event)?;
+    let result = query(INSERT_CORE_TURN_EVENT_SQL)
+        .bind(&event.event_id)
+        .bind(&event.session_id)
+        .bind(&event.user_id)
+        .bind(event.agent_id.as_deref().unwrap_or("astra-cli"))
+        .bind(env!("CARGO_PKG_VERSION"))
+        .bind(&event.event_type)
+        .bind(&event.content)
+        .bind(&event.parent_event_id)
+        .bind(&event.causal_chain_id)
+        .bind(values.turn_seq)
+        .bind(values.token_usage_json)
+        .bind(&event.llm_model_used)
+        .bind(values.llm_params_json)
+        .bind(&event.reasoning_content)
+        .bind(values.token_input)
+        .bind(values.token_output)
+        .bind(values.token_total)
+        .execute(&mut **tx)
+        .await?;
     let inserted = result.rows_affected() > 0;
     if inserted {
         insert_agent_event_edges(
             &mut **tx,
+            &event.user_id,
+            &event.session_id,
             &event.event_id,
             event.parent_event_id.as_deref(),
             &event.parent_event_ids,
@@ -196,6 +310,8 @@ pub(crate) async fn insert_tool_turn_event(
     if inserted {
         insert_agent_event_edges(
             &mut **tx,
+            &event.user_id,
+            &event.session_id,
             &event.event_id,
             event.parent_event_id.as_deref(),
             &event.parent_event_ids,
@@ -229,18 +345,178 @@ pub(crate) async fn insert_turn_decision_audit(
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        INSERT_CORE_TURN_EVENT_SQL, core_turn_event_insert_values, metadata_tool_name,
+        trace_event_insert_values,
+    };
+    use astra_turn_core::contracts::TurnCoreEventRecord;
+    use astra_turn_core::trace_event::TraceEvent;
+
     #[test]
     fn core_turn_event_insert_persists_turn_seq() {
-        let source = include_str!("storage.rs");
         assert!(
-            source.contains(
+            INSERT_CORE_TURN_EVENT_SQL.contains(
                 "parent_event_id, causal_chain_id, turn_seq, token_usage, llm_model_used"
             ),
             "core turn events must persist turn_seq so session_turn inference has a fact source"
         );
+        assert_eq!(
+            INSERT_CORE_TURN_EVENT_SQL.matches('?').count(),
+            17,
+            "core turn event insert SQL placeholder count must match its bound values"
+        );
+    }
+
+    fn core_event_with_token_usage(token_usage: Option<serde_json::Value>) -> TurnCoreEventRecord {
+        TurnCoreEventRecord {
+            event_id: "evt-1".to_string(),
+            user_id: "user-1".to_string(),
+            session_id: "session-1".to_string(),
+            agent_id: None,
+            event_type: "llm_response".to_string(),
+            content: "done".to_string(),
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: "chain-1".to_string(),
+            turn_seq: Some(42),
+            llm_model_used: Some("model-1".to_string()),
+            token_usage,
+            llm_params: Some(serde_json::json!({"temperature": 0.2})),
+            reasoning_content: None,
+        }
+    }
+
+    fn canonical_token_usage() -> serde_json::Value {
+        serde_json::json!({
+            "input_tokens": 10,
+            "cached_input_tokens": 4,
+            "cache_creation_tokens": 3,
+            "output_tokens": 5,
+            "total_tokens": 22
+        })
+    }
+
+    #[test]
+    fn core_turn_event_insert_values_preserve_turn_seq_and_token_columns() {
+        let event = core_event_with_token_usage(Some(canonical_token_usage()));
+
+        let values = core_turn_event_insert_values(&event).expect("canonical token usage");
+
+        assert_eq!(values.turn_seq, Some(42));
+        assert_eq!(values.token_input, Some(17));
+        assert_eq!(values.token_output, Some(5));
+        assert_eq!(values.token_total, Some(22));
         assert!(
-            source.contains(".bind(event.turn_seq)"),
-            "core turn event insert must bind TurnCoreEventRecord.turn_seq"
+            values
+                .token_usage_json
+                .as_deref()
+                .is_some_and(|json| json.contains("\"input_tokens\":10"))
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_str(values.token_usage_json.as_deref().unwrap()).unwrap();
+        assert_eq!(persisted["prompt"], 17);
+        assert_eq!(persisted["completion"], 5);
+        assert_eq!(persisted["cache_read"], 4);
+        assert_eq!(persisted["cache_write"], 3);
+        assert_eq!(persisted["total"], 22);
+        assert_eq!(
+            values.llm_params_json.as_deref(),
+            Some("{\"temperature\":0.2}")
+        );
+    }
+
+    #[test]
+    fn trace_event_insert_values_preserve_canonical_token_columns() {
+        let mut event = TraceEvent::new(
+            "trace-1",
+            "session-1",
+            "user-1",
+            "llm_round_completed",
+            "llm_round",
+        );
+        event.token_usage = Some(canonical_token_usage());
+
+        let values = trace_event_insert_values(&event).expect("canonical token usage");
+
+        assert_eq!(values.token_input, Some(17));
+        assert_eq!(values.token_output, Some(5));
+        assert_eq!(values.token_total, Some(22));
+        assert!(
+            values
+                .token_usage_json
+                .as_deref()
+                .is_some_and(|json| json.contains("\"input_tokens\":10"))
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_str(values.token_usage_json.as_deref().unwrap()).unwrap();
+        assert_eq!(persisted["prompt"], 17);
+        assert_eq!(persisted["completion"], 5);
+        assert_eq!(persisted["cache_read"], 4);
+        assert_eq!(persisted["cache_write"], 3);
+        assert_eq!(persisted["total"], 22);
+    }
+
+    #[test]
+    fn metadata_tool_name_requires_explicit_tool_name() {
+        assert_eq!(
+            metadata_tool_name(Some(&serde_json::json!({"tool_name": " bash "}))).as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            metadata_tool_name(Some(
+                &serde_json::json!({"tool_name": "preferred", "name": "read_file"})
+            ))
+            .as_deref(),
+            Some("preferred")
+        );
+        assert!(metadata_tool_name(Some(&serde_json::json!({"name": "read_file"}))).is_none());
+    }
+
+    #[test]
+    fn token_usage_columns_fail_loudly_on_noncanonical_usage() {
+        let missing_field = core_event_with_token_usage(Some(serde_json::json!({
+            "cached_input_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": 5,
+            "total_tokens": 5,
+        })));
+        let err = core_turn_event_insert_values(&missing_field)
+            .expect_err("missing canonical field must fail");
+        assert!(
+            err.to_string().contains("input_tokens"),
+            "error should identify missing canonical field: {err}"
+        );
+
+        let mismatched_total = core_event_with_token_usage(Some(serde_json::json!({
+            "input_tokens": 10,
+            "cached_input_tokens": 4,
+            "cache_creation_tokens": 3,
+            "output_tokens": 5,
+            "total_tokens": 21,
+        })));
+        let err = core_turn_event_insert_values(&mismatched_total)
+            .expect_err("mismatched total must fail");
+        assert!(
+            err.to_string().contains("total_tokens mismatch"),
+            "error should identify total mismatch: {err}"
+        );
+
+        let mut trace = TraceEvent::new(
+            "trace-bad",
+            "session-1",
+            "user-1",
+            "llm_round_completed",
+            "llm_round",
+        );
+        trace.token_usage = Some(serde_json::json!({
+            "prompt": 10,
+            "completion": 5,
+            "total": 15,
+        }));
+        let err = trace_event_insert_values(&trace).expect_err("alternate token dialect must fail");
+        assert!(
+            err.to_string().contains("input_tokens"),
+            "trace token usage must be canonical-only: {err}"
         );
     }
 }

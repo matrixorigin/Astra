@@ -25,6 +25,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+use crate::db_row::{
+    RowExt as LearningStatsDbRow, RowExt as TaskListDbRow, RowExt as TaskRecordDbRow,
+    RowExt as TaskStatusGuardDbRow, RowExt as TemplateRecommendationDbRow,
+};
 use crate::verification::VerifierKind;
 
 // ─── Task Model ─────────────────────────────────────────────────────────────
@@ -360,8 +364,8 @@ pub trait TaskService: Send + Sync {
         req: TaskCreateRequest,
     ) -> Result<String, String>;
 
-    /// Get a task by ID.
-    async fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>, String>;
+    /// Get a task by owner and ID.
+    async fn get_task(&self, user_id: &str, task_id: &str) -> Result<Option<TaskRecord>, String>;
 
     /// List recent task history for a user (optionally filter by status).
     async fn list_recent_tasks(
@@ -410,11 +414,17 @@ pub trait TaskService: Send + Sync {
     ) -> Result<Vec<TaskListItem>, String>;
 
     /// Update task status.
-    async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String>;
+    async fn update_status(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        status: TaskStatus,
+    ) -> Result<(), String>;
 
     /// Update progress counters.
     async fn update_progress(
         &self,
+        user_id: &str,
         task_id: &str,
         progress_pct: u32,
         items_done: u32,
@@ -424,18 +434,24 @@ pub trait TaskService: Send + Sync {
     /// Save a checkpoint (resumable state).
     async fn save_checkpoint(
         &self,
+        user_id: &str,
         task_id: &str,
         checkpoint: &TaskCheckpoint,
     ) -> Result<(), String>;
 
     /// Update the plan (e.g., mark subtask as done).
-    async fn update_plan(&self, task_id: &str, plan: &TaskPlan) -> Result<(), String>;
+    async fn update_plan(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        plan: &TaskPlan,
+    ) -> Result<(), String>;
 
     /// Mark task as failed with error message.
-    async fn fail_task(&self, task_id: &str, error: &str) -> Result<(), String>;
+    async fn fail_task(&self, user_id: &str, task_id: &str, error: &str) -> Result<(), String>;
 
     /// Mark task as completed.
-    async fn complete_task(&self, task_id: &str) -> Result<(), String>;
+    async fn complete_task(&self, user_id: &str, task_id: &str) -> Result<(), String>;
 
     /// Mark a non-plan task as completed with an explicit outcome.
     ///
@@ -443,6 +459,7 @@ pub trait TaskService: Send + Sync {
     /// subtask progress but may still finish partially.
     async fn complete_task_with_outcome(
         &self,
+        user_id: &str,
         task_id: &str,
         outcome: TaskOutcome,
     ) -> Result<(), String>;
@@ -453,6 +470,7 @@ pub trait TaskService: Send + Sync {
     /// Used when the background plan executor finishes so job status matches delivery state.
     async fn complete_plan_run(
         &self,
+        user_id: &str,
         task_id: &str,
         progress_pct: u32,
         items_done: u32,
@@ -463,6 +481,7 @@ pub trait TaskService: Send + Sync {
     /// Record user feedback for learning.
     async fn record_feedback(
         &self,
+        user_id: &str,
         task_id: &str,
         rating: u8,
         outcome: TaskOutcome,
@@ -470,7 +489,7 @@ pub trait TaskService: Send + Sync {
     ) -> Result<(), String>;
 
     /// Increment replan count.
-    async fn increment_replan_count(&self, task_id: &str) -> Result<(), String>;
+    async fn increment_replan_count(&self, user_id: &str, task_id: &str) -> Result<(), String>;
 
     // ─── Learning Methods ───
 
@@ -478,6 +497,7 @@ pub trait TaskService: Send + Sync {
     /// Returns the template_id if created.
     async fn extract_template(
         &self,
+        user_id: &str,
         task_id: &str,
         goal_pattern: &str,
     ) -> Result<Option<String>, String>;
@@ -499,7 +519,7 @@ pub trait TaskService: Send + Sync {
     ) -> Result<LearningStats, String>;
 
     /// Increment template use count (called when a template is instantiated).
-    async fn record_template_usage(&self, template_id: &str) -> Result<(), String>;
+    async fn record_template_usage(&self, user_id: &str, template_id: &str) -> Result<(), String>;
 }
 
 // ─── MatrixOne Implementation ───────────────────────────────────────────────
@@ -513,6 +533,13 @@ const MAX_TASK_LIST_ROWS: usize = 200;
 const MAX_TASK_QUERY_MATCH_ROWS: usize = 8;
 const AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD: &str =
     "AND status IN ('pending', 'in_progress', 'paused')";
+
+fn guarded_agent_task_update_sql(set_clause: &str) -> String {
+    format!(
+        "UPDATE agent_tasks SET {set_clause} \
+         WHERE user_id = ? AND task_id = ? {AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD}"
+    )
+}
 
 fn task_query_match_rank(task_id: &str, title: &str, query: &str) -> Option<u8> {
     if task_id == query {
@@ -581,10 +608,396 @@ pub(crate) const AGENT_TASK_LIST_SELECT_COLUMNS: &str = "task_id, user_id, sessi
      NULL AS description, status, progress_pct, items_done, items_total, \
      NULL AS plan_json, NULL AS checkpoint_json, error_message, \
      user_rating, completion_time_sec, replan_count, auto_adjustments, \
-     outcome, project_type, goal_pattern, agent_id, \
+     outcome, project_type, goal_pattern, agent_id, NULL AS claimability, \
      CAST(created_at AS CHAR) AS created_at, \
      CAST(updated_at AS CHAR) AS updated_at, \
      completed_at";
+
+fn decode_task_status_guard_row(
+    row: &impl TaskStatusGuardDbRow,
+    task_id: &str,
+) -> Result<TaskStatus, String> {
+    let raw = row
+        .string_column("status")
+        .map_err(|e| format!("task status guard row decode `status`: {e}"))?;
+    TaskStatus::parse_status(&raw)
+        .ok_or_else(|| format!("task {task_id} has unknown persisted status: {raw}"))
+}
+
+fn task_list_decode_error(context: &str, column: &'static str, error: sqlx::Error) -> String {
+    format!("task list {context} decode `{column}`: {error}")
+}
+
+fn task_list_optional_string(
+    row: &impl TaskListDbRow,
+    column: &'static str,
+) -> Result<Option<String>, String> {
+    row.optional_string_column(column)
+        .map_err(|e| task_list_decode_error("row", column, e))
+}
+
+fn task_list_non_negative_u32(
+    row: &impl TaskListDbRow,
+    column: &'static str,
+) -> Result<u32, String> {
+    let value = row
+        .i32_column(column)
+        .map_err(|e| task_list_decode_error("row", column, e))?;
+    u32::try_from(value).map_err(|_| {
+        format!("task list row decode `{column}` expected non-negative integer, got {value}")
+    })
+}
+
+fn task_list_progress_pct(row: &impl TaskListDbRow) -> Result<u32, String> {
+    let value = task_list_non_negative_u32(row, "progress_pct")?;
+    if value > 100 {
+        return Err(format!(
+            "task list row decode `progress_pct` expected 0..=100, got {value}"
+        ));
+    }
+    Ok(value)
+}
+
+fn task_list_outcome(row: &impl TaskListDbRow) -> Result<Option<TaskOutcome>, String> {
+    let Some(raw) = task_list_optional_string(row, "outcome")? else {
+        return Ok(None);
+    };
+    TaskOutcome::parse(&raw)
+        .map(Some)
+        .ok_or_else(|| format!("task list row decode `outcome` unknown value: {raw}"))
+}
+
+fn task_list_claimability(row: &impl TaskListDbRow) -> Result<Option<TaskClaimability>, String> {
+    let Some(raw) = task_list_optional_string(row, "claimability")? else {
+        return Ok(None);
+    };
+    TaskClaimability::parse(&raw)
+        .map(Some)
+        .ok_or_else(|| format!("task list row decode `claimability` unknown value: {raw}"))
+}
+
+fn decode_task_list_item(row: &impl TaskListDbRow) -> Result<TaskListItem, String> {
+    let status_str = row
+        .string_column("status")
+        .map_err(|e| task_list_decode_error("row", "status", e))?;
+    let status = TaskStatus::parse_status(&status_str)
+        .ok_or_else(|| format!("unknown persisted task status: {status_str}"))?;
+
+    Ok(TaskListItem {
+        task_id: row
+            .string_column("task_id")
+            .map_err(|e| task_list_decode_error("row", "task_id", e))?,
+        title: row
+            .string_column("title")
+            .map_err(|e| task_list_decode_error("row", "title", e))?,
+        session_id: task_list_optional_string(row, "session_id")?,
+        status,
+        progress_pct: task_list_progress_pct(row)?,
+        items_done: task_list_non_negative_u32(row, "items_done")?,
+        items_total: task_list_non_negative_u32(row, "items_total")?,
+        created_at: row
+            .string_column("created_at")
+            .map_err(|e| task_list_decode_error("row", "created_at", e))?,
+        updated_at: row
+            .string_column("updated_at")
+            .map_err(|e| task_list_decode_error("row", "updated_at", e))?,
+        completed_at: task_list_optional_string(row, "completed_at")?,
+        outcome: task_list_outcome(row)?,
+        error_message: task_list_optional_string(row, "error_message")?,
+        project_type: task_list_optional_string(row, "project_type")?,
+        claimability: task_list_claimability(row)?,
+    })
+}
+
+fn template_recommendation_decode_error(
+    column: &'static str,
+    error: impl std::fmt::Display,
+) -> String {
+    format!("template recommendation row decode `{column}`: {error}")
+}
+
+fn template_recommendation_string(
+    row: &impl TemplateRecommendationDbRow,
+    column: &'static str,
+) -> Result<String, String> {
+    row.string_column(column)
+        .map_err(|e| template_recommendation_decode_error(column, e))
+}
+
+fn template_recommendation_optional_string(
+    row: &impl TemplateRecommendationDbRow,
+    column: &'static str,
+) -> Result<Option<String>, String> {
+    row.optional_string_column(column)
+        .map_err(|e| template_recommendation_decode_error(column, e))
+}
+
+fn template_recommendation_i32(
+    row: &impl TemplateRecommendationDbRow,
+    column: &'static str,
+) -> Result<i32, String> {
+    row.i32_column(column)
+        .map_err(|e| template_recommendation_decode_error(column, e))
+}
+
+fn template_recommendation_non_negative_u32(
+    row: &impl TemplateRecommendationDbRow,
+    column: &'static str,
+) -> Result<u32, String> {
+    let value = template_recommendation_i32(row, column)?;
+    u32::try_from(value).map_err(|_| {
+        template_recommendation_decode_error(
+            column,
+            format!("expected non-negative integer, got {value}"),
+        )
+    })
+}
+
+fn template_recommendation_optional_i32(
+    row: &impl TemplateRecommendationDbRow,
+    column: &'static str,
+) -> Result<Option<i32>, String> {
+    row.optional_i32_column(column)
+        .map_err(|e| template_recommendation_decode_error(column, e))
+}
+
+fn template_recommendation_f32(
+    row: &impl TemplateRecommendationDbRow,
+    column: &'static str,
+) -> Result<f32, String> {
+    row.f32_column(column)
+        .map_err(|e| template_recommendation_decode_error(column, e))
+}
+
+fn template_recommendation_is_own(row: &impl TemplateRecommendationDbRow) -> Result<bool, String> {
+    match template_recommendation_i32(row, "is_own")? {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(template_recommendation_decode_error(
+            "is_own",
+            format!("expected 0 or 1, got {value}"),
+        )),
+    }
+}
+
+fn decode_template_recommendation(
+    row: &impl TemplateRecommendationDbRow,
+) -> Result<TemplateRecommendation, String> {
+    let template_json = template_recommendation_string(row, "template_json")?;
+    let template_plan: TaskPlan = serde_json::from_str(&template_json)
+        .map_err(|e| template_recommendation_decode_error("template_json", e))?;
+    let is_own = template_recommendation_is_own(row)?;
+    let goal_pattern = template_recommendation_string(row, "goal_pattern")?;
+    let use_count = template_recommendation_non_negative_u32(row, "use_count")?;
+    let reason = if is_own {
+        format!("Your successful pattern: {goal_pattern}")
+    } else {
+        format!("Community pattern ({use_count}x used): {goal_pattern}")
+    };
+
+    Ok(TemplateRecommendation {
+        template: PlanTemplate {
+            template_id: template_recommendation_string(row, "template_id")?,
+            user_id: template_recommendation_optional_string(row, "user_id")?,
+            goal_pattern,
+            project_type: template_recommendation_optional_string(row, "project_type")?,
+            template: template_plan,
+            success_rate: template_recommendation_f32(row, "success_rate")?,
+            avg_completion_time: template_recommendation_optional_i32(row, "avg_completion_time")?,
+            use_count,
+            created_at: template_recommendation_string(row, "created_at")?,
+            updated_at: template_recommendation_string(row, "updated_at")?,
+        },
+        score: template_recommendation_f32(row, "score")?,
+        reason,
+    })
+}
+
+fn learning_stats_decode_error(column: &'static str, error: impl std::fmt::Display) -> String {
+    format!("learning stats row decode `{column}`: {error}")
+}
+
+fn learning_stats_non_negative_u32(
+    row: &impl LearningStatsDbRow,
+    column: &'static str,
+) -> Result<u32, String> {
+    let value = row
+        .i64_column(column)
+        .map_err(|e| learning_stats_decode_error(column, e))?;
+    u32::try_from(value).map_err(|_| {
+        learning_stats_decode_error(
+            column,
+            format!("expected non-negative integer, got {value}"),
+        )
+    })
+}
+
+fn learning_stats_optional_f32(
+    row: &impl LearningStatsDbRow,
+    column: &'static str,
+) -> Result<Option<f32>, String> {
+    row.optional_f32_column(column)
+        .map_err(|e| learning_stats_decode_error(column, e))
+}
+
+fn decode_learning_stats(row: &impl LearningStatsDbRow) -> Result<LearningStats, String> {
+    let total_tasks = learning_stats_non_negative_u32(row, "total_tasks")?;
+    let completed_tasks = learning_stats_non_negative_u32(row, "completed_tasks")?;
+    if completed_tasks > total_tasks {
+        return Err(format!(
+            "learning stats row decode `completed_tasks` expected <= total_tasks {total_tasks}, got {completed_tasks}"
+        ));
+    }
+    let avg_rating = learning_stats_optional_f32(row, "avg_rating")?;
+    let avg_replan_count =
+        learning_stats_optional_f32(row, "avg_replan_count")?.unwrap_or_default();
+
+    let inferred_success_rate = if total_tasks == 0 {
+        0.0
+    } else {
+        let completion_factor = completed_tasks as f32 / total_tasks as f32;
+        let replan_penalty = (avg_replan_count / 3.0).min(1.0);
+        (completion_factor * (1.0 - replan_penalty * 0.3)).clamp(0.0, 1.0)
+    };
+
+    Ok(LearningStats {
+        total_tasks,
+        completed_tasks,
+        avg_rating,
+        avg_replan_count,
+        inferred_success_rate,
+    })
+}
+
+fn task_record_decode_error(context: &str, column: &'static str, error: sqlx::Error) -> String {
+    format!("task record {context} decode `{column}`: {error}")
+}
+
+fn task_record_optional_string(
+    row: &impl TaskRecordDbRow,
+    column: &'static str,
+) -> Result<Option<String>, String> {
+    row.optional_string_column(column)
+        .map_err(|e| task_record_decode_error("row", column, e))
+}
+
+fn task_record_non_negative_u32(
+    row: &impl TaskRecordDbRow,
+    column: &'static str,
+) -> Result<u32, String> {
+    let value = row
+        .i32_column(column)
+        .map_err(|e| task_record_decode_error("row", column, e))?;
+    u32::try_from(value).map_err(|_| {
+        format!("task record row decode `{column}` expected non-negative integer, got {value}")
+    })
+}
+
+fn task_record_progress_pct(row: &impl TaskRecordDbRow) -> Result<u32, String> {
+    let value = task_record_non_negative_u32(row, "progress_pct")?;
+    if value > 100 {
+        return Err(format!(
+            "task record row decode `progress_pct` expected 0..=100, got {value}"
+        ));
+    }
+    Ok(value)
+}
+
+fn task_record_optional_non_negative_i32(
+    row: &impl TaskRecordDbRow,
+    column: &'static str,
+) -> Result<Option<i32>, String> {
+    let Some(value) = row
+        .optional_i32_column(column)
+        .map_err(|e| task_record_decode_error("row", column, e))?
+    else {
+        return Ok(None);
+    };
+    if value < 0 {
+        return Err(format!(
+            "task record row decode `{column}` expected non-negative integer, got {value}"
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn task_record_user_rating(row: &impl TaskRecordDbRow) -> Result<Option<u8>, String> {
+    let Some(value) = row
+        .optional_i8_column("user_rating")
+        .map_err(|e| task_record_decode_error("row", "user_rating", e))?
+    else {
+        return Ok(None);
+    };
+    u8::try_from(value).map(Some).map_err(|_| {
+        format!("task record row decode `user_rating` expected non-negative integer, got {value}")
+    })
+}
+
+fn task_record_optional_json<T: serde::de::DeserializeOwned>(
+    row: &impl TaskRecordDbRow,
+    column: &'static str,
+) -> Result<Option<T>, String> {
+    let Some(raw) = task_record_optional_string(row, column)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|e| format!("task record row decode `{column}` invalid JSON: {e}"))
+}
+
+fn task_record_outcome(row: &impl TaskRecordDbRow) -> Result<Option<TaskOutcome>, String> {
+    let Some(raw) = task_record_optional_string(row, "outcome")? else {
+        return Ok(None);
+    };
+    TaskOutcome::parse(&raw)
+        .map(Some)
+        .ok_or_else(|| format!("task record row decode `outcome` unknown value: {raw}"))
+}
+
+fn decode_task_record(row: &impl TaskRecordDbRow) -> Result<TaskRecord, String> {
+    let status_str = row
+        .string_column("status")
+        .map_err(|e| task_record_decode_error("row", "status", e))?;
+    let status = TaskStatus::parse_status(&status_str)
+        .ok_or_else(|| format!("unknown persisted task status: {status_str}"))?;
+
+    Ok(TaskRecord {
+        task_id: row
+            .string_column("task_id")
+            .map_err(|e| task_record_decode_error("row", "task_id", e))?,
+        user_id: row
+            .string_column("user_id")
+            .map_err(|e| task_record_decode_error("row", "user_id", e))?,
+        session_id: task_record_optional_string(row, "session_id")?,
+        parent_task_id: task_record_optional_string(row, "parent_task_id")?,
+        title: row
+            .string_column("title")
+            .map_err(|e| task_record_decode_error("row", "title", e))?,
+        description: task_record_optional_string(row, "description")?,
+        status,
+        progress_pct: task_record_progress_pct(row)?,
+        items_done: task_record_non_negative_u32(row, "items_done")?,
+        items_total: task_record_non_negative_u32(row, "items_total")?,
+        plan: task_record_optional_json(row, "plan_json")?,
+        checkpoint: task_record_optional_json(row, "checkpoint_json")?,
+        error_message: task_record_optional_string(row, "error_message")?,
+        created_at: row
+            .string_column("created_at")
+            .map_err(|e| task_record_decode_error("row", "created_at", e))?,
+        updated_at: row
+            .string_column("updated_at")
+            .map_err(|e| task_record_decode_error("row", "updated_at", e))?,
+        completed_at: task_record_optional_string(row, "completed_at")?,
+        user_rating: task_record_user_rating(row)?,
+        completion_time_sec: task_record_optional_non_negative_i32(row, "completion_time_sec")?,
+        replan_count: task_record_non_negative_u32(row, "replan_count")?,
+        auto_adjustments: task_record_non_negative_u32(row, "auto_adjustments")?,
+        outcome: task_record_outcome(row)?,
+        project_type: task_record_optional_string(row, "project_type")?,
+        goal_pattern: task_record_optional_string(row, "goal_pattern")?,
+        agent_id: task_record_optional_string(row, "agent_id")?,
+    })
+}
 
 impl MatrixOneTaskService {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
@@ -599,53 +1012,7 @@ impl MatrixOneTaskService {
 
     /// Parse a row from `agent_tasks` (shared with task pack sync / multi-agent helpers).
     pub fn parse_mysql_row(row: &sqlx::mysql::MySqlRow) -> Result<TaskRecord, String> {
-        use sqlx::Row;
-
-        let plan_json: Option<String> = row.try_get("plan_json").ok().flatten();
-        let plan: Option<TaskPlan> = plan_json
-            .as_deref()
-            .and_then(|j| serde_json::from_str(j).ok());
-
-        let ckpt_json: Option<String> = row.try_get("checkpoint_json").ok().flatten();
-        let checkpoint: Option<TaskCheckpoint> = ckpt_json
-            .as_deref()
-            .and_then(|j| serde_json::from_str(j).ok());
-
-        let status_str: String = row.try_get("status").map_err(|e| e.to_string())?;
-        let status = TaskStatus::parse_status(&status_str)
-            .ok_or_else(|| format!("unknown persisted task status: {status_str}"))?;
-
-        // Learning fields (may not exist in older schemas)
-        let outcome_str: Option<String> = row.try_get("outcome").ok().flatten();
-        let outcome = outcome_str.as_deref().and_then(TaskOutcome::parse);
-
-        Ok(TaskRecord {
-            task_id: row.try_get("task_id").map_err(|e| e.to_string())?,
-            user_id: row.try_get("user_id").map_err(|e| e.to_string())?,
-            session_id: row.try_get("session_id").ok().flatten(),
-            parent_task_id: row.try_get("parent_task_id").ok().flatten(),
-            title: row.try_get("title").map_err(|e| e.to_string())?,
-            description: row.try_get("description").ok().flatten(),
-            status,
-            progress_pct: row.try_get::<i32, _>("progress_pct").unwrap_or(0) as u32,
-            items_done: row.try_get::<i32, _>("items_done").unwrap_or(0) as u32,
-            items_total: row.try_get::<i32, _>("items_total").unwrap_or(0) as u32,
-            plan,
-            checkpoint,
-            error_message: row.try_get("error_message").ok().flatten(),
-            created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
-            updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
-            completed_at: row.try_get("completed_at").ok().flatten(),
-            // Learning fields
-            user_rating: row.try_get::<i8, _>("user_rating").ok().map(|r| r as u8),
-            completion_time_sec: row.try_get("completion_time_sec").ok(),
-            replan_count: row.try_get::<i32, _>("replan_count").unwrap_or(0) as u32,
-            auto_adjustments: row.try_get::<i32, _>("auto_adjustments").unwrap_or(0) as u32,
-            outcome,
-            project_type: row.try_get("project_type").ok().flatten(),
-            goal_pattern: row.try_get("goal_pattern").ok().flatten(),
-            agent_id: row.try_get("agent_id").ok().flatten(),
-        })
+        decode_task_record(row)
     }
 
     /// Convert a 0-rows-affected outcome from a guarded UPDATE into a structured
@@ -653,11 +1020,12 @@ impl MatrixOneTaskService {
     /// reading the row's current status.
     async fn report_terminal_guard_violation(
         &self,
+        user_id: &str,
         task_id: &str,
         attempted: &str,
     ) -> Result<(), String> {
-        use sqlx::Row;
-        let row = sqlx::query("SELECT status FROM agent_tasks WHERE task_id = ?")
+        let row = sqlx::query("SELECT status FROM agent_tasks WHERE user_id = ? AND task_id = ?")
+            .bind(user_id)
             .bind(task_id)
             .fetch_optional(&self.pool)
             .await
@@ -665,9 +1033,7 @@ impl MatrixOneTaskService {
         match row {
             None => Err(format!("task not found: {task_id}")),
             Some(r) => {
-                let cur: String = r.try_get("status").unwrap_or_default();
-                let cur_status = TaskStatus::parse_status(&cur)
-                    .ok_or_else(|| format!("task {task_id} has unknown persisted status: {cur}"))?;
+                let cur_status = decode_task_status_guard_row(&r, task_id)?;
                 if cur_status.is_terminal() {
                     Err(format!(
                         "invalid task status transition: {} → {} (terminal states are immutable)",
@@ -688,32 +1054,7 @@ impl MatrixOneTaskService {
     }
 
     pub fn parse_mysql_list_row(row: &sqlx::mysql::MySqlRow) -> Result<TaskListItem, String> {
-        use sqlx::Row;
-
-        let status_str: String = row.try_get("status").map_err(|e| e.to_string())?;
-        let status = TaskStatus::parse_status(&status_str)
-            .ok_or_else(|| format!("unknown persisted task status: {status_str}"))?;
-        let outcome_str: Option<String> = row.try_get("outcome").ok().flatten();
-        let outcome = outcome_str.as_deref().and_then(TaskOutcome::parse);
-        let claimability_str: Option<String> = row.try_get("claimability").ok().flatten();
-        Ok(TaskListItem {
-            task_id: row.try_get("task_id").map_err(|e| e.to_string())?,
-            title: row.try_get("title").map_err(|e| e.to_string())?,
-            session_id: row.try_get("session_id").ok().flatten(),
-            status,
-            progress_pct: row.try_get::<i32, _>("progress_pct").unwrap_or(0) as u32,
-            items_done: row.try_get::<i32, _>("items_done").unwrap_or(0) as u32,
-            items_total: row.try_get::<i32, _>("items_total").unwrap_or(0) as u32,
-            created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
-            updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
-            completed_at: row.try_get("completed_at").ok().flatten(),
-            outcome,
-            error_message: row.try_get("error_message").ok().flatten(),
-            project_type: row.try_get("project_type").ok().flatten(),
-            claimability: claimability_str
-                .as_deref()
-                .and_then(TaskClaimability::parse),
-        })
+        decode_task_list_item(row)
     }
 }
 
@@ -736,7 +1077,13 @@ impl TaskService for MatrixOneTaskService {
             .map(|p| p.subtasks.len() as i64)
             .unwrap_or(0);
 
-        sqlx::query(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("create_task begin: {e}"))?;
+
+        let result = sqlx::query(
             "INSERT INTO agent_tasks \
              (task_id, user_id, session_id, parent_task_id, title, description, status, \
               items_total, plan_json, project_type, goal_pattern, created_at, updated_at) \
@@ -752,9 +1099,17 @@ impl TaskService for MatrixOneTaskService {
         .bind(&plan_json)
         .bind(&req.project_type)
         .bind(&req.goal_pattern)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("create_task: {e}"))?;
+        .execute(&mut *tx)
+        .await;
+
+        if let Err(e) = result {
+            let _ = tx.rollback().await;
+            return Err(format!("create_task: {e}"));
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| format!("create_task commit: {e}"))?;
 
         tracing::info!(
             target: "astra_services::task_orchestrator",
@@ -767,10 +1122,11 @@ impl TaskService for MatrixOneTaskService {
         Ok(task_id)
     }
 
-    async fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>, String> {
+    async fn get_task(&self, user_id: &str, task_id: &str) -> Result<Option<TaskRecord>, String> {
         let row = sqlx::query(&format!(
-            "SELECT {AGENT_TASK_DETAIL_SELECT_COLUMNS} FROM agent_tasks WHERE task_id = ?"
+            "SELECT {AGENT_TASK_DETAIL_SELECT_COLUMNS} FROM agent_tasks WHERE user_id = ? AND task_id = ?"
         ))
+        .bind(user_id)
         .bind(task_id)
         .fetch_optional(&self.pool)
         .await
@@ -918,27 +1274,30 @@ impl TaskService for MatrixOneTaskService {
         crate::multi_agent::task_lease::list_claimable_tasks_mysql(&self.pool, user_id, limit).await
     }
 
-    async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
+    async fn update_status(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        status: TaskStatus,
+    ) -> Result<(), String> {
         // Atomic transition guard: the WHERE clause rejects terminal and unknown
         // persisted states, eliminating the TOCTOU race of a separate SELECT + UPDATE.
         let result = if status.is_terminal() {
-            sqlx::query(&format!(
-                "UPDATE agent_tasks \
-                 SET status = ?, updated_at = NOW(), completed_at = NOW() \
-                 WHERE task_id = ? {AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD}",
+            sqlx::query(&guarded_agent_task_update_sql(
+                "status = ?, updated_at = NOW(), completed_at = NOW()",
             ))
             .bind(status.as_str())
+            .bind(user_id)
             .bind(task_id)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("update_status: {e}"))?
         } else {
-            sqlx::query(&format!(
-                "UPDATE agent_tasks \
-                 SET status = ?, updated_at = NOW(), completed_at = NULL \
-                 WHERE task_id = ? {AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD}",
+            sqlx::query(&guarded_agent_task_update_sql(
+                "status = ?, updated_at = NOW(), completed_at = NULL",
             ))
             .bind(status.as_str())
+            .bind(user_id)
             .bind(task_id)
             .execute(&self.pool)
             .await
@@ -947,16 +1306,15 @@ impl TaskService for MatrixOneTaskService {
 
         if result.rows_affected() == 0 {
             // Either task doesn't exist or is in a terminal state.
-            let current_row = sqlx::query("SELECT status FROM agent_tasks WHERE task_id = ?")
-                .bind(task_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| format!("update_status check: {e}"))?;
+            let current_row =
+                sqlx::query("SELECT status FROM agent_tasks WHERE user_id = ? AND task_id = ?")
+                    .bind(user_id)
+                    .bind(task_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| format!("update_status check: {e}"))?;
             if let Some(row) = current_row {
-                let current_str: String = row.try_get("status").unwrap_or_default();
-                let current = TaskStatus::parse_status(&current_str).ok_or_else(|| {
-                    format!("task {task_id} has unknown persisted status: {current_str}")
-                })?;
+                let current = decode_task_status_guard_row(&row, task_id)?;
                 if current.is_terminal() && status != current {
                     return Err(format!(
                         "invalid task status transition: {} → {} (terminal states are immutable)",
@@ -981,25 +1339,26 @@ impl TaskService for MatrixOneTaskService {
 
     async fn update_progress(
         &self,
+        user_id: &str,
         task_id: &str,
         progress_pct: u32,
         items_done: u32,
         items_total: u32,
     ) -> Result<(), String> {
-        let result = sqlx::query(
-            "UPDATE agent_tasks SET progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() \
-             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
-        )
+        let result = sqlx::query(&guarded_agent_task_update_sql(
+            "progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW()",
+        ))
         .bind(progress_pct as i32)
         .bind(items_done as i32)
         .bind(items_total as i32)
+        .bind(user_id)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("update_progress: {e}"))?;
         if result.rows_affected() == 0 {
             return self
-                .report_terminal_guard_violation(task_id, "progress")
+                .report_terminal_guard_violation(user_id, task_id, "progress")
                 .await;
         }
         Ok(())
@@ -1007,66 +1366,74 @@ impl TaskService for MatrixOneTaskService {
 
     async fn save_checkpoint(
         &self,
+        user_id: &str,
         task_id: &str,
         checkpoint: &TaskCheckpoint,
     ) -> Result<(), String> {
         let ckpt_json =
             serde_json::to_string(checkpoint).map_err(|e| format!("serialize ckpt: {e}"))?;
-        let result = sqlx::query(
-            "UPDATE agent_tasks SET checkpoint_json = ?, updated_at = NOW() \
-             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
-        )
+        let result = sqlx::query(&guarded_agent_task_update_sql(
+            "checkpoint_json = ?, updated_at = NOW()",
+        ))
         .bind(&ckpt_json)
+        .bind(user_id)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("save_checkpoint: {e}"))?;
         if result.rows_affected() == 0 {
             return self
-                .report_terminal_guard_violation(task_id, "checkpoint")
+                .report_terminal_guard_violation(user_id, task_id, "checkpoint")
                 .await;
         }
         Ok(())
     }
 
-    async fn update_plan(&self, task_id: &str, plan: &TaskPlan) -> Result<(), String> {
+    async fn update_plan(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        plan: &TaskPlan,
+    ) -> Result<(), String> {
         let plan_json = serde_json::to_string(plan).map_err(|e| format!("serialize plan: {e}"))?;
         let progress = plan.progress_pct();
         let done = plan.items_done();
         let total = plan.subtasks.len() as i32;
 
-        let result = sqlx::query(
-            "UPDATE agent_tasks SET plan_json = ?, progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() \
-             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
-        )
+        let result = sqlx::query(&guarded_agent_task_update_sql(
+            "plan_json = ?, progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW()",
+        ))
         .bind(&plan_json)
         .bind(progress as i32)
         .bind(done as i32)
         .bind(total)
+        .bind(user_id)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("update_plan: {e}"))?;
         if result.rows_affected() == 0 {
-            return self.report_terminal_guard_violation(task_id, "plan").await;
+            return self
+                .report_terminal_guard_violation(user_id, task_id, "plan")
+                .await;
         }
         Ok(())
     }
 
-    async fn fail_task(&self, task_id: &str, error: &str) -> Result<(), String> {
-        let result = sqlx::query(
-            "UPDATE agent_tasks SET status = 'failed', outcome = 'failed', error_message = ?, \
-             updated_at = NOW(), completed_at = NOW() \
-             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
-        )
+    async fn fail_task(&self, user_id: &str, task_id: &str, error: &str) -> Result<(), String> {
+        let result = sqlx::query(&guarded_agent_task_update_sql(
+            "status = 'failed', outcome = 'failed', error_message = ?, \
+             updated_at = NOW(), completed_at = NOW()",
+        ))
         .bind(error)
+        .bind(user_id)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("fail_task: {e}"))?;
         if result.rows_affected() == 0 {
             return self
-                .report_terminal_guard_violation(task_id, "failed")
+                .report_terminal_guard_violation(user_id, task_id, "failed")
                 .await;
         }
         let preview: String = error.chars().take(200).collect();
@@ -1079,30 +1446,31 @@ impl TaskService for MatrixOneTaskService {
         Ok(())
     }
 
-    async fn complete_task(&self, task_id: &str) -> Result<(), String> {
-        self.complete_task_with_outcome(task_id, TaskOutcome::Success)
+    async fn complete_task(&self, user_id: &str, task_id: &str) -> Result<(), String> {
+        self.complete_task_with_outcome(user_id, task_id, TaskOutcome::Success)
             .await
     }
 
     async fn complete_task_with_outcome(
         &self,
+        user_id: &str,
         task_id: &str,
         outcome: TaskOutcome,
     ) -> Result<(), String> {
-        let result = sqlx::query(
-            "UPDATE agent_tasks SET status = 'completed', progress_pct = 100, \
+        let result = sqlx::query(&guarded_agent_task_update_sql(
+            "status = 'completed', progress_pct = 100, \
              outcome = ?, error_message = NULL, \
-             updated_at = NOW(), completed_at = NOW() \
-             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
-        )
+             updated_at = NOW(), completed_at = NOW()",
+        ))
         .bind(outcome.as_str())
+        .bind(user_id)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("complete_task_with_outcome: {e}"))?;
         if result.rows_affected() == 0 {
             return self
-                .report_terminal_guard_violation(task_id, "completed")
+                .report_terminal_guard_violation(user_id, task_id, "completed")
                 .await;
         }
         tracing::info!(
@@ -1116,29 +1484,30 @@ impl TaskService for MatrixOneTaskService {
 
     async fn complete_plan_run(
         &self,
+        user_id: &str,
         task_id: &str,
         progress_pct: u32,
         items_done: u32,
         items_total: u32,
         outcome: TaskOutcome,
     ) -> Result<(), String> {
-        let result = sqlx::query(
-            "UPDATE agent_tasks SET status = 'completed', progress_pct = ?, items_done = ?, \
+        let result = sqlx::query(&guarded_agent_task_update_sql(
+            "status = 'completed', progress_pct = ?, items_done = ?, \
              items_total = ?, outcome = ?, error_message = NULL, \
-             updated_at = NOW(), completed_at = NOW() \
-             WHERE task_id = ? AND status IN ('pending', 'in_progress', 'paused')",
-        )
+             updated_at = NOW(), completed_at = NOW()",
+        ))
         .bind(progress_pct as i32)
         .bind(items_done as i32)
         .bind(items_total as i32)
         .bind(outcome.as_str())
+        .bind(user_id)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("complete_plan_run: {e}"))?;
         if result.rows_affected() == 0 {
             return self
-                .report_terminal_guard_violation(task_id, "completed")
+                .report_terminal_guard_violation(user_id, task_id, "completed")
                 .await;
         }
         tracing::info!(
@@ -1155,38 +1524,48 @@ impl TaskService for MatrixOneTaskService {
 
     async fn record_feedback(
         &self,
+        user_id: &str,
         task_id: &str,
         rating: u8,
         outcome: TaskOutcome,
         completion_time_sec: Option<i32>,
     ) -> Result<(), String> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE agent_tasks SET user_rating = ?, outcome = ?, completion_time_sec = ?, \
-             updated_at = NOW() WHERE task_id = ?",
+             updated_at = NOW() WHERE user_id = ? AND task_id = ?",
         )
         .bind(rating as i8)
         .bind(outcome.as_str())
         .bind(completion_time_sec)
+        .bind(user_id)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("record_feedback: {e}"))?;
+        if result.rows_affected() == 0 {
+            return Err(format!("task not found: {task_id}"));
+        }
         Ok(())
     }
 
-    async fn increment_replan_count(&self, task_id: &str) -> Result<(), String> {
-        sqlx::query(
-            "UPDATE agent_tasks SET replan_count = replan_count + 1, updated_at = NOW() WHERE task_id = ?",
+    async fn increment_replan_count(&self, user_id: &str, task_id: &str) -> Result<(), String> {
+        let result = sqlx::query(
+            "UPDATE agent_tasks SET replan_count = replan_count + 1, updated_at = NOW() WHERE user_id = ? AND task_id = ?",
         )
+        .bind(user_id)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("increment_replan_count: {e}"))?;
+        if result.rows_affected() == 0 {
+            return Err(format!("task not found: {task_id}"));
+        }
         Ok(())
     }
 
     async fn extract_template(
         &self,
+        user_id: &str,
         task_id: &str,
         goal_pattern: &str,
     ) -> Result<Option<String>, String> {
@@ -1194,7 +1573,7 @@ impl TaskService for MatrixOneTaskService {
 
         // Fetch the task
         let task = self
-            .get_task(task_id)
+            .get_task(user_id, task_id)
             .await?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
 
@@ -1207,7 +1586,10 @@ impl TaskService for MatrixOneTaskService {
             return Ok(None);
         }
 
-        let plan = task.plan.as_ref().expect("plan checked above");
+        let plan = task
+            .plan
+            .as_ref()
+            .ok_or_else(|| format!("task plan missing after eligibility check: {task_id}"))?;
         let template_id = uuid::Uuid::new_v4().to_string();
         let template_json =
             serde_json::to_string(plan).map_err(|e| format!("serialize plan: {e}"))?;
@@ -1235,11 +1617,12 @@ impl TaskService for MatrixOneTaskService {
                  avg_completion_time = COALESCE(?, avg_completion_time), \
                  use_count = use_count + 1, \
                  updated_at = NOW() \
-                 WHERE template_id = ?",
+                 WHERE user_id = ? AND template_id = ?",
             )
             .bind(&template_json)
             .bind(rating / 5.0)
             .bind(task.completion_time_sec)
+            .bind(&task.user_id)
             .bind(&existing_id)
             .execute(&self.pool)
             .await
@@ -1277,8 +1660,6 @@ impl TaskService for MatrixOneTaskService {
         project_type: Option<&str>,
         limit: usize,
     ) -> Result<Vec<TemplateRecommendation>, String> {
-        use sqlx::Row;
-
         // Extract keywords from goal for matching
         let keywords: Vec<&str> = goal
             .split_whitespace()
@@ -1290,72 +1671,45 @@ impl TaskService for MatrixOneTaskService {
             return Ok(vec![]);
         }
 
-        // Build LIKE conditions for keyword matching
-        let like_conditions: Vec<String> = keywords
-            .iter()
-            .map(|k| format!("goal_pattern LIKE '%{}%'", k.replace('\'', "''")))
+        // Build parameterised LIKE patterns: CONCAT('%', ?, '%')
+        let like_conditions: Vec<String> = (0..keywords.len())
+            .map(|_| "goal_pattern LIKE CONCAT('%', ?, '%')".to_string())
             .collect();
         let like_clause = like_conditions.join(" OR ");
 
-        // Query: user's templates first, then global high-success templates
-        let query = format!(
+        // Build bind arrays: user_id appears twice (is_own check + score calc),
+        // then keywords, then project_type x2, then limit.
+        let sql = format!(
             "SELECT template_id, user_id, goal_pattern, project_type, template_json, \
              success_rate, avg_completion_time, use_count, created_at, updated_at, \
              CASE WHEN user_id = ? THEN 1 ELSE 0 END as is_own, \
              (success_rate * 0.4 + (CASE WHEN use_count < 10 THEN use_count ELSE 10 END) / 10.0 * 0.3 + \
               CASE WHEN user_id = ? THEN 0.3 ELSE 0.0 END) as score \
              FROM plan_templates \
-             WHERE ({}) \
+             WHERE user_id = ? AND ({}) \
              AND (project_type IS NULL OR project_type = ? OR ? IS NULL) \
              ORDER BY score DESC, use_count DESC \
              LIMIT ?",
             like_clause
         );
+        let mut query = sqlx::query(&sql).bind(user_id).bind(user_id).bind(user_id);
 
-        let rows = sqlx::query(&query)
-            .bind(user_id)
-            .bind(user_id)
+        for kw in &keywords {
+            query = query.bind(kw);
+        }
+        query = query
             .bind(project_type)
             .bind(project_type)
-            .bind(limit as i32)
+            .bind(limit as i32);
+
+        let rows = query
             .fetch_all(&self.pool)
             .await
             .map_err(|e| format!("query templates: {e}"))?;
 
         let mut recommendations = Vec::new();
         for row in rows {
-            let template_json: String = row
-                .try_get("template_json")
-                .map_err(|e| format!("get template_json: {e}"))?;
-            let template_plan: TaskPlan =
-                serde_json::from_str(&template_json).map_err(|e| format!("parse template: {e}"))?;
-
-            let is_own: i32 = row.try_get("is_own").unwrap_or(0);
-            let goal_pattern: String = row.try_get("goal_pattern").map_err(|e| e.to_string())?;
-
-            let reason = if is_own == 1 {
-                format!("Your successful pattern: {}", goal_pattern)
-            } else {
-                let use_count: i32 = row.try_get("use_count").unwrap_or(0);
-                format!("Community pattern ({}x used): {}", use_count, goal_pattern)
-            };
-
-            recommendations.push(TemplateRecommendation {
-                template: PlanTemplate {
-                    template_id: row.try_get("template_id").map_err(|e| e.to_string())?,
-                    user_id: row.try_get("user_id").ok().flatten(),
-                    goal_pattern,
-                    project_type: row.try_get("project_type").ok().flatten(),
-                    template: template_plan,
-                    success_rate: row.try_get("success_rate").unwrap_or(0.0),
-                    avg_completion_time: row.try_get("avg_completion_time").ok().flatten(),
-                    use_count: row.try_get::<i32, _>("use_count").unwrap_or(0) as u32,
-                    created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
-                    updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
-                },
-                score: row.try_get("score").unwrap_or(0.0),
-                reason,
-            });
+            recommendations.push(decode_template_recommendation(&row)?);
         }
 
         Ok(recommendations)
@@ -1366,8 +1720,6 @@ impl TaskService for MatrixOneTaskService {
         user_id: &str,
         goal_pattern: &str,
     ) -> Result<LearningStats, String> {
-        use sqlx::Row;
-
         // Extract keywords for pattern matching
         let keywords: Vec<&str> = goal_pattern
             .split_whitespace()
@@ -1379,65 +1731,49 @@ impl TaskService for MatrixOneTaskService {
             return Ok(LearningStats::default());
         }
 
-        let like_conditions: Vec<String> = keywords
-            .iter()
-            .map(|k| format!("title LIKE '%{}%'", k.replace('\'', "''")))
+        // Build parameterised LIKE patterns: CONCAT('%', ?, '%')
+        let like_conditions: Vec<String> = (0..keywords.len())
+            .map(|_| "title LIKE CONCAT('%', ?, '%')".to_string())
             .collect();
         let like_clause = like_conditions.join(" OR ");
 
-        let query = format!(
+        let sql = format!(
             "SELECT \
              COUNT(*) as total_tasks, \
-             SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as completed_tasks, \
+             COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END), 0) as completed_tasks, \
              AVG(user_rating) as avg_rating, \
              AVG(replan_count) as avg_replan_count \
              FROM agent_tasks \
              WHERE user_id = ? AND ({})",
             like_clause
         );
+        let mut query = sqlx::query(&sql).bind(user_id);
 
-        let row = sqlx::query(&query)
-            .bind(user_id)
+        for kw in &keywords {
+            query = query.bind(kw);
+        }
+
+        let row = query
             .fetch_one(&self.pool)
             .await
             .map_err(|e| format!("query stats: {e}"))?;
 
-        let total_tasks: i64 = row.try_get("total_tasks").unwrap_or(0);
-        let completed_tasks: i64 = row.try_get("completed_tasks").unwrap_or(0);
-        let avg_rating: Option<f32> = row.try_get("avg_rating").ok().flatten();
-        let avg_replan_count: f32 = row
-            .try_get("avg_replan_count")
-            .ok()
-            .flatten()
-            .unwrap_or(0.0);
-
-        // Infer success rate from completion and replan metrics
-        let inferred_success_rate = if total_tasks == 0 {
-            0.0
-        } else {
-            let completion_factor = completed_tasks as f32 / total_tasks as f32;
-            let replan_penalty = (avg_replan_count / 3.0).min(1.0);
-            (completion_factor * (1.0 - replan_penalty * 0.3)).clamp(0.0, 1.0)
-        };
-
-        Ok(LearningStats {
-            total_tasks: total_tasks as u32,
-            completed_tasks: completed_tasks as u32,
-            avg_rating,
-            avg_replan_count,
-            inferred_success_rate,
-        })
+        decode_learning_stats(&row)
     }
 
-    async fn record_template_usage(&self, template_id: &str) -> Result<(), String> {
-        sqlx::query(
+    async fn record_template_usage(&self, user_id: &str, template_id: &str) -> Result<(), String> {
+        let result = sqlx::query(
             "UPDATE plan_templates SET use_count = use_count + 1, updated_at = NOW() \
-             WHERE template_id = ?",
+             WHERE user_id = ? AND template_id = ?",
         )
+        .bind(user_id)
         .bind(template_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("record_template_usage: {e}"))?;
+        if result.rows_affected() == 0 {
+            return Err(format!("template not found: {template_id}"));
+        }
         Ok(())
     }
 }
@@ -1468,6 +1804,18 @@ impl LocalTaskService {
         let record: TaskRecord =
             serde_json::from_str(&data).map_err(|e| format!("parse task: {e}"))?;
         Ok(Some(record))
+    }
+
+    fn load_owned_task(&self, user_id: &str, task_id: &str) -> Result<Option<TaskRecord>, String> {
+        match self.load_task(task_id)? {
+            Some(record) if record.user_id == user_id => Ok(Some(record)),
+            _ => Ok(None),
+        }
+    }
+
+    fn require_owned_task(&self, user_id: &str, task_id: &str) -> Result<TaskRecord, String> {
+        self.load_owned_task(user_id, task_id)?
+            .ok_or_else(|| format!("task not found: {task_id}"))
     }
 
     fn save_task(&self, record: &TaskRecord) -> Result<(), String> {
@@ -1529,8 +1877,8 @@ impl TaskService for LocalTaskService {
         Ok(task_id)
     }
 
-    async fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>, String> {
-        self.load_task(task_id)
+    async fn get_task(&self, user_id: &str, task_id: &str) -> Result<Option<TaskRecord>, String> {
+        self.load_owned_task(user_id, task_id)
     }
 
     async fn list_recent_tasks(
@@ -1679,10 +2027,13 @@ impl TaskService for LocalTaskService {
         Ok(tasks)
     }
 
-    async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
-        let mut record = self
-            .load_task(task_id)?
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+    async fn update_status(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        status: TaskStatus,
+    ) -> Result<(), String> {
+        let mut record = self.require_owned_task(user_id, task_id)?;
         if record.status.is_terminal() && record.status != status {
             return Err(format!(
                 "invalid task status transition: {} → {} (terminal states are immutable)",
@@ -1700,14 +2051,13 @@ impl TaskService for LocalTaskService {
 
     async fn update_progress(
         &self,
+        user_id: &str,
         task_id: &str,
         progress_pct: u32,
         items_done: u32,
         items_total: u32,
     ) -> Result<(), String> {
-        let mut record = self
-            .load_task(task_id)?
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let mut record = self.require_owned_task(user_id, task_id)?;
         if record.status.is_terminal() {
             return Err(format!(
                 "cannot update progress on terminal task {task_id} (status={})",
@@ -1723,12 +2073,11 @@ impl TaskService for LocalTaskService {
 
     async fn save_checkpoint(
         &self,
+        user_id: &str,
         task_id: &str,
         checkpoint: &TaskCheckpoint,
     ) -> Result<(), String> {
-        let mut record = self
-            .load_task(task_id)?
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let mut record = self.require_owned_task(user_id, task_id)?;
         if record.status.is_terminal() {
             return Err(format!(
                 "cannot save checkpoint on terminal task {task_id} (status={})",
@@ -1740,10 +2089,13 @@ impl TaskService for LocalTaskService {
         self.save_task(&record)
     }
 
-    async fn update_plan(&self, task_id: &str, plan: &TaskPlan) -> Result<(), String> {
-        let mut record = self
-            .load_task(task_id)?
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+    async fn update_plan(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        plan: &TaskPlan,
+    ) -> Result<(), String> {
+        let mut record = self.require_owned_task(user_id, task_id)?;
         if record.status.is_terminal() {
             return Err(format!(
                 "cannot update plan on terminal task {task_id} (status={})",
@@ -1758,10 +2110,8 @@ impl TaskService for LocalTaskService {
         self.save_task(&record)
     }
 
-    async fn fail_task(&self, task_id: &str, error: &str) -> Result<(), String> {
-        let mut record = self
-            .load_task(task_id)?
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+    async fn fail_task(&self, user_id: &str, task_id: &str, error: &str) -> Result<(), String> {
+        let mut record = self.require_owned_task(user_id, task_id)?;
         if record.status.is_terminal() {
             return Err(format!(
                 "invalid task status transition: {} → failed (terminal states are immutable)",
@@ -1777,19 +2127,18 @@ impl TaskService for LocalTaskService {
         self.save_task(&record)
     }
 
-    async fn complete_task(&self, task_id: &str) -> Result<(), String> {
-        self.complete_task_with_outcome(task_id, TaskOutcome::Success)
+    async fn complete_task(&self, user_id: &str, task_id: &str) -> Result<(), String> {
+        self.complete_task_with_outcome(user_id, task_id, TaskOutcome::Success)
             .await
     }
 
     async fn complete_task_with_outcome(
         &self,
+        user_id: &str,
         task_id: &str,
         outcome: TaskOutcome,
     ) -> Result<(), String> {
-        let mut record = self
-            .load_task(task_id)?
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let mut record = self.require_owned_task(user_id, task_id)?;
         if record.status.is_terminal() {
             return Err(format!(
                 "invalid task status transition: {} → completed (terminal states are immutable)",
@@ -1808,15 +2157,14 @@ impl TaskService for LocalTaskService {
 
     async fn complete_plan_run(
         &self,
+        user_id: &str,
         task_id: &str,
         progress_pct: u32,
         items_done: u32,
         items_total: u32,
         outcome: TaskOutcome,
     ) -> Result<(), String> {
-        let mut record = self
-            .load_task(task_id)?
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let mut record = self.require_owned_task(user_id, task_id)?;
         if record.status.is_terminal() {
             return Err(format!(
                 "invalid task status transition: {} → completed (terminal states are immutable)",
@@ -1837,14 +2185,13 @@ impl TaskService for LocalTaskService {
 
     async fn record_feedback(
         &self,
+        user_id: &str,
         task_id: &str,
         rating: u8,
         outcome: TaskOutcome,
         completion_time_sec: Option<i32>,
     ) -> Result<(), String> {
-        let mut record = self
-            .load_task(task_id)?
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let mut record = self.require_owned_task(user_id, task_id)?;
         record.user_rating = Some(rating);
         record.outcome = Some(outcome);
         record.completion_time_sec = completion_time_sec;
@@ -1852,10 +2199,8 @@ impl TaskService for LocalTaskService {
         self.save_task(&record)
     }
 
-    async fn increment_replan_count(&self, task_id: &str) -> Result<(), String> {
-        let mut record = self
-            .load_task(task_id)?
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+    async fn increment_replan_count(&self, user_id: &str, task_id: &str) -> Result<(), String> {
+        let mut record = self.require_owned_task(user_id, task_id)?;
         record.replan_count += 1;
         record.updated_at = chrono::Utc::now().to_rfc3339();
         self.save_task(&record)
@@ -1865,12 +2210,11 @@ impl TaskService for LocalTaskService {
 
     async fn extract_template(
         &self,
+        user_id: &str,
         task_id: &str,
         goal_pattern: &str,
     ) -> Result<Option<String>, String> {
-        let task = self
-            .load_task(task_id)?
-            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let task = self.require_owned_task(user_id, task_id)?;
 
         // Check eligibility
         let eligible = task.user_rating.map(|r| r >= 4).unwrap_or(false)
@@ -1894,7 +2238,10 @@ impl TaskService for LocalTaskService {
             user_id: Some(task.user_id.clone()),
             goal_pattern: goal_pattern.to_string(),
             project_type: task.project_type.clone(),
-            template: task.plan.expect("plan exists for template creation"),
+            template: task
+                .plan
+                .clone()
+                .ok_or_else(|| format!("task plan missing after eligibility check: {task_id}"))?,
             success_rate: task.user_rating.map(|r| r as f32 / 5.0).unwrap_or(0.8),
             avg_completion_time: task.completion_time_sec,
             use_count: 1,
@@ -2068,7 +2415,7 @@ impl TaskService for LocalTaskService {
         })
     }
 
-    async fn record_template_usage(&self, template_id: &str) -> Result<(), String> {
+    async fn record_template_usage(&self, _user_id: &str, template_id: &str) -> Result<(), String> {
         let templates_dir = self
             .tasks_dir
             .parent()
@@ -2105,7 +2452,7 @@ impl TaskService for UnconfiguredTaskService {
     async fn create_task(&self, _: &str, _: &str, _: TaskCreateRequest) -> Result<String, String> {
         Err("task service not configured".into())
     }
-    async fn get_task(&self, _: &str) -> Result<Option<TaskRecord>, String> {
+    async fn get_task(&self, _: &str, _: &str) -> Result<Option<TaskRecord>, String> {
         Err("task service not configured".into())
     }
     async fn list_recent_tasks(
@@ -2133,29 +2480,42 @@ impl TaskService for UnconfiguredTaskService {
     ) -> Result<Vec<TaskListItem>, String> {
         Err("task service not configured".into())
     }
-    async fn update_status(&self, _: &str, _: TaskStatus) -> Result<(), String> {
+    async fn update_status(&self, _: &str, _: &str, _: TaskStatus) -> Result<(), String> {
         Err("task service not configured".into())
     }
-    async fn update_progress(&self, _: &str, _: u32, _: u32, _: u32) -> Result<(), String> {
+    async fn update_progress(
+        &self,
+        _: &str,
+        _: &str,
+        _: u32,
+        _: u32,
+        _: u32,
+    ) -> Result<(), String> {
         Err("task service not configured".into())
     }
-    async fn save_checkpoint(&self, _: &str, _: &TaskCheckpoint) -> Result<(), String> {
+    async fn save_checkpoint(&self, _: &str, _: &str, _: &TaskCheckpoint) -> Result<(), String> {
         Err("task service not configured".into())
     }
-    async fn update_plan(&self, _: &str, _: &TaskPlan) -> Result<(), String> {
+    async fn update_plan(&self, _: &str, _: &str, _: &TaskPlan) -> Result<(), String> {
         Err("task service not configured".into())
     }
-    async fn fail_task(&self, _: &str, _: &str) -> Result<(), String> {
+    async fn fail_task(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
         Err("task service not configured".into())
     }
-    async fn complete_task(&self, _: &str) -> Result<(), String> {
+    async fn complete_task(&self, _: &str, _: &str) -> Result<(), String> {
         Err("task service not configured".into())
     }
-    async fn complete_task_with_outcome(&self, _: &str, _: TaskOutcome) -> Result<(), String> {
+    async fn complete_task_with_outcome(
+        &self,
+        _: &str,
+        _: &str,
+        _: TaskOutcome,
+    ) -> Result<(), String> {
         Err("task service not configured".into())
     }
     async fn complete_plan_run(
         &self,
+        _: &str,
         _: &str,
         _: u32,
         _: u32,
@@ -2167,16 +2527,17 @@ impl TaskService for UnconfiguredTaskService {
     async fn record_feedback(
         &self,
         _: &str,
+        _: &str,
         _: u8,
         _: TaskOutcome,
         _: Option<i32>,
     ) -> Result<(), String> {
         Err("task service not configured".into())
     }
-    async fn increment_replan_count(&self, _: &str) -> Result<(), String> {
+    async fn increment_replan_count(&self, _: &str, _: &str) -> Result<(), String> {
         Err("task service not configured".into())
     }
-    async fn extract_template(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+    async fn extract_template(&self, _: &str, _: &str, _: &str) -> Result<Option<String>, String> {
         Err("task service not configured".into())
     }
     async fn recommend_templates(
@@ -2191,7 +2552,7 @@ impl TaskService for UnconfiguredTaskService {
     async fn get_learning_stats(&self, _: &str, _: &str) -> Result<LearningStats, String> {
         Err("task service not configured".into())
     }
-    async fn record_template_usage(&self, _: &str) -> Result<(), String> {
+    async fn record_template_usage(&self, _: &str, _: &str) -> Result<(), String> {
         Err("task service not configured".into())
     }
 }
@@ -2201,6 +2562,1023 @@ impl TaskService for UnconfiguredTaskService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeTaskStatusGuardRow {
+        status: &'static str,
+        fail_status: bool,
+    }
+
+    impl FakeTaskStatusGuardRow {
+        fn with_status(status: &'static str) -> Self {
+            Self {
+                status,
+                fail_status: false,
+            }
+        }
+
+        fn missing_status() -> Self {
+            Self {
+                status: "in_progress",
+                fail_status: true,
+            }
+        }
+    }
+
+    impl TaskStatusGuardDbRow for FakeTaskStatusGuardRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            if self.fail_status && column == "status" {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+            match column {
+                "status" => Ok(self.status.to_string()),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn task_status_guard_row_decode_preserves_database_status() {
+        let status =
+            decode_task_status_guard_row(&FakeTaskStatusGuardRow::with_status("completed"), "t-1")
+                .unwrap();
+        assert_eq!(status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn task_status_guard_row_decode_fails_loudly_on_missing_status_column() {
+        let error = decode_task_status_guard_row(&FakeTaskStatusGuardRow::missing_status(), "t-1")
+            .unwrap_err();
+        assert!(
+            error.contains("task status guard row decode `status`") && error.contains("status"),
+            "missing status should fail loudly with column context: {error}"
+        );
+    }
+
+    #[test]
+    fn task_status_guard_row_decode_rejects_unknown_persisted_status() {
+        let error =
+            decode_task_status_guard_row(&FakeTaskStatusGuardRow::with_status("mystery"), "t-1")
+                .unwrap_err();
+        assert!(
+            error.contains("task t-1 has unknown persisted status: mystery"),
+            "unknown persisted status should fail loudly: {error}"
+        );
+    }
+
+    struct FakeTaskListRow {
+        failed_column: Option<&'static str>,
+        session_id: Option<&'static str>,
+        status: &'static str,
+        progress_pct: i32,
+        items_done: i32,
+        items_total: i32,
+        completed_at: Option<&'static str>,
+        outcome: Option<&'static str>,
+        error_message: Option<&'static str>,
+        project_type: Option<&'static str>,
+        claimability: Option<&'static str>,
+    }
+
+    impl FakeTaskListRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                session_id: Some("session-1"),
+                status: "in_progress",
+                progress_pct: 40,
+                items_done: 2,
+                items_total: 5,
+                completed_at: None,
+                outcome: Some("partial"),
+                error_message: Some("needs retry"),
+                project_type: Some("rust"),
+                claimability: Some("recoverable_in_progress"),
+            }
+        }
+
+        fn without_optional_values() -> Self {
+            Self {
+                session_id: None,
+                completed_at: None,
+                outcome: None,
+                error_message: None,
+                project_type: None,
+                claimability: None,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_status(status: &'static str) -> Self {
+            Self {
+                status,
+                ..Self::complete()
+            }
+        }
+
+        fn with_outcome(outcome: &'static str) -> Self {
+            Self {
+                outcome: Some(outcome),
+                ..Self::complete()
+            }
+        }
+
+        fn with_claimability(claimability: &'static str) -> Self {
+            Self {
+                claimability: Some(claimability),
+                ..Self::complete()
+            }
+        }
+
+        fn with_i32(column: &'static str, value: i32) -> Self {
+            let mut row = Self::complete();
+            match column {
+                "progress_pct" => row.progress_pct = value,
+                "items_done" => row.items_done = value,
+                "items_total" => row.items_total = value,
+                _ => unreachable!("unexpected i32 column: {column}"),
+            }
+            row
+        }
+    }
+
+    impl TaskListDbRow for FakeTaskListRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            Ok(match column {
+                "task_id" => "task-1",
+                "title" => "Refactor task parser",
+                "status" => self.status,
+                "created_at" => "2026-06-26 09:00:00.000000",
+                "updated_at" => "2026-06-26 10:00:00.000000",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            Ok(match column {
+                "session_id" => self.session_id,
+                "completed_at" => self.completed_at,
+                "outcome" => self.outcome,
+                "error_message" => self.error_message,
+                "project_type" => self.project_type,
+                "claimability" => self.claimability,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .map(str::to_string))
+        }
+
+        fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            match column {
+                "progress_pct" => Ok(self.progress_pct),
+                "items_done" => Ok(self.items_done),
+                "items_total" => Ok(self.items_total),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn task_list_row_decode_preserves_database_values() {
+        let item = decode_task_list_item(&FakeTaskListRow::complete()).unwrap();
+
+        assert_eq!(item.task_id, "task-1");
+        assert_eq!(item.title, "Refactor task parser");
+        assert_eq!(item.session_id.as_deref(), Some("session-1"));
+        assert_eq!(item.status, TaskStatus::InProgress);
+        assert_eq!(item.progress_pct, 40);
+        assert_eq!(item.items_done, 2);
+        assert_eq!(item.items_total, 5);
+        assert_eq!(item.created_at, "2026-06-26 09:00:00.000000");
+        assert_eq!(item.updated_at, "2026-06-26 10:00:00.000000");
+        assert_eq!(item.completed_at, None);
+        assert_eq!(item.outcome, Some(TaskOutcome::Partial));
+        assert_eq!(item.error_message.as_deref(), Some("needs retry"));
+        assert_eq!(item.project_type.as_deref(), Some("rust"));
+        assert_eq!(
+            item.claimability,
+            Some(TaskClaimability::RecoverableInProgress)
+        );
+    }
+
+    #[test]
+    fn task_list_row_decode_preserves_sql_null_optional_values() {
+        let item = decode_task_list_item(&FakeTaskListRow::without_optional_values()).unwrap();
+
+        assert_eq!(item.session_id, None);
+        assert_eq!(item.completed_at, None);
+        assert_eq!(item.outcome, None);
+        assert_eq!(item.error_message, None);
+        assert_eq!(item.project_type, None);
+        assert_eq!(item.claimability, None);
+    }
+
+    #[test]
+    fn task_list_row_decode_fails_loudly_on_any_selected_column_error() {
+        for column in [
+            "task_id",
+            "title",
+            "session_id",
+            "status",
+            "progress_pct",
+            "items_done",
+            "items_total",
+            "created_at",
+            "updated_at",
+            "completed_at",
+            "outcome",
+            "error_message",
+            "project_type",
+            "claimability",
+        ] {
+            let error = decode_task_list_item(&FakeTaskListRow::fail_on(column)).unwrap_err();
+            assert!(
+                error.contains("task list row decode") && error.contains(column),
+                "decode error should identify selected column `{column}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_list_row_decode_rejects_invalid_enums_and_numeric_bounds() {
+        let status = decode_task_list_item(&FakeTaskListRow::with_status("mystery")).unwrap_err();
+        assert!(
+            status.contains("unknown persisted task status: mystery"),
+            "invalid status should fail loudly: {status}"
+        );
+
+        let outcome = decode_task_list_item(&FakeTaskListRow::with_outcome("mystery")).unwrap_err();
+        assert!(
+            outcome.contains("task list row decode `outcome` unknown value: mystery"),
+            "invalid outcome should fail loudly: {outcome}"
+        );
+
+        let claimability =
+            decode_task_list_item(&FakeTaskListRow::with_claimability("mystery")).unwrap_err();
+        assert!(
+            claimability.contains("task list row decode `claimability` unknown value: mystery"),
+            "invalid claimability should fail loudly: {claimability}"
+        );
+
+        for column in ["progress_pct", "items_done", "items_total"] {
+            let error = decode_task_list_item(&FakeTaskListRow::with_i32(column, -1)).unwrap_err();
+            assert!(
+                error.contains(column) && error.contains("non-negative integer"),
+                "negative numeric column should fail loudly for `{column}`: {error}"
+            );
+        }
+
+        let too_large =
+            decode_task_list_item(&FakeTaskListRow::with_i32("progress_pct", 101)).unwrap_err();
+        assert!(
+            too_large.contains("progress_pct") && too_large.contains("0..=100"),
+            "progress_pct above 100 should fail loudly: {too_large}"
+        );
+    }
+
+    #[test]
+    fn task_list_select_columns_declares_claimability_column() {
+        assert!(
+            AGENT_TASK_LIST_SELECT_COLUMNS.contains("NULL AS claimability"),
+            "base task list SELECT must project claimability explicitly so row decode can distinguish SQL NULL from a missing column"
+        );
+    }
+
+    struct FakeTemplateRecommendationRow {
+        failed_column: Option<&'static str>,
+        template_json: &'static str,
+        is_own: i32,
+        use_count: i32,
+        user_id: Option<&'static str>,
+        project_type: Option<&'static str>,
+        avg_completion_time: Option<i32>,
+    }
+
+    impl FakeTemplateRecommendationRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                template_json: r#"{"subtasks":[],"notes":"reuse known path"}"#,
+                is_own: 1,
+                use_count: 4,
+                user_id: Some("user-1"),
+                project_type: Some("rust"),
+                avg_completion_time: Some(120),
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_template_json(template_json: &'static str) -> Self {
+            Self {
+                template_json,
+                ..Self::complete()
+            }
+        }
+
+        fn with_is_own(is_own: i32) -> Self {
+            Self {
+                is_own,
+                ..Self::complete()
+            }
+        }
+
+        fn with_use_count(use_count: i32) -> Self {
+            Self {
+                use_count,
+                ..Self::complete()
+            }
+        }
+
+        fn community() -> Self {
+            Self {
+                is_own: 0,
+                user_id: None,
+                project_type: None,
+                avg_completion_time: None,
+                ..Self::complete()
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl TemplateRecommendationDbRow for FakeTemplateRecommendationRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            let value = match column {
+                "template_id" => "template-1",
+                "goal_pattern" => "ship parser",
+                "template_json" => self.template_json,
+                "created_at" => "2026-06-26 09:00:00.000000",
+                "updated_at" => "2026-06-26 10:00:00.000000",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            };
+            Ok(value.to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Ok(match column {
+                "user_id" => self.user_id,
+                "project_type" => self.project_type,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .map(str::to_string))
+        }
+
+        fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "is_own" => Ok(self.is_own),
+                "use_count" => Ok(self.use_count),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_i32_column(&self, column: &str) -> Result<Option<i32>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "avg_completion_time" => Ok(self.avg_completion_time),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn f32_column(&self, column: &str) -> Result<f32, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "success_rate" => Ok(0.8),
+                "score" => Ok(0.72),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn template_recommendation_row_decode_preserves_database_values() {
+        let recommendation =
+            decode_template_recommendation(&FakeTemplateRecommendationRow::complete()).unwrap();
+
+        assert_eq!(recommendation.template.template_id, "template-1");
+        assert_eq!(recommendation.template.user_id.as_deref(), Some("user-1"));
+        assert_eq!(recommendation.template.goal_pattern, "ship parser");
+        assert_eq!(
+            recommendation.template.project_type.as_deref(),
+            Some("rust")
+        );
+        assert_eq!(
+            recommendation.template.template.notes.as_deref(),
+            Some("reuse known path")
+        );
+        assert_eq!(recommendation.template.success_rate, 0.8);
+        assert_eq!(recommendation.template.avg_completion_time, Some(120));
+        assert_eq!(recommendation.template.use_count, 4);
+        assert_eq!(
+            recommendation.template.created_at,
+            "2026-06-26 09:00:00.000000"
+        );
+        assert_eq!(
+            recommendation.template.updated_at,
+            "2026-06-26 10:00:00.000000"
+        );
+        assert_eq!(recommendation.score, 0.72);
+        assert_eq!(
+            recommendation.reason,
+            "Your successful pattern: ship parser"
+        );
+    }
+
+    #[test]
+    fn template_recommendation_row_decode_preserves_null_optional_values() {
+        let recommendation =
+            decode_template_recommendation(&FakeTemplateRecommendationRow::community()).unwrap();
+
+        assert_eq!(recommendation.template.user_id, None);
+        assert_eq!(recommendation.template.project_type, None);
+        assert_eq!(recommendation.template.avg_completion_time, None);
+        assert_eq!(
+            recommendation.reason,
+            "Community pattern (4x used): ship parser"
+        );
+    }
+
+    #[test]
+    fn template_recommendation_row_decode_fails_loudly_on_any_selected_column_error() {
+        for column in [
+            "template_id",
+            "user_id",
+            "goal_pattern",
+            "project_type",
+            "template_json",
+            "success_rate",
+            "avg_completion_time",
+            "use_count",
+            "created_at",
+            "updated_at",
+            "is_own",
+            "score",
+        ] {
+            let error =
+                decode_template_recommendation(&FakeTemplateRecommendationRow::fail_on(column))
+                    .unwrap_err();
+            assert!(
+                error.contains("template recommendation row decode") && error.contains(column),
+                "decode error should identify selected column `{column}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_recommendation_row_decode_rejects_corrupt_values() {
+        let bad_json = decode_template_recommendation(
+            &FakeTemplateRecommendationRow::with_template_json("not-json"),
+        )
+        .unwrap_err();
+        assert!(
+            bad_json.contains("template_json"),
+            "invalid template_json should fail loudly: {bad_json}"
+        );
+
+        let bad_owner =
+            decode_template_recommendation(&FakeTemplateRecommendationRow::with_is_own(2))
+                .unwrap_err();
+        assert!(
+            bad_owner.contains("is_own") && bad_owner.contains("expected 0 or 1"),
+            "invalid is_own should fail loudly: {bad_owner}"
+        );
+
+        let bad_use_count =
+            decode_template_recommendation(&FakeTemplateRecommendationRow::with_use_count(-1))
+                .unwrap_err();
+        assert!(
+            bad_use_count.contains("use_count") && bad_use_count.contains("non-negative integer"),
+            "negative use_count should fail loudly: {bad_use_count}"
+        );
+    }
+
+    struct FakeLearningStatsRow {
+        failed_column: Option<&'static str>,
+        total_tasks: i64,
+        completed_tasks: i64,
+        avg_rating: Option<f32>,
+        avg_replan_count: Option<f32>,
+    }
+
+    impl FakeLearningStatsRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                total_tasks: 5,
+                completed_tasks: 3,
+                avg_rating: Some(4.2),
+                avg_replan_count: Some(1.5),
+            }
+        }
+
+        fn empty() -> Self {
+            Self {
+                total_tasks: 0,
+                completed_tasks: 0,
+                avg_rating: None,
+                avg_replan_count: None,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_counts(total_tasks: i64, completed_tasks: i64) -> Self {
+            Self {
+                total_tasks,
+                completed_tasks,
+                ..Self::complete()
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl LearningStatsDbRow for FakeLearningStatsRow {
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "total_tasks" => Ok(self.total_tasks),
+                "completed_tasks" => Ok(self.completed_tasks),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_f32_column(&self, column: &str) -> Result<Option<f32>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "avg_rating" => Ok(self.avg_rating),
+                "avg_replan_count" => Ok(self.avg_replan_count),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn learning_stats_row_decode_preserves_database_values() {
+        let stats = decode_learning_stats(&FakeLearningStatsRow::complete()).unwrap();
+
+        assert_eq!(stats.total_tasks, 5);
+        assert_eq!(stats.completed_tasks, 3);
+        assert_eq!(stats.avg_rating, Some(4.2));
+        assert_eq!(stats.avg_replan_count, 1.5);
+        assert!((stats.inferred_success_rate - 0.51).abs() < 0.001);
+    }
+
+    #[test]
+    fn learning_stats_row_decode_preserves_null_avg_values() {
+        let stats = decode_learning_stats(&FakeLearningStatsRow::empty()).unwrap();
+
+        assert_eq!(stats.total_tasks, 0);
+        assert_eq!(stats.completed_tasks, 0);
+        assert_eq!(stats.avg_rating, None);
+        assert_eq!(stats.avg_replan_count, 0.0);
+        assert_eq!(stats.inferred_success_rate, 0.0);
+    }
+
+    #[test]
+    fn learning_stats_row_decode_fails_loudly_on_any_selected_column_error() {
+        for column in [
+            "total_tasks",
+            "completed_tasks",
+            "avg_rating",
+            "avg_replan_count",
+        ] {
+            let error = decode_learning_stats(&FakeLearningStatsRow::fail_on(column)).unwrap_err();
+            assert!(
+                error.contains("learning stats row decode") && error.contains(column),
+                "decode error should identify selected column `{column}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn learning_stats_row_decode_rejects_corrupt_counts() {
+        for (total_tasks, completed_tasks, expected) in [
+            (-1, 0, "total_tasks"),
+            (1, -1, "completed_tasks"),
+            (1, 2, "expected <= total_tasks"),
+        ] {
+            let error = decode_learning_stats(&FakeLearningStatsRow::with_counts(
+                total_tasks,
+                completed_tasks,
+            ))
+            .unwrap_err();
+            assert!(
+                error.contains(expected),
+                "corrupt counts should fail with `{expected}` context: {error}"
+            );
+        }
+    }
+
+    struct FakeTaskRecordRow {
+        failed_column: Option<&'static str>,
+        session_id: Option<&'static str>,
+        parent_task_id: Option<&'static str>,
+        description: Option<&'static str>,
+        status: &'static str,
+        progress_pct: i32,
+        items_done: i32,
+        items_total: i32,
+        plan_json: Option<&'static str>,
+        checkpoint_json: Option<&'static str>,
+        error_message: Option<&'static str>,
+        completed_at: Option<&'static str>,
+        user_rating: Option<i8>,
+        completion_time_sec: Option<i32>,
+        replan_count: i32,
+        auto_adjustments: i32,
+        outcome: Option<&'static str>,
+        project_type: Option<&'static str>,
+        goal_pattern: Option<&'static str>,
+        agent_id: Option<&'static str>,
+    }
+
+    impl FakeTaskRecordRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                session_id: Some("session-1"),
+                parent_task_id: Some("parent-1"),
+                description: Some("full task row"),
+                status: "in_progress",
+                progress_pct: 40,
+                items_done: 2,
+                items_total: 5,
+                plan_json: Some(r#"{"subtasks":[],"notes":"plan"}"#),
+                checkpoint_json: Some(
+                    r#"{"active_subtask_id":null,"turn":3,"session_id":"session-1","state":{}}"#,
+                ),
+                error_message: Some("needs retry"),
+                completed_at: None,
+                user_rating: Some(4),
+                completion_time_sec: Some(120),
+                replan_count: 1,
+                auto_adjustments: 2,
+                outcome: Some("partial"),
+                project_type: Some("rust"),
+                goal_pattern: Some("refactor *"),
+                agent_id: Some("agent-1"),
+            }
+        }
+
+        fn without_optional_values() -> Self {
+            Self {
+                session_id: None,
+                parent_task_id: None,
+                description: None,
+                plan_json: None,
+                checkpoint_json: None,
+                error_message: None,
+                completed_at: None,
+                user_rating: None,
+                completion_time_sec: None,
+                outcome: None,
+                project_type: None,
+                goal_pattern: None,
+                agent_id: None,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_status(status: &'static str) -> Self {
+            Self {
+                status,
+                ..Self::complete()
+            }
+        }
+
+        fn with_outcome(outcome: &'static str) -> Self {
+            Self {
+                outcome: Some(outcome),
+                ..Self::complete()
+            }
+        }
+
+        fn with_optional_string(column: &'static str, value: &'static str) -> Self {
+            let mut row = Self::complete();
+            match column {
+                "plan_json" => row.plan_json = Some(value),
+                "checkpoint_json" => row.checkpoint_json = Some(value),
+                _ => unreachable!("unexpected optional string column: {column}"),
+            }
+            row
+        }
+
+        fn with_i32(column: &'static str, value: i32) -> Self {
+            let mut row = Self::complete();
+            match column {
+                "progress_pct" => row.progress_pct = value,
+                "items_done" => row.items_done = value,
+                "items_total" => row.items_total = value,
+                "replan_count" => row.replan_count = value,
+                "auto_adjustments" => row.auto_adjustments = value,
+                _ => unreachable!("unexpected i32 column: {column}"),
+            }
+            row
+        }
+
+        fn with_optional_i32(column: &'static str, value: i32) -> Self {
+            let mut row = Self::complete();
+            match column {
+                "completion_time_sec" => row.completion_time_sec = Some(value),
+                _ => unreachable!("unexpected optional i32 column: {column}"),
+            }
+            row
+        }
+
+        fn with_user_rating(value: i8) -> Self {
+            Self {
+                user_rating: Some(value),
+                ..Self::complete()
+            }
+        }
+    }
+
+    impl TaskRecordDbRow for FakeTaskRecordRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            Ok(match column {
+                "task_id" => "task-1",
+                "user_id" => "user-1",
+                "title" => "Refactor task record parser",
+                "status" => self.status,
+                "created_at" => "2026-06-26 09:00:00.000000",
+                "updated_at" => "2026-06-26 10:00:00.000000",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            Ok(match column {
+                "session_id" => self.session_id,
+                "parent_task_id" => self.parent_task_id,
+                "description" => self.description,
+                "plan_json" => self.plan_json,
+                "checkpoint_json" => self.checkpoint_json,
+                "error_message" => self.error_message,
+                "completed_at" => self.completed_at,
+                "outcome" => self.outcome,
+                "project_type" => self.project_type,
+                "goal_pattern" => self.goal_pattern,
+                "agent_id" => self.agent_id,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .map(str::to_string))
+        }
+
+        fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            match column {
+                "progress_pct" => Ok(self.progress_pct),
+                "items_done" => Ok(self.items_done),
+                "items_total" => Ok(self.items_total),
+                "replan_count" => Ok(self.replan_count),
+                "auto_adjustments" => Ok(self.auto_adjustments),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_i32_column(&self, column: &str) -> Result<Option<i32>, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            match column {
+                "completion_time_sec" => Ok(self.completion_time_sec),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_i8_column(&self, column: &str) -> Result<Option<i8>, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            match column {
+                "user_rating" => Ok(self.user_rating),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn task_record_row_decode_preserves_database_values() {
+        let record = decode_task_record(&FakeTaskRecordRow::complete()).unwrap();
+
+        assert_eq!(record.task_id, "task-1");
+        assert_eq!(record.user_id, "user-1");
+        assert_eq!(record.session_id.as_deref(), Some("session-1"));
+        assert_eq!(record.parent_task_id.as_deref(), Some("parent-1"));
+        assert_eq!(record.title, "Refactor task record parser");
+        assert_eq!(record.description.as_deref(), Some("full task row"));
+        assert_eq!(record.status, TaskStatus::InProgress);
+        assert_eq!(record.progress_pct, 40);
+        assert_eq!(record.items_done, 2);
+        assert_eq!(record.items_total, 5);
+        assert_eq!(
+            record.plan.as_ref().and_then(|plan| plan.notes.as_deref()),
+            Some("plan")
+        );
+        assert_eq!(
+            record.checkpoint.as_ref().map(|checkpoint| checkpoint.turn),
+            Some(3)
+        );
+        assert_eq!(record.error_message.as_deref(), Some("needs retry"));
+        assert_eq!(record.created_at, "2026-06-26 09:00:00.000000");
+        assert_eq!(record.updated_at, "2026-06-26 10:00:00.000000");
+        assert_eq!(record.completed_at, None);
+        assert_eq!(record.user_rating, Some(4));
+        assert_eq!(record.completion_time_sec, Some(120));
+        assert_eq!(record.replan_count, 1);
+        assert_eq!(record.auto_adjustments, 2);
+        assert_eq!(record.outcome, Some(TaskOutcome::Partial));
+        assert_eq!(record.project_type.as_deref(), Some("rust"));
+        assert_eq!(record.goal_pattern.as_deref(), Some("refactor *"));
+        assert_eq!(record.agent_id.as_deref(), Some("agent-1"));
+    }
+
+    #[test]
+    fn task_record_row_decode_preserves_sql_null_optional_values() {
+        let record = decode_task_record(&FakeTaskRecordRow::without_optional_values()).unwrap();
+
+        assert_eq!(record.session_id, None);
+        assert_eq!(record.parent_task_id, None);
+        assert_eq!(record.description, None);
+        assert!(record.plan.is_none());
+        assert!(record.checkpoint.is_none());
+        assert_eq!(record.error_message, None);
+        assert_eq!(record.completed_at, None);
+        assert_eq!(record.user_rating, None);
+        assert_eq!(record.completion_time_sec, None);
+        assert_eq!(record.outcome, None);
+        assert_eq!(record.project_type, None);
+        assert_eq!(record.goal_pattern, None);
+        assert_eq!(record.agent_id, None);
+    }
+
+    #[test]
+    fn task_record_row_decode_fails_loudly_on_any_selected_column_error() {
+        for column in [
+            "task_id",
+            "user_id",
+            "session_id",
+            "parent_task_id",
+            "title",
+            "description",
+            "status",
+            "progress_pct",
+            "items_done",
+            "items_total",
+            "plan_json",
+            "checkpoint_json",
+            "error_message",
+            "created_at",
+            "updated_at",
+            "completed_at",
+            "user_rating",
+            "completion_time_sec",
+            "replan_count",
+            "auto_adjustments",
+            "outcome",
+            "project_type",
+            "goal_pattern",
+            "agent_id",
+        ] {
+            let error = decode_task_record(&FakeTaskRecordRow::fail_on(column)).unwrap_err();
+            assert!(
+                error.contains("task record row decode") && error.contains(column),
+                "decode error should identify selected column `{column}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_record_row_decode_rejects_invalid_json_enums_and_numeric_bounds() {
+        let status = decode_task_record(&FakeTaskRecordRow::with_status("mystery")).unwrap_err();
+        assert!(
+            status.contains("unknown persisted task status: mystery"),
+            "invalid status should fail loudly: {status}"
+        );
+
+        let outcome = decode_task_record(&FakeTaskRecordRow::with_outcome("mystery")).unwrap_err();
+        assert!(
+            outcome.contains("task record row decode `outcome` unknown value: mystery"),
+            "invalid outcome should fail loudly: {outcome}"
+        );
+
+        for column in ["plan_json", "checkpoint_json"] {
+            let error =
+                decode_task_record(&FakeTaskRecordRow::with_optional_string(column, "not-json"))
+                    .unwrap_err();
+            assert!(
+                error.contains(column) && error.contains("invalid JSON"),
+                "invalid JSON should fail loudly for `{column}`: {error}"
+            );
+        }
+
+        for column in [
+            "progress_pct",
+            "items_done",
+            "items_total",
+            "replan_count",
+            "auto_adjustments",
+        ] {
+            let error = decode_task_record(&FakeTaskRecordRow::with_i32(column, -1)).unwrap_err();
+            assert!(
+                error.contains(column) && error.contains("non-negative integer"),
+                "negative numeric column should fail loudly for `{column}`: {error}"
+            );
+        }
+
+        let too_large =
+            decode_task_record(&FakeTaskRecordRow::with_i32("progress_pct", 101)).unwrap_err();
+        assert!(
+            too_large.contains("progress_pct") && too_large.contains("0..=100"),
+            "progress_pct above 100 should fail loudly: {too_large}"
+        );
+
+        let negative_completion = decode_task_record(&FakeTaskRecordRow::with_optional_i32(
+            "completion_time_sec",
+            -1,
+        ))
+        .unwrap_err();
+        assert!(
+            negative_completion.contains("completion_time_sec")
+                && negative_completion.contains("non-negative integer"),
+            "negative completion_time_sec should fail loudly: {negative_completion}"
+        );
+
+        let negative_rating =
+            decode_task_record(&FakeTaskRecordRow::with_user_rating(-1)).unwrap_err();
+        assert!(
+            negative_rating.contains("user_rating")
+                && negative_rating.contains("non-negative integer"),
+            "negative user_rating should fail loudly: {negative_rating}"
+        );
+    }
 
     // ── TaskStatus ──
 
@@ -2496,10 +3874,46 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = svc.get_task(&task_id).await.unwrap().unwrap();
+        let loaded = svc.get_task("user1", &task_id).await.unwrap().unwrap();
         assert_eq!(loaded.title, "Test Task");
         assert_eq!(loaded.status, TaskStatus::Pending);
         assert_eq!(loaded.outcome, None);
+    }
+
+    #[tokio::test]
+    async fn local_task_owner_mismatch_is_not_readable_or_mutable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let task_id = svc
+            .create_task(
+                "owner-a",
+                "sess1",
+                TaskCreateRequest {
+                    title: "owned task".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            svc.get_task("owner-b", &task_id).await.unwrap().is_none(),
+            "foreign owner must see the same surface as a missing task"
+        );
+        assert!(
+            svc.update_status("owner-b", &task_id, TaskStatus::InProgress)
+                .await
+                .is_err()
+        );
+        assert!(
+            svc.fail_task("owner-b", &task_id, "foreign mutation")
+                .await
+                .is_err()
+        );
+
+        let task = svc.get_task("owner-a", &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.error_message, None);
     }
 
     #[tokio::test]
@@ -2520,15 +3934,15 @@ mod tests {
             .unwrap();
 
         // Pending → InProgress
-        svc.update_status(&tid, TaskStatus::InProgress)
+        svc.update_status("user1", &tid, TaskStatus::InProgress)
             .await
             .unwrap();
-        let t = svc.get_task(&tid).await.unwrap().unwrap();
+        let t = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::InProgress);
 
         // Update progress
-        svc.update_progress(&tid, 50, 5, 10).await.unwrap();
-        let t = svc.get_task(&tid).await.unwrap().unwrap();
+        svc.update_progress("user1", &tid, 50, 5, 10).await.unwrap();
+        let t = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(t.progress_pct, 50);
         assert_eq!(t.items_done, 5);
 
@@ -2539,14 +3953,14 @@ mod tests {
             session_id: Some("sess1".into()),
             state: serde_json::Map::new(),
         };
-        svc.save_checkpoint(&tid, &ckpt).await.unwrap();
-        let t = svc.get_task(&tid).await.unwrap().unwrap();
+        svc.save_checkpoint("user1", &tid, &ckpt).await.unwrap();
+        let t = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert!(t.checkpoint.is_some());
         assert_eq!(t.checkpoint.unwrap().turn, 10);
 
         // Complete
-        svc.complete_task(&tid).await.unwrap();
-        let t = svc.get_task(&tid).await.unwrap().unwrap();
+        svc.complete_task("user1", &tid).await.unwrap();
+        let t = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::Completed);
         assert_eq!(t.outcome, Some(TaskOutcome::Success));
         assert_eq!(t.error_message, None);
@@ -2568,10 +3982,10 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_plan_run(&tid, 66, 2, 3, TaskOutcome::Partial)
+        svc.complete_plan_run("user1", &tid, 66, 2, 3, TaskOutcome::Partial)
             .await
             .unwrap();
-        let t = svc.get_task(&tid).await.unwrap().unwrap();
+        let t = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::Completed);
         assert_eq!(t.progress_pct, 66);
         assert_eq!(t.items_done, 2);
@@ -2595,10 +4009,10 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_task_with_outcome(&tid, TaskOutcome::Partial)
+        svc.complete_task_with_outcome("user1", &tid, TaskOutcome::Partial)
             .await
             .unwrap();
-        let t = svc.get_task(&tid).await.unwrap().unwrap();
+        let t = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::Completed);
         assert_eq!(t.progress_pct, 100);
         assert_eq!(t.items_done, 0);
@@ -2622,7 +4036,7 @@ mod tests {
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
         let tid = svc
             .create_task(
-                "u",
+                "user1",
                 "s",
                 TaskCreateRequest {
                     title: "t".into(),
@@ -2631,12 +4045,12 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_task(&tid).await.unwrap();
-        let before = svc.get_task(&tid).await.unwrap().unwrap();
+        svc.complete_task("user1", &tid).await.unwrap();
+        let before = svc.get_task("user1", &tid).await.unwrap().unwrap();
 
-        let err = svc.fail_task(&tid, "should be rejected").await;
+        let err = svc.fail_task("user1", &tid, "should be rejected").await;
         assert!(err.is_err(), "fail_task on completed must error");
-        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        let after = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(after.status, TaskStatus::Completed);
         assert_eq!(after.outcome, Some(TaskOutcome::Success));
         assert_eq!(after.error_message, None);
@@ -2649,7 +4063,7 @@ mod tests {
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
         let tid = svc
             .create_task(
-                "u",
+                "user1",
                 "s",
                 TaskCreateRequest {
                     title: "t".into(),
@@ -2658,23 +4072,23 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.fail_task(&tid, "boom").await.unwrap();
+        svc.fail_task("user1", &tid, "boom").await.unwrap();
 
-        let err = svc.complete_task(&tid).await;
+        let err = svc.complete_task("user1", &tid).await;
         assert!(err.is_err(), "complete_task on failed must error");
         let err = svc
-            .complete_task_with_outcome(&tid, TaskOutcome::Success)
+            .complete_task_with_outcome("user1", &tid, TaskOutcome::Success)
             .await;
         assert!(
             err.is_err(),
             "complete_task_with_outcome on failed must error"
         );
         let err = svc
-            .complete_plan_run(&tid, 100, 1, 1, TaskOutcome::Success)
+            .complete_plan_run("user1", &tid, 100, 1, 1, TaskOutcome::Success)
             .await;
         assert!(err.is_err(), "complete_plan_run on failed must error");
 
-        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        let after = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(after.status, TaskStatus::Failed);
         assert_eq!(after.outcome, Some(TaskOutcome::Failed));
         assert_eq!(after.error_message.as_deref(), Some("boom"));
@@ -2686,7 +4100,7 @@ mod tests {
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
         let tid = svc
             .create_task(
-                "u",
+                "user1",
                 "s",
                 TaskCreateRequest {
                     title: "t".into(),
@@ -2695,12 +4109,12 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_task(&tid).await.unwrap();
-        let before = svc.get_task(&tid).await.unwrap().unwrap();
+        svc.complete_task("user1", &tid).await.unwrap();
+        let before = svc.get_task("user1", &tid).await.unwrap().unwrap();
 
-        let err = svc.update_progress(&tid, 50, 5, 10).await;
+        let err = svc.update_progress("user1", &tid, 50, 5, 10).await;
         assert!(err.is_err(), "update_progress on completed must error");
-        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        let after = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(after.progress_pct, before.progress_pct);
         assert_eq!(after.updated_at, before.updated_at);
     }
@@ -2711,7 +4125,7 @@ mod tests {
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
         let tid = svc
             .create_task(
-                "u",
+                "user1",
                 "s",
                 TaskCreateRequest {
                     title: "t".into(),
@@ -2720,20 +4134,21 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.update_status(&tid, TaskStatus::Cancelled)
+        svc.update_status("user1", &tid, TaskStatus::Cancelled)
             .await
             .unwrap();
 
-        assert!(svc.fail_task(&tid, "late").await.is_err());
-        assert!(svc.complete_task(&tid).await.is_err());
-        assert!(svc.update_progress(&tid, 1, 1, 1).await.is_err());
+        assert!(svc.fail_task("user1", &tid, "late").await.is_err());
+        assert!(svc.complete_task("user1", &tid).await.is_err());
+        assert!(svc.update_progress("user1", &tid, 1, 1, 1).await.is_err());
         assert!(
-            svc.update_status(&tid, TaskStatus::InProgress)
+            svc.update_status("user1", &tid, TaskStatus::InProgress)
                 .await
                 .is_err()
         );
         assert!(
             svc.save_checkpoint(
+                "user1",
                 &tid,
                 &TaskCheckpoint {
                     active_subtask_id: Some("late".into()),
@@ -2747,6 +4162,7 @@ mod tests {
         );
         assert!(
             svc.update_plan(
+                "user1",
                 &tid,
                 &TaskPlan {
                     subtasks: vec![SubtaskPlan {
@@ -2761,7 +4177,7 @@ mod tests {
             .is_err()
         );
 
-        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        let after = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(after.status, TaskStatus::Cancelled);
         assert!(after.checkpoint.is_none());
         assert!(after.plan.is_none());
@@ -2794,7 +4210,7 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_task(&tid2).await.unwrap();
+        svc.complete_task("user1", &tid2).await.unwrap();
 
         let all = svc.list_recent_tasks("user1", None).await.unwrap();
         assert_eq!(all.len(), 2);
@@ -2830,7 +4246,7 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_plan_run(&tid, 100, 3, 3, TaskOutcome::Partial)
+        svc.complete_plan_run("user1", &tid, 100, 3, 3, TaskOutcome::Partial)
             .await
             .unwrap();
 
@@ -2870,8 +4286,8 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_task(&local).await.unwrap();
-        svc.complete_task(&foreign).await.unwrap();
+        svc.complete_task("user1", &local).await.unwrap();
+        svc.complete_task("user1", &foreign).await.unwrap();
 
         let local_tasks = svc
             .list_recent_tasks_for_session("user1", "sess-local", Some(TaskStatus::Completed))
@@ -3122,8 +4538,10 @@ mod tests {
             .await
             .unwrap();
 
-        svc.fail_task(&tid, "network timeout").await.unwrap();
-        let t = svc.get_task(&tid).await.unwrap().unwrap();
+        svc.fail_task("user1", &tid, "network timeout")
+            .await
+            .unwrap();
+        let t = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::Failed);
         assert_eq!(t.outcome, Some(TaskOutcome::Failed));
         assert_eq!(t.error_message.as_deref(), Some("network timeout"));
@@ -3173,9 +4591,9 @@ mod tests {
         // Mark first subtask complete
         let mut updated_plan = plan;
         updated_plan.subtasks[0].status = TaskStatus::Completed;
-        svc.update_plan(&tid, &updated_plan).await.unwrap();
+        svc.update_plan("user1", &tid, &updated_plan).await.unwrap();
 
-        let t = svc.get_task(&tid).await.unwrap().unwrap();
+        let t = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(t.progress_pct, 50);
         assert_eq!(t.items_done, 1);
         assert_eq!(t.items_total, 2);
@@ -3185,7 +4603,7 @@ mod tests {
     async fn local_task_nonexistent_returns_none() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
-        let result = svc.get_task("nonexistent-id").await.unwrap();
+        let result = svc.get_task("user1", "nonexistent-id").await.unwrap();
         assert!(result.is_none());
     }
 
@@ -3239,10 +4657,11 @@ mod tests {
             .await
             .unwrap();
 
-        svc.update_status(&tid, TaskStatus::InProgress)
+        svc.update_status("user1", &tid, TaskStatus::InProgress)
             .await
             .unwrap();
         svc.save_checkpoint(
+            "user1",
             &tid,
             &TaskCheckpoint {
                 active_subtask_id: Some("s2".into()),
@@ -3260,10 +4679,12 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.update_status(&tid, TaskStatus::Paused).await.unwrap();
+        svc.update_status("user1", &tid, TaskStatus::Paused)
+            .await
+            .unwrap();
 
         // Session 2: new session loads the task and resumes
-        let task = svc.get_task(&tid).await.unwrap().unwrap();
+        let task = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(task.status, TaskStatus::Paused);
         assert!(task.checkpoint.is_some());
 
@@ -3279,10 +4700,10 @@ mod tests {
         assert_eq!(plan.progress_pct(), 33); // 1/3 completed
 
         // Resume: update status and continue
-        svc.update_status(&tid, TaskStatus::InProgress)
+        svc.update_status("user1", &tid, TaskStatus::InProgress)
             .await
             .unwrap();
-        let resumed = svc.get_task(&tid).await.unwrap().unwrap();
+        let resumed = svc.get_task("user1", &tid).await.unwrap().unwrap();
         assert_eq!(resumed.status, TaskStatus::InProgress);
     }
 
@@ -3319,8 +4740,8 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_task(&tid1).await.unwrap();
-        svc.record_feedback(&tid1, 5, TaskOutcome::Success, Some(600))
+        svc.complete_task("user1", &tid1).await.unwrap();
+        svc.record_feedback("user1", &tid1, 5, TaskOutcome::Success, Some(600))
             .await
             .unwrap();
 
@@ -3335,7 +4756,7 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_task(&tid2).await.unwrap();
+        svc.complete_task("user1", &tid2).await.unwrap();
 
         let stats = svc
             .get_learning_stats("user1", "refactor auth")
@@ -3362,7 +4783,7 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_plan_run(&tid, 100, 3, 3, TaskOutcome::Partial)
+        svc.complete_plan_run("user1", &tid, 100, 3, 3, TaskOutcome::Partial)
             .await
             .unwrap();
 
@@ -3402,24 +4823,24 @@ mod tests {
             .unwrap();
 
         // Not eligible (no rating, not completed)
-        let template_id = svc.extract_template(&tid, "test *").await.unwrap();
+        let template_id = svc.extract_template("user1", &tid, "test *").await.unwrap();
         assert!(template_id.is_none());
 
         // Complete with low rating
-        svc.complete_task(&tid).await.unwrap();
-        svc.record_feedback(&tid, 2, TaskOutcome::Partial, None)
+        svc.complete_task("user1", &tid).await.unwrap();
+        svc.record_feedback("user1", &tid, 2, TaskOutcome::Partial, None)
             .await
             .unwrap();
 
         // Still not eligible: partial outcome must not seed templates.
-        let template_id = svc.extract_template(&tid, "test *").await.unwrap();
+        let template_id = svc.extract_template("user1", &tid, "test *").await.unwrap();
         assert!(template_id.is_none());
 
         // A successful completion with the same replan count is eligible.
-        svc.record_feedback(&tid, 5, TaskOutcome::Success, None)
+        svc.record_feedback("user1", &tid, 5, TaskOutcome::Success, None)
             .await
             .unwrap();
-        let template_id = svc.extract_template(&tid, "test *").await.unwrap();
+        let template_id = svc.extract_template("user1", &tid, "test *").await.unwrap();
         assert!(template_id.is_some());
     }
 
@@ -3456,11 +4877,11 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_task(&tid).await.unwrap();
-        svc.record_feedback(&tid, 5, TaskOutcome::Success, Some(1200))
+        svc.complete_task("user1", &tid).await.unwrap();
+        svc.record_feedback("user1", &tid, 5, TaskOutcome::Success, Some(1200))
             .await
             .unwrap();
-        svc.extract_template(&tid, "add authentication")
+        svc.extract_template("user1", &tid, "add authentication")
             .await
             .unwrap();
 
@@ -3498,15 +4919,23 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.complete_task(&tid).await.unwrap();
-        svc.record_feedback(&tid, 5, TaskOutcome::Success, None)
+        svc.complete_task("user1", &tid).await.unwrap();
+        svc.record_feedback("user1", &tid, 5, TaskOutcome::Success, None)
             .await
             .unwrap();
-        let template_id = svc.extract_template(&tid, "test").await.unwrap().unwrap();
+        let template_id = svc
+            .extract_template("user1", &tid, "test")
+            .await
+            .unwrap()
+            .unwrap();
 
         // Use the template
-        svc.record_template_usage(&template_id).await.unwrap();
-        svc.record_template_usage(&template_id).await.unwrap();
+        svc.record_template_usage("user1", &template_id)
+            .await
+            .unwrap();
+        svc.record_template_usage("user1", &template_id)
+            .await
+            .unwrap();
 
         // Check count increased
         let recs = svc
@@ -3763,80 +5192,39 @@ mod tests {
         assert_eq!(ls.inferred_success_rate, 0.0);
     }
 
-    /// P2-B: update_status must validate state transitions.
-    /// Only known non-terminal states are mutable; unknown persisted states fail closed.
     #[test]
-    fn update_status_validates_transitions() {
-        let source = include_str!("task_orchestrator.rs");
-        let fn_body = matrixone_task_service_method_source(source, "update_status");
-        // Must use atomic allow-list guard to prevent terminal or unknown state overwrites.
-        assert!(
-            fn_body.contains("status IN ('pending', 'in_progress', 'paused')")
-                || fn_body.contains("AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD"),
-            "update_status must use an atomic known-non-terminal guard"
+    fn task_guarded_update_sql_is_owner_bound_and_non_terminal_only() {
+        let sql = guarded_agent_task_update_sql("updated_at = NOW()");
+        assert_eq!(
+            sql,
+            "UPDATE agent_tasks SET updated_at = NOW() \
+         WHERE user_id = ? AND task_id = ? AND status IN ('pending', 'in_progress', 'paused')"
         );
-        assert!(
-            fn_body.contains("invalid task status transition"),
-            "update_status must reject invalid transitions with descriptive error"
-        );
-        assert!(
-            fn_body.contains("unknown persisted status"),
-            "update_status must fail closed on unknown persisted statuses"
-        );
-        assert!(
-            fn_body.contains("task not found"),
-            "update_status must reject missing task ids"
-        );
-    }
 
-    fn matrixone_task_service_method_source<'a>(source: &'a str, name: &str) -> &'a str {
-        let impl_start = source
-            .find("impl TaskService for MatrixOneTaskService")
-            .expect("MatrixOneTaskService impl must exist");
-        let impl_source = &source[impl_start..];
-        let fn_start = impl_source
-            .find(&format!("async fn {name}"))
-            .unwrap_or_else(|| panic!("{name} must exist"));
-        let fn_end = impl_source[fn_start..]
-            .find("\n    async fn ")
-            .map(|p| fn_start + p)
-            .unwrap_or(impl_source.len());
-        &impl_source[fn_start..fn_end]
-    }
-
-    #[test]
-    fn matrixone_task_service_mutations_use_known_non_terminal_guards() {
-        let source = include_str!("task_orchestrator.rs");
-        for method in [
-            "update_status",
-            "update_progress",
-            "save_checkpoint",
-            "update_plan",
-            "fail_task",
-            "complete_task_with_outcome",
-            "complete_plan_run",
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::InProgress,
+            TaskStatus::Paused,
         ] {
-            let fn_body = matrixone_task_service_method_source(source, method);
             assert!(
-                fn_body.contains("status IN ('pending', 'in_progress', 'paused')")
-                    || fn_body.contains("AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD"),
-                "{method} must use an atomic known-non-terminal guard"
+                AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD.contains(status.as_str()),
+                "non-terminal status {} must be admitted by the SQL guard",
+                status.as_str()
             );
+            assert!(!status.is_terminal());
         }
 
-        for method in [
-            "update_progress",
-            "save_checkpoint",
-            "update_plan",
-            "fail_task",
-            "complete_task_with_outcome",
-            "complete_plan_run",
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
         ] {
-            let fn_body = matrixone_task_service_method_source(source, method);
             assert!(
-                fn_body.contains("report_terminal_guard_violation"),
-                "{method} must surface terminal-state guard violations"
+                !AGENT_TASK_KNOWN_NON_TERMINAL_STATUS_GUARD.contains(status.as_str()),
+                "terminal status {} must not be admitted by the SQL guard",
+                status.as_str()
             );
+            assert!(status.is_terminal());
         }
     }
 

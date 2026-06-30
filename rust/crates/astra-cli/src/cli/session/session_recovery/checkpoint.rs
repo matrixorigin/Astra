@@ -18,6 +18,22 @@ fn recovery_user_id(state: &SessionState) -> String {
         .unwrap_or_else(cli_user_id)
 }
 
+fn budget_remaining_tokens_from_state(state: &SessionState) -> u64 {
+    if let Some(trace) = state.latest_context_assembly_trace.as_ref() {
+        let limit = u64::from(trace.token_budget.max_tokens);
+        if limit > 0 {
+            return limit.saturating_sub(u64::from(trace.token_budget.total_used));
+        }
+    }
+
+    let limit = astra_core::RuntimeLimits::global().max_turn_input_tokens;
+    if limit == 0 {
+        0
+    } else {
+        limit.saturating_sub(state.total_prompt_tokens)
+    }
+}
+
 pub(crate) fn delegation_from_heavy_checkpoint(
     heavy: &astra_pipeline::step_protocol::HeavyCheckpoint,
     context: &str,
@@ -150,14 +166,8 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
     let heavy = HeavyCheckpoint {
         light,
         messages,
-        budget_remaining_tokens: previous_budget_tokens.unwrap_or_else(|| {
-            let limit = astra_core::RuntimeLimits::global().max_turn_input_tokens;
-            if limit == 0 {
-                0
-            } else {
-                limit.saturating_sub(state.total_prompt_tokens)
-            }
-        }),
+        budget_remaining_tokens: previous_budget_tokens
+            .unwrap_or_else(|| budget_remaining_tokens_from_state(state)),
         budget_remaining_rounds: previous_budget_rounds
             .unwrap_or_else(|| max_turns.saturating_sub(state.turn)),
         blocked_tools: interrupted_blocked_tools,
@@ -402,5 +412,29 @@ mod tests {
         assert_eq!(heavy.messages[1]["content"], "continue");
         assert_eq!(heavy.messages[2]["role"], "assistant");
         assert_eq!(heavy.messages[2]["content"], "Done.");
+    }
+
+    #[test]
+    fn manual_heavy_checkpoint_budget_remaining_uses_latest_context_trace() {
+        let mut state = SessionState {
+            total_prompt_tokens: 41_000,
+            ..Default::default()
+        };
+        let mut trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace::default();
+        trace.token_budget.total_used = 20_687;
+        trace.token_budget.max_tokens = 800_000;
+        state.latest_context_assembly_trace = Some(trace);
+
+        let checkpoint = build_manual_heavy_step_checkpoint(
+            &state,
+            "sess-checkpoint-budget",
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            None,
+        );
+        let astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) = checkpoint else {
+            panic!("expected heavy checkpoint");
+        };
+
+        assert_eq!(heavy.budget_remaining_tokens, 779_313);
     }
 }

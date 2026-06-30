@@ -105,7 +105,7 @@ pub enum PlanUpdate {
         event: chat_stream::StreamEvent,
     },
     /// Per-subtask verification report with individual criterion results.
-    VerificationReport(astra_services::durable_task::SubtaskVerificationReport),
+    VerificationReport(astra_services::verification::SubtaskVerificationReport),
     /// Tool requires interactive approval — the TUI/monitor should prompt the user and
     /// send the response via `response_tx`.
     ApprovalNeeded {
@@ -2076,8 +2076,8 @@ async fn plan_executor_task(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundPlanContext, ChannelSink, PlanCommand, PlanOutputSink, PlanUpdate, StderrSink,
-        annotate_plan_subtask_event, browser_verification_gap_report,
+        BackgroundPlanContext, ChannelSink, PlanCommand, PlanExecutorHandle, PlanOutputSink,
+        PlanUpdate, StderrSink, annotate_plan_subtask_event, browser_verification_gap_report,
         compact_subtask_history_entry, create_plan_channels, failed_verification_status,
         has_any_unresolved_verification_failure, high_failure_tool_evidence, is_credential_error,
         plan_completion_action, record_cloud_step_run, render_verifier_failure_hint,
@@ -2092,14 +2092,32 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    const REAL_TURN_TEST_TIMEOUT: Duration = Duration::from_secs(25);
+
+    fn service_error(message: impl Into<String>) -> astra_services::ServiceError {
+        astra_services::ServiceError::internal(message)
+    }
+
+    async fn recv_plan_update_until<T>(
+        handle: &mut PlanExecutorHandle,
+        timeout: Duration,
+        mut accept: impl FnMut(PlanUpdate) -> Option<T>,
+    ) -> Option<T> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+            match tokio::time::timeout(remaining, handle.update_rx.recv()).await {
+                Ok(Some(update)) => {
+                    if let Some(value) = accept(update) {
+                        return Some(value);
+                    }
+                }
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
     fn test_background_plan_context() -> BackgroundPlanContext {
-        let mut reg = astra_runtime::skills::UnifiedSkillRegistry::new();
-        reg.add_provider(Box::new(
-            astra_skills::providers::LocalSkillProvider::standard(),
-        ));
-        reg.add_provider(Box::new(
-            astra_skills::providers::BundledSkillProvider::with_defaults(),
-        ));
         BackgroundPlanContext {
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             token: String::new(),
@@ -2114,7 +2132,7 @@ mod tests {
             session_id: None,
             recent_tools: vec![],
             tool_health_entries: vec![],
-            unified_skill_registry: Arc::new(reg),
+            unified_skill_registry: Arc::clone(astra_runtime::skills::empty_unified_registry()),
             delegation_engine: None,
             messaging_metrics: None,
             agent_spawner: None,
@@ -2718,56 +2736,89 @@ All acceptance checks pass:
                 _: &str,
                 _: &TaskPlan,
                 _: TaskScope,
-            ) -> Result<TaskContract, String> {
-                Err("stub".into())
+            ) -> astra_services::service_error::ServiceResult<TaskContract> {
+                Err(service_error("stub"))
             }
             async fn amend_contract(
                 &self,
                 _: &str,
                 _: ContractAmendment,
-            ) -> Result<TaskContract, String> {
-                Err("stub".into())
+            ) -> astra_services::service_error::ServiceResult<TaskContract> {
+                Err(service_error("stub"))
             }
-            async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> {
+            async fn get_contract(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<Option<TaskContract>> {
                 Ok(None)
             }
             async fn begin_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskExecutionContext, String> {
-                Err("stub".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskExecutionContext> {
+                Err(service_error("stub"))
             }
-            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
+            async fn complete_subtask_execution(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
                 Ok(())
             }
-            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+            async fn fail_subtask(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
                 Ok(())
             }
             async fn verify_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskVerificationReport, String> {
-                Err("stub".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskVerificationReport>
+            {
+                Err(service_error("stub"))
             }
-            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
-                Err("stub".into())
+            async fn verify_global(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<Vec<VerificationResult>> {
+                Err(service_error("stub"))
             }
-            async fn pause_task(&self, _: &str) -> Result<(), String> {
+            async fn pause_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
                 Ok(())
             }
-            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
-                Err("stub".into())
+            async fn resume_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskResumeContext> {
+                Err(service_error("stub"))
             }
-            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
-                Err("stub".into())
+            async fn deliver_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskDeliveryReport> {
+                Err(service_error("stub"))
             }
-            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
-                Err("stub".into())
+            async fn snapshot_task_state(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<String> {
+                Err(service_error("stub"))
             }
-            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("stub".into())
+            async fn rollback_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("stub"))
             }
         }
 
@@ -2876,8 +2927,6 @@ All acceptance checks pass:
 
     #[tokio::test]
     async fn spawn_plan_executor_marks_browser_subtask_failed_in_real_turn_flow() {
-        use tokio::time::{Duration, Instant, sleep};
-
         let mock = crate::cli::mock_llm::MockLlmServer::start(
             crate::cli::mock_llm::MockScenario::TextOnly,
         )
@@ -2899,47 +2948,38 @@ All acceptance checks pass:
         };
 
         let mut handle = spawn_plan_executor(ctx);
-
-        let deadline = Instant::now() + Duration::from_secs(10);
         let mut saw_browser_report = false;
         let mut saw_failed_status = false;
         let mut saw_completed_status = false;
 
-        while Instant::now() < deadline {
-            let mut drained_any = false;
-            while let Some(update) = handle.try_recv() {
-                drained_any = true;
-                match update {
-                    PlanUpdate::VerificationReport(report)
-                        if report_contains_browser_verification_gap(&report) =>
-                    {
-                        saw_browser_report = true;
+        let _ = recv_plan_update_until(&mut handle, REAL_TURN_TEST_TIMEOUT, |update| {
+            match update {
+                PlanUpdate::VerificationReport(report)
+                    if report_contains_browser_verification_gap(&report) =>
+                {
+                    saw_browser_report = true;
+                }
+                PlanUpdate::SubtaskStatusSync { id, status } if id == "browser-check" => {
+                    if status == TaskStatus::Failed {
+                        saw_failed_status = true;
                     }
-                    PlanUpdate::SubtaskStatusSync { id, status } if id == "browser-check" => {
-                        if status == TaskStatus::Failed {
-                            saw_failed_status = true;
-                            let _ = handle.send_command(PlanCommand::Cancel);
-                        }
-                        if status == TaskStatus::Completed {
-                            saw_completed_status = true;
-                        }
-                    }
-                    PlanUpdate::SubtaskCompleted { id, .. } if id == "browser-check" => {
+                    if status == TaskStatus::Completed {
                         saw_completed_status = true;
                     }
-                    _ => {}
                 }
+                PlanUpdate::SubtaskCompleted { id, .. } if id == "browser-check" => {
+                    saw_completed_status = true;
+                }
+                _ => {}
             }
-            if saw_failed_status && handle.is_finished() {
-                break;
+            if saw_browser_report && saw_failed_status {
+                Some(())
+            } else {
+                None
             }
-            if !drained_any {
-                // 1ms poll (was 25ms) — mock LLM emits events on sub-ms
-                // latency, so the tight poll avoids accumulating ~25ms×N
-                // idle waits per test under parallel load.
-                sleep(Duration::from_millis(1)).await;
-            }
-        }
+        })
+        .await;
+        let _ = handle.send_command(PlanCommand::Cancel);
 
         assert!(
             saw_browser_report,
@@ -2975,56 +3015,89 @@ All acceptance checks pass:
                 _: &str,
                 _: &TaskPlan,
                 _: TaskScope,
-            ) -> Result<TaskContract, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<TaskContract> {
+                Err(service_error("unused"))
             }
             async fn amend_contract(
                 &self,
                 _: &str,
                 _: ContractAmendment,
-            ) -> Result<TaskContract, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<TaskContract> {
+                Err(service_error("unused"))
             }
-            async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> {
+            async fn get_contract(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<Option<TaskContract>> {
                 Ok(None)
             }
             async fn begin_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskExecutionContext, String> {
-                Err("snapshot unavailable".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskExecutionContext> {
+                Err(service_error("snapshot unavailable"))
             }
-            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn complete_subtask_execution(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
-            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn fail_subtask(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
             async fn verify_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskVerificationReport, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskVerificationReport>
+            {
+                Err(service_error("unused"))
             }
-            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
-                Err("unused".into())
+            async fn verify_global(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<Vec<VerificationResult>> {
+                Err(service_error("unused"))
             }
-            async fn pause_task(&self, _: &str) -> Result<(), String> {
+            async fn pause_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
                 Ok(())
             }
-            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
-                Err("unused".into())
+            async fn resume_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskResumeContext> {
+                Err(service_error("unused"))
             }
-            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
-                Err("unused".into())
+            async fn deliver_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskDeliveryReport> {
+                Err(service_error("unused"))
             }
-            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
-                Err("unused".into())
+            async fn snapshot_task_state(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<String> {
+                Err(service_error("unused"))
             }
-            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn rollback_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
         }
 
@@ -3083,12 +3156,14 @@ All acceptance checks pass:
         }
 
         let error = plan_error.expect("plan should surface durable begin failure");
-        assert!(error.contains("Subtask 's1' durable start failed: snapshot unavailable"));
+        assert!(
+            error.contains("Subtask 's1' durable start failed: [internal] snapshot unavailable")
+        );
         assert!(saw_failed_status);
         assert!(!saw_plan_finished);
         match returned_stage.expect("durable state should be returned") {
             SubtaskStage::ExecutionFailed { error } => {
-                assert_eq!(error, "snapshot unavailable");
+                assert_eq!(error, "[internal] snapshot unavailable");
             }
             other => panic!("unexpected durable stage: {other:?}"),
         }
@@ -3116,56 +3191,89 @@ All acceptance checks pass:
                 _: &str,
                 _: &TaskPlan,
                 _: TaskScope,
-            ) -> Result<TaskContract, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<TaskContract> {
+                Err(service_error("unused"))
             }
             async fn amend_contract(
                 &self,
                 _: &str,
                 _: ContractAmendment,
-            ) -> Result<TaskContract, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<TaskContract> {
+                Err(service_error("unused"))
             }
-            async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> {
+            async fn get_contract(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<Option<TaskContract>> {
                 Ok(None)
             }
             async fn begin_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskExecutionContext, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskExecutionContext> {
+                Err(service_error("unused"))
             }
-            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn complete_subtask_execution(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
-            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn fail_subtask(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
             async fn verify_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskVerificationReport, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskVerificationReport>
+            {
+                Err(service_error("unused"))
             }
-            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
+            async fn verify_global(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<Vec<VerificationResult>> {
                 Ok(vec![])
             }
-            async fn pause_task(&self, _: &str) -> Result<(), String> {
+            async fn pause_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
                 Ok(())
             }
-            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
-                Err("unused".into())
+            async fn resume_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskResumeContext> {
+                Err(service_error("unused"))
             }
-            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
-                Err("persist failed".into())
+            async fn deliver_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskDeliveryReport> {
+                Err(service_error("persist failed"))
             }
-            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
-                Err("unused".into())
+            async fn snapshot_task_state(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<String> {
+                Err(service_error("unused"))
             }
-            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn rollback_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
         }
 
@@ -3228,8 +3336,6 @@ All acceptance checks pass:
 
     #[tokio::test]
     async fn spawn_plan_executor_tags_real_turn_event_with_subtask_id() {
-        use tokio::time::{Duration, Instant, sleep};
-
         let mock = crate::cli::mock_llm::MockLlmServer::start(
             crate::cli::mock_llm::MockScenario::TextOnly,
         )
@@ -3249,32 +3355,19 @@ All acceptance checks pass:
         };
 
         let mut handle = spawn_plan_executor(ctx);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut saw_tagged_turn = false;
-
-        while Instant::now() < deadline {
-            let mut drained_any = false;
-            while let Some(update) = handle.try_recv() {
-                drained_any = true;
+        let saw_tagged_turn =
+            recv_plan_update_until(&mut handle, REAL_TURN_TEST_TIMEOUT, |update| {
                 if let PlanUpdate::JournalEvent(event) = update
                     && event.event_type == session_journal::JournalEventType::Turn
                     && event.plan_subtask_id.as_deref() == Some("write-summary")
                 {
-                    saw_tagged_turn = true;
-                    let _ = handle.send_command(PlanCommand::Cancel);
-                    break;
+                    return Some(());
                 }
-            }
-            if saw_tagged_turn && handle.is_finished() {
-                break;
-            }
-            if !drained_any {
-                // 1ms poll (was 25ms) — mock LLM emits events on sub-ms
-                // latency, so the tight poll avoids accumulating ~25ms×N
-                // idle waits per test under parallel load.
-                sleep(Duration::from_millis(1)).await;
-            }
-        }
+                None
+            })
+            .await
+            .is_some();
+        let _ = handle.send_command(PlanCommand::Cancel);
 
         assert!(
             saw_tagged_turn,
@@ -3284,8 +3377,6 @@ All acceptance checks pass:
 
     #[tokio::test]
     async fn spawn_plan_executor_tags_real_turn_error_event_with_subtask_id() {
-        use tokio::time::{Duration, Instant, sleep};
-
         let mock =
             crate::cli::mock_llm::MockLlmServer::start(crate::cli::mock_llm::MockScenario::Fail)
                 .await
@@ -3304,33 +3395,19 @@ All acceptance checks pass:
         };
 
         let mut handle = spawn_plan_executor(ctx);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut saw_tagged_turn_error = false;
-
-        // 25ms was the original poll; under parallel load four of these
-        // tests would each wait ~20 iterations and tip over 1s. 1ms keeps
-        // the test responsive to the mock LLM's emission latency without
-        // hogging CPU (try_recv is a non-blocking channel check).
-        while Instant::now() < deadline {
-            let mut drained_any = false;
-            while let Some(update) = handle.try_recv() {
-                drained_any = true;
+        let saw_tagged_turn_error =
+            recv_plan_update_until(&mut handle, REAL_TURN_TEST_TIMEOUT, |update| {
                 if let PlanUpdate::JournalEvent(event) = update
                     && event.event_type == session_journal::JournalEventType::TurnError
                     && event.plan_subtask_id.as_deref() == Some("failing-step")
                 {
-                    saw_tagged_turn_error = true;
-                    let _ = handle.send_command(PlanCommand::Cancel);
-                    break;
+                    return Some(());
                 }
-            }
-            if saw_tagged_turn_error && handle.is_finished() {
-                break;
-            }
-            if !drained_any {
-                sleep(Duration::from_millis(1)).await;
-            }
-        }
+                None
+            })
+            .await
+            .is_some();
+        let _ = handle.send_command(PlanCommand::Cancel);
 
         assert!(
             saw_tagged_turn_error,
@@ -3340,8 +3417,6 @@ All acceptance checks pass:
 
     #[tokio::test]
     async fn spawn_plan_executor_emits_compact_history_entries_between_subtasks() {
-        use tokio::time::{Duration, Instant, sleep};
-
         let mock = crate::cli::mock_llm::MockLlmServer::start(
             crate::cli::mock_llm::MockScenario::TextOnly,
         )
@@ -3373,33 +3448,19 @@ All acceptance checks pass:
         };
 
         let mut handle = spawn_plan_executor(ctx);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut compact_history: Option<(String, String)> = None;
-
-        while Instant::now() < deadline {
-            let mut drained_any = false;
-            while let Some(update) = handle.try_recv() {
-                drained_any = true;
+        let compact_history =
+            recv_plan_update_until(&mut handle, REAL_TURN_TEST_TIMEOUT, |update| {
                 if let PlanUpdate::HistoryEntry {
                     user_msg,
                     assistant_msg,
                 } = update
                 {
-                    compact_history = Some((user_msg, assistant_msg));
-                    let _ = handle.send_command(PlanCommand::Cancel);
-                    break;
+                    return Some((user_msg, assistant_msg));
                 }
-            }
-            if compact_history.is_some() && handle.is_finished() {
-                break;
-            }
-            if !drained_any {
-                // 1ms poll (was 25ms) — mock LLM emits events on sub-ms
-                // latency, so the tight poll avoids accumulating ~25ms×N
-                // idle waits per test under parallel load.
-                sleep(Duration::from_millis(1)).await;
-            }
-        }
+                None
+            })
+            .await;
+        let _ = handle.send_command(PlanCommand::Cancel);
 
         let (user_msg, assistant_msg) =
             compact_history.expect("real plan executor flow should emit a history entry");

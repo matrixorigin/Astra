@@ -205,12 +205,10 @@ impl BranchService for DatabaseBranchService {
                 "SELECT COUNT(*) AS cnt FROM mo_diff('{}', '{}')",
                 request.source, request.target
             );
-            let row = query(&sql)
-                .fetch_optional(&pool)
-                .await
-                .map_err(internal_error)?;
-
-            let count: i64 = row.map(|r| r.try_get("cnt").unwrap_or(0)).unwrap_or(0);
+            let row = query(&sql).fetch_one(&pool).await.map_err(internal_error)?;
+            let count: i64 = row
+                .try_get("cnt")
+                .map_err(|err| internal_error(format!("invalid mo_diff.cnt: {err}")))?;
 
             Ok(DiffResponse {
                 rows: Vec::new(),
@@ -266,7 +264,11 @@ impl BranchService for DatabaseBranchService {
             status: "merged".into(),
             source: request.source,
             target: request.target,
-            rows_affected: result.rows_affected() as i64,
+            rows_affected: crate::storage::rows_affected_to_i64(
+                result.rows_affected(),
+                "merge_branch",
+            )
+            .map_err(internal_error)?,
         })
     }
 

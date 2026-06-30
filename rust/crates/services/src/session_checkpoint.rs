@@ -12,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
+use astra_core::canonical_names::normalize_name_list;
+
 /// Default interval: create a checkpoint every N turns.
 pub const CHECKPOINT_INTERVAL: u32 = 5;
 
@@ -51,12 +53,13 @@ impl Checkpoint {
         md.push_str(&format!("## Summary\n\n{}\n\n", self.summary));
         md.push_str("## Stats\n\n");
         md.push_str(&format!("- Total tokens: {}\n", self.total_tokens));
+        let tools_used = normalize_name_list(&self.tools_used);
         md.push_str(&format!(
             "- Tools used: {}\n",
-            if self.tools_used.is_empty() {
+            if tools_used.is_empty() {
                 "none".to_string()
             } else {
-                self.tools_used.join(", ")
+                tools_used.join(", ")
             }
         ));
         if self.had_stalls {
@@ -319,6 +322,32 @@ mod tests {
         assert!(md.contains("Total tokens: 5000"));
         assert!(md.contains("bash, read_file"));
         assert!(!md.contains("Stalls"));
+    }
+
+    #[test]
+    fn checkpoint_to_markdown_canonicalizes_tool_names() {
+        let cp = Checkpoint {
+            number: 1,
+            turn: 5,
+            title: "Initial exploration".to_string(),
+            summary: "Explored the codebase and identified key files.".to_string(),
+            tools_used: vec![
+                " bash ".to_string(),
+                "bash".to_string(),
+                String::new(),
+                "  ".to_string(),
+                "read_file".to_string(),
+            ],
+            total_tokens: 5000,
+            had_stalls: false,
+            error_count: 0,
+            contract_state_json: None,
+        };
+
+        let md = cp.to_markdown();
+
+        assert!(md.contains("Tools used: bash, read_file"));
+        assert!(!md.contains(" bash "));
     }
 
     #[test]

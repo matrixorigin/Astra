@@ -1,7 +1,6 @@
 use astra_services::{
     ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore, InstallUserSkill,
-    RecordUserSkillEvaluation, SubmitUserSkillVersion, normalize_version_or_legacy,
-    skill_md_content_hash,
+    PersonalSkillError, RecordUserSkillEvaluation, SubmitUserSkillVersion, skill_md_content_hash,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -13,17 +12,33 @@ fn require_db_it_env() -> astra_core::MatrixOneSettings {
         Ok("1"),
         "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
     );
-    astra_core::MatrixOneSettings::from_env()
+    let mut settings = astra_core::MatrixOneSettings::from_env();
+    settings.db_pool_max_connections = settings.db_pool_max_connections.clamp(1, 4);
+    settings.db_pool_min_connections = settings
+        .db_pool_min_connections
+        .min(settings.db_pool_max_connections);
+    settings
+}
+
+static SHARED_BOOTSTRAP: tokio::sync::OnceCell<astra_core::MatrixOneSettings> =
+    tokio::sync::OnceCell::const_new();
+
+async fn bootstrap_settings() -> &'static astra_core::MatrixOneSettings {
+    SHARED_BOOTSTRAP
+        .get_or_init(|| async {
+            let settings = require_db_it_env();
+            let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                .unwrap_or_else(|_| "mysql".into());
+            astra_services::ensure_core_schema(&settings, &catalog)
+                .await
+                .expect("ensure_core_schema; is MatrixOne up?");
+            settings
+        })
+        .await
 }
 
 async fn setup_pool() -> astra_core::SharedPool {
-    let settings = require_db_it_env();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    astra_services::ensure_core_schema(&settings, &catalog)
-        .await
-        .expect("ensure_core_schema; is MatrixOne up?");
-    astra_core::SharedPool::new(&settings)
+    astra_core::SharedPool::new(bootstrap_settings().await)
         .await
         .expect("SharedPool::new")
 }
@@ -129,12 +144,13 @@ async fn l2_45_active_switch_does_not_mutate_draft_or_auto_activate_install() {
           (SELECT auto_activate_on_topic_match FROM skill_installations
            WHERE user_id = ? AND skill_name = ?) AS auto_activate,
           (SELECT payload_json FROM session_state_items
-           WHERE session_id = ? AND category = 'active_skill' AND item_key = ?) AS payload_json",
+           WHERE session_id = ? AND user_id = ? AND category = 'active_skill' AND item_key = ?) AS payload_json",
     )
     .bind(&v2.version_id)
     .bind(&user_id)
     .bind(&skill_name)
     .bind(&session_id)
+    .bind(&user_id)
     .bind(&skill_name)
     .fetch_one(pool.get())
     .await
@@ -159,29 +175,66 @@ async fn l2_46_skill_evaluations_use_independent_table_and_unified_denominator()
         .await
         .unwrap();
     let evaluation = store
-        .record_evaluation(RecordUserSkillEvaluation {
-            source_id: version.source_id.clone(),
-            version_id: version.version_id.clone(),
-            run_id: Some(format!("run-{}", Uuid::new_v4())),
-            hits: 7,
-            suspects: 10,
-            false_positives: 2,
-            payload_json: Some(json!({"denominator": "suspects", "hit_rate": 0.7})),
-        })
+        .record_evaluation(
+            &user_id,
+            &skill_name,
+            RecordUserSkillEvaluation {
+                source_id: version.source_id.clone(),
+                version_id: version.version_id.clone(),
+                run_id: Some(format!("run-{}", Uuid::new_v4())),
+                hits: 7,
+                suspects: 10,
+                false_positives: 2,
+                payload_json: Some(json!({"denominator": "suspects", "hit_rate": 0.7})),
+            },
+        )
         .await
         .unwrap();
+    assert_eq!(evaluation.owner_user_id, user_id);
     assert_eq!(evaluation.hits, 7);
     assert_eq!(evaluation.suspects, 10);
+    let foreign_user_id = Uuid::new_v4().to_string();
+    let rejected = store
+        .record_evaluation(
+            &foreign_user_id,
+            &skill_name,
+            RecordUserSkillEvaluation {
+                source_id: version.source_id.clone(),
+                version_id: version.version_id.clone(),
+                run_id: Some(format!("run-{}", Uuid::new_v4())),
+                hits: 1,
+                suspects: 1,
+                false_positives: 0,
+                payload_json: Some(json!({"should_not_insert": true})),
+            },
+        )
+        .await
+        .expect_err("foreign owner must not record evaluation for another user's skill version");
+    assert!(
+        matches!(
+            rejected,
+            PersonalSkillError::VersionNotFound {
+                ref owner_user_id,
+                ref version_id,
+                ..
+            } if owner_user_id == &foreign_user_id && version_id == &version.version_id
+        ),
+        "unexpected foreign-owner error: {rejected:?}"
+    );
     let row = sqlx::query(
         "SELECT
-          (SELECT COUNT(*) FROM user_skill_evaluations WHERE version_id = ?) AS eval_count,
+          (SELECT COUNT(*) FROM user_skill_evaluations WHERE owner_user_id = ? AND version_id = ?) AS eval_count,
+          (SELECT COUNT(*) FROM user_skill_evaluations WHERE owner_user_id = ?) AS foreign_eval_count,
           (SELECT COUNT(*) FROM session_state_items WHERE category = 'skill_evaluation') AS state_count",
     )
+    .bind(&user_id)
     .bind(&version.version_id)
+    .bind(&foreign_user_id)
     .fetch_one(pool.get())
     .await
     .unwrap();
     assert_eq!(row.try_get::<i64, _>("eval_count").unwrap(), 1);
+    assert_eq!(row.try_get::<i64, _>("foreign_eval_count").unwrap(), 0);
     assert_eq!(row.try_get::<i64, _>("state_count").unwrap(), 0);
 }
 
@@ -272,7 +325,7 @@ async fn l2_48_auto_activate_topic_match_switch_controls_candidates() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_49_normalize_version_defaults_and_legacy_null_reads_raw_v1() {
+async fn l2_49_normalize_version_defaults_and_empty_values_fail_loud() {
     let pool = setup_pool().await;
     let store = DatabasePersonalSkillStore::new(pool.clone());
     let (user_id, skill_name) = test_ids();
@@ -309,7 +362,21 @@ async fn l2_49_normalize_version_defaults_and_legacy_null_reads_raw_v1() {
             .try_get("normalize_version")
             .unwrap();
     assert_eq!(normalize_version, "skill_md_v1");
-    assert_eq!(normalize_version_or_legacy(None), "raw_v1");
+
+    sqlx::query("UPDATE user_skill_versions SET normalize_version = '' WHERE version_id = ?")
+        .bind(&version_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let error = store
+        .list_versions(&user_id, &skill_name)
+        .await
+        .expect_err("empty normalize_version must fail loud");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("normalize_version") && rendered.contains("must not be empty"),
+        "unexpected error: {rendered}"
+    );
 }
 
 #[tokio::test]
@@ -351,11 +418,12 @@ async fn l3_16_s13_seven_version_iteration_append_only_and_structured_switch_bac
           (SELECT COUNT(*) FROM user_skill_versions WHERE source_id = ?) AS version_count,
           (SELECT status FROM user_skill_versions WHERE version_id = ?) AS v7_status,
           (SELECT payload_json FROM session_state_items
-           WHERE session_id = ? AND category = 'active_skill' AND item_key = ?) AS active_payload",
+           WHERE session_id = ? AND user_id = ? AND category = 'active_skill' AND item_key = ?) AS active_payload",
     )
     .bind(&v2.source_id)
     .bind(&versions[6].version_id)
     .bind(&session_id)
+    .bind(&user_id)
     .bind(&skill_name)
     .fetch_one(pool.get())
     .await

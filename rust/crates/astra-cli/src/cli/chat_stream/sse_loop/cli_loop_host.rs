@@ -134,6 +134,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub auth_profile: Option<&'a str>,
     pub model_id: Option<String>,
     pub model: Option<&'a str>,
+    pub context_window_tokens: u32,
     pub explain: ExplainMode,
     pub render_md: bool,
     pub term_width: usize,
@@ -575,6 +576,8 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             auth_profile: self.auth_profile,
             model_id: effective_model_id,
             model: effective_model,
+            context_window_tokens: self.context_window_tokens,
+            effective_input_budget_tokens: state.max_turn_input_tokens,
             explain: self.explain,
             render_md: self.render_md,
             term_width: self.term_width,
@@ -723,10 +726,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             let bridge_fps = turn_result.core.bridge_injection_fingerprints.as_ref();
             if let Ok(mut session) = session_lock.write() {
                 session.observe_bridge_injections_partial(
-                    astra_runtime::observability::BridgeInjectionTexts {
+                    astra_runtime::observability::BridgeInjectionPreviews {
                         lessons: &lessons_text,
                         self_awareness: &self_awareness_text,
-                        ..astra_runtime::observability::BridgeInjectionTexts::EMPTY
+                        ..astra_runtime::observability::BridgeInjectionPreviews::EMPTY
                     },
                     bridge_fps,
                 );
@@ -965,7 +968,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     fn render_final_text(&mut self, text: &str) {
         use std::io::Write;
-        if self.render_policy.is_silent() || self.render_policy == RenderPolicy::PlanDecompose {
+        if self.render_policy.suppress_final_text() {
             return;
         }
         if text.is_empty() {

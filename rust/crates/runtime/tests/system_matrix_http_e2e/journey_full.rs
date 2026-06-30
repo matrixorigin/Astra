@@ -188,11 +188,13 @@ pub async fn run_product_matrix_full_journey(
         "close response: {closed}"
     );
 
-    let sess_status = sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ?")
-        .bind(&session_id)
-        .fetch_one(pool)
-        .await
-        .expect("session status after close");
+    let sess_status =
+        sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await
+            .expect("session status after close");
     assert_eq!(
         sess_status.try_get::<String, _>("status").ok().as_deref(),
         Some("closed"),
@@ -212,11 +214,13 @@ pub async fn run_product_matrix_full_journey(
         "resume response: {resm}"
     );
 
-    let sess_active = sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ?")
-        .bind(&session_id)
-        .fetch_one(pool)
-        .await
-        .expect("session status after resume");
+    let sess_active =
+        sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await
+            .expect("session status after resume");
     assert_eq!(
         sess_active.try_get::<String, _>("status").ok().as_deref(),
         Some("active"),
@@ -1143,6 +1147,7 @@ pub async fn run_product_matrix_full_journey(
 
     wait_for_agent_event_types(
         pool,
+        &user_id,
         &session_id,
         &["user_query", "llm_response"],
         std::time::Duration::from_secs(30),
@@ -1152,9 +1157,10 @@ pub async fn run_product_matrix_full_journey(
     let recs = sqlx::query(
         "SELECT event_id, session_id, user_id, event_type, content, parent_event_id, \
          causal_chain_id, token_input, token_output, token_total, llm_model_used, reasoning_content \
-         FROM agent_events WHERE session_id = ? ORDER BY created_at ASC",
+         FROM agent_events WHERE session_id = ? AND user_id = ? ORDER BY created_at ASC",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_all(pool)
     .await
     .expect("select agent_events");
@@ -1254,6 +1260,7 @@ pub async fn run_product_matrix_full_journey(
     );
     wait_for_agent_event_types(
         pool,
+        &user_id,
         &session_id,
         &["context_trace_signal"],
         std::time::Duration::from_secs(30),
@@ -1271,12 +1278,14 @@ pub async fn run_product_matrix_full_journey(
                      CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.tools_available')) AS SIGNED) AS tools_available \
                  FROM agent_events \
                  WHERE session_id = ? \
+                   AND user_id = ? \
                    AND event_type = 'context_trace_signal' \
                    AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) IS NOT NULL \
                  ORDER BY created_at DESC \
                  LIMIT 1",
             )
             .bind(&session_id)
+            .bind(&user_id)
             .fetch_optional(pool)
             .await
             .expect("latest tool-backed context_trace_signal event")
@@ -1367,7 +1376,7 @@ pub async fn run_product_matrix_full_journey(
         "replay compare should count non-replay events: {rcmp_j}"
     );
 
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;
     cleanup_edge_registry(pool, &user_id, &edge_agent_id).await;
 
     let del_agent = delete_no_content(

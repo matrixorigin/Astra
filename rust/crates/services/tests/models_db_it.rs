@@ -1,0 +1,91 @@
+mod common;
+
+use std::sync::Arc;
+
+use astra_services::{DatabaseModelService, FernetTokenEncryptor, ModelService};
+use axum::http::StatusCode;
+use serial_test::serial;
+use uuid::Uuid;
+
+async fn seed_model(pool: &sqlx::Pool<sqlx::MySql>, model_name: &str) -> String {
+    let model_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO infra_llm_models \
+         (model_id, model_name, provider, base_url, is_active, context_window, \
+          input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) \
+         VALUES (?, ?, 'mock', 'http://127.0.0.1:1', 1, 128000, \
+          ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&model_id)
+    .bind(model_name)
+    .bind(r#"["text"]"#)
+    .bind(r#"["text"]"#)
+    .bind("[]")
+    .bind("{}")
+    .bind("[]")
+    .bind("{}")
+    .execute(pool)
+    .await
+    .expect("seed model");
+    model_id
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn database_model_corrupt_capability_and_json_shape_fail_loud() {
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let service = DatabaseModelService::new(
+        settings,
+        Arc::new(FernetTokenEncryptor::new("models-db-it-key").expect("test encryptor")),
+    )
+    .with_pool(shared_pool);
+    let model_name = format!("model_{}", Uuid::new_v4().simple());
+    seed_model(&pool, &model_name).await;
+
+    sqlx::query("UPDATE infra_llm_models SET thinking_capability = ? WHERE model_name = ?")
+        .bind("mystery")
+        .bind(&model_name)
+        .execute(&pool)
+        .await
+        .expect("corrupt thinking_capability");
+
+    let err = match service.get_model(model_name.clone()).await {
+        Ok(_) => panic!("unknown persisted thinking_capability must fail loudly"),
+        Err(err) => err,
+    };
+    assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        err.1
+            .detail
+            .contains("infra_llm_models.thinking_capability"),
+        "unexpected error detail: {}",
+        err.1.detail
+    );
+
+    sqlx::query("UPDATE infra_llm_models SET thinking_capability = NULL, input_modalities = ? WHERE model_name = ?")
+        .bind("null")
+        .bind(&model_name)
+        .execute(&pool)
+        .await
+        .expect("corrupt input_modalities shape");
+
+    let err = match service.get_model(model_name.clone()).await {
+        Ok(_) => panic!("invalid persisted input_modalities shape must fail loudly"),
+        Err(err) => err,
+    };
+    assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        err.1
+            .detail
+            .contains("infra_llm_models.input_modalities_json"),
+        "unexpected error detail: {}",
+        err.1.detail
+    );
+
+    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
+        .bind(&model_name)
+        .execute(&pool)
+        .await;
+}

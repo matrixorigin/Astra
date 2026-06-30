@@ -318,7 +318,7 @@ fn journal_usage_from_response_event(
         .and_then(|response| response.get("response"))
         .and_then(|response| response.get("usage"))
         .and_then(serde_json::Value::as_object)?;
-    let canonical = astra_runtime::turn::token_usage::TokenUsage::from_json_map(usage);
+    let canonical = astra_runtime::turn::token_usage::TokenUsage::from_partial_json_map(usage);
     if !canonical.is_empty() {
         return Some(canonical);
     }

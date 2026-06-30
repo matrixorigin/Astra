@@ -22,6 +22,9 @@ use crate::protocol::{
 };
 use crate::sse::SseParser;
 
+const HTTP_STREAM_CONNECT_TIMEOUT_SECS: u64 = 60;
+const AUTHED_TEXT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 #[cfg(test)]
 thread_local! {
     /// Test override: when `Some(ms)`, `sleep_between_attempts` uses this flat
@@ -61,6 +64,24 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
     Some(secs.clamp(1, 120))
 }
 
+fn http_stream_connect_timeout() -> Duration {
+    Duration::from_secs(HTTP_STREAM_CONNECT_TIMEOUT_SECS)
+}
+
+fn authed_text_request_timeout() -> Duration {
+    Duration::from_secs(AUTHED_TEXT_REQUEST_TIMEOUT_SECS)
+}
+
+fn streaming_http_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .no_proxy()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .connect_timeout(http_stream_connect_timeout())
+        .build()
+}
+
 /// Stateless façade over the astra HTTP API (thin client).
 #[derive(Debug, Clone)]
 pub struct ThinClient {
@@ -80,16 +101,9 @@ impl ThinClient {
         let base =
             Url::parse(base).map_err(|_| ThinClientError::InvalidBaseUrl(base.to_string()))?;
         let http = Client::builder().no_proxy().build()?;
-        // audit-#12: cap connection establishment at 60s on the streaming
-        // client. Body streaming itself remains uncapped (chat turns can run
-        // for many minutes) — only TCP/TLS handshake is bounded.
-        let http_stream = Client::builder()
-            .no_proxy()
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .connect_timeout(Duration::from_secs(60))
-            .build()?;
+        // Bound TCP/TLS handshakes while leaving response body streaming uncapped.
+        // Chat turns can run for many minutes after the connection is established.
+        let http_stream = streaming_http_client()?;
         Ok(Self {
             http,
             http_stream,
@@ -865,13 +879,13 @@ impl ThinClient {
         path_with_query: &str,
     ) -> Result<String, ThinClientError> {
         let url = self.url(path_with_query)?;
-        // audit-#13: cap each authed text fetch at 30s so a stalled server
-        // doesn't pin the caller indefinitely.
+        // Bounded request timeout: this helper fetches finite text responses,
+        // unlike chat turn SSE streams.
         let resp = self
             .http
             .get(url)
             .headers(Self::bearer_headers(token)?)
-            .timeout(Duration::from_secs(30))
+            .timeout(authed_text_request_timeout())
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -2584,42 +2598,22 @@ mod tests {
         );
     }
 
-    /// audit-#12: the streaming `http_stream` reqwest client must have a
-    /// connect_timeout so a dead/black-holed server cannot pin the TCP
-    /// handshake forever (body streaming itself remains uncapped).
     #[test]
-    fn thin_client_http_stream_has_connect_timeout() {
-        let source = include_str!("client.rs");
-        let new_pos = source
-            .find("pub fn new(base: &str, bearer_token: Option<String>)")
-            .expect("ThinClient::new must exist");
-        let body_end = source[new_pos..]
-            .find("\n    pub fn ")
-            .map(|i| new_pos + i)
-            .unwrap_or(source.len());
-        let body = &source[new_pos..body_end];
-        assert!(
-            body.contains("connect_timeout("),
-            "ThinClient::new must set a connect_timeout on the streaming client"
-        );
+    fn thin_client_http_stream_connect_timeout_policy_is_bounded() {
+        assert_eq!(http_stream_connect_timeout(), Duration::from_secs(60));
+        streaming_http_client().expect("streaming HTTP client builder");
     }
 
-    /// audit-#13: per-request timeout for `get_authed_path_text` so a stalled
-    /// authed text fetch can't pin the caller indefinitely.
     #[test]
-    fn get_authed_path_text_has_per_request_timeout() {
-        let source = include_str!("client.rs");
-        let fn_start = source
-            .find("pub async fn get_authed_path_text")
-            .expect("get_authed_path_text must exist");
-        let body_end = source[fn_start..]
-            .find("\n    pub ")
-            .map(|i| fn_start + i)
-            .unwrap_or(source.len());
-        let body = &source[fn_start..body_end];
+    fn authed_text_request_timeout_policy_is_bounded() {
+        let timeout = authed_text_request_timeout();
         assert!(
-            body.contains(".timeout("),
-            "get_authed_path_text must apply a per-request .timeout()"
+            timeout <= Duration::from_secs(30),
+            "authed text requests must stay bounded so callers cannot hang indefinitely"
+        );
+        assert!(
+            timeout >= Duration::from_secs(1),
+            "authed text request timeout should not fail healthy calls immediately"
         );
     }
 

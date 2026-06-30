@@ -31,12 +31,14 @@ use astra_runtime::turn::budget_messaging::{BUDGET_REACHED_ADVISORY, COMPACT_RES
 
 #[test]
 fn sonnet_4_6_gets_near_full_one_million_window() {
-    // Sonnet 4.6 advertises a 1M context window. The effective budget
-    // must use that window (minus a reasonable reserve), not the legacy
-    // 200K clamp. A 600K minimum guards against regression where someone
-    // reintroduces the 200K upper bound in min(...).
+    // Sonnet 4.6 advertises a 1M context window via model-registry metadata.
+    // The effective budget must use that explicit window (minus a reasonable
+    // reserve), not the legacy 200K clamp. Model names alone are not metadata.
     let limits = RuntimeLimits::default();
-    let budget = limits.effective_max_turn_input_tokens(Some("claude-sonnet-4-6"));
+    let budget = limits.effective_max_turn_input_tokens_with_context_window(
+        Some("claude-sonnet-4-6"),
+        Some(1_000_000),
+    );
     assert!(
         budget >= 600_000,
         "Sonnet 4.6 must expose a near-1M budget, got {budget}"
@@ -46,7 +48,10 @@ fn sonnet_4_6_gets_near_full_one_million_window() {
 #[test]
 fn opus_4_6_gets_near_full_one_million_window() {
     let limits = RuntimeLimits::default();
-    let budget = limits.effective_max_turn_input_tokens(Some("claude-opus-4-6"));
+    let budget = limits.effective_max_turn_input_tokens_with_context_window(
+        Some("claude-opus-4-6"),
+        Some(1_000_000),
+    );
     assert!(
         budget >= 600_000,
         "Opus 4.6 must expose a near-1M budget, got {budget}"
@@ -60,7 +65,8 @@ fn gpt_4o_stays_within_128k_window() {
     // recovery + ~4K system prompt + ~15K tool schemas = ~29K, so the
     // budget should be in the 95K–115K band.
     let limits = RuntimeLimits::default();
-    let budget = limits.effective_max_turn_input_tokens(Some("gpt-4o"));
+    let budget =
+        limits.effective_max_turn_input_tokens_with_context_window(Some("gpt-4o"), Some(128_000));
     assert!(
         (80_000..115_000).contains(&budget),
         "GPT-4o budget must fit inside the 128K window with a sane reserve, \

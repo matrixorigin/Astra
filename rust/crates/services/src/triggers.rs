@@ -133,7 +133,9 @@ impl TriggerService for DatabaseTriggerService {
         let context_json = request
             .context
             .as_ref()
-            .map(|c| serde_json::to_string(c).unwrap_or_else(|_| "null".into()));
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(internal_error)?;
 
         query(
             "INSERT INTO wf_triggers \
@@ -155,20 +157,17 @@ impl TriggerService for DatabaseTriggerService {
         .await
         .map_err(internal_error)?;
 
-        Ok(TriggerRecord {
-            trigger_id,
-            user_id,
-            agent_id: request.agent_id,
-            trigger_type: request.trigger_type,
-            name: request.name,
-            user_input: request.user_input,
-            context: request.context,
-            cron_expr: request.cron_expr,
-            session_id: request.session_id,
-            is_active: true,
-            created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-            secret,
-        })
+        let row = query(
+            "SELECT trigger_id, user_id, agent_id, trigger_type, name, user_input, \
+             CAST(context AS CHAR) AS context_json, cron_expr, secret, session_id, is_active, \
+             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             FROM wf_triggers WHERE trigger_id = ?",
+        )
+        .bind(&trigger_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error)?;
+        trigger_record_from_row(row, true)
     }
 
     async fn list_triggers(
@@ -178,8 +177,7 @@ impl TriggerService for DatabaseTriggerService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let rows = query(
             "SELECT trigger_id, user_id, agent_id, trigger_type, name, user_input, \
-             IFNULL(CAST(context AS CHAR), 'null') AS context_json, \
-             cron_expr, session_id, is_active, \
+             CAST(context AS CHAR) AS context_json, cron_expr, session_id, is_active, \
               DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
               FROM wf_triggers WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT ?",
         )
@@ -189,27 +187,9 @@ impl TriggerService for DatabaseTriggerService {
         .await
         .map_err(internal_error)?;
 
-        let mut triggers = Vec::with_capacity(rows.len());
-        for row in rows {
-            let ctx_json: String = row
-                .try_get("context_json")
-                .unwrap_or_else(|_| "null".into());
-            triggers.push(TriggerRecord {
-                trigger_id: row.try_get("trigger_id").map_err(internal_error)?,
-                user_id: row.try_get("user_id").map_err(internal_error)?,
-                agent_id: row.try_get("agent_id").map_err(internal_error)?,
-                trigger_type: row.try_get("trigger_type").map_err(internal_error)?,
-                name: row.try_get("name").map_err(internal_error)?,
-                user_input: row.try_get("user_input").map_err(internal_error)?,
-                context: serde_json::from_str(&ctx_json).ok(),
-                cron_expr: row.try_get("cron_expr").ok(),
-                session_id: row.try_get("session_id").ok(),
-                is_active: row.try_get::<i16, _>("is_active").unwrap_or(1) != 0,
-                created_at: row.try_get("created_at").unwrap_or_default(),
-                secret: None, // Never expose secret in list
-            });
-        }
-        Ok(triggers)
+        rows.into_iter()
+            .map(|row| trigger_record_from_row(row, false))
+            .collect()
     }
 
     async fn delete_trigger(
@@ -262,9 +242,14 @@ impl TriggerService for DatabaseTriggerService {
             ));
         }
 
-        let stored_secret: Option<String> = row.try_get("secret").ok();
+        let stored_secret: Option<String> = row.try_get("secret").map_err(internal_error)?;
         match stored_secret {
             Some(s) if s == request.secret => {}
+            None => {
+                return Err(internal_error(
+                    "invalid wf_triggers.secret: missing webhook secret",
+                ));
+            }
             _ => return Err(error_response(StatusCode::FORBIDDEN, "Invalid secret")),
         }
 
@@ -274,6 +259,57 @@ impl TriggerService for DatabaseTriggerService {
             "payload": request.payload,
         }))
     }
+}
+
+fn trigger_record_from_row(
+    row: sqlx::mysql::MySqlRow,
+    include_secret: bool,
+) -> Result<TriggerRecord, (StatusCode, Json<ErrorResponse>)> {
+    let trigger_type: String = row.try_get("trigger_type").map_err(internal_error)?;
+    if !matches!(trigger_type.as_str(), "webhook" | "schedule") {
+        return Err(internal_error(format!(
+            "invalid wf_triggers.trigger_type: {trigger_type}"
+        )));
+    }
+    let is_active_raw: i16 = row.try_get("is_active").map_err(internal_error)?;
+    if is_active_raw != 1 {
+        return Err(internal_error(format!(
+            "invalid wf_triggers.is_active: {is_active_raw}"
+        )));
+    }
+    let context_json: Option<String> = row.try_get("context_json").map_err(internal_error)?;
+    let context = context_json
+        .as_deref()
+        .map(|raw| {
+            serde_json::from_str(raw)
+                .map_err(|error| internal_error(format!("invalid wf_triggers.context: {error}")))
+        })
+        .transpose()?;
+    let secret = if include_secret {
+        let secret: Option<String> = row.try_get("secret").map_err(internal_error)?;
+        if trigger_type == "webhook" && secret.is_none() {
+            return Err(internal_error(
+                "invalid wf_triggers.secret: missing webhook secret",
+            ));
+        }
+        secret
+    } else {
+        None
+    };
+    Ok(TriggerRecord {
+        trigger_id: row.try_get("trigger_id").map_err(internal_error)?,
+        user_id: row.try_get("user_id").map_err(internal_error)?,
+        agent_id: row.try_get("agent_id").map_err(internal_error)?,
+        trigger_type,
+        name: row.try_get("name").map_err(internal_error)?,
+        user_input: row.try_get("user_input").map_err(internal_error)?,
+        context,
+        cron_expr: row.try_get("cron_expr").map_err(internal_error)?,
+        session_id: row.try_get("session_id").map_err(internal_error)?,
+        is_active: true,
+        created_at: row.try_get("created_at").map_err(internal_error)?,
+        secret,
+    })
 }
 
 // ── Noop implementation ──────────────────────────────────────────────────────

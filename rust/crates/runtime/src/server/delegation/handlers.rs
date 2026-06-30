@@ -64,10 +64,11 @@ pub(crate) async fn list_delegations_handler(
     headers: HeaderMap,
 ) -> Result<Json<DelegationListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     state
         .execution
         .run_lifecycle_service
-        .get_run_status(run_id.clone(), user.user_id)
+        .get_run_status(run_id.clone(), user_id.clone())
         .await?;
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
@@ -151,10 +152,11 @@ pub(crate) async fn pause_delegations_handler(
     headers: HeaderMap,
 ) -> Result<Json<DelegationMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     state
         .execution
         .run_lifecycle_service
-        .get_run_status(run_id.clone(), user.user_id)
+        .get_run_status(run_id.clone(), user_id.clone())
         .await?;
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
@@ -164,7 +166,7 @@ pub(crate) async fn pause_delegations_handler(
         )
     })?;
 
-    let affected = engine.pause_children_of(&run_id).await;
+    let affected = engine.pause_children_of(&user_id, &run_id).await;
     Ok(Json(DelegationMutationResponse {
         parent_run_id: run_id,
         affected,
@@ -180,10 +182,11 @@ pub(crate) async fn resume_delegations_handler(
     headers: HeaderMap,
 ) -> Result<Json<DelegationMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     state
         .execution
         .run_lifecycle_service
-        .get_run_status(run_id.clone(), user.user_id)
+        .get_run_status(run_id.clone(), user_id.clone())
         .await?;
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
@@ -193,7 +196,7 @@ pub(crate) async fn resume_delegations_handler(
         )
     })?;
 
-    let affected = engine.resume_children_of(&run_id).await;
+    let affected = engine.resume_children_of(&user_id, &run_id).await;
     Ok(Json(DelegationMutationResponse {
         parent_run_id: run_id,
         affected,

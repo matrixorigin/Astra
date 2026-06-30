@@ -198,16 +198,10 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                 _ = interval.tick() => {
                     match dispatch_svc.poll_pending(&dispatch_user_id, &dispatch_agent_id).await {
                         Ok(rows) if !rows.is_empty() => {
-                            let mut dispatched_ids = Vec::new();
                             for row in &rows {
                                 if let Ok(msg) = serde_json::from_str::<EdgeServerMessage>(&row.payload_json) {
-                                    if send_edge_msg(&dispatch_sink, msg).await.is_ok() {
-                                        dispatched_ids.push(row.dispatch_id);
-                                    }
+                                    let _ = send_edge_msg(&dispatch_sink, msg).await;
                                 }
-                            }
-                            if !dispatched_ids.is_empty() {
-                                let _ = dispatch_svc.mark_dispatched(&dispatched_ids).await;
                             }
                         }
                         _ => {} // no pending dispatches or error
@@ -306,7 +300,7 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                         }
                                     };
                                     if let Err(e) = dispatch_svc
-                                        .deliver_result(&request_id, &edge_agent_id, &result_json)
+                                        .deliver_result(&user.user_id, &request_id, &edge_agent_id, &result_json)
                                         .await
                                     {
                                         tracing::warn!(

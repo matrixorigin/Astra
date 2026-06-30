@@ -37,6 +37,7 @@ use crate::bridge::{
 
 pub mod config_admin;
 pub(crate) mod data_layer;
+pub(crate) mod db_row;
 pub mod messaging;
 
 pub mod orchestration;

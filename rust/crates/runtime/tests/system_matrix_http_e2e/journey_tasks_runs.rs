@@ -34,12 +34,15 @@ pub async fn run_tasks_lease_with_db_assertions() {
     assert_eq!(st_task, StatusCode::CREATED, "create task: {task_j}");
     let task_id = task_j["task_id"].as_str().expect("task_id").to_string();
 
-    let row =
-        sqlx::query("SELECT user_id, session_id, title, status FROM agent_tasks WHERE task_id = ?")
-            .bind(&task_id)
-            .fetch_optional(pool)
-            .await
-            .expect("agent_tasks select");
+    let row = sqlx::query(
+        "SELECT user_id, session_id, title, status \
+         FROM agent_tasks WHERE user_id = ? AND task_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&task_id)
+    .fetch_optional(pool)
+    .await
+    .expect("agent_tasks select");
     let row = row.expect("agent_tasks row after POST /tasks");
     assert_eq!(
         row.try_get::<String, _>("user_id").ok().as_deref(),
@@ -118,8 +121,10 @@ pub async fn run_tasks_lease_with_db_assertions() {
     assert_eq!(st_claim, StatusCode::OK, "lease claim: {claim_j}");
 
     let lease_row = sqlx::query(
-        "SELECT user_id, holder_agent_id, holder_edge_id FROM task_leases WHERE task_id = ?",
+        "SELECT user_id, holder_agent_id, holder_edge_id \
+         FROM task_leases WHERE user_id = ? AND task_id = ?",
     )
+    .bind(&user_id)
     .bind(&task_id)
     .fetch_optional(pool)
     .await
@@ -188,7 +193,8 @@ pub async fn run_tasks_lease_with_db_assertions() {
     .await;
     assert_eq!(st_put, StatusCode::OK, "task status: {put_j}");
 
-    let st_row = sqlx::query("SELECT status FROM agent_tasks WHERE task_id = ?")
+    let st_row = sqlx::query("SELECT status FROM agent_tasks WHERE user_id = ? AND task_id = ?")
+        .bind(&user_id)
         .bind(&task_id)
         .fetch_one(pool)
         .await

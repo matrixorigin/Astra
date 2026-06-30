@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::tool::args::hints::{
     command_hint_from_args, normalize_llm_function_arguments, path_hint_from_args,
 };
+use crate::tool::args::shape::tool_call_name;
 
 /// Maximum number of distinct paths to surface.
 pub const MAX_RECENT_PATHS: usize = 5;
@@ -130,16 +131,9 @@ pub fn extract_recent_tool_calls_from_messages(messages: &[Value]) -> Vec<(Strin
             continue;
         };
         for tc in calls {
-            let name = tc
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .or_else(|| tc.get("name").and_then(Value::as_str))
-                .unwrap_or("")
-                .to_string();
-            if name.is_empty() {
+            let Some(name) = tool_call_name(tc) else {
                 continue;
-            }
+            };
             let args_raw = tc
                 .get("function")
                 .and_then(|f| f.get("arguments"))
@@ -150,7 +144,7 @@ pub fn extract_recent_tool_calls_from_messages(messages: &[Value]) -> Vec<(Strin
                 Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
                 other => other,
             };
-            out.push((name, args));
+            out.push((name.to_string(), args));
         }
     }
     out
@@ -295,6 +289,21 @@ mod tests {
                     "arguments": "{\"path\":\"x.rs\"}"
                 }
             }]
+        })];
+        let calls = extract_recent_tool_calls_from_messages(&messages);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "read_file");
+        assert_eq!(calls[0].1, json!({"path": "x.rs"}));
+    }
+
+    #[test]
+    fn extract_from_messages_canonicalizes_tool_names() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "tool_calls": [
+                {"function": {"name": " read_file ", "arguments": "{\"path\":\"x.rs\"}"}},
+                {"function": {"name": "  ", "arguments": "{\"path\":\"blank.rs\"}"}}
+            ]
         })];
         let calls = extract_recent_tool_calls_from_messages(&messages);
         assert_eq!(calls.len(), 1);

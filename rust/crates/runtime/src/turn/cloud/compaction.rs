@@ -1,4 +1,5 @@
 use crate::prompts::{CompactConfig, CompactionTier};
+use astra_turn_core::tool_call_shape::tool_call_name;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -26,11 +27,7 @@ fn resolve_tool_call_meta(messages: &[Value], tool_index: usize) -> Option<(Stri
             if tc.get("id").and_then(Value::as_str) != Some(call_id) {
                 continue;
             }
-            let name = tc
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)?
-                .to_string();
+            let name = tool_call_name(tc)?.to_string();
             let args = tc
                 .get("function")
                 .and_then(|f| f.get("arguments"))
@@ -282,27 +279,6 @@ impl CompactCircuitBreaker {
         self.consecutive_failures += 1;
         self.last_failure_reason = Some(reason);
     }
-}
-
-/// Tier-aware compaction: applies progressively more aggressive strategies.
-///
-/// * `Normal` — no compaction, return messages unchanged.
-/// * `TrimSchemas` — compact only tool results longer than `keep_chars * 2`.
-/// * `CompactHistory` — compact all tool results to `keep_chars` (original behavior).
-/// * `AggressivePrune` — compact tool results to `keep_chars / 2`, then drop old
-///   user/assistant pairs beyond `keep_recent_turns`.
-///
-/// Returns the compacted message list (backward-compatible). For rich metadata,
-/// use [`compact_tiered_with_result`].
-#[cfg(test)]
-pub(crate) fn compact_tiered(
-    messages: &[Value],
-    budget_chars: usize,
-    keep_chars: usize,
-    tier: CompactionTier,
-    keep_recent_turns: usize,
-) -> Vec<Value> {
-    compact_tiered_with_result(messages, budget_chars, keep_chars, tier, keep_recent_turns).messages
 }
 
 /// Tier-aware compaction returning a [`CompactResult`] with rich metadata.
@@ -558,7 +534,8 @@ mod tests {
     #[test]
     fn normal_tier_no_compaction() {
         let msgs = vec![user("hello"), assistant("hi"), tool(&"x".repeat(5000))];
-        let result = compact_tiered(&msgs, 100, 100, CompactionTier::Normal, 4);
+        let result =
+            compact_tiered_with_result(&msgs, 100, 100, CompactionTier::Normal, 4).messages;
         assert_eq!(result.len(), 3);
         // Content unchanged
         assert_eq!(
@@ -570,7 +547,9 @@ mod tests {
     #[test]
     fn under_budget_no_compaction() {
         let msgs = vec![user("small"), tool("tiny")];
-        let result = compact_tiered(&msgs, 100_000, 100, CompactionTier::AggressivePrune, 4);
+        let result =
+            compact_tiered_with_result(&msgs, 100_000, 100, CompactionTier::AggressivePrune, 4)
+                .messages;
         assert_eq!(result, msgs);
     }
 
@@ -945,6 +924,28 @@ mod tests {
         json!({"role": "tool", "tool_call_id": call_id, "content": content})
     }
 
+    #[test]
+    fn canonicalizes_tool_call_name_for_duplicate_read_compaction() {
+        let large = "line\n".repeat(300);
+        let msgs = vec![
+            user("inspect"),
+            asst_call("c1", " read_file ", r#"{"path":"src/lib.rs"}"#),
+            tool_result("c1", &format!("src/lib.rs\n{large}")),
+            asst_call("c2", " read_file ", r#"{"path":"src/lib.rs"}"#),
+            tool_result("c2", &format!("src/lib.rs\n{large}")),
+            asst_call("c3", "read_file", r#"{"path":"src/keep.rs"}"#),
+            tool_result("c3", &format!("src/keep.rs\n{large}")),
+        ];
+
+        let result = compact_tiered_with_result(&msgs, 10, 100, CompactionTier::CompactHistory, 4);
+
+        let second = result.messages[4]["content"].as_str().unwrap();
+        assert!(
+            second.contains("duplicate read of `src/lib.rs`"),
+            "expected duplicate read stub, got: {second}"
+        );
+    }
+
     /// Scenario 6: Needle-in-haystack — a critical API key rotation
     /// instruction buried in turn 3 of a 20-turn conversation must
     /// survive compaction. Tests that user messages are never dropped
@@ -1117,14 +1118,16 @@ mod tests {
 
     #[test]
     fn compact_tiered_empty_messages() {
-        let result = compact_tiered(&[], 100, 100, CompactionTier::CompactHistory, 4);
+        let result =
+            compact_tiered_with_result(&[], 100, 100, CompactionTier::CompactHistory, 4).messages;
         assert!(result.is_empty());
     }
 
     #[test]
     fn compact_tiered_single_system_message() {
         let msgs = vec![json!({"role": "system", "content": "You are helpful"})];
-        let result = compact_tiered(&msgs, 0, 0, CompactionTier::AggressivePrune, 4);
+        let result =
+            compact_tiered_with_result(&msgs, 0, 0, CompactionTier::AggressivePrune, 4).messages;
         // System message should always survive
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "system");
@@ -1189,7 +1192,8 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "c1"}),
         ];
         // Should not panic even with missing content
-        let result = compact_tiered(&msgs, 0, 0, CompactionTier::AggressivePrune, 4);
+        let result =
+            compact_tiered_with_result(&msgs, 0, 0, CompactionTier::AggressivePrune, 4).messages;
         assert!(!result.is_empty() || msgs.is_empty());
     }
 
@@ -1237,7 +1241,8 @@ mod tests {
     #[test]
     fn keep_recent_turns_larger_than_message_count() {
         let msgs = vec![user("hello"), assistant("hi")];
-        let result = compact_tiered(&msgs, 0, 0, CompactionTier::CompactHistory, 100);
+        let result =
+            compact_tiered_with_result(&msgs, 0, 0, CompactionTier::CompactHistory, 100).messages;
         // keep_recent_turns=100 > 2 messages → all kept
         assert_eq!(result.len(), 2);
     }

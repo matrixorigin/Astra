@@ -319,6 +319,10 @@ pub struct ToolSurfaceTrace {
     /// Count of runtime-activatable deferred tools advertised for this turn.
     #[serde(default)]
     pub deferred_available: u32,
+    /// Deferred tools omitted from the manifest because the current context
+    /// budget could not fit them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_omitted_tools: Vec<String>,
     /// Tool surface assembly latency in milliseconds.
     pub surface_latency_ms: u64,
 }
@@ -592,6 +596,7 @@ pub fn build_tool_surface_trace(
         surface_latency_ms,
         &[],
         0,
+        &[],
     )
 }
 
@@ -603,6 +608,7 @@ pub fn build_tool_surface_trace_with_deferred(
     surface_latency_ms: u64,
     deferred_active_tools: &[String],
     deferred_available: u32,
+    deferred_omitted_tools: &[String],
 ) -> ToolSurfaceTrace {
     let visible_tools: Vec<VisibleTool> = visible_tools
         .iter()
@@ -624,6 +630,7 @@ pub fn build_tool_surface_trace_with_deferred(
         visible_tools,
         deferred_active_tools: deferred_active_tools.to_vec(),
         deferred_available,
+        deferred_omitted_tools: deferred_omitted_tools.to_vec(),
         surface_latency_ms,
     }
 }
@@ -780,10 +787,12 @@ mod tests {
             7,
             &deferred_active_tools,
             4,
+            &["github".to_string()],
         );
 
         assert_eq!(trace.deferred_active_tools, vec!["web_fetch".to_string()]);
         assert_eq!(trace.deferred_available, 4);
+        assert_eq!(trace.deferred_omitted_tools, vec!["github".to_string()]);
         assert_eq!(trace.visible_tools[1].tokens, 250);
     }
 

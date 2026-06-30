@@ -6,9 +6,9 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 
 use super::metrics::SharedMultiAgentMetrics;
+use crate::db_row::RowExt as EdgeRegistryDbRow;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EdgeAgentRecord {
@@ -75,6 +75,50 @@ impl DatabaseEdgeRegistryService {
     }
 }
 
+fn edge_registry_decode_error(context: &str, column: &'static str, error: sqlx::Error) -> String {
+    format!("edge_registry {context} decode `{column}`: {error}")
+}
+
+fn decode_edge_agent_record(row: &impl EdgeRegistryDbRow) -> Result<EdgeAgentRecord, String> {
+    let capabilities = row
+        .optional_string_column("capabilities_json")
+        .map_err(|e| edge_registry_decode_error("list_by_user row", "capabilities_json", e))?;
+    let capabilities = capabilities
+        .map(|raw| {
+            serde_json::from_str(&raw)
+                .map_err(|e| format!("edge_registry list_by_user decode `capabilities_json`: {e}"))
+        })
+        .transpose()?;
+
+    Ok(EdgeAgentRecord {
+        registry_id: row
+            .string_column("registry_id")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "registry_id", e))?,
+        user_id: row
+            .string_column("user_id")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "user_id", e))?,
+        edge_agent_id: row
+            .string_column("edge_agent_id")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "edge_agent_id", e))?,
+        edge_id: row
+            .string_column("edge_id")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "edge_id", e))?,
+        hostname: row
+            .optional_string_column("hostname")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "hostname", e))?,
+        worktree_path: row
+            .optional_string_column("worktree_path")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "worktree_path", e))?,
+        capabilities,
+        registered_at: row
+            .string_column("registered_at")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "registered_at", e))?,
+        last_heartbeat_at: row
+            .string_column("last_heartbeat_at")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "last_heartbeat_at", e))?,
+    })
+}
+
 #[async_trait]
 impl EdgeRegistryService for DatabaseEdgeRegistryService {
     #[tracing::instrument(skip(self, capabilities), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
@@ -131,12 +175,13 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                     "UPDATE edge_agent_registry \
                      SET edge_id = ?, hostname = ?, worktree_path = ?, \
                          capabilities_json = ?, last_heartbeat_at = NOW(6) \
-                     WHERE registry_id = ?",
+                     WHERE user_id = ? AND registry_id = ?",
                 )
                 .bind(edge_id_header)
                 .bind(hostname)
                 .bind(worktree_path)
                 .bind(&cap_json)
+                .bind(user_id)
                 .bind(&reg_id)
                 .execute(&self.pool)
                 .await
@@ -185,8 +230,9 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                     let (registered_at, last_heartbeat_at): (String, String) = sqlx::query_as(
                         "SELECT CAST(registered_at AS CHAR), \
                              CAST(last_heartbeat_at AS CHAR) \
-                             FROM edge_agent_registry WHERE registry_id = ?",
+                             FROM edge_agent_registry WHERE user_id = ? AND registry_id = ?",
                     )
+                    .bind(user_id)
                     .bind(&registry_id)
                     .fetch_one(&self.pool)
                     .await
@@ -263,27 +309,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         .await
         .map_err(|e| format!("edge_registry list_by_user: {e}"))?;
 
-        rows.iter()
-            .map(|r| {
-                Ok(EdgeAgentRecord {
-                    registry_id: r.try_get("registry_id").map_err(|e| e.to_string())?,
-                    user_id: r.try_get("user_id").map_err(|e| e.to_string())?,
-                    edge_agent_id: r.try_get("edge_agent_id").map_err(|e| e.to_string())?,
-                    edge_id: r.try_get("edge_id").map_err(|e| e.to_string())?,
-                    hostname: r.try_get("hostname").ok().flatten(),
-                    worktree_path: r.try_get("worktree_path").ok().flatten(),
-                    capabilities: r
-                        .try_get::<Option<String>, _>("capabilities_json")
-                        .ok()
-                        .flatten()
-                        .and_then(|raw| serde_json::from_str(&raw).ok()),
-                    registered_at: r.try_get::<String, _>("registered_at").unwrap_or_default(),
-                    last_heartbeat_at: r
-                        .try_get::<String, _>("last_heartbeat_at")
-                        .unwrap_or_default(),
-                })
-            })
-            .collect()
+        rows.iter().map(decode_edge_agent_record).collect()
     }
 }
 
@@ -318,5 +344,146 @@ impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
 
     async fn unregister(&self, _user_id: &str, _edge_agent_id: &str) -> Result<(), String> {
         Err("edge registry service not configured".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeEdgeRegistryRow {
+        failed_column: Option<&'static str>,
+        capabilities_json: Option<&'static str>,
+        hostname: Option<&'static str>,
+        worktree_path: Option<&'static str>,
+    }
+
+    impl FakeEdgeRegistryRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                capabilities_json: Some(r#"{"tools":["agent_fanout"]}"#),
+                hostname: Some("edge-host"),
+                worktree_path: Some("/worktree"),
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn without_optional_fields() -> Self {
+            Self {
+                failed_column: None,
+                capabilities_json: None,
+                hostname: None,
+                worktree_path: None,
+            }
+        }
+
+        fn with_capabilities_json(capabilities_json: &'static str) -> Self {
+            Self {
+                capabilities_json: Some(capabilities_json),
+                ..Self::complete()
+            }
+        }
+    }
+
+    impl EdgeRegistryDbRow for FakeEdgeRegistryRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            Ok(match column {
+                "registry_id" => "registry-1",
+                "user_id" => "user-1",
+                "edge_agent_id" => "edge-agent-1",
+                "edge_id" => "edge-transport-1",
+                "registered_at" => "2026-06-26 10:00:00.000000",
+                "last_heartbeat_at" => "2026-06-26 10:01:00.000000",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            Ok(match column {
+                "hostname" => self.hostname,
+                "worktree_path" => self.worktree_path,
+                "capabilities_json" => self.capabilities_json,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .map(str::to_string))
+        }
+    }
+
+    #[test]
+    fn edge_agent_record_decode_preserves_database_values() {
+        let record = decode_edge_agent_record(&FakeEdgeRegistryRow::complete()).unwrap();
+
+        assert_eq!(record.registry_id, "registry-1");
+        assert_eq!(record.user_id, "user-1");
+        assert_eq!(record.edge_agent_id, "edge-agent-1");
+        assert_eq!(record.edge_id, "edge-transport-1");
+        assert_eq!(record.hostname.as_deref(), Some("edge-host"));
+        assert_eq!(record.worktree_path.as_deref(), Some("/worktree"));
+        assert_eq!(
+            record.capabilities.as_ref().and_then(|v| v.get("tools")),
+            Some(&serde_json::json!(["agent_fanout"]))
+        );
+        assert_eq!(record.registered_at, "2026-06-26 10:00:00.000000");
+        assert_eq!(record.last_heartbeat_at, "2026-06-26 10:01:00.000000");
+    }
+
+    #[test]
+    fn edge_agent_record_decode_preserves_sql_null_optional_fields() {
+        let record = decode_edge_agent_record(&FakeEdgeRegistryRow::without_optional_fields())
+            .expect("SQL NULL optional columns are valid");
+
+        assert_eq!(record.hostname, None);
+        assert_eq!(record.worktree_path, None);
+        assert_eq!(record.capabilities, None);
+    }
+
+    #[test]
+    fn edge_agent_record_decode_fails_loudly_on_any_column_error() {
+        for column in [
+            "registry_id",
+            "user_id",
+            "edge_agent_id",
+            "edge_id",
+            "hostname",
+            "worktree_path",
+            "capabilities_json",
+            "registered_at",
+            "last_heartbeat_at",
+        ] {
+            let error =
+                decode_edge_agent_record(&FakeEdgeRegistryRow::fail_on(column)).unwrap_err();
+            assert!(
+                error.contains("edge_registry list_by_user") && error.contains(column),
+                "decode error should identify `{column}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_agent_record_decode_fails_loudly_on_invalid_capabilities_json() {
+        let error =
+            decode_edge_agent_record(&FakeEdgeRegistryRow::with_capabilities_json("not-json"))
+                .unwrap_err();
+
+        assert!(
+            error.contains("edge_registry list_by_user decode `capabilities_json`"),
+            "invalid capabilities JSON should not be silently dropped: {error}"
+        );
     }
 }

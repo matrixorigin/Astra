@@ -2767,36 +2767,40 @@ mod tests {
         assert_eq!(pre_op_snapshot_name("update", 42), "pre_update_42");
     }
 
-    /// R2: auto-snapshot must happen AFTER `build_direct_request`
-    /// validates args. A rejected `forget` (missing reason, missing
-    /// memory_id/topic, etc.) must not produce an orphan `pre_forget_*`
-    /// snapshot. Verified by source ordering: in `call_with_timeout`
-    /// the snapshot-create call must appear after the early-
-    /// return `ep.is_empty()` guard.
-    #[test]
-    fn auto_snapshot_is_ordered_after_validation() {
-        let src = include_str!("memoria.rs");
-        let fn_start = src
-            .find("pub async fn call_with_timeout")
-            .expect("call_with_timeout must exist");
-        // Find the first Err / return-style terminator so we bound the body.
-        let fn_end = src[fn_start..]
-            .find("\n    /// Boost search")
-            .map(|i| fn_start + i)
-            .expect("fn body end sentinel not found");
-        let body = &src[fn_start..fn_end];
+    #[tokio::test]
+    async fn invalid_destructive_call_does_not_create_pre_snapshot() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let snapshot_at = body
-            .find("proxy_snapshot_create")
-            .expect("auto-snapshot call must exist in call_with_timeout");
-        let validation_short_circuit_at = body
-            .find("if ep.is_empty()")
-            .expect("validation short-circuit must exist");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/snapshots"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = MemoriaClient::new(Some(server.uri()), Some("token".to_string()));
+        let out = client
+            .call_with_timeout(
+                "forget",
+                &json!({"memory_id": "id1"}),
+                Duration::from_millis(50),
+            )
+            .await;
+
         assert!(
-            snapshot_at > validation_short_circuit_at,
-            "auto-snapshot must happen AFTER the `if ep.is_empty()` short-\
-             circuit so rejected destructive calls don't create orphan \
-             `pre_<op>_*` snapshots"
+            out.contains("requires a non-empty `reason`"),
+            "invalid destructive call must fail validation before side effects: {out}"
+        );
+        server.verify().await;
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        assert!(
+            requests.is_empty(),
+            "validation failure must not send any HTTP request, got {requests:?}"
         );
     }
 

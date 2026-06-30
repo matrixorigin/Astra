@@ -4,6 +4,7 @@
 //! accumulator and returns terminal UI hints. [`ChatTurnSseFramer`] turns arbitrary byte chunks
 //! into complete event blocks via [`super::sse_blocks`] and records time-to-first-token.
 
+use astra_core::canonical_names::normalize_name;
 use astra_thin_client::ApprovalKind;
 use serde_json::Value;
 use std::time::Instant;
@@ -13,12 +14,11 @@ use super::sse_blocks::SseBlankLineUtf8Buf;
 /// Per-channel fingerprint emitted by the bridge via the
 /// `injection_freshness` SSE event. Carries only opaque metadata
 /// (content hash, byte length, empty-flag) — never the raw channel
-/// text. wip-7 migrated away from `BridgeInjectionTextsOwned` (which
-/// shipped raw text) because the external
-/// `transform_run_event_for_client` transform passed the event through
-/// verbatim, leaking learned feedback rules, memoria recall digests,
-/// self-awareness summaries, and user-correction excerpts to any
-/// authenticated `/chat/turn` client.
+/// text. wip-7 migrated away from the previous raw-text payload because
+/// the external `transform_run_event_for_client` transform passed the
+/// event through verbatim, leaking learned feedback rules, memoria recall
+/// digests, self-awareness summaries, and user-correction excerpts to
+/// any authenticated `/chat/turn` client.
 ///
 /// The fingerprint is enough for `ObservabilitySession` to detect
 /// content change (for the freshness report). The raw preview is
@@ -152,12 +152,15 @@ fn normalize_tool_call_for_accum(event: &Value) -> Option<Value> {
         .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
     if let Some(function) = event.get("function").and_then(Value::as_object) {
-        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(normalize_name);
         let arguments = function
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| Value::String("{}".to_string()));
-        if !name.is_empty() {
+        if let Some(name) = name {
             return Some(serde_json::json!({
                 "id": call_id,
                 "type": "function",
@@ -173,10 +176,7 @@ fn normalize_tool_call_for_accum(event: &Value) -> Option<Value> {
         .get("name")
         .or_else(|| event.get("tool"))
         .and_then(Value::as_str)
-        .unwrap_or("");
-    if name.is_empty() {
-        return None;
-    }
+        .and_then(normalize_name)?;
 
     let raw_arguments = event
         .get("arguments")
@@ -215,8 +215,8 @@ fn approval_request_from_event(event: &Value) -> Option<EdgeApprovalRequest> {
     let tool = event
         .get("tool")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .and_then(normalize_name)
+        .map(str::to_string);
     let approval_kind = approval_kind_from_event(event);
     let detail = event
         .get("detail")
@@ -232,7 +232,8 @@ fn approval_request_from_event(event: &Value) -> Option<EdgeApprovalRequest> {
         .get("display_label")
         .and_then(|v| v.as_str())
         .map(std::string::ToString::to_string);
-    if request_id.is_empty() || tool.is_empty() {
+    let tool = tool?;
+    if request_id.is_empty() {
         return None;
     }
     Some(EdgeApprovalRequest {
@@ -329,13 +330,15 @@ fn apply_one_event(
             let tool = event
                 .get("tool")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .and_then(normalize_name)
+                .map(str::to_string);
             let args = event
                 .get("args")
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Default::default()));
-            if !request_id.is_empty() && !tool.is_empty() {
+            if let Some(tool) = tool
+                && !request_id.is_empty()
+            {
                 edge_pending.push(ChatTurnEdgePending::ToolRequest {
                     request_id,
                     tool,
@@ -831,12 +834,23 @@ mod tests {
     fn tool_call_collected() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            &sse("tool_call", ",\"function\":{\"name\":\"bash\"}"),
+            &sse("tool_call", ",\"function\":{\"name\":\" bash \"}"),
             &mut a,
             &mut vec![],
         );
         assert_eq!(a.tool_calls.len(), 1);
         assert_eq!(a.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
+    }
+
+    #[test]
+    fn blank_tool_call_name_is_not_collected() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("tool_call", ",\"function\":{\"name\":\"  \"}"),
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.tool_calls.is_empty());
     }
 
     #[test]
@@ -987,7 +1001,7 @@ mod tests {
     fn tool_request_enqueues_pending() {
         let mut a = ChatTurnSseAccum::default();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
+        let block = "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"tool\":\" bash \",\"args\":{\"command\":\"echo x\"}}\n\n";
         dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
@@ -1005,10 +1019,22 @@ mod tests {
     }
 
     #[test]
+    fn tool_request_blank_tool_not_pushed() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        dispatch_chat_turn_sse_event_block(
+            &sse("tool_request", ",\"request_id\":\"tr-1\",\"tool\":\"  \""),
+            &mut a,
+            &mut pending,
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn approval_required_enqueues_pending() {
         let mut a = ChatTurnSseAccum::default();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"approval_kind\":\"standard\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"}\n\n";
+        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\" write_file \",\"approval_kind\":\"standard\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"}\n\n";
         dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
@@ -1026,6 +1052,21 @@ mod tests {
             }
             _ => panic!("expected ApprovalRequired"),
         }
+    }
+
+    #[test]
+    fn approval_required_blank_tool_not_pushed() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "approval_required",
+                ",\"request_id\":\"ap-1\",\"tool\":\"  \"",
+            ),
+            &mut a,
+            &mut pending,
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

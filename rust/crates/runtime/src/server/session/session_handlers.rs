@@ -1,3 +1,4 @@
+use crate::db_row::RowExt;
 use crate::server::*;
 use astra_core::{STATUS_CANCELLED, error_response, is_duplicate_key_error};
 use astra_services::context_manifest::session_artifact_raw_payload_is_available;
@@ -43,6 +44,36 @@ pub(crate) struct SessionStateQuery {
     pub device_id: Option<String>,
     #[serde(default)]
     pub device_fingerprint: Option<String>,
+}
+
+fn required_session_state_device_fingerprint(
+    query: &SessionStateQuery,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    query
+        .device_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "device_fingerprint is required for session state synchronization",
+            )
+        })
+}
+
+fn optional_session_state_device_id(
+    query: &SessionStateQuery,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    match query.device_id.as_deref() {
+        Some(value) if value.trim().is_empty() => Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "device_id must be non-empty when provided",
+        )),
+        Some(value) => Ok(Some(value.trim().to_string())),
+        None => Ok(None),
+    }
 }
 
 #[derive(Serialize)]
@@ -235,6 +266,38 @@ impl TranscriptReasoningProjection {
     }
 }
 
+fn session_row_string(row: &impl RowExt, column: &str) -> Result<String, String> {
+    row.string_column(column)
+        .map_err(|error| format!("session row decode column `{column}`: {error}"))
+}
+
+fn session_row_optional_string(row: &impl RowExt, column: &str) -> Result<Option<String>, String> {
+    row.optional_string_column(column)
+        .map_err(|error| format!("session row decode column `{column}`: {error}"))
+}
+
+fn session_row_i64(row: &impl RowExt, column: &str) -> Result<i64, String> {
+    row.i64_column(column)
+        .map_err(|error| format!("session row decode column `{column}`: {error}"))
+}
+
+fn session_row_non_negative_i64(row: &impl RowExt, column: &'static str) -> Result<i64, String> {
+    let value = session_row_i64(row, column)?;
+    if value < 0 {
+        return Err(format!(
+            "session row decode column `{column}` expected non-negative integer, got {value}"
+        ));
+    }
+    Ok(value)
+}
+
+fn session_row_u32(row: &impl RowExt, column: &'static str) -> Result<u32, String> {
+    let value = session_row_i64(row, column)?;
+    u32::try_from(value).map_err(|_| {
+        format!("session row decode column `{column}` expected u32 range, got {value}")
+    })
+}
+
 #[derive(Serialize)]
 pub(crate) struct DeviceLeaseResponse {
     pub lease_id: String,
@@ -387,17 +450,13 @@ pub(crate) async fn get_session_state_handler(
         .session_service
         .get_session(session_id.clone(), user.user_id.clone())
         .await?;
+    let device_fingerprint = required_session_state_device_fingerprint(&query)?;
+    let device_id = optional_session_state_device_id(&query)?;
     let pool = state
         .shared_pool
         .as_ref()
         .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
-    let device_fingerprint = query
-        .device_fingerprint
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("unknown-device")
-        .to_string();
-    if let Some(device_id) = query.device_id.as_deref() {
+    if let Some(device_id) = device_id.as_deref() {
         ensure_device_lease(
             pool,
             &session.user_id,
@@ -567,7 +626,11 @@ pub(crate) async fn get_session_transcript_handler(
     .await
     .map_err(internal_error)?;
 
-    let run_ids = transcript_assistant_run_ids(&rows);
+    let run_ids = transcript_assistant_run_ids(&rows).map_err(|error| {
+        internal_error(format!(
+            "decode transcript assistant run ids failed for session {session_id}: {error}"
+        ))
+    })?;
     let reasoning_by_run = load_transcript_reasoning_by_run(pool, &user_id, &session_id, &run_ids)
         .await
         .map_err(|error| {
@@ -578,37 +641,13 @@ pub(crate) async fn get_session_transcript_handler(
 
     let mut items = rows
         .into_iter()
-        .map(|row| {
-            let run_id = row.try_get::<Option<String>, _>("run_id").ok().flatten();
-            let role = row.try_get::<String, _>("role").unwrap_or_default();
-            let reasoning = if role == "assistant" {
-                run_id
-                    .as_deref()
-                    .and_then(|id| reasoning_by_run.get(id))
-                    .and_then(TranscriptReasoningProjection::reasoning)
-            } else {
-                None
-            };
-            let reasoning_status = if role == "assistant" {
-                run_id
-                    .as_deref()
-                    .and_then(|id| reasoning_by_run.get(id))
-                    .and_then(TranscriptReasoningProjection::status)
-            } else {
-                None
-            };
-            TranscriptItemResponse {
-                session_id: row.try_get("session_id").unwrap_or_default(),
-                item_seq: row.try_get("item_seq").unwrap_or_default(),
-                run_id,
-                role,
-                content: row.try_get("content").unwrap_or_default(),
-                reasoning,
-                reasoning_status,
-                created_at: row.try_get("created_at").unwrap_or_default(),
-            }
-        })
-        .collect::<Vec<_>>();
+        .map(|row| decode_transcript_item(&row, &reasoning_by_run))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            internal_error(format!(
+                "decode transcript item failed for session {session_id}: {error}"
+            ))
+        })?;
     items.reverse();
     let page_refs = load_transcript_page_refs(
         pool,
@@ -634,22 +673,59 @@ pub(crate) async fn get_session_transcript_handler(
     }))
 }
 
-fn transcript_assistant_run_ids(rows: &[sqlx::mysql::MySqlRow]) -> Vec<String> {
+fn decode_transcript_item(
+    row: &impl RowExt,
+    reasoning_by_run: &HashMap<String, TranscriptReasoningProjection>,
+) -> Result<TranscriptItemResponse, String> {
+    let run_id = session_row_optional_string(row, "run_id")?;
+    let role = session_row_string(row, "role")?;
+    let reasoning = if role == "assistant" {
+        run_id
+            .as_deref()
+            .and_then(|id| reasoning_by_run.get(id))
+            .and_then(TranscriptReasoningProjection::reasoning)
+    } else {
+        None
+    };
+    let reasoning_status = if role == "assistant" {
+        run_id
+            .as_deref()
+            .and_then(|id| reasoning_by_run.get(id))
+            .and_then(TranscriptReasoningProjection::status)
+    } else {
+        None
+    };
+    Ok(TranscriptItemResponse {
+        session_id: session_row_string(row, "session_id")?,
+        item_seq: session_row_i64(row, "item_seq")?,
+        run_id,
+        role,
+        content: session_row_string(row, "content")?,
+        reasoning,
+        reasoning_status,
+        created_at: session_row_string(row, "created_at")?,
+    })
+}
+
+fn transcript_assistant_run_id(row: &impl RowExt) -> Result<Option<String>, String> {
+    if session_row_string(row, "role")? != "assistant" {
+        return Ok(None);
+    }
+    session_row_optional_string(row, "run_id")
+}
+
+fn transcript_assistant_run_ids(rows: &[sqlx::mysql::MySqlRow]) -> Result<Vec<String>, String> {
     let mut seen = HashSet::new();
     let mut run_ids = Vec::new();
     for row in rows {
-        let role = row.try_get::<String, _>("role").unwrap_or_default();
-        if role != "assistant" {
-            continue;
-        }
-        let Some(run_id) = row.try_get::<Option<String>, _>("run_id").ok().flatten() else {
+        let Some(run_id) = transcript_assistant_run_id(row)? else {
             continue;
         };
         if seen.insert(run_id.clone()) {
             run_ids.push(run_id);
         }
     }
-    run_ids
+    Ok(run_ids)
 }
 
 async fn load_transcript_page_refs(
@@ -658,7 +734,7 @@ async fn load_transcript_page_refs(
     session_id: &str,
     start_item_seq: Option<i64>,
     end_item_seq: Option<i64>,
-) -> Result<Vec<TranscriptPageRefResponse>, sqlx::Error> {
+) -> Result<Vec<TranscriptPageRefResponse>, String> {
     let (Some(start_item_seq), Some(end_item_seq)) = (start_item_seq, end_item_seq) else {
         return Ok(Vec::new());
     };
@@ -673,17 +749,67 @@ async fn load_transcript_page_refs(
     .bind(start_item_seq)
     .bind(end_item_seq)
     .fetch_all(pool.get())
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| TranscriptPageRefResponse {
-            page_seq: row.try_get("page_seq").unwrap_or_default(),
-            start_item_seq: row.try_get("start_item_seq").unwrap_or_default(),
-            end_item_seq: row.try_get("end_item_seq").unwrap_or_default(),
-            item_count: row.try_get::<i64, _>("item_count").unwrap_or_default(),
-            page_hash: row.try_get("page_hash").unwrap_or_default(),
-        })
-        .collect())
+    .await
+    .map_err(|error| error.to_string())?;
+    rows.into_iter()
+        .map(|row| decode_transcript_page_ref(&row))
+        .collect()
+}
+
+fn decode_transcript_page_ref(row: &impl RowExt) -> Result<TranscriptPageRefResponse, String> {
+    Ok(TranscriptPageRefResponse {
+        page_seq: session_row_i64(row, "page_seq")?,
+        start_item_seq: session_row_i64(row, "start_item_seq")?,
+        end_item_seq: session_row_i64(row, "end_item_seq")?,
+        item_count: session_row_i64(row, "item_count")?,
+        page_hash: session_row_string(row, "page_hash")?,
+    })
+}
+
+fn decode_transcript_page_stats(row: &impl RowExt) -> Result<(u32, i64), String> {
+    Ok((
+        session_row_u32(row, "page_count")?,
+        session_row_non_negative_i64(row, "page_high_watermark")?,
+    ))
+}
+
+fn decode_state_category_summary(
+    row: &impl RowExt,
+) -> Result<StateCategorySummaryResponse, String> {
+    Ok(StateCategorySummaryResponse {
+        category: session_row_string(row, "category")?,
+        count: session_row_u32(row, "total")?,
+    })
+}
+
+fn decode_context_manifest_summary(
+    row: &impl RowExt,
+) -> Result<ContextManifestSummaryResponse, String> {
+    Ok(ContextManifestSummaryResponse {
+        manifest_id: session_row_string(row, "manifest_id")?,
+        run_id: session_row_optional_string(row, "run_id")?,
+        turn_id: session_row_string(row, "turn_id")?,
+        reason: session_row_string(row, "reason")?,
+        total_estimated_tokens: session_row_u32(row, "total_estimated_tokens")?,
+        budget_template_id: session_row_optional_string(row, "budget_template_id")?,
+        policy_version: session_row_string(row, "policy_version")?,
+        created_at: session_row_string(row, "created_at")?,
+    })
+}
+
+fn decode_active_run_projection(row: &impl RowExt) -> Result<ActiveRunProjection, String> {
+    let last_event_idx = session_row_i64(row, "last_event_idx")?;
+    if last_event_idx < -1 {
+        return Err(format!(
+            "session row decode column `last_event_idx` expected -1 or greater, got {last_event_idx}"
+        ));
+    }
+    Ok(ActiveRunProjection {
+        run_id: session_row_string(row, "run_id")?,
+        run_event_high_watermark: last_event_idx.max(0),
+        replay_required: false,
+        replay_start_event_idx: 0,
+    })
 }
 
 async fn load_session_projection_observability(
@@ -703,14 +829,8 @@ async fn load_session_projection_observability(
     .fetch_one(pool.get())
     .await
     .map_err(internal_error)?;
-    let transcript_page_count = transcript_page_row
-        .try_get::<i64, _>("page_count")
-        .unwrap_or(0)
-        .max(0) as u32;
-    let transcript_page_high_watermark = transcript_page_row
-        .try_get::<i64, _>("page_high_watermark")
-        .unwrap_or(0)
-        .max(0);
+    let (transcript_page_count, transcript_page_high_watermark) =
+        decode_transcript_page_stats(&transcript_page_row).map_err(internal_error)?;
     let active_run_projection_lag_events = if let Some(active_run) = active_run {
         let row = sqlx::query(
             "SELECT projection_event_idx
@@ -723,7 +843,9 @@ async fn load_session_projection_observability(
         .await
         .map_err(internal_error)?;
         let projection_event_idx = row
-            .and_then(|row| row.try_get::<i64, _>("projection_event_idx").ok())
+            .map(|row| session_row_i64(&row, "projection_event_idx"))
+            .transpose()
+            .map_err(internal_error)?
             .unwrap_or(-1);
         (active_run.run_event_high_watermark - projection_event_idx).max(0)
     } else {
@@ -805,13 +927,9 @@ async fn load_state_summary(
     .fetch_all(pool.get())
     .await
     .map_err(internal_error)?;
-    Ok(rows
-        .into_iter()
-        .map(|row| StateCategorySummaryResponse {
-            category: row.try_get("category").unwrap_or_default(),
-            count: row.try_get::<i64, _>("total").unwrap_or(0).max(0) as u32,
-        })
-        .collect())
+    rows.into_iter()
+        .map(|row| decode_state_category_summary(&row).map_err(internal_error))
+        .collect()
 }
 
 async fn load_artifact_previews(
@@ -891,22 +1009,8 @@ async fn fetch_latest_context_manifest(
         .await
         .map_err(internal_error)?
     };
-    Ok(row.map(|row| ContextManifestSummaryResponse {
-        manifest_id: row.try_get("manifest_id").unwrap_or_default(),
-        run_id: row.try_get::<Option<String>, _>("run_id").ok().flatten(),
-        turn_id: row.try_get("turn_id").unwrap_or_default(),
-        reason: row.try_get("reason").unwrap_or_default(),
-        total_estimated_tokens: row
-            .try_get::<i64, _>("total_estimated_tokens")
-            .unwrap_or(0)
-            .max(0) as u32,
-        budget_template_id: row
-            .try_get::<Option<String>, _>("budget_template_id")
-            .ok()
-            .flatten(),
-        policy_version: row.try_get("policy_version").unwrap_or_default(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-    }))
+    row.map(|row| decode_context_manifest_summary(&row).map_err(internal_error))
+        .transpose()
 }
 
 async fn load_transcript_reasoning_by_run(
@@ -1041,9 +1145,19 @@ pub(crate) async fn list_session_devices_handler(
     .await
     .map_err(internal_error)?;
 
+    let devices = rows
+        .into_iter()
+        .map(|row| decode_device_response(&row))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            internal_error(format!(
+                "decode session device leases failed for session {session_id}: {error}"
+            ))
+        })?;
+
     Ok(Json(DeviceListResponse {
         session_id,
-        devices: rows.into_iter().map(device_response_from_row).collect(),
+        devices,
     }))
 }
 
@@ -1190,9 +1304,12 @@ pub(crate) async fn trust_session_device_handler(
     .fetch_one(pool.get())
     .await
     .map_err(internal_error)?;
-    Ok(Json(DeviceTrustResponse {
-        lease: device_response_from_row(row),
-    }))
+    let lease = decode_device_response(&row).map_err(|error| {
+        internal_error(format!(
+            "decode trusted device lease failed for session {session_id}: {error}"
+        ))
+    })?;
+    Ok(Json(DeviceTrustResponse { lease }))
 }
 
 pub(crate) async fn session_device_events_handler(
@@ -1322,11 +1439,22 @@ pub(crate) async fn cancel_session_handler(
     headers: HeaderMap,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
+    let session_id_for_cancel = session_id.clone();
+    let _ = state
+        .session_service
+        .get_session(session_id.clone(), user_id.clone())
+        .await?;
+    state
+        .execution
+        .run_lifecycle_service
+        .cancel_session_runs(session_id_for_cancel, user_id.clone())
+        .await?;
     let session = state
         .session_service
         .update_session(
             session_id,
-            user.user_id,
+            user_id,
             SessionUpdateRequestData {
                 title: None,
                 metadata: None,
@@ -1447,17 +1575,17 @@ pub(crate) async fn download_session_artifact_handler(
     let row = sqlx::query(
         "SELECT artifact_id, status, cold_storage_ref
          FROM session_artifacts
-         WHERE artifact_id = ? AND session_id = ? AND user_id = ?
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
          LIMIT 1",
     )
-    .bind(&artifact_id)
-    .bind(&session_id)
     .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
     .fetch_optional(pool.get())
     .await
     .map_err(internal_artifact_error)?
     .ok_or_else(session_artifact_not_found)?;
-    let status = row.try_get::<String, _>("status").unwrap_or_default();
+    let status = session_row_string(&row, "status").map_err(internal_artifact_error)?;
     if !session_artifact_raw_payload_is_available(&status) {
         return Err((
             StatusCode::GONE,
@@ -1722,7 +1850,7 @@ async fn transcript_high_watermark(
     .fetch_one(pool.get())
     .await
     .map_err(internal_error)?;
-    Ok(row.try_get::<i64, _>("high_watermark").unwrap_or(0))
+    session_row_non_negative_i64(&row, "high_watermark").map_err(internal_error)
 }
 
 async fn active_run_projection(
@@ -1742,12 +1870,8 @@ async fn active_run_projection(
     .fetch_optional(pool.get())
     .await
     .map_err(internal_error)?;
-    Ok(row.map(|row| ActiveRunProjection {
-        run_id: row.try_get("run_id").unwrap_or_default(),
-        run_event_high_watermark: row.try_get::<i64, _>("last_event_idx").unwrap_or(0).max(0),
-        replay_required: false,
-        replay_start_event_idx: 0,
-    }))
+    row.map(|row| decode_active_run_projection(&row).map_err(internal_error))
+        .transpose()
 }
 
 fn state_monotonic_id(
@@ -1783,17 +1907,28 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("sha256:{digest:x}")
 }
 
-fn device_response_from_row(row: sqlx::mysql::MySqlRow) -> DeviceLeaseResponse {
-    DeviceLeaseResponse {
-        lease_id: row.try_get("lease_id").unwrap_or_default(),
-        session_id: row.try_get("session_id").unwrap_or_default(),
-        device_id: row.try_get("device_id").unwrap_or_default(),
-        device_fingerprint: row.try_get("device_fingerprint").unwrap_or_default(),
-        trust_level: row.try_get("trust_level").unwrap_or_default(),
-        status: row.try_get("status").unwrap_or_default(),
-        last_monotonic_id: row.try_get("last_monotonic_id").unwrap_or_default(),
-        expires_at: row.try_get("expires_at").unwrap_or_default(),
-    }
+fn decode_device_response(row: &impl RowExt) -> Result<DeviceLeaseResponse, String> {
+    Ok(DeviceLeaseResponse {
+        lease_id: session_row_string(row, "lease_id")?,
+        session_id: session_row_string(row, "session_id")?,
+        device_id: session_row_string(row, "device_id")?,
+        device_fingerprint: session_row_string(row, "device_fingerprint")?,
+        trust_level: session_row_string(row, "trust_level")?,
+        status: session_row_string(row, "status")?,
+        last_monotonic_id: session_row_i64(row, "last_monotonic_id")?,
+        expires_at: session_row_string(row, "expires_at")?,
+    })
+}
+
+fn decode_device_lease_row(row: &impl RowExt) -> Result<DeviceLeaseRow, String> {
+    Ok(DeviceLeaseRow {
+        lease_id: session_row_string(row, "lease_id")?,
+        user_id: session_row_string(row, "user_id")?,
+        session_id: session_row_string(row, "session_id")?,
+        device_id: session_row_string(row, "device_id")?,
+        device_fingerprint: session_row_string(row, "device_fingerprint")?,
+        status: session_row_string(row, "status")?,
+    })
 }
 
 async fn load_device_lease_for_revoke(
@@ -1842,13 +1977,10 @@ async fn load_device_lease_for_revoke(
             "device lease not found",
         ));
     };
-    Ok(DeviceLeaseRow {
-        lease_id: row.try_get("lease_id").unwrap_or_default(),
-        user_id: row.try_get("user_id").unwrap_or_default(),
-        session_id: row.try_get("session_id").unwrap_or_default(),
-        device_id: row.try_get("device_id").unwrap_or_default(),
-        device_fingerprint: row.try_get("device_fingerprint").unwrap_or_default(),
-        status: row.try_get("status").unwrap_or_default(),
+    decode_device_lease_row(&row).map_err(|error| {
+        internal_error(format!(
+            "decode device lease revoke row failed for session {session_id}: {error}"
+        ))
     })
 }
 
@@ -1906,25 +2038,31 @@ async fn load_device_lease_event_payloads(
     .fetch_all(pool.get())
     .await
     .map_err(internal_error)?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let event_type = row.try_get::<String, _>("event_type").unwrap_or_default();
-            DeviceLeaseEndedPayload {
-                r#type: if event_type == "auto_expire" {
-                    "device_lease_expired".to_string()
-                } else {
-                    event_type
-                },
-                lease_id: row.try_get("lease_id").unwrap_or_default(),
-                session_id: row.try_get("session_id").unwrap_or_default(),
-                device_id: row.try_get("device_id").unwrap_or_default(),
-                device_fingerprint: row.try_get("device_fingerprint").unwrap_or_default(),
-                reason: row.try_get("reason").unwrap_or_default(),
-                ended_at_server: row.try_get("ended_at_server").unwrap_or_default(),
-            }
+    rows.into_iter()
+        .map(|row| decode_device_lease_event_payload(&row))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            internal_error(format!(
+                "decode device lease event payload failed for session {session_id}: {error}"
+            ))
         })
-        .collect())
+}
+
+fn decode_device_lease_event_payload(row: &impl RowExt) -> Result<DeviceLeaseEndedPayload, String> {
+    let event_type = session_row_string(row, "event_type")?;
+    Ok(DeviceLeaseEndedPayload {
+        r#type: if event_type == "auto_expire" {
+            "device_lease_expired".to_string()
+        } else {
+            event_type
+        },
+        lease_id: session_row_string(row, "lease_id")?,
+        session_id: session_row_string(row, "session_id")?,
+        device_id: session_row_string(row, "device_id")?,
+        device_fingerprint: session_row_string(row, "device_fingerprint")?,
+        reason: session_row_string(row, "reason")?,
+        ended_at_server: session_row_string(row, "ended_at_server")?,
+    })
 }
 
 #[cfg(test)]
@@ -1950,6 +2088,109 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::{AppState, HealthChecker, ServiceInfo};
+
+    #[derive(Clone)]
+    struct FakeSessionRow {
+        failed_column: Option<&'static str>,
+        i64_overrides: Vec<(&'static str, i64)>,
+    }
+
+    impl FakeSessionRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                i64_overrides: Vec::new(),
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_i64(column: &'static str, value: i64) -> Self {
+            Self {
+                i64_overrides: vec![(column, value)],
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl RowExt for FakeSessionRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "lease_id" => "lease-1",
+                "user_id" => "user-1",
+                "session_id" => "session-1",
+                "device_id" => "device-1",
+                "device_fingerprint" => "fingerprint-1",
+                "trust_level" => "trusted",
+                "status" => "active",
+                "role" => "assistant",
+                "content" => "answer",
+                "category" => "decision",
+                "manifest_id" => "manifest-1",
+                "turn_id" => "turn-1",
+                "policy_version" => "v1",
+                "created_at" => "2026-06-26T12:00:00",
+                "expires_at" => "2026-06-26T14:00:00",
+                "event_type" => "auto_expire",
+                "reason" => "stale",
+                "ended_at_server" => "2026-06-26T13:00:00",
+                "page_hash" => "hash-1",
+                "run_id" => "run-1",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "run_id" => Some("run-1".to_string()),
+                "budget_template_id" => Some("budget-1".to_string()),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if let Some((_, value)) = self
+                .i64_overrides
+                .iter()
+                .find(|(candidate, _)| *candidate == column)
+            {
+                return Ok(*value);
+            }
+            match column {
+                "item_seq" => Ok(7),
+                "last_monotonic_id" => Ok(42),
+                "page_seq" => Ok(2),
+                "start_item_seq" => Ok(5),
+                "end_item_seq" => Ok(9),
+                "item_count" => Ok(5),
+                "page_count" => Ok(3),
+                "page_high_watermark" => Ok(9),
+                "projection_event_idx" => Ok(8),
+                "total" => Ok(4),
+                "total_estimated_tokens" => Ok(123),
+                "high_watermark" => Ok(11),
+                "last_event_idx" => Ok(10),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct AlwaysHealthy;
@@ -2016,6 +2257,27 @@ mod tests {
     #[derive(Default)]
     struct RecordingSessionService {
         get_session_calls: Mutex<Vec<(String, String)>>,
+        owned_session: Option<SessionRecord>,
+    }
+
+    impl RecordingSessionService {
+        fn with_owned_session() -> Self {
+            Self {
+                get_session_calls: Mutex::new(Vec::new()),
+                owned_session: Some(SessionRecord {
+                    session_id: "placeholder-session".to_string(),
+                    user_id: "placeholder-user".to_string(),
+                    agent_id: None,
+                    title: None,
+                    metadata: serde_json::Map::new(),
+                    status: "active".to_string(),
+                    event_count: 0,
+                    created_at: "2026-06-26T00:00:00".to_string(),
+                    updated_at: None,
+                    ended_at: None,
+                }),
+            }
+        }
     }
 
     #[async_trait]
@@ -2043,7 +2305,13 @@ mod tests {
             self.get_session_calls
                 .lock()
                 .await
-                .push((session_id, user_id));
+                .push((session_id.clone(), user_id.clone()));
+            if let Some(record) = &self.owned_session {
+                let mut record = record.clone();
+                record.session_id = session_id;
+                record.user_id = user_id;
+                return Ok(record);
+            }
             Err(error_response(
                 StatusCode::FORBIDDEN,
                 "session access denied",
@@ -2207,6 +2475,78 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_state_rejects_missing_or_blank_device_identity_before_pool_access() {
+        let session_service = Arc::new(RecordingSessionService::with_owned_session());
+        let state = build_state(Arc::new(RecordingAuthService), session_service.clone());
+        let session_id = "session-device-state".to_string();
+
+        for (query, expected_detail) in [
+            (
+                SessionStateQuery::default(),
+                "device_fingerprint is required for session state synchronization",
+            ),
+            (
+                SessionStateQuery {
+                    device_fingerprint: Some("   ".to_string()),
+                    ..SessionStateQuery::default()
+                },
+                "device_fingerprint is required for session state synchronization",
+            ),
+            (
+                SessionStateQuery {
+                    device_fingerprint: Some("fingerprint-1".to_string()),
+                    device_id: Some("   ".to_string()),
+                    ..SessionStateQuery::default()
+                },
+                "device_id must be non-empty when provided",
+            ),
+        ] {
+            let err = match get_session_state_handler(
+                State(state.clone()),
+                Path(session_id.clone()),
+                auth_headers(),
+                Query(query),
+            )
+            .await
+            {
+                Ok(_) => panic!("invalid device identity must fail before durable state access"),
+                Err(err) => err,
+            };
+            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(err.1.detail, expected_detail);
+        }
+
+        let calls = session_service.get_session_calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![
+                (session_id.clone(), "artifact-owner".to_string()),
+                (session_id.clone(), "artifact-owner".to_string()),
+                (session_id, "artifact-owner".to_string()),
+            ],
+            "handler should still verify session ownership before rejecting device identity"
+        );
+    }
+
+    #[test]
+    fn session_state_device_identity_normalizes_valid_values() {
+        let query = SessionStateQuery {
+            device_fingerprint: Some("  fp-1  ".to_string()),
+            device_id: Some("  device-1  ".to_string()),
+            ..SessionStateQuery::default()
+        };
+
+        assert_eq!(
+            required_session_state_device_fingerprint(&query).unwrap(),
+            "fp-1"
+        );
+        assert_eq!(
+            optional_session_state_device_id(&query).unwrap().as_deref(),
+            Some("device-1")
+        );
+    }
+
     #[test]
     fn reasoning_projection_collects_sse_reasoning_events() {
         let mut projection = TranscriptReasoningProjection::default();
@@ -2230,6 +2570,315 @@ mod tests {
             Some("complete"),
             "hydrated reasoning blocks should render as complete after persistence"
         );
+    }
+
+    #[test]
+    fn transcript_item_decode_preserves_values_and_reasoning() {
+        let mut reasoning = HashMap::new();
+        reasoning.insert(
+            "run-1".to_string(),
+            TranscriptReasoningProjection {
+                text: "thinking".to_string(),
+                done: true,
+            },
+        );
+
+        let item = decode_transcript_item(&FakeSessionRow::complete(), &reasoning)
+            .expect("complete row decodes");
+
+        assert_eq!(item.session_id, "session-1");
+        assert_eq!(item.item_seq, 7);
+        assert_eq!(item.run_id.as_deref(), Some("run-1"));
+        assert_eq!(item.role, "assistant");
+        assert_eq!(item.content, "answer");
+        assert_eq!(item.reasoning.as_deref(), Some("thinking"));
+        assert_eq!(item.reasoning_status.as_deref(), Some("complete"));
+        assert_eq!(item.created_at, "2026-06-26T12:00:00");
+    }
+
+    #[test]
+    fn transcript_item_decode_fails_loudly_on_required_columns() {
+        for column in ["session_id", "item_seq", "role", "content", "created_at"] {
+            let err =
+                match decode_transcript_item(&FakeSessionRow::fail_on(column), &HashMap::new()) {
+                    Ok(_) => panic!("missing transcript item column must fail: {column}"),
+                    Err(err) => err,
+                };
+            assert!(
+                err.contains(&format!("decode column `{column}`")),
+                "error should identify missing transcript column {column}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_assistant_run_id_decode_fails_loudly_on_role_column() {
+        let err = transcript_assistant_run_id(&FakeSessionRow::fail_on("role"))
+            .expect_err("role decode failure must not look like non-assistant");
+        assert!(
+            err.contains("decode column `role`"),
+            "error should identify role decode failure: {err}"
+        );
+    }
+
+    #[test]
+    fn transcript_page_ref_decode_fails_loudly_on_required_columns() {
+        let page = decode_transcript_page_ref(&FakeSessionRow::complete())
+            .expect("complete page ref decodes");
+        assert_eq!(page.page_seq, 2);
+        assert_eq!(page.start_item_seq, 5);
+        assert_eq!(page.end_item_seq, 9);
+        assert_eq!(page.item_count, 5);
+        assert_eq!(page.page_hash, "hash-1");
+
+        for column in [
+            "page_seq",
+            "start_item_seq",
+            "end_item_seq",
+            "item_count",
+            "page_hash",
+        ] {
+            let err = match decode_transcript_page_ref(&FakeSessionRow::fail_on(column)) {
+                Ok(_) => panic!("missing transcript page column must fail: {column}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(&format!("decode column `{column}`")),
+                "error should identify missing page column {column}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_page_stats_decode_fails_loudly_on_required_columns() {
+        let (page_count, high_watermark) =
+            decode_transcript_page_stats(&FakeSessionRow::complete()).expect("stats decode");
+        assert_eq!(page_count, 3);
+        assert_eq!(high_watermark, 9);
+
+        for column in ["page_count", "page_high_watermark"] {
+            let err = match decode_transcript_page_stats(&FakeSessionRow::fail_on(column)) {
+                Ok(_) => panic!("missing transcript stats column must fail: {column}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(&format!("decode column `{column}`")),
+                "error should identify stats column {column}: {err}"
+            );
+        }
+
+        for (column, value) in [
+            ("page_count", -1),
+            ("page_count", i64::from(u32::MAX) + 1),
+            ("page_high_watermark", -1),
+        ] {
+            let err = decode_transcript_page_stats(&FakeSessionRow::with_i64(column, value))
+                .expect_err("invalid transcript stats value must fail");
+            assert!(
+                err.contains(column),
+                "error should identify invalid stats column {column}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_summary_decode_preserves_values_and_fails_loudly() {
+        let summary = decode_state_category_summary(&FakeSessionRow::complete())
+            .expect("state summary decodes");
+        assert_eq!(summary.category, "decision");
+        assert_eq!(summary.count, 4);
+
+        for column in ["category", "total"] {
+            let err = match decode_state_category_summary(&FakeSessionRow::fail_on(column)) {
+                Ok(_) => panic!("missing state summary column must fail: {column}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(&format!("decode column `{column}`")),
+                "error should identify state summary column {column}: {err}"
+            );
+        }
+        for value in [-1, i64::from(u32::MAX) + 1] {
+            let err = decode_state_category_summary(&FakeSessionRow::with_i64("total", value))
+                .expect_err("invalid state summary count must fail");
+            assert!(err.contains("total"), "error should identify total: {err}");
+        }
+    }
+
+    #[test]
+    fn context_manifest_summary_decode_preserves_values_and_fails_loudly() {
+        let summary = decode_context_manifest_summary(&FakeSessionRow::complete())
+            .expect("context manifest decodes");
+        assert_eq!(summary.manifest_id, "manifest-1");
+        assert_eq!(summary.run_id.as_deref(), Some("run-1"));
+        assert_eq!(summary.turn_id, "turn-1");
+        assert_eq!(summary.reason, "stale");
+        assert_eq!(summary.total_estimated_tokens, 123);
+        assert_eq!(summary.budget_template_id.as_deref(), Some("budget-1"));
+        assert_eq!(summary.policy_version, "v1");
+        assert_eq!(summary.created_at, "2026-06-26T12:00:00");
+
+        for column in [
+            "manifest_id",
+            "run_id",
+            "turn_id",
+            "reason",
+            "total_estimated_tokens",
+            "budget_template_id",
+            "policy_version",
+            "created_at",
+        ] {
+            let err = match decode_context_manifest_summary(&FakeSessionRow::fail_on(column)) {
+                Ok(_) => panic!("missing context manifest column must fail: {column}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(&format!("decode column `{column}`")),
+                "error should identify context manifest column {column}: {err}"
+            );
+        }
+        for value in [-1, i64::from(u32::MAX) + 1] {
+            let err = decode_context_manifest_summary(&FakeSessionRow::with_i64(
+                "total_estimated_tokens",
+                value,
+            ))
+            .expect_err("invalid token count must fail");
+            assert!(
+                err.contains("total_estimated_tokens"),
+                "error should identify token column: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_run_projection_decode_preserves_values_and_fails_loudly() {
+        let active =
+            decode_active_run_projection(&FakeSessionRow::complete()).expect("active run decodes");
+        assert_eq!(active.run_id, "run-1");
+        assert_eq!(active.run_event_high_watermark, 10);
+        assert!(!active.replay_required);
+        assert_eq!(active.replay_start_event_idx, 0);
+
+        let empty_run =
+            decode_active_run_projection(&FakeSessionRow::with_i64("last_event_idx", -1))
+                .expect("last_event_idx -1 means no run events yet");
+        assert_eq!(empty_run.run_event_high_watermark, 0);
+
+        for column in ["run_id", "last_event_idx"] {
+            let err = match decode_active_run_projection(&FakeSessionRow::fail_on(column)) {
+                Ok(_) => panic!("missing active run column must fail: {column}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(&format!("decode column `{column}`")),
+                "error should identify active run column {column}: {err}"
+            );
+        }
+        let err =
+            match decode_active_run_projection(&FakeSessionRow::with_i64("last_event_idx", -2)) {
+                Ok(_) => panic!("last_event_idx less than -1 must fail"),
+                Err(err) => err,
+            };
+        assert!(
+            err.contains("last_event_idx"),
+            "error should identify invalid last_event_idx: {err}"
+        );
+    }
+
+    #[test]
+    fn device_response_decode_preserves_values_and_fails_loudly() {
+        let device = decode_device_response(&FakeSessionRow::complete())
+            .expect("complete device row decodes");
+        assert_eq!(device.lease_id, "lease-1");
+        assert_eq!(device.session_id, "session-1");
+        assert_eq!(device.device_id, "device-1");
+        assert_eq!(device.device_fingerprint, "fingerprint-1");
+        assert_eq!(device.trust_level, "trusted");
+        assert_eq!(device.status, "active");
+        assert_eq!(device.last_monotonic_id, 42);
+        assert_eq!(device.expires_at, "2026-06-26T14:00:00");
+
+        for column in [
+            "lease_id",
+            "session_id",
+            "device_id",
+            "device_fingerprint",
+            "trust_level",
+            "status",
+            "last_monotonic_id",
+            "expires_at",
+        ] {
+            let err = match decode_device_response(&FakeSessionRow::fail_on(column)) {
+                Ok(_) => panic!("missing device response column must fail: {column}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(&format!("decode column `{column}`")),
+                "error should identify missing device response column {column}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_lease_row_decode_preserves_owner_and_fails_loudly() {
+        let lease =
+            decode_device_lease_row(&FakeSessionRow::complete()).expect("lease row decodes");
+        assert_eq!(lease.lease_id, "lease-1");
+        assert_eq!(lease.user_id, "user-1");
+        assert_eq!(lease.session_id, "session-1");
+        assert_eq!(lease.device_id, "device-1");
+        assert_eq!(lease.device_fingerprint, "fingerprint-1");
+        assert_eq!(lease.status, "active");
+
+        for column in [
+            "lease_id",
+            "user_id",
+            "session_id",
+            "device_id",
+            "device_fingerprint",
+            "status",
+        ] {
+            let err = match decode_device_lease_row(&FakeSessionRow::fail_on(column)) {
+                Ok(_) => panic!("missing device lease row column must fail: {column}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(&format!("decode column `{column}`")),
+                "error should identify missing device lease row column {column}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_lease_event_payload_decode_maps_auto_expire_and_fails_loudly() {
+        let payload = decode_device_lease_event_payload(&FakeSessionRow::complete())
+            .expect("event payload decodes");
+        assert_eq!(payload.r#type, "device_lease_expired");
+        assert_eq!(payload.lease_id, "lease-1");
+        assert_eq!(payload.session_id, "session-1");
+        assert_eq!(payload.device_id, "device-1");
+        assert_eq!(payload.device_fingerprint, "fingerprint-1");
+        assert_eq!(payload.reason, "stale");
+        assert_eq!(payload.ended_at_server, "2026-06-26T13:00:00");
+
+        for column in [
+            "event_type",
+            "lease_id",
+            "session_id",
+            "device_id",
+            "device_fingerprint",
+            "reason",
+            "ended_at_server",
+        ] {
+            let err = match decode_device_lease_event_payload(&FakeSessionRow::fail_on(column)) {
+                Ok(_) => panic!("missing device lease event column must fail: {column}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(&format!("decode column `{column}`")),
+                "error should identify missing lease event column {column}: {err}"
+            );
+        }
     }
 
     #[test]

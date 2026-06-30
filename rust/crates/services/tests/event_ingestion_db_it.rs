@@ -6,7 +6,9 @@
 //!
 //! Or via: `make test-online`
 
+use astra_services::config_version_cloud::{CONFIG_VERSIONS_SELECT_TOML_SQL, ConfigVersionPayload};
 use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, IngestionEvent};
+use astra_services::storage::{insert_agent_event_edges, load_agent_event_parent_ids};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -15,10 +17,24 @@ mod common;
 const TEST_USER_ID: &str = "test-user";
 
 fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEvent {
+    test_event_for_user(TEST_USER_ID, event_id, session_id, event_type)
+}
+
+fn config_version_fixture_id() -> String {
+    let uuid_hex = Uuid::new_v4().simple().to_string();
+    format!("cfg_{}", &uuid_hex[..20])
+}
+
+fn test_event_for_user(
+    user_id: &str,
+    event_id: &str,
+    session_id: &str,
+    event_type: &str,
+) -> IngestionEvent {
     IngestionEvent {
         event_id: event_id.to_string(),
         session_id: session_id.to_string(),
-        user_id: TEST_USER_ID.to_string(),
+        user_id: user_id.to_string(),
         event_type: event_type.to_string(),
         content: None,
         token_usage: None,
@@ -32,13 +48,23 @@ fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEv
     }
 }
 
-async fn insert_session_root(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
+async fn insert_session_root(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str) {
+    insert_session_root_with_count(pool, user_id, session_id, 0).await;
+}
+
+async fn insert_session_root_with_count(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    event_count: i64,
+) {
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'event-ingestion-test', 'active', 0)",
+         VALUES (?, ?, 'event-ingestion-test', 'active', ?)",
     )
     .bind(session_id)
-    .bind(TEST_USER_ID)
+    .bind(user_id)
+    .bind(event_count)
     .execute(pool)
     .await
     .expect("insert session root");
@@ -46,41 +72,57 @@ async fn insert_session_root(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
 
 async fn assert_session_event_count(
     pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
     session_id: &str,
     expected: i64,
 ) {
-    let row = sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ?")
-        .bind(session_id)
-        .fetch_one(pool)
-        .await
-        .expect("load session event_count");
+    let row =
+        sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("load session event_count");
     let actual: i64 = row.get("event_count");
     assert_eq!(
         actual, expected,
-        "agent_sessions.event_count for {session_id}"
+        "agent_sessions.event_count for {user_id}/{session_id}"
     );
 }
 
-async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
-    let event_rows = sqlx::query("SELECT event_id FROM agent_events WHERE session_id = ?")
+async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str) {
+    let _ = sqlx::query("DELETE FROM agent_event_edges WHERE user_id = ? AND session_id = ?")
+        .bind(user_id)
         .bind(session_id)
-        .fetch_all(pool)
+        .execute(pool)
         .await;
+    let event_rows =
+        sqlx::query("SELECT event_id FROM agent_events WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_all(pool)
+            .await;
     if let Ok(event_rows) = event_rows {
         for row in event_rows {
             let event_id: String = row.get("event_id");
-            let _ = sqlx::query("DELETE FROM agent_event_edges WHERE child_event_id = ?")
+            let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ? AND user_id = ?")
                 .bind(&event_id)
-                .execute(pool)
-                .await;
-            let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ?")
-                .bind(&event_id)
+                .bind(user_id)
                 .execute(pool)
                 .await;
         }
     }
-    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
         .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await;
+}
+
+async fn cleanup_config_version(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, version_id: &str) {
+    let _ = sqlx::query("DELETE FROM config_versions WHERE user_id = ? AND version_id = ?")
+        .bind(user_id)
+        .bind(version_id)
         .execute(pool)
         .await;
 }
@@ -96,8 +138,8 @@ async fn event_ingest_idempotent_duplicate_key_no_error() {
 
     let event_id = format!("evt-test-{}", Uuid::new_v4());
     let session_id = Uuid::new_v4().to_string();
-    cleanup_session(&pool, &session_id).await;
-    insert_session_root(&pool, &session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+    insert_session_root(&pool, TEST_USER_ID, &session_id).await;
     let event = test_event(&event_id, &session_id, "test_idempotent");
 
     // Spawn worker, send event, shutdown — first insert
@@ -115,20 +157,22 @@ async fn event_ingest_idempotent_duplicate_key_no_error() {
     handle.await.unwrap();
 
     // Verify only one row exists
-    let row = sqlx::query("SELECT COUNT(*) AS cnt FROM agent_events WHERE event_id = ?")
-        .bind(&event_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count query");
+    let row =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM agent_events WHERE event_id = ? AND user_id = ?")
+            .bind(&event_id)
+            .bind(TEST_USER_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("count query");
     let count: i64 = row.get("cnt");
     assert_eq!(
         count, 1,
         "expected exactly 1 row for event_id {event_id}, got {count}"
     );
-    assert_session_event_count(&pool, &session_id, 1).await;
+    assert_session_event_count(&pool, TEST_USER_ID, &session_id, 1).await;
 
     // Cleanup
-    cleanup_session(&pool, &session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
 }
 
 /// Verifies that concurrent writes with the same event_id both succeed
@@ -145,8 +189,8 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
 
     let event_id = format!("evt-test-{}", Uuid::new_v4());
     let session_id = Uuid::new_v4().to_string();
-    cleanup_session(&pool, &session_id).await;
-    insert_session_root(&pool, &session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+    insert_session_root(&pool, TEST_USER_ID, &session_id).await;
     let event = test_event(&event_id, &session_id, "test_concurrent");
 
     let config = IngestionConfig::default();
@@ -184,20 +228,79 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
     r2.expect("second concurrent worker panicked");
 
     // Verify only one row exists (INSERT IGNORE deduplicates)
-    let row = sqlx::query("SELECT COUNT(*) AS cnt FROM agent_events WHERE event_id = ?")
-        .bind(&event_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count query");
+    let row =
+        sqlx::query("SELECT COUNT(*) AS cnt FROM agent_events WHERE event_id = ? AND user_id = ?")
+            .bind(&event_id)
+            .bind(TEST_USER_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("count query");
     let count: i64 = row.get("cnt");
     assert_eq!(
         count, 1,
         "expected exactly 1 row for event_id {event_id}, got {count}"
     );
-    assert_session_event_count(&pool, &session_id, 1).await;
+    assert_session_event_count(&pool, TEST_USER_ID, &session_id, 1).await;
 
     // Cleanup
-    cleanup_session(&pool, &session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn event_ingest_same_event_id_isolated_by_user() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+
+    let event_id = format!("evt-cross-user-{}", Uuid::new_v4());
+    let user_a = "test-user-a";
+    let user_b = "test-user-b";
+    let session_a = Uuid::new_v4().to_string();
+    let session_b = Uuid::new_v4().to_string();
+    cleanup_session(&pool, user_a, &session_a).await;
+    cleanup_session(&pool, user_b, &session_b).await;
+    insert_session_root(&pool, user_a, &session_a).await;
+    insert_session_root(&pool, user_b, &session_b).await;
+
+    let config = IngestionConfig::default();
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender
+        .enqueue_async(test_event_for_user(
+            user_a,
+            &event_id,
+            &session_a,
+            "test_cross_user",
+        ))
+        .await;
+    sender
+        .enqueue_async(test_event_for_user(
+            user_b,
+            &event_id,
+            &session_b,
+            "test_cross_user",
+        ))
+        .await;
+    shutdown.signal();
+    handle.await.unwrap();
+
+    for (user_id, session_id) in [(user_a, &session_a), (user_b, &session_b)] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_id = ? AND user_id = ?",
+        )
+        .bind(&event_id)
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count cross-user event");
+        assert_eq!(
+            count, 1,
+            "same event_id must be idempotent per user, not global"
+        );
+        assert_session_event_count(&pool, user_id, session_id, 1).await;
+    }
+
+    cleanup_session(&pool, user_a, &session_a).await;
+    cleanup_session(&pool, user_b, &session_b).await;
 }
 
 /// Verifies that batch insert with multiple events succeeds and
@@ -209,8 +312,8 @@ async fn event_ingest_batch_partial_duplicate_no_error() {
     let pool = shared.get().clone();
 
     let session_id = Uuid::new_v4().to_string();
-    cleanup_session(&pool, &session_id).await;
-    insert_session_root(&pool, &session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+    insert_session_root(&pool, TEST_USER_ID, &session_id).await;
     let event1 = test_event(
         &format!("evt-batch1-{}", Uuid::new_v4()),
         &session_id,
@@ -239,18 +342,167 @@ async fn event_ingest_batch_partial_duplicate_no_error() {
 
     // Verify both rows exist
     for event in [&event1, &event2] {
-        let row = sqlx::query("SELECT COUNT(*) AS cnt FROM agent_events WHERE event_id = ?")
-            .bind(&event.event_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count query");
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS cnt FROM agent_events WHERE event_id = ? AND user_id = ?",
+        )
+        .bind(&event.event_id)
+        .bind(TEST_USER_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count query");
         let count: i64 = row.get("cnt");
         assert_eq!(count, 1, "expected 1 row for {}", event.event_id);
     }
-    assert_session_event_count(&pool, &session_id, 2).await;
+    assert_session_event_count(&pool, TEST_USER_ID, &session_id, 2).await;
 
     // Cleanup
-    cleanup_session(&pool, &session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn event_ingest_closes_session_only_for_inserted_session_end() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+
+    let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+    insert_session_root(&pool, TEST_USER_ID, &session_id).await;
+
+    let duplicate_event_id = format!("evt-session-end-dup-{}", Uuid::new_v4());
+    let existing = test_event(&duplicate_event_id, &session_id, "ordinary_event");
+    let config = IngestionConfig::default();
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(existing).await;
+    shutdown.signal();
+    handle.await.unwrap();
+    assert_session_event_count(&pool, TEST_USER_ID, &session_id, 1).await;
+
+    let ignored_session_end = test_event(&duplicate_event_id, &session_id, "session_end");
+    let config = IngestionConfig::default();
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(ignored_session_end).await;
+    shutdown.signal();
+    handle.await.unwrap();
+
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(TEST_USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load session status after ignored session_end");
+    assert_eq!(
+        status, "active",
+        "ignored duplicate session_end input must not close the session"
+    );
+    assert_session_event_count(&pool, TEST_USER_ID, &session_id, 1).await;
+
+    let inserted_session_end = test_event(
+        &format!("evt-session-end-new-{}", Uuid::new_v4()),
+        &session_id,
+        "session_end",
+    );
+    let config = IngestionConfig::default();
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(inserted_session_end).await;
+    shutdown.signal();
+    handle.await.unwrap();
+
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(TEST_USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load session status after inserted session_end");
+    assert_eq!(status, "ended");
+    assert_session_event_count(&pool, TEST_USER_ID, &session_id, 2).await;
+
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn event_ingest_config_version_dual_writes_config_versions_once() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+
+    let user_id = format!("test-user-{}", Uuid::new_v4());
+    let session_id = Uuid::new_v4().to_string();
+    let version_id = config_version_fixture_id();
+    cleanup_session(&pool, &user_id, &session_id).await;
+    cleanup_config_version(&pool, &user_id, &version_id).await;
+    insert_session_root(&pool, &user_id, &session_id).await;
+
+    let row = ConfigVersionPayload {
+        version_id: version_id.clone(),
+        user_id: user_id.clone(),
+        toml_body: format!("model = \"worker-config\"\n# {}\n", "x".repeat(70_000)),
+        first_seen_session: Some(session_id.clone()),
+    };
+    let event = IngestionEvent::for_config_version(&row).expect("config version event");
+
+    let config = IngestionConfig {
+        batch_size: 20,
+        flush_interval_secs: 300,
+        channel_capacity: 8,
+        ..Default::default()
+    };
+    let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(event.clone()).await;
+    sender.enqueue_async(event.clone()).await;
+    shutdown.signal();
+    sender.shutdown();
+    handle.await.expect("config version ingestion worker join");
+
+    {
+        let stats = stats.lock().expect("config version ingestion stats");
+        assert!(
+            stats.last_error.is_none(),
+            "config version ingestion must not record MatrixOne errors: {:?}",
+            stats.last_error
+        );
+    }
+
+    let config_toml: String = sqlx::query_scalar(CONFIG_VERSIONS_SELECT_TOML_SQL)
+        .bind(&user_id)
+        .bind(&version_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load config version body");
+    assert_eq!(config_toml, row.toml_body);
+
+    let config_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM config_versions WHERE user_id = ? AND version_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&version_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count config version rows");
+    assert_eq!(
+        config_rows, 1,
+        "duplicate config events must be idempotent in config_versions"
+    );
+
+    let event_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE event_id = ? AND user_id = ?")
+            .bind(&version_id)
+            .bind(&user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count agent event rows");
+    assert_eq!(
+        event_rows, 1,
+        "duplicate config events must be idempotent in agent_events"
+    );
+    assert_session_event_count(&pool, &user_id, &session_id, 1).await;
+
+    cleanup_config_version(&pool, &user_id, &version_id).await;
+    cleanup_session(&pool, &user_id, &session_id).await;
 }
 
 /// Verifies that one mixed batch updates each session from its own inserted
@@ -263,8 +515,8 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
 
     let session_a = Uuid::new_v4().to_string();
     let session_b = Uuid::new_v4().to_string();
-    cleanup_session(&pool, &session_a).await;
-    cleanup_session(&pool, &session_b).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_a).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_b).await;
 
     let duplicate_a = test_event(
         &format!("evt-lazy-dup-{}", Uuid::new_v4()),
@@ -298,7 +550,7 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
     shutdown.signal();
     handle.await.unwrap();
 
-    assert_session_event_count(&pool, &session_a, 1).await;
+    assert_session_event_count(&pool, TEST_USER_ID, &session_a, 1).await;
 
     let config = IngestionConfig {
         batch_size: 50,
@@ -318,21 +570,91 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
     shutdown.signal();
     handle.await.unwrap();
 
-    assert_session_event_count(&pool, &session_a, 2).await;
-    assert_session_event_count(&pool, &session_b, 2).await;
+    assert_session_event_count(&pool, TEST_USER_ID, &session_a, 2).await;
+    assert_session_event_count(&pool, TEST_USER_ID, &session_b, 2).await;
 
     for (session_id, expected) in [(&session_a, 2_i64), (&session_b, 2_i64)] {
-        let actual: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
-                .bind(session_id)
-                .fetch_one(&pool)
-                .await
-                .expect("count session events");
+        let actual: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(session_id)
+        .bind(TEST_USER_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count session events");
         assert_eq!(actual, expected, "persisted agent_events for {session_id}");
     }
 
-    cleanup_session(&pool, &session_a).await;
-    cleanup_session(&pool, &session_b).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_a).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_b).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn event_ingest_rejects_foreign_owned_session_without_mutation() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+
+    let session_id = Uuid::new_v4().to_string();
+    let foreign_user_id = format!("foreign-user-{}", Uuid::new_v4());
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+    cleanup_session(&pool, &foreign_user_id, &session_id).await;
+    insert_session_root_with_count(&pool, &foreign_user_id, &session_id, 7).await;
+
+    let event_id = format!("evt-foreign-session-{}", Uuid::new_v4());
+    let event = test_event_for_user(
+        TEST_USER_ID,
+        &event_id,
+        &session_id,
+        "test_foreign_session_rejected",
+    );
+    let config = IngestionConfig::default();
+    let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(event).await;
+    shutdown.signal();
+    handle.await.unwrap();
+
+    let test_user_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(TEST_USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count test-user events");
+    assert_eq!(
+        test_user_event_count, 0,
+        "foreign-owned session must reject test-user event rows"
+    );
+
+    let test_user_session_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(TEST_USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count test-user sessions");
+    assert_eq!(
+        test_user_session_count, 0,
+        "foreign-owned session must not create a test-user session root"
+    );
+    assert_session_event_count(&pool, &foreign_user_id, &session_id, 7).await;
+
+    let stats = stats.lock().expect("stats lock").clone();
+    assert_eq!(stats.events_flushed, 0);
+    assert_eq!(stats.flush_count, 0);
+    assert_eq!(stats.errors, 1);
+    assert!(
+        stats
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("event_count delta")),
+        "unexpected ingestion error: {:?}",
+        stats.last_error
+    );
+
+    cleanup_session(&pool, &foreign_user_id, &session_id).await;
 }
 
 /// Verifies that a duplicate event in a mixed batch cannot mutate causal
@@ -344,8 +666,8 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
     let pool = shared.get().clone();
 
     let session_id = Uuid::new_v4().to_string();
-    cleanup_session(&pool, &session_id).await;
-    insert_session_root(&pool, &session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+    insert_session_root(&pool, TEST_USER_ID, &session_id).await;
 
     let duplicate_event_id = format!("evt-edge-dup-{}", Uuid::new_v4());
     let unique_event_id = format!("evt-edge-new-{}", Uuid::new_v4());
@@ -376,26 +698,97 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
     shutdown.signal();
     handle.await.unwrap();
 
-    let duplicate_edges: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_event_edges WHERE child_event_id = ?")
-            .bind(&duplicate_event_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count duplicate edges");
+    let duplicate_edges: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_event_edges WHERE user_id = ? AND child_event_id = ?",
+    )
+    .bind(TEST_USER_ID)
+    .bind(&duplicate_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count duplicate edges");
     assert_eq!(
         duplicate_edges, 0,
         "duplicate event rows must not gain parent edges from a later ignored retry"
     );
 
     let unique_parent: Option<String> = sqlx::query_scalar(
-        "SELECT parent_event_id FROM agent_event_edges WHERE child_event_id = ?",
+        "SELECT parent_event_id FROM agent_event_edges WHERE user_id = ? AND child_event_id = ?",
     )
+    .bind(TEST_USER_ID)
     .bind(&unique_event_id)
     .fetch_optional(&pool)
     .await
     .expect("load unique edge");
     assert_eq!(unique_parent.as_deref(), Some(unique_parent_id.as_str()));
-    assert_session_event_count(&pool, &session_id, 2).await;
+    assert_session_event_count(&pool, TEST_USER_ID, &session_id, 2).await;
 
-    cleanup_session(&pool, &session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn agent_event_edges_concurrent_inserts_preserve_distinct_parents() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+
+    let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+    insert_session_root(&pool, TEST_USER_ID, &session_id).await;
+
+    let child_event_id = format!("evt-edge-child-{}", Uuid::new_v4());
+    let parent_a = format!("evt-edge-parent-a-{}", Uuid::new_v4());
+    let parent_b = format!("evt-edge-parent-b-{}", Uuid::new_v4());
+
+    let pool_a = pool.clone();
+    let session_a = session_id.clone();
+    let child_a = child_event_id.clone();
+    let parent_a_task = parent_a.clone();
+    let write_a = tokio::spawn(async move {
+        insert_agent_event_edges(
+            &pool_a,
+            TEST_USER_ID,
+            &session_a,
+            &child_a,
+            Some(&parent_a_task),
+            &[],
+        )
+        .await
+    });
+
+    let pool_b = pool.clone();
+    let session_b = session_id.clone();
+    let child_b = child_event_id.clone();
+    let parent_b_task = parent_b.clone();
+    let write_b = tokio::spawn(async move {
+        insert_agent_event_edges(
+            &pool_b,
+            TEST_USER_ID,
+            &session_b,
+            &child_b,
+            Some(&parent_b_task),
+            &[],
+        )
+        .await
+    });
+
+    write_a.await.expect("edge insert task a").expect("edge a");
+    write_b.await.expect("edge insert task b").expect("edge b");
+
+    let mut by_child =
+        load_agent_event_parent_ids(&pool, TEST_USER_ID, std::slice::from_ref(&child_event_id))
+            .await
+            .expect("load event parents");
+    let mut actual = by_child
+        .remove(&child_event_id)
+        .expect("child should have parent edges");
+    actual.sort();
+
+    let mut expected = vec![parent_a, parent_b];
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "concurrent inserts for distinct parents must not drop edges"
+    );
+
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
 }

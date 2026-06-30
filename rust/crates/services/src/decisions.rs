@@ -174,24 +174,18 @@ impl DatabaseDecisionService {
     pub fn decision_record_from_row(
         row: sqlx::mysql::MySqlRow,
     ) -> Result<DecisionRecord, (StatusCode, Json<ErrorResponse>)> {
-        let output_json: String = row
-            .try_get("decision_output_json")
-            .unwrap_or_else(|_| "{}".to_string());
-        let params_json: String = row
-            .try_get("model_params_json")
-            .unwrap_or_else(|_| "{}".to_string());
+        let output_json = decision_row_string(&row, "decision_output_json")?;
+        let params_json = decision_row_string(&row, "model_params_json")?;
 
         Ok(DecisionRecord {
-            decision_id: row.try_get("decision_id").map_err(internal_error)?,
-            session_id: row.try_get("session_id").map_err(internal_error)?,
-            event_id: row.try_get("event_id").map_err(internal_error)?,
-            context_capture_id: row.try_get("context_capture_id").map_err(internal_error)?,
-            decision_type: row.try_get("decision_type").map_err(internal_error)?,
-            decision_output: serde_json::from_str(&output_json)
-                .unwrap_or(serde_json::Value::Object(Default::default())),
-            model_params: serde_json::from_str(&params_json)
-                .unwrap_or(serde_json::Value::Object(Default::default())),
-            created_at: row.try_get("created_at").unwrap_or_default(),
+            decision_id: decision_row_string(&row, "decision_id")?,
+            session_id: decision_row_string(&row, "session_id")?,
+            event_id: decision_row_string(&row, "event_id")?,
+            context_capture_id: decision_row_string_allow_empty(&row, "context_capture_id")?,
+            decision_type: decision_row_string(&row, "decision_type")?,
+            decision_output: parse_decision_json("decision_output_json", &output_json)?,
+            model_params: parse_decision_json("model_params_json", &params_json)?,
+            created_at: decision_row_string(&row, "created_at")?,
         })
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
@@ -210,9 +204,61 @@ impl DatabaseDecisionService {
 
 pub const DECISION_SELECT_COLS: &str = "\
     decision_id, session_id, event_id, context_capture_id, decision_type, \
-    IFNULL(CAST(decision_output AS CHAR), '{}') AS decision_output_json, \
-    IFNULL(CAST(model_params AS CHAR), '{}') AS model_params_json, \
+    CAST(decision_output AS CHAR) AS decision_output_json, \
+    CAST(model_params AS CHAR) AS model_params_json, \
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
+
+fn decision_decode_error(
+    column: &'static str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ErrorResponse>) {
+    internal_error(format!(
+        "ctx_decision_audits row decode column `{column}`: {}",
+        message.into()
+    ))
+}
+
+fn decision_row_string(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let value = decision_row_string_allow_empty(row, column)?;
+    if value.trim().is_empty() {
+        return Err(decision_decode_error(column, "must not be empty"));
+    }
+    Ok(value)
+}
+
+fn decision_row_string_allow_empty(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    row.try_get::<String, _>(column)
+        .map_err(|error| decision_decode_error(column, error.to_string()))
+}
+
+fn decision_row_optional_string(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    row.try_get::<Option<String>, _>(column)
+        .map_err(|error| decision_decode_error(column, error.to_string()))
+}
+
+fn decision_row_i64(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+    row.try_get::<i64, _>(column)
+        .map_err(|error| decision_decode_error(column, error.to_string()))
+}
+
+fn parse_decision_json(
+    column: &'static str,
+    raw: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+    serde_json::from_str(raw).map_err(|source| decision_decode_error(column, source.to_string()))
+}
 
 #[async_trait]
 impl DecisionService for DatabaseDecisionService {
@@ -331,12 +377,12 @@ impl DecisionService for DatabaseDecisionService {
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
-        let total = total_row.try_get::<i64, _>("total").unwrap_or(0);
+        let total = decision_row_i64(&total_row, "total")?;
 
         let mut list_qb = QueryBuilder::<MySql>::new(
             "SELECT d.decision_id, d.session_id, d.event_id, d.context_capture_id, d.decision_type, \
-             IFNULL(CAST(d.decision_output AS CHAR), '{}') AS decision_output_json, \
-             IFNULL(CAST(d.model_params AS CHAR), '{}') AS model_params_json, \
+             CAST(d.decision_output AS CHAR) AS decision_output_json, \
+             CAST(d.model_params AS CHAR) AS model_params_json, \
              DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
              FROM ctx_decision_audits d \
              WHERE d.user_id = ".to_string(),
@@ -402,8 +448,8 @@ impl DecisionService for DatabaseDecisionService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let sql = "SELECT d.decision_id, d.session_id, d.event_id, d.context_capture_id, d.decision_type, \
-             IFNULL(CAST(d.decision_output AS CHAR), '{}') AS decision_output_json, \
-             IFNULL(CAST(d.model_params AS CHAR), '{}') AS model_params_json, \
+             CAST(d.decision_output AS CHAR) AS decision_output_json, \
+             CAST(d.model_params AS CHAR) AS model_params_json, \
              DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM ctx_decision_audits d \
              WHERE d.decision_id = ? AND d.user_id = ?".to_string();
@@ -431,10 +477,11 @@ impl DecisionService for DatabaseDecisionService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let sql = "SELECT d.decision_id, d.session_id, d.event_id, d.context_capture_id, d.decision_type, \
-             IFNULL(CAST(d.decision_output AS CHAR), '{}') AS decision_output_json, \
-             IFNULL(CAST(d.model_params AS CHAR), '{}') AS model_params_json, \
+             CAST(d.decision_output AS CHAR) AS decision_output_json, \
+             CAST(d.model_params AS CHAR) AS model_params_json, \
              DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
-             IFNULL(CAST(cs.context_data AS CHAR), '{}') AS context_json \
+             cs.context_capture_id AS joined_context_capture_id, \
+             CAST(cs.context_data AS CHAR) AS context_json \
              FROM ctx_decision_audits d \
              LEFT JOIN ctx_snapshots cs \
                ON d.context_capture_id = cs.context_capture_id \
@@ -454,11 +501,31 @@ impl DecisionService for DatabaseDecisionService {
             )
         })?;
 
-        let context_json: String = row
-            .try_get("context_json")
-            .unwrap_or_else(|_| "{}".to_string());
-        let context: Option<serde_json::Value> = serde_json::from_str(&context_json).ok();
-
+        let referenced_context_capture_id =
+            decision_row_string_allow_empty(&row, "context_capture_id")?;
+        let context = if referenced_context_capture_id.trim().is_empty() {
+            None
+        } else {
+            let joined_context_capture_id =
+                decision_row_optional_string(&row, "joined_context_capture_id")?;
+            if joined_context_capture_id.is_none() {
+                return Err(decision_decode_error(
+                    "context_capture_id",
+                    format!(
+                        "referenced context snapshot {} not found",
+                        referenced_context_capture_id
+                    ),
+                ));
+            }
+            let context_json =
+                decision_row_optional_string(&row, "context_json")?.ok_or_else(|| {
+                    decision_decode_error(
+                        "context_json",
+                        "referenced context snapshot has NULL data",
+                    )
+                })?;
+            Some(parse_decision_json("context_json", &context_json)?)
+        };
         let decision = Self::decision_record_from_row(row)?;
 
         Ok(DecisionWithContextRecord { decision, context })

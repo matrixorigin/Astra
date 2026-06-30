@@ -102,6 +102,31 @@ fn installed_list_cursor_from_installation(
     })
 }
 
+fn required_installation_string(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let value: String = row.try_get(column).map_err(internal_error)?;
+    if value.trim().is_empty() {
+        return Err(internal_error(format!(
+            "invalid skill_installations.{column}: value is empty"
+        )));
+    }
+    Ok(value)
+}
+
+fn installation_response_from_row(
+    row: sqlx::mysql::MySqlRow,
+) -> Result<InstallationResponse, (StatusCode, Json<ErrorResponse>)> {
+    Ok(InstallationResponse {
+        installation_id: required_installation_string(&row, "installation_id")?,
+        skill_name: required_installation_string(&row, "skill_name")?,
+        skill_version: required_installation_string(&row, "skill_version")?,
+        status: required_installation_string(&row, "status")?,
+        installed_at: required_installation_string(&row, "installed_at")?,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub status: String,
@@ -235,12 +260,9 @@ impl MarketplaceService for DatabaseMarketplaceService {
                 format!("Skill '{}' not found in registry", request.skill_name),
             )
         })?;
-        let version: String = skill_row
-            .try_get("version")
-            .unwrap_or_else(|_| "1.0.0".into());
+        let version: String = skill_row.try_get("version").map_err(internal_error)?;
 
         let installation_id = Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
         query(
             "INSERT INTO skill_installations \
@@ -255,13 +277,14 @@ impl MarketplaceService for DatabaseMarketplaceService {
         .await
         .map_err(internal_error)?;
 
-        Ok(InstallationResponse {
-            installation_id,
-            skill_name: request.skill_name,
-            skill_version: version,
-            status: "installed".into(),
-            installed_at: now,
-        })
+        let row = query(&format!(
+            "SELECT {INSTALLED_LIST_SELECT} FROM skill_installations WHERE installation_id = ?"
+        ))
+        .bind(&installation_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error)?;
+        installation_response_from_row(row)
     }
 
     async fn uninstall_skill(
@@ -303,9 +326,7 @@ impl MarketplaceService for DatabaseMarketplaceService {
         let current =
             current.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Skill not installed"))?;
         let installation_id: String = current.try_get("installation_id").map_err(internal_error)?;
-        let old_version: String = current
-            .try_get("skill_version")
-            .unwrap_or_else(|_| "1.0.0".into());
+        let old_version: String = current.try_get("skill_version").map_err(internal_error)?;
 
         let latest =
             query("SELECT version FROM skills_registry WHERE skill_name = ? AND is_active = 1")
@@ -314,9 +335,9 @@ impl MarketplaceService for DatabaseMarketplaceService {
                 .await
                 .map_err(internal_error)?;
 
-        let new_version: String = latest
-            .and_then(|r| r.try_get("version").ok())
-            .unwrap_or_else(|| old_version.clone());
+        let latest =
+            latest.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Skill not found"))?;
+        let new_version: String = latest.try_get("version").map_err(internal_error)?;
 
         query(
             "UPDATE skill_installations SET skill_version = ?, previous_version = ?, \
@@ -330,13 +351,14 @@ impl MarketplaceService for DatabaseMarketplaceService {
         .await
         .map_err(internal_error)?;
 
-        Ok(InstallationResponse {
-            installation_id,
-            skill_name: request.skill_name,
-            skill_version: new_version,
-            status: "upgraded".into(),
-            installed_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-        })
+        let row = query(&format!(
+            "SELECT {INSTALLED_LIST_SELECT} FROM skill_installations WHERE installation_id = ?"
+        ))
+        .bind(&installation_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error)?;
+        installation_response_from_row(row)
     }
 
     async fn rollback_skill(
@@ -359,7 +381,9 @@ impl MarketplaceService for DatabaseMarketplaceService {
         let current =
             current.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Skill not installed"))?;
         let installation_id: String = current.try_get("installation_id").map_err(internal_error)?;
-        let previous_version: Option<String> = current.try_get("previous_version").ok();
+        let previous_version: Option<String> = current
+            .try_get("previous_version")
+            .map_err(internal_error)?;
         let previous_version = previous_version.ok_or_else(|| {
             error_response(
                 StatusCode::BAD_REQUEST,
@@ -378,13 +402,14 @@ impl MarketplaceService for DatabaseMarketplaceService {
         .await
         .map_err(internal_error)?;
 
-        Ok(InstallationResponse {
-            installation_id,
-            skill_name: request.skill_name,
-            skill_version: previous_version,
-            status: "rolled_back".into(),
-            installed_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-        })
+        let row = query(&format!(
+            "SELECT {INSTALLED_LIST_SELECT} FROM skill_installations WHERE installation_id = ?"
+        ))
+        .bind(&installation_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error)?;
+        installation_response_from_row(row)
     }
 
     async fn list_installed(
@@ -401,7 +426,7 @@ impl MarketplaceService for DatabaseMarketplaceService {
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
-        let total: i64 = count_row.try_get("cnt").unwrap_or(0);
+        let total: i64 = count_row.try_get("cnt").map_err(internal_error)?;
 
         let list_sql = if cursor.is_some() {
             format!(
@@ -432,13 +457,7 @@ impl MarketplaceService for DatabaseMarketplaceService {
 
         let mut installations = Vec::with_capacity(rows.len());
         for row in rows {
-            installations.push(InstallationResponse {
-                installation_id: row.try_get("installation_id").map_err(internal_error)?,
-                skill_name: row.try_get("skill_name").map_err(internal_error)?,
-                skill_version: row.try_get("skill_version").unwrap_or_default(),
-                status: row.try_get("status").unwrap_or_default(),
-                installed_at: row.try_get("installed_at").unwrap_or_default(),
-            });
+            installations.push(installation_response_from_row(row)?);
         }
         let has_more = installations.len() > limit as usize;
         if has_more {

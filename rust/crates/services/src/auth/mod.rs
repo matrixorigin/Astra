@@ -280,6 +280,31 @@ impl fmt::Debug for DatabaseAuthService {
     }
 }
 
+trait RefreshTokenRow {
+    fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error>;
+    fn optional_string_column(&self, column: &'static str) -> Result<Option<String>, sqlx::Error>;
+}
+
+impl RefreshTokenRow for sqlx::mysql::MySqlRow {
+    fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn optional_string_column(&self, column: &'static str) -> Result<Option<String>, sqlx::Error> {
+        self.try_get(column)
+    }
+}
+
+fn decode_refresh_token_row(
+    row: &impl RefreshTokenRow,
+) -> Result<(String, String, Option<String>), sqlx::Error> {
+    Ok((
+        row.string_column("user_id")?,
+        row.string_column("expires_at")?,
+        row.optional_string_column("session_id")?,
+    ))
+}
+
 impl DatabaseAuthService {
     pub fn new(matrixone: MatrixOneSettings, jwt: JwtSettings) -> Self {
         Self {
@@ -329,7 +354,7 @@ impl DatabaseAuthService {
         .bind(username)
         .fetch_optional(executor)
         .await
-        .map(|row| row.map(database_user_from_row))
+        .and_then(|row| row.map(database_user_from_row).transpose())
     }
 
     async fn fetch_user_by_email(
@@ -344,7 +369,7 @@ impl DatabaseAuthService {
         .bind(email)
         .fetch_optional(executor)
         .await
-        .map(|row| row.map(database_user_from_row))
+        .and_then(|row| row.map(database_user_from_row).transpose())
     }
 
     async fn fetch_user_by_id_or_username(
@@ -362,7 +387,7 @@ impl DatabaseAuthService {
             .bind(username)
             .fetch_optional(executor)
             .await
-            .map(|row| row.map(database_user_from_row))
+            .and_then(|row| row.map(database_user_from_row).transpose())
         } else {
             query(
                 "SELECT user_id, username, email, password_hash, display_name, is_active \
@@ -371,7 +396,7 @@ impl DatabaseAuthService {
             .bind(user_id)
             .fetch_optional(executor)
             .await
-            .map(|row| row.map(database_user_from_row))
+            .and_then(|row| row.map(database_user_from_row).transpose())
         }
     }
 
@@ -387,15 +412,7 @@ impl DatabaseAuthService {
         .bind(token_hash)
         .fetch_optional(executor)
         .await
-        .map(|row| {
-            row.map(|row| {
-                (
-                    row.try_get("user_id").unwrap_or_default(),
-                    row.try_get("expires_at").unwrap_or_default(),
-                    row.try_get("session_id").ok(),
-                )
-            })
-        })
+        .and_then(|row| row.map(|row| decode_refresh_token_row(&row)).transpose())
     }
 
     fn create_access_token(
@@ -1843,6 +1860,74 @@ mod tests {
                 assert_eq!(context.request_authorization_id, "authz-1");
             }
             other => panic!("expected external_authorized_request, got {other:?}"),
+        }
+    }
+
+    struct FakeRefreshTokenRow {
+        failed_column: Option<&'static str>,
+    }
+
+    impl FakeRefreshTokenRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+            }
+        }
+    }
+
+    impl RefreshTokenRow for FakeRefreshTokenRow {
+        fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            Ok(match column {
+                "user_id" => "user-1",
+                "expires_at" => "2026-06-26T10:00:00",
+                _ => unreachable!("unexpected refresh token column: {column}"),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(
+            &self,
+            column: &'static str,
+        ) -> Result<Option<String>, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            Ok(match column {
+                "session_id" => Some("session-1".to_string()),
+                _ => unreachable!("unexpected optional refresh token column: {column}"),
+            })
+        }
+    }
+
+    #[test]
+    fn refresh_token_row_decode_preserves_database_values() {
+        let (user_id, expires_at, session_id) =
+            decode_refresh_token_row(&FakeRefreshTokenRow::complete())
+            .expect("complete refresh token row should decode");
+
+        assert_eq!(user_id, "user-1");
+        assert_eq!(expires_at, "2026-06-26T10:00:00");
+        assert_eq!(session_id.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn refresh_token_row_decode_fails_loudly_on_any_missing_column() {
+        for column in ["user_id", "expires_at", "session_id"] {
+            match decode_refresh_token_row(&FakeRefreshTokenRow::fail_on(column)).unwrap_err() {
+                sqlx::Error::ColumnNotFound(name) => assert_eq!(name, column),
+                err => panic!("expected ColumnNotFound({column}), got {err:?}"),
+            }
         }
     }
 

@@ -14,6 +14,8 @@
 
 use serde_json::Value;
 
+use crate::tool::args::shape::tool_call_name;
+
 /// Placeholder that replaces cleared tool result content.
 pub const CLEARED_PLACEHOLDER: &str = "[Previous tool output cleared]";
 
@@ -237,12 +239,9 @@ fn build_tool_call_maps(messages: &[Value]) -> ToolCallMaps {
             continue;
         };
         for tc in calls {
-            if let (Some(id), Some(name)) = (
-                tc.get("id").and_then(Value::as_str),
-                tc.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str),
-            ) {
+            if let (Some(id), Some(name)) =
+                (tc.get("id").and_then(Value::as_str), tool_call_name(tc))
+            {
                 id_to_name.insert(id.to_string(), name.to_string());
                 if let Some(args) = tc
                     .get("function")
@@ -298,6 +297,36 @@ const PERSISTED_TAG: &str = "<persisted-output>";
 
 fn is_compactable_tool_name(name: &str) -> bool {
     crate::tool::categories::registry().is_compactable(name)
+}
+
+fn tool_result_name<'a>(
+    msg: &'a Value,
+    id_to_name: &'a std::collections::HashMap<&str, &str>,
+) -> Option<&'a str> {
+    msg.get("name")
+        .and_then(Value::as_str)
+        .and_then(astra_core::canonical_names::normalize_name)
+        .or_else(|| {
+            msg.get("tool_call_id")
+                .and_then(Value::as_str)
+                .and_then(|id| id_to_name.get(id).copied())
+        })
+}
+
+fn persisted_tool_name<'a>(
+    msg: &'a Value,
+    call_id: &str,
+    id_to_name: &'a std::collections::HashMap<&str, &str>,
+) -> &'a str {
+    id_to_name
+        .get(call_id)
+        .copied()
+        .or_else(|| {
+            msg.get("name")
+                .and_then(Value::as_str)
+                .and_then(astra_core::canonical_names::normalize_name)
+        })
+        .unwrap_or("unknown")
 }
 
 /// How many recent compactable tool results to keep intact.
@@ -582,12 +611,8 @@ fn compact_tool_results_with_pin_list(
         if let Some(dir) = session_dir {
             if let Some(content) = messages[idx].get("content").and_then(Value::as_str) {
                 let content = content.to_string();
-                let tool_name = id_to_name
-                    .get(call_id.as_str())
-                    .copied()
-                    .or_else(|| messages[idx].get("name").and_then(Value::as_str))
-                    .unwrap_or("unknown")
-                    .to_string();
+                let tool_name =
+                    persisted_tool_name(&messages[idx], call_id.as_str(), &id_to_name).to_string();
                 let persisted =
                     crate::tool::result::storage::maybe_persist_tool_result_unconditional(
                         dir, &call_id, &tool_name, &content,
@@ -613,11 +638,7 @@ fn extract_file_path_from_tool_result(
     id_to_name: &std::collections::HashMap<&str, &str>,
 ) -> Option<String> {
     // For read_file results, the content often starts with the file path
-    let tool_name = msg.get("name").and_then(Value::as_str).or_else(|| {
-        msg.get("tool_call_id")
-            .and_then(Value::as_str)
-            .and_then(|id| id_to_name.get(id).copied())
-    })?;
+    let tool_name = tool_result_name(msg, id_to_name)?;
     if !matches!(tool_name, "read_file" | "grep" | "glob" | "git") {
         return None;
     }
@@ -796,12 +817,8 @@ fn compact_tool_results_with_persistence(
         if let Some(dir) = session_dir {
             if let Some(content) = messages[idx].get("content").and_then(Value::as_str) {
                 let content = content.to_string();
-                let tool_name = id_to_name
-                    .get(call_id.as_str())
-                    .copied()
-                    .or_else(|| messages[idx].get("name").and_then(Value::as_str))
-                    .unwrap_or("unknown")
-                    .to_string();
+                let tool_name =
+                    persisted_tool_name(&messages[idx], call_id.as_str(), &id_to_name).to_string();
                 let persisted =
                     crate::tool::result::storage::maybe_persist_tool_result_unconditional(
                         dir, &call_id, &tool_name, &content,
@@ -836,15 +853,8 @@ fn is_compactable_tool_result(
             return false;
         }
     }
-    // Check tool name from the message itself
-    if let Some(name) = msg.get("name").and_then(Value::as_str) {
+    if let Some(name) = tool_result_name(msg, id_to_name) {
         return is_compactable_tool_name(name);
-    }
-    // Look up tool name via tool_call_id → assistant message mapping
-    if let Some(call_id) = msg.get("tool_call_id").and_then(Value::as_str) {
-        if let Some(&name) = id_to_name.get(call_id) {
-            return is_compactable_tool_name(name);
-        }
     }
     // Unknown tool — don't compact (could be bash, skill, or write_file)
     false
@@ -946,6 +956,38 @@ mod tests {
         );
         assert_eq!(messages[6]["content"], big); // recent kept
         assert_eq!(messages[7]["content"], big);
+    }
+
+    #[test]
+    fn canonicalizes_tool_call_names_before_compaction() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            assistant_with_tools(&[("c1", " read_file "), ("c2", "  ")]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+        ];
+
+        let stats = compact_tool_results(&mut messages, Some(0), Default::default());
+
+        assert_eq!(stats.results_compacted, 1);
+        assert!(content_is_cleared(&messages[1]));
+        assert_eq!(messages[2]["content"], big);
+    }
+
+    #[test]
+    fn canonicalizes_tool_result_name_fallback_before_compaction() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "orphan",
+            "name": " read_file ",
+            "content": big
+        })];
+
+        let stats = compact_tool_results(&mut messages, Some(0), Default::default());
+
+        assert_eq!(stats.results_compacted, 1);
+        assert!(content_is_cleared(&messages[0]));
     }
 
     #[test]

@@ -361,50 +361,50 @@ fn create_pipeline_modules_inner(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerModelSelection {
+    pub name: String,
+    pub context_window: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServerDefaultModel {
-    Selected(String),
+    Selected(ServerModelSelection),
     NoModels,
     Unavailable,
 }
 
 fn model_list_entry_is_active(entry: &serde_json::Value) -> bool {
-    if let Some(value) = entry.get("is_active") {
-        if let Some(active) = value.as_bool() {
-            return active;
-        }
-        if let Some(active) = value.as_i64() {
-            return active != 0;
-        }
-        if let Some(active) = value.as_u64() {
-            return active != 0;
-        }
-    }
-    if let Some(value) = entry.get("active") {
-        if let Some(active) = value.as_bool() {
-            return active;
-        }
-        if let Some(active) = value.as_i64() {
-            return active != 0;
-        }
-        if let Some(active) = value.as_u64() {
-            return active != 0;
-        }
-    }
-    true
+    entry
+        .get("is_active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
     entry
         .get("name")
-        .or_else(|| entry.get("model_name"))
-        .or_else(|| entry.get("model_id"))
-        .or_else(|| entry.get("id"))
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|name| !name.is_empty())
 }
 
-pub(crate) fn default_model_from_models_response(body: &serde_json::Value) -> Option<String> {
+fn positive_u32(value: &serde_json::Value) -> Option<u32> {
+    if let Some(value) = value.as_u64() {
+        return u32::try_from(value).ok().filter(|value| *value > 0);
+    }
+    value
+        .as_i64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+pub(crate) fn model_list_entry_context_window(entry: &serde_json::Value) -> Option<u32> {
+    entry.get("context_window").and_then(positive_u32)
+}
+
+pub(crate) fn default_model_selection_from_models_response(
+    body: &serde_json::Value,
+) -> Option<ServerModelSelection> {
     let models = body.as_array().or_else(|| {
         body.get("models")
             .or_else(|| body.get("items"))
@@ -413,7 +413,62 @@ pub(crate) fn default_model_from_models_response(body: &serde_json::Value) -> Op
     models
         .iter()
         .filter(|entry| model_list_entry_is_active(entry))
-        .find_map(|entry| model_list_entry_name(entry).map(str::to_string))
+        .find_map(|entry| {
+            model_list_entry_name(entry).map(|name| ServerModelSelection {
+                name: name.to_string(),
+                context_window: model_list_entry_context_window(entry),
+            })
+        })
+}
+
+pub(crate) fn default_model_from_models_response(body: &serde_json::Value) -> Option<String> {
+    default_model_selection_from_models_response(body).map(|selection| selection.name)
+}
+
+pub(crate) fn context_window_for_model_from_models_response(
+    body: &serde_json::Value,
+    model: &str,
+) -> Option<u32> {
+    let registry_model = astra_turn_core::thinking_config::resolve_model_thinking(model).0;
+    let models = body.as_array().or_else(|| {
+        body.get("models")
+            .or_else(|| body.get("items"))
+            .and_then(|value| value.as_array())
+    })?;
+    models
+        .iter()
+        .filter(|entry| model_list_entry_is_active(entry))
+        .find(|entry| {
+            model_list_entry_name(entry)
+                .is_some_and(|name| name.eq_ignore_ascii_case(registry_model))
+        })
+        .and_then(model_list_entry_context_window)
+}
+
+pub(crate) async fn resolve_server_model_context_window(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    model: &str,
+) -> Result<u32, String> {
+    let resp = api
+        .get_models_response_timeout(token, std::time::Duration::from_secs(3))
+        .await
+        .map_err(|error| format!("failed to load server model registry: {error}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "server model registry request failed with status {}",
+            resp.status()
+        ));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|error| format!("server model registry response was not valid JSON: {error}"))?;
+    context_window_for_model_from_models_response(&body, model).ok_or_else(|| {
+        format!(
+            "model '{model}' is missing positive context_window metadata in the server registry"
+        )
+    })
 }
 
 /// Resolve the model the CLI should preselect when the user did not explicitly
@@ -434,8 +489,8 @@ pub(crate) async fn resolve_server_default_model(
         Ok(v) => v,
         Err(_) => return ServerDefaultModel::Unavailable,
     };
-    match default_model_from_models_response(&body) {
-        Some(model) => ServerDefaultModel::Selected(model),
+    match default_model_selection_from_models_response(&body) {
+        Some(selection) => ServerDefaultModel::Selected(selection),
         None => ServerDefaultModel::NoModels,
     }
 }
@@ -445,13 +500,50 @@ pub(crate) async fn ensure_state_default_model(
     token: &str,
     state: &mut SessionState,
 ) -> Option<String> {
-    if let Some(model) = normalize_model_override(state.model.as_deref()) {
-        return Some(model.to_string());
+    if let Some(model) = normalize_model_override(state.model.as_deref()).map(str::to_string) {
+        match resolve_server_model_context_window(api, token, &model).await {
+            Ok(context_window) => {
+                state.context_budget =
+                    astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
+                        &state.runtime_config,
+                        Some(&model),
+                        Some(context_window),
+                    );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_cli::model_selection",
+                    model,
+                    error = %error,
+                    "could not resolve explicit model context_window from server registry"
+                );
+                eprintln!("warning: {error}; keeping current context budget");
+            }
+        }
+        return Some(model);
     }
     match resolve_server_default_model(api, token).await {
-        ServerDefaultModel::Selected(model) => {
-            state.model = Some(model.clone());
-            Some(model)
+        ServerDefaultModel::Selected(selection) => {
+            state.model = Some(selection.name.clone());
+            if let Some(context_window) = selection.context_window {
+                state.context_budget =
+                    astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
+                        &state.runtime_config,
+                        Some(&selection.name),
+                        Some(context_window),
+                    );
+            } else {
+                tracing::warn!(
+                    target: "astra_cli::model_selection",
+                    model = %selection.name,
+                    "server default model is missing positive context_window metadata"
+                );
+                eprintln!(
+                    "warning: model '{}' is missing positive context_window metadata; keeping current context budget",
+                    selection.name
+                );
+            }
+            Some(selection.name)
         }
         ServerDefaultModel::NoModels | ServerDefaultModel::Unavailable => None,
     }
@@ -1327,8 +1419,10 @@ mod tests {
     use super::{
         ACCESS_TOKEN_REFRESH_SKEW_SECS, RestoredSessionState, SilentRefreshError,
         access_token_needs_refresh, banner_session_display, banner_welcome_text,
-        current_access_token, current_git_root, default_model_from_models_response,
-        fresh_access_token, initialize_session_state, pending_recovery_status_line,
+        context_window_for_model_from_models_response, current_access_token, current_git_root,
+        default_model_from_models_response, default_model_selection_from_models_response,
+        ensure_state_default_model, fresh_access_token, initialize_session_state,
+        pending_recovery_status_line, resolve_server_model_context_window,
         restore_history_from_journal, restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error,
     };
@@ -1395,47 +1489,152 @@ mod tests {
     }
 
     #[test]
-    fn default_model_from_models_response_accepts_wrapped_legacy_shape() {
+    fn default_model_selection_carries_configured_context_window() {
+        let body = serde_json::json!([
+            {"name": "inactive-model", "is_active": false, "context_window": 999999},
+            {"name": "claude-sonnet-4", "is_active": true, "context_window": 200000}
+        ]);
+
+        let selection =
+            default_model_selection_from_models_response(&body).expect("active model selection");
+        assert_eq!(selection.name, "claude-sonnet-4");
+        assert_eq!(selection.context_window, Some(200_000));
+    }
+
+    #[test]
+    fn context_window_lookup_uses_active_named_model_entry() {
         let body = serde_json::json!({
             "models": [
-                {"model_name": "legacy-inactive", "active": 0},
-                {"model_name": "legacy-active", "active": 1}
+                {"name": "custom-model", "is_active": false, "context_window": 8_000},
+                {"name": "custom-model", "is_active": true, "context_window": 500_000}
             ]
         });
 
         assert_eq!(
-            default_model_from_models_response(&body).as_deref(),
-            Some("legacy-active")
+            context_window_for_model_from_models_response(&body, "CUSTOM-MODEL"),
+            Some(500_000)
         );
     }
 
     #[test]
-    fn default_model_from_models_response_accepts_items_shape() {
+    fn context_window_lookup_strips_thinking_suffix_for_registry_match() {
         let body = serde_json::json!({
-            "items": [
-                {"id": "row-without-name", "is_active": true},
-                {"name": "items-active-model", "is_active": true}
+            "models": [
+                {
+                    "name": "deepseek-v4-pro-official",
+                    "is_active": true,
+                    "context_window": 1_000_000
+                }
             ]
         });
 
         assert_eq!(
-            default_model_from_models_response(&body).as_deref(),
-            Some("row-without-name")
+            context_window_for_model_from_models_response(
+                &body,
+                "deepseek-v4-pro-official(thinking:high)"
+            ),
+            Some(1_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_server_model_context_window_errors_when_registry_metadata_missing() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    {"name": "small-model", "is_active": true}
+                ]
+            })))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let error = resolve_server_model_context_window(&api, "token", "small-model")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("missing positive context_window"));
+    }
+
+    #[tokio::test]
+    async fn resolve_server_model_context_window_accepts_thinking_suffix() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    {
+                        "name": "deepseek-v4-pro-official",
+                        "is_active": true,
+                        "context_window": 1_000_000
+                    }
+                ]
+            })))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let context_window = resolve_server_model_context_window(
+            &api,
+            "token",
+            "deepseek-v4-pro-official(thinking:high)",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(context_window, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn ensure_state_default_model_updates_budget_for_explicit_model() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    {
+                        "name": "deepseek-v4-pro-official",
+                        "is_active": true,
+                        "context_window": 1_000_000
+                    }
+                ]
+            })))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let mut state = SessionState {
+            model: Some("deepseek-v4-pro-official".to_string()),
+            ..SessionState::default()
+        };
+
+        let selected = ensure_state_default_model(&api, "token", &mut state).await;
+
+        assert_eq!(
+            selected.as_deref(),
+            Some("deepseek-v4-pro-official"),
+            "explicit model selection should be preserved"
+        );
+        assert_eq!(
+            state.context_budget.model_limit, 1_000_000,
+            "state diagnostics must reflect the server model context_window, not the client default"
         );
     }
 
     #[test]
-    fn default_model_from_models_response_uses_model_id_when_name_is_missing() {
+    fn default_model_from_models_response_filters_by_active_and_name() {
         let body = serde_json::json!({
             "models": [
-                {"name": "inactive", "is_active": false},
-                {"model_id": "row-without-name", "is_active": true}
+                {"name": "inactive-model", "is_active": false},
+                {"name": "active-model", "is_active": true},
+                {"name": "", "is_active": true}
             ]
         });
 
         assert_eq!(
             default_model_from_models_response(&body).as_deref(),
-            Some("row-without-name")
+            Some("active-model")
         );
     }
 

@@ -6,6 +6,7 @@
 //! session restore and CSL prompt-materialization boundaries.
 
 use crate::conversation_log::SessionStateCompact;
+use crate::tool::args::shape::tool_call_name;
 use serde_json::{Value, json};
 
 const MAX_PROMPT_FACING_MESSAGES: usize = 40;
@@ -177,12 +178,7 @@ fn extract_tool_calls(msg: &Value) -> Vec<ToolCallRef> {
             let Some(id) = call.get("id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let name = call
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-                .or_else(|| call.get("name").and_then(|v| v.as_str()))
-                .unwrap_or("unknown_tool");
+            let name = tool_call_name(call).unwrap_or("unknown_tool");
             calls.push(ToolCallRef {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -197,10 +193,7 @@ fn extract_tool_calls(msg: &Value) -> Vec<ToolCallRef> {
             let Some(id) = block.get("id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let name = block
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown_tool");
+            let name = tool_call_name(block).unwrap_or("unknown_tool");
             calls.push(ToolCallRef {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -350,6 +343,30 @@ mod tests {
                 json!({"role": "user", "content": "fix it"}),
                 json!({"role": "system", "content": "[Runtime tool result]\nread_file: file"}),
                 json!({"role": "assistant", "content": "done"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_recap_canonicalizes_tool_call_names() {
+        let messages = vec![
+            json!({"role": "user", "content": "inspect"}),
+            json!({"role": "assistant", "tool_calls": [
+                {"id": "c1", "function": {"name": " read_file "}},
+                {"id": "c2", "function": {"name": "  "}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "file"}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "blank-name result"}),
+        ];
+
+        let got = sanitize_prompt_facing_messages(messages);
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "inspect"}),
+                json!({"role": "system", "content": "[Runtime tool result]\nread_file: file"}),
+                json!({"role": "system", "content": "[Runtime tool result]\nunknown_tool: blank-name result"}),
             ]
         );
     }

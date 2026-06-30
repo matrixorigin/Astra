@@ -4,7 +4,7 @@ use astra_runtime_env::{
     CleanupReason, RuntimeBinding, WorkspaceAuthority, WorkspaceBindingKind, WorkspaceMountPlan,
     WorkspaceOwnerScope, WorkspacePersistence, WorkspaceProvisionError,
     WorkspaceProvisionErrorKind, WorkspaceProvisionRequest, WorkspaceProvisioner, WorkspaceRecord,
-    WorkspaceSource,
+    WorkspaceSource, validate_workspace_id,
 };
 use async_trait::async_trait;
 
@@ -288,13 +288,8 @@ fn canonicalize_path(
 }
 
 fn safe_workspace_id(session_id: &str) -> Result<String, ServerWorkspaceProvisionError> {
-    if session_id.is_empty()
-        || !session_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(ServerWorkspaceProvisionError::InvalidSessionId);
-    }
+    validate_workspace_id(session_id)
+        .map_err(|_| ServerWorkspaceProvisionError::InvalidSessionId)?;
     Ok(session_id.to_string())
 }
 

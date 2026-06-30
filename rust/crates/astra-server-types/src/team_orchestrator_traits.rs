@@ -103,6 +103,7 @@ pub trait RunPersistence: Send + Sync {
     /// Persist a status change.
     async fn persist_status(
         &self,
+        user_id: &str,
         run_id: &str,
         status: &str,
         waiting_for: Option<&str>,
@@ -112,6 +113,7 @@ pub trait RunPersistence: Send + Sync {
     /// Persist token/tool usage counters.
     async fn persist_usage(
         &self,
+        user_id: &str,
         run_id: &str,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -119,9 +121,13 @@ pub trait RunPersistence: Send + Sync {
     ) -> Result<bool, String>;
 
     /// Save a checkpoint for crash recovery.
-    async fn persist_checkpoint(&self, run_id: &str, checkpoint_json: &str)
-    -> Result<bool, String>;
+    async fn persist_checkpoint(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        checkpoint_json: &str,
+    ) -> Result<bool, String>;
 
     /// Append an event to the durable event log.
-    async fn append_event(&self, run_id: &str, event: Value) -> Result<(), String>;
+    async fn append_event(&self, user_id: &str, run_id: &str, event: Value) -> Result<(), String>;
 }

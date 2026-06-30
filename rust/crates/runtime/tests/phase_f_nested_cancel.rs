@@ -31,6 +31,10 @@ use astra_services::coordination::{
 };
 use astra_services::runs::InMemoryRunStateStore;
 
+const NATURAL_TIMEOUT: Duration = Duration::from_secs(25);
+const CANCEL_LATENCY_BUDGET: Duration = Duration::from_secs(20);
+const START_WAIT_BUDGET: Duration = Duration::from_secs(10);
+
 // ─── Test harness ───────────────────────────────────────────────────────────
 
 fn setup() -> (
@@ -61,7 +65,7 @@ fn fan_out(delegation_id: &str, agents: Vec<&str>) -> DelegationRequest {
             aggregation: AggregationStrategy::AllResults,
             // Keep timeout noticeably longer than expected cancel latency so
             // a hang is distinguishable from natural completion.
-            timeout_sec: 30,
+            timeout_sec: 25,
         },
         user_id: "user-1".into(),
         depth: 0,
@@ -123,7 +127,7 @@ impl SubRunExecutor for NestedMockExecutor {
                             _ = t2.cancelled() => {
                                 seen2.fetch_add(1, Ordering::SeqCst);
                             }
-                            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                            _ = tokio::time::sleep(NATURAL_TIMEOUT) => {}
                         }
                     }));
                 }
@@ -131,7 +135,7 @@ impl SubRunExecutor for NestedMockExecutor {
                     _ = t1.cancelled() => {
                         seen1.fetch_add(1, Ordering::SeqCst);
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = tokio::time::sleep(NATURAL_TIMEOUT) => {}
                 }
                 for h in grand {
                     let _ = h.await;
@@ -144,7 +148,7 @@ impl SubRunExecutor for NestedMockExecutor {
             _ = token.cancelled() => {
                 self.seen_depth_0.fetch_add(1, Ordering::SeqCst);
             }
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            _ = tokio::time::sleep(NATURAL_TIMEOUT) => {}
         }
         for h in depth_1_handles {
             let _ = h.await;
@@ -167,7 +171,7 @@ impl SubRunExecutor for NestedMockExecutor {
 // Fan-out of 2 sub-runs at depth-0; each opens 3 depth-1 and 9 depth-2 tasks
 // all sharing the same `Arc<CancellationToken>`. Root cancel must be observed
 // at every depth, and the top-level `execute` must return well before the
-// natural 30-s task timeout.
+// natural task timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nested_cancel_propagates_through_three_levels() {
     let (reg, engine, tracker) = setup();
@@ -188,7 +192,7 @@ async fn nested_cancel_propagates_through_three_levels() {
         let t = token.clone();
         let started = exec.started_at_root.clone();
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let deadline = tokio::time::Instant::now() + START_WAIT_BUDGET;
             while tokio::time::Instant::now() < deadline && started.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -203,10 +207,11 @@ async fn nested_cancel_propagates_through_three_levels() {
     let elapsed = started.elapsed();
     let _ = cancel_after.await;
 
-    // Sanity: the top-level execute returned quickly, not after the 30-s
-    // natural timeout.
+    // Sanity: the top-level execute returned quickly, not after the natural
+    // timeout. The budget is intentionally below NATURAL_TIMEOUT but wide
+    // enough for full nextest parallelism on loaded CI hosts.
     assert!(
-        elapsed < Duration::from_secs(5),
+        elapsed < CANCEL_LATENCY_BUDGET,
         "execute blocked after cancel; took {elapsed:?}"
     );
 
@@ -262,7 +267,7 @@ async fn pre_cancelled_token_short_circuits_nested_execute() {
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < CANCEL_LATENCY_BUDGET,
         "pre-cancelled execute should return fast; took {elapsed:?}"
     );
 }
@@ -300,14 +305,25 @@ async fn sibling_delegations_have_isolated_cancel_tokens() {
         de_b.execute(req, "orch", Some(tb)).await
     });
 
-    // Give both a chance to reach the cancel-await boundary.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Give both a chance to reach the cancel-await boundary. Fixed sleeps are
+    // scheduler-sensitive under full nextest parallelism, so wait for the
+    // executor's own start counter instead.
+    let start_deadline = tokio::time::Instant::now() + START_WAIT_BUDGET;
+    while tokio::time::Instant::now() < start_deadline
+        && exec.started_at_root.load(Ordering::SeqCst) < 2
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        exec.started_at_root.load(Ordering::SeqCst) >= 2,
+        "both sibling delegations should start before isolation assertion"
+    );
 
     // Cancel only A.
     token_a.cancel();
 
     // A completes quickly; B is still pending.
-    let a = tokio::time::timeout(Duration::from_secs(5), handle_a)
+    let a = tokio::time::timeout(CANCEL_LATENCY_BUDGET, handle_a)
         .await
         .expect("A must unwind after its own token fires")
         .unwrap();

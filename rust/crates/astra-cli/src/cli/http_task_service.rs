@@ -112,7 +112,7 @@ impl TaskService for HttpTaskService {
             .ok_or_else(|| "create_task: missing task_id in response".to_string())
     }
 
-    async fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>, String> {
+    async fn get_task(&self, _user_id: &str, task_id: &str) -> Result<Option<TaskRecord>, String> {
         let result = self.rpc("get_task", json!({ "task_id": task_id })).await?;
         if result.is_null() {
             return Ok(None);
@@ -192,7 +192,12 @@ impl TaskService for HttpTaskService {
         Ok(tasks)
     }
 
-    async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
+    async fn update_status(
+        &self,
+        _user_id: &str,
+        task_id: &str,
+        status: TaskStatus,
+    ) -> Result<(), String> {
         let status_str = serde_json::to_value(status)
             .ok()
             .and_then(|v| v.as_str().map(String::from))
@@ -207,6 +212,7 @@ impl TaskService for HttpTaskService {
 
     async fn update_progress(
         &self,
+        _user_id: &str,
         task_id: &str,
         progress_pct: u32,
         items_done: u32,
@@ -227,6 +233,7 @@ impl TaskService for HttpTaskService {
 
     async fn save_checkpoint(
         &self,
+        _user_id: &str,
         task_id: &str,
         checkpoint: &TaskCheckpoint,
     ) -> Result<(), String> {
@@ -238,19 +245,24 @@ impl TaskService for HttpTaskService {
         Ok(())
     }
 
-    async fn update_plan(&self, task_id: &str, plan: &TaskPlan) -> Result<(), String> {
+    async fn update_plan(
+        &self,
+        _user_id: &str,
+        task_id: &str,
+        plan: &TaskPlan,
+    ) -> Result<(), String> {
         self.rpc("update_plan", json!({ "task_id": task_id, "plan": plan }))
             .await?;
         Ok(())
     }
 
-    async fn fail_task(&self, task_id: &str, error: &str) -> Result<(), String> {
+    async fn fail_task(&self, _user_id: &str, task_id: &str, error: &str) -> Result<(), String> {
         self.rpc("fail_task", json!({ "task_id": task_id, "error": error }))
             .await?;
         Ok(())
     }
 
-    async fn complete_task(&self, task_id: &str) -> Result<(), String> {
+    async fn complete_task(&self, _user_id: &str, task_id: &str) -> Result<(), String> {
         self.rpc("complete_task", json!({ "task_id": task_id }))
             .await?;
         Ok(())
@@ -258,6 +270,7 @@ impl TaskService for HttpTaskService {
 
     async fn complete_task_with_outcome(
         &self,
+        _user_id: &str,
         task_id: &str,
         outcome: TaskOutcome,
     ) -> Result<(), String> {
@@ -271,6 +284,7 @@ impl TaskService for HttpTaskService {
 
     async fn complete_plan_run(
         &self,
+        _user_id: &str,
         task_id: &str,
         progress_pct: u32,
         items_done: u32,
@@ -293,6 +307,7 @@ impl TaskService for HttpTaskService {
 
     async fn record_feedback(
         &self,
+        _user_id: &str,
         task_id: &str,
         rating: u8,
         outcome: TaskOutcome,
@@ -311,7 +326,7 @@ impl TaskService for HttpTaskService {
         Ok(())
     }
 
-    async fn increment_replan_count(&self, task_id: &str) -> Result<(), String> {
+    async fn increment_replan_count(&self, _user_id: &str, task_id: &str) -> Result<(), String> {
         self.rpc("increment_replan_count", json!({ "task_id": task_id }))
             .await?;
         Ok(())
@@ -319,6 +334,7 @@ impl TaskService for HttpTaskService {
 
     async fn extract_template(
         &self,
+        _user_id: &str,
         task_id: &str,
         goal_pattern: &str,
     ) -> Result<Option<String>, String> {
@@ -367,7 +383,7 @@ impl TaskService for HttpTaskService {
         Ok(stats)
     }
 
-    async fn record_template_usage(&self, template_id: &str) -> Result<(), String> {
+    async fn record_template_usage(&self, _user_id: &str, template_id: &str) -> Result<(), String> {
         self.rpc(
             "record_template_usage",
             json!({ "template_id": template_id }),

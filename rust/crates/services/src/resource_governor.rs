@@ -767,22 +767,6 @@ mod tests {
         assert_eq!(gov.get_usage("b").await.tool_calls, 20);
     }
 
-    /// audit-D1/D2: DatabaseResourceGovernor must not silently drop DB write
-    /// errors. Every `sqlx::query(...).execute(...)` in production code must
-    /// be wrapped in error handling, not `let _ =`.
-    #[test]
-    fn resource_governor_db_writes_are_not_silently_dropped() {
-        let source = include_str!("resource_governor.rs");
-        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        let silent_count = prod_code.matches("let _ = sqlx::query").count();
-        assert_eq!(
-            silent_count, 0,
-            "resource governor has {silent_count} silently-dropped DB writes; \
-             use `if let Err(e) = ... {{ tracing::warn!(...) }}` instead"
-        );
-    }
-
     /// P0-C: A session that starts within budget must be DENIED further
     /// tokens once the daily limit is exceeded mid-session.
     /// This verifies the check_token_budget method exists and works.

@@ -248,7 +248,7 @@ impl AgenticLoopHost for SubRunHost {
             &self.all_schemas,
             &mut state.restricted_tools,
             &self.executor,
-            effective_model,
+            approximate_context_window_from_effective_input_budget(state.max_turn_input_tokens),
             interaction_mode,
         );
 
@@ -814,13 +814,27 @@ fn empty_surface_report_for_schemas(
     }
 }
 
+// AgenticLoopState currently carries the effective input budget, not the full
+// model context window. This approximation is used only for deferred-tool
+// manifest sizing in sub-runs; callers with registry metadata should pass the
+// full context window directly.
+fn approximate_context_window_from_effective_input_budget(
+    max_turn_input_tokens: u64,
+) -> Option<u32> {
+    if max_turn_input_tokens == 0 {
+        return None;
+    }
+    let approx_context_window = max_turn_input_tokens.saturating_mul(10).div_ceil(8);
+    Some(approx_context_window.min(u64::from(u32::MAX)) as u32)
+}
+
 fn attach_subrun_tool_surface(
     payload: &mut Value,
     mut schemas_to_use: Vec<Value>,
     all_schemas: &[Value],
     restricted_tools: &mut HashSet<String>,
     executor: &edge_tools::ToolExecutor,
-    effective_model: Option<&str>,
+    context_window_tokens: Option<u32>,
     interaction_mode: TurnInteractionMode,
 ) -> TurnInteractionPolicy {
     let activated = executor.activated_deferred_tool_names_for_schema_injection();
@@ -865,7 +879,8 @@ fn attach_subrun_tool_surface(
     );
     let mut activatable_tool_names = HashSet::new();
     if final_visible_tool_names.contains("tool_search")
-        && let Some(manifest) = tool_surface.deferred_manifest(effective_model)
+        && let Some(manifest) =
+            tool_surface.deferred_manifest_with_context_window(context_window_tokens)
     {
         activatable_tool_names = manifest.names.iter().cloned().collect();
         merge_edge_profile_extensions(
@@ -1090,7 +1105,7 @@ mod tests {
             &all_schemas,
             &mut restricted_tools,
             &executor,
-            None,
+            Some(200_000),
             TurnInteractionMode::NonInteractive,
         );
 
@@ -1152,7 +1167,7 @@ mod tests {
             &all_schemas,
             &mut restricted_tools,
             &executor,
-            None,
+            Some(200_000),
             TurnInteractionMode::NonInteractive,
         );
 
@@ -1186,7 +1201,7 @@ mod tests {
             &all_schemas,
             &mut restricted_tools,
             &executor,
-            None,
+            Some(200_000),
             TurnInteractionMode::NonInteractive,
         );
 
@@ -1228,7 +1243,7 @@ mod tests {
             &all_schemas,
             &mut restricted_tools,
             &executor,
-            None,
+            Some(200_000),
             TurnInteractionMode::NonInteractive,
         );
 

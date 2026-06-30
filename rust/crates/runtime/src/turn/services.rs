@@ -2,6 +2,7 @@ use crate::data_layer::storage::{
     bump_agent_session_event_count, insert_trace_event, touch_agent_session_activity,
 };
 use crate::*;
+use astra_core::canonical_names::metadata_tool_name;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
 
 #[derive(Clone, Debug)]
@@ -134,14 +135,6 @@ impl DatabaseTraceEventWriter {
             .map(|p| p.get().clone())
             .ok_or_else(|| TraceWriteError::Unavailable("shared pool not configured".to_string()))
     }
-}
-
-fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String> {
-    metadata
-        .and_then(|v| v.get("tool_name").or_else(|| v.get("name")))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
 }
 
 fn record_session_event_delta(
@@ -366,6 +359,8 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
                 update_turn_skill_selection_version(
                     &mut tx,
                     &skill_selection.event_id,
+                    &skill_selection.user_id,
+                    &skill_selection.session_id,
                     skill_version,
                 )
                 .await
@@ -529,6 +524,8 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
             if result.rows_affected() > 0 {
                 crate::data_layer::storage::insert_agent_event_edges(
                     &mut *tx,
+                    &event.user_id,
+                    &event.session_id,
                     &event.event_id,
                     event.parent_event_id.as_deref(),
                     &event.parent_event_ids,
@@ -658,19 +655,19 @@ mod tests {
 
     #[test]
     fn metadata_tool_name_from_tool_name() {
-        let v = json!({"tool_name": "bash"});
+        let v = json!({"tool_name": " bash "});
         assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "bash");
     }
 
     #[test]
-    fn metadata_tool_name_from_name_fallback() {
+    fn metadata_tool_name_does_not_use_name_alias() {
         let v = json!({"name": "read_file"});
-        assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "read_file");
+        assert!(metadata_tool_name(Some(&v)).is_none());
     }
 
     #[test]
-    fn metadata_tool_name_prefers_tool_name() {
-        let v = json!({"tool_name": "preferred", "name": "fallback"});
+    fn metadata_tool_name_ignores_ambiguous_name_when_tool_name_exists() {
+        let v = json!({"tool_name": "preferred", "name": "read_file"});
         assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "preferred");
     }
 
@@ -967,16 +964,18 @@ mod tests {
         .expect("decode event count");
         assert_eq!(actual_events, 6);
 
-        let _ = sqlx::query("DELETE FROM agent_events WHERE session_id = ? AND user_id = ?")
+        sqlx::query("DELETE FROM agent_events WHERE session_id = ? AND user_id = ?")
             .bind(&session_id)
             .bind(&user_id)
             .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .await
+            .expect("cleanup event count fixture agent_events");
+        sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
             .bind(&session_id)
             .bind(&user_id)
             .execute(&pool)
-            .await;
+            .await
+            .expect("cleanup event count fixture agent_sessions");
     }
 
     /// Verify that all Database*Writer structs fail instantly when no pool is

@@ -3,6 +3,7 @@ use crate::orchestration::{
     is_agent_trace_settled_event,
 };
 use crate::server::*;
+use astra_services::db_row::{RowDecoder, RowExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
@@ -145,7 +146,10 @@ async fn load_trace_events(
     .await
     .map_err(internal_error)?;
 
-    Ok(rows.into_iter().map(trace_event_from_row).collect())
+    rows.iter()
+        .map(trace_event_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal_error)
 }
 
 async fn load_trace_run_liveness(
@@ -182,73 +186,40 @@ async fn load_trace_run_liveness(
         .map_err(internal_error)?;
     let active_run_ids = rows
         .into_iter()
-        .filter_map(|row| row.try_get::<String, _>("run_id").ok())
-        .collect();
+        .map(|row| row.try_get::<String, _>("run_id"))
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(internal_error)?;
     Ok(TraceRunLiveness { active_run_ids })
 }
 
-fn trace_event_from_row(row: sqlx::mysql::MySqlRow) -> TraceApiEvent {
-    TraceApiEvent {
-        event_id: row.try_get("event_id").unwrap_or_default(),
-        event_type: row.try_get("event_type").unwrap_or_default(),
-        trace_kind: row
-            .try_get::<Option<String>, _>("trace_kind")
-            .ok()
-            .flatten(),
-        session_id: row.try_get("session_id").unwrap_or_default(),
-        turn_id: row.try_get::<Option<String>, _>("turn_id").ok().flatten(),
-        turn_seq: row.try_get::<Option<i64>, _>("turn_seq").ok().flatten(),
-        run_id: row.try_get::<Option<String>, _>("run_id").ok().flatten(),
-        parent_run_id: row
-            .try_get::<Option<String>, _>("parent_run_id")
-            .ok()
-            .flatten(),
-        agent_id: row.try_get::<Option<String>, _>("agent_id").ok().flatten(),
-        parent_agent_id: row
-            .try_get::<Option<String>, _>("parent_agent_id")
-            .ok()
-            .flatten(),
-        round_index: row.try_get::<Option<i64>, _>("round_index").ok().flatten(),
-        tool_call_id: row
-            .try_get::<Option<String>, _>("tool_call_id")
-            .ok()
-            .flatten(),
-        meta_tool_name: row
-            .try_get::<Option<String>, _>("meta_tool_name")
-            .ok()
-            .flatten(),
-        content: row.try_get::<Option<String>, _>("content").ok().flatten(),
-        reasoning_content: row
-            .try_get::<Option<String>, _>("reasoning_content")
-            .ok()
-            .flatten(),
-        token_usage: parse_json_column(&row, "token_usage"),
-        llm_model_used: row
-            .try_get::<Option<String>, _>("llm_model_used")
-            .ok()
-            .flatten(),
-        meta_duration_ms: row
-            .try_get::<Option<i32>, _>("meta_duration_ms")
-            .ok()
-            .flatten(),
-        parent_event_id: row
-            .try_get::<Option<String>, _>("parent_event_id")
-            .ok()
-            .flatten(),
-        causal_chain_id: row
-            .try_get::<Option<String>, _>("causal_chain_id")
-            .ok()
-            .flatten(),
-        metadata: parse_json_column(&row, "metadata").unwrap_or_else(|| serde_json::json!({})),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-    }
-}
-
-fn parse_json_column(row: &sqlx::mysql::MySqlRow, column: &str) -> Option<Value> {
-    row.try_get::<Option<String>, _>(column)
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
+fn trace_event_from_row(row: &impl RowExt) -> Result<TraceApiEvent, String> {
+    let dec = RowDecoder::new(row, "trace event row");
+    Ok(TraceApiEvent {
+        event_id: dec.string("event_id")?,
+        event_type: dec.string("event_type")?,
+        trace_kind: dec.optional_string("trace_kind")?,
+        session_id: dec.string("session_id")?,
+        turn_id: dec.optional_string("turn_id")?,
+        turn_seq: dec.optional_i64("turn_seq")?,
+        run_id: dec.optional_string("run_id")?,
+        parent_run_id: dec.optional_string("parent_run_id")?,
+        agent_id: dec.optional_string("agent_id")?,
+        parent_agent_id: dec.optional_string("parent_agent_id")?,
+        round_index: dec.optional_i64("round_index")?,
+        tool_call_id: dec.optional_string("tool_call_id")?,
+        meta_tool_name: dec.optional_string("meta_tool_name")?,
+        content: dec.optional_string("content")?,
+        reasoning_content: dec.optional_string("reasoning_content")?,
+        token_usage: dec.optional_json("token_usage")?,
+        llm_model_used: dec.optional_string("llm_model_used")?,
+        meta_duration_ms: dec.optional_i32("meta_duration_ms")?,
+        parent_event_id: dec.optional_string("parent_event_id")?,
+        causal_chain_id: dec.optional_string("causal_chain_id")?,
+        metadata: dec
+            .optional_json("metadata")?
+            .unwrap_or_else(|| serde_json::json!({})),
+        created_at: dec.string("created_at")?,
+    })
 }
 
 pub(crate) fn build_trace_response(
@@ -514,6 +485,237 @@ fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    struct FakeTraceEventRow {
+        failed_column: Option<&'static str>,
+        token_usage: Option<&'static str>,
+        metadata: Option<&'static str>,
+    }
+
+    impl Default for FakeTraceEventRow {
+        fn default() -> Self {
+            Self {
+                failed_column: None,
+                token_usage: Some(
+                    r#"{"input_tokens":11,"cached_input_tokens":0,"cache_creation_tokens":0,"output_tokens":7,"total_tokens":18}"#,
+                ),
+                metadata: Some(r#"{"status":"ok","child_run_id":"child-run"}"#),
+            }
+        }
+    }
+
+    impl FakeTraceEventRow {
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::default()
+            }
+        }
+
+        fn with_token_usage(token_usage: Option<&'static str>) -> Self {
+            Self {
+                token_usage,
+                ..Self::default()
+            }
+        }
+
+        fn with_metadata(metadata: Option<&'static str>) -> Self {
+            Self {
+                metadata,
+                ..Self::default()
+            }
+        }
+
+        fn fake_sqlx_error(column: &str, message: impl Into<String>) -> sqlx::Error {
+            sqlx::Error::ColumnDecode {
+                index: column.to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    message.into(),
+                )),
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(Self::fake_sqlx_error(column, "injected column failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl RowExt for FakeTraceEventRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            let value = match column {
+                "event_id" => "event-1",
+                "event_type" => "tool_call_completed",
+                "session_id" => "session-1",
+                "created_at" => "2026-06-25 12:00:00.000000",
+                other => {
+                    return Err(Self::fake_sqlx_error(
+                        column,
+                        format!("unexpected string column `{other}`"),
+                    ));
+                }
+            };
+            Ok(value.to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            let value = match column {
+                "trace_kind" => Some("tool_call"),
+                "turn_id" => Some("turn-1"),
+                "run_id" => Some("run-1"),
+                "parent_run_id" => Some("root-run"),
+                "agent_id" => Some("agent-1"),
+                "parent_agent_id" => Some("root-agent"),
+                "tool_call_id" => Some("tool-1"),
+                "meta_tool_name" => Some("bash"),
+                "content" => Some("tool completed"),
+                "reasoning_content" => Some("reasoning"),
+                "token_usage" => self.token_usage,
+                "llm_model_used" => Some("model-1"),
+                "parent_event_id" => Some("event-0"),
+                "causal_chain_id" => Some("chain-1"),
+                "metadata" => self.metadata,
+                other => {
+                    return Err(Self::fake_sqlx_error(
+                        column,
+                        format!("unexpected optional string column `{other}`"),
+                    ));
+                }
+            };
+            Ok(value.map(str::to_string))
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "turn_seq" => Ok(Some(3)),
+                "round_index" => Ok(Some(2)),
+                other => Err(Self::fake_sqlx_error(
+                    column,
+                    format!("unexpected optional i64 column `{other}`"),
+                )),
+            }
+        }
+
+        fn optional_i32_column(&self, column: &str) -> Result<Option<i32>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "meta_duration_ms" => Ok(Some(42)),
+                other => Err(Self::fake_sqlx_error(
+                    column,
+                    format!("unexpected optional i32 column `{other}`"),
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn trace_event_row_decode_preserves_database_values() {
+        let event = trace_event_from_row(&FakeTraceEventRow::default()).unwrap();
+
+        assert_eq!(event.event_id, "event-1");
+        assert_eq!(event.event_type, "tool_call_completed");
+        assert_eq!(event.trace_kind.as_deref(), Some("tool_call"));
+        assert_eq!(event.session_id, "session-1");
+        assert_eq!(event.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(event.turn_seq, Some(3));
+        assert_eq!(event.run_id.as_deref(), Some("run-1"));
+        assert_eq!(event.parent_run_id.as_deref(), Some("root-run"));
+        assert_eq!(event.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(event.parent_agent_id.as_deref(), Some("root-agent"));
+        assert_eq!(event.round_index, Some(2));
+        assert_eq!(event.tool_call_id.as_deref(), Some("tool-1"));
+        assert_eq!(event.meta_tool_name.as_deref(), Some("bash"));
+        assert_eq!(event.content.as_deref(), Some("tool completed"));
+        assert_eq!(event.reasoning_content.as_deref(), Some("reasoning"));
+        assert_eq!(
+            event
+                .token_usage
+                .as_ref()
+                .and_then(|v| v.get("input_tokens")),
+            Some(&serde_json::json!(11))
+        );
+        assert_eq!(event.llm_model_used.as_deref(), Some("model-1"));
+        assert_eq!(event.meta_duration_ms, Some(42));
+        assert_eq!(event.parent_event_id.as_deref(), Some("event-0"));
+        assert_eq!(event.causal_chain_id.as_deref(), Some("chain-1"));
+        assert_eq!(
+            event.metadata.get("child_run_id").and_then(Value::as_str),
+            Some("child-run")
+        );
+        assert_eq!(event.created_at, "2026-06-25 12:00:00.000000");
+    }
+
+    #[test]
+    fn trace_event_row_decode_preserves_nullable_json_columns() {
+        let without_token_usage =
+            trace_event_from_row(&FakeTraceEventRow::with_token_usage(None)).unwrap();
+        assert_eq!(without_token_usage.token_usage, None);
+
+        let without_metadata =
+            trace_event_from_row(&FakeTraceEventRow::with_metadata(None)).unwrap();
+        assert_eq!(without_metadata.metadata, serde_json::json!({}));
+    }
+
+    #[test]
+    fn trace_event_row_decode_fails_loudly_on_any_selected_column_error() {
+        for column in [
+            "event_id",
+            "event_type",
+            "trace_kind",
+            "session_id",
+            "turn_id",
+            "turn_seq",
+            "run_id",
+            "parent_run_id",
+            "agent_id",
+            "parent_agent_id",
+            "round_index",
+            "tool_call_id",
+            "meta_tool_name",
+            "content",
+            "reasoning_content",
+            "token_usage",
+            "llm_model_used",
+            "meta_duration_ms",
+            "parent_event_id",
+            "causal_chain_id",
+            "metadata",
+            "created_at",
+        ] {
+            let error = trace_event_from_row(&FakeTraceEventRow::fail_on(column)).unwrap_err();
+            assert!(
+                error.contains("trace event row decode")
+                    && error.contains(column)
+                    && error.contains("injected column failure"),
+                "decode error should identify selected column `{column}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_event_row_decode_rejects_invalid_json_columns() {
+        let token_usage =
+            trace_event_from_row(&FakeTraceEventRow::with_token_usage(Some("not-json")))
+                .unwrap_err();
+        assert!(
+            token_usage.contains("token_usage") && token_usage.contains("invalid JSON"),
+            "invalid token_usage should fail loudly: {token_usage}"
+        );
+
+        let metadata =
+            trace_event_from_row(&FakeTraceEventRow::with_metadata(Some("not-json"))).unwrap_err();
+        assert!(
+            metadata.contains("metadata") && metadata.contains("invalid JSON"),
+            "invalid metadata should fail loudly: {metadata}"
+        );
+    }
 
     fn event(event_type: &str, run_id: &str) -> TraceApiEvent {
         TraceApiEvent {

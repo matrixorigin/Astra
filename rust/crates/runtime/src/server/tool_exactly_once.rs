@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -343,9 +344,9 @@ async fn persist_result(
     dedup_key: &str,
     key: &astra_pipeline::step_protocol::IdempotencyKey,
     result: &astra_pipeline::step_protocol::CachedToolResult,
-) -> Result<(), sqlx::Error> {
-    let key_json = serde_json::to_string(key).unwrap_or_default();
-    let result_json = serde_json::to_string(result).unwrap_or_default();
+) -> Result<(), String> {
+    let key_json = serialize_exactly_once_json("key_json", key)?;
+    let result_json = serialize_exactly_once_json("result_json", result)?;
 
     // Use INSERT IGNORE to handle race: if the key already exists (e.g. from
     // a replay or concurrent execution), silently skip the insert rather than
@@ -361,7 +362,79 @@ async fn persist_result(
     .bind(&key_json)
     .bind(&result_json)
     .execute(pool.get())
-    .await?;
+    .await
+    .map_err(|source| format!("persist exactly-once result: {source}"))?;
 
     Ok(())
+}
+
+fn serialize_exactly_once_json<T: Serialize>(
+    label: &'static str,
+    value: &T,
+) -> Result<String, String> {
+    serde_json::to_string(value)
+        .map_err(|source| format!("serialize exactly-once {label}: {source}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Serializer;
+    use serde_json::json;
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(serde::ser::Error::custom("forced serializer failure"))
+        }
+    }
+
+    #[test]
+    fn exactly_once_json_serialization_fails_loudly() {
+        let error = serialize_exactly_once_json("key_json", &FailingSerialize)
+            .expect_err("serializer errors must be surfaced");
+
+        assert!(
+            error.contains("serialize exactly-once key_json")
+                && error.contains("forced serializer failure"),
+            "serialization error should identify the affected exactly-once field: {error}"
+        );
+    }
+
+    #[test]
+    fn exactly_once_json_serialization_round_trips_cache_payloads() {
+        let args = json!({"command": "date"});
+        let key = astra_pipeline::step_protocol::IdempotencyKey::semantic("shell", &args);
+        let cached = astra_pipeline::step_protocol::CachedToolResult {
+            tool_name: "shell".to_string(),
+            output: "Fri Jun 26".to_string(),
+            is_error: false,
+            cached_at: 42,
+            context_signature: None,
+        };
+
+        let key_json = serialize_exactly_once_json("key_json", &key).expect("serialize key");
+        let result_json =
+            serialize_exactly_once_json("result_json", &cached).expect("serialize cached result");
+
+        assert!(
+            !key_json.is_empty(),
+            "key_json must not silently become empty"
+        );
+        assert!(
+            !result_json.is_empty(),
+            "result_json must not silently become empty"
+        );
+        serde_json::from_str::<astra_pipeline::step_protocol::IdempotencyKey>(&key_json)
+            .expect("key JSON should deserialize");
+        let restored =
+            serde_json::from_str::<astra_pipeline::step_protocol::CachedToolResult>(&result_json)
+                .expect("cached result JSON should deserialize");
+        assert_eq!(restored.output, "Fri Jun 26");
+        assert!(!restored.is_error);
+    }
 }

@@ -548,7 +548,47 @@ fn build_introspect_observations(
         _ => {}
     }
 
+    if matches!(
+        request.facet,
+        ObservationFacet::Session | ObservationFacet::Overview | ObservationFacet::Trace
+    ) && let Some(summary) = latest_step_latency_summary(snapshot)
+    {
+        observations.push(ObservationRecord {
+            ref_id: "urn:astra:observation:local:introspect:execution:step_latency".to_string(),
+            topic: "execution".to_string(),
+            facet: request.facet.as_str().to_string(),
+            kind: "step_latency".to_string(),
+            severity: "info".to_string(),
+            summary,
+            confidence: ObservationConfidence::evidence(0.80),
+            evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+        });
+    }
+
     observations
+}
+
+fn latest_step_latency_summary(snapshot: &IntrospectSnapshot) -> Option<String> {
+    let latest = snapshot.step_latency.last()?;
+    Some(format!(
+        "latest_step={} dominant={} total_ms={} pre_tool_wait_ms={} tool_execution_ms={} max_tool_execution_ms={} calls={} skipped={} first_tool={} terminal={}",
+        latest.step_id,
+        latest.dominant_phase,
+        fmt_opt_u64(latest.total_ms),
+        fmt_opt_u64(latest.pre_tool_wait_ms),
+        latest.tool_execution_ms,
+        latest.max_tool_execution_ms,
+        latest.tool_call_count,
+        latest.skipped_tool_count,
+        latest.first_tool_name.as_deref().unwrap_or("-"),
+        latest.terminal_event_kind.as_deref().unwrap_or("-"),
+    ))
+}
+
+fn fmt_opt_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn build_introspect_action_hints(
@@ -910,7 +950,8 @@ fn build_introspect_graph_slice(
 mod tests {
     use super::*;
     use crate::introspect::{
-        IntrospectSnapshot, StallSnapshotSummary, ToolErrorEntry, ToolHealthEntry,
+        IntrospectSnapshot, StallSnapshotSummary, StepLatencySnapshotEntry, ToolErrorEntry,
+        ToolHealthEntry,
     };
     use astra_core::{ObservationFacet, ObservationTopic};
 
@@ -939,6 +980,51 @@ mod tests {
             consecutive_failures: 2,
             last_failure_category: Some("timeout".to_string()),
         }
+    }
+
+    #[test]
+    fn json_report_includes_step_latency_observation() {
+        let snapshot = IntrospectSnapshot {
+            step_latency: vec![StepLatencySnapshotEntry {
+                step_id: "turn-1-step-3".into(),
+                total_ms: Some(8_978),
+                pre_tool_wait_ms: Some(8_000),
+                first_tool_name: Some("bash".into()),
+                tool_call_count: 1,
+                skipped_tool_count: 0,
+                tool_execution_ms: 8,
+                max_tool_execution_ms: 8,
+                terminal_event_kind: Some("StepIncomplete".into()),
+                dominant_phase: "model_wait".into(),
+            }],
+            ..Default::default()
+        };
+        let request = IntrospectRequest {
+            topic: ObservationTopic::Execution,
+            facet: ObservationFacet::Trace,
+            ..Default::default()
+        };
+
+        let report = build_introspect_report(&snapshot, &request);
+        let observation = report
+            .observations
+            .iter()
+            .find(|observation| observation.kind == "step_latency")
+            .expect("json introspect report should expose step latency");
+
+        assert_eq!(observation.topic, "execution");
+        assert_eq!(observation.facet, "trace");
+        assert!(observation.summary.contains("dominant=model_wait"));
+        assert!(observation.summary.contains("pre_tool_wait_ms=8000"));
+        assert!(observation.summary.contains("first_tool=bash"));
+        assert!(
+            report
+                .graph_slice
+                .nodes
+                .iter()
+                .any(|node| node.label == "step_latency"),
+            "step latency observation should also be reachable from graph_slice"
+        );
     }
 
     // ── graph_slice tests ──

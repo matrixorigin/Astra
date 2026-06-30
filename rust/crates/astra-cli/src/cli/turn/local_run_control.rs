@@ -58,7 +58,11 @@ impl LocalDeferredInputRunControl {
 
 #[async_trait::async_trait]
 impl RunStatusProvider for LocalDeferredInputRunControl {
-    async fn control_status(&self, _run_id: &str) -> Result<Option<RunControlStatus>, String> {
+    async fn control_status(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+    ) -> Result<Option<RunControlStatus>, String> {
         Ok(None)
     }
 }
@@ -67,6 +71,7 @@ impl RunStatusProvider for LocalDeferredInputRunControl {
 impl RunInputProvider for LocalDeferredInputRunControl {
     async fn poll_user_inputs(
         &self,
+        _user_id: &str,
         _run_id: &str,
         after_event_index: usize,
     ) -> RunQueuedInputPoll {
@@ -86,6 +91,7 @@ impl RunInputProvider for LocalDeferredInputRunControl {
 
     async fn mark_user_inputs_released(
         &self,
+        _user_id: &str,
         _run_id: &str,
         event_indices: &[usize],
     ) -> Result<(), String> {
@@ -114,13 +120,17 @@ mod tests {
         provider.enqueue_text("first").expect("enqueue first");
         provider.enqueue_text("second").expect("enqueue second");
 
-        let first = provider.poll_user_inputs("run-local", 0).await;
+        let first = provider
+            .poll_user_inputs("local-user", "run-local", 0)
+            .await;
         assert_eq!(first.next_cursor, 2);
         assert_eq!(first.inputs.len(), 2);
         assert_eq!(first.inputs[0].input["content"], "first");
         assert_eq!(first.inputs[1].input["content"], "second");
 
-        let second = provider.poll_user_inputs("run-local", 1).await;
+        let second = provider
+            .poll_user_inputs("local-user", "run-local", 1)
+            .await;
         assert_eq!(second.next_cursor, 2);
         assert_eq!(second.inputs.len(), 1);
         assert_eq!(second.inputs[0].input["content"], "second");
@@ -152,11 +162,13 @@ mod tests {
         provider.enqueue_text("second").expect("enqueue second");
 
         provider
-            .mark_user_inputs_released("run-local", &[1])
+            .mark_user_inputs_released("local-user", "run-local", &[1])
             .await
             .expect("release should succeed");
 
-        let remaining = provider.poll_user_inputs("run-local", 0).await;
+        let remaining = provider
+            .poll_user_inputs("local-user", "run-local", 0)
+            .await;
         assert_eq!(remaining.next_cursor, 2);
         assert_eq!(remaining.inputs.len(), 1);
         assert_eq!(remaining.inputs[0].event_index, 2);

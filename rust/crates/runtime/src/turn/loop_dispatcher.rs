@@ -127,7 +127,7 @@ impl LoopResult {
     pub fn from_state(state: &AgenticLoopState) -> Self {
         Self {
             final_text: state.final_text.clone(),
-            total_prompt_tokens: state.total_prompt,
+            total_prompt_tokens: state.provider_input_tokens(),
             total_completion_tokens: state.total_completion,
             total_tool_calls: state.total_tool_calls,
             session_id: state.current_session_id.clone(),
@@ -453,6 +453,8 @@ mod tests {
         let mut state = test_state("test");
         state.final_text = "output".to_string();
         state.total_prompt = 200;
+        state.total_cache_read = 40;
+        state.total_cache_creation = 10;
         state.total_completion = 100;
         state.total_tool_calls = 3;
         state.current_session_id = Some("s1".into());
@@ -460,7 +462,7 @@ mod tests {
         state.telemetry.all_tools_used.insert("bash".into());
         let result = LoopResult::from_state(&state);
         assert_eq!(result.final_text, "output");
-        assert_eq!(result.total_prompt_tokens, 200);
+        assert_eq!(result.total_prompt_tokens, 250);
         assert_eq!(result.total_completion_tokens, 100);
         assert_eq!(result.total_tool_calls, 3);
         assert_eq!(result.session_id.as_deref(), Some("s1"));

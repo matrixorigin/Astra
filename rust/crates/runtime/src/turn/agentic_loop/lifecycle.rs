@@ -1054,6 +1054,19 @@ pub(crate) fn estimate_context_pressure(
     (tokens as f64 / max_turn_input_tokens as f64, tokens)
 }
 
+// AgenticLoopState currently carries the effective input budget, not the full
+// model context window. This approximation is used only for skill-listing size
+// hints; callers with registry metadata should pass the full context window.
+fn approximate_context_window_from_effective_input_budget(
+    max_turn_input_tokens: u64,
+) -> Option<u32> {
+    if max_turn_input_tokens == 0 {
+        return None;
+    }
+    let approx_context_window = max_turn_input_tokens.saturating_mul(10).div_ceil(8);
+    Some(approx_context_window.min(u64::from(u32::MAX)) as u32)
+}
+
 /// Run the compaction pipeline and record results (event + audit).
 ///
 /// Shared by pre-turn proactive compression and resume-time compression to
@@ -1170,8 +1183,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             // Periodic DB poll for cross-pod cancel/pause
             if last_db_poll.elapsed() >= db_poll_interval {
                 if let Some(ref rc) = state.run_control {
-                    if let Some(run_id) = state.current_run_id.as_deref() {
-                        match rc.control_status(run_id).await {
+                    if let (Some(user_id), Some(run_id)) = (
+                        state.context_manifest_user_id.as_deref(),
+                        state.current_run_id.as_deref(),
+                    ) {
+                        match rc.control_status(user_id, run_id).await {
                             Ok(Some(RunControlStatus::Cancelled)) => {
                                 if let Some(ref flag) = state.cancellation.flag {
                                     flag.store(true, Ordering::SeqCst);
@@ -1232,8 +1248,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // Cross-pod DB check for cancel (only if in-memory didn't already catch it)
         let db_cancelled = if !in_memory_cancelled {
             if let Some(ref rc) = state.run_control {
-                if let Some(run_id) = state.current_run_id.as_deref() {
-                    match rc.control_status(run_id).await {
+                if let (Some(user_id), Some(run_id)) = (
+                    state.context_manifest_user_id.as_deref(),
+                    state.current_run_id.as_deref(),
+                ) {
+                    match rc.control_status(user_id, run_id).await {
                         Ok(status) => matches!(status, Some(RunControlStatus::Cancelled)),
                         Err(error) => {
                             tracing::warn!(
@@ -1276,9 +1295,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
         // Cross-pod DB check for pause (between turns)
         if state.run_control.is_some() {
-            if let Some(run_id) = state.current_run_id.as_deref() {
+            if let (Some(user_id), Some(run_id)) = (
+                state.context_manifest_user_id.as_deref(),
+                state.current_run_id.as_deref(),
+            ) {
                 if let Some(ref rc) = state.run_control {
-                    match rc.control_status(run_id).await {
+                    match rc.control_status(user_id, run_id).await {
                         Ok(Some(RunControlStatus::Paused)) => {
                             if let Some(ref flag) = state.cancellation.pause_flag {
                                 flag.store(true, Ordering::SeqCst);
@@ -1614,24 +1636,24 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     if let Some(resolver) = &state.skills.resolver {
         // Phase-9: skill listing moves from per-turn volatile to
         // session-stable. The full skill catalog is rendered via
-        // `build_skill_listing_section_for_model` (CacheScope::Session)
-        // — the model id sizes the budget so smaller-context providers
-        // don't waste prompt space on full listings.
+        // CacheScope::Session — the resolved turn input budget sizes the
+        // listing so small-context providers do not waste prompt space and
+        // large-context providers are not silently capped by model-name
+        // fallbacks.
         //
         // We still populate `listing_message` as a rendered `role: system`
         // value for downstream adapters (introspect tooling, tests) so
         // they don't need to know about the cache-scope plumbing.
         let full = resolver.available_skills();
-        let model_hint = state.current_model_hint().map(str::to_string);
         state.skills.listing_message = if full.is_empty() {
             None
         } else {
             let agent_spawn_available = host
                 .capabilities()
                 .has(astra_turn_core::capability::Capability::AgentSpawner);
-            crate::prompts::build_skill_listing_section_with_caps(
+            crate::prompts::build_skill_listing_section_with_context_window_and_caps(
                 &full,
-                model_hint.as_deref(),
+                approximate_context_window_from_effective_input_budget(state.max_turn_input_tokens),
                 agent_spawn_available,
             )
             .map(|section| {
@@ -2943,7 +2965,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RunStatusProvider for FailingStatusRunControl {
-        async fn control_status(&self, _run_id: &str) -> Result<Option<RunControlStatus>, String> {
+        async fn control_status(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+        ) -> Result<Option<RunControlStatus>, String> {
             Err("transient db timeout".to_string())
         }
     }
@@ -2952,6 +2978,7 @@ mod tests {
     impl RunInputProvider for FailingStatusRunControl {
         async fn poll_user_inputs(
             &self,
+            _user_id: &str,
             _run_id: &str,
             after_event_index: usize,
         ) -> RunQueuedInputPoll {
@@ -2964,6 +2991,7 @@ mod tests {
 
         async fn mark_user_inputs_released(
             &self,
+            _user_id: &str,
             _run_id: &str,
             _event_indices: &[usize],
         ) -> Result<(), String> {

@@ -15,10 +15,12 @@
 
 use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use astra_core::canonical_names::{append_unique_names, normalize_name_list};
 
 use crate::{
     SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore,
@@ -26,10 +28,233 @@ use crate::{
 };
 
 const STEP_CHECKPOINT_NUMBER_OFFSET: u32 = 1_000_000_000;
+const MAX_CLOUD_RESTORE_CHECKPOINTS: u32 = 200;
 pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_index";
+const CLOUD_CHECKPOINTS_SELECT_SQL: &str = "\
+    SELECT number, turn, title, summary, total_tokens, contract_state_json \
+    FROM ( \
+        SELECT number, turn, title, summary, total_tokens, contract_state_json \
+        FROM session_checkpoints \
+        WHERE user_id = ? AND session_id = ? AND state_json IS NULL \
+        ORDER BY number DESC \
+        LIMIT ? \
+    ) AS recent_checkpoints \
+    ORDER BY number";
+const CLOUD_CHECKPOINT_COUNT_SQL: &str = "\
+    SELECT COUNT(*) AS checkpoint_count \
+    FROM session_checkpoints \
+    WHERE user_id = ? AND session_id = ? AND state_json IS NULL";
+const PUSH_SESSION_STATE_UPSERT_SQL: &str = "INSERT INTO agent_sessions \
+             (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
+             SELECT ?, ?, 'active', ?, NOW(6), NOW(6), NOW(6) \
+             FROM DUAL \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM agent_sessions \
+                 WHERE session_id = ? AND user_id <> ? \
+                 LIMIT 1 \
+             ) \
+             ON DUPLICATE KEY UPDATE \
+             metadata = IF(user_id = VALUES(user_id), VALUES(metadata), metadata), \
+             updated_at = IF(user_id = VALUES(user_id), NOW(6), updated_at), \
+             last_active_at = IF(user_id = VALUES(user_id), NOW(6), last_active_at)";
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
+}
+
+trait SessionRestoreRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error>;
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error>;
+    fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error>;
+}
+
+impl SessionRestoreRow for sqlx::mysql::MySqlRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+        use sqlx::Row;
+        self.try_get::<String, _>(column)
+    }
+
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+        use sqlx::Row;
+        self.try_get::<Option<String>, _>(column)
+    }
+
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+        use sqlx::Row;
+        self.try_get::<i64, _>(column)
+    }
+
+    fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error> {
+        use sqlx::Row;
+        self.try_get::<i32, _>(column)
+    }
+}
+
+fn mysql_string(
+    row: &impl SessionRestoreRow,
+    context: &str,
+    column: &str,
+) -> Result<String, String> {
+    row.string_column(column)
+        .map_err(|e| format!("{context}: decode column `{column}`: {e}"))
+}
+
+fn mysql_optional_string(
+    row: &impl SessionRestoreRow,
+    context: &str,
+    column: &str,
+) -> Result<Option<String>, String> {
+    row.optional_string_column(column)
+        .map_err(|e| format!("{context}: decode column `{column}`: {e}"))
+}
+
+fn mysql_i64(row: &impl SessionRestoreRow, context: &str, column: &str) -> Result<i64, String> {
+    row.i64_column(column)
+        .map_err(|e| format!("{context}: decode column `{column}`: {e}"))
+}
+
+fn mysql_i32(row: &impl SessionRestoreRow, context: &str, column: &str) -> Result<i32, String> {
+    row.i32_column(column)
+        .map_err(|e| format!("{context}: decode column `{column}`: {e}"))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CloudRestoreTimings {
+    session_query_ms: u64,
+    heavy_checkpoint_ms: u64,
+    transcript_ms: u64,
+    context_trace_ms: u64,
+    recent_tools_ms: u64,
+    contract_ms: u64,
+    checkpoint_fallback_ms: u64,
+    total_ms: u64,
+}
+
+impl CloudRestoreTimings {
+    fn emit(self, session_id: &str, restored: bool) {
+        tracing::info!(
+            target: "astra_services::session_restore",
+            %session_id,
+            restored,
+            session_query_ms = self.session_query_ms,
+            heavy_checkpoint_ms = self.heavy_checkpoint_ms,
+            transcript_ms = self.transcript_ms,
+            context_trace_ms = self.context_trace_ms,
+            recent_tools_ms = self.recent_tools_ms,
+            contract_ms = self.contract_ms,
+            checkpoint_fallback_ms = self.checkpoint_fallback_ms,
+            total_ms = self.total_ms,
+            "cloud session restore timings"
+        );
+    }
+}
+
+fn elapsed_ms(started_at: std::time::Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn metadata_json_state(metadata_str: Option<&str>) -> Result<SessionMetadataState, String> {
+    match metadata_str.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(metadata) => extract_session_state_from_metadata(metadata),
+        None => Ok(SessionMetadataState::default()),
+    }
+}
+
+fn non_negative_i64_to_u64(value: i64, context: &str, column: &str) -> Result<u64, String> {
+    u64::try_from(value)
+        .map_err(|_| format!("{context}: column `{column}` expected u64 range, got {value}"))
+}
+
+fn non_negative_i64_to_u32(value: i64, context: &str, column: &str) -> Result<u32, String> {
+    u32::try_from(value)
+        .map_err(|_| format!("{context}: column `{column}` expected u32 range, got {value}"))
+}
+
+fn non_negative_i32_to_u32(value: i32, context: &str, column: &str) -> Result<u32, String> {
+    u32::try_from(value)
+        .map_err(|_| format!("{context}: column `{column}` expected u32 range, got {value}"))
+}
+
+fn token_usage_i64_or_zero(value: &Value, field: &str, context: &str) -> Result<i64, String> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(0),
+        Some(raw) => {
+            let count = raw.as_i64().ok_or_else(|| {
+                format!("{context}: token_usage field `{field}` must be an integer, got {raw}")
+            })?;
+            if count < 0 {
+                return Err(format!(
+                    "{context}: token_usage field `{field}` must be non-negative, got {count}"
+                ));
+            }
+            Ok(count)
+        }
+    }
+}
+
+fn cache_token_counts_from_token_usage_json(
+    raw: &str,
+    context: &str,
+) -> Result<(i64, i64), String> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("{context}: token_usage JSON decode failed: {error}"))?;
+    if !value.is_object() {
+        return Err(format!(
+            "{context}: token_usage must be an object, got {value}"
+        ));
+    }
+    Ok((
+        token_usage_i64_or_zero(&value, "cached_input_tokens", context)?,
+        token_usage_i64_or_zero(&value, "cache_creation_tokens", context)?,
+    ))
+}
+
+fn apply_restore_cache_token_usage(
+    raw: &str,
+    event_id: &str,
+    cache_read_total: &mut i64,
+    cache_creation_total: &mut i64,
+) -> bool {
+    let (cache_read, cache_creation) = match cache_token_counts_from_token_usage_json(
+        raw,
+        "restore_cloud_session.cache_tokens",
+    ) {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_services::session_restore",
+                event_id = event_id,
+                error = %error,
+                "invalid token_usage while restoring cache totals; skipping event token counters"
+            );
+            return false;
+        }
+    };
+    let Some(next_cache_read_total) = cache_read_total.checked_add(cache_read) else {
+        tracing::warn!(
+            target: "astra_services::session_restore",
+            event_id = event_id,
+            current_total = *cache_read_total,
+            delta = cache_read,
+            "cache read token total overflow while restoring session; skipping event token counters"
+        );
+        return false;
+    };
+    let Some(next_cache_creation_total) = cache_creation_total.checked_add(cache_creation) else {
+        tracing::warn!(
+            target: "astra_services::session_restore",
+            event_id = event_id,
+            current_total = *cache_creation_total,
+            delta = cache_creation,
+            "cache creation token total overflow while restoring session; skipping event token counters"
+        );
+        return false;
+    };
+
+    *cache_read_total = next_cache_read_total;
+    *cache_creation_total = next_cache_creation_total;
+    true
 }
 
 // ─── Restored Session State ─────────────────────────────────────────────────
@@ -221,6 +446,46 @@ pub trait SessionRestoreService: Send + Sync {
     }
 }
 
+async fn restore_cloud_cache_token_totals(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(i64, i64), String> {
+    let rows = sqlx::query(
+        "SELECT event_id, IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
+         FROM agent_events \
+         WHERE session_id = ? AND user_id = ? \
+           AND event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("restore_cloud_session.cache_tokens: {e}"))?;
+
+    let mut cache_read_total = 0i64;
+    let mut cache_creation_total = 0i64;
+    for row in rows {
+        let event_id = mysql_string(&row, "restore_cloud_session.cache_tokens", "event_id")
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    target: "astra_services::session_restore",
+                    error = %error,
+                    "could not decode event_id while restoring cache totals"
+                );
+                "<unknown>".to_string()
+            });
+        let raw = mysql_string(&row, "restore_cloud_session.cache_tokens", "token_usage")?;
+        apply_restore_cache_token_usage(
+            &raw,
+            &event_id,
+            &mut cache_read_total,
+            &mut cache_creation_total,
+        );
+    }
+    Ok((cache_read_total, cache_creation_total))
+}
+
 // ─── Local-First Implementation ─────────────────────────────────────────────
 
 /// Restores from local files first, falls back to MatrixOne.
@@ -336,9 +601,7 @@ impl HybridRestoreService {
 
         if let Some(ws) = local_workspace {
             let mut recent_tools = if let Some(user_id) = user_id {
-                self.restore_recent_tools(user_id, session_id)
-                    .await
-                    .unwrap_or_default()
+                self.restore_recent_tools(user_id, session_id).await?
             } else {
                 Vec::new()
             };
@@ -348,12 +611,10 @@ impl HybridRestoreService {
             if recent_tools.is_empty()
                 && let Some(summary) = local_journal.as_ref()
             {
-                recent_tools = summary.recent_tools.clone();
+                recent_tools = normalize_name_list(summary.recent_tools.iter().map(String::as_str));
             }
 
-            let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
-                .map(|v| v.len() as u32)
-                .unwrap_or(0);
+            let ckpt_count = local_checkpoint_count(session_id, "restore_session_inner")?;
 
             return Ok(Some(restored_session_from_workspace(
                 ws,
@@ -367,10 +628,7 @@ impl HybridRestoreService {
         if let Some(user_id) = user_id
             && let Some(ws) = self.restore_cloud_workspace(user_id, session_id).await?
         {
-            let mut recent_tools = self
-                .restore_recent_tools(user_id, session_id)
-                .await
-                .unwrap_or_default();
+            let mut recent_tools = self.restore_recent_tools(user_id, session_id).await?;
             if recent_tools.is_empty() {
                 recent_tools =
                     recent_tools_from_context_trace(ws.metadata.last_context_trace.as_ref());
@@ -378,17 +636,14 @@ impl HybridRestoreService {
             if recent_tools.is_empty()
                 && let Some(summary) = local_journal.as_ref()
             {
-                recent_tools = summary.recent_tools.clone();
+                recent_tools = normalize_name_list(summary.recent_tools.iter().map(String::as_str));
             }
 
-            let local_ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
-                .map(|v| v.len() as u32)
-                .unwrap_or(0);
+            let local_ckpt_count = local_checkpoint_count(session_id, "restore_session_inner")?;
             let cloud_ckpt_count = self
-                .cloud_checkpoints(user_id, session_id)
+                .cloud_checkpoint_count(user_id, session_id)
                 .await
-                .map(|v| v.len() as u32)
-                .unwrap_or(local_ckpt_count);
+                .map_err(|e| format!("restore_session_inner cloud checkpoint count: {e}"))?;
 
             return Ok(Some(restored_session_from_workspace(
                 ws.metadata,
@@ -400,9 +655,7 @@ impl HybridRestoreService {
         }
 
         if let Some(summary) = local_journal {
-            let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
-                .map(|v| v.len() as u32)
-                .unwrap_or(0);
+            let ckpt_count = local_checkpoint_count(session_id, "restore_session_inner")?;
 
             return Ok(Some(RestoredSession {
                 session_id: session_id.to_string(),
@@ -411,7 +664,7 @@ impl HybridRestoreService {
                 total_tokens_out: summary.total_tokens_out,
                 total_cache_read_tokens: summary.total_cache_read_tokens,
                 total_cache_creation_tokens: summary.total_cache_creation_tokens,
-                recent_tools: summary.recent_tools,
+                recent_tools: normalize_name_list(summary.recent_tools),
                 checkpoint_count: ckpt_count,
                 last_status: summary.last_status,
                 model: summary.model,
@@ -448,25 +701,21 @@ impl HybridRestoreService {
             return Ok(Vec::new());
         }
 
-        let local_entries = super::session_checkpoint::read_checkpoint_index(session_id)
-            .unwrap_or_else(|e| {
-                astra_core::agent_warn!(
-                    "restore",
-                    "failed to read checkpoint index for {session_id}: {e}"
-                );
-                Vec::new()
-            });
+        let local_entries =
+            super::session_checkpoint::read_checkpoint_index(session_id).map_err(|error| {
+                format!(
+                    "list_checkpoints_inner: failed to read local checkpoint index for {session_id}: {error}"
+                )
+            })?;
         let local = parse_local_checkpoint_entries(&local_entries);
         let cloud = if let Some(user_id) = user_id {
             self.cloud_checkpoints(user_id, session_id)
                 .await
-                .unwrap_or_else(|e| {
-                    astra_core::agent_warn!(
-                        "restore",
-                        "failed to read cloud checkpoints for {session_id}: {e}"
-                    );
-                    Vec::new()
-                })
+                .map_err(|error| {
+                    format!(
+                        "list_checkpoints_inner: failed to read cloud checkpoints for {session_id}: {error}"
+                    )
+                })?
         } else {
             Vec::new()
         };
@@ -551,21 +800,23 @@ impl HybridRestoreService {
         user_id: &str,
         session_id: &str,
     ) -> Result<Option<RestoredSession>, String> {
+        let started_at = std::time::Instant::now();
         let pool = match &self.pool {
             Some(p) => p,
             None => return Ok(None),
         };
 
+        let session_query_started_at = std::time::Instant::now();
         let row = sqlx::query(
             "SELECT session_id, user_id, title, status, event_count, CAST(metadata AS CHAR) AS metadata_json, \
              (SELECT COALESCE(MAX(ae.turn_seq), 0) FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id) AS turn_count, \
-             (SELECT COALESCE(SUM(CASE WHEN event_type = 'user_query' AND token_usage IS NOT NULL \
+             (SELECT COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
                  THEN COALESCE(token_input, 0) ELSE 0 END), 0) \
                FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id) AS total_tokens_in, \
-             (SELECT COALESCE(SUM(CASE WHEN event_type = 'user_query' AND token_usage IS NOT NULL \
+             (SELECT COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) \
                FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id) AS total_tokens_out, \
-             (SELECT COUNT(*) FROM session_checkpoints sc WHERE sc.session_id = agent_sessions.session_id AND sc.user_id = agent_sessions.user_id AND state_json IS NULL) AS checkpoint_count, \
+             (SELECT COUNT(*) FROM session_checkpoints sc WHERE sc.user_id = agent_sessions.user_id AND sc.session_id = agent_sessions.session_id AND state_json IS NULL) AS checkpoint_count, \
              (SELECT e.llm_model_used FROM agent_events e WHERE e.session_id = agent_sessions.session_id \
                AND e.user_id = agent_sessions.user_id \
                AND e.llm_model_used IS NOT NULL AND e.llm_model_used != '' ORDER BY e.created_at DESC LIMIT 1) AS latest_model, \
@@ -577,51 +828,54 @@ impl HybridRestoreService {
         .fetch_optional(pool)
         .await
         .map_err(|e| format!("restore_cloud_session: {e}"))?;
+        let session_query_ms = elapsed_ms(session_query_started_at);
 
         match row {
             Some(row) => {
-                use sqlx::Row;
-                let status: String = row.try_get("status").unwrap_or_default();
-                let title: Option<String> = row.try_get("title").ok().flatten();
-                let turn_count: i64 = row.try_get("turn_count").unwrap_or(0);
-                let total_tokens_in: i64 = row.try_get("total_tokens_in").unwrap_or(0);
-                let total_tokens_out: i64 = row.try_get("total_tokens_out").unwrap_or(0);
-                let checkpoint_count: i64 = row.try_get("checkpoint_count").unwrap_or(0);
+                let status = mysql_string(&row, "restore_cloud_session", "status")?;
+                let title = mysql_optional_string(&row, "restore_cloud_session", "title")?;
+                let turn_count = mysql_i64(&row, "restore_cloud_session", "turn_count")?;
+                let total_tokens_in = mysql_i64(&row, "restore_cloud_session", "total_tokens_in")?;
+                let total_tokens_out =
+                    mysql_i64(&row, "restore_cloud_session", "total_tokens_out")?;
+                let checkpoint_count =
+                    mysql_i64(&row, "restore_cloud_session", "checkpoint_count")?;
+                let (total_cache_read_tokens, total_cache_creation_tokens) =
+                    restore_cloud_cache_token_totals(pool, user_id, session_id).await?;
 
                 // Extract plan state from metadata JSON
-                let metadata_str: Option<String> = row.try_get("metadata_json").ok().flatten();
-                let metadata_state = metadata_str
-                    .as_deref()
-                    .filter(|m| !m.is_empty())
-                    .map(extract_session_state_from_metadata)
-                    .unwrap_or_default();
+                let metadata_str =
+                    mysql_optional_string(&row, "restore_cloud_session", "metadata_json")?;
+                let metadata_state = metadata_json_state(metadata_str.as_deref())?;
 
+                let heavy_started_at = std::time::Instant::now();
                 let heavy_state = self
                     .restore_latest_heavy_checkpoint_state(user_id, session_id)
-                    .await
-                    .ok()
-                    .flatten();
+                    .await?;
+                let heavy_checkpoint_ms = elapsed_ms(heavy_started_at);
+
+                let transcript_started_at = std::time::Instant::now();
                 let transcript_messages = match heavy_state.as_ref() {
                     Some(heavy) if !heavy.messages.is_empty() => Vec::new(),
-                    _ => self
-                        .restore_cloud_transcript_messages(user_id, session_id)
-                        .await
-                        .unwrap_or_default(),
+                    _ => {
+                        self.restore_cloud_transcript_messages(user_id, session_id)
+                            .await?
+                    }
                 };
+                let transcript_ms = elapsed_ms(transcript_started_at);
 
+                let context_trace_started_at = std::time::Instant::now();
                 let last_context_trace = self
                     .restore_latest_context_trace_signal(user_id, session_id)
-                    .await
-                    .ok()
-                    .flatten();
-                let mut recent_tools = self
-                    .restore_recent_tools(user_id, session_id)
-                    .await
-                    .unwrap_or_default();
+                    .await?;
+                let context_trace_ms = elapsed_ms(context_trace_started_at);
+
+                let recent_tools_started_at = std::time::Instant::now();
+                let mut recent_tools = self.restore_recent_tools(user_id, session_id).await?;
                 if recent_tools.is_empty()
                     && let Some(heavy) = heavy_state.as_ref()
                 {
-                    append_unique_tools(
+                    append_unique_names(
                         &mut recent_tools,
                         heavy.recent_tools.iter().map(String::as_str),
                     );
@@ -629,37 +883,78 @@ impl HybridRestoreService {
                 if recent_tools.is_empty() {
                     recent_tools = recent_tools_from_context_trace(last_context_trace.as_ref());
                 }
+                let recent_tools_ms = elapsed_ms(recent_tools_started_at);
+
                 let latest_model = astra_core::model_override::normalize_model_override_owned(
-                    row.try_get("latest_model").ok().flatten(),
+                    mysql_optional_string(&row, "restore_cloud_session", "latest_model")?,
                 );
                 let model = metadata_state.model.clone().or(latest_model);
 
                 // Load active contract from task_contracts table
-                let mut contract_json = Self::load_cloud_contract(pool, user_id, session_id)
-                    .await
-                    .ok()
-                    .flatten();
+                let contract_started_at = std::time::Instant::now();
+                let mut contract_json =
+                    Self::load_cloud_contract(pool, user_id, session_id).await?;
+                let contract_ms = elapsed_ms(contract_started_at);
 
                 // Fallback: try latest checkpoint's contract state
-                if contract_json.is_none()
-                    && let Ok(ckpts) = self.cloud_checkpoints(user_id, session_id).await
-                {
+                let checkpoint_fallback_started_at = std::time::Instant::now();
+                if contract_json.is_none() {
+                    let ckpts = self.cloud_checkpoints(user_id, session_id).await?;
                     contract_json = ckpts
                         .iter()
                         .rev()
                         .find_map(|c| c.contract_state_json.clone());
                 }
+                let checkpoint_fallback_ms = elapsed_ms(checkpoint_fallback_started_at);
+
+                CloudRestoreTimings {
+                    session_query_ms,
+                    heavy_checkpoint_ms,
+                    transcript_ms,
+                    context_trace_ms,
+                    recent_tools_ms,
+                    contract_ms,
+                    checkpoint_fallback_ms,
+                    total_ms: elapsed_ms(started_at),
+                }
+                .emit(session_id, true);
 
                 Ok(Some(RestoredSession {
                     session_id: session_id.to_string(),
-                    turn_count: turn_count as u32,
-                    total_tokens_in: total_tokens_in.max(0) as u64,
-                    total_tokens_out: total_tokens_out.max(0) as u64,
+                    turn_count: non_negative_i64_to_u32(
+                        turn_count,
+                        "restore_cloud_session",
+                        "turn_count",
+                    )?,
+                    total_tokens_in: non_negative_i64_to_u64(
+                        total_tokens_in,
+                        "restore_cloud_session",
+                        "total_tokens_in",
+                    )?,
+                    total_tokens_out: non_negative_i64_to_u64(
+                        total_tokens_out,
+                        "restore_cloud_session",
+                        "total_tokens_out",
+                    )?,
+                    total_cache_read_tokens: non_negative_i64_to_u64(
+                        total_cache_read_tokens,
+                        "restore_cloud_session",
+                        "total_cache_read_tokens",
+                    )?,
+                    total_cache_creation_tokens: non_negative_i64_to_u64(
+                        total_cache_creation_tokens,
+                        "restore_cloud_session",
+                        "total_cache_creation_tokens",
+                    )?,
                     last_status: status,
                     title,
                     restored_from_cloud: true,
                     recent_tools,
-                    checkpoint_count: checkpoint_count.max(0) as u32,
+                    checkpoint_count: non_negative_i64_to_u32(
+                        checkpoint_count,
+                        "restore_cloud_session",
+                        "checkpoint_count",
+                    )?,
                     git_branch: metadata_state.git_branch.clone(),
                     model,
                     permission_mode: metadata_state.permission_mode.clone(),
@@ -693,7 +988,15 @@ impl HybridRestoreService {
                     ..Default::default()
                 }))
             }
-            None => Ok(None),
+            None => {
+                CloudRestoreTimings {
+                    session_query_ms,
+                    total_ms: elapsed_ms(started_at),
+                    ..Default::default()
+                }
+                .emit(session_id, false);
+                Ok(None)
+            }
         }
     }
 
@@ -724,26 +1027,25 @@ impl HybridRestoreService {
 
         match row {
             Some(row) => {
-                use sqlx::Row;
                 // Reconstruct contract as JSON matching TaskContract serde format
-                let contract_id: String = row.try_get("contract_id").map_err(|e| e.to_string())?;
-                let task_id: String = row.try_get("task_id").map_err(|e| e.to_string())?;
-                let goal: String = row.try_get("goal").map_err(|e| e.to_string())?;
-                let version: i32 = row.try_get("version").unwrap_or(1);
-                let status: String = row.try_get("status").unwrap_or_default();
-                let created_at: String = row.try_get("created_at").unwrap_or_default();
-                let updated_at: String = row.try_get("updated_at").unwrap_or_default();
-                let scope_json: Option<String> = row.try_get("scope_json").ok().flatten();
-                let subtasks_json: String =
-                    row.try_get("subtasks_json").map_err(|e| e.to_string())?;
-                let criteria_json: String =
-                    row.try_get("criteria_json").map_err(|e| e.to_string())?;
+                let contract_id = mysql_string(&row, "load_cloud_contract", "contract_id")?;
+                let task_id = mysql_string(&row, "load_cloud_contract", "task_id")?;
+                let goal = mysql_string(&row, "load_cloud_contract", "goal")?;
+                let version = mysql_i32(&row, "load_cloud_contract", "version")?;
+                let status = mysql_string(&row, "load_cloud_contract", "status")?;
+                let created_at = mysql_string(&row, "load_cloud_contract", "created_at")?;
+                let updated_at = mysql_string(&row, "load_cloud_contract", "updated_at")?;
+                let scope_json = mysql_optional_string(&row, "load_cloud_contract", "scope_json")?;
+                let subtasks_json = mysql_string(&row, "load_cloud_contract", "subtasks_json")?;
+                let criteria_json = mysql_string(&row, "load_cloud_contract", "criteria_json")?;
 
                 // Parse sub-objects so serde round-trips correctly
-                let scope: serde_json::Value = scope_json
-                    .as_deref()
-                    .and_then(|j| serde_json::from_str(j).ok())
-                    .unwrap_or(serde_json::json!({}));
+                let scope: serde_json::Value = match scope_json.as_deref() {
+                    Some(json) if !json.trim().is_empty() => {
+                        serde_json::from_str(json).map_err(|e| format!("parse scope: {e}"))?
+                    }
+                    _ => serde_json::json!({}),
+                };
                 let subtasks: serde_json::Value = serde_json::from_str(&subtasks_json)
                     .map_err(|e| format!("parse subtasks: {e}"))?;
                 let criteria: serde_json::Value = serde_json::from_str(&criteria_json)
@@ -779,26 +1081,30 @@ impl HybridRestoreService {
             None => return Ok(Vec::new()),
         };
 
-        use sqlx::Row;
-
         let checkpoint_rows = sqlx::query(
             "SELECT CAST(tools_json AS CHAR) AS tools_json FROM session_checkpoints \
-             WHERE session_id = ? AND user_id = ? AND state_json IS NULL \
+             WHERE user_id = ? AND session_id = ? AND state_json IS NULL \
              ORDER BY number DESC LIMIT 5",
         )
-        .bind(session_id)
         .bind(user_id)
+        .bind(session_id)
         .fetch_all(pool)
         .await
         .map_err(|e| format!("restore_recent_tools: {e}"))?;
 
         let mut tools = Vec::new();
         for row in &checkpoint_rows {
-            if let Ok(Some(tools_json)) = row.try_get::<Option<String>, _>("tools_json")
-                && let Ok(used) = serde_json::from_str::<Vec<String>>(&tools_json)
-            {
-                append_unique_tools(&mut tools, used.iter().map(String::as_str));
+            let Some(tools_json) =
+                mysql_optional_string(row, "restore_recent_tools", "tools_json")?
+            else {
+                continue;
+            };
+            if tools_json.trim().is_empty() {
+                continue;
             }
+            let used = serde_json::from_str::<Vec<String>>(&tools_json)
+                .map_err(|e| format!("restore_recent_tools: parse tools_json: {e}"))?;
+            append_unique_names(&mut tools, used.iter().map(String::as_str));
         }
 
         Ok(tools)
@@ -826,13 +1132,20 @@ impl HybridRestoreService {
         .await
         .map_err(|e| format!("restore_latest_context_trace_signal: {e}"))?;
 
-        use sqlx::Row;
-        Ok(row.and_then(|row| {
-            row.try_get::<Option<String>, _>("metadata_json")
-                .ok()
-                .flatten()
-                .and_then(|meta| serde_json::from_str(&meta).ok())
-        }))
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let Some(metadata_json) =
+            mysql_optional_string(&row, "restore_latest_context_trace_signal", "metadata_json")?
+        else {
+            return Ok(None);
+        };
+        if metadata_json.trim().is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str(&metadata_json)
+            .map(Some)
+            .map_err(|e| format!("restore_latest_context_trace_signal: parse metadata_json: {e}"))
     }
 
     async fn restore_latest_heavy_checkpoint_state(
@@ -872,31 +1185,10 @@ impl HybridRestoreService {
         .await
         .map_err(|e| format!("restore_cloud_transcript_messages: {e}"))?;
 
-        use sqlx::Row;
         let mut messages = Vec::new();
-        for row in rows {
-            let role = match row.try_get::<String, _>("role") {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        %session_id,
-                        error = %e,
-                        "restore_cloud_transcript: failed to read 'role' column — possible schema drift"
-                    );
-                    continue;
-                }
-            };
-            let content = match row.try_get::<String, _>("content") {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        %session_id,
-                        error = %e,
-                        "restore_cloud_transcript: failed to read 'content' column — possible schema drift"
-                    );
-                    continue;
-                }
-            };
+        for row in &rows {
+            let role = mysql_string(row, "restore_cloud_transcript_messages", "role")?;
+            let content = mysql_string(row, "restore_cloud_transcript_messages", "content")?;
             if content.trim().is_empty() {
                 continue;
             }
@@ -922,36 +1214,60 @@ impl HybridRestoreService {
             None => return Ok(Vec::new()),
         };
 
-        let rows = sqlx::query(
-            "SELECT number, turn, title, summary, total_tokens, contract_state_json \
-             FROM session_checkpoints \
-             WHERE session_id = ? AND user_id = ? AND state_json IS NULL \
-             ORDER BY number",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("cloud_checkpoints: {e}"))?;
+        let rows = sqlx::query(CLOUD_CHECKPOINTS_SELECT_SQL)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(MAX_CLOUD_RESTORE_CHECKPOINTS)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("cloud_checkpoints: {e}"))?;
 
-        use sqlx::Row;
         let ckpts = rows
             .iter()
-            .filter_map(|row| {
-                Some(RestoredCheckpoint {
-                    number: row.try_get::<i32, _>("number").ok()? as u32,
-                    turn: row.try_get::<i32, _>("turn").ok()? as u32,
-                    title: row.try_get("title").ok()?,
-                    summary: row.try_get("summary").unwrap_or_default(),
-                    total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-                    contract_state_json: row
-                        .try_get::<Option<String>, _>("contract_state_json")
-                        .ok()
-                        .flatten(),
+            .map(|row| {
+                Ok(RestoredCheckpoint {
+                    number: non_negative_i32_to_u32(
+                        mysql_i32(row, "cloud_checkpoints", "number")?,
+                        "cloud_checkpoints",
+                        "number",
+                    )?,
+                    turn: non_negative_i32_to_u32(
+                        mysql_i32(row, "cloud_checkpoints", "turn")?,
+                        "cloud_checkpoints",
+                        "turn",
+                    )?,
+                    title: mysql_string(row, "cloud_checkpoints", "title")?,
+                    summary: mysql_optional_string(row, "cloud_checkpoints", "summary")?
+                        .unwrap_or_default(),
+                    total_tokens: non_negative_i64_to_u64(
+                        mysql_i64(row, "cloud_checkpoints", "total_tokens")?,
+                        "cloud_checkpoints",
+                        "total_tokens",
+                    )?,
+                    contract_state_json: mysql_optional_string(
+                        row,
+                        "cloud_checkpoints",
+                        "contract_state_json",
+                    )?,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(ckpts)
+    }
+
+    async fn cloud_checkpoint_count(&self, user_id: &str, session_id: &str) -> Result<u32, String> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(0),
+        };
+        let row = sqlx::query(CLOUD_CHECKPOINT_COUNT_SQL)
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("cloud_checkpoint_count: {e}"))?;
+        let count = mysql_i64(&row, "cloud_checkpoint_count", "checkpoint_count")?;
+        non_negative_i64_to_u32(count, "cloud_checkpoint_count", "checkpoint_count")
     }
 }
 
@@ -979,6 +1295,19 @@ fn composite_snapshots_json_path(session_id: &str) -> Result<PathBuf, String> {
     crate::local_session_artifact_store()
         .session_path(session_id, "step_checkpoints/composite_snapshots.json")
         .map_err(|error| format!("invalid session_id: {error}"))
+}
+
+fn local_checkpoint_count(session_id: &str, context: &str) -> Result<u32, String> {
+    let entries =
+        super::session_checkpoint::read_checkpoint_index(session_id).map_err(|error| {
+            format!("{context}: failed to read local checkpoint index for {session_id}: {error}")
+        })?;
+    u32::try_from(entries.len()).map_err(|_| {
+        format!(
+            "{context}: local checkpoint index for {session_id} has too many entries: {}",
+            entries.len()
+        )
+    })
 }
 
 fn composite_snapshot_index_to_remote_artifact_record(
@@ -1047,19 +1376,26 @@ fn merge_composite_snapshot_indexes(
     index
 }
 
+fn merge_composite_snapshot_sources(
+    session_id: &str,
+    local: astra_core::composite_snapshot::CompositeSnapshotIndex,
+    remote: Result<Option<astra_core::composite_snapshot::CompositeSnapshotIndex>, String>,
+) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
+    let remote = remote
+        .map_err(|error| {
+            format!(
+                "list_composite_snapshots: failed to read remote composite snapshot index for {session_id}: {error}"
+            )
+        })?
+        .unwrap_or_default();
+    Ok(merge_composite_snapshot_indexes(local, remote))
+}
+
 /// Parse checkpoint number from a heavy checkpoint filename ref (e.g. `000005-heavy.json`).
 fn parse_heavy_checkpoint_number(session_state_ref: &str) -> Option<u32> {
     session_state_ref
         .strip_suffix("-heavy.json")
         .and_then(|prefix| prefix.parse().ok())
-}
-
-fn append_unique_tools<'a>(tools: &mut Vec<String>, candidates: impl IntoIterator<Item = &'a str>) {
-    for name in candidates {
-        if !tools.iter().any(|existing| existing == name) {
-            tools.push(name.to_string());
-        }
-    }
 }
 
 fn recent_tools_from_context_trace(
@@ -1070,7 +1406,7 @@ fn recent_tools_from_context_trace(
         .and_then(|signal| signal.tool_surface.as_ref())
         .map(|selection| selection.visible_tools.iter().map(String::as_str))
     {
-        append_unique_tools(&mut tools, visible_tools);
+        append_unique_names(&mut tools, visible_tools);
     }
     tools
 }
@@ -1201,7 +1537,7 @@ fn summarize_local_journal(session_id: &str) -> Result<Option<LocalJournalSummar
         && let Some(event) = events.get(idx)
     {
         if let Some(tools_used) = event.tools_used.as_ref() {
-            append_unique_tools(
+            append_unique_names(
                 &mut summary.recent_tools,
                 tools_used.iter().map(String::as_str),
             );
@@ -1209,7 +1545,7 @@ fn summarize_local_journal(session_id: &str) -> Result<Option<LocalJournalSummar
         if summary.recent_tools.is_empty()
             && let Some(tool_calls) = event.tool_calls.as_ref()
         {
-            append_unique_tools(
+            append_unique_names(
                 &mut summary.recent_tools,
                 tool_calls.iter().map(|call| call.name.as_str()),
             );
@@ -1286,8 +1622,35 @@ fn restored_session_from_workspace(
     }
 }
 
-fn cloud_heavy_payload(root: &serde_json::Value) -> Option<&serde_json::Value> {
-    root.get("Heavy")
+fn cloud_heavy_payload(
+    root: &serde_json::Value,
+) -> Result<Option<&serde_json::Map<String, serde_json::Value>>, String> {
+    let Some(heavy) = root.get("Heavy") else {
+        return Ok(None);
+    };
+    heavy.as_object().map(Some).ok_or_else(|| {
+        "invalid cloud heavy checkpoint JSON field: field=Heavy, expected=object".to_string()
+    })
+}
+
+fn required_cloud_heavy_field<T>(
+    heavy: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
+    let value = heavy
+        .get(field)
+        .ok_or_else(|| format!("missing cloud heavy checkpoint JSON field: field={field}"))?;
+    if value.is_null() {
+        return Err(format!(
+            "invalid cloud heavy checkpoint JSON field: field={field}, expected=non-null"
+        ));
+    }
+    serde_json::from_value(value.clone()).map_err(|source| {
+        format!("invalid cloud heavy checkpoint JSON field: field={field}, source={source}")
+    })
 }
 
 /// Parse cloud step-checkpoint JSON into the heavy-state fields needed for restore.
@@ -1295,27 +1658,16 @@ fn cloud_heavy_payload(root: &serde_json::Value) -> Option<&serde_json::Value> {
 pub fn parse_cloud_heavy_checkpoint_state(
     state_json: &str,
 ) -> Result<Option<CloudHeavyCheckpointState>, String> {
-    let root = match serde_json::from_str::<serde_json::Value>(state_json) {
-        Ok(root) => root,
-        Err(_) => return Ok(None),
-    };
-    let Some(heavy) = cloud_heavy_payload(&root) else {
+    let root = serde_json::from_str::<serde_json::Value>(state_json)
+        .map_err(|source| format!("invalid cloud heavy checkpoint JSON: source={source}"))?;
+    let Some(heavy) = cloud_heavy_payload(&root)? else {
         return Ok(None);
     };
+    let recent_tools: Vec<String> = required_cloud_heavy_field(heavy, "recent_tools")?;
     Ok(Some(CloudHeavyCheckpointState {
-        messages: heavy
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        blocked_tools: heavy
-            .get("blocked_tools")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default(),
-        recent_tools: heavy
-            .get("recent_tools")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default(),
+        messages: required_cloud_heavy_field(heavy, "messages")?,
+        blocked_tools: required_cloud_heavy_field(heavy, "blocked_tools")?,
+        recent_tools: normalize_name_list(recent_tools),
         approval_overrides: heavy
             .get("approval_overrides")
             .cloned()
@@ -1383,47 +1735,32 @@ impl SessionRestoreService for HybridRestoreService {
         .await
         .map_err(|e| format!("list_resumable: {e}"))?;
 
-        use sqlx::Row;
         let mut sessions = Vec::new();
         for row in &rows {
-            let session_id: String = match row.try_get("session_id") {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let title: Option<String> = row.try_get("title").ok().flatten();
-            let status: String = match row.try_get("status") {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let turn_count: i64 = row.try_get("turn_count").unwrap_or(0);
-            let metadata_state = row
-                .try_get::<Option<String>, _>("metadata_json")
-                .ok()
-                .flatten()
-                .as_deref()
-                .map(extract_session_state_from_metadata)
-                .unwrap_or_default();
+            let session_id = mysql_string(row, "list_resumable_sessions", "session_id")?;
+            let title = mysql_optional_string(row, "list_resumable_sessions", "title")?;
+            let status = mysql_string(row, "list_resumable_sessions", "status")?;
+            let turn_count = mysql_i64(row, "list_resumable_sessions", "turn_count")?;
+            let metadata_json =
+                mysql_optional_string(row, "list_resumable_sessions", "metadata_json")?;
+            let metadata_state = metadata_json_state(metadata_json.as_deref())?;
             let latest_model = astra_core::model_override::normalize_model_override_owned(
-                row.try_get("latest_model").ok().flatten(),
+                mysql_optional_string(row, "list_resumable_sessions", "latest_model")?,
             );
             let model = metadata_state.model.clone().or(latest_model);
             let mut restored = if let Some(workspace) =
                 self.restore_cloud_workspace(user_id, &session_id).await?
             {
-                let mut recent_tools = self
-                    .restore_recent_tools(user_id, &session_id)
-                    .await
-                    .unwrap_or_default();
+                let mut recent_tools = self.restore_recent_tools(user_id, &session_id).await?;
                 if recent_tools.is_empty() {
                     recent_tools = recent_tools_from_context_trace(
                         workspace.metadata.last_context_trace.as_ref(),
                     );
                 }
                 let checkpoint_count = self
-                    .cloud_checkpoints(user_id, &session_id)
+                    .cloud_checkpoint_count(user_id, &session_id)
                     .await
-                    .map(|checkpoints| checkpoints.len() as u32)
-                    .unwrap_or(0);
+                    .map_err(|e| format!("list_resumable_sessions checkpoint count: {e}"))?;
                 restored_session_from_workspace(
                     workspace.metadata,
                     None,
@@ -1438,7 +1775,11 @@ impl SessionRestoreService for HybridRestoreService {
                     ..Default::default()
                 }
             };
-            restored.turn_count = restored.turn_count.max(turn_count.max(0) as u32);
+            restored.turn_count = restored.turn_count.max(non_negative_i64_to_u32(
+                turn_count,
+                "list_resumable_sessions",
+                "turn_count",
+            )?);
             restored.last_status = status;
             restored.title = restored.title.or(title);
             if restored.git_branch.is_none() {
@@ -1535,16 +1876,8 @@ impl SessionRestoreService for HybridRestoreService {
         let local = read_composite_snapshot_index_local(session_id)?;
         let remote = self
             .restore_cloud_composite_snapshot_index(user_id, session_id)
-            .await
-            .unwrap_or_else(|error| {
-                astra_core::agent_warn!(
-                    "restore",
-                    "failed to read remote composite snapshot index for {session_id}: {error}"
-                );
-                None
-            })
-            .unwrap_or_default();
-        Ok(merge_composite_snapshot_indexes(local, remote))
+            .await;
+        merge_composite_snapshot_sources(session_id, local, remote)
     }
 }
 
@@ -1558,9 +1891,9 @@ impl crate::state_sync::MatrixOneSyncService {
         user_id: &str,
         checkpoint: &super::session_checkpoint::Checkpoint,
     ) -> Result<(), String> {
+        let started_at = std::time::Instant::now();
         let checkpoint_id = uuid::Uuid::new_v4().to_string();
-        let tools_json =
-            serde_json::to_string(&checkpoint.tools_used).unwrap_or_else(|_| "[]".to_string());
+        let tools_json = checkpoint_tools_json(checkpoint);
 
         let payload_size = checkpoint.title.len()
             + checkpoint.summary.len()
@@ -1573,21 +1906,38 @@ impl crate::state_sync::MatrixOneSyncService {
         let log_result = |status: &str, error_msg: Option<&str>| {
             log_checkpoint_sync(
                 &self.audit,
-                user_id,
-                session_id,
-                "checkpoint",
                 checkpoint.number,
-                payload_size,
-                status,
-                error_msg,
+                SessionSyncLogEntry {
+                    user_id,
+                    session_id,
+                    sync_type: "checkpoint",
+                    payload_size,
+                    duration_ms: Some(elapsed_ms(started_at)),
+                    status,
+                    error_msg,
+                },
             );
         };
+
+        match crate::storage::agent_session_exists_for_user(&self.pool, session_id, user_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let err = "push_checkpoint owner mismatch".to_string();
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+            Err(e) => {
+                let err = format!("push_checkpoint owner check: {e}");
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+        }
 
         let updated = match sqlx::query(
             "UPDATE session_checkpoints SET \
                 turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
                 had_stalls = ?, error_count = ?, contract_state_json = ? \
-             WHERE session_id = ? AND user_id = ? AND number = ?",
+             WHERE user_id = ? AND session_id = ? AND number = ?",
         )
         .bind(checkpoint.turn as i32)
         .bind(&checkpoint.title)
@@ -1597,8 +1947,8 @@ impl crate::state_sync::MatrixOneSyncService {
         .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
         .bind(checkpoint.error_count as i32)
         .bind(&checkpoint.contract_state_json)
-        .bind(session_id)
         .bind(user_id)
+        .bind(session_id)
         .bind(checkpoint.number as i32)
         .execute(&self.pool)
         .await
@@ -1639,7 +1989,7 @@ impl crate::state_sync::MatrixOneSyncService {
                         "UPDATE session_checkpoints SET \
                             turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
                             had_stalls = ?, error_count = ?, contract_state_json = ? \
-             WHERE session_id = ? AND user_id = ? AND number = ?",
+             WHERE user_id = ? AND session_id = ? AND number = ?",
                     )
                     .bind(checkpoint.turn as i32)
                     .bind(&checkpoint.title)
@@ -1649,8 +1999,8 @@ impl crate::state_sync::MatrixOneSyncService {
                     .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
                     .bind(checkpoint.error_count as i32)
                     .bind(&checkpoint.contract_state_json)
-                    .bind(session_id)
                     .bind(user_id)
+                    .bind(session_id)
                     .bind(checkpoint.number as i32)
                     .execute(&self.pool)
                     .await;
@@ -1692,6 +2042,7 @@ impl crate::state_sync::MatrixOneSyncService {
         tools_json: &str,
         state_json: &str,
     ) -> Result<(), String> {
+        let started_at = std::time::Instant::now();
         let checkpoint_id = uuid::Uuid::new_v4().to_string();
         let cloud_number = cloud_step_checkpoint_number(checkpoint_number)?;
         let payload_size = title.len() + tier.len() + tools_json.len() + state_json.len();
@@ -1699,28 +2050,45 @@ impl crate::state_sync::MatrixOneSyncService {
         let log_result = |status: &str, error_msg: Option<&str>| {
             log_checkpoint_sync(
                 &self.audit,
-                user_id,
-                session_id,
-                "step_checkpoint",
                 checkpoint_number,
-                payload_size,
-                status,
-                error_msg,
+                SessionSyncLogEntry {
+                    user_id,
+                    session_id,
+                    sync_type: "step_checkpoint",
+                    payload_size,
+                    duration_ms: Some(elapsed_ms(started_at)),
+                    status,
+                    error_msg,
+                },
             );
         };
+
+        match crate::storage::agent_session_exists_for_user(&self.pool, session_id, user_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let err = "push_step_checkpoint owner mismatch".to_string();
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+            Err(e) => {
+                let err = format!("push_step_checkpoint owner check: {e}");
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+        }
 
         let updated = match sqlx::query(
             "UPDATE session_checkpoints SET \
                 turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
-	             WHERE session_id = ? AND user_id = ? AND number = ?",
+	             WHERE user_id = ? AND session_id = ? AND number = ?",
         )
         .bind(turn as i32)
         .bind(title)
         .bind(tier)
         .bind(tools_json)
         .bind(state_json)
-        .bind(session_id)
         .bind(user_id)
+        .bind(session_id)
         .bind(cloud_number)
         .execute(&self.pool)
         .await
@@ -1757,15 +2125,15 @@ impl crate::state_sync::MatrixOneSyncService {
                     let retry = sqlx::query(
                         "UPDATE session_checkpoints SET \
                             turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
-                         WHERE session_id = ? AND user_id = ? AND number = ?",
+                         WHERE user_id = ? AND session_id = ? AND number = ?",
                     )
                     .bind(turn as i32)
                     .bind(title)
                     .bind(tier)
                     .bind(tools_json)
                     .bind(state_json)
-                    .bind(session_id)
                     .bind(user_id)
+                    .bind(session_id)
                     .bind(cloud_number)
                     .execute(&self.pool)
                     .await;
@@ -1807,9 +2175,9 @@ impl crate::state_sync::MatrixOneSyncService {
         git_branch: Option<&str>,
         model: Option<&str>,
     ) -> Result<(), String> {
-        use sqlx::Row;
+        let started_at = std::time::Instant::now();
 
-        let existing_metadata_json = sqlx::query(
+        let existing_metadata_row = sqlx::query(
             "SELECT CAST(metadata AS CHAR) AS metadata_json \
              FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
         )
@@ -1817,12 +2185,12 @@ impl crate::state_sync::MatrixOneSyncService {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| format!("load session metadata: {e}"))?
-        .and_then(|row| {
-            row.try_get::<Option<String>, _>("metadata_json")
-                .ok()
-                .flatten()
-        });
+        .map_err(|e| format!("load session metadata: {e}"))?;
+        let existing_metadata_json = existing_metadata_row
+            .as_ref()
+            .map(|row| mysql_optional_string(row, "push_session_state", "metadata_json"))
+            .transpose()?
+            .flatten();
 
         let metadata_json = merge_session_state_metadata(
             existing_metadata_json.as_deref(),
@@ -1832,41 +2200,26 @@ impl crate::state_sync::MatrixOneSyncService {
             plan_execution_rounds,
             git_branch,
             model,
-        );
+        )?;
         let payload_size = metadata_json.len();
 
-        let result = sqlx::query(
-            "INSERT INTO agent_sessions \
-             (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
-             SELECT ?, ?, 'active', ?, NOW(6), NOW(6), NOW(6) \
-             FROM DUAL \
-             WHERE NOT EXISTS ( \
-                 SELECT 1 FROM agent_sessions \
-                 WHERE session_id = ? AND user_id <> ? \
-                 LIMIT 1 \
-             ) \
-             ON DUPLICATE KEY UPDATE \
-             status = CASE WHEN user_id = VALUES(user_id) THEN status ELSE NULL END, \
-             metadata = CASE WHEN user_id = VALUES(user_id) THEN VALUES(metadata) ELSE metadata END, \
-             updated_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE updated_at END, \
-             last_active_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE last_active_at END",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(&metadata_json)
-        .bind(session_id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await
-        .and_then(|result| {
-            if result.rows_affected() == 0 {
-                Err(sqlx::Error::RowNotFound)
-            } else {
-                Ok(result)
-            }
-        })
-        .map(|_| ())
-        .map_err(|e| format!("push_session_state: {e}"));
+        let result = sqlx::query(PUSH_SESSION_STATE_UPSERT_SQL)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(&metadata_json)
+            .bind(session_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .and_then(|result| {
+                if result.rows_affected() == 0 {
+                    Err(sqlx::Error::RowNotFound)
+                } else {
+                    Ok(result)
+                }
+            })
+            .map(|_| ())
+            .map_err(|e| format!("push_session_state: {e}"));
 
         let (status, error_msg) = match &result {
             Ok(()) => ("success", None),
@@ -1874,12 +2227,15 @@ impl crate::state_sync::MatrixOneSyncService {
         };
         log_session_sync(
             &self.audit,
-            user_id,
-            session_id,
-            "session_state",
-            payload_size,
-            status,
-            error_msg,
+            SessionSyncLogEntry {
+                user_id,
+                session_id,
+                sync_type: "session_state",
+                payload_size,
+                duration_ms: Some(elapsed_ms(started_at)),
+                status,
+                error_msg,
+            },
         );
 
         result
@@ -1892,6 +2248,7 @@ impl crate::state_sync::MatrixOneSyncService {
         user_id: &str,
         signal: &super::session_workspace::ContextTraceSignal,
     ) -> Result<(), String> {
+        let started_at = std::time::Instant::now();
         let metadata_json = serde_json::to_string(signal)
             .map_err(|e| format!("serialize context_trace_signal: {e}"))?;
         let duration_ms = signal
@@ -1911,12 +2268,15 @@ impl crate::state_sync::MatrixOneSyncService {
         let log_result = |status: &str, error_msg: Option<&str>| {
             log_session_sync(
                 &self.audit,
-                user_id,
-                session_id,
-                "context_trace",
-                payload_size,
-                status,
-                error_msg,
+                SessionSyncLogEntry {
+                    user_id,
+                    session_id,
+                    sync_type: "context_trace",
+                    payload_size,
+                    duration_ms: Some(elapsed_ms(started_at)),
+                    status,
+                    error_msg,
+                },
             );
         };
 
@@ -2004,46 +2364,50 @@ impl crate::state_sync::MatrixOneSyncService {
     }
 }
 
-fn log_session_sync(
-    audit: &crate::state_sync::SyncAuditWriter,
-    user_id: &str,
-    session_id: &str,
-    sync_type: &str,
+pub type ExtractedPlanMetadata = (Option<String>, Option<String>, Option<String>, usize);
+
+fn checkpoint_tools_json(checkpoint: &super::session_checkpoint::Checkpoint) -> String {
+    let tools_used = normalize_name_list(checkpoint.tools_used.iter().map(String::as_str));
+    serde_json::to_string(&tools_used).expect("canonical checkpoint tools must serialize")
+}
+
+struct SessionSyncLogEntry<'a> {
+    user_id: &'a str,
+    session_id: &'a str,
+    sync_type: &'a str,
     payload_size: usize,
-    status: &str,
-    error_msg: Option<&str>,
-) {
+    duration_ms: Option<u64>,
+    status: &'a str,
+    error_msg: Option<&'a str>,
+}
+
+fn log_session_sync(audit: &crate::state_sync::SyncAuditWriter, entry: SessionSyncLogEntry<'_>) {
     audit.log(crate::state_sync::SyncAuditEntry {
-        user_id: user_id.to_string(),
-        session_id: session_id.to_string(),
-        sync_type: sync_type.to_string(),
+        user_id: entry.user_id.to_string(),
+        session_id: entry.session_id.to_string(),
+        sync_type: entry.sync_type.to_string(),
         direction: crate::state_sync::SyncDirection::Push,
-        payload_size,
-        status: status.to_string(),
-        error_message: error_msg.map(|s| s.to_string()),
+        payload_size: entry.payload_size,
+        duration_ms: entry.duration_ms,
+        status: entry.status.to_string(),
+        error_message: entry.error_msg.map(|s| s.to_string()),
     });
 }
 
-#[allow(clippy::too_many_arguments)]
 fn log_checkpoint_sync(
     audit: &crate::state_sync::SyncAuditWriter,
-    user_id: &str,
-    session_id: &str,
-    sync_type: &str,
     checkpoint_number: u32,
-    payload_size: usize,
-    status: &str,
-    error_msg: Option<&str>,
+    entry: SessionSyncLogEntry<'_>,
 ) {
-    let error_with_number = error_msg.map(|e| format!("[checkpoint #{}] {}", checkpoint_number, e));
+    let error_with_number = entry
+        .error_msg
+        .map(|e| format!("[checkpoint #{}] {}", checkpoint_number, e));
     log_session_sync(
         audit,
-        user_id,
-        session_id,
-        sync_type,
-        payload_size,
-        status,
-        error_with_number.as_deref().or(error_msg),
+        SessionSyncLogEntry {
+            error_msg: error_with_number.as_deref().or(entry.error_msg),
+            ..entry
+        },
     );
 }
 
@@ -2058,11 +2422,11 @@ pub async fn pull_step_checkpoint_from_cloud(
 
     let row = sqlx::query(
         "SELECT CAST(state_json AS CHAR) AS state_json_json FROM session_checkpoints \
-         WHERE session_id = ? AND user_id = ? AND summary = 'heavy' AND state_json IS NOT NULL \
+         WHERE user_id = ? AND session_id = ? AND summary = 'heavy' AND state_json IS NOT NULL \
          ORDER BY number DESC LIMIT 1",
     )
-    .bind(session_id)
     .bind(user_id)
+    .bind(session_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| format!("pull_step_checkpoint: {e}"))?;
@@ -2096,11 +2460,8 @@ fn merge_session_state_metadata(
     plan_execution_rounds: usize,
     git_branch: Option<&str>,
     model: Option<&str>,
-) -> String {
-    let mut metadata = existing_metadata_json
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
+) -> Result<String, String> {
+    let mut metadata = session_metadata_object_for_merge(existing_metadata_json)?;
 
     if let Some(plan) = executing_plan_json {
         metadata.insert(
@@ -2156,47 +2517,82 @@ fn merge_session_state_metadata(
         metadata.remove("model");
     }
 
-    serde_json::Value::Object(metadata).to_string()
+    Ok(serde_json::Value::Object(metadata).to_string())
+}
+
+fn session_metadata_object_for_merge(
+    existing_metadata_json: Option<&str>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let Some(metadata) = existing_metadata_json
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+    else {
+        return Ok(serde_json::Map::new());
+    };
+    let parsed: serde_json::Value = serde_json::from_str(metadata).map_err(|e| {
+        let prefix = &metadata[..metadata.len().min(200)];
+        format!("session metadata JSON parse failed before merge: {e}; payload_prefix={prefix:?}")
+    })?;
+    parsed.as_object().cloned().ok_or_else(|| {
+        format!(
+            "session metadata JSON must be an object before merge, got {}",
+            value_type_name(&parsed)
+        )
+    })
+}
+
+fn value_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 /// Extract plan state from the metadata JSON returned by agent_sessions.
 /// Returns (executing_plan_json, plan_goal, plan_config_json, plan_execution_rounds).
-pub fn extract_session_state_from_metadata(metadata_json: &str) -> SessionMetadataState {
+pub fn extract_session_state_from_metadata(
+    metadata_json: &str,
+) -> Result<SessionMetadataState, String> {
     // Defense: reject excessively large metadata to prevent DoS
     const MAX_METADATA_SIZE: usize = 512 * 1024; // 512 KB
     if metadata_json.len() > MAX_METADATA_SIZE {
-        tracing::warn!(
-            target: "astra_services::session_restore",
-            size = metadata_json.len(),
-            "session metadata too large, skipping plan extraction"
-        );
-        return SessionMetadataState::default();
+        return Err(format!(
+            "session metadata JSON exceeds maximum size: {} > {MAX_METADATA_SIZE}",
+            metadata_json.len()
+        ));
     }
     let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
         Ok(v) => v,
         Err(e) => {
             let prefix = &metadata_json[..metadata_json.len().min(200)];
-            tracing::error!(
-                target: "astra_services::session_restore",
-                err = %e,
-                payload_prefix = %prefix,
-                "metadata JSON parse failed; returning default state"
-            );
-            return SessionMetadataState::default();
+            return Err(format!(
+                "session metadata JSON parse failed: {e}; payload_prefix={prefix:?}"
+            ));
         }
     };
     let obj = match parsed.as_object() {
         Some(o) => o,
         None => {
-            tracing::warn!(
-                target: "astra_services::session_restore",
-                "session metadata is not a JSON object; returning default state"
-            );
-            return SessionMetadataState::default();
+            return Err("session metadata JSON must be an object".to_string());
         }
     };
+    let plan_execution_rounds = match obj.get("plan_execution_rounds") {
+        Some(value) => {
+            let rounds = value.as_u64().ok_or_else(|| {
+                "session metadata `plan_execution_rounds` must be a u64".to_string()
+            })?;
+            usize::try_from(rounds).map_err(|_| {
+                format!("session metadata `plan_execution_rounds` exceeds usize::MAX: {rounds}")
+            })?
+        }
+        None => 0,
+    };
 
-    SessionMetadataState {
+    Ok(SessionMetadataState {
         executing_plan_json: obj
             .get("executing_plan")
             .and_then(|v| v.as_str())
@@ -2209,10 +2605,7 @@ pub fn extract_session_state_from_metadata(metadata_json: &str) -> SessionMetada
             .get("plan_config")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        plan_execution_rounds: obj
-            .get("plan_execution_rounds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize,
+        plan_execution_rounds,
         git_branch: obj
             .get("git_branch")
             .and_then(|v| v.as_str())
@@ -2226,19 +2619,17 @@ pub fn extract_session_state_from_metadata(metadata_json: &str) -> SessionMetada
             .get("permission_mode")
             .and_then(|v| v.as_str())
             .map(str::to_string),
-    }
+    })
 }
 
-pub fn extract_plan_from_metadata(
-    metadata_json: &str,
-) -> (Option<String>, Option<String>, Option<String>, usize) {
-    let state = extract_session_state_from_metadata(metadata_json);
-    (
+pub fn extract_plan_from_metadata(metadata_json: &str) -> Result<ExtractedPlanMetadata, String> {
+    let state = extract_session_state_from_metadata(metadata_json)?;
+    Ok((
         state.executing_plan_json,
         state.plan_goal,
         state.plan_config_json,
         state.plan_execution_rounds,
-    )
+    ))
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -2251,6 +2642,369 @@ mod tests {
 
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");
+
+    struct FakeSessionRestoreRow {
+        failed_column: Option<&'static str>,
+    }
+
+    impl FakeSessionRestoreRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl SessionRestoreRow for FakeSessionRestoreRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "status" => "active",
+                "session_id" => "sess-1",
+                "title" => "Checkpoint",
+                _ => unreachable!("unexpected string column: {column}"),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "title" => Some("Resume work".to_string()),
+                "latest_model" => None,
+                _ => unreachable!("unexpected optional string column: {column}"),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "turn_count" => 42,
+                "total_tokens_in" => 1000,
+                _ => unreachable!("unexpected i64 column: {column}"),
+            })
+        }
+
+        fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "number" => 7,
+                _ => unreachable!("unexpected i32 column: {column}"),
+            })
+        }
+    }
+
+    #[test]
+    fn session_restore_row_decode_helpers_preserve_database_values() {
+        let row = FakeSessionRestoreRow::complete();
+
+        assert_eq!(
+            mysql_string(&row, "restore_cloud_session", "status").unwrap(),
+            "active"
+        );
+        assert_eq!(
+            mysql_optional_string(&row, "restore_cloud_session", "title").unwrap(),
+            Some("Resume work".to_string())
+        );
+        assert_eq!(
+            mysql_optional_string(&row, "restore_cloud_session", "latest_model").unwrap(),
+            None
+        );
+        assert_eq!(
+            mysql_i64(&row, "restore_cloud_session", "turn_count").unwrap(),
+            42
+        );
+        assert_eq!(mysql_i32(&row, "cloud_checkpoints", "number").unwrap(), 7);
+    }
+
+    #[test]
+    fn session_restore_row_decode_helpers_fail_loudly_with_context_and_column() {
+        for (column, decode) in [
+            (
+                "status",
+                mysql_string(
+                    &FakeSessionRestoreRow::fail_on("status"),
+                    "restore_cloud_session",
+                    "status",
+                ),
+            ),
+            (
+                "title",
+                mysql_optional_string(
+                    &FakeSessionRestoreRow::fail_on("title"),
+                    "restore_cloud_session",
+                    "title",
+                )
+                .map(|_| String::new()),
+            ),
+            (
+                "turn_count",
+                mysql_i64(
+                    &FakeSessionRestoreRow::fail_on("turn_count"),
+                    "restore_cloud_session",
+                    "turn_count",
+                )
+                .map(|_| String::new()),
+            ),
+            (
+                "number",
+                mysql_i32(
+                    &FakeSessionRestoreRow::fail_on("number"),
+                    "cloud_checkpoints",
+                    "number",
+                )
+                .map(|_| String::new()),
+            ),
+        ] {
+            let err = decode.unwrap_err();
+            assert!(
+                err.contains(&format!("decode column `{column}`")),
+                "error should identify failed column: {err}"
+            );
+            assert!(
+                err.contains("restore_cloud_session") || err.contains("cloud_checkpoints"),
+                "error should identify decode context: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_session_state_upsert_is_atomically_owner_guarded() {
+        let sql = PUSH_SESSION_STATE_UPSERT_SQL;
+        assert!(
+            sql.contains("WHERE session_id = ? AND user_id <> ?"),
+            "insert path must reject an existing session_id owned by another user"
+        );
+        assert!(
+            !sql.contains(concat!("ELSE ", "NULL")),
+            "owner mismatch must not rely on NOT NULL constraint failures"
+        );
+        assert!(
+            !sql.contains("status ="),
+            "duplicate push must preserve existing session status instead of assigning a no-op"
+        );
+        for assignment in [
+            "metadata = IF(user_id = VALUES(user_id), VALUES(metadata), metadata)",
+            "updated_at = IF(user_id = VALUES(user_id), NOW(6), updated_at)",
+            "last_active_at = IF(user_id = VALUES(user_id), NOW(6), last_active_at)",
+        ] {
+            assert!(
+                sql.contains(assignment),
+                "session-state upsert assignment must be owner-guarded: {assignment}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_restore_timings_are_structured_segments() {
+        let timings = CloudRestoreTimings {
+            session_query_ms: 1,
+            heavy_checkpoint_ms: 2,
+            transcript_ms: 3,
+            context_trace_ms: 4,
+            recent_tools_ms: 5,
+            contract_ms: 6,
+            checkpoint_fallback_ms: 7,
+            total_ms: 8,
+        };
+
+        assert_eq!(timings.session_query_ms, 1);
+        assert_eq!(timings.heavy_checkpoint_ms, 2);
+        assert_eq!(timings.transcript_ms, 3);
+        assert_eq!(timings.context_trace_ms, 4);
+        assert_eq!(timings.recent_tools_ms, 5);
+        assert_eq!(timings.contract_ms, 6);
+        assert_eq!(timings.checkpoint_fallback_ms, 7);
+        assert_eq!(timings.total_ms, 8);
+    }
+
+    #[test]
+    fn cache_token_counts_from_token_usage_json_preserves_cache_split() {
+        let raw = json!({
+            "input_tokens": 10,
+            "cached_input_tokens": 4,
+            "cache_creation_tokens": 3,
+            "output_tokens": 2,
+            "total_tokens": 19,
+        })
+        .to_string();
+        assert_eq!(
+            cache_token_counts_from_token_usage_json(&raw, "test").expect("cache split"),
+            (4, 3)
+        );
+        assert_eq!(
+            cache_token_counts_from_token_usage_json("{}", "test").expect("missing fields default"),
+            (0, 0)
+        );
+        let error = cache_token_counts_from_token_usage_json(
+            r#"{"cached_input_tokens":-1,"cache_creation_tokens":0}"#,
+            "test",
+        )
+        .expect_err("negative cache counts must fail");
+        assert!(error.contains("non-negative"));
+    }
+
+    #[test]
+    fn restore_cache_token_totals_skip_invalid_rows() {
+        let mut cache_read_total = 0;
+        let mut cache_creation_total = 0;
+        let valid = json!({
+            "cached_input_tokens": 4,
+            "cache_creation_tokens": 3,
+        })
+        .to_string();
+
+        assert!(apply_restore_cache_token_usage(
+            &valid,
+            "event-ok",
+            &mut cache_read_total,
+            &mut cache_creation_total,
+        ));
+        assert!(!apply_restore_cache_token_usage(
+            "{not-json",
+            "event-bad-json",
+            &mut cache_read_total,
+            &mut cache_creation_total,
+        ));
+        assert!(!apply_restore_cache_token_usage(
+            r#"{"cached_input_tokens":-1,"cache_creation_tokens":0}"#,
+            "event-negative",
+            &mut cache_read_total,
+            &mut cache_creation_total,
+        ));
+
+        assert_eq!((cache_read_total, cache_creation_total), (4, 3));
+    }
+
+    #[test]
+    fn restore_cache_token_totals_skip_overflowing_rows_atomically() {
+        let mut cache_read_total = i64::MAX - 1;
+        let mut cache_creation_total = 10;
+        let overflowing = json!({
+            "cached_input_tokens": 2,
+            "cache_creation_tokens": 5,
+        })
+        .to_string();
+
+        assert!(!apply_restore_cache_token_usage(
+            &overflowing,
+            "event-overflow",
+            &mut cache_read_total,
+            &mut cache_creation_total,
+        ));
+        assert_eq!((cache_read_total, cache_creation_total), (i64::MAX - 1, 10));
+    }
+
+    #[test]
+    fn cloud_restore_token_totals_use_core_token_events() {
+        let source = include_str!("session_restore.rs");
+        let cache_body = source
+            .split("async fn restore_cloud_cache_token_totals")
+            .nth(1)
+            .and_then(|rest| rest.split("// ─── Restored Session State").next())
+            .expect("cache token restore body");
+        let cloud_body = source
+            .split("async fn restore_cloud_session")
+            .nth(1)
+            .and_then(|rest| rest.split("let session_query_ms").next())
+            .expect("cloud restore session query body");
+        assert!(
+            cache_body.contains(
+                "event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL"
+            ),
+            "cloud restore must read token/cache totals from core turn events"
+        );
+        assert!(
+            cloud_body.contains(
+                "event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL"
+            ),
+            "cloud restore must read token totals from core turn events"
+        );
+        assert!(
+            !cache_body.contains("event_type = 'user_query' AND token_usage IS NOT NULL")
+                && !cloud_body.contains("event_type = 'user_query' AND token_usage IS NOT NULL"),
+            "cloud restore must not miss llm_response token_usage rows"
+        );
+    }
+
+    #[test]
+    fn metadata_json_state_defaults_only_for_absent_or_empty_metadata() {
+        assert_eq!(
+            metadata_json_state(None).unwrap(),
+            SessionMetadataState::default()
+        );
+        assert_eq!(
+            metadata_json_state(Some("")).unwrap(),
+            SessionMetadataState::default()
+        );
+
+        let state = metadata_json_state(Some(
+            r#"{"model":"gpt-5","permission_mode":"accept_edits"}"#,
+        ))
+        .unwrap();
+        assert_eq!(state.model.as_deref(), Some("gpt-5"));
+        assert_eq!(state.permission_mode.as_deref(), Some("accept_edits"));
+    }
+
+    #[test]
+    fn metadata_json_state_fails_loudly_on_corrupt_present_metadata() {
+        for (metadata, expected) in [
+            ("not json", "parse failed"),
+            ("[]", "must be an object"),
+            (
+                r#"{"plan_execution_rounds":"three"}"#,
+                "plan_execution_rounds",
+            ),
+        ] {
+            let error = metadata_json_state(Some(metadata)).expect_err("metadata should fail");
+            assert!(
+                error.contains(expected),
+                "metadata error should identify `{expected}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_negative_numeric_conversions_fail_loudly_on_invalid_values() {
+        assert_eq!(
+            non_negative_i64_to_u64(42, "restore_cloud_session", "total_tokens_in").unwrap(),
+            42
+        );
+        assert_eq!(
+            non_negative_i64_to_u32(42, "restore_cloud_session", "turn_count").unwrap(),
+            42
+        );
+        assert_eq!(
+            non_negative_i32_to_u32(42, "cloud_checkpoints", "turn").unwrap(),
+            42
+        );
+
+        for err in [
+            non_negative_i64_to_u64(-1, "restore_cloud_session", "total_tokens_in").unwrap_err(),
+            non_negative_i64_to_u32(-1, "restore_cloud_session", "turn_count").unwrap_err(),
+            non_negative_i32_to_u32(-1, "cloud_checkpoints", "turn").unwrap_err(),
+            non_negative_i64_to_u32(i64::MAX, "restore_cloud_session", "turn_count").unwrap_err(),
+        ] {
+            assert!(
+                err.contains("expected") && err.contains("column"),
+                "error should identify invalid numeric restore value: {err}"
+            );
+        }
+    }
 
     // ── RestoredSession ──
 
@@ -2325,6 +3079,32 @@ mod tests {
             .await
             .unwrap();
         assert!(ckpts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_only_list_checkpoints_unreadable_index_fails_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+        let checkpoint_index = session_workspace::workspace_dir_for(&sid)
+            .join("checkpoints")
+            .join("index.md");
+        std::fs::create_dir_all(&checkpoint_index).unwrap();
+
+        let svc = HybridRestoreService::local_only();
+        let error = svc
+            .list_local_checkpoints(&sid)
+            .await
+            .expect_err("unreadable checkpoint index must fail checkpoint listing");
+
+        assert!(
+            error.contains("failed to read local checkpoint index"),
+            "checkpoint listing error should identify local index failure: {error}"
+        );
+        assert!(
+            error.contains("list_checkpoints_inner"),
+            "checkpoint listing error should include context: {error}"
+        );
     }
 
     #[tokio::test]
@@ -2455,6 +3235,35 @@ mod tests {
         assert_eq!(restored.model.as_deref(), Some("test-model"));
         assert_eq!(restored.last_status, "local");
         assert!(!restored.restored_from_cloud);
+    }
+
+    #[tokio::test]
+    async fn local_restore_unreadable_checkpoint_index_fails_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+
+        let ws = session_workspace::WorkspaceMetadata::with_context(&sid, "gpt-5", "/repo", None);
+        session_workspace::write_workspace(&ws).unwrap();
+        let checkpoint_index = session_workspace::workspace_dir_for(&sid)
+            .join("checkpoints")
+            .join("index.md");
+        std::fs::create_dir_all(&checkpoint_index).unwrap();
+
+        let svc = HybridRestoreService::local_only();
+        let error = svc
+            .restore_local_session(&sid)
+            .await
+            .expect_err("unreadable checkpoint index must fail restore");
+
+        assert!(
+            error.contains("failed to read local checkpoint index"),
+            "restore error should identify checkpoint index failure: {error}"
+        );
+        assert!(
+            error.contains("restore_session_inner"),
+            "restore error should include context: {error}"
+        );
     }
 
     #[tokio::test]
@@ -2680,6 +3489,51 @@ mod tests {
     }
 
     #[test]
+    fn merge_composite_snapshot_sources_keeps_local_when_remote_is_absent() {
+        let local = astra_core::composite_snapshot::CompositeSnapshotIndex {
+            snapshots: vec![astra_core::composite_snapshot::CompositeSnapshot {
+                snapshot_id: "snap-local".into(),
+                session_id: "s1".into(),
+                turn: 2,
+                created_at: "2025-01-01T00:00:00Z".into(),
+                version: 1,
+                label: Some("local".into()),
+                refs: vec![],
+            }],
+        };
+
+        let merged = merge_composite_snapshot_sources("s1", local, Ok(None)).unwrap();
+
+        assert_eq!(merged.snapshots.len(), 1);
+        assert_eq!(merged.snapshots[0].snapshot_id, "snap-local");
+    }
+
+    #[test]
+    fn merge_composite_snapshot_sources_fails_loudly_on_remote_error() {
+        let local = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
+
+        let error = merge_composite_snapshot_sources(
+            "s1",
+            local,
+            Err("restore_cloud_composite_snapshot_index: corrupt artifact JSON".into()),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("list_composite_snapshots"),
+            "remote composite snapshot error should keep caller context: {error}"
+        );
+        assert!(
+            error.contains("failed to read remote composite snapshot index"),
+            "remote composite snapshot error should identify the failed source: {error}"
+        );
+        assert!(
+            error.contains("corrupt artifact JSON"),
+            "remote composite snapshot error should preserve the source error: {error}"
+        );
+    }
+
+    #[test]
     fn local_composite_snapshot_index_reads_plaintext_file() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
@@ -2801,17 +3655,55 @@ mod tests {
         assert!(ckpts.is_empty());
     }
 
+    #[tokio::test]
+    async fn local_only_cloud_checkpoint_count_returns_zero() {
+        let svc = HybridRestoreService::local_only();
+        let count = svc
+            .cloud_checkpoint_count("user1", "nonexistent")
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn cloud_checkpoint_queries_are_bounded_and_projection_aware() {
+        assert_eq!(MAX_CLOUD_RESTORE_CHECKPOINTS, 200);
+        assert!(
+            CLOUD_CHECKPOINTS_SELECT_SQL
+                .to_ascii_uppercase()
+                .contains("LIMIT ?"),
+            "cloud checkpoint restore must bound LONGTEXT reads"
+        );
+        assert!(
+            CLOUD_CHECKPOINTS_SELECT_SQL.contains("ORDER BY number DESC"),
+            "inner query must choose the latest checkpoints before applying LIMIT"
+        );
+        assert!(
+            CLOUD_CHECKPOINTS_SELECT_SQL.ends_with("ORDER BY number"),
+            "outer query must restore ascending checkpoint order for callers"
+        );
+        assert!(
+            !CLOUD_CHECKPOINT_COUNT_SQL.contains("contract_state_json"),
+            "checkpoint count must not read LONGTEXT checkpoint bodies"
+        );
+        assert!(
+            CLOUD_CHECKPOINT_COUNT_SQL
+                .to_ascii_uppercase()
+                .contains("COUNT(*)"),
+            "checkpoint count must stay a lightweight aggregate"
+        );
+    }
+
     // ── Checkpoint convergence ──
 
     #[test]
-    fn checkpoint_fields_for_cloud_push() {
-        // Verify Checkpoint struct has all fields needed by MatrixOneSyncService::push_checkpoint
+    fn checkpoint_tools_json_for_cloud_push_is_canonical() {
         let ckpt = crate::session_checkpoint::Checkpoint {
             number: 3,
             turn: 15,
             title: "Phase A done".into(),
             summary: "Token efficiency implemented".into(),
-            tools_used: vec!["bash".into(), "grep".into()],
+            tools_used: vec![" bash ".into(), "bash".into(), "".into(), " grep".into()],
             total_tokens: 50_000,
             had_stalls: true,
             error_count: 1,
@@ -2821,8 +3713,7 @@ mod tests {
         assert_eq!(ckpt.turn, 15);
         assert!(ckpt.had_stalls);
         assert_eq!(ckpt.error_count, 1);
-        let tools_json = serde_json::to_string(&ckpt.tools_used).unwrap();
-        assert!(tools_json.contains("bash"));
+        assert_eq!(checkpoint_tools_json(&ckpt), r#"["bash","grep"]"#);
     }
 
     #[test]
@@ -2877,7 +3768,7 @@ mod tests {
             "plan_config": "{\"step_by_step\":true}",
             "plan_execution_rounds": 3
         }"#;
-        let (plan, goal, config, rounds) = extract_plan_from_metadata(metadata);
+        let (plan, goal, config, rounds) = extract_plan_from_metadata(metadata).unwrap();
         assert!(plan.is_some());
         assert!(plan.unwrap().contains("subtasks"));
         assert_eq!(goal, Some("Build feature X".to_string()));
@@ -2887,7 +3778,7 @@ mod tests {
 
     #[test]
     fn extract_plan_from_metadata_empty() {
-        let (plan, goal, config, rounds) = extract_plan_from_metadata("{}");
+        let (plan, goal, config, rounds) = extract_plan_from_metadata("{}").unwrap();
         assert!(plan.is_none());
         assert!(goal.is_none());
         assert!(config.is_none());
@@ -2895,18 +3786,18 @@ mod tests {
     }
 
     #[test]
-    fn extract_plan_from_metadata_invalid_json() {
-        let (plan, goal, config, rounds) = extract_plan_from_metadata("not json");
-        assert!(plan.is_none());
-        assert!(goal.is_none());
-        assert!(config.is_none());
-        assert_eq!(rounds, 0);
+    fn extract_plan_from_metadata_invalid_json_fails_loudly() {
+        let error = extract_plan_from_metadata("not json").expect_err("invalid JSON must fail");
+        assert!(
+            error.contains("parse failed"),
+            "invalid metadata should fail loudly: {error}"
+        );
     }
 
     #[test]
     fn extract_plan_from_metadata_partial() {
         let metadata = r#"{"plan_goal": "Fix bug", "plan_execution_rounds": 1}"#;
-        let (plan, goal, config, rounds) = extract_plan_from_metadata(metadata);
+        let (plan, goal, config, rounds) = extract_plan_from_metadata(metadata).unwrap();
         assert!(plan.is_none());
         assert_eq!(goal, Some("Fix bug".to_string()));
         assert!(config.is_none());
@@ -2923,7 +3814,8 @@ mod tests {
             2,
             Some("main"),
             Some("gpt-5.4"),
-        );
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(
             parsed.get("agent_id").and_then(|v| v.as_str()),
@@ -2958,7 +3850,8 @@ mod tests {
             0,
             None,
             Some(" default "),
-        );
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
         assert!(parsed.get("model").is_none());
     }
@@ -2975,7 +3868,8 @@ mod tests {
             0,
             None,
             None,
-        );
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(
             parsed.get("agent_id").and_then(|v| v.as_str()),
@@ -2987,6 +3881,37 @@ mod tests {
         assert!(parsed.get("plan_execution_rounds").is_none());
         assert!(parsed.get("git_branch").is_none());
         assert!(parsed.get("model").is_none());
+    }
+
+    #[test]
+    fn merge_session_state_metadata_fails_loudly_on_corrupt_existing_metadata() {
+        let error =
+            merge_session_state_metadata(Some("{not-json"), None, None, None, 0, None, None)
+                .unwrap_err();
+
+        assert!(
+            error.contains("session metadata JSON parse failed before merge"),
+            "merge must report corrupt existing metadata: {error}"
+        );
+        assert!(
+            error.contains("payload_prefix"),
+            "merge error should include bounded payload context: {error}"
+        );
+    }
+
+    #[test]
+    fn merge_session_state_metadata_fails_loudly_on_non_object_existing_metadata() {
+        let error =
+            merge_session_state_metadata(Some("[]"), None, None, None, 0, None, None).unwrap_err();
+
+        assert!(
+            error.contains("session metadata JSON must be an object before merge"),
+            "merge must reject non-object metadata: {error}"
+        );
+        assert!(
+            error.contains("array"),
+            "merge error should identify the JSON type: {error}"
+        );
     }
 
     #[test]
@@ -3006,7 +3931,7 @@ mod tests {
                 "total_tokens_used": 12345
             }
         }"#;
-        let state = extract_session_state_from_metadata(metadata);
+        let state = extract_session_state_from_metadata(metadata).unwrap();
         assert!(state.executing_plan_json.is_some());
         assert_eq!(state.plan_execution_rounds, 0);
         assert_eq!(state.git_branch.as_deref(), Some("feature/cloud-sync"));
@@ -3015,7 +3940,7 @@ mod tests {
 
     #[test]
     fn extract_session_state_from_metadata_drops_symbolic_default_model() {
-        let state = extract_session_state_from_metadata(r#"{"model":"default"}"#);
+        let state = extract_session_state_from_metadata(r#"{"model":"default"}"#).unwrap();
         assert_eq!(state.model, None);
     }
 
@@ -3264,6 +4189,37 @@ mod tests {
     }
 
     #[test]
+    fn recent_tools_from_context_trace_drops_blank_tool_names() {
+        let trace = session_workspace::ContextTraceSignal {
+            turn_id: "turn-blank-tools".into(),
+            captured_at: None,
+            tool_surface: Some(session_workspace::ContextTraceToolSurface {
+                tools_available: 5,
+                visible_tools: vec![
+                    "".into(),
+                    "  ".into(),
+                    " rg ".into(),
+                    "rg".into(),
+                    " bash".into(),
+                ],
+                surface_scope: "latest_round".into(),
+                latency_ms: 3,
+            }),
+            memory: None,
+            history: None,
+            budget: None,
+            timing: None,
+            explanations: Vec::new(),
+        };
+
+        assert_eq!(
+            recent_tools_from_context_trace(Some(&trace)),
+            vec!["rg".to_string(), "bash".to_string()],
+            "resume recent_tools must contain canonical non-empty tool names only"
+        );
+    }
+
+    #[test]
     fn parse_cloud_heavy_checkpoint_state_accepts_only_tagged_shape() {
         let messages = vec![serde_json::json!({"role":"user","content":"hi"})];
         let approval_overrides = serde_json::json!({"rules": []});
@@ -3312,7 +4268,79 @@ mod tests {
     }
 
     #[test]
-    fn parse_cloud_heavy_checkpoint_state_keeps_corrupt_json_as_absent() {
-        assert_eq!(parse_cloud_heavy_checkpoint_state("{not-json"), Ok(None));
+    fn parse_cloud_heavy_checkpoint_state_normalizes_recent_tools() {
+        let checkpoint = serde_json::json!({
+            "Heavy": {
+                "messages": [],
+                "blocked_tools": [],
+                "recent_tools": ["", "  ", " rg ", "rg", " bash"]
+            }
+        })
+        .to_string();
+
+        let state = parse_cloud_heavy_checkpoint_state(&checkpoint)
+            .unwrap()
+            .expect("tagged heavy checkpoint should restore");
+
+        assert_eq!(
+            state.recent_tools,
+            vec!["rg".to_string(), "bash".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_cloud_heavy_checkpoint_state_rejects_corrupt_json() {
+        let error = parse_cloud_heavy_checkpoint_state("{not-json").unwrap_err();
+        assert!(error.contains("invalid cloud heavy checkpoint JSON"));
+    }
+
+    #[test]
+    fn parse_cloud_heavy_checkpoint_state_rejects_missing_required_heavy_fields() {
+        for field in ["messages", "blocked_tools", "recent_tools"] {
+            let mut heavy = serde_json::Map::new();
+            heavy.insert("messages".into(), serde_json::json!([]));
+            heavy.insert("blocked_tools".into(), serde_json::json!([]));
+            heavy.insert("recent_tools".into(), serde_json::json!([]));
+            heavy.remove(field);
+            let checkpoint = serde_json::json!({ "Heavy": heavy }).to_string();
+
+            let error = parse_cloud_heavy_checkpoint_state(&checkpoint).unwrap_err();
+            assert!(
+                error.contains(&format!("field={field}")),
+                "error should identify missing field {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_cloud_heavy_checkpoint_state_rejects_null_or_corrupt_required_fields() {
+        for (field, value) in [
+            ("messages", serde_json::Value::Null),
+            ("blocked_tools", serde_json::Value::Null),
+            ("recent_tools", serde_json::Value::Null),
+            ("messages", serde_json::json!("not-array")),
+            ("blocked_tools", serde_json::json!([1])),
+            ("recent_tools", serde_json::json!({"tool": "rg"})),
+        ] {
+            let mut heavy = serde_json::Map::new();
+            heavy.insert("messages".into(), serde_json::json!([]));
+            heavy.insert("blocked_tools".into(), serde_json::json!([]));
+            heavy.insert("recent_tools".into(), serde_json::json!([]));
+            heavy.insert(field.into(), value);
+            let checkpoint = serde_json::json!({ "Heavy": heavy }).to_string();
+
+            let error = parse_cloud_heavy_checkpoint_state(&checkpoint).unwrap_err();
+            assert!(
+                error.contains(&format!("field={field}")),
+                "error should identify corrupt field {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_cloud_heavy_checkpoint_state_rejects_non_object_heavy_payload() {
+        let checkpoint = serde_json::json!({ "Heavy": "not-object" }).to_string();
+        let error = parse_cloud_heavy_checkpoint_state(&checkpoint).unwrap_err();
+        assert!(error.contains("field=Heavy"));
     }
 }

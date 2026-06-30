@@ -10,8 +10,9 @@
 use astra_core::SharedPool;
 use astra_services::team_persistence::{
     MatrixOneTeamStore, TeamBudget, TeamCoordination, TeamDefinition, TeamMemberDef,
-    TeamPersistenceService, WorktreeMode,
+    TeamPersistenceService, TeamSnapshotRecord, WorktreeMode,
 };
+use serial_test::serial;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -28,6 +29,13 @@ async fn cleanup_team(pool: &sqlx::Pool<sqlx::MySql>, team_id: &str) {
         .await;
     let _ = sqlx::query("DELETE FROM team_definitions WHERE team_id = ?")
         .bind(team_id)
+        .execute(pool)
+        .await;
+}
+
+async fn cleanup_snapshot(pool: &sqlx::Pool<sqlx::MySql>, snapshot_id: &str) {
+    let _ = sqlx::query("DELETE FROM team_snapshots WHERE snapshot_id = ?")
+        .bind(snapshot_id)
         .execute(pool)
         .await;
 }
@@ -76,6 +84,7 @@ fn test_team(suffix: &str, coord: TeamCoordination) -> TeamDefinition {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
 async fn team_crud_roundtrip() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -132,6 +141,7 @@ async fn team_crud_roundtrip() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
 async fn save_team_rejects_primary_key_collision_with_different_logical_team() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -179,6 +189,7 @@ async fn save_team_rejects_primary_key_collision_with_different_logical_team() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
 async fn execution_history_lifecycle() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -232,6 +243,7 @@ async fn execution_history_lifecycle() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
 async fn execution_history_respects_limit() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -271,6 +283,7 @@ async fn execution_history_respects_limit() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
 async fn coordination_variants_roundtrip() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -323,6 +336,7 @@ async fn coordination_variants_roundtrip() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
 async fn budget_and_max_parallel_roundtrip() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -368,10 +382,120 @@ async fn budget_and_max_parallel_roundtrip() {
     cleanup_team(&pool, &team.team_id).await;
 }
 
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
+async fn load_team_rejects_corrupt_context_json_on_live_matrixone() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let store = MatrixOneTeamStore::new(pool.clone());
+    let team = test_team("badctx", TeamCoordination::Pipeline);
+    cleanup_team(&pool, &team.team_id).await;
+
+    store.save_team(&team).await.expect("save_team");
+    sqlx::query("UPDATE team_definitions SET context_json = 'not-json' WHERE team_id = ?")
+        .bind(&team.team_id)
+        .execute(&pool)
+        .await
+        .expect("corrupt context_json");
+
+    let err = store
+        .load_team(&team.user_id, &team.name)
+        .await
+        .expect_err("corrupt persisted context_json must fail loudly");
+    assert!(
+        err.contains("team_definitions row decode column `context_json`"),
+        "unexpected error: {err}"
+    );
+
+    cleanup_team(&pool, &team.team_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
+async fn record_execution_complete_rejects_invalid_result_json_on_live_matrixone() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let store = MatrixOneTeamStore::new(pool.clone());
+    let team = test_team("bad-result", TeamCoordination::Pipeline);
+    cleanup_team(&pool, &team.team_id).await;
+
+    store.save_team(&team).await.expect("save_team");
+    let exec_id = format!("it-exec-bad-json-{}", Uuid::new_v4());
+    store
+        .record_execution_start(&exec_id, &team.team_id, &team.user_id, "build")
+        .await
+        .expect("record_execution_start");
+
+    let err = store
+        .record_execution_complete(&exec_id, "completed", Some("{not-json"))
+        .await
+        .expect_err("invalid execution result_json must not be persisted");
+    assert!(
+        err.contains("team execution result_json must be valid JSON"),
+        "unexpected error: {err}"
+    );
+
+    let rows = store
+        .list_executions(&team.team_id, 10)
+        .await
+        .expect("list executions after rejected completion");
+    assert_eq!(rows[0].status, "running");
+    assert!(rows[0].result_json.is_none());
+
+    cleanup_team(&pool, &team.team_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
+async fn list_snapshots_rejects_null_required_label_on_live_matrixone() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let store = MatrixOneTeamStore::new(pool.clone());
+    let snapshot_id = format!("it-snap-{}", Uuid::new_v4());
+    let team_name = format!("it-snap-team-{}", Uuid::new_v4().simple());
+    let user_id = format!("it-snap-user-{}", Uuid::new_v4());
+    cleanup_snapshot(&pool, &snapshot_id).await;
+
+    store
+        .save_snapshot(&TeamSnapshotRecord {
+            snapshot_id: snapshot_id.clone(),
+            team_name: team_name.clone(),
+            user_id: user_id.clone(),
+            label: "before refactor".to_string(),
+            git_commit: None,
+            session_id: None,
+            team_definition_json: None,
+            created_at: String::new(),
+        })
+        .await
+        .expect("save snapshot");
+
+    sqlx::query("UPDATE team_snapshots SET label = NULL WHERE snapshot_id = ?")
+        .bind(&snapshot_id)
+        .execute(&pool)
+        .await
+        .expect("corrupt snapshot label");
+
+    let err = store
+        .list_snapshots(&team_name, &user_id, 10)
+        .await
+        .expect_err("null persisted snapshot label must fail loudly");
+    assert!(
+        err.contains("team_snapshots row decode column `label`"),
+        "unexpected error: {err}"
+    );
+
+    cleanup_snapshot(&pool, &snapshot_id).await;
+}
+
 // ─── Builtins Seeding ───────────────────────────────────────────────────────
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+#[serial]
 async fn ensure_builtins_idempotent() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();

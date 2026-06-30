@@ -160,21 +160,8 @@ pub(super) async fn record_user_skill_evaluation_handler(
 > {
     let user = state.auth_service.current_user(&headers).await?;
     let store = require_personal_skill_store(&state)?;
-    let versions = store
-        .list_versions(&user.user_id, &skill_name)
-        .await
-        .map_err(map_personal_skill_error)?;
-    let owns_version = versions.iter().any(|version| {
-        version.source_id == request.source_id && version.version_id == request.version_id
-    });
-    if !owns_version {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            format!("skill version not found for {skill_name}"),
-        ));
-    }
     store
-        .record_evaluation(request)
+        .record_evaluation(&user.user_id, &skill_name, request)
         .await
         .map(|record| (StatusCode::CREATED, Json(record)))
         .map_err(map_personal_skill_error)

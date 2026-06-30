@@ -156,6 +156,7 @@ impl TeamExecutionOrchestrator {
         warn_persist!(
             self.run_engine
                 .append_event(
+                    &self.config.user_id,
                     &parent_run_id,
                     serde_json::json!({
                         "event_type": "team_prepare",
@@ -177,7 +178,13 @@ impl TeamExecutionOrchestrator {
                 drop(registry);
                 warn_persist!(
                     self.run_engine
-                        .persist_status(&parent_run_id, "failed", None, Some(&e))
+                        .persist_status(
+                            &self.config.user_id,
+                            &parent_run_id,
+                            "failed",
+                            None,
+                            Some(&e),
+                        )
                         .await,
                     "Failed to run_engine.persist_status"
                 );
@@ -274,6 +281,7 @@ impl TeamExecutionOrchestrator {
                         warn_persist!(
                             self.run_engine
                                 .persist_status(
+                                    &self.config.user_id,
                                     &parent_run_id,
                                     "failed",
                                     None,
@@ -303,7 +311,7 @@ impl TeamExecutionOrchestrator {
         .to_string();
         warn_persist!(
             self.run_engine
-                .persist_checkpoint(&parent_run_id, &checkpoint)
+                .persist_checkpoint(&self.config.user_id, &parent_run_id, &checkpoint)
                 .await,
             "Failed to run_engine.persist_checkpoint"
         );
@@ -316,6 +324,7 @@ impl TeamExecutionOrchestrator {
         warn_persist!(
             self.run_engine
                 .append_event(
+                    &self.config.user_id,
                     &parent_run_id,
                     serde_json::json!({
                         "event_type": "team_execute_start",
@@ -419,7 +428,13 @@ impl TeamExecutionOrchestrator {
             Err(e) => {
                 warn_persist!(
                     self.run_engine
-                        .persist_status(&parent_run_id, "failed", None, Some(&e))
+                        .persist_status(
+                            &self.config.user_id,
+                            &parent_run_id,
+                            "failed",
+                            None,
+                            Some(&e),
+                        )
                         .await,
                     "Failed to run_engine.persist_status"
                 );
@@ -471,7 +486,13 @@ impl TeamExecutionOrchestrator {
         let (total_prompt, total_completion, total_tools) = sum_usage(&delegation_result);
         warn_persist!(
             self.run_engine
-                .persist_usage(&parent_run_id, total_prompt, total_completion, total_tools)
+                .persist_usage(
+                    &self.config.user_id,
+                    &parent_run_id,
+                    total_prompt,
+                    total_completion,
+                    total_tools,
+                )
                 .await,
             "Failed to run_engine.persist_usage"
         );
@@ -486,6 +507,7 @@ impl TeamExecutionOrchestrator {
             warn_persist!(
                 self.run_engine
                     .append_event(
+                        &self.config.user_id,
                         &parent_run_id,
                         serde_json::json!({
                             "event_type": "team_budget_exceeded",
@@ -502,6 +524,7 @@ impl TeamExecutionOrchestrator {
         warn_persist!(
             self.run_engine
                 .append_event(
+                    &self.config.user_id,
                     &parent_run_id,
                     serde_json::json!({
                         "event_type": "team_execute_complete",
@@ -569,7 +592,13 @@ impl TeamExecutionOrchestrator {
         // Persist final run status
         warn_persist!(
             self.run_engine
-                .persist_status(&parent_run_id, &status.to_string(), None, error.as_deref())
+                .persist_status(
+                    &self.config.user_id,
+                    &parent_run_id,
+                    &status.to_string(),
+                    None,
+                    error.as_deref(),
+                )
                 .await,
             "Failed to run_engine.persist_status"
         );
@@ -597,6 +626,7 @@ impl TeamExecutionOrchestrator {
         warn_persist!(
             self.run_engine
                 .append_event(
+                    &self.config.user_id,
                     &parent_run_id,
                     serde_json::json!({
                         "event_type": "team_complete",
@@ -917,7 +947,7 @@ mod tests {
 
         // The parent run should have events logged
         let run = run_engine
-            .load_run(&report.parent_run_id)
+            .load_run("test-user", &report.parent_run_id)
             .await
             .unwrap()
             .unwrap();
@@ -951,7 +981,7 @@ mod tests {
         assert_eq!(report.status, TeamExecutionStatus::Completed);
 
         let run = run_engine
-            .load_run(&report.parent_run_id)
+            .load_run("test-user", &report.parent_run_id)
             .await
             .unwrap()
             .unwrap();
@@ -969,13 +999,13 @@ mod tests {
         assert_eq!(report.status, TeamExecutionStatus::Completed);
 
         let run = run_engine
-            .load_run(&report.parent_run_id)
+            .load_run("test-user", &report.parent_run_id)
             .await
             .unwrap()
             .unwrap();
         // Typed checkpoint should be set after preparation phase
         let checkpoint = run_engine
-            .load_latest_checkpoint(&report.parent_run_id, Some("phase"))
+            .load_latest_checkpoint("test-user", &report.parent_run_id, Some("phase"))
             .await
             .unwrap()
             .expect("expected typed checkpoint to be persisted");
@@ -1438,7 +1468,7 @@ mod tests {
 
         // Verify the event carries enforcement=post_execution
         let run = run_engine
-            .load_run(&report.parent_run_id)
+            .load_run("u1", &report.parent_run_id)
             .await
             .unwrap()
             .expect("run record should exist");
@@ -1490,13 +1520,14 @@ mod tests {
                 other => return Err(format!("expected Completed, got {other:?}")),
             }
 
+            let prompt_tokens = state.provider_input_tokens();
             Ok(AgentResult {
                 agent_id: config.agent_profile.agent_id.clone(),
                 run_id: config.run_id.clone(),
                 status: STATUS_COMPLETED.to_string(),
                 output: Some(state.final_text),
                 error: None,
-                prompt_tokens: state.total_prompt,
+                prompt_tokens,
                 completion_tokens: state.total_completion,
                 tool_calls: state.total_tool_calls,
             })
@@ -1537,13 +1568,14 @@ mod tests {
                 other => return Err(format!("expected Completed, got {other:?}")),
             }
 
+            let prompt_tokens = state.provider_input_tokens();
             Ok(AgentResult {
                 agent_id: config.agent_profile.agent_id.clone(),
                 run_id: config.run_id.clone(),
                 status: STATUS_COMPLETED.to_string(),
                 output: Some(state.final_text),
                 error: None,
-                prompt_tokens: state.total_prompt,
+                prompt_tokens,
                 completion_tokens: state.total_completion,
                 tool_calls: state.total_tool_calls,
             })

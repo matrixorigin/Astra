@@ -43,6 +43,7 @@ use astra_turn_core::sse_data_lines::{
     validated_drain_sse_data_lines, validated_finish_sse_data_buffer,
 };
 use astra_turn_core::thinking_config::ThinkingConfig;
+use astra_turn_core::tool_call_shape::tool_call_name;
 
 /// Redact common provider secret patterns from a string before logging.
 ///
@@ -130,11 +131,15 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         let connect = llm_connect_timeout();
         let total = std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S + 60);
+        let pool_idle = std::env::var("ASTRA_LLM_POOL_MAX_IDLE_PER_HOST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4usize);
         let mut builder = reqwest::Client::builder()
             .connect_timeout(connect)
             // Use a generous timeout; per-request timeout handled via tokio::time::timeout
             .timeout(total)
-            .pool_max_idle_per_host(4);
+            .pool_max_idle_per_host(pool_idle);
         // Honour HTTPS_PROXY / ALL_PROXY env vars (reqwest default-features=false
         // does not auto-read system proxy, so we wire it up explicitly).
         builder = apply_env_proxy(builder);
@@ -143,7 +148,7 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
             Ok(client) => {
                 tracing::info!(
                     target: "astra_runtime::llm_client",
-                    pool_max_idle_per_host = 4,
+                    pool_max_idle_per_host = pool_idle,
                     connect_timeout_s = connect.as_secs(),
                     total_timeout_s = total.as_secs(),
                     "global LLM HTTP client built"
@@ -210,6 +215,10 @@ fn is_valid_tool_name(name: &str) -> bool {
         && !name.chars().any(char::is_whitespace)
 }
 
+fn canonical_valid_tool_name(name: &str) -> Option<&str> {
+    astra_core::canonical_names::normalize_name(name).filter(|name| is_valid_tool_name(name))
+}
+
 // ── System Prompt ─────────────────────────────────────────────────────────
 
 /// Build a system prompt for the given tool+profile context.
@@ -228,10 +237,6 @@ pub(crate) fn cached_system_prompt(
     )
 }
 
-/// Classify an LLM error message into an [`ErrorKind`].
-///
-/// Used only for legacy callers that still have string errors. New code should
-/// construct [`ClassifiedError`] at the source.
 /// Detect TPM (tokens per minute) exhaustion errors.
 ///
 /// TPM errors require longer wait times because they indicate the account-level
@@ -808,7 +813,7 @@ fn build_bedrock_tool_blocks(tool_calls: Option<&Vec<Value>>) -> Vec<Value> {
         .filter_map(|tool_call| {
             let id = tool_call.get("id").and_then(Value::as_str)?;
             let function = tool_call.get("function")?.as_object()?;
-            let name = function.get("name").and_then(Value::as_str)?;
+            let name = tool_call_name(tool_call)?;
             let input = function
                 .get("arguments")
                 .and_then(Value::as_str)
@@ -1884,7 +1889,11 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
         .filter_map(|m| {
             let id = m.get("tool_call_id").and_then(Value::as_str)?.to_string();
-            let name = m.get("name").and_then(Value::as_str)?.to_string();
+            let name = m
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(astra_core::canonical_names::normalize_name)?
+                .to_string();
             Some((id, name))
         })
         .collect();
@@ -1908,8 +1917,16 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
                 .unwrap_or("")
                 .to_string();
             if let Some(func) = tc.get_mut("function") {
-                let name = func.get("name").and_then(Value::as_str).unwrap_or("");
-                if name.is_empty() {
+                let canonical_name = func
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .and_then(astra_core::canonical_names::normalize_name)
+                    .map(std::string::ToString::to_string);
+                if let Some(name) = canonical_name {
+                    if let Some(f) = func.as_object_mut() {
+                        f.insert("name".to_string(), Value::String(name));
+                    }
+                } else {
                     let recovered = tool_name_by_id
                         .get(&call_id)
                         .map(|s| s.as_str())
@@ -1953,7 +1970,7 @@ fn anthropic_text_blocks_from_content(content: Option<&Value>) -> Vec<Value> {
 fn openai_tool_call_to_anthropic_block(tool_call: &Value) -> Option<Value> {
     let id = tool_call.get("id").and_then(Value::as_str)?;
     let function = tool_call.get("function")?.as_object()?;
-    let name = function.get("name").and_then(Value::as_str)?;
+    let name = tool_call_name(tool_call)?;
     let input = function
         .get("arguments")
         .and_then(Value::as_str)
@@ -2963,7 +2980,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
         }
 
         // Context-window errors — classified at source, no string prefix needed.
-        if status == 400 && astra_core::is_context_window_error(&text.to_lowercase()) {
+        if status == 400 && astra_core::is_llm_context_window_error(&text) {
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContextWindow,
                 format!("LLM error {status}: {text}"),
@@ -3205,8 +3222,10 @@ async fn collect_llm_stream(
                     let Some(f) = f.as_object_mut() else {
                         continue;
                     };
-                    if let Some(name) = func.get("name").and_then(Value::as_str)
-                        && is_valid_tool_name(name)
+                    if let Some(name) = func
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .and_then(canonical_valid_tool_name)
                     {
                         f.insert("name".to_string(), Value::String(name.to_string()));
                         made_progress = true;
@@ -3776,7 +3795,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
             astra_core::ErrorKind::RateLimit
         } else if status >= 500 {
             astra_core::ErrorKind::ServerError
-        } else if status == 400 && astra_core::is_context_window_error(&text.to_lowercase()) {
+        } else if status == 400 && astra_core::is_llm_context_window_error(&text) {
             astra_core::ErrorKind::ContextWindow
         } else if status == 400 {
             astra_core::ErrorKind::InvalidRequest
@@ -4914,6 +4933,51 @@ mod tests {
         let parsed: Value = serde_json::from_str(args).expect("valid merged JSON args");
         assert_eq!(parsed, json!({"foo":"bar"}));
         assert_eq!(res.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_canonicalizes_tool_call_name() {
+        let c1 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":" bash ","arguments":"{}"}}]}}]});
+        let body = format!("data: {c1}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .expect("collect");
+        assert_eq!(res.tool_calls.len(), 1);
+        assert_eq!(res.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
+    }
+
+    #[test]
+    fn bedrock_tool_blocks_canonicalize_tool_call_names() {
+        let tool_calls = vec![json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": " bash ", "arguments": "{\"command\":\"pwd\"}"}
+        })];
+        let blocks = build_bedrock_tool_blocks(Some(&tool_calls));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["toolUse"]["name"].as_str(), Some("bash"));
+        assert_eq!(blocks[0]["toolUse"]["input"], json!({"command": "pwd"}));
+    }
+
+    #[test]
+    fn openai_tool_call_to_anthropic_block_canonicalizes_name() {
+        let tool_call = json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": " bash ", "arguments": "{\"command\":\"pwd\"}"}
+        });
+        let block = openai_tool_call_to_anthropic_block(&tool_call).expect("tool_use block");
+        assert_eq!(block["name"].as_str(), Some("bash"));
+        assert_eq!(block["input"], json!({"command": "pwd"}));
     }
 
     #[tokio::test]
@@ -7178,6 +7242,30 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(tc_name, "_unknown");
+    }
+
+    #[test]
+    fn consolidate_canonicalizes_tool_call_names_and_recovered_tool_result_names() {
+        let msgs = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": " bash ", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": " ", "arguments": "{}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "c2", "name": " skill ", "content": "result"}),
+        ];
+        let out = consolidate_system_messages(&msgs);
+        assert_eq!(
+            out[0]["tool_calls"][0]["function"]["name"].as_str(),
+            Some("bash")
+        );
+        assert_eq!(
+            out[0]["tool_calls"][1]["function"]["name"].as_str(),
+            Some("skill")
+        );
     }
 
     #[test]

@@ -13,6 +13,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+use astra_core::canonical_names::normalize_name_list;
+
 use crate::{
     SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore,
     StoredSessionArtifact,
@@ -26,6 +28,17 @@ fn is_zero(v: &usize) -> bool {
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
+}
+
+fn canonical_workspace_metadata(metadata: &WorkspaceMetadata) -> WorkspaceMetadata {
+    let mut canonical = metadata.clone();
+    canonical.discovered_skills = normalize_name_list(&canonical.discovered_skills);
+    if let Some(trace) = canonical.last_context_trace.as_mut()
+        && let Some(surface) = trace.tool_surface.as_mut()
+    {
+        surface.visible_tools = normalize_name_list(&surface.visible_tools);
+    }
+    canonical
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -595,6 +608,7 @@ pub fn to_remote_artifact_record(
     metadata: &WorkspaceMetadata,
     user_id: &str,
 ) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
+    let metadata = canonical_workspace_metadata(metadata);
     Ok(SessionArtifactJsonRecord {
         artifact_id: String::new(),
         session_id: metadata.session_id.clone(),
@@ -603,7 +617,7 @@ pub fn to_remote_artifact_record(
         source: Some("workspace_metadata".to_string()),
         turn: Some(metadata.turn_count),
         round: None,
-        content: serde_json::to_value(metadata)?,
+        content: serde_json::to_value(&metadata)?,
         metadata: Some(json!({
             "model": astra_core::model_override::normalize_model_override(metadata.model.as_deref()),
             "status": metadata.status,
@@ -645,11 +659,12 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
 
 /// Write workspace metadata to disk.
 pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
+    let metadata = canonical_workspace_metadata(metadata);
     let dir = validated_workspace_dir(&metadata.session_id)?;
     std::fs::create_dir_all(&dir)?;
     sync_parent_dir(&dir)?;
     let path = dir.join("workspace.yaml");
-    let yaml = serde_yaml_ng::to_string(metadata)
+    let yaml = serde_yaml_ng::to_string(&metadata)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     // Atomic write: tmp → fsync → rename → fsync parent
@@ -1151,6 +1166,65 @@ mod tests {
         let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.last_context_trace, ws.last_context_trace);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn workspace_persistence_canonicalizes_tool_and_skill_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+
+        let session_id = "workspace-canonical-names";
+        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-4", "/tmp", Some("main"));
+        ws.discovered_skills = vec![
+            "".into(),
+            " review ".into(),
+            "review".into(),
+            " planning".into(),
+        ];
+        ws.last_context_trace = Some(ContextTraceSignal {
+            turn_id: "turn-7".into(),
+            captured_at: None,
+            tool_surface: Some(ContextTraceToolSurface {
+                tools_available: 4,
+                visible_tools: vec![" ".into(), " rg ".into(), "rg".into(), "bash".into()],
+                surface_scope: "latest_round".into(),
+                latency_ms: 18,
+            }),
+            memory: None,
+            history: None,
+            budget: None,
+            timing: None,
+            explanations: Vec::new(),
+        });
+
+        write_workspace(&ws).unwrap();
+        let parsed = read_workspace(session_id).unwrap();
+        assert_eq!(
+            parsed.discovered_skills,
+            vec!["review".to_string(), "planning".to_string()]
+        );
+        assert_eq!(
+            parsed
+                .last_context_trace
+                .as_ref()
+                .and_then(|trace| trace.tool_surface.as_ref())
+                .map(|surface| surface.visible_tools.clone())
+                .unwrap(),
+            vec!["rg".to_string(), "bash".to_string()]
+        );
+
+        let record = to_remote_artifact_record(&ws, "user-1").unwrap();
+        assert_eq!(
+            record.content["discovered_skills"],
+            serde_json::json!(["review", "planning"])
+        );
+        assert_eq!(
+            record.content["last_context_trace"]["tool_surface"]["visible_tools"],
+            serde_json::json!(["rg", "bash"])
+        );
     }
 
     #[test]

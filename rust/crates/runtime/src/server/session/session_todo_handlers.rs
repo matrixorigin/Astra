@@ -28,6 +28,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 
+const SESSION_TODO_OWNER_LOCK_SQL: &str =
+    "SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? FOR UPDATE";
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecuteTodoRequest {
@@ -396,13 +399,13 @@ async fn ensure_session_todo_session_owner(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
-    let session_owner: Option<(String,)> =
-        sqlx::query_as("SELECT user_id FROM agent_sessions WHERE session_id = ? FOR UPDATE")
-            .bind(session_id)
-            .fetch_optional(&mut *executor)
-            .await
-            .map_err(|e| e.to_string())?;
-    if session_owner.as_ref().map(|(owner,)| owner.as_str()) == Some(user_id) {
+    let session_exists: Option<(i32,)> = sqlx::query_as(SESSION_TODO_OWNER_LOCK_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(&mut *executor)
+        .await
+        .map_err(|e| e.to_string())?;
+    if session_exists.is_some() {
         Ok(())
     } else {
         Err(session_todo_owner_mismatch_error(
@@ -1095,6 +1098,24 @@ pub(crate) async fn list_user_todos_handler(
 
     let status_filter = normalize_user_todos_status_filter(query.status.as_deref())?;
 
+    let invalid_status: Option<String> = sqlx::query_scalar(
+        "SELECT st.status \
+         FROM session_todos st FORCE INDEX (idx_session_todos_user_status_updated) \
+         WHERE st.user_id = ? \
+           AND st.status NOT IN ('pending', 'in_progress', 'paused', 'completed', 'failed', 'cancelled', 'archived', 'deleted', 'migrated') \
+         ORDER BY st.updated_at DESC LIMIT 1",
+    )
+    .bind(&user.user_id)
+    .fetch_optional(pool.get())
+    .await
+    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(status) = invalid_status {
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("session_todos.status contains invalid status '{status}'"),
+        ));
+    }
+
     // U-12: LEFT JOIN agent_sessions so each row carries session
     // recency context. The `created_at` / `title` from agent_sessions
     // is NULL when the session was deleted — we surface it as
@@ -1148,8 +1169,7 @@ pub(crate) async fn list_user_todos_handler(
              FROM session_todos st FORCE INDEX (idx_session_todos_user_status_updated) \
              LEFT JOIN agent_sessions s ON s.session_id = st.session_id \
              WHERE st.user_id = ? \
-               AND (st.status IN ('pending', 'in_progress', 'paused') \
-                    OR st.status NOT IN ('pending', 'in_progress', 'paused', 'completed', 'failed', 'cancelled', 'archived', 'deleted', 'migrated')) \
+               AND st.status IN ('pending', 'in_progress', 'paused') \
              ORDER BY st.updated_at DESC LIMIT 200",
         )
         .bind(&user.user_id)
@@ -1619,6 +1639,20 @@ mod tests {
         assert!(validate_create_idempotency_key(Some(&"x".repeat(129))).is_err());
     }
 
+    #[test]
+    fn session_todo_owner_lock_sql_is_owner_bound() {
+        let normalized = SESSION_TODO_OWNER_LOCK_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_uppercase();
+        assert!(normalized.contains("WHERE SESSION_ID = ? AND USER_ID = ?"));
+        assert!(
+            !normalized.contains("WHERE SESSION_ID = ? FOR UPDATE"),
+            "session todo owner lock must not lock by session_id before checking owner"
+        );
+    }
+
     #[tokio::test]
     async fn execute_todo_handler_rejects_idempotency_key_for_non_create_before_store_access() {
         let state = crate::AppState::new(crate::ServiceInfo::default(), Arc::new(Healthy))
@@ -1819,23 +1853,31 @@ mod tests {
         SharedPool::new(&settings).await.expect("connect matrixone")
     }
 
-    async fn cleanup_session_rows(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
-        let _ = sqlx::query("DELETE FROM session_todo_idempotency WHERE session_id = ?")
+    async fn cleanup_session_rows(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_id: &str) {
+        sqlx::query("DELETE FROM session_todo_idempotency WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
+            .bind(user_id)
             .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
+            .await
+            .expect("cleanup session todo handler fixture session_todo_idempotency");
+        sqlx::query("DELETE FROM session_todos WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
+            .bind(user_id)
             .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
+            .await
+            .expect("cleanup session todo handler fixture session_todos");
+        sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
+            .bind(user_id)
             .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+            .await
+            .expect("cleanup session todo handler fixture session_todo_counters");
+        sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
+            .bind(user_id)
             .execute(pool)
-            .await;
+            .await
+            .expect("cleanup session todo handler fixture agent_sessions");
     }
 
     async fn prepare_session_todo_owner(
@@ -1843,7 +1885,7 @@ mod tests {
         session_id: &str,
         user_id: &str,
     ) {
-        cleanup_session_rows(pool, session_id).await;
+        cleanup_session_rows(pool, session_id, user_id).await;
         sqlx::query(
             "INSERT INTO agent_sessions (session_id, user_id, agent_id, title, status, metadata)
              VALUES (?, ?, 'session-todo-handler-test', 'session todo handler test', 'active', '{}')",
@@ -1923,8 +1965,8 @@ mod tests {
         .expect("source status");
         assert_eq!(status, "pending", "source must remain adoptable");
 
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        cleanup_session_rows(&pool, &source_session, &user_id).await;
+        cleanup_session_rows(&pool, &target_session, &user_id).await;
     }
 
     #[tokio::test]
@@ -2022,8 +2064,8 @@ mod tests {
             "second fork_copy must preserve existing child board: {preserve}"
         );
 
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        cleanup_session_rows(&pool, &source_session, &user_id).await;
+        cleanup_session_rows(&pool, &target_session, &user_id).await;
     }
 
     #[tokio::test]
@@ -2133,7 +2175,7 @@ mod tests {
             &paused_session,
             &completed_session,
         ] {
-            cleanup_session_rows(&pool, session_id).await;
+            cleanup_session_rows(&pool, session_id, &user_id).await;
         }
     }
 
@@ -2189,7 +2231,7 @@ mod tests {
             err.1.0
         );
 
-        cleanup_session_rows(&pool, &session_id).await;
+        cleanup_session_rows(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -2261,8 +2303,8 @@ mod tests {
             serde_json::from_str(target_row.3.as_deref().unwrap_or("{}")).unwrap();
         assert_eq!(metadata["forked_from"], format!("{source_session}:task-1"));
 
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        cleanup_session_rows(&pool, &source_session, &user_id).await;
+        cleanup_session_rows(&pool, &target_session, &user_id).await;
     }
 
     #[tokio::test]
@@ -2349,8 +2391,8 @@ mod tests {
         .expect("target row count");
         assert_eq!(target_rows, 0, "rejected adopt must not create a clone");
 
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        cleanup_session_rows(&pool, &source_session, &user_id).await;
+        cleanup_session_rows(&pool, &target_session, &user_id).await;
     }
 
     #[tokio::test]
@@ -2413,8 +2455,8 @@ mod tests {
             "single-task adopt must not bring source-session task edges into target"
         );
 
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        cleanup_session_rows(&pool, &source_session, &user_id).await;
+        cleanup_session_rows(&pool, &target_session, &user_id).await;
     }
 
     #[tokio::test]
@@ -2490,7 +2532,7 @@ mod tests {
             "rejected status alias must not mutate MatrixOne task state"
         );
 
-        cleanup_session_rows(&pool, &session_id).await;
+        cleanup_session_rows(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -2627,7 +2669,7 @@ mod tests {
             "refused terminal reopen must not mutate MatrixOne task state"
         );
 
-        cleanup_session_rows(&pool, &session_id).await;
+        cleanup_session_rows(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -2770,7 +2812,7 @@ mod tests {
             "rejected subtask update must not mutate terminal history: {subtasks}"
         );
 
-        cleanup_session_rows(&pool, &session_id).await;
+        cleanup_session_rows(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -2904,7 +2946,7 @@ mod tests {
             "reopening should consume the reversible auto-completion marker: {reopened_metadata:?}"
         );
 
-        cleanup_session_rows(&pool, &session_id).await;
+        cleanup_session_rows(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -3050,7 +3092,7 @@ mod tests {
             serde_json::from_str(failed_row.2.as_deref().unwrap_or("{}")).unwrap();
         assert_eq!(metadata["error_message"], "missing Foo");
 
-        cleanup_session_rows(&pool, &session_id).await;
+        cleanup_session_rows(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -3121,7 +3163,7 @@ mod tests {
             "refused terminal adopt must not create a target clone"
         );
 
-        cleanup_session_rows(&pool, &source_session).await;
-        cleanup_session_rows(&pool, &target_session).await;
+        cleanup_session_rows(&pool, &source_session, &user_id).await;
+        cleanup_session_rows(&pool, &target_session, &user_id).await;
     }
 }

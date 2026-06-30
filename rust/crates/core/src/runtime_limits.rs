@@ -28,6 +28,11 @@ pub(crate) const DEFAULT_MAX_TOOL_RETRIES: usize = 2;
 pub(crate) const DEFAULT_RETRY_BASE_MS: u64 = 500;
 pub(crate) const DEFAULT_MAX_RETRIEVED: usize = 6;
 pub(crate) const DEFAULT_MAX_TURN_INPUT_TOKENS: u64 = 200_000;
+/// Fraction of a model's full context window made available for prompt input.
+///
+/// The remaining headroom covers output tokens and provider protocol overhead.
+/// Keep this centralized so CLI diagnostics and runtime enforcement do not drift.
+pub const MODEL_CONTEXT_INPUT_BUDGET_RATIO: f64 = 0.80;
 
 use std::sync::OnceLock;
 
@@ -122,20 +127,30 @@ impl RuntimeLimits {
 
     /// Resolve the effective max_turn_input_tokens for a given model.
     ///
-    /// When the model has a known context window, derive the model-safe
+    /// When the model registry provides a context window, derive the model-safe
     /// ceiling from it (roughly 80% — the remaining ~20% covers output
-    /// tokens and protocol overhead). The historical 200K default remains
-    /// the fallback for unknown models, but it should not clamp known
-    /// 1M-window models down to 200K unless the operator explicitly chose
-    /// a non-default limit.
+    /// tokens and protocol overhead). Without explicit model metadata, keep the
+    /// configured runtime limit. The default configured limit is 200K.
     ///
     /// `max_turn_input_tokens = 0` keeps the legacy "unlimited" sentinel:
     /// known models use their model-safe ceiling, unknown models stay
     /// uncapped.
     pub fn effective_max_turn_input_tokens(&self, model: Option<&str>) -> u64 {
-        let model_budget = model
-            .and_then(context_window_for_model)
-            .map(|window| (window as f64 * 0.80) as u64);
+        self.effective_max_turn_input_tokens_with_context_window(model, None)
+    }
+
+    /// Resolve the effective max_turn_input_tokens for a given model, allowing
+    /// the server-side model registry context_window to override static model
+    /// name heuristics.
+    pub fn effective_max_turn_input_tokens_with_context_window(
+        &self,
+        model: Option<&str>,
+        context_window_override: Option<u32>,
+    ) -> u64 {
+        let model_budget = context_window_override
+            .map(u64::from)
+            .or_else(|| model.and_then(context_window_for_model))
+            .map(|window| (window as f64 * MODEL_CONTEXT_INPUT_BUDGET_RATIO) as u64);
         let default_budget = Self::default().max_turn_input_tokens;
 
         match (model_budget, self.max_turn_input_tokens) {
@@ -147,106 +162,30 @@ impl RuntimeLimits {
     }
 }
 
-/// Known context window sizes for common models. Used by the CLI
-/// (which doesn't have access to the server-side model registry) to
-/// set per-turn token budgets correctly.
+/// Configured context window size for a model.
 ///
-/// Returns the full context window in tokens. The caller should
-/// apply a reserve (e.g., 80% for input, 20% for output).
+/// This intentionally does not infer limits from model names. The caller must
+/// pass a registry/config value via [`context_window_for_model_with_override`]
+/// when it has one; otherwise the runtime-level 200K default applies.
 /// Convenience wrapper around [`context_window_for_model_with_override`].
 pub fn context_window_for_model(model: &str) -> Option<u64> {
     context_window_for_model_with_override(model, None)
 }
 
-/// Known context window sizes for common models.
+/// Configured context window size for a model.
 ///
-/// When `config_override` is provided (from `.models.yaml` or the DB),
-/// it takes precedence over the hardcoded lookup table. When `None`, falls
-/// back to the static lookup table keyed by model name.
+/// When `config_override` is provided (from `.models.yaml` or the DB), it is
+/// the authoritative context window. When it is absent, return `None` so callers
+/// fall back to their explicit runtime default instead of guessing by model
+/// name.
 ///
 /// Returns the full context window in tokens. The caller should
 /// apply a reserve (e.g., 80% for input, 20% for output).
 pub fn context_window_for_model_with_override(
-    model: &str,
+    _model: &str,
     config_override: Option<u32>,
 ) -> Option<u64> {
-    // Dynamic override from model config — always wins.
-    if let Some(cw) = config_override {
-        return Some(cw as u64);
-    }
-
-    let lower = model.to_lowercase();
-    // OpenAI — GPT-5 family (256K context)
-    if lower.contains("gpt-5") {
-        return Some(256_000);
-    }
-    // OpenAI — GPT-4o / GPT-4.1 / GPT-4 Turbo (128K context)
-    if lower.contains("gpt-4o") || lower.contains("gpt-4.1") || lower.contains("gpt-4-turbo") {
-        return Some(128_000);
-    }
-    // OpenAI — GPT-4 generic
-    if lower.contains("gpt-4") {
-        return Some(128_000);
-    }
-    // OpenAI — GPT-3.5
-    if lower.contains("gpt-3.5") {
-        return Some(16_000);
-    }
-    // OpenAI reasoning models
-    if has_model_token(&lower, "o1") || has_model_token(&lower, "o3") {
-        return Some(200_000);
-    }
-    // Anthropic 4.6+ generation: 1M context window.
-    // The 4.6 generation (Opus 4.6, Sonnet 4.6, Haiku 4.6) advertises a 1M
-    // token context. Earlier Claude generations stay at 128K. Match the
-    // specific suffix first so legacy members still get the 128K window.
-    if lower.contains("opus-4-6")
-        || lower.contains("sonnet-4-6")
-        || lower.contains("haiku-4-6")
-        || lower.contains("opus-4-7")
-        || lower.contains("sonnet-4-7")
-        || lower.contains("haiku-4-7")
-    {
-        return Some(1_000_000);
-    }
-    if lower.contains("claude")
-        || lower.contains("opus-4")
-        || lower.contains("sonnet-4")
-        || lower.contains("haiku-4")
-    {
-        return Some(128_000);
-    }
-    // DeepSeek V4 (1M context) — must precede generic deepseek arm
-    if lower.contains("deepseek-v4") {
-        return Some(1_000_000);
-    }
-    // DeepSeek V3 / R1 (64K context)
-    if lower.contains("deepseek") {
-        return Some(64_000);
-    }
-    // Google — Gemini (1M context)
-    if lower.contains("gemini") {
-        return Some(1_000_000);
-    }
-    // Qwen (most have 1M but practical limit is lower)
-    if lower.contains("qwen") {
-        return Some(128_000);
-    }
-    // Moonshot / Kimi
-    if lower.contains("kimi") || lower.contains("moonshot") {
-        return Some(128_000);
-    }
-    // MiniMax
-    if lower.contains("minimax") {
-        return Some(200_000);
-    }
-    None
-}
-
-fn has_model_token(model: &str, token: &str) -> bool {
-    model
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|part| part == token)
+    config_override.map(u64::from)
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -314,46 +253,51 @@ mod tests {
     }
 
     #[test]
-    fn context_window_recognizes_shared_model_families() {
-        assert_eq!(context_window_for_model("gpt-5-turbo"), Some(256_000));
-        assert_eq!(context_window_for_model("gpt-3.5-turbo"), Some(16_000));
-        assert_eq!(context_window_for_model("o3-mini"), Some(200_000));
-        assert_eq!(context_window_for_model("openai/o1-preview"), Some(200_000));
-        assert_eq!(context_window_for_model("claude-3.5-sonnet"), Some(128_000));
-        assert_eq!(context_window_for_model("kimi-k2"), Some(128_000));
+    fn context_window_does_not_guess_from_model_names() {
+        assert_eq!(context_window_for_model("gpt-5-turbo"), None);
+        assert_eq!(context_window_for_model("gpt-3.5-turbo"), None);
+        assert_eq!(context_window_for_model("o3-mini"), None);
+        assert_eq!(
+            context_window_for_model("claude-sonnet-4-20250514[1m]"),
+            None
+        );
+        assert_eq!(context_window_for_model("deepseek-v4-pro"), None);
     }
 
     #[test]
-    fn context_window_does_not_misclassify_embedded_o1_or_o3_substrings() {
+    fn context_window_uses_only_explicit_override() {
         assert_eq!(
-            context_window_for_model("claude-opus-2025-v01"),
-            Some(128_000)
+            context_window_for_model_with_override("deepseek-v4-pro", Some(1_000_000)),
+            Some(1_000_000)
         );
-        assert_eq!(context_window_for_model("deepseek-chat-v03"), Some(64_000));
         assert_eq!(context_window_for_model("custom-vision-v03-beta"), None);
     }
 
     #[test]
-    fn effective_max_turn_input_tokens_uses_model_ceiling_for_default_budget() {
+    fn effective_max_turn_input_tokens_uses_default_without_context_window() {
         let limits = RuntimeLimits {
             max_turn_input_tokens: 200_000,
             ..Default::default()
         };
         assert_eq!(
             limits.effective_max_turn_input_tokens(Some("deepseek-v4-pro")),
-            800_000
+            200_000
+        );
+        assert_eq!(
+            limits.effective_max_turn_input_tokens(Some("claude-sonnet-4-20250514")),
+            200_000
         );
     }
 
     #[test]
-    fn effective_max_turn_input_tokens_never_exceeds_small_model_window() {
+    fn effective_max_turn_input_tokens_does_not_guess_small_windows() {
         let limits = RuntimeLimits {
             max_turn_input_tokens: 200_000,
             ..Default::default()
         };
         assert_eq!(
             limits.effective_max_turn_input_tokens(Some("deepseek-chat")),
-            51_200
+            200_000
         );
     }
 
@@ -377,11 +321,33 @@ mod tests {
         };
         assert_eq!(
             limits.effective_max_turn_input_tokens(Some("deepseek-v4-pro")),
-            800_000
+            0
         );
         assert_eq!(
             limits.effective_max_turn_input_tokens(Some("unknown-model")),
             0
+        );
+    }
+
+    #[test]
+    fn effective_max_turn_input_tokens_uses_configured_context_window() {
+        let limits = RuntimeLimits {
+            max_turn_input_tokens: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            limits.effective_max_turn_input_tokens_with_context_window(
+                Some("custom-model"),
+                Some(500_000)
+            ),
+            400_000
+        );
+        assert_eq!(
+            limits.effective_max_turn_input_tokens_with_context_window(
+                Some("deepseek-chat"),
+                Some(1_000_000)
+            ),
+            800_000
         );
     }
 }

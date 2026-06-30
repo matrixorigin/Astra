@@ -86,7 +86,7 @@ pub async fn plan_resume_hint_for_session(
         .await
         .ok()
         .flatten()?;
-    let state = repo.load_owned(&plan_id, user_id).await.ok()?;
+    let state = repo.load(user_id, &plan_id).await.ok()?;
     plan_resume_prompt_hint(&state)
 }
 

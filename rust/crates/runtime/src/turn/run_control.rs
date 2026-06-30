@@ -29,7 +29,11 @@ pub trait RunStatusProvider: Send + Sync {
     /// still active (or doesn't exist). Transient lookup failures must be
     /// surfaced so callers do not confuse control-plane unavailability with a
     /// durable cancel/pause signal.
-    async fn control_status(&self, run_id: &str) -> Result<Option<RunControlStatus>, String>;
+    async fn control_status(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RunControlStatus>, String>;
 }
 
 /// Polls durable user input appended to a run while the agent is executing.
@@ -37,13 +41,19 @@ pub trait RunStatusProvider: Send + Sync {
 pub trait RunInputProvider: Send + Sync {
     /// Poll deferred `user_input` events appended to a durable run after the
     /// provided exclusive cursor.
-    async fn poll_user_inputs(&self, run_id: &str, after_event_index: usize) -> RunQueuedInputPoll;
+    async fn poll_user_inputs(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_index: usize,
+    ) -> RunQueuedInputPoll;
 
     /// Mark deferred inputs as released to the model. Durable providers use this
     /// to clear an `input-queued` run status once the queued input is no longer
     /// just pending at a future tool boundary.
     async fn mark_user_inputs_released(
         &self,
+        user_id: &str,
         run_id: &str,
         event_indices: &[usize],
     ) -> Result<(), String>;

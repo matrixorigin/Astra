@@ -97,17 +97,14 @@ impl DatabaseContextService {
     pub fn snapshot_record_from_row(
         row: sqlx::mysql::MySqlRow,
     ) -> Result<SnapshotRecord, (StatusCode, Json<ErrorResponse>)> {
-        let data_json: String = row
-            .try_get("context_data_json")
-            .unwrap_or_else(|_| "{}".to_string());
+        let data_json = context_row_string(&row, "context_data_json")?;
 
         Ok(SnapshotRecord {
-            context_capture_id: row.try_get("context_capture_id").map_err(internal_error)?,
-            session_id: row.try_get("session_id").map_err(internal_error)?,
-            event_id: row.try_get("event_id").map_err(internal_error)?,
-            context_data: serde_json::from_str(&data_json)
-                .unwrap_or(serde_json::Value::Object(Default::default())),
-            created_at: row.try_get("created_at").unwrap_or_default(),
+            context_capture_id: context_row_string(&row, "context_capture_id")?,
+            session_id: context_row_string(&row, "session_id")?,
+            event_id: context_row_string(&row, "event_id")?,
+            context_data: parse_context_json("context_data_json", &data_json)?,
+            created_at: context_row_string(&row, "created_at")?,
         })
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
@@ -126,7 +123,7 @@ impl DatabaseContextService {
 
 const SNAPSHOT_SELECT_COLS: &str = "\
     context_capture_id, session_id, event_id, \
-    IFNULL(CAST(context_data AS CHAR), '{}') AS context_data_json, \
+    CAST(context_data AS CHAR) AS context_data_json, \
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
 const SNAPSHOT_LIST_SELECT_COLS: &str = "\
     cs.context_capture_id, cs.session_id, cs.event_id, \
@@ -139,6 +136,44 @@ fn validate_snapshot_list_limit(limit: u32) -> u32 {
 
 fn snapshot_list_query_limit(limit: u32) -> i64 {
     i64::from(limit) + 1
+}
+
+fn context_decode_error(
+    column: &'static str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ErrorResponse>) {
+    internal_error(format!(
+        "ctx_snapshots row decode column `{column}`: {}",
+        message.into()
+    ))
+}
+
+fn context_row_string(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let value = row
+        .try_get::<String, _>(column)
+        .map_err(|error| context_decode_error(column, error.to_string()))?;
+    if value.trim().is_empty() {
+        return Err(context_decode_error(column, "must not be empty"));
+    }
+    Ok(value)
+}
+
+fn context_row_i64(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+    row.try_get::<i64, _>(column)
+        .map_err(|error| context_decode_error(column, error.to_string()))
+}
+
+fn parse_context_json(
+    column: &'static str,
+    raw: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+    serde_json::from_str(raw).map_err(|source| context_decode_error(column, source.to_string()))
 }
 
 fn snapshot_list_cursor_db_created_at(
@@ -303,7 +338,7 @@ impl ContextService for DatabaseContextService {
                 .await
         }
         .map_err(internal_error)?;
-        let total = total_row.try_get::<i64, _>("total").unwrap_or(0);
+        let total = context_row_i64(&total_row, "total")?;
 
         let mut list_qb = QueryBuilder::<MySql>::new(format!(
             "SELECT {} FROM ctx_snapshots cs WHERE cs.user_id = ",
@@ -337,10 +372,10 @@ impl ContextService for DatabaseContextService {
         let mut snapshots = Vec::with_capacity(rows.len());
         for row in rows {
             snapshots.push(SnapshotListItem {
-                context_capture_id: row.try_get("context_capture_id").map_err(internal_error)?,
-                session_id: row.try_get("session_id").map_err(internal_error)?,
-                event_id: row.try_get("event_id").map_err(internal_error)?,
-                created_at: row.try_get("created_at").unwrap_or_default(),
+                context_capture_id: context_row_string(&row, "context_capture_id")?,
+                session_id: context_row_string(&row, "session_id")?,
+                event_id: context_row_string(&row, "event_id")?,
+                created_at: context_row_string(&row, "created_at")?,
             });
         }
         let has_more = snapshots.len() > limit as usize;
@@ -371,7 +406,7 @@ impl ContextService for DatabaseContextService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let sql = "SELECT cs.context_capture_id, cs.session_id, cs.event_id, \
-             IFNULL(CAST(cs.context_data AS CHAR), '{}') AS context_data_json, \
+             CAST(cs.context_data AS CHAR) AS context_data_json, \
              DATE_FORMAT(cs.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM ctx_snapshots cs \
              WHERE cs.context_capture_id = ? AND cs.user_id = ?"

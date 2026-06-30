@@ -28,6 +28,7 @@ pub(crate) async fn resolve_task_result_task_id(
 
 pub(crate) async fn finalize_headless_task_result<T: astra_services::TaskService + ?Sized>(
     svc: &T,
+    user_id: &str,
     task_id: &str,
     sr: &StreamResult,
     task_session_id: Option<&str>,
@@ -36,6 +37,7 @@ pub(crate) async fn finalize_headless_task_result<T: astra_services::TaskService
     let exit_code = stream_result_exit_code(sr);
     let state = task_checkpoint_state_from_result(sr, output_path, exit_code);
     svc.save_checkpoint(
+        user_id,
         task_id,
         &astra_services::TaskCheckpoint {
             active_subtask_id: None,
@@ -50,10 +52,10 @@ pub(crate) async fn finalize_headless_task_result<T: astra_services::TaskService
 
     match exit_code {
         ExitCode::Success => {
-            svc.complete_task(task_id).await?;
+            svc.complete_task(user_id, task_id).await?;
         }
         ExitCode::Partial => {
-            svc.complete_task_with_outcome(task_id, stream_result_completion_outcome(sr))
+            svc.complete_task_with_outcome(user_id, task_id, stream_result_completion_outcome(sr))
                 .await?;
         }
         ExitCode::Unfinished => {
@@ -64,7 +66,7 @@ pub(crate) async fn finalize_headless_task_result<T: astra_services::TaskService
         | ExitCode::ApiError
         | ExitCode::PersistenceError => {
             let failure_reason = stream_result_failure_reason(exit_code, sr);
-            svc.fail_task(task_id, &failure_reason).await?;
+            svc.fail_task(user_id, task_id, &failure_reason).await?;
         }
     }
 
@@ -81,9 +83,10 @@ pub(crate) async fn execute_task_result(args: TaskResultArgs) -> Result<ExitCode
     // falls back to env-only token resolution which is fine for
     // one-shot `astra task result <query>` invocations.
     let svc = session_runtime::resolve_task_service(None).await;
+    let user_id = cli_user_id();
     let task_id = resolve_task_result_task_id(&*svc, &query).await?;
     let task = svc
-        .get_task(&task_id)
+        .get_task(&user_id, &task_id)
         .await?
         .ok_or_else(|| format!("task disappeared: {task_id}"))?;
     let read = load_task_result_read_surface(&task);
@@ -243,7 +246,7 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
+        svc.update_status("test-user", &tid, astra_services::TaskStatus::InProgress)
             .await
             .unwrap();
         tid
@@ -259,6 +262,7 @@ mod tests {
         let sr = stream_result_for_task_checkpoint();
         let exit_code = finalize_headless_task_result(
             &svc,
+            "test-user",
             &tid,
             &sr,
             Some("fallback-session"),
@@ -269,7 +273,7 @@ mod tests {
 
         assert_eq!(exit_code, ExitCode::PersistenceError);
 
-        let record = svc.get_task(&tid).await.unwrap().unwrap();
+        let record = svc.get_task("test-user", &tid).await.unwrap().unwrap();
         assert_eq!(record.status, astra_services::TaskStatus::Failed);
         assert_eq!(
             record.error_message.as_deref(),
@@ -298,6 +302,7 @@ mod tests {
 
         let exit_code = finalize_headless_task_result(
             &svc,
+            "test-user",
             &tid,
             &sr,
             Some("fallback-session"),
@@ -308,7 +313,7 @@ mod tests {
 
         assert_eq!(exit_code, ExitCode::Success);
 
-        let record = svc.get_task(&tid).await.unwrap().unwrap();
+        let record = svc.get_task("test-user", &tid).await.unwrap().unwrap();
         assert_eq!(record.status, astra_services::TaskStatus::Completed);
         assert_eq!(record.outcome, Some(astra_services::TaskOutcome::Success));
         assert_eq!(record.error_message, None);
@@ -330,6 +335,7 @@ mod tests {
 
         let exit_code = finalize_headless_task_result(
             &svc,
+            "test-user",
             &tid,
             &sr,
             Some("fallback-session"),
@@ -340,7 +346,7 @@ mod tests {
 
         assert_eq!(exit_code, ExitCode::Partial);
 
-        let record = svc.get_task(&tid).await.unwrap().unwrap();
+        let record = svc.get_task("test-user", &tid).await.unwrap().unwrap();
         assert_eq!(record.status, astra_services::TaskStatus::Completed);
         assert_eq!(record.outcome, Some(astra_services::TaskOutcome::Partial));
         assert_eq!(record.error_message, None);
@@ -358,14 +364,20 @@ mod tests {
         let mut sr = stream_result_for_task_checkpoint();
         sr.session_persistence_error = Some("write task output: permission denied".into());
 
-        let exit_code =
-            finalize_headless_task_result(&svc, &tid, &sr, Some("fallback-session"), None)
-                .await
-                .unwrap();
+        let exit_code = finalize_headless_task_result(
+            &svc,
+            "test-user",
+            &tid,
+            &sr,
+            Some("fallback-session"),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(exit_code, ExitCode::PersistenceError);
 
-        let record = svc.get_task(&tid).await.unwrap().unwrap();
+        let record = svc.get_task("test-user", &tid).await.unwrap().unwrap();
         assert_eq!(record.status, astra_services::TaskStatus::Failed);
         let checkpoint = record.checkpoint.expect("checkpoint should be saved");
         assert!(checkpoint.state.get("output_file").is_none());

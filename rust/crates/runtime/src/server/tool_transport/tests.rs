@@ -390,12 +390,9 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         Ok(Vec::new())
     }
 
-    async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
-        Ok(())
-    }
-
     async fn deliver_result(
         &self,
+        _user_id: &str,
         _request_id: &str,
         _edge_agent_id: &str,
         _result_json: &str,
@@ -403,7 +400,12 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         Ok(true)
     }
 
-    async fn fail_dispatch(&self, request_id: &str, reason: &str) -> Result<bool, String> {
+    async fn fail_dispatch(
+        &self,
+        _user_id: &str,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
         self.failed_dispatches
             .lock()
             .expect("failed dispatches lock")
@@ -413,6 +415,7 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
 
     async fn wait_result(
         &self,
+        _user_id: &str,
         request_id: &str,
         _timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
@@ -476,12 +479,9 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
         Ok(Vec::new())
     }
 
-    async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
-        Ok(())
-    }
-
     async fn deliver_result(
         &self,
+        _user_id: &str,
         _request_id: &str,
         _edge_agent_id: &str,
         _result_json: &str,
@@ -489,7 +489,12 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
         Ok(true)
     }
 
-    async fn fail_dispatch(&self, request_id: &str, reason: &str) -> Result<bool, String> {
+    async fn fail_dispatch(
+        &self,
+        _user_id: &str,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
         self.failed_dispatches
             .lock()
             .expect("failed dispatches lock")
@@ -499,6 +504,7 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
 
     async fn wait_result(
         &self,
+        _user_id: &str,
         _request_id: &str,
         _timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {

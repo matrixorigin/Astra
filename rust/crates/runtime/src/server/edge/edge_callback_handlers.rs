@@ -186,6 +186,7 @@ pub(crate) async fn post_tool_result_handler(
     })?;
     if let Err(e) = dispatch_svc
         .deliver_result(
+            &user.user_id,
             &body.request_id,
             body.edge_agent_id.as_deref().unwrap_or(""),
             &result_json,

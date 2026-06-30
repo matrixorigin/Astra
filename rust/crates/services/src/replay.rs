@@ -58,6 +58,24 @@ pub struct ReplaySessionRequestData {
     pub mock_mode: bool,
 }
 
+trait ReplayCountRow {
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error>;
+}
+
+impl ReplayCountRow for sqlx::mysql::MySqlRow {
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+        self.try_get::<i64, _>(column)
+    }
+}
+
+fn replay_count_column(
+    row: &impl ReplayCountRow,
+    column: &str,
+) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+    row.i64_column(column)
+        .map_err(|e| internal_error(format!("replay count decode column `{column}`: {e}")))
+}
+
 // ── Database implementation ──────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -93,21 +111,17 @@ impl ReplayService for DatabaseReplayService {
     ) -> Result<ReplayResponse, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        if !agent_session_exists_for_user(&pool, &session_id, &user_id)
-            .await
-            .map_err(internal_error)?
-        {
-            return Err(error_response(StatusCode::NOT_FOUND, "Session not found"));
-        }
-
-        let count_row =
-            query("SELECT COUNT(*) AS cnt FROM agent_events WHERE session_id = ? AND user_id = ?")
-                .bind(&session_id)
-                .bind(&user_id)
-                .fetch_one(&pool)
-                .await
-                .map_err(internal_error)?;
-        let events_replayed: i64 = count_row.try_get("cnt").unwrap_or(0);
+        let session_row = query(
+            "SELECT event_count FROM agent_sessions
+             WHERE session_id = ? AND user_id = ? LIMIT 1",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
+        let events_replayed: i64 = session_row.try_get("event_count").map_err(internal_error)?;
 
         let replay_id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -148,8 +162,8 @@ impl ReplayService for DatabaseReplayService {
         .fetch_one(&pool)
         .await
         .map_err(internal_error)?;
-        let original_event_count: i64 = counts.try_get("original_cnt").unwrap_or(0);
-        let replay_event_count: i64 = counts.try_get("replay_cnt").unwrap_or(0);
+        let original_event_count = replay_count_column(&counts, "original_cnt")?;
+        let replay_event_count = replay_count_column(&counts, "replay_cnt")?;
 
         let difference = (original_event_count - replay_event_count).abs();
         let is_match = difference == 0;
@@ -217,6 +231,60 @@ mod tests {
     fn replay_session_request_explicit_mock_false() {
         let req: ReplaySessionRequest = serde_json::from_str(r#"{"mock_mode": false}"#).unwrap();
         assert_eq!(req.mock_mode, Some(false));
+    }
+
+    struct FakeReplayCountRow {
+        failed_column: Option<&'static str>,
+    }
+
+    impl FakeReplayCountRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+            }
+        }
+    }
+
+    impl ReplayCountRow for FakeReplayCountRow {
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            match column {
+                "original_cnt" => Ok(7),
+                "replay_cnt" => Ok(5),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn replay_count_column_preserves_database_values() {
+        let row = FakeReplayCountRow::complete();
+
+        assert_eq!(replay_count_column(&row, "original_cnt").unwrap(), 7);
+        assert_eq!(replay_count_column(&row, "replay_cnt").unwrap(), 5);
+    }
+
+    #[test]
+    fn replay_count_column_fails_loudly_on_decode_errors() {
+        for column in ["original_cnt", "replay_cnt"] {
+            let row = FakeReplayCountRow::fail_on(column);
+            let (status, Json(body)) = replay_count_column(&row, column).unwrap_err();
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                body.detail.contains(&format!("decode column `{column}`")),
+                "error should identify failed column: {:?}",
+                body.detail
+            );
+        }
     }
 
     #[test]

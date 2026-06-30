@@ -121,18 +121,20 @@ pub enum VerifierKind {
 
 ```sql
 CREATE TABLE IF NOT EXISTS task_contracts (
-    contract_id    VARCHAR(36) PRIMARY KEY,
+    contract_id    VARCHAR(36) NOT NULL,
     task_id        VARCHAR(36) NOT NULL,
     session_id     VARCHAR(36) NOT NULL,
     user_id        VARCHAR(36) NOT NULL,
     goal           TEXT NOT NULL,
     scope_json     JSON,
+    subtasks_json  JSON NOT NULL,
     criteria_json  JSON NOT NULL,
     version        INT NOT NULL DEFAULT 1,
     status         VARCHAR(20) NOT NULL DEFAULT 'draft',
     created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    INDEX idx_tc_task (task_id),
+    PRIMARY KEY (user_id, contract_id),
+    INDEX idx_tc_owner_task_status_version (user_id, task_id, status, version),
     INDEX idx_tc_user_status (user_id, status)
 );
 ```
@@ -305,13 +307,15 @@ impl VerificationRunner {
 ### Cloud Storage for Verification Audit
 
 ```sql
-CREATE TABLE IF NOT EXISTS task_verification_results (
-    result_id      VARCHAR(36) PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS verification_results (
+    result_id      VARCHAR(36) NOT NULL,
     contract_id    VARCHAR(36) NOT NULL,
     task_id        VARCHAR(36) NOT NULL,
     subtask_id     VARCHAR(64) NOT NULL,
     criterion_id   VARCHAR(64) NOT NULL,
     session_id     VARCHAR(36) NOT NULL,
+    user_id        VARCHAR(36) NOT NULL,
+    status         VARCHAR(20) NOT NULL,
     passed         SMALLINT NOT NULL,
     evidence       LONGTEXT,
     expected       TEXT,
@@ -319,8 +323,11 @@ CREATE TABLE IF NOT EXISTS task_verification_results (
     error_message  TEXT,
     attempt        INT NOT NULL DEFAULT 1,
     created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    INDEX idx_tvr_task_subtask (task_id, subtask_id),
-    INDEX idx_tvr_contract (contract_id, created_at)
+    CONSTRAINT chk_verification_results_outcome
+        CHECK ((status = 'passed' AND passed = 1) OR (status = 'failed' AND passed = 0)),
+    PRIMARY KEY (user_id, contract_id, result_id),
+    INDEX idx_verification_results_contract_created (user_id, contract_id, created_at, result_id),
+    INDEX idx_verification_results_status_created (user_id, status, created_at)
 );
 ```
 
@@ -468,7 +475,7 @@ task_abandoned           → rollback snapshot, cleanup
 
 ### Phase 2: Git4Data + Cloud Integration
 - `TaskBranchService` (snapshot, branch, diff, merge, rollback)
-- Cloud DDL: `task_contracts`, `task_verification_results`
+- Cloud DDL: `task_contracts`, `verification_results`
 - Integration with event ingestion pipeline
 - Checkpoint enhancement (include verification state)
 

@@ -2,10 +2,10 @@
 //!
 //! Shared between the CLI SSE loop and any future server-side handler that consumes the same shape.
 
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
-use serde_json::{Value, json};
-
+use crate::tool::args::shape::tool_call_name;
 use crate::tool::categories::is_file_mutation_tool;
 use crate::tool::result::semantics::tool_dedup_signature;
 
@@ -116,20 +116,15 @@ pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
 
     // Support both flat format (name/arguments at top level) and
     // OpenAI format (function.name / function.arguments nested).
-    let (name, args_raw) = if let Some(func) = tc.get("function").and_then(Value::as_object) {
-        let n = func.get("name").and_then(Value::as_str).unwrap_or("");
-        let a = func
-            .get("arguments")
+    let name = tool_call_name(tc).unwrap_or("").to_string();
+    let args_raw = if let Some(func) = tc.get("function").and_then(Value::as_object) {
+        func.get("arguments")
             .cloned()
-            .unwrap_or(Value::Object(Default::default()));
-        (n.to_string(), a)
+            .unwrap_or(Value::Object(Default::default()))
     } else {
-        let n = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let a = tc
-            .get("arguments")
+        tc.get("arguments")
             .cloned()
-            .unwrap_or(Value::Object(Default::default()));
-        (n.to_string(), a)
+            .unwrap_or(Value::Object(Default::default()))
     };
 
     let args = match args_raw {
@@ -571,8 +566,6 @@ pub fn openai_tool_roundtrip_values_with_result_fields(
     content: &str,
     tool_result_fields: Option<&serde_json::Map<String, Value>>,
 ) -> (Value, Value) {
-    let content = astra_core::error_kind::strip_tool_binding_sentinel(content);
-    let content = content.as_ref();
     let msg = json!({
         "role": "tool",
         "tool_call_id": tool_call_id,
@@ -767,12 +760,6 @@ mod tests {
         );
         assert!(!lower.contains("workaround: use `bash`"), "{}", out.output);
         assert!(
-            !out.output
-                .contains(astra_core::error_kind::TOOL_BINDING_SENTINEL),
-            "{}",
-            out.output
-        );
-        assert!(
             !out.output.contains("Workaround: use `bash`"),
             "{}",
             out.output
@@ -799,6 +786,7 @@ mod tests {
             &mut consumed,
             &by_sig,
         );
+
         assert_eq!(out.output, "OK (no results)");
         assert_eq!(
             out.tool_result_fields
@@ -880,6 +868,28 @@ mod tests {
         assert_eq!(id, "c2");
         assert_eq!(name, "grep");
         assert_eq!(args, json!({"pattern":"x"}));
+    }
+
+    #[test]
+    fn parse_flat_tool_call_canonicalizes_name() {
+        let flat = json!({
+            "id": "c1",
+            "name": " bash ",
+            "arguments": "{}"
+        });
+        let (_, name, _) = parse_flat_tool_call_event(&flat);
+        assert_eq!(name, "bash");
+
+        let openai = json!({
+            "id": "c2",
+            "type": "function",
+            "function": {
+                "name": " grep ",
+                "arguments": "{}"
+            }
+        });
+        let (_, name, _) = parse_flat_tool_call_event(&openai);
+        assert_eq!(name, "grep");
     }
 
     #[test]
@@ -1260,28 +1270,6 @@ mod tests {
     }
 
     #[test]
-    fn openai_tool_roundtrip_values_strips_tool_binding_sentinel() {
-        let content = format!(
-            "Error: tool binding unavailable {}",
-            astra_core::error_kind::TOOL_BINDING_SENTINEL
-        );
-        let (m, tr) = openai_tool_roundtrip_values("call-1", "agent", &content);
-        assert!(
-            !m["content"]
-                .as_str()
-                .unwrap()
-                .contains(astra_core::error_kind::TOOL_BINDING_SENTINEL)
-        );
-        assert!(
-            !tr["result"]
-                .as_str()
-                .unwrap()
-                .contains(astra_core::error_kind::TOOL_BINDING_SENTINEL)
-        );
-        assert!(m["content"].as_str().unwrap().contains("tool binding"));
-    }
-
-    #[test]
     fn openai_tool_roundtrip_values_with_result_fields_merges_metadata() {
         let extra_fields = serde_json::Map::from_iter([(
             "pre_state_snapshot_id".to_string(),
@@ -1512,10 +1500,6 @@ mod tests {
         assert!(
             message.contains("visible and executable in this turn"),
             "fanout binding message must explain the executable-tool boundary: {message}"
-        );
-        assert!(
-            !message.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL),
-            "binding classification is structural; messages must not carry sentinels: {message}"
         );
     }
 

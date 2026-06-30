@@ -14,11 +14,9 @@
 
 use uuid::Uuid;
 
-use crate::durable_task::{
-    ContractStatus, DurableSubtask, SubtaskStage, TaskContract, TaskScope, VerificationCriterion,
-    VerifierKind,
-};
+use crate::durable_task::{ContractStatus, DurableSubtask, SubtaskStage, TaskContract, TaskScope};
 use crate::task_orchestrator::{SubtaskPlan, TaskPlan};
+use crate::verification::{VerificationCriterion, VerifierKind};
 
 // ─── Project Detection ──────────────────────────────────────────────────────
 

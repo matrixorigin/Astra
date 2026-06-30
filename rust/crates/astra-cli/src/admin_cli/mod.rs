@@ -38,6 +38,15 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
     } else if !active {
         println!("  connectivity: (not in response; run: astra admin model check {model_name})");
     }
+    if let Some(context_window) = value
+        .get("context_window")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|value| *value > 0)
+    {
+        println!("  context_window: {context_window}");
+    } else {
+        eprintln!("  warning: response did not include a positive context_window");
+    }
     let thinking_cap = value
         .get("thinking_capability")
         .and_then(serde_json::Value::as_str);
@@ -68,6 +77,28 @@ fn yaml_i64(entry: &serde_yaml_ng::Value, key: &str) -> Option<i64> {
     entry.get(key).and_then(|v| v.as_i64())
 }
 
+fn require_yaml_positive_i64(entry: &serde_yaml_ng::Value, key: &str) -> Result<i64, String> {
+    match yaml_i64(entry, key) {
+        Some(value) if value > 0 => Ok(value),
+        Some(value) => Err(format!(
+            "model.{key} must be a positive integer, got {value}"
+        )),
+        None => Err(format!(
+            "model.{key} missing; model registry metadata must declare {key}"
+        )),
+    }
+}
+
+fn require_positive_context_window(value: i32) -> Result<i32, String> {
+    if value > 0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "context_window must be a positive token count, got {value}"
+        ))
+    }
+}
+
 fn yaml_f64(entry: &serde_yaml_ng::Value, key: &str) -> Option<f64> {
     entry.get(key).and_then(|v| v.as_f64())
 }
@@ -91,9 +122,6 @@ fn apply_optional_yaml_fields(
 ) {
     if let Some(v) = yaml_str(entry, "description") {
         obj.insert("description".into(), serde_json::json!(v));
-    }
-    if let Some(v) = yaml_i64(entry, "context_window") {
-        obj.insert("context_window".into(), serde_json::json!(v));
     }
     if let Some(v) = yaml_i64(entry, "max_completion_tokens") {
         obj.insert("max_completion_tokens".into(), serde_json::json!(v));
@@ -180,19 +208,23 @@ fn apply_optional_yaml_fields(
 fn build_model_update_payload(
     entry: &serde_yaml_ng::Value,
     provider: &str,
-    api_key: &str,
+    api_key: Option<&str>,
     base_url: Option<&str>,
-) -> serde_json::Value {
-    let mut payload = serde_json::json!({
-        "api_key": api_key,
-        "provider": provider,
-    });
-    let obj = payload.as_object_mut().unwrap();
+) -> Result<serde_json::Value, String> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("provider".into(), serde_json::json!(provider));
+    obj.insert(
+        "context_window".into(),
+        serde_json::json!(require_yaml_positive_i64(entry, "context_window")?),
+    );
+    if let Some(v) = api_key.filter(|v| !v.is_empty()) {
+        obj.insert("api_key".into(), serde_json::json!(v));
+    }
     if let Some(v) = base_url {
         obj.insert("base_url".into(), serde_json::json!(v));
     }
-    apply_optional_yaml_fields(obj, entry);
-    payload
+    apply_optional_yaml_fields(&mut obj, entry);
+    Ok(serde_json::Value::Object(obj))
 }
 
 fn build_model_create_payload(
@@ -201,16 +233,24 @@ fn build_model_create_payload(
     provider: &str,
     api_key: &str,
     base_url: Option<&str>,
-) -> serde_json::Value {
-    let mut payload = serde_json::json!({
-        "name": name,
-        "provider": provider,
-        "api_key": api_key,
-        "base_url": base_url,
-    });
-    let obj = payload.as_object_mut().unwrap();
-    apply_optional_yaml_fields(obj, entry);
-    payload
+) -> Result<serde_json::Value, String> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(format!(
+            "model.api_key missing or empty for new model {name}"
+        ));
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".into(), serde_json::json!(name));
+    obj.insert("provider".into(), serde_json::json!(provider));
+    obj.insert("api_key".into(), serde_json::json!(api_key));
+    obj.insert("base_url".into(), serde_json::json!(base_url));
+    obj.insert(
+        "context_window".into(),
+        serde_json::json!(require_yaml_positive_i64(entry, "context_window")?),
+    );
+    apply_optional_yaml_fields(&mut obj, entry);
+    Ok(serde_json::Value::Object(obj))
 }
 
 pub async fn run_from_env() -> Result<(), String> {
@@ -480,6 +520,7 @@ pub async fn run(
         }
         Command::Model(ModelCmd::Add(args)) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let context_window = require_positive_context_window(args.context_window)?;
             let body = api
                 .post_bearer_path_json_text(
                     &token,
@@ -488,6 +529,7 @@ pub async fn run(
                         "name": args.name,
                         "provider": args.provider,
                         "api_key": args.api_key,
+                        "context_window": context_window,
                         "base_url": args.base_url
                     }),
                 )
@@ -552,43 +594,53 @@ pub async fn run(
                 let api_key = entry
                     .get("api_key")
                     .and_then(serde_yaml_ng::Value::as_str)
-                    .unwrap_or("");
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
                 let base_url = entry
                     .get("base_url")
                     .and_then(serde_yaml_ng::Value::as_str)
                     .map(ToString::to_string);
-                let payload = build_model_create_payload(
-                    entry,
-                    model_name,
-                    provider,
-                    api_key,
-                    base_url.as_deref(),
-                );
-                let needs_check = match api
-                    .post_bearer_path_json_text(&token, paths::MODELS, &payload)
-                    .await
-                {
-                    Ok(body) => {
-                        println!("loaded model: {model_name}");
-                        print_model_load_server_result(&body, model_name);
-                        true
-                    }
-                    Err(astra_thin_client::ThinClientError::Api { body, .. })
-                        if body.contains("already exists") =>
+                let metadata_only_update = args.update_existing && api_key.is_none();
+                let needs_check = if metadata_only_update {
+                    let upd =
+                        build_model_update_payload(entry, provider, None, base_url.as_deref())?;
+                    let body = api
+                        .put_bearer_path_json_text(&token, &paths::model(model_name), &upd)
+                        .await
+                        .map_err(map_thin_err)?;
+                    println!("re-synced existing model metadata: {model_name}");
+                    print_model_load_server_result(&body, model_name);
+                    true
+                } else {
+                    let api_key = api_key.ok_or_else(|| {
+                        format!("model.api_key missing or empty for new model {model_name}")
+                    })?;
+                    let payload = build_model_create_payload(
+                        entry,
+                        model_name,
+                        provider,
+                        api_key,
+                        base_url.as_deref(),
+                    )?;
+                    match api
+                        .post_bearer_path_json_text(&token, paths::MODELS, &payload)
+                        .await
                     {
-                        if args.update_existing {
-                            if api_key.is_empty() {
-                                eprintln!(
-                                    "skipped (already exists): {model_name} — need non-empty api_key in YAML to use --update-existing"
-                                );
-                                false
-                            } else {
+                        Ok(body) => {
+                            println!("loaded model: {model_name}");
+                            print_model_load_server_result(&body, model_name);
+                            true
+                        }
+                        Err(astra_thin_client::ThinClientError::Api { body, .. })
+                            if body.contains("already exists") =>
+                        {
+                            if args.update_existing {
                                 let upd = build_model_update_payload(
                                     entry,
                                     provider,
-                                    api_key,
+                                    Some(api_key),
                                     base_url.as_deref(),
-                                );
+                                )?;
                                 let body = api
                                     .put_bearer_path_json_text(
                                         &token,
@@ -600,16 +652,16 @@ pub async fn run(
                                 println!("re-synced existing model: {model_name}");
                                 print_model_load_server_result(&body, model_name);
                                 true
+                            } else {
+                                println!(
+                                    "skipped (already exists): {model_name} — use `astra admin model load {} --update-existing` to push YAML credentials and re-run connectivity",
+                                    args.path
+                                );
+                                false
                             }
-                        } else {
-                            println!(
-                                "skipped (already exists): {model_name} — use `astra admin model load {} --update-existing` to push YAML credentials and re-run connectivity",
-                                args.path
-                            );
-                            false
                         }
+                        Err(e) => return Err(map_thin_err(e)),
                     }
-                    Err(e) => return Err(map_thin_err(e)),
                 };
                 if needs_check {
                     match api
@@ -873,7 +925,8 @@ mod tests {
             "bedrock",
             "k",
             Some("https://example.com"),
-        );
+        )
+        .unwrap();
         assert_eq!(payload["description"], "test description");
         assert_eq!(payload["context_window"], 200000);
         assert_eq!(payload["max_completion_tokens"], 4096);
@@ -893,6 +946,7 @@ mod tests {
             name: strict-openai-compatible
             provider: openai
             api_key: k
+            context_window: 200000
             prompt_cache_capability:
               protocol: strict_history_match
               volatile_placement: current_user_only
@@ -901,7 +955,8 @@ mod tests {
         );
 
         let payload =
-            build_model_create_payload(&entry, "strict-openai-compatible", "openai", "k", None);
+            build_model_create_payload(&entry, "strict-openai-compatible", "openai", "k", None)
+                .unwrap();
 
         assert_eq!(
             payload["quirks"]["prompt_cache_capability"],
@@ -911,5 +966,60 @@ mod tests {
                 "reuse_scope": "conversation_turns",
             })
         );
+    }
+
+    #[test]
+    fn model_load_payload_requires_context_window() {
+        let entry = yaml(
+            r#"
+            name: missing-window
+            provider: openai
+            api_key: k
+            "#,
+        );
+        let error =
+            build_model_create_payload(&entry, "missing-window", "openai", "k", None).unwrap_err();
+
+        assert!(error.contains("model.context_window missing"));
+    }
+
+    #[test]
+    fn model_create_payload_requires_non_empty_api_key() {
+        let entry = yaml(
+            r#"
+            name: missing-key
+            provider: openai
+            context_window: 200000
+            "#,
+        );
+        let error =
+            build_model_create_payload(&entry, "missing-key", "openai", "", None).unwrap_err();
+
+        assert!(error.contains("model.api_key missing or empty"));
+    }
+
+    #[test]
+    fn model_add_context_window_must_be_positive() {
+        assert_eq!(
+            require_positive_context_window(1_000_000).unwrap(),
+            1_000_000
+        );
+        let error = require_positive_context_window(0).unwrap_err();
+        assert!(error.contains("positive token count"));
+    }
+
+    #[test]
+    fn update_existing_payload_syncs_context_window_without_new_key() {
+        let entry = yaml(
+            r#"
+            name: existing-model
+            provider: openai
+            context_window: 1000000
+            "#,
+        );
+        let payload = build_model_update_payload(&entry, "openai", Some(""), None).unwrap();
+
+        assert_eq!(payload["context_window"], 1000000);
+        assert!(payload.get("api_key").is_none());
     }
 }

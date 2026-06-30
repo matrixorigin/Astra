@@ -853,13 +853,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Read the live observation snapshot for the running turn/session. Use for self-checks: token/cache pressure, tool health, recent rounds, runtime errors, stall/noise state, working memory, and plan/task/session lifecycle/resume state including the last lifecycle event when available. CLI/Edge can also inspect local cache and session_memory artifacts. For persisted multi-turn causal analysis, use reflect.",
+                "description": "Read the live observation snapshot for the running turn/session. Use for self-checks: token/cache pressure, step latency/performance, tool health, recent rounds, runtime errors, stall/noise state, working memory, and plan/task/session lifecycle/resume state including the last lifecycle event when available. CLI/Edge can also inspect local cache and session_memory artifacts. For persisted multi-turn causal analysis, use reflect.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "topic": {"type": "string", "enum": ["overview","runtime","execution","knowledge"], "description": "Top-level observation area. Defaults to runtime; use execution for errors/trace and knowledge for session_memory/context artifacts."},
                         "facet": {"type": "string", "enum": ["session","overview","recent","errors","trace","volatile","stall","noise","cache","session_memory"], "description": "Specific live view. cache and session_memory require CLI/Edge-local artifacts; unavailable providers are reported in data_coverage."},
-                        "depth": {"type": "string", "enum": ["hint","summary","diagnostic","forensic"], "description": "Output depth. hint is a compact nudge; diagnostic/forensic use the bounded full live renderer."},
+                        "depth": {"type": "string", "enum": ["hint","summary","diagnostic","forensic"], "description": "Output depth. hint is a compact nudge; diagnostic/forensic use the bounded full live renderer, including step latency/performance when available."},
                         "horizon": {"type": "string", "enum": ["now","current_turn","recent","turn","session","cross_session"], "description": "Time range label. Choose trace-like content with facet=trace, not by changing horizon."},
                         "source_policy": {"type": "string", "enum": ["auto","live_only","live_first","durable_first","local_only","cloud_only"], "description": "Preferred data source. Missing or unsatisfied providers are reported instead of fabricated."},
                         "include_context": {"type": "boolean", "description": "Request visible prompt/context facts when a provider is available; these are observed context, not durable truth."},
@@ -1036,8 +1036,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "title": {"type": "string", "description": "(create/update) Title."},
                         "description": {"type": "string", "description": "(create/update) Done."},
                         "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in current session."},
-                        "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only) New task/subtask status. Do not send `status`. Only one parent task may be in_progress; `paused` frees that slot; `deleted` removes the task."},
-                        "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","all","active"], "description": "(list only) Use `status_filter: \"all\"` to list all tasks; do not send an `all` boolean. `active` = pending + in_progress + paused."},
+                        "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only) New task/subtask status. Do not send `status`. Only one parent task may be in_progress; `paused` frees that slot; `deleted` hides the task from active views while keeping an audit tombstone."},
+                        "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","deleted","all","active"], "description": "(list only) Use `status_filter: \"all\"` to list all tasks, including audit tombstones; use `deleted` to inspect deleted tombstones; do not send an `all` boolean. `active` = pending + in_progress + paused."},
                         "subtask_id": {"type": "string", "description": "(update) Subtask id; use with task_id + new_status, optional reason."},
                         "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
                         "owner": {"type": "string", "description": "(create/update) Owner."},
@@ -1636,6 +1636,13 @@ mod tests {
             properties["status_filter"]
                 .as_object()
                 .and_then(|_| properties["status_filter"]["enum"].as_array())
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("deleted"))),
+            "task schema should let the model query deleted audit tombstones explicitly"
+        );
+        assert!(
+            properties["status_filter"]
+                .as_object()
+                .and_then(|_| properties["status_filter"]["enum"].as_array())
                 .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
             "task schema should let the model query auto-paused tasks explicitly"
         );
@@ -1650,6 +1657,7 @@ mod tests {
         assert!(
             status_filter_desc.contains("status_filter")
                 && status_filter_desc.contains("\"all\"")
+                && status_filter_desc.contains("audit tombstones")
                 && status_filter_desc.contains("do not send an `all` boolean"),
             "task schema should steer list-all away from an unsupported all field: {status_filter_desc}"
         );
@@ -1678,6 +1686,10 @@ mod tests {
         assert!(
             new_status_desc.contains("Do not send `status`"),
             "new_status should explicitly reject the old status alias: {new_status_desc}"
+        );
+        assert!(
+            new_status_desc.contains("audit tombstone"),
+            "new_status should explain deleted keeps an audit tombstone: {new_status_desc}"
         );
         let add_blocked_by_desc = properties["add_blocked_by"]["description"]
             .as_str()
@@ -1845,6 +1857,10 @@ mod tests {
             "introspect should advertise lifecycle and resume visibility: {desc}"
         );
         assert!(
+            desc.contains("step latency/performance"),
+            "introspect should advertise live latency/performance visibility: {desc}"
+        );
+        assert!(
             desc.contains("last lifecycle event"),
             "introspect should advertise causal last-event visibility: {desc}"
         );
@@ -1906,6 +1922,12 @@ mod tests {
             enum_values(&properties["depth"]),
             vec!["hint", "summary", "diagnostic", "forensic"],
             "introspect depth schema must expose canonical observation depths"
+        );
+        assert!(
+            properties["depth"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("step latency/performance")),
+            "diagnostic depth should advertise step latency/performance coverage"
         );
         assert_eq!(
             enum_values(&properties["source_policy"]),

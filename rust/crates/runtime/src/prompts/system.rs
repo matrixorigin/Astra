@@ -74,15 +74,18 @@ pub fn build_skill_listing_section(
     build_skill_listing_section_with_budget(skills, None)
 }
 
-/// Build skill listing using the per-model context window for budget sizing.
+/// Build skill listing with the default runtime context-window budget.
 ///
-/// Resolves the model's context window via [`budget_for_model`] so the listing
-/// scales with provider capacity (32K → ~1.3KB, 200K → 8KB, 1M → 40KB).
+/// Model names are not a reliable source of context-window truth. Callers that
+/// have resolved model metadata should use
+/// [`build_skill_listing_section_with_budget`] or
+/// [`build_skill_listing_section_with_context_window_and_caps`].
 pub fn build_skill_listing_section_for_model(
     skills: &[astra_skills::traits::SkillToolInfo],
     model: Option<&str>,
 ) -> Option<PromptSection> {
-    build_skill_listing_section_with_caps(skills, model, true)
+    let _ = model;
+    build_skill_listing_section_with_budget(skills, None)
 }
 
 pub fn build_skill_listing_section_with_caps(
@@ -90,8 +93,20 @@ pub fn build_skill_listing_section_with_caps(
     model: Option<&str>,
     agent_spawn_available: bool,
 ) -> Option<PromptSection> {
-    let context_window = u32::try_from(crate::prompts::budget_for_model(model).model_limit).ok();
-    build_skill_listing_section_with_budget_and_caps(skills, context_window, agent_spawn_available)
+    let _ = model;
+    build_skill_listing_section_with_context_window_and_caps(skills, None, agent_spawn_available)
+}
+
+pub fn build_skill_listing_section_with_context_window_and_caps(
+    skills: &[astra_skills::traits::SkillToolInfo],
+    context_window_tokens: Option<u32>,
+    agent_spawn_available: bool,
+) -> Option<PromptSection> {
+    build_skill_listing_section_with_budget_and_caps(
+        skills,
+        context_window_tokens,
+        agent_spawn_available,
+    )
 }
 
 /// Build skill listing with explicit context window size for budget calculation.
@@ -662,7 +677,8 @@ fn turn_discipline_section() -> &'static str {
      - **End with a short summary**: close the turn with 1-2 sentences stating what changed and what's next. This is the deliverable — not a list of tools you ran.\n\
      - **No externalized reasoning**: deliberation belongs in <think> blocks. Skip \"Let me think...\" / \"Hmm\" / \"Actually, wait\" — noise, not content.\n\
      - **Lead with the answer**: \"The bug is on line 42 because X\" beats \"Looking at the code, I notice line 42 might be relevant, let me investigate…\".\n\
-     - **Match depth to task**: short question → short answer.\n"
+     - **Match depth to task**: short question → short answer.\n\
+     - **Context is capacity, not a target**: large windows let you keep essential evidence, but repeated high-token turns with little new information should converge via summaries, checkpoints, or a narrower read path.\n"
 }
 
 /// Plan execution guidance. Pure static.
@@ -1219,6 +1235,8 @@ fn task_lifecycle_section(tool_names: &[&str]) -> String {
      - Mark done after verifying: `task update task_id=task-1 new_status=completed`.\n\
      - For a child item, include its parent: `task update task_id=task-1 subtask_id=s1 new_status=completed`.\n\
      - Check remaining: `task list` to see what is unfinished.\n\
+     - Do not delete failed/cancelled/completed tasks to make the board look clean; terminal states are evidence. Use archive for old terminal work, and create follow-up tasks only for genuinely new work.\n\
+     - Before saying all work is done or all checks are green, verify the artifact/build/test evidence and explicitly account for skipped or ignored checks.\n\
      - The task board is your working memory across turns — if the session resumes or you are interrupted, read it before acting.\n"
         .to_string()
 }
@@ -2377,6 +2395,8 @@ mod tests {
         assert!(p_task.contains("task create"));
         assert!(p_task.contains("task update task_id=task-1 new_status=in_progress"));
         assert!(p_task.contains("task update task_id=task-1 subtask_id=s1 new_status=completed"));
+        assert!(p_task.contains("terminal states are evidence"));
+        assert!(p_task.contains("all checks are green"));
         assert!(
             !p_task.contains("task update subtask_id=X"),
             "task update examples must include the required parent task_id"
@@ -3183,7 +3203,7 @@ mod tests {
         ];
 
         let section =
-            build_skill_listing_section_with_caps(&skills, Some("claude-sonnet-4"), false)
+            build_skill_listing_section_with_context_window_and_caps(&skills, Some(200_000), false)
                 .expect("real visible skills should render a session-scoped listing");
 
         assert_eq!(section.scope, CacheScope::Session);
@@ -3213,10 +3233,10 @@ mod tests {
         )];
 
         let with_fanout =
-            build_skill_listing_section_with_caps(&skills, Some("claude-sonnet-4"), true)
+            build_skill_listing_section_with_context_window_and_caps(&skills, Some(200_000), true)
                 .expect("skill listing should render when fanout is available");
         let without_fanout =
-            build_skill_listing_section_with_caps(&skills, Some("claude-sonnet-4"), false)
+            build_skill_listing_section_with_context_window_and_caps(&skills, Some(200_000), false)
                 .expect("skill listing should render when fanout is unavailable");
 
         assert!(with_fanout.text.contains("agent_fanout(action='start'"));
@@ -3683,10 +3703,10 @@ mod tests {
     }
 
     #[test]
-    fn build_skill_listing_section_for_model_sizes_per_provider() {
-        // Production must call build_skill_listing_section_for_model so the
-        // budget scales with the provider's actual context window. Verify
-        // claude (200K) and gpt-3.5 (16K) produce different listings.
+    fn build_skill_listing_section_sizes_from_explicit_context_window() {
+        // Model names are not a source of context-window truth. The caller must
+        // pass resolved registry metadata so 1M providers are not silently
+        // capped at the runtime default and small providers are not overlisted.
         let skills: Vec<_> = (0..50)
             .map(|i| astra_skills::traits::SkillToolInfo {
                 name: format!("skill-{i:02}"),
@@ -3694,22 +3714,23 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let claude =
-            build_skill_listing_section_for_model(&skills, Some("claude-sonnet-4")).unwrap();
-        let small = build_skill_listing_section_for_model(&skills, Some("gpt-3.5-turbo")).unwrap();
+        let large = build_skill_listing_section_with_budget(&skills, Some(200_000)).unwrap();
+        let small = build_skill_listing_section_with_budget(&skills, Some(16_000)).unwrap();
         assert!(
-            claude.text.matches("<name>").count() > small.text.matches("<name>").count(),
-            "200K context must list more skills than 16K context"
+            large.text.matches("<name>").count() > small.text.matches("<name>").count(),
+            "explicit 200K context must list more skills than explicit 16K context"
         );
     }
 
     #[test]
-    fn deferred_block_text_for_model_sizes_per_provider() {
+    fn deferred_block_text_sizes_from_explicit_context_window() {
         let surface = make_deferred_surface(60);
         let claude = surface
-            .deferred_block_text(Some("claude-sonnet-4"))
+            .deferred_block_text_with_context_window(Some(200_000))
             .unwrap();
-        let small = surface.deferred_block_text(Some("gpt-3.5-turbo")).unwrap();
+        let small = surface
+            .deferred_block_text_with_context_window(Some(16_000))
+            .unwrap();
 
         fn deferred_names(block: &str) -> Vec<&str> {
             let open = "<deferred-tools>";

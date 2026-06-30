@@ -14,9 +14,10 @@ pub use astra_prompts::skills::{
     builtin_system_skills,
 };
 pub use context::{
-    CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, DEFAULT_SYSTEM_PROMPT_TOKENS,
-    budget_for_model, budget_for_model_with_override, capped_output_tokens, estimate_str_tokens,
-    estimate_tokens, estimate_tokens_cache_aware, estimate_tokens_cache_aware_split,
+    CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget,
+    DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_SYSTEM_PROMPT_TOKENS, budget_for_model,
+    budget_for_model_with_override, capped_output_tokens, estimate_str_tokens, estimate_tokens,
+    estimate_tokens_cache_aware, estimate_tokens_cache_aware_split,
 };
 pub(crate) use context::{PER_MESSAGE_OVERHEAD, estimate_single_message_tokens};
 pub use system::{
@@ -27,7 +28,8 @@ pub use system::{
     build_deferred_tools_section_with_budget, build_main_system_prompt,
     build_main_system_prompt_with_style, build_pipeline_static_sections,
     build_skill_listing_section, build_skill_listing_section_for_model,
-    build_skill_listing_section_with_caps, build_system_prompt_sections,
+    build_skill_listing_section_with_caps,
+    build_skill_listing_section_with_context_window_and_caps, build_system_prompt_sections,
     build_system_prompt_sections_with_style, build_system_prompt_trace, default_overrides_dir,
     detect_task_type, load_overrides, parallel_batching_nudge_directive,
     parallel_execution_feedback, sections_to_string, self_awareness_prompt_section,
@@ -177,7 +179,7 @@ mod tests {
     #[test]
     fn context_budget_default_values() {
         let b = ContextBudget::default();
-        assert_eq!(b.model_limit, 128_000);
+        assert_eq!(b.model_limit, 200_000);
         assert!((b.compact_threshold - 0.75).abs() < 0.01);
         assert_eq!(b.keep_recent_turns, 6);
     }
@@ -185,32 +187,32 @@ mod tests {
     #[test]
     fn context_budget_should_compact() {
         let b = ContextBudget::default();
-        assert!(!b.should_compact(75_000));
-        assert!(b.should_compact(85_000));
+        assert!(!b.should_compact(134_999));
+        assert!(b.should_compact(135_001));
     }
 
     #[test]
     fn budget_for_model_claude() {
         let b = budget_for_model(Some("claude-3.5-sonnet"));
-        assert_eq!(b.model_limit, 128_000);
+        assert_eq!(b.model_limit, 200_000);
     }
 
     #[test]
     fn budget_for_model_gpt35() {
         let b = budget_for_model(Some("gpt-3.5-turbo"));
-        assert_eq!(b.model_limit, 16_000);
+        assert_eq!(b.model_limit, 200_000);
     }
 
     #[test]
     fn budget_for_model_unknown_uses_default() {
         let b = budget_for_model(Some("some-unknown-model"));
-        assert_eq!(b.model_limit, 128_000);
+        assert_eq!(b.model_limit, 200_000);
     }
 
     #[test]
     fn budget_for_model_none_uses_default() {
         let b = budget_for_model(None);
-        assert_eq!(b.model_limit, 128_000);
+        assert_eq!(b.model_limit, 200_000);
     }
 
     // ── Task type detection tests ──

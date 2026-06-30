@@ -34,24 +34,66 @@ use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
 use crate::MatrixOneSettings;
 use crate::turn::agentic_loop::host::AgenticLoopState;
+use crate::turn::token_usage::TokenUsage;
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
     EventCreateRequestData, EventService,
 };
+use astra_services::db_row::{RowDecoder, RowExt};
 
 use super::{
     build_runtime_event_service, build_runtime_turn_evaluation_event, flush_turn_observability,
     persist_runtime_promotion_events, persist_turn_evaluation_journal,
 };
 
-/// Bundles all handles needed by post-loop best-effort persistence calls.
-///
-/// Both `create_run` and `stream_chat` run the same set of side effects after
-/// the agentic loop finishes: core event persistence, tool event persistence,
-/// hook DB writes, Memoria observer, pipeline learning, session-end hooks,
-/// runtime promotion events, and learning-stack save.  This struct captures
-/// the shared state so both paths can call `run()` instead of duplicating
-/// ~60 lines of glue code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranscriptPageItemRow {
+    item_seq: i64,
+    role: String,
+    content_hash: String,
+}
+
+fn lifecycle_token_usage_json(
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_tokens: u64,
+    output_tokens: u64,
+) -> Option<serde_json::Value> {
+    let usage = TokenUsage {
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_tokens,
+        output_tokens,
+    };
+    if usage.is_empty() {
+        return None;
+    }
+
+    let billable_input = input_tokens
+        .saturating_add(cached_input_tokens)
+        .saturating_add(cache_creation_tokens);
+    let total_tokens = usage.total_tokens();
+    let mut usage_json = usage.to_json_map();
+    usage_json.insert("prompt".into(), Value::from(billable_input));
+    usage_json.insert("completion".into(), Value::from(output_tokens));
+    usage_json.insert("cache_read".into(), Value::from(cached_input_tokens));
+    usage_json.insert("cache_write".into(), Value::from(cache_creation_tokens));
+    usage_json.insert("total".into(), Value::from(total_tokens));
+    Some(Value::Object(usage_json))
+}
+
+fn decode_post_compaction_manifest_count(row: &impl RowExt) -> Result<i64, String> {
+    RowDecoder::new(row, "post-compaction context manifest count").non_negative_i64("count")
+}
+
+fn decode_transcript_page_item_row(row: &impl RowExt) -> Result<TranscriptPageItemRow, String> {
+    let dec = RowDecoder::new(row, "transcript page item row");
+    Ok(TranscriptPageItemRow {
+        item_seq: dec.positive_i64("item_seq")?,
+        role: dec.non_empty_string("role")?,
+        content_hash: dec.non_empty_string("content_hash")?,
+    })
+}
 
 /// Bundles all handles needed by post-loop best-effort persistence calls.
 ///
@@ -105,7 +147,7 @@ impl PostLoopPersistContext {
         // transaction so that a crash between writes leaves a consistent state.
         let _mo_tx = self.persist_core_and_trace_in_transaction(state).await;
 
-        // 3. Persist compatibility aggregate tool_call events for session_audit metrics.
+        // 3. Persist audit-facing tool_call events for session_audit metrics.
         if let Some(ref writer) = self.tool_event_writer {
             persist_server_loop_tool_events(
                 writer.as_ref(),
@@ -370,7 +412,7 @@ async fn persist_server_loop_projection_state(
         }
     }
 
-    let post_compaction_count = sqlx::query(
+    let post_compaction_count_row = match sqlx::query(
         "SELECT COUNT(*) AS count FROM context_manifests \
          WHERE user_id = ? AND session_id = ? AND run_id = ? AND reason = 'post_compaction'",
     )
@@ -379,9 +421,33 @@ async fn persist_server_loop_projection_state(
     .bind(run_id)
     .fetch_one(pool.get())
     .await
-    .ok()
-    .and_then(|row| row.try_get::<i64, _>("count").ok())
-    .unwrap_or(0);
+    {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_runtime::state_projection",
+                session_id = %session_id,
+                run_id = %run_id,
+                error = %error,
+                "failed to inspect post-compaction context manifest count"
+            );
+            return;
+        }
+    };
+    let post_compaction_count =
+        match decode_post_compaction_manifest_count(&post_compaction_count_row) {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::state_projection",
+                    session_id = %session_id,
+                    run_id = %run_id,
+                    error = %error,
+                    "failed to decode post-compaction context manifest count"
+                );
+                return;
+            }
+        };
     if post_compaction_count > 0 {
         match store
             .run_compaction_assertions(user_id, session_id, run_id)
@@ -812,24 +878,12 @@ async fn persist_server_loop_core_events_impl(
     };
 
     let llm_response_event = if !state.final_text.is_empty() {
-        let usage = if state.total_prompt > 0
-            || state.total_completion > 0
-            || state.total_cache_read > 0
-            || state.total_cache_creation > 0
-        {
-            Some(json!({
-                "prompt": state.total_prompt,
-                "completion": state.total_completion,
-                "cache_read_tokens": state.total_cache_read,
-                "cache_creation_tokens": state.total_cache_creation,
-                "total": state.total_prompt
-                    + state.total_completion
-                    + state.total_cache_read
-                    + state.total_cache_creation,
-            }))
-        } else {
-            None
-        };
+        let usage = lifecycle_token_usage_json(
+            state.total_prompt,
+            state.total_cache_read,
+            state.total_cache_creation,
+            state.total_completion,
+        );
         let mut event = TraceEvent::new(
             trace_event_id("response", &[run_id, &trace.turn_id]),
             session_id,
@@ -1138,16 +1192,7 @@ fn build_llm_round_trace_events(
                 .then(|| round.model.clone())
                 .or_else(|| model_default.clone());
             event.meta_duration_ms = i32::try_from(round.duration_ms).ok();
-            event.token_usage = Some(json!({
-                "prompt": round.prompt_tokens,
-                "completion": round.completion_tokens,
-                "cache_read_tokens": round.cache_read_tokens,
-                "cache_creation_tokens": round.cache_creation_tokens,
-                "total": round.prompt_tokens
-                    + round.completion_tokens
-                    + round.cache_read_tokens
-                    + round.cache_creation_tokens,
-            }));
+            event.token_usage = llm_round_token_usage_json(round);
             event.parent_event_id = Some(root_event_id.clone());
             event.metadata = json!({
                 "finish_reason": round.finish_reason,
@@ -1158,6 +1203,17 @@ fn build_llm_round_trace_events(
             event
         })
         .collect()
+}
+
+fn llm_round_token_usage_json(
+    round: &crate::turn::agentic_loop::host::RecentRoundSummary,
+) -> Option<serde_json::Value> {
+    lifecycle_token_usage_json(
+        round.prompt_tokens,
+        round.cache_read_tokens,
+        round.cache_creation_tokens,
+        round.completion_tokens,
+    )
 }
 
 fn tool_trace_call_id(
@@ -1546,21 +1602,30 @@ async fn sync_transcript_page_inner(
         return Ok(());
     }
 
-    let first_item_seq = rows
-        .first()
-        .and_then(|row| row.try_get::<i64, _>("item_seq").ok())
-        .unwrap_or(start_item_seq);
-    let last_item_seq = rows
-        .last()
-        .and_then(|row| row.try_get::<i64, _>("item_seq").ok())
-        .unwrap_or(end_item_seq);
+    let page_items = rows
+        .iter()
+        .map(decode_transcript_page_item_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlx::Error::Protocol)?;
+    let Some(first_page_item) = page_items.first() else {
+        return Err(sqlx::Error::Protocol(
+            "non-empty transcript page rows decoded into an empty page item set".to_string(),
+        ));
+    };
+    let Some(last_page_item) = page_items.last() else {
+        return Err(sqlx::Error::Protocol(
+            "non-empty transcript page rows decoded into an empty page item set".to_string(),
+        ));
+    };
+    let first_item_seq = first_page_item.item_seq;
+    let last_item_seq = last_page_item.item_seq;
     let mut hasher = Sha256::new();
-    for row in &rows {
-        hasher.update(row.try_get::<i64, _>("item_seq")?.to_string().as_bytes());
+    for item in &page_items {
+        hasher.update(item.item_seq.to_string().as_bytes());
         hasher.update([0]);
-        hasher.update(row.try_get::<String, _>("role")?.as_bytes());
+        hasher.update(item.role.as_bytes());
         hasher.update([0]);
-        hasher.update(row.try_get::<String, _>("content_hash")?.as_bytes());
+        hasher.update(item.content_hash.as_bytes());
         hasher.update([0xff]);
     }
     let page_hash = format!("{:x}", hasher.finalize());
@@ -1569,7 +1634,6 @@ async fn sync_transcript_page_inner(
          (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
          ON DUPLICATE KEY UPDATE
-           user_id = VALUES(user_id),
            start_item_seq = VALUES(start_item_seq),
            end_item_seq = VALUES(end_item_seq),
            item_count = VALUES(item_count),
@@ -1596,12 +1660,12 @@ fn transcript_content_hash(role: &str, content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Persist `tool_call` events to `agent_events` for tools used during the
-/// server-driven agentic loop.  The bridge path creates detailed per-call
-/// records; here we create one event per unique tool name from
+/// Persist audit-facing `tool_call` events to `agent_events` for tools used
+/// during the server-driven agentic loop. The bridge path creates detailed
+/// per-call records; here we create one event per unique tool name from
 /// `state.telemetry.all_tools_used` with metadata containing `tool_name`
-/// so that `session_audit` aggregate queries (`meta_tool_name`, `tool_calls_total`)
-/// return correct results for server-loop sessions.
+/// so that `session_audit` aggregate queries (`meta_tool_name`,
+/// `tool_calls_total`) return correct results for server-loop sessions.
 async fn persist_server_loop_tool_events(
     writer: &dyn TurnToolEventWriter,
     user_id: &str,
@@ -1678,7 +1742,7 @@ async fn persist_server_loop_hook_events(
             "tool_calls": tool_call_names,
             "model_used": model_name,
             "total_tool_calls": state.total_tool_calls,
-            "total_prompt_tokens": state.total_prompt,
+            "total_prompt_tokens": state.provider_input_tokens(),
             "total_completion_tokens": state.total_completion,
         }),
         model_used: model_name.map(|s| s.to_string()),
@@ -1876,6 +1940,32 @@ mod tests {
             .clone()
     }
 
+    #[derive(Default)]
+    struct CaptureToolEventWriter {
+        plans: std::sync::Mutex<Vec<TurnToolEventPersistPlan>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnToolEventWriter for CaptureToolEventWriter {
+        async fn persist(&self, plan: TurnToolEventPersistPlan) -> Result<(), String> {
+            self.plans.lock().expect("capture lock").push(plan);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CaptureHookDbWriter {
+        plans: std::sync::Mutex<Vec<TurnHookDbPersistPlan>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnHookDbWriter for CaptureHookDbWriter {
+        async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
+            self.plans.lock().expect("capture lock").push(plan);
+            Ok(())
+        }
+    }
+
     #[test]
     fn messages_for_csl_persist_keeps_only_prompt_facing_history() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
@@ -1913,6 +2003,338 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn lifecycle_token_usage_json_uses_canonical_prompt_cache_shape() {
+        let usage = lifecycle_token_usage_json(10, 4, 3, 5).expect("non-empty usage");
+
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["cached_input_tokens"], 4);
+        assert_eq!(usage["cache_creation_tokens"], 3);
+        assert_eq!(usage["output_tokens"], 5);
+        assert_eq!(usage["total_tokens"], 22);
+        assert_eq!(usage["prompt"], 17);
+        assert_eq!(usage["completion"], 5);
+        assert_eq!(usage["cache_read"], 4);
+        assert_eq!(usage["cache_write"], 3);
+        assert_eq!(usage["total"], 22);
+        assert!(
+            usage.get("cache_read_tokens").is_none(),
+            "persisted runtime events must use canonical prompt-cache field names"
+        );
+        assert!(lifecycle_token_usage_json(0, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn llm_round_trace_events_use_canonical_token_usage() {
+        let trace = server_trace_context("user-1", "session-1", "run-1", 3);
+        let events = build_llm_round_trace_events(
+            &trace,
+            "run-1",
+            Some("parent-run"),
+            Some("agent-1"),
+            Some("root-agent"),
+            Some("fallback-model"),
+            &[crate::turn::agentic_loop::host::RecentRoundSummary {
+                round: 2,
+                model: "model-1".to_string(),
+                prompt_tokens: 10,
+                cache_read_tokens: 4,
+                cache_creation_tokens: 3,
+                completion_tokens: 5,
+                duration_ms: 123,
+                ..Default::default()
+            }],
+        );
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.event_type, "llm_round_completed");
+        assert_eq!(event.trace_kind, "llm_round");
+        assert_eq!(event.round_index, Some(2));
+        let token_usage = event.token_usage.as_ref().expect("token usage");
+        assert_eq!(token_usage["input_tokens"], 10);
+        assert_eq!(token_usage["cached_input_tokens"], 4);
+        assert_eq!(token_usage["cache_creation_tokens"], 3);
+        assert_eq!(token_usage["output_tokens"], 5);
+        assert_eq!(token_usage["total_tokens"], 22);
+        assert_eq!(token_usage["prompt"], 17);
+        assert_eq!(token_usage["completion"], 5);
+        assert_eq!(token_usage["cache_read"], 4);
+        assert_eq!(token_usage["cache_write"], 3);
+        assert_eq!(token_usage["total"], 22);
+    }
+
+    #[tokio::test]
+    async fn server_loop_tool_events_are_audit_facing_tool_call_records() {
+        let writer = CaptureToolEventWriter::default();
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.telemetry.all_tools_used = ["bash", "read_file"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        persist_server_loop_tool_events(&writer, "user-1", "session-1", Some("agent-1"), &state)
+            .await;
+
+        let plans = writer.plans.lock().expect("capture lock");
+        assert_eq!(plans.len(), 1);
+        let events = &plans[0].events;
+        assert_eq!(events.len(), 2);
+        let mut tool_names = events
+            .iter()
+            .map(|event| {
+                assert!(!event.event_id.is_empty());
+                assert_eq!(event.user_id, "user-1");
+                assert_eq!(event.session_id, "session-1");
+                assert_eq!(event.agent_id.as_deref(), Some("agent-1"));
+                assert_eq!(event.event_type, "tool_call");
+                assert_eq!(event.parent_event_id, None);
+                assert!(event.parent_event_ids.is_empty());
+                assert!(!event.causal_chain_id.is_empty());
+                event
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("tool_name"))
+                    .and_then(Value::as_str)
+                    .expect("tool_name metadata")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        tool_names.sort();
+        assert_eq!(tool_names, vec!["bash", "read_file"]);
+    }
+
+    #[tokio::test]
+    async fn server_loop_hook_audit_prompt_tokens_include_cache_buckets() {
+        let writer = CaptureHookDbWriter::default();
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.final_text = "done".to_string();
+        state.total_prompt = 10;
+        state.total_cache_read = 4;
+        state.total_cache_creation = 3;
+        state.total_completion = 5;
+
+        persist_server_loop_hook_events(
+            &writer,
+            "user-1",
+            "session-1",
+            "work",
+            &state,
+            Some("model-a"),
+        )
+        .await;
+
+        let plans = writer.plans.lock().expect("capture lock");
+        assert_eq!(plans.len(), 1);
+        let decision = plans[0].decision_audit.as_ref().expect("decision audit");
+        assert_eq!(decision.decision_output["total_prompt_tokens"], 17);
+        assert_eq!(decision.decision_output["total_completion_tokens"], 5);
+    }
+
+    #[tokio::test]
+    async fn server_loop_tool_events_skip_empty_tool_sets() {
+        let writer = CaptureToolEventWriter::default();
+        let state = crate::turn::agentic_loop::host::make_test_loop_state();
+
+        persist_server_loop_tool_events(&writer, "user-1", "session-1", None, &state).await;
+
+        let plans = writer.plans.lock().expect("capture lock");
+        assert!(plans.is_empty());
+    }
+
+    struct FakeRunLifecyclePersistenceRow {
+        failed_column: Option<&'static str>,
+        count: i64,
+        item_seq: i64,
+        role: &'static str,
+        content_hash: &'static str,
+    }
+
+    impl Default for FakeRunLifecyclePersistenceRow {
+        fn default() -> Self {
+            Self {
+                failed_column: None,
+                count: 2,
+                item_seq: 7,
+                role: "assistant",
+                content_hash: "sha256:page-item",
+            }
+        }
+    }
+
+    impl FakeRunLifecyclePersistenceRow {
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::default()
+            }
+        }
+
+        fn with_count(count: i64) -> Self {
+            Self {
+                count,
+                ..Self::default()
+            }
+        }
+
+        fn with_item_seq(item_seq: i64) -> Self {
+            Self {
+                item_seq,
+                ..Self::default()
+            }
+        }
+
+        fn with_role(role: &'static str) -> Self {
+            Self {
+                role,
+                ..Self::default()
+            }
+        }
+
+        fn with_content_hash(content_hash: &'static str) -> Self {
+            Self {
+                content_hash,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl RowExt for FakeRunLifecyclePersistenceRow {
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+            match column {
+                "count" => Ok(self.count),
+                "item_seq" => Ok(self.item_seq),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+            match column {
+                "role" => Ok(self.role.to_string()),
+                "content_hash" => Ok(self.content_hash.to_string()),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn post_compaction_manifest_count_decode_preserves_zero_and_fails_loudly() {
+        assert_eq!(
+            decode_post_compaction_manifest_count(&FakeRunLifecyclePersistenceRow::with_count(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            decode_post_compaction_manifest_count(&FakeRunLifecyclePersistenceRow::with_count(2))
+                .unwrap(),
+            2
+        );
+
+        let missing = decode_post_compaction_manifest_count(
+            &FakeRunLifecyclePersistenceRow::fail_on("count"),
+        )
+        .unwrap_err();
+        assert!(
+            missing.contains("post-compaction context manifest count") && missing.contains("count"),
+            "missing count should fail loudly: {missing}"
+        );
+
+        let negative =
+            decode_post_compaction_manifest_count(&FakeRunLifecyclePersistenceRow::with_count(-1))
+                .unwrap_err();
+        assert!(
+            negative.contains("count") && negative.contains("non-negative integer"),
+            "negative count should fail loudly: {negative}"
+        );
+    }
+
+    #[test]
+    fn transcript_page_item_row_decode_preserves_database_values() {
+        let row =
+            decode_transcript_page_item_row(&FakeRunLifecyclePersistenceRow::default()).unwrap();
+
+        assert_eq!(
+            row,
+            TranscriptPageItemRow {
+                item_seq: 7,
+                role: "assistant".to_string(),
+                content_hash: "sha256:page-item".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn transcript_page_item_row_decode_fails_loudly_on_any_selected_column_error() {
+        for column in ["item_seq", "role", "content_hash"] {
+            let error =
+                decode_transcript_page_item_row(&FakeRunLifecyclePersistenceRow::fail_on(column))
+                    .unwrap_err();
+            assert!(
+                error.contains("transcript page item row") && error.contains(column),
+                "decode error should identify selected column `{column}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_page_item_row_decode_rejects_invalid_page_identity() {
+        for item_seq in [0, -1] {
+            let error = decode_transcript_page_item_row(
+                &FakeRunLifecyclePersistenceRow::with_item_seq(item_seq),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("item_seq") && error.contains("positive integer"),
+                "invalid item_seq should fail loudly: {error}"
+            );
+        }
+
+        for (column, row) in [
+            ("role", FakeRunLifecyclePersistenceRow::with_role("   ")),
+            (
+                "content_hash",
+                FakeRunLifecyclePersistenceRow::with_content_hash(""),
+            ),
+        ] {
+            let error = decode_transcript_page_item_row(&row).unwrap_err();
+            assert!(
+                error.contains(column) && error.contains("non-empty string"),
+                "empty transcript page identity column should fail loudly for `{column}`: {error}"
+            );
+        }
+    }
+
+    async fn cleanup_transcript_fixture_for_owner(
+        db: &sqlx::Pool<sqlx::MySql>,
+        session_id: &str,
+        user_id: &str,
+    ) {
+        sqlx::query("DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .expect("cleanup transcript fixture transcript_pages");
+        sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .expect("cleanup transcript fixture session_transcript_items");
+        sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .expect("cleanup transcript fixture agent_sessions");
+    }
+
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn transcript_persistence_writes_owner_scoped_pages_and_rejects_wrong_owner() {
@@ -1923,18 +2345,8 @@ mod tests {
         let other_user_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
 
-        let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
-            .bind(&session_id)
-            .execute(&db)
-            .await;
-        let _ = sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ?")
-            .bind(&session_id)
-            .execute(&db)
-            .await;
-        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .execute(&db)
-            .await;
+        cleanup_transcript_fixture_for_owner(&db, &session_id, &owner_user_id).await;
+        cleanup_transcript_fixture_for_owner(&db, &session_id, &other_user_id).await;
 
         sqlx::query(
             "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
@@ -1945,6 +2357,28 @@ mod tests {
         .execute(&db)
         .await
         .expect("insert owner session");
+        sqlx::query(
+            "INSERT INTO session_transcript_items
+             (user_id, session_id, item_seq, run_id, role, content, source_event_id, content_hash, created_at)
+             VALUES (?, ?, 1, ?, 'assistant', 'foreign dirty row', ?, 'foreign-hash', NOW(6))",
+        )
+        .bind(&other_user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .bind(Uuid::new_v4().to_string())
+        .execute(&db)
+        .await
+        .expect("insert foreign dirty transcript item");
+        sqlx::query(
+            "INSERT INTO transcript_pages
+             (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash, created_at, updated_at)
+             VALUES (?, ?, 1, 1, 1, 1, 'foreign-page', NOW(6), NOW(6))",
+        )
+        .bind(&other_user_id)
+        .bind(&session_id)
+        .execute(&db)
+        .await
+        .expect("insert foreign dirty transcript page");
 
         let items = [
             TranscriptPersistItem {
@@ -1974,8 +2408,9 @@ mod tests {
         let page = sqlx::query(
             "SELECT user_id, start_item_seq, end_item_seq, item_count
              FROM transcript_pages
-             WHERE session_id = ? AND page_seq = 1",
+             WHERE user_id = ? AND session_id = ? AND page_seq = 1",
         )
+        .bind(&owner_user_id)
         .bind(&session_id)
         .fetch_one(&db)
         .await
@@ -1984,6 +2419,38 @@ mod tests {
         assert_eq!(page.try_get::<i64, _>("start_item_seq").unwrap(), 1);
         assert_eq!(page.try_get::<i64, _>("end_item_seq").unwrap(), 2);
         assert_eq!(page.try_get::<i64, _>("item_count").unwrap(), 2);
+
+        let same_item_seq_rows = sqlx::query(
+            "SELECT COUNT(*) AS c
+             FROM session_transcript_items
+             WHERE session_id = ? AND item_seq = 1",
+        )
+        .bind(&session_id)
+        .fetch_one(&db)
+        .await
+        .expect("count shared item_seq rows")
+        .try_get::<i64, _>("c")
+        .expect("decode shared item_seq count");
+        assert_eq!(
+            same_item_seq_rows, 2,
+            "transcript item identity must include owner"
+        );
+
+        let same_page_seq_rows = sqlx::query(
+            "SELECT COUNT(*) AS c
+             FROM transcript_pages
+             WHERE session_id = ? AND page_seq = 1",
+        )
+        .bind(&session_id)
+        .fetch_one(&db)
+        .await
+        .expect("count shared page_seq rows")
+        .try_get::<i64, _>("c")
+        .expect("decode shared page_seq count");
+        assert_eq!(
+            same_page_seq_rows, 2,
+            "transcript page identity must include owner"
+        );
 
         let mut wrong_owner_tx = db.begin().await.expect("begin wrong-owner transcript tx");
         let wrong_owner = persist_session_transcript_items_inner_in_tx(
@@ -2020,19 +2487,25 @@ mod tests {
         .expect("count wrong owner rows")
         .try_get::<i64, _>("c")
         .expect("decode wrong owner count");
-        assert_eq!(wrong_owner_rows, 0);
+        assert_eq!(
+            wrong_owner_rows, 1,
+            "wrong owner attempt must not add rows beyond the seeded dirty row"
+        );
+        let wrong_owner_attempt_rows = sqlx::query(
+            "SELECT COUNT(*) AS c
+             FROM session_transcript_items
+             WHERE session_id = ? AND user_id = ? AND content = 'wrong owner'",
+        )
+        .bind(&session_id)
+        .bind(&other_user_id)
+        .fetch_one(&db)
+        .await
+        .expect("count wrong owner attempted content")
+        .try_get::<i64, _>("c")
+        .expect("decode wrong owner attempted content count");
+        assert_eq!(wrong_owner_attempt_rows, 0);
 
-        let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
-            .bind(&session_id)
-            .execute(&db)
-            .await;
-        let _ = sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ?")
-            .bind(&session_id)
-            .execute(&db)
-            .await;
-        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .execute(&db)
-            .await;
+        cleanup_transcript_fixture_for_owner(&db, &session_id, &owner_user_id).await;
+        cleanup_transcript_fixture_for_owner(&db, &session_id, &other_user_id).await;
     }
 }

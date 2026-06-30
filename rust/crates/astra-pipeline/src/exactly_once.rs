@@ -131,8 +131,9 @@ pub struct ExactlyOnceExecutor {
     /// Short-lived failure leases used to prevent crash-recovery retry storms
     /// without poisoning the exactly-once result cache.
     retry_suppressions: HashMap<IdempotencyKey, RetrySuppression>,
-    /// FIFO index for bounded transient retry state. Stale entries are skipped
-    /// during pruning, so clearing a key does not require scanning the queue.
+    /// FIFO index for bounded transient retry state. Entries are removed when
+    /// their retry state clears, so long-running sessions do not retain stale
+    /// retry keys after successful retries.
     retry_order: VecDeque<IdempotencyKey>,
     retry_suppression_secs: u64,
     max_retry_tracking_entries: usize,
@@ -416,6 +417,7 @@ impl ExactlyOnceExecutor {
     fn clear_retry_tracking(&mut self, key: &IdempotencyKey) {
         self.retry_counts.remove(key);
         self.retry_suppressions.remove(key);
+        self.retry_order.retain(|tracked| tracked != key);
     }
 
     fn record_retry_failure(&mut self, key: &IdempotencyKey) -> Option<u32> {
@@ -435,7 +437,12 @@ impl ExactlyOnceExecutor {
     }
 
     fn retry_tracking_size(&self) -> usize {
-        self.retry_counts.len().max(self.retry_suppressions.len())
+        self.retry_counts.len()
+            + self
+                .retry_suppressions
+                .keys()
+                .filter(|key| !self.retry_counts.contains_key(*key))
+                .count()
     }
 
     fn enforce_retry_tracking_bound(&mut self) {
@@ -494,20 +501,6 @@ impl ExactlyOnceExecutor {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn exactly_once_production_has_no_direct_panic_unwraps() {
-        let source = include_str!("exactly_once.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        assert!(
-            !production.contains(".expect("),
-            "exactly-once production path must not panic on unhappy paths"
-        );
-        assert!(
-            !production.contains(".unwrap("),
-            "exactly-once production path must not unwrap fallible runtime state"
-        );
-    }
 
     #[tokio::test]
     async fn test_cache_miss_executes_tool() {
@@ -823,6 +816,64 @@ mod tests {
         assert!(!executor.retry_suppressions.contains_key(&key));
     }
 
+    #[test]
+    fn clear_retry_tracking_removes_retry_order_entries() {
+        let mut executor = ExactlyOnceExecutor::new();
+        let key = IdempotencyKey::new("step-1", 0, "bash", &json!({"command": "curl"}));
+
+        assert_eq!(executor.record_retry_failure(&key), Some(1));
+        assert_eq!(executor.retry_order.len(), 1);
+
+        executor.clear_retry_tracking(&key);
+
+        assert_eq!(executor.retry_counts.len(), 0);
+        assert_eq!(executor.retry_suppressions.len(), 0);
+        assert_eq!(
+            executor.retry_order.len(),
+            0,
+            "clearing retry state must not leave stale queue entries"
+        );
+
+        assert_eq!(executor.record_retry_failure(&key), Some(1));
+        assert_eq!(
+            executor.retry_order.len(),
+            1,
+            "retrying the same key after a success should not accumulate duplicate stale entries"
+        );
+    }
+
+    #[test]
+    fn retry_tracking_bound_counts_disjoint_maps_as_union() {
+        let mut executor = ExactlyOnceExecutor::new().with_max_retry_tracking_entries(1);
+        let count_key = IdempotencyKey::new("step-1", 0, "bash", &json!({"command": "a"}));
+        let suppression_key = IdempotencyKey::new("step-1", 1, "bash", &json!({"command": "b"}));
+
+        executor.retry_counts.insert(count_key.clone(), 1);
+        executor.retry_suppressions.insert(
+            suppression_key.clone(),
+            RetrySuppression {
+                retry_count: 1,
+                retry_after_epoch_secs: unix_timestamp_secs().saturating_add(60),
+                last_error: "temporary failure".to_string(),
+            },
+        );
+        executor.retry_order.push_back(count_key);
+        executor.retry_order.push_back(suppression_key);
+
+        assert_eq!(
+            executor.retry_tracking_size(),
+            2,
+            "tracking size must count distinct keys across counts and suppressions"
+        );
+
+        executor.enforce_retry_tracking_bound();
+
+        assert!(
+            executor.retry_tracking_size() <= 1,
+            "eviction must use the true union size, not max(counts, suppressions)"
+        );
+    }
+
     #[tokio::test]
     async fn test_different_args_different_cache_entries() {
         let mut executor = ExactlyOnceExecutor::new();
@@ -1026,5 +1077,108 @@ mod tests {
             .await
             .unwrap();
         assert!(read_cached.from_cache); // AlwaysCache policy
+    }
+
+    /// Production panic guard: verify ExactlyOnceExecutor does not panic on edge cases.
+    /// These tests ensure no `.unwrap()` or `.expect()` calls in production paths.
+    #[test]
+    fn exactly_once_production_has_no_direct_panic_unwraps() {
+        let source = include_str!("exactly_once.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !production.contains(".expect("),
+            "exactly-once production path must not panic on unhappy paths"
+        );
+        assert!(
+            !production.contains(".unwrap("),
+            "exactly-once production path must not unwrap fallible runtime state"
+        );
+    }
+
+    /// Production panic guard: verify ExactlyOnceExecutor does not panic on edge cases.
+    /// These tests ensure no `.unwrap()` or `.expect()` calls in production paths.
+    #[tokio::test]
+    async fn panic_guard_empty_step_id_does_not_panic() {
+        let mut executor = ExactlyOnceExecutor::new();
+        let result = executor
+            .execute_with_dedup("", 0, "bash", &json!({"command": "echo"}), |_, _| async {
+                Ok("ok".to_string())
+            })
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn panic_guard_empty_tool_name_does_not_panic() {
+        let mut executor = ExactlyOnceExecutor::new();
+        let result = executor
+            .execute_with_dedup("step-1", 0, "", &json!({}), |_, _| async {
+                Ok("ok".to_string())
+            })
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn panic_guard_null_json_args_does_not_panic() {
+        let mut executor = ExactlyOnceExecutor::new();
+        let result = executor
+            .execute_with_dedup(
+                "step-1",
+                0,
+                "bash",
+                &serde_json::Value::Null,
+                |_, _| async { Ok("ok".to_string()) },
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn panic_guard_tool_returning_error_does_not_panic() {
+        let mut executor = ExactlyOnceExecutor::new();
+        let result = executor
+            .execute_with_dedup(
+                "step-1",
+                0,
+                "bash",
+                &json!({"command": "fail"}),
+                |_, _| async { Err("tool error".to_string()) },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ExactlyOnceError::ToolExecutionError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn panic_guard_max_retries_zero_does_not_panic() {
+        let mut executor = ExactlyOnceExecutor::new().with_max_retries(0);
+        let result = executor
+            .execute_with_dedup(
+                "step-1",
+                0,
+                "bash",
+                &json!({"command": "fail"}),
+                |_, _| async { Err("error".to_string()) },
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn panic_guard_max_retry_tracking_zero_does_not_panic() {
+        let mut executor = ExactlyOnceExecutor::new().with_max_retry_tracking_entries(0);
+        let result = executor
+            .execute_with_dedup(
+                "step-1",
+                0,
+                "bash",
+                &json!({"command": "fail"}),
+                |_, _| async { Err("error".to_string()) },
+            )
+            .await;
+        assert!(result.is_err());
     }
 }

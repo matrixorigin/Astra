@@ -14,6 +14,10 @@ use crate::session_journal::{
     validate_session_id,
 };
 use crate::session_workspace::{self, WorkspaceMetadata};
+use std::{
+    ffi::{OsStr, OsString},
+    path::PathBuf,
+};
 
 // ---------------------------------------------------------------------------
 // Layer 5.1 — Session Fork with Data Branching
@@ -94,6 +98,38 @@ impl Drop for ForkArtifactGuard {
         let _ = std::fs::remove_file(journal_file_path(&self.session_id));
         let _ = std::fs::remove_dir_all(session_workspace::workspace_dir_for(&self.session_id));
     }
+}
+
+#[derive(Debug)]
+struct StepCheckpointDirEntry {
+    name: OsString,
+    path: PathBuf,
+}
+
+impl StepCheckpointDirEntry {
+    fn from_dir_entry(entry: std::fs::DirEntry) -> Self {
+        Self {
+            name: entry.file_name(),
+            path: entry.path(),
+        }
+    }
+}
+
+fn collect_step_checkpoint_entries<I>(entries: I) -> Result<Vec<StepCheckpointDirEntry>, String>
+where
+    I: IntoIterator<Item = Result<StepCheckpointDirEntry, std::io::Error>>,
+{
+    let mut entries = entries
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read step_checkpoints entry: {e}"))?;
+    entries.sort_by_key(|entry| entry.name.clone());
+    Ok(entries)
+}
+
+fn is_step_checkpoint_file_name(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.ends_with("-heavy.json") || name.ends_with("-light.json")
 }
 
 /// Fork parent journal into a new session file and workspace metadata.
@@ -231,19 +267,17 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
             let new_cp_dir = store.session_dir(&new_id)?.join("step_checkpoints");
             std::fs::create_dir_all(&new_cp_dir)
                 .map_err(|e| format!("create step_checkpoints dir: {e}"))?;
-            let mut entries: Vec<_> = std::fs::read_dir(&parent_cp_dir)
-                .map_err(|e| format!("read step_checkpoints: {e}"))?
-                .filter_map(|e| e.ok())
-                .collect();
-            entries.sort_by_key(|e| e.file_name());
+            let entries = collect_step_checkpoint_entries(
+                std::fs::read_dir(&parent_cp_dir)
+                    .map_err(|e| format!("read step_checkpoints: {e}"))?
+                    .map(|entry| entry.map(StepCheckpointDirEntry::from_dir_entry)),
+            )?;
             for entry in entries {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                // Skip non-checkpoint files (composite_snapshots.json, breakpoints.json).
-                if !name_str.ends_with("-heavy.json") && !name_str.ends_with("-light.json") {
+                if !is_step_checkpoint_file_name(&entry.name) {
                     continue;
                 }
-                std::fs::copy(entry.path(), new_cp_dir.join(&name))
+                let name_str = entry.name.to_string_lossy();
+                std::fs::copy(entry.path, new_cp_dir.join(&entry.name))
                     .map_err(|e| format!("copy checkpoint {name_str}: {e}"))?;
             }
         }
@@ -318,6 +352,52 @@ mod tests {
         let mut ws = session_workspace::WorkspaceMetadata::new(session_id, "test-model");
         ws.turn_count = num_turns;
         session_workspace::write_workspace(&ws).unwrap();
+    }
+
+    fn fake_checkpoint_entry(name: &str) -> StepCheckpointDirEntry {
+        StepCheckpointDirEntry {
+            name: OsString::from(name),
+            path: PathBuf::from(name),
+        }
+    }
+
+    #[test]
+    fn collect_step_checkpoint_entries_sorts_and_fails_loudly_on_entry_error() {
+        let entries = collect_step_checkpoint_entries(vec![
+            Ok(fake_checkpoint_entry("000002-light.json")),
+            Ok(fake_checkpoint_entry("000001-heavy.json")),
+        ])
+        .expect("entries collect");
+
+        let names = entries
+            .iter()
+            .map(|entry| entry.name.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["000001-heavy.json", "000002-light.json"]);
+
+        let err = collect_step_checkpoint_entries(vec![
+            Ok(fake_checkpoint_entry("000001-heavy.json")),
+            Err(std::io::Error::other("directory entry vanished")),
+        ])
+        .expect_err("entry errors must not be dropped");
+        assert!(
+            err.contains("read step_checkpoints entry") && err.contains("directory entry vanished"),
+            "entry error should be explicit: {err}"
+        );
+    }
+
+    #[test]
+    fn step_checkpoint_file_name_filter_accepts_only_checkpoint_files() {
+        assert!(is_step_checkpoint_file_name(OsStr::new(
+            "000001-heavy.json"
+        )));
+        assert!(is_step_checkpoint_file_name(OsStr::new(
+            "000002-light.json"
+        )));
+        assert!(!is_step_checkpoint_file_name(OsStr::new(
+            "composite_snapshots.json"
+        )));
+        assert!(!is_step_checkpoint_file_name(OsStr::new("000003.json")));
     }
 
     /// Cleanup test session files (journal + workspace dir under `~/.astra/sessions`).

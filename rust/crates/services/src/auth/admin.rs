@@ -20,6 +20,34 @@ use axum::{
 use sqlx::{MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
+fn required_admin_string(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<String, sqlx::Error> {
+    let value: String = row.try_get(column)?;
+    if value.trim().is_empty() {
+        return Err(sqlx::Error::ColumnDecode {
+            index: column.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid {table}.{column}: value is empty"),
+            )
+            .into(),
+        });
+    }
+    Ok(value)
+}
+
+fn required_admin_string_response(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    required_admin_string(row, table, column)
+        .map_err(|err| internal_error(format!("invalid {table}.{column}: {err}")))
+}
+
 #[derive(Clone, Debug)]
 pub struct DatabaseAdminAuthorizer {
     matrixone: MatrixOneSettings,
@@ -319,7 +347,10 @@ impl DatabaseAdminUserRoleManager {
             .bind(username)
             .fetch_optional(pool)
             .await
-            .map(|row| row.and_then(|row| row.try_get("user_id").ok()))
+            .and_then(|row| {
+                row.map(|row| required_admin_string(&row, "auth_users", "user_id"))
+                    .transpose()
+            })
     }
 
     async fn lookup_role_id(
@@ -331,7 +362,10 @@ impl DatabaseAdminUserRoleManager {
             .bind(role_name)
             .fetch_optional(pool)
             .await
-            .map(|row| row.and_then(|row| row.try_get("role_id").ok()))
+            .and_then(|row| {
+                row.map(|row| required_admin_string(&row, "auth_roles", "role_id"))
+                    .transpose()
+            })
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
@@ -610,24 +644,28 @@ impl AdminFeedbackStatsReader for DatabaseAdminFeedbackStatsReader {
 
         let mut feedback_by_type = serde_json::Map::new();
         for row in type_rows {
-            let feedback_type: String = row.try_get("feedback_type").map_err(internal_error)?;
+            let feedback_type =
+                required_admin_string_response(&row, "eval_user_feedback", "feedback_type")?;
             let count: i64 = row.try_get("type_count").map_err(internal_error)?;
             feedback_by_type.insert(feedback_type, serde_json::Value::from(count));
         }
 
+        let total_feedback: i64 = summary_row
+            .try_get("total_feedback")
+            .map_err(internal_error)?;
+        let positive_feedback: Option<i64> = summary_row
+            .try_get("positive_feedback")
+            .map_err(internal_error)?;
+        let negative_feedback: Option<i64> = summary_row
+            .try_get("negative_feedback")
+            .map_err(internal_error)?;
+        let avg_rating: Option<f64> = summary_row.try_get("avg_rating").map_err(internal_error)?;
+
         Ok(AdminFeedbackStatsRecord {
-            total_feedback: summary_row.try_get::<i64, _>("total_feedback").unwrap_or(0),
-            positive_feedback: summary_row
-                .try_get::<Option<i64>, _>("positive_feedback")
-                .unwrap_or(None)
-                .unwrap_or(0),
-            negative_feedback: summary_row
-                .try_get::<Option<i64>, _>("negative_feedback")
-                .unwrap_or(None)
-                .unwrap_or(0),
-            avg_rating: summary_row
-                .try_get::<Option<f64>, _>("avg_rating")
-                .unwrap_or(None),
+            total_feedback,
+            positive_feedback: positive_feedback.unwrap_or(0),
+            negative_feedback: negative_feedback.unwrap_or(0),
+            avg_rating,
             feedback_by_type,
         })
     }

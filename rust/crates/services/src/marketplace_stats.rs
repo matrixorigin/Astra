@@ -148,6 +148,83 @@ fn aggregate_metric_id(skill_name: &str) -> String {
     format!("skill-metric-aggregate-{skill_name}")
 }
 
+fn row_value<T>(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<T, (StatusCode, Json<ErrorResponse>)>
+where
+    for<'r> T: sqlx::Decode<'r, sqlx::MySql> + sqlx::Type<sqlx::MySql>,
+{
+    row.try_get(column)
+        .map_err(|err| internal_error(format!("invalid {table}.{column}: {err}")))
+}
+
+fn row_required_string(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let value: String = row_value(row, table, column)?;
+    if value.trim().is_empty() {
+        return Err(internal_error(format!(
+            "invalid {table}.{column}: value is empty"
+        )));
+    }
+    Ok(value)
+}
+
+fn row_optional_string(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    let value: Option<String> = row_value(row, table, column)?;
+    if value
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(internal_error(format!(
+            "invalid {table}.{column}: value is empty"
+        )));
+    }
+    Ok(value)
+}
+
+fn marketplace_stats_from_row(
+    row: sqlx::mysql::MySqlRow,
+) -> Result<SkillMarketplaceStats, (StatusCode, Json<ErrorResponse>)> {
+    Ok(SkillMarketplaceStats {
+        skill_name: row_required_string(&row, "skill_metrics", "skill_name")?,
+        publisher_id: row_optional_string(&row, "skill_metrics", "publisher_id")?,
+        total_installs: row_value(&row, "skill_metrics", "total_installs")?,
+        active_users_7d: row_value(&row, "skill_metrics", "active_users_7d")?,
+        avg_quality: row_value(&row, "skill_metrics", "avg_quality")?,
+        avg_rating: row_value(&row, "skill_metrics", "avg_rating")?,
+        report_count: row_value(&row, "skill_metrics", "report_count")?,
+        compatibility_score: row_value(&row, "skill_metrics", "compatibility_score")?,
+        trust_tier: row_optional_string(&row, "skill_metrics", "trust_tier")?,
+        last_updated: row_optional_string(&row, "skill_metrics", "last_updated")?,
+    })
+}
+
+fn marketplace_search_result_from_row(
+    row: sqlx::mysql::MySqlRow,
+) -> Result<SkillSearchResult, (StatusCode, Json<ErrorResponse>)> {
+    Ok(SkillSearchResult {
+        skill_name: row_required_string(&row, "skills_registry", "skill_name")?,
+        version: row_required_string(&row, "skills_registry", "version")?,
+        description: row_optional_string(&row, "skills_registry", "description")?,
+        publisher_id: row_optional_string(&row, "skill_metrics", "publisher_id")?,
+        trust_tier: row_optional_string(&row, "skill_metrics", "trust_tier")?,
+        category: row_optional_string(&row, "skills_registry", "category")?,
+        ranking_score: row_value(&row, "marketplace_search", "ranking_score")?,
+        avg_quality: row_value(&row, "skill_metrics", "avg_quality")?,
+        total_installs: row_value(&row, "skill_metrics", "total_installs")?,
+        active_users_7d: row_value(&row, "skill_metrics", "active_users_7d")?,
+    })
+}
+
 #[async_trait]
 impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
     async fn submit_quality_report(
@@ -206,18 +283,7 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
             )
         })?;
 
-        Ok(SkillMarketplaceStats {
-            skill_name: row.try_get("skill_name").unwrap_or_default(),
-            publisher_id: row.try_get("publisher_id").ok(),
-            total_installs: row.try_get("total_installs").unwrap_or(0),
-            active_users_7d: row.try_get("active_users_7d").unwrap_or(0),
-            avg_quality: row.try_get("avg_quality").unwrap_or(0.0),
-            avg_rating: row.try_get("avg_rating").unwrap_or(0.0),
-            report_count: row.try_get("report_count").unwrap_or(0),
-            compatibility_score: row.try_get("compatibility_score").unwrap_or(0.0),
-            trust_tier: row.try_get("trust_tier").ok(),
-            last_updated: row.try_get("last_updated").ok(),
-        })
+        marketplace_stats_from_row(row)
     }
 
     async fn search_ranked(
@@ -308,7 +374,7 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
             count_q = count_q.bind(b);
         }
         let count_row = count_q.fetch_one(&pool).await.map_err(internal_error)?;
-        let total: i64 = count_row.try_get("cnt").unwrap_or(0);
+        let total: i64 = row_value(&count_row, "marketplace_search", "cnt")?;
 
         // Build and execute search query
         let mut search_q = query(&sql);
@@ -319,21 +385,10 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
 
         let rows = search_q.fetch_all(&pool).await.map_err(internal_error)?;
 
-        let results = rows
-            .iter()
-            .map(|row| SkillSearchResult {
-                skill_name: row.try_get("skill_name").unwrap_or_default(),
-                version: row.try_get("version").unwrap_or_default(),
-                description: row.try_get("description").ok(),
-                publisher_id: row.try_get("publisher_id").ok(),
-                trust_tier: row.try_get("trust_tier").ok(),
-                category: row.try_get("category").ok(),
-                ranking_score: row.try_get("ranking_score").unwrap_or(0.0),
-                avg_quality: row.try_get("avg_quality").unwrap_or(0.0),
-                total_installs: row.try_get("total_installs").unwrap_or(0),
-                active_users_7d: row.try_get("active_users_7d").unwrap_or(0),
-            })
-            .collect();
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            results.push(marketplace_search_result_from_row(row)?);
+        }
 
         Ok(SkillSearchResponse {
             results,
@@ -363,8 +418,9 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         .await
         .map_err(internal_error)?;
 
-        let avg_quality: f64 = agg_row.try_get("avg_quality").unwrap_or(0.0);
-        let report_count: i64 = agg_row.try_get("report_count").unwrap_or(0);
+        let avg_quality: Option<f64> = row_value(&agg_row, "skill_metrics", "avg_quality")?;
+        let report_count: i64 = row_value(&agg_row, "skill_metrics", "report_count")?;
+        let avg_tokens: Option<f64> = row_value(&agg_row, "skill_metrics", "avg_tokens")?;
 
         query(
             "INSERT INTO skill_metrics \
@@ -380,9 +436,9 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         .bind(&skill_name)
         .bind(SKILL_METRIC_TYPE_AGGREGATE)
         .bind(SKILL_METRIC_SLOT_AGGREGATE)
-        .bind(avg_quality)
+        .bind(avg_quality.unwrap_or(0.0))
         .bind(report_count as i32)
-        .bind(agg_row.try_get::<Option<f64>, _>("avg_tokens").unwrap_or(None))
+        .bind(avg_tokens)
         .execute(&pool)
         .await
         .map_err(internal_error)?;

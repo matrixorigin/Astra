@@ -69,6 +69,13 @@ fn global_alert_dispatcher()
         .as_ref()
 }
 
+fn alert_dispatch_session_id(session_id: Option<&str>) -> Option<String> {
+    session_id
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+        .map(ToString::to_string)
+}
+
 pub(crate) fn deferred_user_input_text(input: &serde_json::Value) -> Option<String> {
     fn trimmed_text(value: Option<&serde_json::Value>) -> Option<String> {
         value
@@ -117,12 +124,22 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<(), astra_core::ClassifiedError> {
-    let (run_control, run_id) = match (state.run_control.as_ref(), state.current_run_id.as_ref()) {
-        (Some(run_control), Some(run_id)) => (run_control.clone(), run_id.clone()),
+    let (run_control, user_id, run_id) = match (
+        state.run_control.as_ref(),
+        state.context_manifest_user_id.as_ref(),
+        state.current_run_id.as_ref(),
+    ) {
+        (Some(run_control), Some(user_id), Some(run_id)) => {
+            (run_control.clone(), user_id.clone(), run_id.clone())
+        }
         _ => return Ok(()),
     };
     let poll = run_control
-        .poll_user_inputs(&run_id, state.deferred_input.deferred_user_input_cursor())
+        .poll_user_inputs(
+            &user_id,
+            &run_id,
+            state.deferred_input.deferred_user_input_cursor(),
+        )
         .await;
     if let Some(error) = &poll.error {
         tracing::warn!(run_id, error = %error, "deferred user input poll failed");
@@ -167,7 +184,7 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
         return Ok(());
     }
     match run_control
-        .mark_user_inputs_released(&run_id, &release_event_indices)
+        .mark_user_inputs_released(&user_id, &run_id, &release_event_indices)
         .await
     {
         Ok(()) => state
@@ -365,9 +382,7 @@ async fn persist_context_manifest_for_llm_call(
     let turn_id = format!("{run_id}:llm:{llm_attempt_index}");
     let reason = manifest_reason_for_llm_call(state);
     let model_name = state.current_model_identity().unwrap_or("").to_string();
-    let context_window_tokens =
-        u32::try_from(crate::prompts::budget_for_model(Some(&model_name)).model_limit)
-            .unwrap_or(u32::MAX);
+    let context_window_tokens = context_window_tokens_for_context_manifest(state);
     let projection = crate::turn::llm::context::build_context_manifest_projection(
         crate::turn::llm::context::ContextManifestProjectionInput {
             session_id,
@@ -419,6 +434,17 @@ async fn persist_context_manifest_for_llm_call(
             "failed to persist per-llm-call context manifest"
         );
     }
+}
+
+fn context_window_tokens_for_context_manifest(state: &AgenticLoopState) -> u32 {
+    state
+        .last_llm_context_manifest_trace
+        .as_ref()
+        .and_then(|trace| trace.get("model_context_window_tokens"))
+        .and_then(|value| value.as_u64())
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(crate::prompts::DEFAULT_CONTEXT_WINDOW_TOKENS as u32)
 }
 
 fn circuit_breaker_introspection_message(
@@ -1333,13 +1359,20 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 // connection pool + TLS session cache across turns. Dispatch
                 // runs async so it never blocks turn execution.
                 if !alerts.is_empty() {
-                    if let Some(dispatcher) = global_alert_dispatcher() {
-                        let session_id_str = session_id.unwrap_or("unknown-session").to_string();
-                        let alerts_to_send = alerts.clone();
-                        let dispatcher = dispatcher.clone();
-                        tokio::spawn(async move {
-                            dispatcher.dispatch(&session_id_str, &alerts_to_send).await;
-                        });
+                    if let Some(session_id_str) = alert_dispatch_session_id(session_id) {
+                        if let Some(dispatcher) = global_alert_dispatcher() {
+                            let alerts_to_send = alerts.clone();
+                            let dispatcher = dispatcher.clone();
+                            tokio::spawn(async move {
+                                dispatcher.dispatch(&session_id_str, &alerts_to_send).await;
+                            });
+                        }
+                    } else {
+                        tracing::warn!(
+                            target: "astra_runtime::agentic_loop",
+                            turn,
+                            "skipping alert webhook dispatch without session_id"
+                        );
                     }
                 }
 
@@ -3358,6 +3391,17 @@ mod tests {
     use crate::turn::run_control::{RunInputProvider, RunQueuedInputPoll, RunStatusProvider};
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 
+    #[test]
+    fn alert_dispatch_session_id_requires_real_session_identity() {
+        assert_eq!(alert_dispatch_session_id(None), None);
+        assert_eq!(alert_dispatch_session_id(Some("")), None);
+        assert_eq!(alert_dispatch_session_id(Some("   ")), None);
+        assert_eq!(
+            alert_dispatch_session_id(Some("  session-123  ")).as_deref(),
+            Some("session-123")
+        );
+    }
+
     struct SnapshotClearingHost {
         turn_results: Vec<HostTurnResult>,
         current_turn: usize,
@@ -3495,6 +3539,7 @@ mod tests {
     impl RunStatusProvider for StubRunControlProvider {
         async fn control_status(
             &self,
+            _user_id: &str,
             _run_id: &str,
         ) -> Result<Option<crate::turn::run_control::RunControlStatus>, String> {
             Ok(None)
@@ -3505,6 +3550,7 @@ mod tests {
     impl RunInputProvider for StubRunControlProvider {
         async fn poll_user_inputs(
             &self,
+            _user_id: &str,
             _run_id: &str,
             after_event_index: usize,
         ) -> RunQueuedInputPoll {
@@ -3521,6 +3567,7 @@ mod tests {
 
         async fn mark_user_inputs_released(
             &self,
+            _user_id: &str,
             _run_id: &str,
             event_indices: &[usize],
         ) -> Result<(), String> {
@@ -3633,6 +3680,29 @@ mod tests {
         // The function signature enforces ordering: it takes a
         // turn_result: Option<&HostTurnResult>, which only exists after
         // execute_turn returns.
+    }
+
+    #[test]
+    fn context_manifest_uses_pipeline_context_window_trace() {
+        let mut state = make_state();
+        state.last_llm_context_manifest_trace = Some(serde_json::json!({
+            "model_context_window_tokens": 1_000_000
+        }));
+
+        assert_eq!(
+            context_window_tokens_for_context_manifest(&state),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn context_manifest_context_window_defaults_to_generic_200k_without_trace() {
+        let state = make_state();
+
+        assert_eq!(
+            context_window_tokens_for_context_manifest(&state),
+            crate::prompts::DEFAULT_CONTEXT_WINDOW_TOKENS as u32
+        );
     }
 
     // PR 5a: the turn loop must invoke host.on_turn_completed
@@ -5314,6 +5384,7 @@ mod tests {
     async fn deferred_user_input_injects_immediately_at_loop_top() {
         let mut state = make_state();
         state.current_run_id = Some("run-queued".into());
+        state.context_manifest_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
             next_cursor: 2,
             inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
@@ -5350,6 +5421,7 @@ mod tests {
     async fn deferred_user_input_does_not_reinject_after_cursor_advance() {
         let mut state = make_state();
         state.current_run_id = Some("run-repoll".into());
+        state.context_manifest_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![
             RunQueuedInputPoll {
                 next_cursor: 2,
@@ -5391,6 +5463,7 @@ mod tests {
     async fn deferred_user_input_retries_release_without_reinjecting_after_ack_failure() {
         let mut state = make_state();
         state.current_run_id = Some("run-release-retry".into());
+        state.context_manifest_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::with_release_failures(
             vec![
                 RunQueuedInputPoll {
@@ -5435,6 +5508,7 @@ mod tests {
     async fn deferred_user_input_advances_cursor_even_when_content_is_unusable() {
         let mut state = make_state();
         state.current_run_id = Some("run-invalid".into());
+        state.context_manifest_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
             next_cursor: 7,
             inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
@@ -5460,6 +5534,7 @@ mod tests {
     async fn deferred_user_input_poll_error_fails_closed() {
         let mut state = make_state();
         state.current_run_id = Some("run-missing".into());
+        state.context_manifest_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
             next_cursor: 4,
             inputs: Vec::new(),

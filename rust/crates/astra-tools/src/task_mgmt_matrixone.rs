@@ -2,8 +2,8 @@
 //!
 //! Authoritative store for the Tier 1 task board, per Plan
 //! `docs/plans/task-system-design.md` §2.1. Each edge and cloud loop host
-//! reads/writes the same `session_todos` rows for a given `session_id`, so a
-//! task created on the CLI is immediately visible to a cloud-resumed turn.
+//! reads/writes the same `session_todos` rows for a given owner/session pair,
+//! so a task created on the CLI is immediately visible to a cloud-resumed turn.
 //!
 //! # Sizing assumption
 //!
@@ -17,9 +17,8 @@
 //! of rows at most), so a full rewrite on every mutation keeps the MO access
 //! pattern and the in-memory logic in perfect sync with no partial-update
 //! complexity. CLAUDE.md §5 compliance: no `WHERE` on JSON columns; every
-//! read is column-scoped; single (session_id, status, updated_at) index
-//! covers the only non-PK query the manager makes (not used yet but kept
-//! for future list-filtering).
+//! read is column-scoped; owner-bound session indexes cover load and active
+//! queries, while a separate user/status index powers cross-session views.
 
 use astra_core::sqlx::{self, MySql, MySqlConnection, Pool, QueryBuilder, Row};
 use async_trait::async_trait;
@@ -44,6 +43,8 @@ pub const TASK_SOFT_CAP: usize = 256;
 const INSERT_BATCH_ROWS: usize = 100;
 
 const EXHAUSTED_COUNTER_SENTINEL: u64 = u32::MAX as u64 + 1;
+const COUNTER_OWNER_LOCK_SQL: &str =
+    "SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? FOR UPDATE";
 
 // MatrixOne rejects `LAST_INSERT_ID(expr)` with error 20203 "invalid
 // argument function last_insert_id, bad value" — in ALL positions, not
@@ -198,13 +199,13 @@ async fn ensure_counter_owner_available(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
-    let session_owner: Option<(String,)> =
-        sqlx::query_as("SELECT user_id FROM agent_sessions WHERE session_id = ? FOR UPDATE")
-            .bind(session_id)
-            .fetch_optional(&mut *executor)
-            .await
-            .map_err(|e| e.to_string())?;
-    if session_owner.as_ref().map(|(owner,)| owner.as_str()) != Some(user_id) {
+    let owner_exists = sqlx::query(COUNTER_OWNER_LOCK_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(&mut *executor)
+        .await
+        .map_err(|e| e.to_string())?;
+    if owner_exists.is_none() {
         return Err(counter_owner_mismatch_error(
             session_id,
             user_id,
@@ -243,7 +244,7 @@ fn to_mo_datetime(rfc3339: &str, column: &'static str, task_id: &str) -> Result<
 /// Pick the right [`TaskStore`] for this process: MatrixOne when a pool is
 /// configured, in-memory otherwise. Call once per process (or per
 /// host-binding lifecycle) — the returned store is safe to share across
-/// sessions; each `TaskManager` scopes reads/writes by `session_id`.
+/// sessions; each `TaskManager` scopes reads/writes by owner/session.
 pub fn select_task_store(
     pool: Option<astra_core::sqlx::Pool<astra_core::sqlx::MySql>>,
     user_id: impl Into<String>,
@@ -455,7 +456,7 @@ impl TaskStore for MatrixOneTaskStore {
     }
 
     /// U-8: SQL-pushdown path for open-work `active` queries.
-    /// Uses `idx_session_todos_session_status_updated` so only matching
+    /// Uses `idx_session_todos_owner_session_status_updated` so only matching
     /// rows are returned instead of shipping the whole table to Rust.
     ///
     /// **Security fix**: removed fail-open `OR status NOT IN (...)` clause.
@@ -470,6 +471,7 @@ impl TaskStore for MatrixOneTaskStore {
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
+             FORCE INDEX (idx_session_todos_owner_session_status_updated) \
              WHERE session_id = ? \
                AND user_id = ? \
                AND status IN (?, ?, ?) \
@@ -1105,6 +1107,22 @@ mod tests {
             counter_after_allocation(u32::MAX),
             4_294_967_296,
             "allocating the final u32 task id must store an exhausted sentinel, not wrap to 0/-1"
+        );
+    }
+
+    #[test]
+    fn counter_owner_lock_sql_is_owner_bound() {
+        let normalized = COUNTER_OWNER_LOCK_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            normalized,
+            "SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? FOR UPDATE"
+        );
+        assert!(
+            !normalized.contains("SELECT user_id FROM agent_sessions WHERE session_id = ?"),
+            "counter owner lock must not load a session by session_id alone and compare owner in Rust"
         );
     }
 

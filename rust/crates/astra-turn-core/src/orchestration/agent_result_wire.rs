@@ -450,10 +450,9 @@ pub fn render_agent_tool_error_with_kind(
     message: &str,
     error_kind: Option<astra_core::ErrorKind>,
 ) -> String {
-    let message = astra_core::error_kind::strip_tool_binding_sentinel(message);
     let mut body = json!({
         "status": AgentToolResultStatusKind::Failed.as_str(),
-        "error": message.as_ref(),
+        "error": message,
     });
     if let Some(error_kind) = error_kind {
         body["error_kind"] = json!(error_kind.as_str());

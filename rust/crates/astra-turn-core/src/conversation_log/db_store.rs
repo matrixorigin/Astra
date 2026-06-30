@@ -398,7 +398,20 @@ mod tests {
     // These tests require a live MatrixOne/MySQL instance.
     // Run with: cargo test -p astra-turn-core conversation_log::db_store -- --ignored
     //
-    // The DB must have the `conversation_log` table created (via ensure_core_schema).
+    // The DB schema is always created through astra-services' core schema
+    // bootstrap so these tests cannot drift into a private CSL table shape.
+
+    #[test]
+    fn db_store_tests_do_not_embed_private_core_schema_ddl() {
+        let source = include_str!("db_store.rs");
+        for table in ["agent_sessions", "conversation_log"] {
+            let private_ddl = format!("{}{}", "CREATE TABLE IF NOT EXISTS ", table);
+            assert!(
+                !source.contains(&private_ddl),
+                "DbCslStore tests must use astra_services::ensure_core_schema instead of private {table} DDL"
+            );
+        }
+    }
 
     async fn test_store() -> DbCslStore {
         test_store_for("csl-test-user").await
@@ -411,56 +424,29 @@ mod tests {
             "set ASTRA_TEST_DB_IT=1 to run this ignored test"
         );
         let settings = MatrixOneSettings::from_env();
-        let store = DbCslStore::new(settings, user_id.to_string()).expect("user-scoped store");
-
-        // Ensure table exists for tests.
-        let pool = store.get_pool().await.expect("DB connection required");
-        query(
-            "CREATE TABLE IF NOT EXISTS conversation_log (
-                user_id       VARCHAR(64) NOT NULL,
-                session_id    VARCHAR(64) NOT NULL,
-                seq           BIGINT NOT NULL,
-                turn          INT NOT NULL,
-                entry_type    TINYINT NOT NULL,
-                trace_id      VARCHAR(64) DEFAULT NULL,
-                message_count INT DEFAULT NULL,
-                payload       MEDIUMTEXT NOT NULL,
-                created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                PRIMARY KEY (user_id, session_id, seq),
-                INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC),
-                INDEX idx_csl_owner_turn (user_id, session_id, turn)
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create table");
-        query(
-            "CREATE TABLE IF NOT EXISTS agent_sessions (
-                session_id VARCHAR(64) PRIMARY KEY,
-                user_id VARCHAR(64) NOT NULL,
-                title VARCHAR(255) NULL,
-                status VARCHAR(20) NOT NULL DEFAULT 'active',
-                event_count BIGINT NOT NULL DEFAULT 0,
-                created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create agent_sessions table");
-
-        store
+        let bootstrap_catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        astra_services::ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .expect("ensure core schema");
+        DbCslStore::new(settings, user_id.to_string()).expect("user-scoped store")
     }
 
     async fn cleanup(store: &DbCslStore, session_id: &str) {
+        cleanup_for_user(store, session_id, &store.user_id).await;
+    }
+
+    async fn cleanup_for_user(store: &DbCslStore, session_id: &str, user_id: &str) {
         let pool = store.get_pool().await.unwrap();
-        query("DELETE FROM conversation_log WHERE session_id = ?")
+        query("DELETE FROM conversation_log WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
+            .bind(user_id)
             .execute(&pool)
             .await
             .ok();
-        query("DELETE FROM agent_sessions WHERE session_id = ?")
+        query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
+            .bind(user_id)
             .execute(&pool)
             .await
             .ok();
@@ -533,7 +519,8 @@ mod tests {
         let owner_store = test_store_for(&owner_user_id).await;
         let other_store = test_store_for(&other_user_id).await;
         let sid = &format!("db-test-owner-scope-{}", uuid::Uuid::new_v4());
-        cleanup(&owner_store, sid).await;
+        cleanup_for_user(&owner_store, sid, &owner_user_id).await;
+        cleanup_for_user(&owner_store, sid, &other_user_id).await;
         create_session_for(&owner_store, sid, &owner_user_id).await;
 
         owner_store
@@ -590,7 +577,8 @@ mod tests {
             "failed cross-owner operations must not rewrite owner rows"
         );
 
-        cleanup(&owner_store, sid).await;
+        cleanup_for_user(&owner_store, sid, &owner_user_id).await;
+        cleanup_for_user(&owner_store, sid, &other_user_id).await;
     }
 
     #[tokio::test]
@@ -601,7 +589,8 @@ mod tests {
         let owner_store = test_store_for(&owner_user_id).await;
         let other_store = test_store_for(&other_user_id).await;
         let sid = &format!("db-test-owner-noise-{}", uuid::Uuid::new_v4());
-        cleanup(&owner_store, sid).await;
+        cleanup_for_user(&owner_store, sid, &owner_user_id).await;
+        cleanup_for_user(&owner_store, sid, &other_user_id).await;
         create_session_for(&owner_store, sid, &owner_user_id).await;
 
         owner_store
@@ -654,7 +643,8 @@ mod tests {
             "unexpected other-owner error: {other_err}"
         );
 
-        cleanup(&owner_store, sid).await;
+        cleanup_for_user(&owner_store, sid, &owner_user_id).await;
+        cleanup_for_user(&owner_store, sid, &other_user_id).await;
     }
 
     #[tokio::test]
@@ -666,8 +656,10 @@ mod tests {
         let other_store = test_store_for(&other_user_id).await;
         let parent = &format!("db-test-fork-parent-{}", uuid::Uuid::new_v4());
         let child = &format!("db-test-fork-child-{}", uuid::Uuid::new_v4());
-        cleanup(&owner_store, parent).await;
-        cleanup(&owner_store, child).await;
+        cleanup_for_user(&owner_store, parent, &owner_user_id).await;
+        cleanup_for_user(&owner_store, parent, &other_user_id).await;
+        cleanup_for_user(&owner_store, child, &owner_user_id).await;
+        cleanup_for_user(&owner_store, child, &other_user_id).await;
         create_session_for(&owner_store, parent, &owner_user_id).await;
 
         owner_store
@@ -722,8 +714,10 @@ mod tests {
             "failed fork must not overwrite child rows owned by another user"
         );
 
-        cleanup(&owner_store, parent).await;
-        cleanup(&owner_store, child).await;
+        cleanup_for_user(&owner_store, parent, &owner_user_id).await;
+        cleanup_for_user(&owner_store, parent, &other_user_id).await;
+        cleanup_for_user(&owner_store, child, &owner_user_id).await;
+        cleanup_for_user(&owner_store, child, &other_user_id).await;
     }
 
     #[tokio::test]

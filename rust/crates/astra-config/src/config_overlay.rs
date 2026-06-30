@@ -23,7 +23,9 @@
 //!    that's regression-guarded by `every_catalog_item_is_editable_via_apply_edit`.
 
 use crate::runtime_config::{RuntimeConfig, TraceCategory, TraceLevel, TraceProfile, TraceSink};
-use astra_core::runtime_limits::{RuntimeLimits, context_window_for_model};
+use astra_core::runtime_limits::{
+    MODEL_CONTEXT_INPUT_BUDGET_RATIO, RuntimeLimits, context_window_for_model,
+};
 use serde_json::Value;
 use std::path::Path;
 
@@ -105,7 +107,7 @@ pub fn effective_budget_for_model(config: &RuntimeConfig, model: Option<&str>) -
     let configured = config.token_budget.max_turn_input_tokens as u64;
     let model_budget = model
         .and_then(context_window_for_model)
-        .map(|window| (window as f64 * 0.80) as u64);
+        .map(|window| (window as f64 * MODEL_CONTEXT_INPUT_BUDGET_RATIO) as u64);
 
     match (model_budget, configured) {
         (Some(budget), 0) => budget,

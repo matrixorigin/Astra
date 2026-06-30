@@ -34,20 +34,61 @@ fn omitted_names(edge_profile: &Map<String, Value>) -> HashSet<String> {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn block_for_model(
     edge_profile: &Map<String, Value>,
     resolved_model_name: &str,
 ) -> Option<String> {
-    manifest_for_model(edge_profile, resolved_model_name).map(|manifest| manifest.text)
+    block_for_model_with_context_window(edge_profile, resolved_model_name, None)
 }
 
-#[cfg(test)]
+pub(crate) fn block_for_model_with_context_window(
+    edge_profile: &Map<String, Value>,
+    resolved_model_name: &str,
+    resolved_context_window: Option<u32>,
+) -> Option<String> {
+    manifest_for_model(edge_profile, resolved_model_name, resolved_context_window)
+        .map(|manifest| manifest.text)
+}
+
+pub(crate) fn block_for_model_filtered(
+    edge_profile: &Map<String, Value>,
+    resolved_model_name: &str,
+    resolved_context_window: Option<u32>,
+    allowed_names: &HashSet<String>,
+) -> Option<String> {
+    if allowed_names.is_empty() {
+        return None;
+    }
+    let manifest = manifest_for_model(edge_profile, resolved_model_name, resolved_context_window)?;
+    let manifest_names: HashSet<String> = manifest.names.iter().cloned().collect();
+    let retained_names: HashSet<String> = manifest_names
+        .intersection(allowed_names)
+        .cloned()
+        .collect();
+    if retained_names.is_empty() {
+        tracing::warn!(
+            target: LOG_TARGET,
+            model = resolved_model_name,
+            manifest_count = manifest_names.len(),
+            allowed_count = allowed_names.len(),
+            "deferred tool manifest filtered to zero names for the current runtime surface"
+        );
+        return None;
+    }
+    if retained_names == manifest_names {
+        return Some(manifest.text);
+    }
+    filter_block_to_names(&manifest.text, &retained_names)
+}
+
 pub(crate) fn names_for_model(
     edge_profile: &Map<String, Value>,
     resolved_model_name: Option<&str>,
+    resolved_context_window: Option<u32>,
 ) -> HashSet<String> {
     resolved_model_name
-        .and_then(|model| manifest_for_model(edge_profile, model))
+        .and_then(|model| manifest_for_model(edge_profile, model, resolved_context_window))
         .map(|manifest| manifest.names.into_iter().collect())
         .unwrap_or_default()
 }
@@ -55,6 +96,7 @@ pub(crate) fn names_for_model(
 fn manifest_for_model(
     edge_profile: &Map<String, Value>,
     resolved_model_name: &str,
+    resolved_context_window: Option<u32>,
 ) -> Option<DeferredManifest> {
     let declared_names = names(edge_profile);
     let omitted_names = omitted_names(edge_profile);
@@ -87,7 +129,9 @@ fn manifest_for_model(
         );
         return None;
     };
-    let resolved_budget = crate::prompts::budget_for_model(Some(resolved_model_name)).model_limit;
+    let resolved_budget = resolved_context_window
+        .map(|value| value as usize)
+        .unwrap_or(crate::prompts::DEFAULT_CONTEXT_WINDOW_TOKENS);
     let effective_budget = if source_budget != resolved_budget {
         tracing::warn!(
             target: LOG_TARGET,
@@ -234,7 +278,7 @@ mod tests {
     fn names_and_block_for_model_accept_cli_rendered_manifest() {
         let edge_profile = deferred_profile(&["agent_fanout", " "], &["agent_fanout"], "gpt-4o");
 
-        let names = names_for_model(&edge_profile, Some("gpt-4o"));
+        let names = names_for_model(&edge_profile, Some("gpt-4o"), None);
 
         assert_eq!(names, HashSet::from(["agent_fanout".to_string()]));
         let block = block_for_model(&edge_profile, "gpt-4o")
@@ -254,12 +298,56 @@ mod tests {
             json!(["web_fetch"]),
         );
 
-        let names = names_for_model(&edge_profile, Some("gpt-4o"));
+        let names = names_for_model(&edge_profile, Some("gpt-4o"), None);
         assert_eq!(names, HashSet::from(["agent_fanout".to_string()]));
 
-        let manifest = manifest_for_model(&edge_profile, "gpt-4o")
+        let manifest = manifest_for_model(&edge_profile, "gpt-4o", None)
             .expect("consistent manifest should keep omitted metadata");
         assert_eq!(manifest.omitted_names, vec!["web_fetch".to_string()]);
+    }
+
+    #[test]
+    fn block_for_model_filtered_keeps_only_allowed_manifest_entries() {
+        let edge_profile = deferred_profile(
+            &["github", "agent_fanout"],
+            &["github", "agent_fanout"],
+            "gpt-4o",
+        );
+
+        let block = block_for_model_filtered(
+            &edge_profile,
+            "gpt-4o",
+            None,
+            &HashSet::from(["github".to_string()]),
+        )
+        .expect("filtered manifest should keep allowed names");
+
+        assert!(block.contains("\ngithub\n"));
+        assert!(!block.contains("\nagent_fanout\n"));
+        assert!(!block.contains("<tool>"));
+        assert!(!block.contains("<name>"));
+    }
+
+    #[test]
+    fn manifest_uses_explicit_resolved_context_window() {
+        let mut edge_profile = deferred_profile(&["github"], &["github"], "gpt-4o");
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            Value::Number(1_000_000.into()),
+        );
+
+        let explicit = manifest_for_model(&edge_profile, "gpt-4o", Some(1_000_000))
+            .expect("matching explicit context should render");
+        assert_eq!(explicit.context_window, 1_000_000);
+
+        let defaulted = manifest_for_model(&edge_profile, "gpt-4o", None)
+            .expect("default context still renders but remains conservative");
+        assert_eq!(
+            defaulted.context_window,
+            crate::prompts::DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "callers with resolved model metadata must pass it instead of silently defaulting to 200K"
+        );
     }
 
     #[test]
@@ -268,7 +356,7 @@ mod tests {
             deferred_profile(&["agent_fanout", "web_fetch"], &["agent_fanout"], "gpt-4o");
 
         assert!(
-            names_for_model(&edge_profile, Some("gpt-4o")).is_empty(),
+            names_for_model(&edge_profile, Some("gpt-4o"), None).is_empty(),
             "activation/search names must not include tools absent from the prompt manifest"
         );
         assert!(
@@ -283,7 +371,7 @@ mod tests {
             deferred_profile(&["agent_fanout"], &["agent_fanout", "web_fetch"], "gpt-4o");
 
         assert!(
-            names_for_model(&edge_profile, Some("gpt-4o")).is_empty(),
+            names_for_model(&edge_profile, Some("gpt-4o"), None).is_empty(),
             "tool_search must not expose only a subset of the names shown in the prompt"
         );
         assert!(
@@ -305,7 +393,7 @@ mod tests {
         );
 
         assert!(
-            names_for_model(&edge_profile, Some("gpt-4o")).is_empty(),
+            names_for_model(&edge_profile, Some("gpt-4o"), None).is_empty(),
             "legacy schema-like deferred manifests must not be activatable"
         );
         assert!(

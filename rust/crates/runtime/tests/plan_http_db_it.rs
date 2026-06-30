@@ -208,13 +208,26 @@ async fn cleanup_plan(pool: &sqlx::Pool<sqlx::MySql>, plan_id: &str) {
         .await;
 }
 
-async fn cleanup_session_todos(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
-    let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
+async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_id: &str) {
+    let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ? AND user_id = ?")
         .bind(session_id)
+        .bind(user_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
+    let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ? AND user_id = ?")
         .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await;
+    let _ =
+        sqlx::query("DELETE FROM session_todo_idempotency WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+        .bind(session_id)
+        .bind(user_id)
         .execute(pool)
         .await;
 }
@@ -604,6 +617,7 @@ async fn start_and_finish_step_run_round_trips_through_plan_step_runs_table() {
     assert!(runs.iter().any(|r| r["run_id"] == run_id));
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 #[tokio::test]
@@ -617,12 +631,14 @@ async fn execute_pins_active_plan_id_on_session() {
     ensure_session(&pool, &session_id).await;
 
     // Initially the session has no active plan.
-    let active_before: Option<String> =
-        sqlx::query_scalar("SELECT active_plan_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let active_before: Option<String> = sqlx::query_scalar(
+        "SELECT active_plan_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(auth_bearer())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert!(active_before.is_none());
 
     // GET current version so we pass expected_version correctly.
@@ -644,15 +660,18 @@ async fn execute_pins_active_plan_id_on_session() {
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_eq!(body["phase"], "executing");
 
-    let active_after: Option<String> =
-        sqlx::query_scalar("SELECT active_plan_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let active_after: Option<String> = sqlx::query_scalar(
+        "SELECT active_plan_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(auth_bearer())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(active_after.as_deref(), Some(plan_id.as_str()));
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 #[tokio::test]
@@ -687,13 +706,16 @@ async fn delete_plan_clears_active_plan_id_on_any_session() {
         .await
         .unwrap();
     assert_eq!(count, 0);
-    let active: Option<String> =
-        sqlx::query_scalar("SELECT active_plan_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let active: Option<String> = sqlx::query_scalar(
+        "SELECT active_plan_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(auth_bearer())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert!(active.is_none(), "delete must clear active_plan_id");
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 #[tokio::test]
@@ -753,6 +775,7 @@ async fn post_completed_step_run_persists_finalized_row_in_one_call() {
     assert_eq!(reqid, "req-oneshot");
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 #[tokio::test]
@@ -788,6 +811,7 @@ async fn post_completed_step_run_rejects_in_progress_status() {
     );
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 #[tokio::test]
@@ -884,6 +908,7 @@ async fn end_to_end_thin_client_posts_step_run_pair_and_persists_row() {
 
     server.abort();
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 #[tokio::test]
@@ -918,12 +943,14 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "execute must pin active_plan_id");
-    let active_after_execute: Option<String> =
-        sqlx::query_scalar("SELECT active_plan_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let active_after_execute: Option<String> = sqlx::query_scalar(
+        "SELECT active_plan_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(auth_bearer())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(active_after_execute.as_deref(), Some(plan_id.as_str()));
 
     // Approve → active_plan_id must be cleared so the write guard lifts.
@@ -939,12 +966,14 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_eq!(body["phase"], "refining");
 
-    let active_after_approve: Option<String> =
-        sqlx::query_scalar("SELECT active_plan_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let active_after_approve: Option<String> = sqlx::query_scalar(
+        "SELECT active_plan_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(auth_bearer())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert!(
         active_after_approve.is_none(),
         "approving the plan must clear active_plan_id so the write-tool guard lifts; \
@@ -1010,8 +1039,8 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
         "step completion should update the top-level approved-plan task"
     );
 
-    cleanup_session_todos(&pool, &session_id).await;
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 #[tokio::test]
@@ -1102,6 +1131,7 @@ async fn list_plans_active_session_only_returns_true_active_plan() {
 
     cleanup_plan(&pool, &newer_plan_id).await;
     cleanup_plan(&pool, &active_plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 #[tokio::test]
@@ -1132,12 +1162,15 @@ async fn list_plans_active_session_only_hides_other_users_active_plan() {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE agent_sessions SET active_plan_id = ? WHERE session_id = ?")
-        .bind(&plan_id)
-        .bind(&session_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE agent_sessions SET active_plan_id = ? WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&plan_id)
+    .bind(&session_id)
+    .bind(&owner_id)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let (status, owner_view) = request_json_as_user(
         app.clone(),
@@ -1168,6 +1201,7 @@ async fn list_plans_active_session_only_hides_other_users_active_plan() {
     );
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, &owner_id).await;
 }
 
 #[tokio::test]
@@ -1218,12 +1252,14 @@ async fn exit_plan_mode_rejected_leaves_active_plan_id_pinned() {
     .await;
     assert_eq!(s, StatusCode::OK);
 
-    let active_after_reject: Option<String> =
-        sqlx::query_scalar("SELECT active_plan_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let active_after_reject: Option<String> = sqlx::query_scalar(
+        "SELECT active_plan_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(auth_bearer())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         active_after_reject.as_deref(),
         Some(plan_id.as_str()),
@@ -1231,6 +1267,7 @@ async fn exit_plan_mode_rejected_leaves_active_plan_id_pinned() {
     );
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 #[tokio::test]
@@ -1319,6 +1356,7 @@ async fn start_step_run_rejects_attempt_out_of_range() {
     assert_eq!(count, 0, "no step_runs must persist for rejected attempts");
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 /// Same rule applies to the one-shot completed-step-run endpoint.
@@ -1354,6 +1392,7 @@ async fn post_completed_step_run_rejects_attempt_out_of_range() {
     }
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 /// `rewind.reason`, `finish.error`, and `finish.artifact_ref` have no
@@ -1451,6 +1490,7 @@ async fn finish_step_run_rejects_oversized_error_and_artifact_ref() {
     );
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 /// Regression for round-2 review finding: rewind was resetting subtasks to
@@ -1551,6 +1591,7 @@ async fn rewind_cancels_open_step_runs_for_reset_subtasks() {
     assert_eq!(a_status, "completed", "a's run must stay completed");
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }
 
 #[tokio::test]
@@ -1636,4 +1677,5 @@ async fn start_step_run_rejects_unknown_subtask_id_with_400() {
     assert_eq!(count, 0);
 
     cleanup_plan(&pool, &plan_id).await;
+    cleanup_session(&pool, &session_id, auth_bearer()).await;
 }

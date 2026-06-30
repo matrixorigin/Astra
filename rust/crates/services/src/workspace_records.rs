@@ -142,6 +142,12 @@ pub trait WorkspaceRecordStore: Send + Sync {
         owner_id: &str,
         limit: u32,
     ) -> Result<Vec<WorkspaceRecordEntry>, WorkspaceRecordStoreError>;
+
+    async fn delete_workspace_record(
+        &self,
+        owner_id: &str,
+        workspace_id: &str,
+    ) -> Result<bool, WorkspaceRecordStoreError>;
 }
 
 #[async_trait]
@@ -253,6 +259,26 @@ impl WorkspaceRecordStore for InMemoryWorkspaceRecordStore {
         records.truncate(limit.max(1) as usize);
         Ok(records)
     }
+
+    async fn delete_workspace_record(
+        &self,
+        owner_id: &str,
+        workspace_id: &str,
+    ) -> Result<bool, WorkspaceRecordStoreError> {
+        validate_owner_id(owner_id)?;
+        validate_workspace_id(workspace_id)
+            .map_err(|error| WorkspaceRecordStoreError::InvalidWorkspaceId(error.to_string()))?;
+        let mut records = self.records.write().await;
+        if records
+            .get(workspace_id)
+            .is_some_and(|entry| entry.owner_id == owner_id)
+        {
+            records.remove(workspace_id);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 #[async_trait]
@@ -339,14 +365,7 @@ pub struct DatabaseWorkspaceRecordStore {
     pool: SharedPool,
 }
 
-impl DatabaseWorkspaceRecordStore {
-    pub fn new(pool: SharedPool) -> Self {
-        Self { pool }
-    }
-
-    pub async fn ensure_tables(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
+const WORKSPACE_RECORDS_CREATE_SQL: &str = r#"
             CREATE TABLE IF NOT EXISTS workspace_records (
                 workspace_id        VARCHAR(255) PRIMARY KEY,
                 owner_id            VARCHAR(255) NOT NULL,
@@ -364,18 +383,9 @@ impl DatabaseWorkspaceRecordStore {
                 created_at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                 updated_at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
             )
-            "#,
-        )
-        .execute(self.pool.get())
-        .await?;
-        ensure_workspace_records_column(
-            self.pool.get(),
-            "ALTER TABLE workspace_records ADD COLUMN source_key VARCHAR(512) NULL",
-        )
-        .await?;
-        ensure_workspace_records_source_key_unique(self.pool.get()).await?;
-        sqlx::query(
-            r#"
+            "#;
+
+const WORKSPACE_CLEANUP_DEBTS_CREATE_SQL: &str = r#"
             CREATE TABLE IF NOT EXISTS workspace_cleanup_debts (
                 debt_id            VARCHAR(255) PRIMARY KEY,
                 owner_id           VARCHAR(255) NOT NULL,
@@ -390,12 +400,34 @@ impl DatabaseWorkspaceRecordStore {
                 updated_at         DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                 resolved_at        DATETIME(6)  NULL
             )
-            "#,
-        )
-        .execute(self.pool.get())
-        .await?;
-        Ok(())
+            "#;
+
+impl DatabaseWorkspaceRecordStore {
+    pub fn new(pool: SharedPool) -> Self {
+        Self { pool }
     }
+
+    pub async fn ensure_tables(&self) -> Result<(), sqlx::Error> {
+        ensure_workspace_record_tables(self.pool.get()).await
+    }
+}
+
+pub(crate) async fn ensure_workspace_record_tables(
+    pool: &sqlx::Pool<sqlx::MySql>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(WORKSPACE_RECORDS_CREATE_SQL)
+        .execute(pool)
+        .await?;
+    ensure_workspace_records_column(
+        pool,
+        "ALTER TABLE workspace_records ADD COLUMN source_key VARCHAR(512) NULL",
+    )
+    .await?;
+    ensure_workspace_records_source_key_unique(pool).await?;
+    sqlx::query(WORKSPACE_CLEANUP_DEBTS_CREATE_SQL)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 async fn ensure_workspace_records_column(
@@ -593,6 +625,23 @@ impl WorkspaceRecordStore for DatabaseWorkspaceRecordStore {
         .fetch_all(self.pool.get())
         .await?;
         rows.into_iter().map(workspace_entry_from_row).collect()
+    }
+
+    async fn delete_workspace_record(
+        &self,
+        owner_id: &str,
+        workspace_id: &str,
+    ) -> Result<bool, WorkspaceRecordStoreError> {
+        validate_owner_id(owner_id)?;
+        validate_workspace_id(workspace_id)
+            .map_err(|error| WorkspaceRecordStoreError::InvalidWorkspaceId(error.to_string()))?;
+        let result =
+            sqlx::query("DELETE FROM workspace_records WHERE workspace_id = ? AND owner_id = ?")
+                .bind(workspace_id)
+                .bind(owner_id)
+                .execute(self.pool.get())
+                .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -810,7 +859,8 @@ fn validate_debt_id(debt_id: &str) -> Result<(), WorkspaceCleanupDebtStoreError>
 }
 
 fn validate_owner_id(owner_id: &str) -> Result<(), WorkspaceRecordStoreError> {
-    if owner_id.trim().is_empty() {
+    let trimmed = owner_id.trim();
+    if trimmed.is_empty() || trimmed.len() > 255 {
         return Err(WorkspaceRecordStoreError::InvalidOwnerId);
     }
     Ok(())
@@ -970,12 +1020,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workspace_record_owner_id_accepts_non_uuid_principal() {
+        validate_owner_id("test-user").expect("business user ids are valid principals");
+        validate_owner_id("tenant:alpha").expect("tenant-scoped principals are valid");
+    }
+
+    #[test]
+    fn workspace_record_owner_id_rejects_empty_and_too_long_values() {
+        assert!(matches!(
+            validate_owner_id("   "),
+            Err(WorkspaceRecordStoreError::InvalidOwnerId)
+        ));
+        let too_long = "x".repeat(256);
+        assert!(matches!(
+            validate_owner_id(&too_long),
+            Err(WorkspaceRecordStoreError::InvalidOwnerId)
+        ));
+    }
+
     #[tokio::test]
     async fn in_memory_store_round_trips_workspace_record_for_owner() {
         let store = InMemoryWorkspaceRecordStore::new();
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-1",
+                "00000000-0000-0000-0000-000000000001",
                 Some("session-1".to_string()),
                 Some("run-1".to_string()),
                 record("workspace-1"),
@@ -984,12 +1053,12 @@ mod tests {
             .expect("store workspace record");
 
         let loaded = store
-            .load_workspace_record("user-1", "workspace-1")
+            .load_workspace_record("00000000-0000-0000-0000-000000000001", "workspace-1")
             .await
             .expect("load workspace record")
             .expect("record");
 
-        assert_eq!(loaded.owner_id, "user-1");
+        assert_eq!(loaded.owner_id, "00000000-0000-0000-0000-000000000001");
         assert_eq!(loaded.session_id.as_deref(), Some("session-1"));
         assert_eq!(loaded.run_id.as_deref(), Some("run-1"));
         assert_eq!(loaded.record.workspace_id, "workspace-1");
@@ -1002,11 +1071,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_store_deletes_workspace_record_for_owner_only() {
+        let store = InMemoryWorkspaceRecordStore::new();
+        store
+            .upsert_workspace_record(WorkspaceRecordEntry::new(
+                "00000000-0000-0000-0000-000000000001",
+                Some("session-1".to_string()),
+                Some("run-1".to_string()),
+                record("workspace-delete-owner"),
+            ))
+            .await
+            .expect("store workspace record");
+
+        assert!(
+            !store
+                .delete_workspace_record(
+                    "00000000-0000-0000-0000-000000000002",
+                    "workspace-delete-owner"
+                )
+                .await
+                .expect("foreign delete is a no-op")
+        );
+        assert!(
+            store
+                .load_workspace_record(
+                    "00000000-0000-0000-0000-000000000001",
+                    "workspace-delete-owner"
+                )
+                .await
+                .expect("load after foreign delete")
+                .is_some(),
+            "foreign owner must not delete workspace record"
+        );
+
+        assert!(
+            store
+                .delete_workspace_record(
+                    "00000000-0000-0000-0000-000000000001",
+                    "workspace-delete-owner"
+                )
+                .await
+                .expect("owner delete")
+        );
+        assert!(
+            store
+                .load_workspace_record(
+                    "00000000-0000-0000-0000-000000000001",
+                    "workspace-delete-owner"
+                )
+                .await
+                .expect("load after owner delete")
+                .is_none(),
+            "owner delete must remove workspace record"
+        );
+    }
+
+    #[tokio::test]
     async fn in_memory_store_enforces_owner_visibility() {
         let store = InMemoryWorkspaceRecordStore::new();
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-1",
+                "00000000-0000-0000-0000-000000000001",
                 None,
                 None,
                 record("workspace-1"),
@@ -1016,14 +1141,14 @@ mod tests {
 
         assert!(
             store
-                .load_workspace_record("user-2", "workspace-1")
+                .load_workspace_record("00000000-0000-0000-0000-000000000002", "workspace-1")
                 .await
                 .expect("load workspace record")
                 .is_none()
         );
         assert!(
             store
-                .list_workspace_records("user-2", 10)
+                .list_workspace_records("00000000-0000-0000-0000-000000000002", 10)
                 .await
                 .expect("list workspace records")
                 .is_empty()
@@ -1035,7 +1160,7 @@ mod tests {
         let store = InMemoryWorkspaceRecordStore::new();
         let error = store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-1",
+                "00000000-0000-0000-0000-000000000001",
                 None,
                 None,
                 record("../bad"),
@@ -1054,7 +1179,7 @@ mod tests {
         let store = InMemoryWorkspaceRecordStore::new();
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-1",
+                "00000000-0000-0000-0000-000000000001",
                 None,
                 None,
                 record("workspace-1"),
@@ -1064,7 +1189,7 @@ mod tests {
 
         let error = store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-2",
+                "00000000-0000-0000-0000-000000000002",
                 None,
                 None,
                 record("workspace-1"),
@@ -1083,7 +1208,7 @@ mod tests {
         let store = InMemoryWorkspaceRecordStore::new();
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-1",
+                "00000000-0000-0000-0000-000000000001",
                 None,
                 None,
                 record("workspace-1"),
@@ -1094,7 +1219,12 @@ mod tests {
         second.root_or_volume_ref = "/workspace/volume-1-copy".to_string();
 
         let error = store
-            .upsert_workspace_record(WorkspaceRecordEntry::new("user-2", None, None, second))
+            .upsert_workspace_record(WorkspaceRecordEntry::new(
+                "00000000-0000-0000-0000-000000000002",
+                None,
+                None,
+                second,
+            ))
             .await
             .expect_err("cross-owner source claim must fail");
 
@@ -1109,7 +1239,7 @@ mod tests {
         let store = InMemoryWorkspaceRecordStore::new();
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-1",
+                "00000000-0000-0000-0000-000000000001",
                 None,
                 None,
                 snapshot_record("snapshot-1", "artifact-1"),
@@ -1119,7 +1249,7 @@ mod tests {
 
         let error = store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-2",
+                "00000000-0000-0000-0000-000000000002",
                 None,
                 None,
                 snapshot_record("snapshot-2", "artifact-1"),
@@ -1151,7 +1281,7 @@ mod tests {
             let store = InMemoryWorkspaceRecordStore::new();
             store
                 .upsert_workspace_record(WorkspaceRecordEntry::new(
-                    "user-1",
+                    "00000000-0000-0000-0000-000000000001",
                     None,
                     None,
                     materialized_record("workspace-1", source.clone()),
@@ -1161,7 +1291,7 @@ mod tests {
 
             let error = store
                 .upsert_workspace_record(WorkspaceRecordEntry::new(
-                    "user-2",
+                    "00000000-0000-0000-0000-000000000002",
                     None,
                     None,
                     materialized_record("workspace-2", source),
@@ -1185,7 +1315,7 @@ mod tests {
         };
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-1",
+                "00000000-0000-0000-0000-000000000001",
                 None,
                 None,
                 materialized_record("workspace-1", source.clone()),
@@ -1195,7 +1325,7 @@ mod tests {
 
         let error = store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-2",
+                "00000000-0000-0000-0000-000000000002",
                 None,
                 None,
                 materialized_record("workspace-2", source),
@@ -1214,7 +1344,7 @@ mod tests {
         let store = InMemoryWorkspaceRecordStore::new();
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-1",
+                "00000000-0000-0000-0000-000000000001",
                 Some("session-1".to_string()),
                 Some("run-1".to_string()),
                 record("workspace-1"),
@@ -1224,7 +1354,7 @@ mod tests {
 
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-1",
+                "00000000-0000-0000-0000-000000000001",
                 Some("session-2".to_string()),
                 Some("run-2".to_string()),
                 record("workspace-2"),
@@ -1233,7 +1363,7 @@ mod tests {
             .expect_err("source key cannot be reused by another workspace");
 
         let records = store
-            .list_workspace_records("user-1", 10)
+            .list_workspace_records("00000000-0000-0000-0000-000000000001", 10)
             .await
             .expect("list workspace records");
         assert_eq!(records.len(), 1);
@@ -1244,7 +1374,7 @@ mod tests {
         let store = InMemoryWorkspaceRecordStore::new();
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-1",
+                "00000000-0000-0000-0000-000000000001",
                 None,
                 None,
                 snapshot_record("snapshot-1", "artifact-1"),
@@ -1253,7 +1383,7 @@ mod tests {
             .expect("store first snapshot");
         store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-2",
+                "00000000-0000-0000-0000-000000000002",
                 None,
                 None,
                 snapshot_record("snapshot-2", "artifact-2"),
@@ -1263,7 +1393,7 @@ mod tests {
 
         let error = store
             .upsert_workspace_record(WorkspaceRecordEntry::new(
-                "user-2",
+                "00000000-0000-0000-0000-000000000002",
                 None,
                 None,
                 snapshot_record("snapshot-2", "artifact-1"),
@@ -1281,7 +1411,7 @@ mod tests {
     async fn cleanup_debt_store_round_trips_and_resolves_owner_debt() {
         let store = InMemoryWorkspaceRecordStore::new();
         let debt = WorkspaceCleanupDebtEntry::new(
-            "user-1",
+            "00000000-0000-0000-0000-000000000001",
             Some("session-1".to_string()),
             Some("run-1".to_string()),
             record("workspace-1"),
@@ -1296,7 +1426,7 @@ mod tests {
             .expect("record cleanup debt");
 
         let debts = store
-            .list_cleanup_debts("user-1", 10)
+            .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
             .await
             .expect("list cleanup debts");
         assert_eq!(debts.len(), 1);
@@ -1306,13 +1436,13 @@ mod tests {
 
         assert!(
             store
-                .resolve_cleanup_debt("user-1", &debt_id)
+                .resolve_cleanup_debt("00000000-0000-0000-0000-000000000001", &debt_id)
                 .await
                 .expect("resolve cleanup debt")
         );
         assert!(
             store
-                .list_cleanup_debts("user-1", 10)
+                .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
                 .await
                 .expect("list cleanup debts")
                 .is_empty()
@@ -1323,7 +1453,7 @@ mod tests {
     async fn cleanup_debt_store_enforces_owner_visibility() {
         let store = InMemoryWorkspaceRecordStore::new();
         let debt = WorkspaceCleanupDebtEntry::new(
-            "user-1",
+            "00000000-0000-0000-0000-000000000001",
             None,
             None,
             record("workspace-1"),
@@ -1338,20 +1468,20 @@ mod tests {
 
         assert!(
             store
-                .list_cleanup_debts("user-2", 10)
+                .list_cleanup_debts("00000000-0000-0000-0000-000000000002", 10)
                 .await
                 .expect("list cleanup debts")
                 .is_empty()
         );
         assert!(
             !store
-                .resolve_cleanup_debt("user-2", &debt_id)
+                .resolve_cleanup_debt("00000000-0000-0000-0000-000000000002", &debt_id)
                 .await
                 .expect("cross-owner resolve should not fail but should not resolve")
         );
         assert_eq!(
             store
-                .list_cleanup_debts("user-1", 10)
+                .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
                 .await
                 .expect("owner debts")
                 .len(),
@@ -1363,7 +1493,7 @@ mod tests {
     async fn cleanup_debt_store_rejects_cross_owner_debt_id_takeover() {
         let store = InMemoryWorkspaceRecordStore::new();
         let debt = WorkspaceCleanupDebtEntry::new(
-            "user-1",
+            "00000000-0000-0000-0000-000000000001",
             None,
             None,
             record("workspace-1"),
@@ -1371,7 +1501,7 @@ mod tests {
             "first owner debt",
         );
         let mut takeover = WorkspaceCleanupDebtEntry::new(
-            "user-2",
+            "00000000-0000-0000-0000-000000000002",
             None,
             None,
             record("workspace-2"),
@@ -1394,7 +1524,7 @@ mod tests {
             WorkspaceCleanupDebtStoreError::CleanupDebtOwnerConflict { .. }
         ));
         let debts = store
-            .list_cleanup_debts("user-1", 10)
+            .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
             .await
             .expect("list first owner debts");
         assert_eq!(debts.len(), 1);
@@ -1405,7 +1535,7 @@ mod tests {
     async fn cleanup_debt_store_rejects_invalid_debt() {
         let store = InMemoryWorkspaceRecordStore::new();
         let mut debt = WorkspaceCleanupDebtEntry::new(
-            "user-1",
+            "00000000-0000-0000-0000-000000000001",
             None,
             None,
             record("workspace-1"),

@@ -145,6 +145,7 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
     pub cache_cfg: &'a PromptCacheConfig,
     pub provider: &'a str,
     pub model_name: &'a str,
+    pub context_window: Option<u32>,
     pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub user_content: &'a str,
     pub query_source: &'a str,
@@ -258,6 +259,7 @@ pub(crate) struct LlmContextManifestTrace {
     pub source: &'static str,
     pub provider: String,
     pub model_name: String,
+    pub model_context_window_tokens: u32,
     pub compaction_tier: String,
     pub system_prompt_tokens: u32,
     pub stable_system_message_count: usize,
@@ -272,6 +274,7 @@ impl LlmContextManifestTrace {
             "source": self.source,
             "provider": self.provider.clone(),
             "model_name": self.model_name.clone(),
+            "model_context_window_tokens": self.model_context_window_tokens,
             "compaction_tier": self.compaction_tier.clone(),
             "system_prompt_tokens": self.system_prompt_tokens,
             "stable_system_message_count": self.stable_system_message_count,
@@ -409,6 +412,7 @@ pub(crate) struct BridgeSessionContextInput<'a> {
     pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub session_id: &'a str,
     pub model_id: &'a str,
+    pub context_window: Option<u32>,
     pub provider: &'a str,
     pub edge_profile_cwd: Option<&'a str>,
     pub edge_profile_git_branch: Option<&'a str>,
@@ -435,6 +439,7 @@ impl<'a> BridgeSessionContextInput<'a> {
             cache_capability,
             session_id,
             model_id,
+            context_window: None,
             provider,
             edge_profile_cwd,
             edge_profile_git_branch,
@@ -446,6 +451,11 @@ impl<'a> BridgeSessionContextInput<'a> {
 
     pub(crate) fn with_skill_listing_block(mut self, skill_listing_block: &'a str) -> Self {
         self.skill_listing_block = skill_listing_block;
+        self
+    }
+
+    pub(crate) fn with_context_window(mut self, context_window: Option<u32>) -> Self {
+        self.context_window = context_window;
         self
     }
 }
@@ -682,6 +692,7 @@ pub(crate) fn assemble_bridge_context(
         input.session.cache_capability,
         input.session.session_id,
         input.session.model_id,
+        input.session.context_window,
         input.session.provider,
         input.session.edge_profile_cwd,
         input.session.edge_profile_git_branch,
@@ -701,6 +712,14 @@ pub(crate) fn assemble_bridge_context(
     let volatile_preamble_count = usize::from(outcome.dynamic_system.is_some());
     let tool_schema_count = outcome.tool_schemas.len();
     let compaction_tier = format!("{:?}", outcome.tier);
+    let model_context_window_tokens = u32::try_from(
+        crate::prompts::budget_for_model_with_override(
+            Some(input.session.model_id),
+            input.session.context_window,
+        )
+        .model_limit,
+    )
+    .unwrap_or(u32::MAX);
     BridgeContextAssemblyOutput {
         primary_system: outcome.primary_system,
         dynamic_system: outcome.dynamic_system,
@@ -711,6 +730,7 @@ pub(crate) fn assemble_bridge_context(
             source: "llm_context_bridge",
             provider: input.session.provider.to_string(),
             model_name: input.session.model_id.to_string(),
+            model_context_window_tokens,
             compaction_tier,
             system_prompt_tokens,
             stable_system_message_count,
@@ -808,9 +828,14 @@ pub(crate) fn assemble_context_pipeline(
     // cap, and `0` is its legacy "unlimited" sentinel. The pipeline's
     // `SessionContext::model_limit` is different: it must be the concrete
     // model context window used for section budgeting and pressure planning.
-    let model_context_limit =
-        u64::try_from(crate::prompts::budget_for_model(Some(input.model_name)).model_limit)
-            .unwrap_or(u64::MAX);
+    let model_context_limit = u64::try_from(
+        crate::prompts::budget_for_model_with_override(
+            Some(input.model_name),
+            input.context_window,
+        )
+        .model_limit,
+    )
+    .unwrap_or(u64::MAX);
     let session_current_date =
         resolve_pipeline_session_current_date(state.pipeline_session.as_ref(), input.session_id);
     let mut session_ctx = build_session_context(
@@ -943,6 +968,7 @@ pub(crate) fn assemble_context_pipeline(
     let tool_schema_count = pipeline_output.optimized.tool_schemas.len();
     let tier = pipeline_output.plan.compact_tier;
     let compaction_tier = format!("{:?}", tier);
+    let model_context_window_tokens = u32::try_from(model_context_limit).unwrap_or(u32::MAX);
 
     Ok(LlmContextAssemblyOutput {
         system_messages,
@@ -955,6 +981,7 @@ pub(crate) fn assemble_context_pipeline(
             source: "llm_context",
             provider: input.provider.to_string(),
             model_name: input.model_name.to_string(),
+            model_context_window_tokens,
             compaction_tier,
             system_prompt_tokens: pipeline_output.metrics.sections,
             stable_system_message_count,
@@ -1317,6 +1344,7 @@ mod context_cache_contract_tests {
             cache_cfg: &cache_cfg,
             provider: "openai",
             model_name: "deepseek-v4-pro-official(thinking:high)",
+            context_window: Some(1_000_000),
             cache_capability: Some(strict_history),
             user_content: "which model are you?",
             query_source: "test",
@@ -1340,6 +1368,44 @@ mod context_cache_contract_tests {
         assert!(
             output.volatile_preamble.is_empty(),
             "CurrentUserOnly providers must still suppress normal volatile preamble"
+        );
+        assert_eq!(
+            output.manifest_trace.to_json()["model_context_window_tokens"],
+            json!(1_000_000),
+            "context assembly must use registry context_window, not model-name heuristics or 200K default"
+        );
+    }
+
+    #[test]
+    fn assemble_bridge_context_reports_configured_context_window() {
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let visible_tools: Vec<Value> = Vec::new();
+        let restricted_tools = HashSet::new();
+
+        let output = assemble_bridge_context(BridgeContextAssemblyInput {
+            tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
+            runtime_signals: BridgeRuntimeSignals::new(&[], &[], &[], None, None),
+            session: BridgeSessionContextInput::new(
+                &cache_cfg,
+                None,
+                "sid-bridge-context-window",
+                "deepseek-v4-pro-official",
+                "openai",
+                None,
+                None,
+                None,
+                "2026-07-01",
+            )
+            .with_context_window(Some(1_000_000)),
+        });
+
+        assert_eq!(
+            output.manifest_trace.to_json()["model_context_window_tokens"],
+            json!(1_000_000),
+            "bridge context assembly must preserve the resolved model context_window"
         );
     }
 

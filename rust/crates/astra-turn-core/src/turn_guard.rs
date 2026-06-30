@@ -1187,13 +1187,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_tool_binding_sentinel_does_not_poison_tool_health() {
+    fn binding_failure_not_health_failure() {
         let mut guard = TurnGuard::new();
-        let result = format!(
-            "Error: {} legacy binding failure",
-            astra_core::error_kind::TOOL_BINDING_SENTINEL
-        );
-        let quality = guard.record_tool_result("agent_fanout", &result);
+        let result = "Error: tool binding failure for agent_fanout";
+        let quality = guard.record_tool_result("agent_fanout", result);
 
         assert_eq!(quality, super::result_quality::ResultQuality::Error);
         assert!(guard.round_had_error);

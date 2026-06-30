@@ -10,13 +10,47 @@ const ABSOLUTE_AGGRESSIVE_PRUNE_TOKENS: usize = 320_000;
 
 /// Same pressure value used when building `SelectionContext` for tool surface.
 #[must_use]
-pub fn budget_pressure_for_chat_turn(
+#[cfg(test)]
+fn budget_pressure_for_chat_turn(
     messages: &[Value],
     model: Option<&str>,
     always_load_schema_tokens: usize,
 ) -> f64 {
     let estimated = prompts::estimate_tokens(messages, always_load_schema_tokens, 0);
     let budget = prompts::budget_for_model(model);
+    budget_pressure_for_estimate(estimated, &budget)
+}
+
+#[must_use]
+pub fn budget_pressure_for_chat_turn_with_input_budget(
+    messages: &[Value],
+    always_load_schema_tokens: usize,
+    effective_input_budget_tokens: u64,
+) -> f64 {
+    let estimated = prompts::estimate_tokens(messages, always_load_schema_tokens, 0);
+    if effective_input_budget_tokens == 0 {
+        return budget_pressure_for_estimate(estimated, &prompts::ContextBudget::default());
+    }
+    let budget = prompts::ContextBudget {
+        model_limit: effective_input_budget_tokens.min(usize::MAX as u64) as usize,
+        output_reserve_ratio: 0.0,
+        ..Default::default()
+    };
+    budget_pressure_for_estimate(estimated, &budget)
+}
+
+#[must_use]
+pub fn budget_pressure_for_chat_turn_with_context_window(
+    messages: &[Value],
+    always_load_schema_tokens: usize,
+    context_window_tokens: u32,
+) -> f64 {
+    let estimated = prompts::estimate_tokens(messages, always_load_schema_tokens, 0);
+    let budget = prompts::budget_for_model_with_override(None, Some(context_window_tokens));
+    budget_pressure_for_estimate(estimated, &budget)
+}
+
+fn budget_pressure_for_estimate(estimated: usize, budget: &prompts::ContextBudget) -> f64 {
     let tier = budget.compaction_tier(estimated);
     tier.budget_pressure()
         .max(absolute_latency_pressure(estimated))
@@ -58,14 +92,16 @@ mod tests {
             messages.push(json!({"role":"assistant","content": format!("好的，我来帮你分析第{i}个问题。根据代码审查的结果，问题出在以下几个方面...")}));
         }
 
-        let pressure_without_schema = budget_pressure_for_chat_turn(&messages, None, 0);
-        let pressure_with_schema = budget_pressure_for_chat_turn(&messages, None, 50_000);
+        let pressure_without_schema =
+            budget_pressure_for_chat_turn_with_input_budget(&messages, 0, 80_000);
+        let pressure_with_schema =
+            budget_pressure_for_chat_turn_with_input_budget(&messages, 50_000, 80_000);
 
         assert!(
             pressure_with_schema > pressure_without_schema,
             "schema tokens must increase pressure: without={pressure_without_schema}, with={pressure_with_schema}"
         );
-        // 50K schema tokens in a 128K window produce at least a tier jump
+        // 50K schema tokens in an 80K effective input budget produce at least a tier jump
         // (Normal→TrimSchemas = +0.3). Without schema the 40 CJK messages
         // alone land in Normal (0.0), so the delta must be meaningful.
         assert!(
@@ -103,7 +139,7 @@ mod tests {
             }
         }
 
-        let pressure = budget_pressure_for_chat_turn(&messages, None, 50_000);
+        let pressure = budget_pressure_for_chat_turn_with_input_budget(&messages, 50_000, 128_000);
 
         // At minimum must trigger TrimSchemas (0.3).
         assert!(
@@ -172,12 +208,29 @@ mod tests {
     #[test]
     fn large_absolute_prompt_escalates_pressure_even_on_large_context_model() {
         assert_eq!(
-            budget_pressure_for_chat_turn(&[], Some("gemini-2.5-pro"), 100_000),
+            budget_pressure_for_chat_turn_with_input_budget(&[], 80_000, 800_000),
             0.0
         );
-        assert!(budget_pressure_for_chat_turn(&[], Some("gemini-2.5-pro"), 128_000) >= 0.3);
-        assert!(budget_pressure_for_chat_turn(&[], Some("gemini-2.5-pro"), 200_000) >= 0.6);
-        assert!(budget_pressure_for_chat_turn(&[], Some("gemini-2.5-pro"), 320_000) >= 0.9);
+        assert!(budget_pressure_for_chat_turn_with_input_budget(&[], 128_000, 800_000) >= 0.3);
+        assert!(budget_pressure_for_chat_turn_with_input_budget(&[], 200_000, 800_000) >= 0.6);
+        assert!(budget_pressure_for_chat_turn_with_input_budget(&[], 320_000, 800_000) >= 0.9);
+    }
+
+    #[test]
+    fn zero_effective_input_budget_falls_back_to_default_context_budget() {
+        assert!(
+            budget_pressure_for_chat_turn_with_input_budget(&[], 110_000, 0) >= 0.3,
+            "legacy zero sentinel should use the default 200K context budget, not only absolute latency thresholds"
+        );
+    }
+
+    #[test]
+    fn context_window_path_uses_full_window_with_output_reserve() {
+        let pressure = budget_pressure_for_chat_turn_with_context_window(&[], 115_000, 200_000);
+        assert!(
+            (0.3..0.6).contains(&pressure),
+            "200K context with 10% output reserve should trim schemas but not compact history at 115K, got {pressure}"
+        );
     }
 
     /// Even with many messages, if they're all short and no schema tokens,

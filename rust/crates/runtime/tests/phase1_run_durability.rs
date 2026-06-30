@@ -293,7 +293,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         let run = self
             .store()
             .await
-            .load_run(&run_id)
+            .load_run(&user_id, &run_id)
             .await
             .map_err(|error| {
                 (
@@ -335,7 +335,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         let run = self
             .store()
             .await
-            .load_run(&run_id)
+            .load_run(&user_id, &run_id)
             .await
             .map_err(|error| {
                 (
@@ -391,7 +391,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
     ) -> Result<RunInputRecord, (StatusCode, Json<ErrorResponse>)> {
         let store = self.store().await;
         let run = store
-            .load_run(&run_id)
+            .load_run(&user_id, &run_id)
             .await
             .map_err(|error| {
                 (
@@ -418,6 +418,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         if !duplicate {
             store
                 .append_event(
+                    &user_id,
                     &run_id,
                     json!({
                         "event_type": "user_input",
@@ -433,7 +434,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
                     )
                 })?;
             store
-                .update_run_status(&run_id, "running", None, None)
+                .update_run_status(&user_id, &run_id, "running", None, None)
                 .await
                 .map_err(|error| {
                     (
@@ -443,6 +444,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
                 })?;
             store
                 .append_event(
+                    &user_id,
                     &run_id,
                     json!({"event_type": "run_resumed", "data": {"source": "approval_input"}}),
                 )
@@ -464,11 +466,11 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
     async fn pause_run(
         &self,
         run_id: String,
-        _user_id: String,
+        user_id: String,
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
         self.store()
             .await
-            .update_run_status(&run_id, "waiting", Some("user"), None)
+            .update_run_status(&user_id, &run_id, "waiting", Some("user"), None)
             .await
             .map_err(|error| {
                 (
@@ -545,8 +547,8 @@ async fn l2_lease_race_has_single_owner() {
     let a = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("owner-a");
     let b = DatabaseRunStateStore::new(pool).with_owner_pod_id("owner-b");
     let (won_a, won_b) = tokio::join!(
-        a.acquire_owner_lease(&run_id, "owner-a", Duration::from_secs(30)),
-        b.acquire_owner_lease(&run_id, "owner-b", Duration::from_secs(30))
+        a.acquire_owner_lease(&user_id, &run_id, "owner-a", Duration::from_secs(30)),
+        b.acquire_owner_lease(&user_id, &run_id, "owner-b", Duration::from_secs(30))
     );
     let wins = [won_a.unwrap(), won_b.unwrap()]
         .into_iter()
@@ -600,20 +602,26 @@ async fn l2_event_idx_and_idempotency_use_agent_runs() {
         .unwrap();
     store
         .append_event(
-            &run_id,
+                    &user_id,
+                    &run_id,
             json!({"event_type": "user_input", "idempotency_key": "same-key", "data": {"text": "one"}}),
         )
         .await
         .unwrap();
     store
         .append_event(
-            &run_id,
+                    &user_id,
+                    &run_id,
             json!({"event_type": "user_input", "idempotency_key": "same-key", "data": {"text": "one"}}),
         )
         .await
         .unwrap();
     store
-        .append_event(&run_id, json!({"event_type": "tool_result", "data": {}}))
+        .append_event(
+            &user_id,
+            &run_id,
+            json!({"event_type": "tool_result", "data": {}}),
+        )
         .await
         .unwrap();
 
@@ -654,6 +662,7 @@ async fn l2_graceful_checkpoint_recovers_as_waiting() {
     assert!(
         store
             .save_checkpoint(
+                &user_id,
                 &run_id,
                 &json!({
                     "version": "checkpoint_v1",
@@ -674,7 +683,7 @@ async fn l2_graceful_checkpoint_recovers_as_waiting() {
     );
     assert!(
         store
-            .save_checkpoint(&run_id, r#"{"version":"bad"}"#)
+            .save_checkpoint(&user_id, &run_id, r#"{"version":"bad"}"#)
             .await
             .is_err()
     );
@@ -682,7 +691,7 @@ async fn l2_graceful_checkpoint_recovers_as_waiting() {
     let engine = RunEngine::new(store);
     let recovered = engine.recover_active_runs().await.unwrap();
     assert!(recovered.iter().any(|run| run.run_id == run_id));
-    let loaded = engine.load_run(&run_id).await.unwrap().unwrap();
+    let loaded = engine.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(loaded.status, "waiting");
     assert_eq!(loaded.waiting_for.as_deref(), Some("restart_resume"));
     assert!(loaded.events.iter().any(|event| {
@@ -705,7 +714,7 @@ async fn l2_crash_recovery_marks_running_failed() {
     let engine = RunEngine::new(store);
     let recovered = engine.recover_active_runs().await.unwrap();
     assert!(recovered.iter().any(|run| run.run_id == run_id));
-    let loaded = engine.load_run(&run_id).await.unwrap().unwrap();
+    let loaded = engine.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(loaded.status, "failed");
     assert_eq!(
         loaded.error_message.as_deref(),
@@ -722,7 +731,7 @@ async fn l2_retry_scope_and_batch_contracts_hold() {
     let mut record = durable_record(&run_id, &session_id, &user_id);
     record.retry_scope = Some("siblings".to_string());
     store.insert_run(record).await.unwrap();
-    let loaded = store.load_run(&run_id).await.unwrap().unwrap();
+    let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(loaded.retry_scope.as_deref(), Some("siblings"));
 
     let mut invalid = durable_record(&format!("{run_id}-invalid"), &session_id, &user_id);
@@ -822,6 +831,7 @@ async fn l3_s04_reconnect_replays_monotonic_events() {
     for idx in 0..17 {
         store
             .append_event(
+                &user_id,
                 &run_id,
                 json!({"event_type": "text_delta", "data": {"idx": idx}}),
             )
@@ -831,13 +841,14 @@ async fn l3_s04_reconnect_replays_monotonic_events() {
     for idx in 0..2 {
         store
             .append_event(
+                &user_id,
                 &run_id,
                 json!({"event_type": "approval_decision", "data": {"idx": idx}}),
             )
             .await
             .unwrap();
     }
-    let loaded = store.load_run(&run_id).await.unwrap().unwrap();
+    let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
     let indexes = loaded
         .events
         .iter()
@@ -863,7 +874,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         .unwrap();
     assert!(
         store_a
-            .acquire_owner_lease(&run_id, "phase1-pod-a", Duration::from_secs(30))
+            .acquire_owner_lease(&user_id, &run_id, "phase1-pod-a", Duration::from_secs(30))
             .await
             .unwrap()
     );
@@ -882,6 +893,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             .read()
             .await
             .append_event(
+                &user_id,
                 &run_id,
                 json!({"event_type": "text_delta", "data": {"disconnect": disconnect}}),
             )
@@ -905,6 +917,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         .read()
         .await
         .save_checkpoint(
+            &user_id,
             &run_id,
             &json!({
                 "version": "checkpoint_v1",
@@ -929,8 +942,9 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
     sqlx::query(
         "UPDATE agent_runs
          SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND)
-         WHERE run_id = ?",
+         WHERE user_id = ? AND run_id = ?",
     )
+    .bind(&user_id)
     .bind(&run_id)
     .execute(pool.get())
     .await
@@ -938,7 +952,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
     let store_b = DatabaseRunStateStore::new(pool).with_owner_pod_id("phase1-pod-b");
     assert!(
         store_b
-            .acquire_owner_lease(&run_id, "phase1-pod-b", Duration::from_secs(30))
+            .acquire_owner_lease(&user_id, &run_id, "phase1-pod-b", Duration::from_secs(30))
             .await
             .unwrap(),
         "new pod should take over the durable agent_runs lease after restart"
@@ -950,6 +964,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             .read()
             .await
             .append_event(
+                &user_id,
                 &run_id,
                 json!({"event_type": "run_paused", "data": {"waiting_for": "user"}}),
             )
@@ -959,7 +974,8 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             .read()
             .await
             .append_event(
-                &run_id,
+                    &user_id,
+                    &run_id,
                 json!({"event_type": "approval_required", "data": {"request_id": format!("approval-{idx}")}}),
             )
             .await
@@ -967,7 +983,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         active_store
             .read()
             .await
-            .update_run_status(&run_id, "waiting", Some("user"), None)
+            .update_run_status(&user_id, &run_id, "waiting", Some("user"), None)
             .await
             .unwrap();
         let waiting = http_get_run_stream(&app, &run_id, next_index).await;
@@ -1001,7 +1017,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
     let loaded = active_store
         .read()
         .await
-        .load_run(&run_id)
+        .load_run(&user_id, &run_id)
         .await
         .unwrap()
         .unwrap();
@@ -1091,7 +1107,7 @@ async fn l3_s10_retry_scope_is_persisted_for_retry_runs() {
     retry.depth = 1;
     retry.ancestor_path = Some(format!("{run_id}/child"));
     store.insert_run(retry).await.unwrap();
-    let loaded = store.load_run(&run_id).await.unwrap().unwrap();
+    let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(loaded.retry_scope.as_deref(), Some("subtree"));
     assert!(loaded.retry_of.is_some());
 }

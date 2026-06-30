@@ -321,7 +321,9 @@ fn apply_turn_success_sync(
         initialize_post_commit_session_state(state, session_id, session_rebound);
     }
 
-    state.last_turn_interrupted = false;
+    state.last_turn_interrupted = result.interruption.is_some()
+        || result.interruption_kind.is_some()
+        || result.final_state == "interrupted";
     print_turn_status_line(state, &result, Some(&learning_snap.eval), turn_start);
     if state.tui_render_policy.is_none() {
         if let Some(suggestion) = state.pending_followup_suggestion.as_ref() {
@@ -407,6 +409,36 @@ mod tests {
         apply_turn_success(&mut state, None, "apply the fix", result, Instant::now());
 
         assert_eq!(state.recent_tools, vec!["str_replace".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_preserves_interrupted_state_for_partial_turn() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let mut state = SessionState::default();
+        let mut result = crate::tests::stub_stream_result(
+            "[budget_exhausted] 46 tool call(s) completed. A checkpoint was saved. You can continue in the next message.",
+        );
+        result.final_state = "interrupted".into();
+        result.interruption_kind = Some("budget_exhausted".into());
+        result.interruption = Some(serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "resume_restricted_tools": ["bash"],
+            "user_message": "[budget_exhausted] 46 tool call(s) completed. A checkpoint was saved. You can continue in the next message."
+        }));
+
+        apply_turn_success(&mut state, None, "continue", result, Instant::now());
+
+        assert!(state.last_turn_interrupted);
+        assert_eq!(state.resume_restricted_tools, vec!["bash".to_string()]);
+        assert!(
+            state
+                .last_response
+                .as_deref()
+                .unwrap_or_default()
+                .contains("46 tool call(s) completed")
+        );
     }
 
     #[test]

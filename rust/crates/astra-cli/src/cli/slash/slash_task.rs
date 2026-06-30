@@ -15,12 +15,13 @@ use crossterm::style::Stylize;
 
 async fn mark_background_task_failed(
     svc: &dyn astra_services::TaskService,
+    user_id: &str,
     task_id: &str,
     error_kind: &str,
     error: String,
 ) -> String {
     let stored_error = encode_task_failure_message(error_kind, &error);
-    match svc.fail_task(task_id, &stored_error).await {
+    match svc.fail_task(user_id, task_id, &stored_error).await {
         Ok(()) => error,
         Err(fail_err) => {
             format!("{error}; additionally failed to persist failed status: {fail_err}")
@@ -30,6 +31,7 @@ async fn mark_background_task_failed(
 
 async fn persist_background_task_result(
     svc: &dyn astra_services::TaskService,
+    user_id: &str,
     task_id: &str,
     session_id: Option<String>,
     sr: &crate::StreamResult,
@@ -37,6 +39,7 @@ async fn persist_background_task_result(
     let exit_code = crate::cli::task::task_result_projection::stream_result_exit_code(sr);
     if let Err(error) = svc
         .save_checkpoint(
+            user_id,
             task_id,
             &astra_services::task_orchestrator::TaskCheckpoint {
                 active_subtask_id: None,
@@ -51,6 +54,7 @@ async fn persist_background_task_result(
     {
         return Err(mark_background_task_failed(
             svc,
+            user_id,
             task_id,
             "persistence_error",
             format!("failed to save background task result: {error}"),
@@ -60,9 +64,10 @@ async fn persist_background_task_result(
 
     match exit_code {
         crate::cli::exit_code::ExitCode::Success => {
-            if let Err(error) = svc.complete_task(task_id).await {
+            if let Err(error) = svc.complete_task(user_id, task_id).await {
                 return Err(mark_background_task_failed(
                     svc,
+                    user_id,
                     task_id,
                     "persistence_error",
                     format!("failed to mark background task finalized: {error}"),
@@ -74,9 +79,13 @@ async fn persist_background_task_result(
         crate::cli::exit_code::ExitCode::Partial => {
             let outcome =
                 crate::cli::task::task_result_projection::stream_result_completion_outcome(sr);
-            if let Err(error) = svc.complete_task_with_outcome(task_id, outcome).await {
+            if let Err(error) = svc
+                .complete_task_with_outcome(user_id, task_id, outcome)
+                .await
+            {
                 return Err(mark_background_task_failed(
                     svc,
+                    user_id,
                     task_id,
                     "persistence_error",
                     format!("failed to mark background task finalized: {error}"),
@@ -87,6 +96,7 @@ async fn persist_background_task_result(
         }
         _ => Err(mark_background_task_failed(
             svc,
+            user_id,
             task_id,
             crate::cli::command_router::error_kind_for_exit_code(exit_code)
                 .unwrap_or("tool_failure"),
@@ -220,7 +230,7 @@ pub(crate) async fn handle_task_command(
         },
         "status" if !sub_arg.is_empty() => {
             match find_task_by_query(&*svc, user_id, sub_arg).await {
-                Ok(Some(tid)) => match svc.get_task(&tid).await {
+                Ok(Some(tid)) => match svc.get_task(user_id, &tid).await {
                     Ok(Some(t)) => {
                         let read = load_task_result_read_surface(&t);
                         eprintln!(
@@ -333,6 +343,7 @@ pub(crate) async fn handle_task_command(
             #[cfg(feature = "harness")]
             let bg_harness_trace = state.harness_trace.clone();
             let svc_clone = svc.clone();
+            let bg_user_id = user_id.to_string();
             let workspace_root = std::env::current_dir().unwrap_or_default();
             let bg_root_agent_id = format!("task-{task_id}");
 
@@ -356,7 +367,7 @@ pub(crate) async fn handle_task_command(
             tokio::spawn(async move {
                 // Mark in-progress
                 let _ = svc_clone
-                    .update_status(&bg_task_id, TaskStatus::InProgress)
+                    .update_status(&bg_user_id, &bg_task_id, TaskStatus::InProgress)
                     .await;
 
                 // Create fresh auto-approve permission manager for background
@@ -451,6 +462,7 @@ pub(crate) async fn handle_task_command(
                     Ok(sr) => {
                         match persist_background_task_result(
                             &*svc_clone,
+                            &bg_user_id,
                             &bg_task_id,
                             bg_session_id.clone(),
                             &sr,
@@ -489,6 +501,7 @@ pub(crate) async fn handle_task_command(
                     Err(e) => {
                         let error = mark_background_task_failed(
                             &*svc_clone,
+                            &bg_user_id,
                             &bg_task_id,
                             "turn_error",
                             e.error,
@@ -507,7 +520,7 @@ pub(crate) async fn handle_task_command(
         "result" if !sub_arg.is_empty() => {
             // Show the full result of a background task.
             match find_task_by_query(&*svc, user_id, sub_arg).await {
-                Ok(Some(tid)) => match svc.get_task(&tid).await {
+                Ok(Some(tid)) => match svc.get_task(user_id, &tid).await {
                     Ok(Some(t)) => {
                         let read = load_task_result_read_surface(&t);
                         let short = &t.task_id[..8.min(t.task_id.len())];
@@ -628,7 +641,11 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get_task(&self, _: &str) -> Result<Option<astra_services::TaskRecord>, String> {
+        async fn get_task(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<astra_services::TaskRecord>, String> {
             unimplemented!()
         }
 
@@ -669,17 +686,26 @@ mod tests {
         async fn update_status(
             &self,
             _: &str,
+            _: &str,
             _: astra_services::TaskStatus,
         ) -> Result<(), String> {
             unimplemented!()
         }
 
-        async fn update_progress(&self, _: &str, _: u32, _: u32, _: u32) -> Result<(), String> {
+        async fn update_progress(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: u32,
+        ) -> Result<(), String> {
             unimplemented!()
         }
 
         async fn save_checkpoint(
             &self,
+            _: &str,
             _: &str,
             checkpoint: &astra_services::TaskCheckpoint,
         ) -> Result<(), String> {
@@ -692,11 +718,16 @@ mod tests {
             Ok(())
         }
 
-        async fn update_plan(&self, _: &str, _: &astra_services::TaskPlan) -> Result<(), String> {
+        async fn update_plan(
+            &self,
+            _: &str,
+            _: &str,
+            _: &astra_services::TaskPlan,
+        ) -> Result<(), String> {
             unimplemented!()
         }
 
-        async fn fail_task(&self, _: &str, error: &str) -> Result<(), String> {
+        async fn fail_task(&self, _: &str, _: &str, error: &str) -> Result<(), String> {
             if let Some(fail_error) = &self.fail_task_error {
                 return Err(fail_error.clone());
             }
@@ -704,7 +735,7 @@ mod tests {
             Ok(())
         }
 
-        async fn complete_task(&self, _: &str) -> Result<(), String> {
+        async fn complete_task(&self, _: &str, _: &str) -> Result<(), String> {
             if let Some(error) = &self.complete_task_error {
                 return Err(error.clone());
             }
@@ -714,6 +745,7 @@ mod tests {
 
         async fn complete_plan_run(
             &self,
+            _: &str,
             _: &str,
             _: u32,
             _: u32,
@@ -727,6 +759,7 @@ mod tests {
         async fn complete_task_with_outcome(
             &self,
             _: &str,
+            _: &str,
             outcome: astra_services::TaskOutcome,
         ) -> Result<(), String> {
             self.state.lock_recover().completed_outcome = Some(outcome);
@@ -736,6 +769,7 @@ mod tests {
         async fn record_feedback(
             &self,
             _: &str,
+            _: &str,
             _: u8,
             _: astra_services::TaskOutcome,
             _: Option<i32>,
@@ -743,11 +777,16 @@ mod tests {
             unimplemented!()
         }
 
-        async fn increment_replan_count(&self, _: &str) -> Result<(), String> {
+        async fn increment_replan_count(&self, _: &str, _: &str) -> Result<(), String> {
             unimplemented!()
         }
 
-        async fn extract_template(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+        async fn extract_template(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<String>, String> {
             unimplemented!()
         }
 
@@ -762,7 +801,7 @@ mod tests {
             unimplemented!()
         }
 
-        async fn record_template_usage(&self, _: &str) -> Result<(), String> {
+        async fn record_template_usage(&self, _: &str, _: &str) -> Result<(), String> {
             unimplemented!()
         }
 
@@ -791,7 +830,11 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get_task(&self, _: &str) -> Result<Option<astra_services::TaskRecord>, String> {
+        async fn get_task(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<astra_services::TaskRecord>, String> {
             unimplemented!()
         }
 
@@ -833,37 +876,52 @@ mod tests {
         async fn update_status(
             &self,
             _: &str,
+            _: &str,
             _: astra_services::TaskStatus,
         ) -> Result<(), String> {
             unimplemented!()
         }
 
-        async fn update_progress(&self, _: &str, _: u32, _: u32, _: u32) -> Result<(), String> {
+        async fn update_progress(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: u32,
+        ) -> Result<(), String> {
             unimplemented!()
         }
 
         async fn save_checkpoint(
             &self,
             _: &str,
+            _: &str,
             _: &astra_services::TaskCheckpoint,
         ) -> Result<(), String> {
             unimplemented!()
         }
 
-        async fn update_plan(&self, _: &str, _: &astra_services::TaskPlan) -> Result<(), String> {
+        async fn update_plan(
+            &self,
+            _: &str,
+            _: &str,
+            _: &astra_services::TaskPlan,
+        ) -> Result<(), String> {
             unimplemented!()
         }
 
-        async fn fail_task(&self, _: &str, _: &str) -> Result<(), String> {
+        async fn fail_task(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
             unimplemented!()
         }
 
-        async fn complete_task(&self, _: &str) -> Result<(), String> {
+        async fn complete_task(&self, _: &str, _: &str) -> Result<(), String> {
             unimplemented!()
         }
 
         async fn complete_plan_run(
             &self,
+            _: &str,
             _: &str,
             _: u32,
             _: u32,
@@ -876,6 +934,7 @@ mod tests {
         async fn complete_task_with_outcome(
             &self,
             _: &str,
+            _: &str,
             _: astra_services::TaskOutcome,
         ) -> Result<(), String> {
             unimplemented!()
@@ -884,6 +943,7 @@ mod tests {
         async fn record_feedback(
             &self,
             _: &str,
+            _: &str,
             _: u8,
             _: astra_services::TaskOutcome,
             _: Option<i32>,
@@ -891,11 +951,16 @@ mod tests {
             unimplemented!()
         }
 
-        async fn increment_replan_count(&self, _: &str) -> Result<(), String> {
+        async fn increment_replan_count(&self, _: &str, _: &str) -> Result<(), String> {
             unimplemented!()
         }
 
-        async fn extract_template(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+        async fn extract_template(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<String>, String> {
             unimplemented!()
         }
 
@@ -910,7 +975,7 @@ mod tests {
             unimplemented!()
         }
 
-        async fn record_template_usage(&self, _: &str) -> Result<(), String> {
+        async fn record_template_usage(&self, _: &str, _: &str) -> Result<(), String> {
             unimplemented!()
         }
 
@@ -1006,9 +1071,10 @@ mod tests {
         sr.prompt_tokens = 10;
         sr.completion_tokens = 20;
 
-        let err = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
-            .await
-            .unwrap_err();
+        let err =
+            persist_background_task_result(&svc, "test-user", "task-1", Some("sess-1".into()), &sr)
+                .await
+                .unwrap_err();
 
         let snapshot = state.lock_recover();
         assert!(snapshot.failed_error.is_some());
@@ -1039,9 +1105,10 @@ mod tests {
         sr.completion_tokens = 20;
         sr.tool_calls_count = 1;
 
-        let outcome = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
-            .await
-            .unwrap();
+        let outcome =
+            persist_background_task_result(&svc, "test-user", "task-1", Some("sess-1".into()), &sr)
+                .await
+                .unwrap();
 
         let snapshot = state.lock_recover();
         assert_eq!(outcome, astra_services::TaskOutcome::Success);
@@ -1069,9 +1136,10 @@ mod tests {
         sr.final_state = "interrupted".into();
         sr.interruption_kind = Some("budget_exhausted".into());
 
-        let outcome = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
-            .await
-            .unwrap();
+        let outcome =
+            persist_background_task_result(&svc, "test-user", "task-1", Some("sess-1".into()), &sr)
+                .await
+                .unwrap();
 
         let snapshot = state.lock_recover();
         assert_eq!(outcome, astra_services::TaskOutcome::Partial);
@@ -1101,9 +1169,10 @@ mod tests {
         sr.tool_calls_count = 1;
         sr.session_persistence_error = Some("failed to append turn event".into());
 
-        let err = persist_background_task_result(&svc, "task-1", Some("sess-1".into()), &sr)
-            .await
-            .unwrap_err();
+        let err =
+            persist_background_task_result(&svc, "test-user", "task-1", Some("sess-1".into()), &sr)
+                .await
+                .unwrap_err();
 
         let snapshot = state.lock_recover();
         assert!(snapshot.saved_checkpoint);

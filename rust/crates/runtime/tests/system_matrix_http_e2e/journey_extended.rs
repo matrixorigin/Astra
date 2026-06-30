@@ -43,8 +43,9 @@ pub async fn run_session_cancel_then_delete() {
         "cancel response: {can_j}"
     );
 
-    let row = sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ?")
+    let row = sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ?")
         .bind(&session_id)
+        .bind(&ctx.user_id)
         .fetch_optional(pool)
         .await
         .expect("select session after cancel");
@@ -949,9 +950,10 @@ pub async fn run_same_session_concurrent_turns_isolated() {
     loop {
         let llm_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events \
-             WHERE session_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
+             WHERE session_id = ? AND user_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
         )
         .bind(&ctx.session_id)
+        .bind(&ctx.user_id)
         .bind("Overlap response A")
         .bind("Overlap response B")
         .fetch_one(&ctx.pool)
@@ -969,9 +971,10 @@ pub async fn run_same_session_concurrent_turns_isolated() {
 
     let distinct_event_ids: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT event_id) FROM agent_events \
-         WHERE session_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
+         WHERE session_id = ? AND user_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
     )
     .bind(&ctx.session_id)
+    .bind(&ctx.user_id)
     .bind("Overlap response A")
     .bind("Overlap response B")
     .fetch_one(&ctx.pool)
@@ -984,9 +987,10 @@ pub async fn run_same_session_concurrent_turns_isolated() {
 
     let distinct_chain_ids: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT causal_chain_id) FROM agent_events \
-         WHERE session_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
+         WHERE session_id = ? AND user_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
     )
     .bind(&ctx.session_id)
+    .bind(&ctx.user_id)
     .bind("Overlap response A")
     .bind("Overlap response B")
     .fetch_one(&ctx.pool)

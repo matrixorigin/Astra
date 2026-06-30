@@ -849,8 +849,6 @@ fn informative_error_line(result: &str) -> Option<&str> {
 /// `WHAT/WHY/NEXT` into a generic banner.
 #[must_use]
 pub fn tool_error_summary(tool_name: &str, result: &str) -> String {
-    let result = astra_core::error_kind::strip_tool_binding_sentinel(result);
-    let result = result.as_ref();
     let trimmed = result.trim();
     if trimmed.is_empty() {
         return format!("{tool_name} failed before returning output");
@@ -913,8 +911,6 @@ fn summarize_git_result(result: &str) -> Option<String> {
 /// Build a brief summary of a tool result for the status line (after execution).
 #[must_use]
 pub fn tool_result_summary(name: &str, result: &str) -> Option<String> {
-    let result = astra_core::error_kind::strip_tool_binding_sentinel(result);
-    let result = result.as_ref();
     match name {
         "read_file" => {
             let lines = result.lines().count();
@@ -1571,17 +1567,6 @@ mod tests {
         let output = "banner\n\nError: Missing 'path' parameter";
         let summary = tool_error_summary("str_replace", output);
         assert_eq!(summary, "Error: Missing 'path' parameter");
-    }
-
-    #[test]
-    fn tool_error_summary_strips_tool_binding_sentinel() {
-        let output = format!(
-            "Error: tool `agent` runtime binding is unavailable. {}",
-            astra_core::error_kind::TOOL_BINDING_SENTINEL
-        );
-        let summary = tool_error_summary("agent", &output);
-        assert!(!summary.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL));
-        assert!(summary.contains("runtime binding is unavailable"));
     }
 
     #[test]

@@ -92,6 +92,7 @@ mod enabled {
 
     async fn persisted_history(
         state: &AppState,
+        user_id: &str,
         session_id: &str,
         n: usize,
     ) -> Vec<RuntimeSnapshot> {
@@ -105,10 +106,11 @@ mod enabled {
         let rows: Vec<(String,)> = match sqlx::query_as(
             "SELECT snapshot_json
              FROM harness_snapshots
-             WHERE session_id = ?
+             WHERE user_id = ? AND session_id = ?
              ORDER BY created_at DESC
              LIMIT ?",
         )
+        .bind(user_id)
         .bind(session_id)
         .bind(limit)
         .fetch_all(pool.get())
@@ -132,9 +134,10 @@ mod enabled {
         Path(session_id): Path<String>,
     ) -> Result<Json<RuntimeSnapshot>, (StatusCode, Json<ErrorResponse>)> {
         let user = state.auth_service.current_user(&headers).await?;
+        let user_id = user.user_id;
         state
             .session_service
-            .get_session(session_id.clone(), user.user_id)
+            .get_session(session_id.clone(), user_id.clone())
             .await?;
         let registry = &state.harness_registry;
         let snapshot = if let Some(sink) = registry.get(&session_id) {
@@ -144,7 +147,7 @@ mod enabled {
         };
         let snapshot = match snapshot {
             Some(snapshot) => snapshot,
-            None => persisted_history(&state, &session_id, 1)
+            None => persisted_history(&state, &user_id, &session_id, 1)
                 .await
                 .into_iter()
                 .next()
@@ -165,9 +168,10 @@ mod enabled {
         Query(params): Query<HistoryParams>,
     ) -> Result<Json<Vec<RuntimeSnapshot>>, (StatusCode, Json<ErrorResponse>)> {
         let user = state.auth_service.current_user(&headers).await?;
+        let user_id = user.user_id;
         state
             .session_service
-            .get_session(session_id.clone(), user.user_id)
+            .get_session(session_id.clone(), user_id.clone())
             .await?;
         let registry = &state.harness_registry;
         let mut history: Vec<RuntimeSnapshot> = registry
@@ -175,7 +179,7 @@ mod enabled {
             .map(|sink| sink.history(params.n))
             .unwrap_or_default();
         if history.is_empty() {
-            history = persisted_history(&state, &session_id, params.n).await;
+            history = persisted_history(&state, &user_id, &session_id, params.n).await;
         }
         let history: Vec<RuntimeSnapshot> = history.into_iter().map(sanitize_snapshot).collect();
         if history.is_empty() {
@@ -328,9 +332,10 @@ mod enabled {
         Path(session_id): Path<String>,
     ) -> Result<Json<SnapshotDiff>, (StatusCode, Json<ErrorResponse>)> {
         let user = state.auth_service.current_user(&headers).await?;
+        let user_id = user.user_id;
         state
             .session_service
-            .get_session(session_id.clone(), user.user_id)
+            .get_session(session_id.clone(), user_id.clone())
             .await?;
         let registry = &state.harness_registry;
         let mut history = registry
@@ -338,7 +343,7 @@ mod enabled {
             .map(|sink| sink.history(2))
             .unwrap_or_default();
         if history.len() < 2 {
-            history = persisted_history(&state, &session_id, 2).await;
+            history = persisted_history(&state, &user_id, &session_id, 2).await;
         }
         if history.len() < 2 {
             return Err((

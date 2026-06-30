@@ -47,9 +47,10 @@ mod tests {
 
     /// Clean up test messages between tests.
     async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>) {
-        let _ = sqlx::query("DELETE FROM agent_message_queue WHERE message_id LIKE 'test-%' OR from_run_id LIKE 'run-%'")
+        sqlx::query("DELETE FROM agent_message_queue WHERE message_id LIKE 'test-%' OR from_run_id LIKE 'run-%'")
             .execute(pool)
-            .await;
+            .await
+            .expect("cleanup messaging DB transport fixture rows");
     }
 
     macro_rules! skip_without_db {

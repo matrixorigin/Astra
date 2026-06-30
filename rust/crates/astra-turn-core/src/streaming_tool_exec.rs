@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 
 use super::parallel_tool_exec::{ToolExecResult, ToolExecutorFn, is_read_only_tool_with_args};
 use super::permission::types::PermissionDecision;
+use crate::tool::args::shape::canonicalize_tool_call_name_in_place;
 
 /// Environment variable gating speculative streaming execution.
 /// Set to `1` to enable; default (unset) keeps pre-speculation behavior.
@@ -58,6 +59,9 @@ pub fn should_speculate(
     args: Option<&serde_json::Value>,
     perm_decision: Option<&PermissionDecision>,
 ) -> bool {
+    let Some(tool_name) = astra_core::canonical_names::normalize_name(tool_name) else {
+        return false;
+    };
     if !is_read_only_tool_with_args(tool_name, args) {
         return false;
     }
@@ -161,6 +165,16 @@ impl StreamingToolExecutor {
         tool_call: serde_json::Value,
         original_index: usize,
     ) -> bool {
+        let mut tool_call = tool_call;
+        let canonical_tool_name =
+            canonicalize_tool_call_name_in_place(&mut tool_call).or_else(|| {
+                astra_core::canonical_names::normalize_name(&tool_name)
+                    .map(std::string::ToString::to_string)
+            });
+        let Some(tool_name) = canonical_tool_name else {
+            return false;
+        };
+
         let args = super::parallel_tool_exec::parse_tool_args(&tool_call);
         if !is_read_only_tool_with_args(&tool_name, args.as_ref()) {
             return false;
@@ -439,6 +453,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn speculate_canonicalizes_tool_call_before_executor() {
+        let exec = StreamingToolExecutor::new(make_fast_executor());
+
+        let started = exec
+            .on_tool_block(
+                "c1".into(),
+                " read_file ".into(),
+                tool_block(" read_file ", "c1"),
+                0,
+            )
+            .await;
+        assert!(started);
+
+        let results = exec.wait_all().await;
+        assert_eq!(results["c1"].tool_name, "read_file");
+        assert_eq!(results["c1"].content, "result:read_file");
+    }
+
+    #[tokio::test]
     async fn skip_mutating() {
         let exec = StreamingToolExecutor::new(make_fast_executor());
 
@@ -574,6 +607,15 @@ mod tests {
             Some(&args_safe),
             Some(&PermissionDecision::deny("policy"))
         ));
+    }
+
+    #[test]
+    fn should_speculate_canonicalizes_tool_name() {
+        assert!(should_speculate(" read_file ", None, None));
+        assert!(!should_speculate("  ", None, None));
+
+        let args = json!({"command": "git status"});
+        assert!(should_speculate(" bash ", Some(&args), None));
     }
 
     #[tokio::test]

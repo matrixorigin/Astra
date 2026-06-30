@@ -133,6 +133,8 @@ pub struct ModelAddArgs {
     #[arg(long)]
     pub api_key: String,
     #[arg(long)]
+    pub context_window: i32,
+    #[arg(long)]
     pub base_url: Option<String>,
 }
 

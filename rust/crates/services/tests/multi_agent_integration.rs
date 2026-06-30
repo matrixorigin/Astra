@@ -29,12 +29,14 @@ async fn setup_pool() -> SharedPool {
     common::setup_pool().await
 }
 
-async fn cleanup_task(pool: &sqlx::Pool<sqlx::MySql>, task_id: &str) {
-    let _ = sqlx::query("DELETE FROM task_leases WHERE task_id = ?")
+async fn cleanup_task(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, task_id: &str) {
+    let _ = sqlx::query("DELETE FROM task_leases WHERE user_id = ? AND task_id = ?")
+        .bind(user_id)
         .bind(task_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query("DELETE FROM agent_tasks WHERE task_id = ?")
+    let _ = sqlx::query("DELETE FROM agent_tasks WHERE user_id = ? AND task_id = ?")
+        .bind(user_id)
         .bind(task_id)
         .execute(pool)
         .await;
@@ -55,7 +57,7 @@ async fn agent_task_unknown_status_fails_closed_across_service_and_worker_views(
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'unknown_status')",
@@ -69,7 +71,7 @@ async fn agent_task_unknown_status_fails_closed_across_service_and_worker_views(
 
     let svc = MatrixOneTaskService::new(pool.clone());
     let get_err = svc
-        .get_task(&task_id)
+        .get_task(&user, &task_id)
         .await
         .expect_err("get_task must reject unknown persisted status");
     assert!(
@@ -96,7 +98,7 @@ async fn agent_task_unknown_status_fails_closed_across_service_and_worker_views(
     );
 
     let update_err = svc
-        .update_status(&task_id, TaskStatus::Pending)
+        .update_status(&user, &task_id, TaskStatus::Pending)
         .await
         .expect_err("update_status must not coerce unknown status rows back to pending");
     assert!(
@@ -139,7 +141,7 @@ async fn agent_task_unknown_status_fails_closed_across_service_and_worker_views(
         .expect("claim-next should not treat unknown statuses as unfinished claimable work");
     assert_eq!(next, NextClaimableLeaseClaimResult::NoClaimableTasks);
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 #[tokio::test]
@@ -195,7 +197,7 @@ async fn task_lease_second_holder_gets_contested() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -226,7 +228,7 @@ async fn task_lease_second_holder_gets_contested() {
         other => panic!("expected Contested, got {other:?}"),
     }
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 #[tokio::test]
@@ -236,7 +238,7 @@ async fn task_lease_parallel_claims_single_winner() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -274,7 +276,7 @@ async fn task_lease_parallel_claims_single_winner() {
     }
     assert_eq!(granted, 1, "exactly one parallel claim should win");
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 fn sample_task_record(task_id: &str, user_id: &str) -> TaskRecord {
@@ -313,7 +315,7 @@ async fn push_tasks_pack_held_accepts_holder_rejects_other() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -348,7 +350,8 @@ async fn push_tasks_pack_held_accepts_holder_rejects_other() {
     assert_eq!(bad.applied, 0);
     assert_eq!(bad.rejected, 1);
 
-    let row = sqlx::query("SELECT progress_pct FROM agent_tasks WHERE task_id = ?")
+    let row = sqlx::query("SELECT progress_pct FROM agent_tasks WHERE user_id = ? AND task_id = ?")
+        .bind(&user)
         .bind(&task_id)
         .fetch_one(&pool)
         .await
@@ -356,7 +359,7 @@ async fn push_tasks_pack_held_accepts_holder_rejects_other() {
     let pct: i32 = row.try_get("progress_pct").expect("progress_pct");
     assert_eq!(pct, 77);
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 #[tokio::test]
@@ -366,7 +369,7 @@ async fn push_tasks_pack_held_rejects_stale_holder_after_lease_transfer() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -385,8 +388,9 @@ async fn push_tasks_pack_held_rejects_stale_holder_after_lease_transfer() {
         .await
         .expect("claim old lease");
 
-    sqlx::query("UPDATE task_leases SET expires_at = ? WHERE task_id = ?")
+    sqlx::query("UPDATE task_leases SET expires_at = ? WHERE user_id = ? AND task_id = ?")
         .bind(EXPIRED_TASK_LEASE_AT)
+        .bind(&user)
         .bind(&task_id)
         .execute(&pool)
         .await
@@ -408,17 +412,20 @@ async fn push_tasks_pack_held_rejects_stale_holder_after_lease_transfer() {
     assert_eq!(rejected.applied, 0);
     assert_eq!(rejected.rejected, 1);
 
-    let row = sqlx::query("SELECT progress_pct, agent_id FROM agent_tasks WHERE task_id = ?")
-        .bind(&task_id)
-        .fetch_one(&pool)
-        .await
-        .expect("select after stale push");
+    let row = sqlx::query(
+        "SELECT progress_pct, agent_id FROM agent_tasks WHERE user_id = ? AND task_id = ?",
+    )
+    .bind(&user)
+    .bind(&task_id)
+    .fetch_one(&pool)
+    .await
+    .expect("select after stale push");
     let pct: i32 = row.try_get("progress_pct").expect("progress_pct");
     let agent_id: Option<String> = row.try_get("agent_id").expect("agent_id");
     assert_ne!(pct, 91, "stale holder must not overwrite task progress");
     assert_eq!(agent_id.as_deref(), Some("agent-new"));
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 #[tokio::test]
@@ -428,7 +435,7 @@ async fn task_lease_renew_extends_expiry_and_version() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -474,7 +481,7 @@ async fn task_lease_renew_extends_expiry_and_version() {
     );
     assert_eq!(renewed.holder_agent_id, "agent-renew");
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 #[tokio::test]
@@ -484,7 +491,7 @@ async fn task_lease_expired_cannot_be_renewed() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -506,8 +513,9 @@ async fn task_lease_expired_cannot_be_renewed() {
         .expect("claim");
 
     // Manually expire the lease in DB for test speed
-    sqlx::query("UPDATE task_leases SET expires_at = ? WHERE task_id = ?")
+    sqlx::query("UPDATE task_leases SET expires_at = ? WHERE user_id = ? AND task_id = ?")
         .bind(EXPIRED_TASK_LEASE_AT)
+        .bind(&user)
         .bind(&task_id)
         .execute(&pool)
         .await
@@ -520,7 +528,7 @@ async fn task_lease_expired_cannot_be_renewed() {
 
     assert!(result.is_none(), "expired lease should not renew");
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 #[tokio::test]
@@ -530,7 +538,7 @@ async fn task_lease_release_clears_hold_cache() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -570,7 +578,7 @@ async fn task_lease_release_clears_hold_cache() {
         "hold cache should clear on release"
     );
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 #[tokio::test]
@@ -580,7 +588,7 @@ async fn task_lease_wrong_agent_cannot_release() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -614,7 +622,7 @@ async fn task_lease_wrong_agent_cannot_release() {
         .expect("lease exists");
     assert_eq!(view.holder_agent_id, "agent-owner");
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 /// Release then claim: after one agent releases, another agent can claim
@@ -628,7 +636,7 @@ async fn task_lease_concurrent_release_and_claim() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -676,7 +684,7 @@ async fn task_lease_concurrent_release_and_claim() {
         .expect("lease exists");
     assert_eq!(view.holder_agent_id, "agent-b", "agent-b should be holder");
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 /// Concurrent release from same agent: only one should return true.
@@ -687,7 +695,7 @@ async fn task_lease_concurrent_double_release_only_one_succeeds() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -749,7 +757,7 @@ async fn task_lease_concurrent_double_release_only_one_succeeds() {
         "lease should be fully released after concurrent deletes"
     );
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 /// Claim → Release → Claim: after release, another agent can claim.
@@ -761,7 +769,7 @@ async fn task_lease_release_then_new_claim_succeeds() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -807,7 +815,7 @@ async fn task_lease_release_then_new_claim_succeeds() {
         .expect("lease exists");
     assert_eq!(view.holder_agent_id, "agent-b");
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }
 
 #[tokio::test]
@@ -818,8 +826,8 @@ async fn task_lease_claim_next_skips_same_agent_active_lease_and_claims_next_tas
     let user = format!("it-u-{}", Uuid::new_v4());
     let first_task = Uuid::new_v4().to_string();
     let second_task = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &first_task).await;
-    cleanup_task(&pool, &second_task).await;
+    cleanup_task(&pool, &user, &first_task).await;
+    cleanup_task(&pool, &user, &second_task).await;
 
     for (task_id, title) in [(&first_task, "first"), (&second_task, "second")] {
         sqlx::query(
@@ -833,14 +841,16 @@ async fn task_lease_claim_next_skips_same_agent_active_lease_and_claims_next_tas
         .expect("insert task");
     }
 
-    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE task_id = ?")
+    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE user_id = ? AND task_id = ?")
         .bind("2025-01-01 00:00:00.000000")
+        .bind(&user)
         .bind(&first_task)
         .execute(&pool)
         .await
         .expect("order first task");
-    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE task_id = ?")
+    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE user_id = ? AND task_id = ?")
         .bind("2025-01-02 00:00:00.000000")
+        .bind(&user)
         .bind(&second_task)
         .execute(&pool)
         .await
@@ -879,8 +889,8 @@ async fn task_lease_claim_next_skips_same_agent_active_lease_and_claims_next_tas
         .expect("first lease exists");
     assert_eq!(first_view.holder_agent_id, "agent-same");
 
-    cleanup_task(&pool, &first_task).await;
-    cleanup_task(&pool, &second_task).await;
+    cleanup_task(&pool, &user, &first_task).await;
+    cleanup_task(&pool, &user, &second_task).await;
 }
 
 #[tokio::test]
@@ -892,9 +902,9 @@ async fn task_lease_claim_next_reclaims_orphaned_in_progress_after_expiry() {
     let leased_pending = Uuid::new_v4().to_string();
     let orphaned_in_progress = Uuid::new_v4().to_string();
     let fresh_pending = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &leased_pending).await;
-    cleanup_task(&pool, &orphaned_in_progress).await;
-    cleanup_task(&pool, &fresh_pending).await;
+    cleanup_task(&pool, &user, &leased_pending).await;
+    cleanup_task(&pool, &user, &orphaned_in_progress).await;
+    cleanup_task(&pool, &user, &fresh_pending).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -924,20 +934,23 @@ async fn task_lease_claim_next_reclaims_orphaned_in_progress_after_expiry() {
     .await
     .expect("insert fresh pending");
 
-    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE task_id = ?")
+    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE user_id = ? AND task_id = ?")
         .bind("2025-01-01 00:00:00.000000")
+        .bind(&user)
         .bind(&leased_pending)
         .execute(&pool)
         .await
         .expect("order leased pending");
-    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE task_id = ?")
+    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE user_id = ? AND task_id = ?")
         .bind("2025-01-02 00:00:00.000000")
+        .bind(&user)
         .bind(&orphaned_in_progress)
         .execute(&pool)
         .await
         .expect("order orphaned");
-    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE task_id = ?")
+    sqlx::query("UPDATE agent_tasks SET created_at = ? WHERE user_id = ? AND task_id = ?")
         .bind("2025-01-03 00:00:00.000000")
+        .bind(&user)
         .bind(&fresh_pending)
         .execute(&pool)
         .await
@@ -954,8 +967,9 @@ async fn task_lease_claim_next_reclaims_orphaned_in_progress_after_expiry() {
         .await
         .expect("claim orphaned");
 
-    sqlx::query("UPDATE task_leases SET expires_at = ? WHERE task_id = ?")
+    sqlx::query("UPDATE task_leases SET expires_at = ? WHERE user_id = ? AND task_id = ?")
         .bind(EXPIRED_TASK_LEASE_AT)
+        .bind(&user)
         .bind(&orphaned_in_progress)
         .execute(&pool)
         .await
@@ -980,9 +994,9 @@ async fn task_lease_claim_next_reclaims_orphaned_in_progress_after_expiry() {
         .expect("orphaned lease exists");
     assert_eq!(orphaned_view.holder_agent_id, "agent-c");
 
-    cleanup_task(&pool, &leased_pending).await;
-    cleanup_task(&pool, &orphaned_in_progress).await;
-    cleanup_task(&pool, &fresh_pending).await;
+    cleanup_task(&pool, &user, &leased_pending).await;
+    cleanup_task(&pool, &user, &orphaned_in_progress).await;
+    cleanup_task(&pool, &user, &fresh_pending).await;
 }
 
 /// Verify agent_id is cleared BEFORE lease row is deleted during release.
@@ -995,7 +1009,7 @@ async fn task_lease_release_clears_agent_id_before_deleting_lease() {
     let pool = shared.get().clone();
     let user = format!("it-u-{}", Uuid::new_v4());
     let task_id = Uuid::new_v4().to_string();
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 
     sqlx::query(
         "INSERT INTO agent_tasks (task_id, user_id, title, status) VALUES (?, ?, ?, 'pending')",
@@ -1017,11 +1031,13 @@ async fn task_lease_release_clears_agent_id_before_deleting_lease() {
         .expect("claim");
 
     // Verify agent_id is set
-    let ag: String = sqlx::query_scalar("SELECT agent_id FROM agent_tasks WHERE task_id = ?")
-        .bind(&task_id)
-        .fetch_one(&pool)
-        .await
-        .expect("select agent_id");
+    let ag: String =
+        sqlx::query_scalar("SELECT agent_id FROM agent_tasks WHERE user_id = ? AND task_id = ?")
+            .bind(&user)
+            .bind(&task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("select agent_id");
     assert_eq!(ag, "agent-clr");
 
     // Release
@@ -1033,7 +1049,8 @@ async fn task_lease_release_clears_agent_id_before_deleting_lease() {
 
     // After release: agent_id should be NULL
     let ag_after: Option<String> =
-        sqlx::query_scalar("SELECT agent_id FROM agent_tasks WHERE task_id = ?")
+        sqlx::query_scalar("SELECT agent_id FROM agent_tasks WHERE user_id = ? AND task_id = ?")
+            .bind(&user)
             .bind(&task_id)
             .fetch_one(&pool)
             .await
@@ -1041,16 +1058,18 @@ async fn task_lease_release_clears_agent_id_before_deleting_lease() {
     assert!(ag_after.is_none(), "agent_id MUST be NULL after release");
 
     // Lease row should be gone
-    let lease_exists: Option<String> =
-        sqlx::query_scalar("SELECT holder_agent_id FROM task_leases WHERE task_id = ?")
-            .bind(&task_id)
-            .fetch_optional(&pool)
-            .await
-            .expect("select lease");
+    let lease_exists: Option<String> = sqlx::query_scalar(
+        "SELECT holder_agent_id FROM task_leases WHERE user_id = ? AND task_id = ?",
+    )
+    .bind(&user)
+    .bind(&task_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("select lease");
     assert!(
         lease_exists.is_none(),
         "lease row must be deleted after release"
     );
 
-    cleanup_task(&pool, &task_id).await;
+    cleanup_task(&pool, &user, &task_id).await;
 }

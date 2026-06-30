@@ -179,9 +179,13 @@ pub(crate) async fn stream_chat_sse(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     p.model = normalize_turn_model(p.model);
+    let mut model_context_window = None;
     let default_model = if p.model.is_none() {
         match session_runtime::resolve_server_default_model(p.api, p.token).await {
-            ServerDefaultModel::Selected(model) => Some(model),
+            ServerDefaultModel::Selected(selection) => {
+                model_context_window = selection.context_window;
+                Some(selection.name)
+            }
             ServerDefaultModel::NoModels | ServerDefaultModel::Unavailable => None,
         }
     } else {
@@ -206,6 +210,49 @@ pub(crate) async fn stream_chat_sse(
         return Err(missing_model_selection_turn_failure(p.session_id));
     };
     p.model = Some(selected_model);
+    if model_context_window.is_none() {
+        match session_runtime::resolve_server_model_context_window(p.api, p.token, selected_model)
+            .await
+        {
+            Ok(context_window) => {
+                model_context_window = Some(context_window);
+            }
+            Err(error) => {
+                tracing::error!(
+                    target: "astra_cli::model_selection",
+                    model = selected_model,
+                    error = %error,
+                    "turn failed before SSE stream because model context_window metadata was unavailable"
+                );
+                return Err(crate::TurnFailure {
+                    error,
+                    partial: crate::PartialTurnData {
+                        session_id: p.session_id.map(str::to_string),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+    }
+    let Some(context_window_tokens) = model_context_window else {
+        let error = format!(
+            "model '{selected_model}' is missing positive context_window metadata in the server registry"
+        );
+        tracing::error!(
+            target: "astra_cli::model_selection",
+            model = selected_model,
+            "turn failed before SSE stream because selected model did not include context_window"
+        );
+        return Err(crate::TurnFailure {
+            error,
+            partial: crate::PartialTurnData {
+                session_id: p.session_id.map(str::to_string),
+                ..Default::default()
+            },
+        });
+    };
+    let effective_max_turn_input_tokens = RuntimeLimits::global()
+        .effective_max_turn_input_tokens_with_context_window(p.model, model_context_window);
     let root_agent_id = p.root_agent_id.unwrap_or("main");
     p.perm_manager.clear_turn_overrides();
 
@@ -358,6 +405,8 @@ pub(crate) async fn stream_chat_sse(
         }
     };
     executor.set_current_model(selected_model.to_string());
+    executor.set_current_context_window_tokens(u64::from(context_window_tokens));
+    executor.set_current_effective_input_budget_tokens(effective_max_turn_input_tokens);
     // Wire observability session for context_analysis tool
     if let Some(ref obs) = p.observability_session {
         executor.observability_session = Some(obs.clone());
@@ -593,6 +642,7 @@ pub(crate) async fn stream_chat_sse(
         auth_profile: p.auth_profile,
         model: p.model,
         model_id: p.model_id.clone(),
+        context_window_tokens,
         explain: p.explain,
         render_md: p.render_md,
         term_width,
@@ -880,7 +930,7 @@ pub(crate) async fn stream_chat_sse(
         compaction_effectiveness: restored_compaction_effectiveness(p.compaction_state.as_ref()),
         pinned_tool_schema_tokens: always_load_schema_tokens,
         sticky_tool_schemas: Vec::new(),
-        max_turn_input_tokens: RuntimeLimits::global().effective_max_turn_input_tokens(p.model),
+        max_turn_input_tokens: effective_max_turn_input_tokens,
         budget_wrapup_injected: false,
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,

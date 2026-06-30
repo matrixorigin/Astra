@@ -31,6 +31,22 @@ const STEP_COMPOSITE_INDEX_ARTIFACT_KIND: &str = "step_composite_snapshot_index"
 /// Maximum number of light checkpoints to retain (older ones pruned).
 const MAX_LIGHT_CHECKPOINTS: usize = 50;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteDurability {
+    /// Write and close the file immediately, but let the OS flush dirty pages.
+    ///
+    /// Used for per-event and per-tool light artifacts on the agent hot path.
+    /// Readers can replay the data after this process exits or crashes, but
+    /// this deliberately does not pay the multi-second `fsync` cost that some
+    /// filesystems impose under load.
+    Buffered,
+    /// Force file contents and directory metadata to stable storage before returning.
+    ///
+    /// Reserved for low-frequency recovery anchors such as heavy checkpoints
+    /// and indexes where extra latency is acceptable.
+    Durable,
+}
+
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -38,7 +54,11 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(parent)?.sync_all()
 }
 
-fn write_atomic_text(path: &Path, content: &str) -> std::io::Result<()> {
+fn write_atomic_text(
+    path: &Path,
+    content: &str,
+    durability: WriteDurability,
+) -> std::io::Result<()> {
     let Some(dir) = path.parent() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -70,13 +90,22 @@ fn write_atomic_text(path: &Path, content: &str) -> std::io::Result<()> {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        file.sync_all()?;
+        if matches!(durability, WriteDurability::Durable) {
+            file.sync_all()?;
+        }
     }
     std::fs::rename(&tmp_path, path)?;
-    sync_parent_dir(path)
+    if matches!(durability, WriteDurability::Durable) {
+        sync_parent_dir(path)?;
+    }
+    Ok(())
 }
 
-fn append_jsonl_line(path: &Path, content: &str) -> std::io::Result<()> {
+fn append_jsonl_line(
+    path: &Path,
+    content: &str,
+    durability: WriteDurability,
+) -> std::io::Result<()> {
     let Some(dir) = path.parent() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -102,7 +131,9 @@ fn append_jsonl_line(path: &Path, content: &str) -> std::io::Result<()> {
             file.write_all(b"\n")?;
         }
         writeln!(file, "{content}")?;
-        file.sync_data()?;
+        if matches!(durability, WriteDurability::Durable) {
+            file.sync_data()?;
+        }
         drop(file);
     }
     #[cfg(not(unix))]
@@ -115,7 +146,9 @@ fn append_jsonl_line(path: &Path, content: &str) -> std::io::Result<()> {
             file.write_all(b"\n")?;
         }
         writeln!(file, "{content}")?;
-        file.sync_data()?;
+        if matches!(durability, WriteDurability::Durable) {
+            file.sync_data()?;
+        }
         drop(file);
     }
     // Heal permissions unconditionally: if a prior crash left a 0o644 file, fix it.
@@ -124,7 +157,7 @@ fn append_jsonl_line(path: &Path, content: &str) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
-    if !existed {
+    if !existed && matches!(durability, WriteDurability::Durable) {
         sync_parent_dir(path)?;
     }
     Ok(())
@@ -330,7 +363,7 @@ pub fn write_step_checkpoint(
         checkpoint,
     )?;
 
-    write_atomic_text(&path, &json)?;
+    write_atomic_text(&path, &json, checkpoint_write_durability(checkpoint))?;
 
     // Prune old light checkpoints if too many
     if tier == "light" {
@@ -338,6 +371,20 @@ pub fn write_step_checkpoint(
     }
 
     Ok(path)
+}
+
+fn checkpoint_write_durability(checkpoint: &StepCheckpoint) -> WriteDurability {
+    // Light checkpoints are written after each tool completion (~1KB, up to 500+
+    // per session). They are immediately readable after a process crash, but do
+    // not provide OS-crash durability; heavy checkpoints remain the durable
+    // recovery anchor. Use Buffered to avoid per-tool fsync overhead (5-50ms
+    // each on ext4).
+    // Heavy checkpoints are written at major phase boundaries and must survive
+    // OS crash — keep Durable.
+    match checkpoint {
+        StepCheckpoint::Light(_) => WriteDurability::Buffered,
+        StepCheckpoint::Heavy(_) => WriteDurability::Durable,
+    }
 }
 
 /// Delete a step checkpoint by number and tier.
@@ -555,7 +602,7 @@ pub fn write_composite_snapshot_index(
         session_id,
         index,
     )?;
-    write_atomic_text(&path, &json)
+    write_atomic_text(&path, &json, WriteDurability::Durable)
 }
 
 /// Read the composite snapshot index from disk.
@@ -593,7 +640,11 @@ pub(crate) fn session_dir_for(user_id: &str, session_id: &str) -> std::io::Resul
 }
 
 /// File-backed event store: in-memory DAG + append-only JSONL on disk.
-/// Writes are immediate (no buffering) for crash safety.
+///
+/// Appends are written and closed immediately, but they are not fsynced on the
+/// hot path. Heavy checkpoints remain the durable recovery anchors; per-event
+/// JSONL gives process-crash replay without adding multi-second filesystem
+/// stalls to every tool completion.
 pub struct FileBackedEventStore {
     user_id: String,
     session_id: String,
@@ -769,7 +820,7 @@ impl FileBackedEventStore {
             &self.session_id,
             event,
         )?;
-        append_jsonl_line(&path, &json)
+        append_jsonl_line(&path, &json, WriteDurability::Buffered)
     }
 
     /// Get all events (for audit/replay).
@@ -904,6 +955,50 @@ mod tests {
             .unwrap()
             .as_nanos();
         format!("{prefix}-{}-{nanos}", std::process::id())
+    }
+
+    #[test]
+    fn light_checkpoints_are_buffered_and_heavy_checkpoints_are_durable() {
+        let light = StepCheckpoint::Light(make_light("light-fast-path", 0.25));
+        let heavy = StepCheckpoint::Heavy(Box::new(make_heavy(
+            "heavy-anchor",
+            vec![json!({"role": "assistant", "content": "done"})],
+        )));
+
+        assert_eq!(
+            checkpoint_write_durability(&light),
+            WriteDurability::Buffered,
+            "light checkpoints stay on the hot path and rely on heavy checkpoints for OS-crash anchors"
+        );
+        assert_eq!(
+            checkpoint_write_durability(&heavy),
+            WriteDurability::Durable,
+            "heavy checkpoints are the low-frequency durable recovery anchor"
+        );
+    }
+
+    #[test]
+    fn buffered_event_append_is_immediately_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = unique_session_id("buffered-event");
+        let mut store = FileBackedEventStore::empty(TEST_USER_ID, &session_id);
+        let event = StepEvent {
+            event_id: "evt-buffered".to_string(),
+            canonical_event_id: None,
+            step_id: "step-buffered".to_string(),
+            event_type: crate::step_protocol::StepEventType::ToolCallCompleted,
+            agent_id: None,
+            caused_by: Vec::new(),
+            payload: Some(json!({"tool_name": "bash"})),
+            created_at: 123,
+        };
+
+        store.append(event).expect("append buffered event");
+        let replayed = FileBackedEventStore::new(TEST_USER_ID, &session_id);
+
+        assert_eq!(replayed.event_count(), 1);
+        assert_eq!(replayed.all_events()[0].event_id, "evt-buffered");
     }
 
     #[test]
@@ -1286,7 +1381,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         std::fs::create_dir_all(session_dir_for(TEST_USER_ID, &session_id).unwrap())
             .expect("session dir");
-        append_jsonl_line(&path, r#"{"not":"a step event"}"#).expect("append corrupt event");
+        append_jsonl_line(
+            &path,
+            r#"{"not":"a step event"}"#,
+            WriteDurability::Buffered,
+        )
+        .expect("append corrupt event");
 
         let error =
             FileBackedEventStore::load_events_created_at_or_after(TEST_USER_ID, &session_id, 0)

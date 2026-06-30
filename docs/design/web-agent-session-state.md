@@ -1894,7 +1894,7 @@ CREATE TABLE IF NOT EXISTS session_tool_outputs (
   request_id       VARCHAR(128) NULL,
   trace_id         VARCHAR(128) NULL,
   created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX idx_tool_outputs_session_created (session_id, created_at, output_id),
+  INDEX idx_tool_outputs_user_session_created (user_id, session_id, created_at, output_id),
   INDEX idx_tool_outputs_tool_created (tool_name, created_at),
   INDEX idx_tool_outputs_session_tool_score (session_id, tool_name, relevance_score, created_at),
   INDEX idx_tool_outputs_status_created (session_id, status, created_at),
@@ -2184,9 +2184,10 @@ ALTER TABLE session_artifacts ADD COLUMN derived_from_artifact_id VARCHAR(128) N
 ALTER TABLE session_artifacts ADD COLUMN referenced_by_manifest_count INT NOT NULL DEFAULT 0;
 ALTER TABLE session_artifacts ADD COLUMN referenced_by_state_items_count INT NOT NULL DEFAULT 0;
 ALTER TABLE session_artifacts ADD COLUMN referenced_by_citation_count INT NOT NULL DEFAULT 0;
-ALTER TABLE session_artifacts ADD INDEX idx_artifacts_retention (status, retention_until, retention_policy);
-ALTER TABLE session_artifacts ADD INDEX idx_artifacts_project (project_id, status, retention_until);
-ALTER TABLE session_artifacts ADD INDEX idx_artifacts_derived (derived_from_artifact_id);
+ALTER TABLE session_artifacts ADD PRIMARY KEY (user_id, session_id, artifact_id);
+ALTER TABLE session_artifacts ADD INDEX idx_artifacts_retention (retention_until, retention_policy, user_id, session_id, artifact_id, status);
+ALTER TABLE session_artifacts ADD INDEX idx_artifacts_project (user_id, project_id, status, retention_until, artifact_id);
+ALTER TABLE session_artifacts ADD INDEX idx_artifacts_derived (user_id, session_id, derived_from_artifact_id);
 
 -- Additive extension to agent_sessions.
 ALTER TABLE agent_sessions ADD COLUMN project_id VARCHAR(128) NULL;
@@ -2233,8 +2234,8 @@ Additive schema:
 ALTER TABLE session_artifacts ADD COLUMN owner_run_id VARCHAR(128) NULL;
 ALTER TABLE session_artifacts ADD COLUMN owner_delegation_id VARCHAR(128) NULL;
 ALTER TABLE session_artifacts ADD COLUMN root_run_id VARCHAR(128) NULL;
-ALTER TABLE session_artifacts ADD INDEX idx_artifacts_root_scope (root_run_id, access_scope, status, updated_at);
-ALTER TABLE session_artifacts ADD INDEX idx_artifacts_owner_run (owner_run_id, status, updated_at);
+ALTER TABLE session_artifacts ADD INDEX idx_artifacts_root_scope (user_id, root_run_id, access_scope, status, updated_at, artifact_id);
+ALTER TABLE session_artifacts ADD INDEX idx_artifacts_owner_run (user_id, owner_run_id, status, updated_at, artifact_id);
 
 ALTER TABLE session_delegations ADD COLUMN sibling_exposed_artifacts_json LONGTEXT NULL;
 
@@ -2351,9 +2352,8 @@ CREATE TABLE IF NOT EXISTS session_transcript_items (
   is_deleted        BOOLEAN NOT NULL DEFAULT FALSE,
   request_id        VARCHAR(128) NULL,
   trace_id          VARCHAR(128) NULL,
-  PRIMARY KEY (session_id, item_seq),
+  PRIMARY KEY (user_id, session_id, item_seq),
   INDEX idx_transcript_user_created (user_id, created_at, session_id),
-  INDEX idx_transcript_session_created (session_id, created_at, item_seq),
   INDEX idx_transcript_message (message_id),
   INDEX idx_transcript_event (event_id)
 );

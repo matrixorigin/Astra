@@ -103,31 +103,23 @@ impl Drop for HomeGuard {
 
 // ── CredentialsGuard ───────────────────────────────────────────────────
 
+/// Test isolation for credentials without mutating process env vars.
+///
+/// The override is process-wide so credential reads on tokio worker threads,
+/// `spawn_blocking`, and ordinary spawned threads resolve to the same temp
+/// directory. The credentials crate serializes active overrides.
 pub(crate) struct CredentialsGuard {
-    prev: Option<OsString>,
     _dir: tempfile::TempDir,
-}
-
-impl Drop for CredentialsGuard {
-    fn drop(&mut self) {
-        // SAFETY: Tests using CredentialsGuard are #[serial_test::serial].
-        unsafe {
-            match &self.prev {
-                Some(v) => set_var_serial("ASTRA_CLI_CREDENTIALS_DIR", v),
-                None => remove_var_serial("ASTRA_CLI_CREDENTIALS_DIR"),
-            }
-        }
-    }
+    _guard: astra_credentials::CredentialsDirOverrideGuard,
 }
 
 pub(crate) fn isolate_credentials() -> CredentialsGuard {
     let dir = test_temp_dir();
-    let prev = std::env::var_os("ASTRA_CLI_CREDENTIALS_DIR");
-    // SAFETY: Tests using CredentialsGuard are #[serial_test::serial].
-    unsafe {
-        set_var_serial("ASTRA_CLI_CREDENTIALS_DIR", dir.path());
+    let guard = astra_credentials::set_test_credentials_dir(dir.path().to_path_buf());
+    CredentialsGuard {
+        _dir: dir,
+        _guard: guard,
     }
-    CredentialsGuard { prev, _dir: dir }
 }
 
 // ── Session Journal Isolation ──────────────────────────────────────────
@@ -429,26 +421,35 @@ mod tests {
     // ── CredentialsGuard ───────────────────────────────────────────
 
     #[test]
-    #[serial_test::serial]
-    fn credentials_guard_sets_env_var() {
-        let guard = isolate_credentials();
-        assert!(
-            std::env::var_os("ASTRA_CLI_CREDENTIALS_DIR").is_some(),
-            "ASTRA_CLI_CREDENTIALS_DIR must be set while guard is alive"
+    fn credentials_guard_is_visible_to_spawned_threads() {
+        let _guard = isolate_credentials();
+        let store = astra_credentials::CredentialStore::new();
+        let path = store.path().clone();
+
+        let spawned_path =
+            std::thread::spawn(|| astra_credentials::CredentialStore::new().path().clone())
+                .join()
+                .expect("spawned credential reader");
+
+        assert_eq!(
+            spawned_path, path,
+            "spawned threads must observe the active credentials override"
         );
-        drop(guard);
     }
 
     #[test]
-    #[serial_test::serial]
-    fn credentials_guard_drop_removes_env_var() {
-        {
+    fn credentials_guard_clears_on_drop() {
+        let path_during = {
             let _guard = isolate_credentials();
-            assert!(std::env::var_os("ASTRA_CLI_CREDENTIALS_DIR").is_some());
-        }
-        assert!(
-            std::env::var_os("ASTRA_CLI_CREDENTIALS_DIR").is_none(),
-            "ASTRA_CLI_CREDENTIALS_DIR must be removed after guard drop"
+            let store_during = astra_credentials::CredentialStore::new();
+            store_during.path().clone()
+        };
+
+        let store_after = astra_credentials::CredentialStore::new();
+        assert_ne!(
+            store_after.path(),
+            &path_during,
+            "guard drop must clear the credentials directory override"
         );
     }
 }

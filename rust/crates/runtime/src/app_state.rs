@@ -827,6 +827,19 @@ impl ReqwestMemoriaForwarder {
             client,
         }
     }
+
+    fn request_builder(
+        &self,
+        method: reqwest::Method,
+        endpoint: &str,
+        body: &serde_json::Value,
+    ) -> reqwest::RequestBuilder {
+        let url = format!("{}{}", self.base_url, endpoint);
+        self.client
+            .request(method, url)
+            .header("Authorization", format!("Bearer {}", self.master_key))
+            .json(body)
+    }
 }
 
 #[async_trait]
@@ -837,12 +850,8 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let url = format!("{}{}", self.base_url, endpoint);
         let resp = self
-            .client
-            .request(method, &url)
-            .header("Authorization", format!("Bearer {}", self.master_key))
-            .json(&body)
+            .request_builder(method, endpoint, &body)
             .send()
             .await
             .map_err(|e| format!("Memoria request failed: {e}"))?;
@@ -1004,30 +1013,35 @@ mod tests {
         );
     }
 
-    /// P1-B: ReqwestMemoriaForwarder must NOT create a per-request client.
-    /// The `forward` method must reuse `self.client`.
     #[test]
-    fn memoria_forwarder_reuses_client() {
-        let source = include_str!("app_state.rs");
-        let impl_start = source
-            .find("impl MemoriaForwarder for ReqwestMemoriaForwarder")
-            .expect("impl block must exist");
-        let impl_end = source[impl_start..]
-            .find("\n/// ")
-            .map(|p| impl_start + p)
-            .unwrap_or(source.len());
-        let impl_body = &source[impl_start..impl_end];
-        assert!(
-            !impl_body.contains("Client::builder"),
-            "forward() must not create a per-request client — use self.client"
+    fn memoria_forwarder_request_builder_preserves_method_url_and_auth() {
+        let forwarder = ReqwestMemoriaForwarder::new_with_timeouts(
+            "http://memoria.test".to_string(),
+            "test-key".to_string(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
         );
-        assert!(
-            impl_body.contains("self.client") || impl_body.contains("self\n            .client"),
-            "forward() must use the shared self.client"
+
+        let request = forwarder
+            .request_builder(
+                reqwest::Method::PUT,
+                "/v1/memories/test-id/correct",
+                &serde_json::json!({"new_content": "x", "reason": "y"}),
+            )
+            .build()
+            .expect("request builder");
+
+        assert_eq!(request.method(), reqwest::Method::PUT);
+        assert_eq!(
+            request.url().as_str(),
+            "http://memoria.test/v1/memories/test-id/correct"
         );
-        assert!(
-            impl_body.contains(".request(method, &url)"),
-            "forward() must honor the caller-provided HTTP method"
+        assert_eq!(
+            request
+                .headers()
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-key")
         );
     }
 

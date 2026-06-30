@@ -3,11 +3,9 @@
 //!
 //! Two things land on the server:
 //!
-//!   1. `config_versions` table — one row per unique `cfg_<hex>` blob.
-//!      Primary key is the version_id; body is the canonical TOML bytes
-//!      (small, KBs, fits in a TEXT column); user_id scopes rows so
-//!      multiple tenants don't collide on identical content-addressed
-//!      ids. created_at + first_seen_session are forensic metadata.
+//!   1. `config_versions` table — one row per unique `(user_id,
+//!      version_id)` pair. The body is canonical TOML bytes; created_at
+//!      + first_seen_session are forensic metadata.
 //!
 //!   2. `agent_sessions.config_version_id` — foreign pointer to the
 //!      version_id a session ran under.
@@ -17,114 +15,254 @@
 //!
 //! The live DB test is `#[ignore]` and runs under
 //! `ASTRA_TEST_DB_IT=1`, matching the existing services_db_integration.
-//! A pure builder test verifies the SQL shape without touching the DB.
-//!
-//! The live test uses a current-schema database and verifies the final
-//! column set directly.
+//! It verifies the current schema and query semantics against MatrixOne
+//! instead of matching SQL strings.
 
+use astra_config::config_versions::{ConfigVersionStore, LocalFileStore, VersionId};
 use astra_services::config_version_cloud::{
-    CONFIG_VERSIONS_CREATE_SQL, CONFIG_VERSIONS_LIST_SQL, CONFIG_VERSIONS_SELECT_TOML_SQL,
-    ConfigVersionRow, config_versions_insert_params, parse_config_version_row,
+    CONFIG_VERSIONS_INSERT_SQL, CONFIG_VERSIONS_LIST_SQL, CONFIG_VERSIONS_SELECT_TOML_SQL,
+    ConfigVersionPayload, pull_all_into_local_store,
 };
+use astra_services::storage::ensure_core_schema;
+use sqlx::Row;
+use std::collections::HashMap;
+use uuid::Uuid;
 
-#[test]
-fn select_toml_sql_scopes_to_user_and_version() {
-    // Pull path: exactly (user_id, version_id) positional binds.
-    // Order matters because sqlx bind positions are by index.
-    let sql = CONFIG_VERSIONS_SELECT_TOML_SQL;
-    assert!(sql.contains("FROM config_versions"), "sql: {sql}");
-    assert!(sql.contains("user_id = ?"), "sql: {sql}");
-    assert!(sql.contains("version_id = ?"), "sql: {sql}");
-    assert_eq!(
-        sql.matches('?').count(),
-        2,
-        "SELECT by id must bind exactly two positional params: {sql}"
-    );
+mod common;
+
+fn version_id_for_body(body: &str) -> String {
+    VersionId::from_toml_bytes(body.as_bytes()).to_string()
 }
 
-#[test]
-fn list_sql_scopes_to_user_and_paginates() {
-    let sql = CONFIG_VERSIONS_LIST_SQL;
-    assert!(sql.contains("WHERE user_id = ?"));
-    assert!(sql.contains("ORDER BY created_at DESC"));
-    assert!(sql.contains("LIMIT ?"));
-    assert_eq!(
-        sql.matches('?').count(),
-        2,
-        "list expects (user_id, limit) binds only: {sql}"
-    );
-}
-
-#[test]
-fn create_sql_names_expected_columns_and_types() {
-    // Pure shape check on the DDL string — no DB round-trip needed.
-    // If someone renames a column, this test makes them update the
-    // query builder + row parser in lock-step.
-    let ddl = CONFIG_VERSIONS_CREATE_SQL;
-    for needle in [
-        "CREATE TABLE IF NOT EXISTS config_versions",
-        "version_id",
-        "user_id",
-        "toml_body",
-        "created_at",
-        "first_seen_session",
-        "PRIMARY KEY",
-    ] {
-        assert!(
-            ddl.contains(needle),
-            "DDL missing required token `{needle}`; got:\n{ddl}"
-        );
+async fn delete_fixture_versions(pool: &sqlx::Pool<sqlx::MySql>, user_ids: &[&str]) {
+    for user_id in user_ids {
+        let _ = sqlx::query("DELETE FROM config_versions WHERE user_id = ?")
+            .bind(user_id)
+            .execute(pool)
+            .await;
     }
 }
 
-#[test]
-fn insert_params_roundtrip_preserves_every_field() {
-    // The insert-params builder is the bridge between a typed
-    // ConfigVersionRow in Rust and the bound sqlx query: exercising
-    // it here guards against a field being added to the struct but
-    // not plumbed through the bind list. We verify the output shape
-    // matches what the SQL VALUES clause expects.
-    let row = ConfigVersionRow {
-        version_id: "cfg_abcdef0123456789".to_string(),
-        user_id: "user_test".to_string(),
-        toml_body: "[token_budget]\nmax_turn_input_tokens = 500000\n".to_string(),
-        created_at_ms: 1_778_485_059_634,
-        first_seen_session: Some("sess_xyz".to_string()),
-    };
-    let bindings = config_versions_insert_params(&row);
-    // Four required bind positions + one optional; order corresponds
-    // to the column list in CONFIG_VERSIONS_INSERT_SQL.
-    assert_eq!(bindings.version_id, "cfg_abcdef0123456789");
-    assert_eq!(bindings.user_id, "user_test");
-    assert!(bindings.toml_body.contains("max_turn_input_tokens"));
-    assert_eq!(bindings.created_at_ms, 1_778_485_059_634);
-    assert_eq!(bindings.first_seen_session, Some("sess_xyz"));
+async fn insert_config_version(pool: &sqlx::Pool<sqlx::MySql>, row: &ConfigVersionPayload) {
+    sqlx::query(CONFIG_VERSIONS_INSERT_SQL)
+        .bind(&row.version_id)
+        .bind(&row.user_id)
+        .bind(&row.toml_body)
+        .bind(row.first_seen_session.as_deref())
+        .execute(pool)
+        .await
+        .expect("insert config version");
 }
 
-#[test]
-fn parse_row_accepts_optional_first_seen_session() {
-    // A version can be saved before it is associated with a concrete session.
-    // The parser must preserve that as an explicit None, not panic.
-    let row = ConfigVersionRow {
-        version_id: "cfg_no_session_row".to_string(),
-        user_id: "user_x".to_string(),
-        toml_body: "ok = true\n".to_string(),
-        created_at_ms: 0,
-        first_seen_session: None,
-    };
-    let out = parse_config_version_row(&row);
-    assert_eq!(out.version_id, "cfg_no_session_row");
-    assert!(out.first_seen_session.is_none());
+async fn set_config_version_created_at(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    row: &ConfigVersionPayload,
+    created_at: &str,
+) {
+    sqlx::query(
+        "UPDATE config_versions \
+         SET created_at = ? \
+         WHERE user_id = ? AND version_id = ?",
+    )
+    .bind(created_at)
+    .bind(&row.user_id)
+    .bind(&row.version_id)
+    .execute(pool)
+    .await
+    .expect("set config version created_at");
 }
 
-#[test]
-fn create_sql_is_idempotent_shape() {
-    // `IF NOT EXISTS` is non-negotiable — `ensure_core_schema`
-    // re-runs on every server boot. A fresh CREATE TABLE on an
-    // existing table would panic-on-rerun, which is exactly the
-    // regression this DDL token prevents.
-    assert!(
-        CONFIG_VERSIONS_CREATE_SQL.contains("IF NOT EXISTS"),
-        "create statement must be idempotent: {CONFIG_VERSIONS_CREATE_SQL}"
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn config_versions_schema_and_queries_hold_on_live_matrixone() {
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    ensure_core_schema(&settings, &catalog)
+        .await
+        .expect("config schema bootstrap must be idempotent");
+    let pool = shared.get().clone();
+
+    let owner = format!("user-{}", Uuid::new_v4());
+    let foreign_owner = format!("user-{}", Uuid::new_v4());
+    delete_fixture_versions(&pool, &[&owner, &foreign_owner]).await;
+
+    let older_body = format!("model = \"older\"\n# {}\n", "x".repeat(70_000));
+    let newer_body = "model = \"newer\"\n".to_string();
+    let older = ConfigVersionPayload {
+        version_id: version_id_for_body(&older_body),
+        user_id: owner.clone(),
+        toml_body: older_body,
+        first_seen_session: Some(format!("session-{}", Uuid::new_v4())),
+    };
+    let newer = ConfigVersionPayload {
+        version_id: version_id_for_body(&newer_body),
+        user_id: owner.clone(),
+        toml_body: newer_body,
+        first_seen_session: Some(format!("session-{}", Uuid::new_v4())),
+    };
+    let foreign_same_version = ConfigVersionPayload {
+        version_id: older.version_id.clone(),
+        user_id: foreign_owner.clone(),
+        toml_body: "model = \"foreign\"\n".to_string(),
+        first_seen_session: Some(format!("session-{}", Uuid::new_v4())),
+    };
+
+    insert_config_version(&pool, &older).await;
+    set_config_version_created_at(&pool, &older, "2026-05-01 10:00:00.000000").await;
+    let mut duplicate = older.clone();
+    duplicate.toml_body = "model = \"must-not-overwrite\"\n".to_string();
+    insert_config_version(&pool, &duplicate).await;
+    insert_config_version(&pool, &newer).await;
+    set_config_version_created_at(&pool, &newer, "2026-05-01 10:01:00.000000").await;
+    insert_config_version(&pool, &foreign_same_version).await;
+    set_config_version_created_at(&pool, &foreign_same_version, "2026-05-01 10:02:00.000000").await;
+
+    let owner_toml: String = sqlx::query_scalar(CONFIG_VERSIONS_SELECT_TOML_SQL)
+        .bind(&owner)
+        .bind(&older.version_id)
+        .fetch_one(&pool)
+        .await
+        .expect("select owner config version");
+    assert_eq!(
+        owner_toml, older.toml_body,
+        "INSERT IGNORE must keep the original owner/version body"
     );
+    let foreign_toml: String = sqlx::query_scalar(CONFIG_VERSIONS_SELECT_TOML_SQL)
+        .bind(&foreign_owner)
+        .bind(&older.version_id)
+        .fetch_one(&pool)
+        .await
+        .expect("select foreign config version with same version id");
+    assert_eq!(
+        foreign_toml, foreign_same_version.toml_body,
+        "config version identity must be owner scoped"
+    );
+
+    let rows = sqlx::query(CONFIG_VERSIONS_LIST_SQL)
+        .bind(&owner)
+        .bind(10_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("list owner config versions");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].try_get::<String, _>("version_id").unwrap(),
+        newer.version_id
+    );
+    assert_eq!(
+        rows[1].try_get::<String, _>("version_id").unwrap(),
+        older.version_id
+    );
+    assert_eq!(
+        rows[0]
+            .try_get::<Option<String>, _>("first_seen_session")
+            .unwrap(),
+        newer.first_seen_session
+    );
+
+    let local_dir = tempfile::tempdir().expect("local config version dir");
+    let local = LocalFileStore::new(local_dir.path().to_path_buf());
+    let pull = pull_all_into_local_store(&pool, &owner, &local, 10)
+        .await
+        .expect("pull owner config versions into local store");
+    assert_eq!(pull.fetched, 2);
+    assert_eq!(pull.written, 2);
+    assert_eq!(pull.skipped_hash_mismatch, 0);
+    let older_id = VersionId::from_wire_string(older.version_id.clone());
+    let newer_id = VersionId::from_wire_string(newer.version_id.clone());
+    assert_eq!(
+        local
+            .get_toml(&older_id)
+            .expect("load older local TOML")
+            .as_deref(),
+        Some(older.toml_body.as_str())
+    );
+    assert_eq!(
+        local
+            .get_toml(&newer_id)
+            .expect("load newer local TOML")
+            .as_deref(),
+        Some(newer.toml_body.as_str())
+    );
+
+    let column_rows = sqlx::query(
+        "SELECT COLUMN_NAME, LOWER(DATA_TYPE) AS data_type, CHARACTER_MAXIMUM_LENGTH AS char_len, IS_NULLABLE \
+         FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'config_versions'",
+    )
+    .bind(&settings.database)
+    .fetch_all(&pool)
+    .await
+    .expect("load config_versions columns");
+    let columns = column_rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String, _>("COLUMN_NAME").unwrap(),
+                (
+                    row.try_get::<String, _>("data_type").unwrap(),
+                    row.try_get::<Option<i64>, _>("char_len").unwrap(),
+                    row.try_get::<String, _>("IS_NULLABLE").unwrap(),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        columns.get("version_id"),
+        Some(&("varchar".to_string(), Some(24), "NO".to_string()))
+    );
+    assert_eq!(
+        columns.get("user_id"),
+        Some(&("varchar".to_string(), Some(64), "NO".to_string()))
+    );
+    let toml_body = columns
+        .get("toml_body")
+        .expect("config_versions.toml_body column must exist");
+    assert!(
+        matches!(toml_body.0.as_str(), "text" | "mediumtext" | "longtext"),
+        "toml_body must be text-like on MatrixOne, got {:?}",
+        toml_body
+    );
+    assert_eq!(toml_body.2, "NO");
+    assert_eq!(
+        columns
+            .get("created_at")
+            .map(|(data_type, _, nullable)| (data_type.as_str(), nullable.as_str())),
+        Some(("datetime", "NO"))
+    );
+    assert_eq!(
+        columns.get("first_seen_session"),
+        Some(&("varchar".to_string(), Some(64), "YES".to_string()))
+    );
+
+    let primary_key_columns = sqlx::query(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'config_versions' AND INDEX_NAME = 'PRIMARY' \
+         ORDER BY SEQ_IN_INDEX",
+    )
+    .bind(&settings.database)
+    .fetch_all(&pool)
+    .await
+    .expect("load config_versions primary key")
+    .into_iter()
+    .map(|row| row.try_get::<String, _>("COLUMN_NAME").unwrap())
+    .collect::<Vec<_>>();
+    assert_eq!(primary_key_columns, ["user_id", "version_id"]);
+
+    let list_index_columns = sqlx::query(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'config_versions' AND INDEX_NAME = 'idx_cv_user_created' \
+         ORDER BY SEQ_IN_INDEX",
+    )
+    .bind(&settings.database)
+    .fetch_all(&pool)
+    .await
+    .expect("load config_versions list index")
+    .into_iter()
+    .map(|row| row.try_get::<String, _>("COLUMN_NAME").unwrap())
+    .collect::<Vec<_>>();
+    assert_eq!(list_index_columns, ["user_id", "created_at"]);
+
+    delete_fixture_versions(&pool, &[&owner, &foreign_owner]).await;
 }

@@ -19,13 +19,30 @@ use std::sync::{Arc, OnceLock};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 
+use crate::tool::args::shape::{canonicalize_tool_call_name_in_place, tool_call_name};
+
 /// Maximum number of read-only tools that can execute concurrently.
-pub const MAX_CONCURRENT_READ_ONLY: usize = 10;
+/// Override with `ASTRA_MAX_CONCURRENT_TOOL_EXECUTIONS` env var.
+pub const DEFAULT_MAX_CONCURRENT_TOOL_EXECUTIONS: usize = 10;
+
+/// Effective max concurrent tool executions — reads `ASTRA_MAX_CONCURRENT_TOOL_EXECUTIONS`
+/// env var at process start, falling back to [`DEFAULT_MAX_CONCURRENT_TOOL_EXECUTIONS`].
+pub fn max_concurrent_tool_executions() -> usize {
+    static CELL: OnceLock<usize> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("ASTRA_MAX_CONCURRENT_TOOL_EXECUTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_TOOL_EXECUTIONS)
+    })
+}
+
+// Backward-compat aliases (the const is the default; the fn is the runtime value)
+pub const MAX_CONCURRENT_READ_ONLY: usize = DEFAULT_MAX_CONCURRENT_TOOL_EXECUTIONS;
 
 /// Alias used by the CLI-side batch path (`stream_render::execute_tools_batch`).
-/// Kept equal to [`MAX_CONCURRENT_READ_ONLY`] so the in-turn cap matches
-/// reference-agent semantics (10) across both speculative and batched paths.
-pub const MAX_CONCURRENT_TOOL_EXECUTIONS: usize = MAX_CONCURRENT_READ_ONLY;
+/// Effective runtime value from [`max_concurrent_tool_executions`].
+pub const MAX_CONCURRENT_TOOL_EXECUTIONS: usize = DEFAULT_MAX_CONCURRENT_TOOL_EXECUTIONS;
 
 /// Process-wide semaphore shared across every tool-execution batch.
 ///
@@ -48,7 +65,7 @@ pub const MAX_CONCURRENT_TOOL_EXECUTIONS: usize = MAX_CONCURRENT_READ_ONLY;
 /// ```
 pub fn shared_tool_semaphore() -> Arc<Semaphore> {
     static CELL: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    CELL.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TOOL_EXECUTIONS)))
+    CELL.get_or_init(|| Arc::new(Semaphore::new(max_concurrent_tool_executions())))
         .clone()
 }
 
@@ -56,11 +73,24 @@ pub fn shared_tool_semaphore() -> Arc<Semaphore> {
 
 /// Extract tool name from a tool call JSON value.
 fn extract_tool_name(tc: &Value) -> &str {
-    tc.get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(|n| n.as_str())
-        .or_else(|| tc.get("name").and_then(|n| n.as_str()))
+    tool_call_name(tc).unwrap_or("")
+}
+
+fn canonical_tool_name(tc: &Value) -> String {
+    extract_tool_name(tc).to_string()
+}
+
+fn canonical_tool_call_for_exec(tc: &Value) -> Value {
+    let mut owned = tc.clone();
+    let _ = canonicalize_tool_call_name_in_place(&mut owned);
+    owned
+}
+
+fn tool_call_id(tc: &Value) -> String {
+    tc.get("id")
+        .and_then(Value::as_str)
         .unwrap_or("")
+        .to_string()
 }
 
 /// Parse the `arguments` field from a tool call into a `serde_json::Value`.
@@ -190,7 +220,9 @@ pub async fn execute_parallel_round(
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, tc) in read_only {
-            let tc_owned = tc.clone();
+            let tc_owned = canonical_tool_call_for_exec(tc);
+            let fallback_call_id = tool_call_id(&tc_owned);
+            let fallback_tool_name = canonical_tool_name(&tc_owned);
             let sem = semaphore.clone();
             let exec = executor.clone();
             join_set.spawn(async move {
@@ -199,8 +231,8 @@ pub async fn execute_parallel_round(
                     Err(_) => {
                         return ToolExecResult {
                             original_index: idx,
-                            call_id: String::new(),
-                            tool_name: String::new(),
+                            call_id: fallback_call_id,
+                            tool_name: fallback_tool_name,
                             content: "semaphore closed".into(),
                             success: false,
                         };
@@ -225,8 +257,8 @@ pub async fn execute_parallel_round(
                         eprintln!("[parallel_tool_exec] tool task panicked: {e}");
                         ToolExecResult {
                             original_index: idx,
-                            call_id: String::new(),
-                            tool_name: String::new(),
+                            call_id: fallback_call_id,
+                            tool_name: fallback_tool_name,
                             content: format!("internal error: task panicked: {e}"),
                             success: false,
                         }
@@ -261,18 +293,8 @@ pub async fn execute_parallel_round(
 
     for (mut_pos, (idx, tc)) in mutating.into_iter().enumerate() {
         if sibling_aborted {
-            let call_id = tc
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let tool_name = tc
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .or_else(|| tc.get("name").and_then(|n| n.as_str()))
-                .unwrap_or("")
-                .to_string();
+            let call_id = tool_call_id(tc);
+            let tool_name = canonical_tool_name(tc);
             aborted_count += 1;
             results[idx] = Some(ToolExecResult {
                 original_index: idx,
@@ -284,7 +306,8 @@ pub async fn execute_parallel_round(
             continue;
         }
 
-        let (call_id, tool_name, content, success) = executor(tc.clone()).await;
+        let (call_id, tool_name, content, success) =
+            executor(canonical_tool_call_for_exec(tc)).await;
         mutating_executed += 1;
 
         // Sibling abort: any mutating-tool failure aborts remaining siblings.
@@ -328,18 +351,8 @@ pub async fn execute_parallel_round(
     for (idx, slot) in results.iter_mut().enumerate() {
         if slot.is_none() {
             let tc = &tool_calls[idx];
-            let call_id = tc
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let tool_name = tc
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .or_else(|| tc.get("name").and_then(|n| n.as_str()))
-                .unwrap_or("")
-                .to_string();
+            let call_id = tool_call_id(tc);
+            let tool_name = canonical_tool_name(tc);
             *slot = Some(ToolExecResult {
                 original_index: idx,
                 call_id,
@@ -663,6 +676,44 @@ mod tests {
         assert_eq!(ro[1].0, 1); // bash "git status"
         assert_eq!(ro[2].0, 2); // grep
         assert_eq!(mut_[0].0, 3); // bash "rm -rf /"
+    }
+
+    #[test]
+    fn partition_canonicalizes_tool_names() {
+        let calls = vec![
+            json!({"id": "1", "function": {"name": " read_file ", "arguments": "{}"}}),
+            json!({"id": "2", "function": {"name": " bash ", "arguments": json!({"command": "rm -rf /"}).to_string()}}),
+            json!({"id": "3", "function": {"name": "  ", "arguments": "{}"}}),
+        ];
+
+        let (ro, mutating) = partition_tool_calls(&calls);
+
+        assert_eq!(ro.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(
+            mutating.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_parallel_round_canonicalizes_tool_call_before_executor() {
+        let calls = vec![json!({
+            "id": "c1",
+            "function": {"name": " read_file ", "arguments": "{}"}
+        })];
+        let exec: ToolExecutorFn = Arc::new(|tc| {
+            Box::pin(async move {
+                let call_id = tc["id"].as_str().unwrap_or("").to_string();
+                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                (call_id, name.clone(), format!("result of {}", name), true)
+            })
+        });
+
+        let outcome = execute_parallel_round(&calls, exec).await;
+
+        assert_eq!(outcome.parallel_count, 1);
+        assert_eq!(outcome.results[0].tool_name, "read_file");
+        assert_eq!(outcome.results[0].content, "result of read_file");
     }
 
     #[test]

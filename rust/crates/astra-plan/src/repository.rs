@@ -15,11 +15,12 @@
 //! # Invariants enforced here
 //!
 //! * `plans.user_id` NOT NULL — every plan is owned.
-//! * At most one session has `active_plan_id = P` at any time — enforced by
-//!   [`PlanRepository::set_active_plan`] clearing other sessions pointing at
-//!   the same plan in one transaction.
+//! * For each owner, at most one session has `active_plan_id = P` at any time —
+//!   enforced by [`PlanRepository::set_active_plan`] clearing that owner's other
+//!   sessions pointing at the same plan in one transaction.
 //! * `plans.session_id` is a routing hint (most-recent executor); canonical
-//!   cross-session audit lives in `plan_step_runs.session_id`.
+//!   cross-session audit lives in `plan_step_runs.session_id`, and step-run
+//!   reads/writes are always scoped by `(user_id, plan_id)`.
 //! * `plan_step_runs` is append-only. Every subtask attempt creates a new row
 //!   — never UPDATE, never DELETE.
 
@@ -112,28 +113,21 @@ pub struct SavedPlanInfo {
 /// tokio tasks.
 #[async_trait]
 pub trait PlanRepository: Send + Sync {
-    /// Persist a plan, inserting or updating by `plan_id`.
+    /// Persist a plan, inserting or updating by `(user_id, plan_id)`.
     ///
     /// `expected_version` enforces optimistic concurrency: pass the version
     /// observed at load time; the write fails with [`PlanLoadError::Conflict`]
     /// if the stored version has moved. Pass `None` for a first insert.
     async fn save(
         &self,
+        user_id: &str,
         plan_id: &str,
         state: &mut PlanModeState,
         expected_version: Option<u64>,
     ) -> Result<(), PlanLoadError>;
 
-    /// Load a plan by id. Returns [`PlanLoadError::NotFound`] if missing.
-    async fn load(&self, plan_id: &str) -> Result<PlanModeState, PlanLoadError>;
-
-    /// Load a plan and verify `user_id` owns it. Returns [`PlanLoadError::NotFound`]
-    /// for non-owned plans too — do not leak existence via a 403.
-    async fn load_owned(
-        &self,
-        plan_id: &str,
-        user_id: &str,
-    ) -> Result<PlanModeState, PlanLoadError>;
+    /// Load a plan by `(user_id, plan_id)`. Returns [`PlanLoadError::NotFound`] if missing.
+    async fn load(&self, user_id: &str, plan_id: &str) -> Result<PlanModeState, PlanLoadError>;
 
     /// List plans for a user, optionally filtered by session or phase.
     async fn list_for_user(
@@ -143,7 +137,7 @@ pub trait PlanRepository: Send + Sync {
     ) -> Result<Vec<SavedPlanInfo>, PlanLoadError>;
 
     /// Delete a plan (and, for cloud, cascade its `plan_step_runs`).
-    async fn delete(&self, plan_id: &str) -> Result<(), PlanLoadError>;
+    async fn delete(&self, user_id: &str, plan_id: &str) -> Result<(), PlanLoadError>;
 
     /// Mark `plan_id` as the active plan for an owned session, atomically
     /// clearing any other session currently pointing at the same plan. Passing
@@ -166,7 +160,11 @@ pub trait PlanRepository: Send + Sync {
     ) -> Result<Option<String>, PlanLoadError>;
 
     /// Append a new step-run row. Returns the assigned `run_id`.
-    async fn record_step_run(&self, input: NewStepRun<'_>) -> Result<String, PlanLoadError>;
+    async fn record_step_run(
+        &self,
+        _user_id: &str,
+        input: NewStepRun<'_>,
+    ) -> Result<String, PlanLoadError>;
 
     /// Record an attempt that already reached a terminal state in one write.
     ///
@@ -181,6 +179,7 @@ pub trait PlanRepository: Send + Sync {
     /// is rejected at the HTTP boundary (this method itself doesn't gate).
     async fn record_completed_step_run(
         &self,
+        user_id: &str,
         input: NewStepRun<'_>,
         error: Option<&str>,
         artifact_ref: Option<&str>,
@@ -196,6 +195,7 @@ pub trait PlanRepository: Send + Sync {
     /// here closes the loop.
     async fn finalize_step_run(
         &self,
+        user_id: &str,
         plan_id: &str,
         run_id: &str,
         status: TaskStatus,
@@ -203,14 +203,19 @@ pub trait PlanRepository: Send + Sync {
         artifact_ref: Option<&str>,
     ) -> Result<(), PlanLoadError>;
 
-    /// Fetch a single step-run by `(run_id, plan_id)`. Returns `NotFound` if
+    /// Fetch a single step-run by `(user_id, run_id, plan_id)`. Returns `NotFound` if
     /// the row doesn't exist or belongs to a different plan.
-    async fn get_step_run(&self, plan_id: &str, run_id: &str)
-    -> Result<PlanStepRun, PlanLoadError>;
+    async fn get_step_run(
+        &self,
+        user_id: &str,
+        plan_id: &str,
+        run_id: &str,
+    ) -> Result<PlanStepRun, PlanLoadError>;
 
     /// List step runs for a plan (optionally one subtask), newest first.
     async fn list_step_runs(
         &self,
+        user_id: &str,
         plan_id: &str,
         subtask_id: Option<&str>,
         limit: i32,
@@ -229,6 +234,7 @@ pub trait PlanRepository: Send + Sync {
     /// terminal-edit semantics.
     async fn abort_open_step_runs(
         &self,
+        user_id: &str,
         plan_id: &str,
         subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError>;
@@ -239,6 +245,7 @@ pub trait PlanRepository: Send + Sync {
     /// implementations must protect both changes under the same write lock.
     async fn save_existing_and_abort_open_step_runs(
         &self,
+        user_id: &str,
         plan_id: &str,
         state: &mut PlanModeState,
         expected_version: u64,
@@ -300,8 +307,20 @@ fn validate_plan_id(plan_id: &str) -> Result<(), PlanLoadError> {
     Ok(())
 }
 
+fn ensure_state_owner(user_id: &str, state: &PlanModeState) -> Result<(), PlanLoadError> {
+    match state.created_by.as_deref() {
+        Some(owner) if owner == user_id => Ok(()),
+        Some(owner) => Err(PlanLoadError::Internal(format!(
+            "plan owner mismatch: state.created_by={owner}, row user_id={user_id}"
+        ))),
+        None => Err(PlanLoadError::Internal(format!(
+            "plan has no owner (created_by=None), expected {user_id}"
+        ))),
+    }
+}
+
 /// Translate the MySQL duplicate-key error (1062) raised by the unique
-/// `(plan_id, subtask_id, attempt)` index on `plan_step_runs` into
+/// `(user_id, plan_id, subtask_id, attempt)` index on `plan_step_runs` into
 /// [`PlanLoadError::Conflict`]. This happens when two concurrent redos
 /// compute the same `next_attempt` and race to INSERT — exactly one must win.
 fn map_step_run_insert_error(
@@ -326,18 +345,16 @@ fn map_step_run_insert_error(
 impl PlanRepository for CloudPlanRepository {
     async fn save(
         &self,
+        user_id: &str,
         plan_id: &str,
         state: &mut PlanModeState,
         expected_version: Option<u64>,
     ) -> Result<(), PlanLoadError> {
         validate_plan_id(plan_id)?;
+        ensure_state_owner(user_id, state)?;
         let phase = state.infer_phase().as_str();
         let progress = state.plan.progress_pct() as i32;
         let goal = state.goal.clone();
-        let user_id = state
-            .created_by
-            .clone()
-            .ok_or_else(|| PlanLoadError::Internal("plan has no owner (created_by=None)".into()))?;
 
         // Two concurrent writers at the same `expected_version` must never
         // both win. The original implementation did SELECT...FOR UPDATE then
@@ -356,11 +373,13 @@ impl PlanRepository for CloudPlanRepository {
 
         // First, read the current row (without FOR UPDATE — we rely on the
         // conditional UPDATE below for the real guard).
-        let current: Option<(i64,)> = sqlx::query_as("SELECT version FROM plans WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        let current: Option<(i64,)> =
+            sqlx::query_as("SELECT version FROM plans WHERE user_id = ? AND plan_id = ?")
+                .bind(user_id)
+                .bind(plan_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
 
         match (current, expected_version) {
             // Caller thinks row exists but doesn't → reject, even if expected=0
@@ -391,7 +410,7 @@ impl PlanRepository for CloudPlanRepository {
                      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
                 )
                 .bind(plan_id)
-                .bind(&user_id)
+                .bind(user_id)
                 .bind(state.session_hint.as_deref())
                 .bind(&goal)
                 .bind(phase)
@@ -399,7 +418,7 @@ impl PlanRepository for CloudPlanRepository {
                 .bind(state.plan_md.as_deref())
                 .bind(progress)
                 .bind(subtask_count)
-                .bind(&user_id)
+                .bind(user_id)
                 .execute(&self.pool)
                 .await;
                 match res {
@@ -442,7 +461,7 @@ impl PlanRepository for CloudPlanRepository {
                     "UPDATE plans \
                      SET goal = ?, phase = ?, version = ?, plan_json = ?, plan_md = ?, \
                          progress_pct = ?, subtask_count = ?, updated_at = NOW(6) \
-                     WHERE plan_id = ? AND version = ?",
+                     WHERE user_id = ? AND plan_id = ? AND version = ?",
                 )
                 .bind(&goal)
                 .bind(phase)
@@ -451,6 +470,7 @@ impl PlanRepository for CloudPlanRepository {
                 .bind(state.plan_md.as_deref())
                 .bind(progress)
                 .bind(subtask_count)
+                .bind(user_id)
                 .bind(plan_id)
                 .bind(stored)
                 .execute(&self.pool)
@@ -461,12 +481,14 @@ impl PlanRepository for CloudPlanRepository {
                     // Another writer moved the version under us. Read back
                     // the actual stored version so the error carries the
                     // real conflict pair, not the stale `stored` we read.
-                    let latest: Option<(i64,)> =
-                        sqlx::query_as("SELECT version FROM plans WHERE plan_id = ?")
-                            .bind(plan_id)
-                            .fetch_optional(&self.pool)
-                            .await
-                            .map_err(map_sqlx)?;
+                    let latest: Option<(i64,)> = sqlx::query_as(
+                        "SELECT version FROM plans WHERE user_id = ? AND plan_id = ?",
+                    )
+                    .bind(user_id)
+                    .bind(plan_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_sqlx)?;
                     let actual = latest.map(|(v,)| v as u64).unwrap_or(0);
                     return Err(PlanLoadError::conflict(
                         expected_version.unwrap_or(stored as u64),
@@ -478,11 +500,12 @@ impl PlanRepository for CloudPlanRepository {
         }
     }
 
-    async fn load(&self, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
+    async fn load(&self, user_id: &str, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
         validate_plan_id(plan_id)?;
         let row = sqlx::query(
-            "SELECT plan_json, plan_md, session_id, version FROM plans WHERE plan_id = ?",
+            "SELECT plan_json, plan_md, session_id, version FROM plans WHERE user_id = ? AND plan_id = ?",
         )
+        .bind(user_id)
         .bind(plan_id)
         .fetch_optional(&self.pool)
         .await
@@ -504,6 +527,12 @@ impl PlanRepository for CloudPlanRepository {
             .map_err(|e| PlanLoadError::Corrupt(format!("read version: {e}")))?;
         let mut state = serde_json::from_str::<PlanModeState>(&plan_json)
             .map_err(|e| PlanLoadError::Corrupt(format!("parse plan state: {e}")))?;
+        if state.created_by.as_deref() != Some(user_id) {
+            return Err(PlanLoadError::Corrupt(format!(
+                "plan owner mismatch: state.created_by={:?}, row user_id={user_id}",
+                state.created_by
+            )));
+        }
         state.session_hint = session_hint;
         state.plan_md = plan_md.or(state.plan_md);
         // `plans.version` is the authoritative optimistic-concurrency value.
@@ -511,18 +540,6 @@ impl PlanRepository for CloudPlanRepository {
         // version inside plan_json; trust the column.
         state.version = version_col as u64;
         Ok(state)
-    }
-
-    async fn load_owned(
-        &self,
-        plan_id: &str,
-        user_id: &str,
-    ) -> Result<PlanModeState, PlanLoadError> {
-        let state = self.load(plan_id).await?;
-        match &state.created_by {
-            Some(owner) if owner != user_id => Err(PlanLoadError::NotFound(plan_id.to_string())),
-            _ => Ok(state),
-        }
     }
 
     async fn list_for_user(
@@ -576,11 +593,11 @@ impl PlanRepository for CloudPlanRepository {
         Ok(out)
     }
 
-    async fn delete(&self, plan_id: &str) -> Result<(), PlanLoadError> {
-        validate_plan_id(plan_id)?;
+    async fn delete(&self, user_id: &str, plan_id: &str) -> Result<(), PlanLoadError> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
-        let result = sqlx::query("DELETE FROM plans WHERE plan_id = ?")
+        let result = sqlx::query("DELETE FROM plans WHERE user_id = ? AND plan_id = ?")
+            .bind(user_id)
             .bind(plan_id)
             .execute(&mut *tx)
             .await
@@ -592,7 +609,8 @@ impl PlanRepository for CloudPlanRepository {
         }
 
         // plan_step_runs has no FK (HTAP keeps writes fast) — cascade here.
-        sqlx::query("DELETE FROM plan_step_runs WHERE plan_id = ?")
+        sqlx::query("DELETE FROM plan_step_runs WHERE user_id = ? AND plan_id = ?")
+            .bind(user_id)
             .bind(plan_id)
             .execute(&mut *tx)
             .await
@@ -600,11 +618,15 @@ impl PlanRepository for CloudPlanRepository {
 
         // Any session still pointing at this plan must be cleared so we don't
         // strand a dangling foreign reference.
-        sqlx::query("UPDATE agent_sessions SET active_plan_id = NULL WHERE active_plan_id = ?")
-            .bind(plan_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
+        sqlx::query(
+            "UPDATE agent_sessions SET active_plan_id = NULL \
+             WHERE user_id = ? AND active_plan_id = ?",
+        )
+        .bind(user_id)
+        .bind(plan_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(())
@@ -623,10 +645,10 @@ impl PlanRepository for CloudPlanRepository {
             // Clear any OTHER session currently pointing at this plan.
             sqlx::query(
                 "UPDATE agent_sessions SET active_plan_id = NULL \
-                 WHERE active_plan_id = ? AND NOT (user_id = ? AND session_id = ?)",
+                 WHERE user_id = ? AND active_plan_id = ? AND session_id <> ?",
             )
-            .bind(pid)
             .bind(user_id)
+            .bind(pid)
             .bind(session_id)
             .execute(&mut *tx)
             .await
@@ -635,15 +657,16 @@ impl PlanRepository for CloudPlanRepository {
             // Refresh the plans.session_id routing hint.
             let updated = sqlx::query(
                 "UPDATE plans SET session_id = ?, updated_at = NOW(6) \
-                 WHERE plan_id = ? AND user_id = ?",
+                 WHERE user_id = ? AND plan_id = ?",
             )
             .bind(session_id)
-            .bind(pid)
             .bind(user_id)
+            .bind(pid)
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
             if updated.rows_affected() == 0 {
+                tx.rollback().await.map_err(map_sqlx)?;
                 return Err(PlanLoadError::NotFound(pid.to_string()));
             }
         }
@@ -679,14 +702,20 @@ impl PlanRepository for CloudPlanRepository {
         Ok(row.and_then(|(id,)| id))
     }
 
-    async fn record_step_run(&self, input: NewStepRun<'_>) -> Result<String, PlanLoadError> {
+    async fn record_step_run(
+        &self,
+        user_id: &str,
+        input: NewStepRun<'_>,
+    ) -> Result<String, PlanLoadError> {
         let run_id = Uuid::new_v4().to_string();
         let res = sqlx::query(
             "INSERT INTO plan_step_runs \
-                 (run_id, plan_id, subtask_id, attempt, status, session_id, \
+                 (user_id, run_id, plan_id, subtask_id, attempt, status, session_id, \
                   started_at, request_id) \
-             VALUES (?, ?, ?, ?, ?, ?, NOW(6), ?)",
+             SELECT ?, ?, ?, ?, ?, ?, ?, NOW(6), ? \
+             FROM plans WHERE user_id = ? AND plan_id = ?",
         )
+        .bind(user_id)
         .bind(&run_id)
         .bind(input.plan_id)
         .bind(input.subtask_id)
@@ -694,9 +723,14 @@ impl PlanRepository for CloudPlanRepository {
         .bind(input.status.as_str())
         .bind(input.session_id)
         .bind(input.request_id)
+        .bind(user_id)
+        .bind(input.plan_id)
         .execute(&self.pool)
         .await;
         match res {
+            Ok(result) if result.rows_affected() == 0 => {
+                Err(PlanLoadError::NotFound(input.plan_id.to_string()))
+            }
             Ok(_) => Ok(run_id),
             Err(e) => Err(map_step_run_insert_error(
                 e,
@@ -709,6 +743,7 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn record_completed_step_run(
         &self,
+        user_id: &str,
         input: NewStepRun<'_>,
         error: Option<&str>,
         artifact_ref: Option<&str>,
@@ -716,10 +751,12 @@ impl PlanRepository for CloudPlanRepository {
         let run_id = Uuid::new_v4().to_string();
         let res = sqlx::query(
             "INSERT INTO plan_step_runs \
-                 (run_id, plan_id, subtask_id, attempt, status, session_id, \
+                 (user_id, run_id, plan_id, subtask_id, attempt, status, session_id, \
                   started_at, finished_at, request_id, error, artifact_ref) \
-             VALUES (?, ?, ?, ?, ?, ?, NOW(6), NOW(6), ?, ?, ?)",
+             SELECT ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), ?, ?, ? \
+             FROM plans WHERE user_id = ? AND plan_id = ?",
         )
+        .bind(user_id)
         .bind(&run_id)
         .bind(input.plan_id)
         .bind(input.subtask_id)
@@ -729,9 +766,14 @@ impl PlanRepository for CloudPlanRepository {
         .bind(input.request_id)
         .bind(error)
         .bind(artifact_ref)
+        .bind(user_id)
+        .bind(input.plan_id)
         .execute(&self.pool)
         .await;
         match res {
+            Ok(result) if result.rows_affected() == 0 => {
+                Err(PlanLoadError::NotFound(input.plan_id.to_string()))
+            }
             Ok(_) => Ok(run_id),
             Err(e) => Err(map_step_run_insert_error(
                 e,
@@ -744,6 +786,7 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn finalize_step_run(
         &self,
+        user_id: &str,
         plan_id: &str,
         run_id: &str,
         status: TaskStatus,
@@ -753,11 +796,12 @@ impl PlanRepository for CloudPlanRepository {
         let result = sqlx::query(
             "UPDATE plan_step_runs \
              SET status = ?, finished_at = NOW(6), error = ?, artifact_ref = ? \
-             WHERE run_id = ? AND plan_id = ? AND finished_at IS NULL",
+             WHERE user_id = ? AND run_id = ? AND plan_id = ? AND finished_at IS NULL",
         )
         .bind(status.as_str())
         .bind(error)
         .bind(artifact_ref)
+        .bind(user_id)
         .bind(run_id)
         .bind(plan_id)
         .execute(&self.pool)
@@ -776,6 +820,7 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn get_step_run(
         &self,
+        user_id: &str,
         plan_id: &str,
         run_id: &str,
     ) -> Result<PlanStepRun, PlanLoadError> {
@@ -783,8 +828,9 @@ impl PlanRepository for CloudPlanRepository {
             "SELECT run_id, plan_id, subtask_id, attempt, status, session_id, \
                     started_at, finished_at, request_id, error, artifact_ref \
              FROM plan_step_runs \
-             WHERE run_id = ? AND plan_id = ?",
+             WHERE user_id = ? AND run_id = ? AND plan_id = ?",
         )
+        .bind(user_id)
         .bind(run_id)
         .bind(plan_id)
         .fetch_optional(&self.pool)
@@ -814,11 +860,11 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn list_step_runs(
         &self,
+        user_id: &str,
         plan_id: &str,
         subtask_id: Option<&str>,
         limit: i32,
     ) -> Result<Vec<PlanStepRun>, PlanLoadError> {
-        validate_plan_id(plan_id)?;
         let limit = limit.clamp(1, 1000);
 
         // Stable order: newest started_at first, `run_id` ASC as the
@@ -830,9 +876,10 @@ impl PlanRepository for CloudPlanRepository {
                 "SELECT run_id, plan_id, subtask_id, attempt, status, session_id, \
                         started_at, finished_at, request_id, error, artifact_ref \
                  FROM plan_step_runs \
-                 WHERE plan_id = ? AND subtask_id = ? \
+                 WHERE user_id = ? AND plan_id = ? AND subtask_id = ? \
                  ORDER BY started_at DESC, run_id ASC LIMIT ?",
             )
+            .bind(user_id)
             .bind(plan_id)
             .bind(sid)
             .bind(limit)
@@ -843,9 +890,10 @@ impl PlanRepository for CloudPlanRepository {
                 "SELECT run_id, plan_id, subtask_id, attempt, status, session_id, \
                         started_at, finished_at, request_id, error, artifact_ref \
                  FROM plan_step_runs \
-                 WHERE plan_id = ? \
+                 WHERE user_id = ? AND plan_id = ? \
                  ORDER BY started_at DESC, run_id ASC LIMIT ?",
             )
+            .bind(user_id)
             .bind(plan_id)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -876,6 +924,7 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn abort_open_step_runs(
         &self,
+        user_id: &str,
         plan_id: &str,
         subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError> {
@@ -893,11 +942,12 @@ impl PlanRepository for CloudPlanRepository {
         let sql = format!(
             "UPDATE plan_step_runs \
              SET status = ?, finished_at = NOW(6) \
-             WHERE plan_id = ? AND finished_at IS NULL \
+             WHERE user_id = ? AND plan_id = ? AND finished_at IS NULL \
                AND subtask_id IN ({placeholders})"
         );
         let mut q = sqlx::query(&sql)
             .bind(TaskStatus::Cancelled.as_str())
+            .bind(user_id)
             .bind(plan_id);
         for sid in subtask_ids {
             q = q.bind(sid);
@@ -908,12 +958,13 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn save_existing_and_abort_open_step_runs(
         &self,
+        user_id: &str,
         plan_id: &str,
         state: &mut PlanModeState,
         expected_version: u64,
         subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError> {
-        validate_plan_id(plan_id)?;
+        ensure_state_owner(user_id, state)?;
         let phase = state.infer_phase().as_str();
         let progress = state.plan.progress_pct() as i32;
         let goal = state.goal.clone();
@@ -931,7 +982,7 @@ impl PlanRepository for CloudPlanRepository {
             "UPDATE plans \
              SET goal = ?, phase = ?, version = ?, plan_json = ?, plan_md = ?, \
                  progress_pct = ?, subtask_count = ?, updated_at = NOW(6) \
-             WHERE plan_id = ? AND version = ?",
+             WHERE user_id = ? AND plan_id = ? AND version = ?",
         )
         .bind(&goal)
         .bind(phase)
@@ -940,6 +991,7 @@ impl PlanRepository for CloudPlanRepository {
         .bind(persisted_state.plan_md.as_deref())
         .bind(progress)
         .bind(subtask_count)
+        .bind(user_id)
         .bind(plan_id)
         .bind(expected_version as i64)
         .execute(&mut *tx)
@@ -948,7 +1000,8 @@ impl PlanRepository for CloudPlanRepository {
 
         if update.rows_affected() == 0 {
             let latest: Option<(i64,)> =
-                sqlx::query_as("SELECT version FROM plans WHERE plan_id = ?")
+                sqlx::query_as("SELECT version FROM plans WHERE user_id = ? AND plan_id = ?")
+                    .bind(user_id)
                     .bind(plan_id)
                     .fetch_optional(&mut *tx)
                     .await
@@ -967,11 +1020,12 @@ impl PlanRepository for CloudPlanRepository {
             let sql = format!(
                 "UPDATE plan_step_runs \
                  SET status = ?, finished_at = NOW(6) \
-                 WHERE plan_id = ? AND finished_at IS NULL \
+                 WHERE user_id = ? AND plan_id = ? AND finished_at IS NULL \
                    AND subtask_id IN ({placeholders})"
             );
             let mut q = sqlx::query(&sql)
                 .bind(TaskStatus::Cancelled.as_str())
+                .bind(user_id)
                 .bind(plan_id);
             for sid in subtask_ids {
                 q = q.bind(sid);
@@ -989,9 +1043,9 @@ impl PlanRepository for CloudPlanRepository {
 
 #[derive(Debug, Default)]
 struct InMemoryPlanRepositoryState {
-    plans: HashMap<String, PlanModeState>,
+    plans: HashMap<(String, String), PlanModeState>,
     active_plans: HashMap<(String, String), String>,
-    step_runs: HashMap<String, PlanStepRun>,
+    step_runs: HashMap<(String, String), PlanStepRun>,
 }
 
 /// Process-local repository for tests and unconfigured runtime defaults.
@@ -1030,16 +1084,16 @@ fn saved_plan_info(plan_id: &str, state: &PlanModeState) -> SavedPlanInfo {
 impl PlanRepository for InMemoryPlanRepository {
     async fn save(
         &self,
+        user_id: &str,
         plan_id: &str,
         state: &mut PlanModeState,
         expected_version: Option<u64>,
     ) -> Result<(), PlanLoadError> {
         validate_plan_id(plan_id)?;
+        ensure_state_owner(user_id, state)?;
         let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
-        match (
-            guard.plans.get(plan_id).map(|s| s.version),
-            expected_version,
-        ) {
+        let key = (user_id.to_string(), plan_id.to_string());
+        match (guard.plans.get(&key).map(|s| s.version), expected_version) {
             (None, Some(expected)) if expected != 0 => {
                 return Err(PlanLoadError::conflict(expected, 0));
             }
@@ -1056,31 +1110,20 @@ impl PlanRepository for InMemoryPlanRepository {
                 state.version = 1;
             }
         }
-        guard.plans.insert(plan_id.to_string(), state.clone());
+        guard.plans.insert(key, state.clone());
         Ok(())
     }
 
-    async fn load(&self, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
+    async fn load(&self, user_id: &str, plan_id: &str) -> Result<PlanModeState, PlanLoadError> {
         validate_plan_id(plan_id)?;
+        let key = (user_id.to_string(), plan_id.to_string());
         self.inner
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .plans
-            .get(plan_id)
+            .get(&key)
             .cloned()
             .ok_or_else(|| PlanLoadError::NotFound(plan_id.to_string()))
-    }
-
-    async fn load_owned(
-        &self,
-        plan_id: &str,
-        user_id: &str,
-    ) -> Result<PlanModeState, PlanLoadError> {
-        let state = self.load(plan_id).await?;
-        match &state.created_by {
-            Some(owner) if owner != user_id => Err(PlanLoadError::NotFound(plan_id.to_string())),
-            _ => Ok(state),
-        }
     }
 
     async fn list_for_user(
@@ -1092,9 +1135,8 @@ impl PlanRepository for InMemoryPlanRepository {
         let mut plans = guard
             .plans
             .iter()
-            .filter_map(|(plan_id, state)| {
-                let owner = state.created_by.as_deref().unwrap_or(user_id);
-                if owner != user_id {
+            .filter_map(|((uid, plan_id), state)| {
+                if uid != user_id {
                     return None;
                 }
                 if let Some(session_id) = filter.session_id
@@ -1117,12 +1159,19 @@ impl PlanRepository for InMemoryPlanRepository {
         Ok(plans)
     }
 
-    async fn delete(&self, plan_id: &str) -> Result<(), PlanLoadError> {
+    async fn delete(&self, user_id: &str, plan_id: &str) -> Result<(), PlanLoadError> {
         validate_plan_id(plan_id)?;
+        let key = (user_id.to_string(), plan_id.to_string());
         let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
-        guard.plans.remove(plan_id);
-        guard.active_plans.retain(|_, active| active != plan_id);
-        guard.step_runs.retain(|_, run| run.plan_id != plan_id);
+        if guard.plans.remove(&key).is_none() {
+            return Err(PlanLoadError::NotFound(plan_id.to_string()));
+        }
+        guard
+            .active_plans
+            .retain(|(uid, _), active| uid != user_id || active != plan_id);
+        guard
+            .step_runs
+            .retain(|(uid, _), run| uid != user_id || run.plan_id != plan_id);
         Ok(())
     }
 
@@ -1138,7 +1187,15 @@ impl PlanRepository for InMemoryPlanRepository {
             .remove(&(user_id.to_string(), session_id.to_string()));
         if let Some(plan_id) = plan_id {
             validate_plan_id(plan_id)?;
-            guard.active_plans.retain(|_, active| active != plan_id);
+            if !guard
+                .plans
+                .contains_key(&(user_id.to_string(), plan_id.to_string()))
+            {
+                return Err(PlanLoadError::NotFound(plan_id.to_string()));
+            }
+            guard
+                .active_plans
+                .retain(|(uid, _), active| uid != user_id || active != plan_id);
             guard.active_plans.insert(
                 (user_id.to_string(), session_id.to_string()),
                 plan_id.to_string(),
@@ -1161,65 +1218,95 @@ impl PlanRepository for InMemoryPlanRepository {
             .cloned())
     }
 
-    async fn record_step_run(&self, input: NewStepRun<'_>) -> Result<String, PlanLoadError> {
+    async fn record_step_run(
+        &self,
+        user_id: &str,
+        input: NewStepRun<'_>,
+    ) -> Result<String, PlanLoadError> {
         let run_id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .step_runs
-            .insert(
-                run_id.clone(),
-                PlanStepRun {
-                    run_id: run_id.clone(),
-                    plan_id: input.plan_id.to_string(),
-                    subtask_id: input.subtask_id.to_string(),
-                    attempt: input.attempt,
-                    status: input.status,
-                    session_id: input.session_id.to_string(),
-                    started_at: now,
-                    finished_at: None,
-                    request_id: input.request_id.to_string(),
-                    error: None,
-                    artifact_ref: None,
-                },
-            );
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
+        let plan_key = (user_id.to_string(), input.plan_id.to_string());
+        if !guard.plans.contains_key(&plan_key) {
+            return Err(PlanLoadError::NotFound(input.plan_id.to_string()));
+        }
+        if guard.step_runs.iter().any(|((uid, _), run)| {
+            uid == user_id
+                && run.plan_id == input.plan_id
+                && run.subtask_id == input.subtask_id
+                && run.attempt == input.attempt
+        }) {
+            return Err(PlanLoadError::Conflict {
+                expected: input.attempt as u64,
+                actual: input.attempt as u64,
+            });
+        }
+        guard.step_runs.insert(
+            (user_id.to_string(), run_id.clone()),
+            PlanStepRun {
+                run_id: run_id.clone(),
+                plan_id: input.plan_id.to_string(),
+                subtask_id: input.subtask_id.to_string(),
+                attempt: input.attempt,
+                status: input.status,
+                session_id: input.session_id.to_string(),
+                started_at: now,
+                finished_at: None,
+                request_id: input.request_id.to_string(),
+                error: None,
+                artifact_ref: None,
+            },
+        );
         Ok(run_id)
     }
 
     async fn record_completed_step_run(
         &self,
+        user_id: &str,
         input: NewStepRun<'_>,
         error: Option<&str>,
         artifact_ref: Option<&str>,
     ) -> Result<String, PlanLoadError> {
         let run_id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .step_runs
-            .insert(
-                run_id.clone(),
-                PlanStepRun {
-                    run_id: run_id.clone(),
-                    plan_id: input.plan_id.to_string(),
-                    subtask_id: input.subtask_id.to_string(),
-                    attempt: input.attempt,
-                    status: input.status,
-                    session_id: input.session_id.to_string(),
-                    started_at: now,
-                    finished_at: Some(now),
-                    request_id: input.request_id.to_string(),
-                    error: error.map(str::to_string),
-                    artifact_ref: artifact_ref.map(str::to_string),
-                },
-            );
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
+        let plan_key = (user_id.to_string(), input.plan_id.to_string());
+        if !guard.plans.contains_key(&plan_key) {
+            return Err(PlanLoadError::NotFound(input.plan_id.to_string()));
+        }
+        if guard.step_runs.iter().any(|((uid, _), run)| {
+            uid == user_id
+                && run.plan_id == input.plan_id
+                && run.subtask_id == input.subtask_id
+                && run.attempt == input.attempt
+        }) {
+            return Err(PlanLoadError::Conflict {
+                expected: input.attempt as u64,
+                actual: input.attempt as u64,
+            });
+        }
+        guard.step_runs.insert(
+            (user_id.to_string(), run_id.clone()),
+            PlanStepRun {
+                run_id: run_id.clone(),
+                plan_id: input.plan_id.to_string(),
+                subtask_id: input.subtask_id.to_string(),
+                attempt: input.attempt,
+                status: input.status,
+                session_id: input.session_id.to_string(),
+                started_at: now,
+                finished_at: Some(now),
+                request_id: input.request_id.to_string(),
+                error: error.map(str::to_string),
+                artifact_ref: artifact_ref.map(str::to_string),
+            },
+        );
         Ok(run_id)
     }
 
     async fn finalize_step_run(
         &self,
+        user_id: &str,
         plan_id: &str,
         run_id: &str,
         status: TaskStatus,
@@ -1227,7 +1314,8 @@ impl PlanRepository for InMemoryPlanRepository {
         artifact_ref: Option<&str>,
     ) -> Result<(), PlanLoadError> {
         let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
-        let Some(run) = guard.step_runs.get_mut(run_id) else {
+        let run_key = (user_id.to_string(), run_id.to_string());
+        let Some(run) = guard.step_runs.get_mut(&run_key) else {
             return Err(PlanLoadError::NotFound(run_id.to_string()));
         };
         if run.plan_id != plan_id {
@@ -1245,11 +1333,13 @@ impl PlanRepository for InMemoryPlanRepository {
 
     async fn get_step_run(
         &self,
+        user_id: &str,
         plan_id: &str,
         run_id: &str,
     ) -> Result<PlanStepRun, PlanLoadError> {
         let guard = astra_core::sync_poison::recover_rwlock_read(&self.inner);
-        let Some(run) = guard.step_runs.get(run_id) else {
+        let run_key = (user_id.to_string(), run_id.to_string());
+        let Some(run) = guard.step_runs.get(&run_key) else {
             return Err(PlanLoadError::NotFound(run_id.to_string()));
         };
         if run.plan_id != plan_id {
@@ -1260,6 +1350,7 @@ impl PlanRepository for InMemoryPlanRepository {
 
     async fn list_step_runs(
         &self,
+        user_id: &str,
         plan_id: &str,
         subtask_id: Option<&str>,
         limit: i32,
@@ -1267,7 +1358,9 @@ impl PlanRepository for InMemoryPlanRepository {
         let guard = astra_core::sync_poison::recover_rwlock_read(&self.inner);
         let mut runs = guard
             .step_runs
-            .values()
+            .iter()
+            .filter(|((uid, _), _)| uid == user_id)
+            .map(|(_, run)| run)
             .filter(|run| run.plan_id == plan_id)
             .filter(|run| subtask_id.is_none_or(|subtask_id| run.subtask_id == subtask_id))
             .cloned()
@@ -1275,7 +1368,7 @@ impl PlanRepository for InMemoryPlanRepository {
         runs.sort_by(|a, b| {
             b.started_at
                 .cmp(&a.started_at)
-                .then_with(|| b.run_id.cmp(&a.run_id))
+                .then_with(|| a.run_id.cmp(&b.run_id))
         });
         runs.truncate(limit.max(0) as usize);
         Ok(runs)
@@ -1283,14 +1376,16 @@ impl PlanRepository for InMemoryPlanRepository {
 
     async fn abort_open_step_runs(
         &self,
+        user_id: &str,
         plan_id: &str,
         subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError> {
         let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
         let now = Utc::now();
         let mut aborted = 0;
-        for run in guard.step_runs.values_mut() {
-            if run.plan_id == plan_id
+        for ((uid, _), run) in guard.step_runs.iter_mut() {
+            if uid == user_id
+                && run.plan_id == plan_id
                 && run.finished_at.is_none()
                 && subtask_ids
                     .iter()
@@ -1306,14 +1401,17 @@ impl PlanRepository for InMemoryPlanRepository {
 
     async fn save_existing_and_abort_open_step_runs(
         &self,
+        user_id: &str,
         plan_id: &str,
         state: &mut PlanModeState,
         expected_version: u64,
         subtask_ids: &[String],
     ) -> Result<u64, PlanLoadError> {
         validate_plan_id(plan_id)?;
+        ensure_state_owner(user_id, state)?;
         let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
-        let Some(actual) = guard.plans.get(plan_id).map(|s| s.version) else {
+        let key = (user_id.to_string(), plan_id.to_string());
+        let Some(actual) = guard.plans.get(&key).map(|s| s.version) else {
             return Err(PlanLoadError::conflict(expected_version, 0));
         };
         if actual != expected_version {
@@ -1322,8 +1420,9 @@ impl PlanRepository for InMemoryPlanRepository {
 
         let now = Utc::now();
         let mut aborted = 0;
-        for run in guard.step_runs.values_mut() {
-            if run.plan_id == plan_id
+        for ((uid, _), run) in guard.step_runs.iter_mut() {
+            if uid == user_id
+                && run.plan_id == plan_id
                 && run.finished_at.is_none()
                 && subtask_ids
                     .iter()
@@ -1334,9 +1433,8 @@ impl PlanRepository for InMemoryPlanRepository {
                 aborted += 1;
             }
         }
-
-        state.version = actual + 1;
-        guard.plans.insert(plan_id.to_string(), state.clone());
+        state.version = expected_version + 1;
+        guard.plans.insert(key, state.clone());
         Ok(aborted)
     }
 }
@@ -1393,50 +1491,102 @@ mod tests {
         let repo = InMemoryPlanRepository::new();
         let mut state = PlanModeState::new_with_owner("test goal".into(), "u-1".into());
         state.plan_md = Some("# test plan".into());
-        repo.save("plan-1", &mut state, None).await.unwrap();
+        repo.save("u-1", "plan-1", &mut state, None).await.unwrap();
 
-        let loaded = repo.load("plan-1").await.unwrap();
+        let loaded = repo.load("u-1", "plan-1").await.unwrap();
         assert_eq!(loaded.goal, "test goal");
         assert_eq!(loaded.created_by.as_deref(), Some("u-1"));
         assert_eq!(loaded.plan_md.as_deref(), Some("# test plan"));
     }
 
     #[tokio::test]
-    async fn in_memory_load_owned_returns_not_found_for_wrong_user() {
+    async fn in_memory_load_returns_not_found_for_wrong_user() {
         let repo = InMemoryPlanRepository::new();
         let mut state = PlanModeState::new_with_owner("goal".into(), "u-1".into());
-        repo.save("plan-2", &mut state, None).await.unwrap();
+        repo.save("u-1", "plan-2", &mut state, None).await.unwrap();
 
-        let err = repo.load_owned("plan-2", "u-other").await.unwrap_err();
+        let err = repo.load("u-other", "plan-2").await.unwrap_err();
         assert!(matches!(err, PlanLoadError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn in_memory_reuses_plan_id_across_users_without_collision() {
+        let repo = InMemoryPlanRepository::new();
+        let mut state_a = PlanModeState::new_with_owner("goal A".into(), "u-1".into());
+        let mut state_b = PlanModeState::new_with_owner("goal B".into(), "u-2".into());
+
+        repo.save("u-1", "shared-plan", &mut state_a, None)
+            .await
+            .unwrap();
+        repo.save("u-2", "shared-plan", &mut state_b, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.load("u-1", "shared-plan").await.unwrap().goal,
+            "goal A"
+        );
+        assert_eq!(
+            repo.load("u-2", "shared-plan").await.unwrap().goal,
+            "goal B"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_save_rejects_owner_mismatch() {
+        let repo = InMemoryPlanRepository::new();
+        let mut state = PlanModeState::new_with_owner("goal".into(), "u-1".into());
+
+        let err = repo
+            .save("u-2", "plan-owner-mismatch", &mut state, None)
+            .await
+            .expect_err("row owner and plan_json owner must match");
+        assert!(matches!(err, PlanLoadError::Internal(_)));
     }
 
     #[tokio::test]
     async fn in_memory_step_run_roundtrip_and_abort() {
         let repo = InMemoryPlanRepository::new();
+        let mut state = PlanModeState::new_with_owner("step plan".into(), "u-1".into());
+        repo.save("u-1", "p", &mut state, None).await.unwrap();
         let run_id = repo
-            .record_step_run(NewStepRun {
-                plan_id: "p",
-                subtask_id: "s",
-                attempt: 1,
-                status: TaskStatus::InProgress,
-                session_id: "sess",
-                request_id: "req",
-            })
+            .record_step_run(
+                "u-1",
+                NewStepRun {
+                    plan_id: "p",
+                    subtask_id: "s",
+                    attempt: 1,
+                    status: TaskStatus::InProgress,
+                    session_id: "sess",
+                    request_id: "req",
+                },
+            )
             .await
             .unwrap();
-        let open = repo.get_step_run("p", &run_id).await.unwrap();
+        let open = repo.get_step_run("u-1", "p", &run_id).await.unwrap();
         assert_eq!(open.status, TaskStatus::InProgress);
         assert!(open.finished_at.is_none());
 
         let aborted = repo
-            .abort_open_step_runs("p", &[String::from("s")])
+            .abort_open_step_runs("u-1", "p", &[String::from("s")])
             .await
             .unwrap();
         assert_eq!(aborted, 1);
 
-        let closed = repo.get_step_run("p", &run_id).await.unwrap();
+        let closed = repo.get_step_run("u-1", "p", &run_id).await.unwrap();
         assert_eq!(closed.status, TaskStatus::Cancelled);
         assert!(closed.finished_at.is_some());
+
+        assert!(matches!(
+            repo.get_step_run("u-other", "p", &run_id).await,
+            Err(PlanLoadError::NotFound(_))
+        ));
+        assert!(
+            repo.list_step_runs("u-other", "p", Some("s"), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "step-run listing must stay owner-scoped"
+        );
     }
 }

@@ -310,6 +310,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
         None,
         session_id,
         model_id,
+        None,
         provider,
         edge_profile_cwd,
         edge_profile_git_branch,
@@ -363,6 +364,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     session_id: &str,
     model_id: &str,
+    context_window: Option<u32>,
     provider: &str,
     edge_profile_cwd: Option<&str>,
     edge_profile_git_branch: Option<&str>,
@@ -475,13 +477,11 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         run_id: String::new(),
         model_id: model_id.to_string(),
         provider_name: provider.to_string(),
-        // Resolve the true per-model context window via the shared
-        // `budget_for_model` table. Previously hardcoded to 200_000, which
-        // severely under-reported budget pressure on 32K/8K-window models
-        // and delayed compaction until the provider returned a
-        // context-length error.
-        model_limit: u32::try_from(crate::prompts::budget_for_model(Some(model_id)).model_limit)
-            .unwrap_or(u32::MAX),
+        model_limit: u32::try_from(
+            crate::prompts::budget_for_model_with_override(Some(model_id), context_window)
+                .model_limit,
+        )
+        .unwrap_or(u32::MAX),
         provider_policy: provider_policy.clone(),
         provider_strategy,
         project_context: project_context.unwrap_or("").to_string(),
@@ -1106,6 +1106,7 @@ mod tests {
             None,
             "sid-bridge",
             "gpt-4o",
+            None,
             "openai",
             None,
             None,
@@ -1162,6 +1163,7 @@ mod tests {
             None,
             "sid-memory",
             "gpt-4o",
+            None,
             "openai",
             None,
             None,
@@ -1211,6 +1213,7 @@ mod tests {
             None,
             "sid-session-memory",
             "gpt-4o",
+            None,
             "openai",
             None,
             None,
@@ -1267,6 +1270,7 @@ mod tests {
             None,
             "sid-system-override",
             "gpt-4o",
+            None,
             "openai",
             None,
             None,
@@ -1325,6 +1329,7 @@ mod tests {
             None,
             "sid-session-memory-anthropic",
             "claude-sonnet-4-6",
+            None,
             "anthropic",
             None,
             None,
@@ -1380,6 +1385,7 @@ mod tests {
             None,
             "sid-deferred-tools",
             "gpt-4o",
+            None,
             "openai",
             None,
             None,
@@ -1435,6 +1441,7 @@ mod tests {
             Some(strict_history),
             "sid-deepseek",
             "deepseek-v4-pro",
+            None,
             "openai",
             None,
             None,
@@ -1983,6 +1990,7 @@ mod tests {
             }),
             "sid-explicit-capability",
             "proxy-claude",
+            None,
             "openai",
             None,
             None,

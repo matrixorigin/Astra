@@ -248,7 +248,7 @@ impl RunEngine {
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         let (root_run_id, ancestor_path, depth) = if let Some(parent_run_id) = parent_run_id {
-            match self.store.load_run(parent_run_id).await? {
+            match self.store.load_run(user_id, parent_run_id).await? {
                 Some(parent) => {
                     let parent_root = parent.root_run_id.unwrap_or(parent.run_id.clone());
                     let parent_path = parent.ancestor_path.unwrap_or(parent.run_id);
@@ -330,7 +330,7 @@ impl RunEngine {
             updated_at: now,
         };
         self.store.insert_run(record).await?;
-        self.project_delegation_run_if_needed(run_id, STATUS_RUNNING, None)
+        self.project_delegation_run_if_needed(user_id, run_id, STATUS_RUNNING, None)
             .await?;
         Ok(())
     }
@@ -338,6 +338,7 @@ impl RunEngine {
     /// Persist a status change to the durable store.
     pub async fn persist_status(
         &self,
+        user_id: &str,
         run_id: &str,
         status: &str,
         waiting_for: Option<&str>,
@@ -345,11 +346,11 @@ impl RunEngine {
     ) -> Result<bool, String> {
         let updated = self
             .store
-            .update_run_status(run_id, status, waiting_for, error_message)
+            .update_run_status(user_id, run_id, status, waiting_for, error_message)
             .await?;
         if updated {
             let summary = error_message.or(waiting_for);
-            self.project_delegation_run_if_needed(run_id, status, summary)
+            self.project_delegation_run_if_needed(user_id, run_id, status, summary)
                 .await?;
         }
         Ok(updated)
@@ -360,6 +361,7 @@ impl RunEngine {
     /// overwriting a newer pause/cancel/terminal status.
     pub async fn persist_status_if_current(
         &self,
+        user_id: &str,
         run_id: &str,
         expected_statuses: &[&str],
         status: &str,
@@ -369,6 +371,7 @@ impl RunEngine {
         let updated = self
             .store
             .update_run_status_if_current(
+                user_id,
                 run_id,
                 expected_statuses,
                 status,
@@ -378,7 +381,7 @@ impl RunEngine {
             .await?;
         if updated {
             let summary = error_message.or(waiting_for);
-            self.project_delegation_run_if_needed(run_id, status, summary)
+            self.project_delegation_run_if_needed(user_id, run_id, status, summary)
                 .await?;
         }
         Ok(updated)
@@ -386,6 +389,7 @@ impl RunEngine {
 
     async fn project_delegation_run_if_needed(
         &self,
+        user_id: &str,
         run_id: &str,
         status: &str,
         last_summary_text: Option<&str>,
@@ -393,7 +397,7 @@ impl RunEngine {
         let Some(projection_store) = self.projection_store.as_ref() else {
             return Ok(());
         };
-        let Some(run) = self.store.load_run(run_id).await? else {
+        let Some(run) = self.store.load_run(user_id, run_id).await? else {
             return Ok(());
         };
         if run.parent_run_id.is_none() || run.delegation_id.is_none() {
@@ -401,6 +405,7 @@ impl RunEngine {
         }
         projection_store
             .upsert_delegation_projection_for_run(
+                &run.user_id,
                 run_id,
                 status,
                 run.agent_id.as_deref(),
@@ -415,61 +420,85 @@ impl RunEngine {
     /// Persist token/tool usage counters.
     pub async fn persist_usage(
         &self,
+        user_id: &str,
         run_id: &str,
         prompt_tokens: u64,
         completion_tokens: u64,
         tool_calls: u32,
     ) -> Result<bool, String> {
         self.store
-            .update_run_usage(run_id, prompt_tokens, completion_tokens, tool_calls)
+            .update_run_usage(
+                user_id,
+                run_id,
+                prompt_tokens,
+                completion_tokens,
+                tool_calls,
+            )
             .await
     }
 
     /// Save a checkpoint for crash recovery.
     pub async fn persist_checkpoint(
         &self,
+        user_id: &str,
         run_id: &str,
         checkpoint_json: &str,
     ) -> Result<bool, String> {
-        self.store.save_checkpoint(run_id, checkpoint_json).await
+        self.store
+            .save_checkpoint(user_id, run_id, checkpoint_json)
+            .await
     }
 
     /// Load the newest typed checkpoint for a run.
     pub async fn load_latest_checkpoint(
         &self,
+        user_id: &str,
         run_id: &str,
         checkpoint_kind: Option<&str>,
     ) -> Result<Option<DurableRunCheckpointRecord>, String> {
         self.store
-            .load_latest_checkpoint(run_id, checkpoint_kind)
+            .load_latest_checkpoint(user_id, run_id, checkpoint_kind)
             .await
     }
 
     /// Load the current durable display projection for a run.
     pub async fn load_run_projection(
         &self,
+        user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        self.store.load_run_projection(run_id).await
+        self.store.load_run_projection(user_id, run_id).await
     }
 
     /// Append an event to the durable event log.
-    pub async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
-        self.store.append_event(run_id, event).await
+    pub async fn append_event(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        event: serde_json::Value,
+    ) -> Result<(), String> {
+        self.store.append_event(user_id, run_id, event).await
     }
 
     /// Append multiple events in a single batch.
     pub async fn append_events_batch(
         &self,
+        user_id: &str,
         run_id: &str,
         events: &[serde_json::Value],
     ) -> Result<(), String> {
-        self.store.append_events_batch(run_id, events).await
+        self.store
+            .append_events_batch(user_id, run_id, events)
+            .await
     }
 
     /// Load a run from the durable store (cache miss or recovery path).
-    pub async fn load_run(&self, run_id: &str) -> Result<Option<DurableRunRecord>, String> {
-        self.store.load_run(run_id).await
+    pub async fn load_run(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String> {
+        self.store.load_run(user_id, run_id).await
     }
 
     /// Check whether the run has been cancelled or paused externally
@@ -479,9 +508,10 @@ impl RunEngine {
     /// when the run record cannot be found (e.g. was deleted by a different pod).
     pub async fn check_control_status(
         &self,
+        user_id: &str,
         run_id: &str,
     ) -> Result<Option<RunControlStatus>, String> {
-        let record = self.store.load_run(run_id).await?;
+        let record = self.store.load_run(user_id, run_id).await?;
         Ok(match record {
             None => None,
             Some(r) => match durable_run_status_kind(&r.status) {
@@ -511,18 +541,22 @@ impl RunEngine {
     /// Find all sub-runs belonging to a delegation.
     pub async fn find_sub_runs(
         &self,
+        user_id: &str,
         delegation_id: &str,
     ) -> Result<Vec<DurableRunRecord>, String> {
-        self.store.find_sub_runs(delegation_id).await
+        self.store.find_sub_runs(user_id, delegation_id).await
     }
 
     /// Persist the verification-gate retry count for a run.
     pub async fn persist_retry_count(
         &self,
+        user_id: &str,
         run_id: &str,
         retry_count: u32,
     ) -> Result<bool, String> {
-        self.store.update_retry_count(run_id, retry_count).await
+        self.store
+            .update_retry_count(user_id, run_id, retry_count)
+            .await
     }
 
     /// Recover active runs after a crash/restart.
@@ -541,7 +575,13 @@ impl RunEngine {
             if has_graceful_resume_checkpoint(self, &run).await {
                 if let Err(e) = self
                     .store
-                    .update_run_status(&run.run_id, STATUS_WAITING, Some("restart_resume"), None)
+                    .update_run_status(
+                        &run.user_id,
+                        &run.run_id,
+                        STATUS_WAITING,
+                        Some("restart_resume"),
+                        None,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -554,6 +594,7 @@ impl RunEngine {
                 if let Err(e) = self
                     .store
                     .append_event(
+                        &run.user_id,
                         &run.run_id,
                         serde_json::json!({
                             "event_type": "run_resumed_after_restart",
@@ -575,6 +616,7 @@ impl RunEngine {
                 if let Err(e) = self
                     .store
                     .update_run_status(
+                        &run.user_id,
                         &run.run_id,
                         astra_core::STATUS_FAILED,
                         None,
@@ -624,15 +666,24 @@ use crate::turn::run_control::{
 #[async_trait::async_trait]
 impl RunStatusProvider for RunEngine {
     #[allow(clippy::blocks_in_conditions)]
-    async fn control_status(&self, run_id: &str) -> Result<Option<RunControlStatus>, String> {
-        self.check_control_status(run_id).await
+    async fn control_status(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RunControlStatus>, String> {
+        self.check_control_status(user_id, run_id).await
     }
 }
 
 #[async_trait::async_trait]
 impl RunInputProvider for RunEngine {
-    async fn poll_user_inputs(&self, run_id: &str, after_event_index: usize) -> RunQueuedInputPoll {
-        let run = match self.store.load_run(run_id).await {
+    async fn poll_user_inputs(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_index: usize,
+    ) -> RunQueuedInputPoll {
+        let run = match self.store.load_run(user_id, run_id).await {
             Ok(Some(run)) => run,
             Ok(None) => {
                 let error = format!("run not found while polling deferred input: {run_id}");
@@ -702,6 +753,7 @@ impl RunInputProvider for RunEngine {
         if run.status == STATUS_INPUT_QUEUED && inputs.is_empty() && !released_indices.is_empty() {
             if let Err(update_error) = self
                 .persist_status_if_current(
+                    user_id,
                     run_id,
                     &[STATUS_INPUT_QUEUED],
                     STATUS_RUNNING,
@@ -728,6 +780,7 @@ impl RunInputProvider for RunEngine {
 
     async fn mark_user_inputs_released(
         &self,
+        user_id: &str,
         run_id: &str,
         event_indices: &[usize],
     ) -> Result<(), String> {
@@ -735,7 +788,7 @@ impl RunInputProvider for RunEngine {
             return Ok(());
         }
         let run =
-            self.store.load_run(run_id).await?.ok_or_else(|| {
+            self.store.load_run(user_id, run_id).await?.ok_or_else(|| {
                 format!("run not found while acknowledging deferred input: {run_id}")
             })?;
         match durable_run_status_kind(&run.status) {
@@ -745,6 +798,7 @@ impl RunInputProvider for RunEngine {
             _ => {}
         }
         self.append_event(
+            user_id,
             run_id,
             serde_json::json!({
                 "event_type": "user_inputs_released",
@@ -753,21 +807,28 @@ impl RunInputProvider for RunEngine {
         )
         .await?;
         let current =
-            self.store.load_run(run_id).await?.ok_or_else(|| {
+            self.store.load_run(user_id, run_id).await?.ok_or_else(|| {
                 format!("run not found after acknowledging deferred input: {run_id}")
             })?;
         if current.status != STATUS_INPUT_QUEUED {
             return Ok(());
         }
-        self.persist_status_if_current(run_id, &[STATUS_INPUT_QUEUED], STATUS_RUNNING, None, None)
-            .await
-            .map(|_| ())
+        self.persist_status_if_current(
+            user_id,
+            run_id,
+            &[STATUS_INPUT_QUEUED],
+            STATUS_RUNNING,
+            None,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 }
 
 async fn has_graceful_resume_checkpoint(engine: &RunEngine, run: &DurableRunRecord) -> bool {
     if let Ok(Some(checkpoint)) = engine
-        .load_latest_checkpoint(&run.run_id, Some("resume"))
+        .load_latest_checkpoint(&run.user_id, &run.run_id, Some("resume"))
         .await
     {
         return checkpoint_is_graceful_resume(
@@ -822,34 +883,50 @@ impl astra_server_types::team_orchestrator_traits::RunPersistence for RunEngine 
 
     async fn persist_status(
         &self,
+        user_id: &str,
         run_id: &str,
         status: &str,
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
-        RunEngine::persist_status(self, run_id, status, waiting_for, error_message).await
+        RunEngine::persist_status(self, user_id, run_id, status, waiting_for, error_message).await
     }
 
     async fn persist_usage(
         &self,
+        user_id: &str,
         run_id: &str,
         prompt_tokens: u64,
         completion_tokens: u64,
         tool_calls: u32,
     ) -> Result<bool, String> {
-        RunEngine::persist_usage(self, run_id, prompt_tokens, completion_tokens, tool_calls).await
+        RunEngine::persist_usage(
+            self,
+            user_id,
+            run_id,
+            prompt_tokens,
+            completion_tokens,
+            tool_calls,
+        )
+        .await
     }
 
     async fn persist_checkpoint(
         &self,
+        user_id: &str,
         run_id: &str,
         checkpoint_json: &str,
     ) -> Result<bool, String> {
-        RunEngine::persist_checkpoint(self, run_id, checkpoint_json).await
+        RunEngine::persist_checkpoint(self, user_id, run_id, checkpoint_json).await
     }
 
-    async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
-        RunEngine::append_event(self, run_id, event).await
+    async fn append_event(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        event: serde_json::Value,
+    ) -> Result<(), String> {
+        RunEngine::append_event(self, user_id, run_id, event).await
     }
 }
 
@@ -870,12 +947,17 @@ mod tests {
             Err("store unavailable".into())
         }
 
-        async fn load_run(&self, _run_id: &str) -> Result<Option<DurableRunRecord>, String> {
+        async fn load_run(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+        ) -> Result<Option<DurableRunRecord>, String> {
             Err("load failed".into())
         }
 
         async fn update_run_status(
             &self,
+            _user_id: &str,
             _run_id: &str,
             _status: &str,
             _waiting_for: Option<&str>,
@@ -886,6 +968,7 @@ mod tests {
 
         async fn update_run_status_if_current(
             &self,
+            _user_id: &str,
             _run_id: &str,
             _expected_statuses: &[&str],
             _status: &str,
@@ -897,6 +980,7 @@ mod tests {
 
         async fn update_run_usage(
             &self,
+            _user_id: &str,
             _run_id: &str,
             _prompt_tokens: u64,
             _completion_tokens: u64,
@@ -907,6 +991,7 @@ mod tests {
 
         async fn save_checkpoint(
             &self,
+            _user_id: &str,
             _run_id: &str,
             _checkpoint_json: &str,
         ) -> Result<bool, String> {
@@ -915,6 +1000,7 @@ mod tests {
 
         async fn load_latest_checkpoint(
             &self,
+            _user_id: &str,
             _run_id: &str,
             _checkpoint_kind: Option<&str>,
         ) -> Result<Option<DurableRunCheckpointRecord>, String> {
@@ -923,6 +1009,7 @@ mod tests {
 
         async fn load_run_projection(
             &self,
+            _user_id: &str,
             _run_id: &str,
         ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
             Err("store unavailable".into())
@@ -930,6 +1017,7 @@ mod tests {
 
         async fn append_events_batch(
             &self,
+            _user_id: &str,
             _run_id: &str,
             _events: &[serde_json::Value],
         ) -> Result<(), String> {
@@ -963,6 +1051,7 @@ mod tests {
 
         async fn find_sub_runs(
             &self,
+            _user_id: &str,
             _delegation_id: &str,
         ) -> Result<Vec<DurableRunRecord>, String> {
             Err("store unavailable".into())
@@ -970,6 +1059,7 @@ mod tests {
 
         async fn update_retry_count(
             &self,
+            _user_id: &str,
             _run_id: &str,
             _retry_count: u32,
         ) -> Result<bool, String> {
@@ -981,7 +1071,7 @@ mod tests {
     async fn start_and_load_run() {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-        let run = engine.load_run("run-1").await.unwrap().unwrap();
+        let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(run.run_id, "run-1");
         assert_eq!(run.user_id, "user-1");
         assert_eq!(run.session_id, "sess-1");
@@ -1006,7 +1096,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let run = engine.load_run("run-ctx").await.unwrap().unwrap();
+        let run = engine.load_run("user-1", "run-ctx").await.unwrap().unwrap();
         assert_eq!(run.events[0]["event_type"], "run_started");
         assert_eq!(run.events[0]["data"]["interaction_mode"], "auto");
         assert_eq!(run.events[0]["data"]["suppressed_loop_nudges"], true);
@@ -1066,7 +1156,11 @@ mod tests {
             .await
             .unwrap();
 
-        let run = engine.load_run("run-agent-binding").await.unwrap().unwrap();
+        let run = engine
+            .load_run("user-1", "run-agent-binding")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             run.runtime_profile.as_deref(),
             Some("agent_binding_registry")
@@ -1094,7 +1188,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let run = engine.load_run("run-prompt").await.unwrap().unwrap();
+        let run = engine
+            .load_run("user-1", "run-prompt")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(run.events[0]["data"]["interaction_mode"], "prompt");
         assert_eq!(run.events[0]["data"]["suppressed_loop_nudges"], false);
         assert_eq!(run.events[0]["data"]["interactive_client"], true);
@@ -1118,7 +1216,7 @@ mod tests {
             .await
             .unwrap();
         let run = engine
-            .load_run("run-non-interactive")
+            .load_run("user-1", "run-non-interactive")
             .await
             .unwrap()
             .unwrap();
@@ -1142,7 +1240,11 @@ mod tests {
             .await
             .unwrap();
 
-        let run = engine.load_run("run-retry").await.unwrap().unwrap();
+        let run = engine
+            .load_run("user-1", "run-retry")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(run.parent_run_id.as_deref(), Some("parent-1"));
         assert_eq!(run.delegation_id.as_deref(), Some("del-1"));
         assert_eq!(run.agent_id.as_deref(), Some("coder"));
@@ -1152,7 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn load_nonexistent_returns_none() {
         let engine = test_engine();
-        assert!(engine.load_run("nope").await.unwrap().is_none());
+        assert!(engine.load_run("user-1", "nope").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1160,11 +1262,11 @@ mod tests {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         let ok = engine
-            .persist_status("run-1", "paused", Some("user_resume"), None)
+            .persist_status("user-1", "run-1", "paused", Some("user_resume"), None)
             .await
             .unwrap();
         assert!(ok);
-        let run = engine.load_run("run-1").await.unwrap().unwrap();
+        let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(run.status, "paused");
         assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
     }
@@ -1173,7 +1275,7 @@ mod tests {
     async fn persist_status_nonexistent_returns_false() {
         let engine = test_engine();
         let ok = engine
-            .persist_status("nope", "failed", None, Some("crash"))
+            .persist_status("user-1", "nope", "failed", None, Some("crash"))
             .await
             .unwrap();
         assert!(!ok);
@@ -1183,8 +1285,11 @@ mod tests {
     async fn persist_usage_updates() {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-        engine.persist_usage("run-1", 1000, 500, 7).await.unwrap();
-        let run = engine.load_run("run-1").await.unwrap().unwrap();
+        engine
+            .persist_usage("user-1", "run-1", 1000, 500, 7)
+            .await
+            .unwrap();
+        let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(run.total_prompt_tokens, 1000);
         assert_eq!(run.total_completion_tokens, 500);
         assert_eq!(run.total_tool_calls, 7);
@@ -1195,9 +1300,12 @@ mod tests {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         let ck = r#"{"version":"checkpoint_v1","graceful":true,"messages":[],"turn":3}"#;
-        engine.persist_checkpoint("run-1", ck).await.unwrap();
+        engine
+            .persist_checkpoint("user-1", "run-1", ck)
+            .await
+            .unwrap();
         let checkpoint = engine
-            .load_latest_checkpoint("run-1", Some("resume"))
+            .load_latest_checkpoint("user-1", "run-1", Some("resume"))
             .await
             .unwrap()
             .unwrap();
@@ -1211,26 +1319,31 @@ mod tests {
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
             .append_event(
+                "user-1",
                 "run-1",
                 serde_json::json!({"event_type": "tool_call_start", "data": {"tool": "bash"}}),
             )
             .await
             .unwrap();
-        engine.persist_usage("run-1", 11, 7, 3).await.unwrap();
+        engine
+            .persist_usage("user-1", "run-1", 11, 7, 3)
+            .await
+            .unwrap();
         engine
             .persist_checkpoint(
+                "user-1",
                 "run-1",
                 r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"batch-1"}"#,
             )
             .await
             .unwrap();
         engine
-            .persist_status("run-1", "waiting", Some("user_input"), None)
+            .persist_status("user-1", "run-1", "waiting", Some("user_input"), None)
             .await
             .unwrap();
 
         let projection = engine
-            .load_run_projection("run-1")
+            .load_run_projection("user-1", "run-1")
             .await
             .unwrap()
             .expect("projection should exist");
@@ -1258,7 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn load_run_projection_missing_run_returns_none() {
         let engine = test_engine();
-        let projection = engine.load_run_projection("nope").await.unwrap();
+        let projection = engine.load_run_projection("user-1", "nope").await.unwrap();
         assert!(projection.is_none());
     }
 
@@ -1268,16 +1381,21 @@ mod tests {
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
             .append_event(
+                "user-1",
                 "run-1",
                 serde_json::json!({"event_type": "tool_call_start"}),
             )
             .await
             .unwrap();
         engine
-            .append_event("run-1", serde_json::json!({"event_type": "tool_result"}))
+            .append_event(
+                "user-1",
+                "run-1",
+                serde_json::json!({"event_type": "tool_result"}),
+            )
             .await
             .unwrap();
-        let run = engine.load_run("run-1").await.unwrap().unwrap();
+        let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(run.events.len(), 3); // run_started + 2 appended
     }
 
@@ -1287,7 +1405,7 @@ mod tests {
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine.start_run("run-2", "user-1", "sess-2").await.unwrap();
         engine
-            .persist_status("run-2", "waiting", Some("tool_approval"), None)
+            .persist_status("user-1", "run-2", "waiting", Some("tool_approval"), None)
             .await
             .unwrap();
         let waiting = engine.find_waiting_runs().await.unwrap();
@@ -1307,7 +1425,7 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("paused-free", "paused", None, None)
+            .persist_status("user-1", "paused-free", "paused", None, None)
             .await
             .unwrap();
         engine
@@ -1315,7 +1433,7 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("completed", "completed", None, None)
+            .persist_status("user-1", "completed", "completed", None, None)
             .await
             .unwrap();
 
@@ -1345,7 +1463,7 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("paused", "paused", Some("user_resume"), None)
+            .persist_status("user-1", "paused", "paused", Some("user_resume"), None)
             .await
             .unwrap();
         engine
@@ -1353,7 +1471,7 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("waiting", "waiting", Some("tool_approval"), None)
+            .persist_status("user-1", "waiting", "waiting", Some("tool_approval"), None)
             .await
             .unwrap();
         engine
@@ -1361,17 +1479,29 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("cancelled", "cancelled", None, None)
+            .persist_status("user-1", "cancelled", "cancelled", None, None)
             .await
             .unwrap();
 
         assert_eq!(
-            engine.check_control_status("paused").await.unwrap(),
+            engine
+                .check_control_status("user-1", "paused")
+                .await
+                .unwrap(),
             Some(RunControlStatus::Paused)
         );
-        assert_eq!(engine.check_control_status("waiting").await.unwrap(), None);
         assert_eq!(
-            engine.check_control_status("cancelled").await.unwrap(),
+            engine
+                .check_control_status("user-1", "waiting")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            engine
+                .check_control_status("user-1", "cancelled")
+                .await
+                .unwrap(),
             Some(RunControlStatus::Cancelled)
         );
     }
@@ -1385,6 +1515,7 @@ mod tests {
             .unwrap();
         engine
             .append_event(
+                "user-1",
                 "run-input",
                 serde_json::json!({
                     "event_type": "user_input",
@@ -1394,7 +1525,7 @@ mod tests {
             .await
             .unwrap();
 
-        let poll = engine.poll_user_inputs("run-input", 99).await;
+        let poll = engine.poll_user_inputs("user-1", "run-input", 99).await;
 
         assert_eq!(poll.next_cursor, 99);
         assert!(poll.inputs.is_empty());
@@ -1405,7 +1536,7 @@ mod tests {
     async fn poll_user_inputs_reports_store_load_errors() {
         let engine = RunEngine::new(Arc::new(FailingLoadRunStore));
 
-        let poll = engine.poll_user_inputs("run-input", 7).await;
+        let poll = engine.poll_user_inputs("user-1", "run-input", 7).await;
 
         assert_eq!(poll.next_cursor, 7);
         assert!(poll.inputs.is_empty());
@@ -1416,7 +1547,7 @@ mod tests {
     async fn poll_user_inputs_reports_missing_run_as_error() {
         let engine = test_engine();
 
-        let poll = engine.poll_user_inputs("missing-run", 3).await;
+        let poll = engine.poll_user_inputs("user-1", "missing-run", 3).await;
 
         assert_eq!(poll.next_cursor, 3);
         assert!(poll.inputs.is_empty());
@@ -1434,19 +1565,29 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("run-queued", STATUS_INPUT_QUEUED, Some("user_input"), None)
+            .persist_status(
+                "user-1",
+                "run-queued",
+                STATUS_INPUT_QUEUED,
+                Some("user_input"),
+                None,
+            )
             .await
             .unwrap();
 
         engine
-            .mark_user_inputs_released("run-queued", &[1])
+            .mark_user_inputs_released("user-1", "run-queued", &[1])
             .await
             .unwrap();
 
-        let run = engine.load_run("run-queued").await.unwrap().unwrap();
+        let run = engine
+            .load_run("user-1", "run-queued")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(run.status, STATUS_RUNNING);
         assert_eq!(run.waiting_for, None);
-        let poll = engine.poll_user_inputs("run-queued", 0).await;
+        let poll = engine.poll_user_inputs("user-1", "run-queued", 0).await;
         assert!(
             poll.inputs.is_empty(),
             "released inputs must not replay after crash recovery"
@@ -1462,6 +1603,7 @@ mod tests {
             .unwrap();
         engine
             .persist_status(
+                "user-1",
                 "run-paused-release",
                 STATUS_INPUT_QUEUED,
                 Some("user_input"),
@@ -1471,6 +1613,7 @@ mod tests {
             .unwrap();
         engine
             .persist_status(
+                "user-1",
                 "run-paused-release",
                 STATUS_PAUSED,
                 Some("user_resume"),
@@ -1480,12 +1623,12 @@ mod tests {
             .unwrap();
 
         engine
-            .mark_user_inputs_released("run-paused-release", &[1])
+            .mark_user_inputs_released("user-1", "run-paused-release", &[1])
             .await
             .unwrap();
 
         let run = engine
-            .load_run("run-paused-release")
+            .load_run("user-1", "run-paused-release")
             .await
             .unwrap()
             .unwrap();
@@ -1501,11 +1644,17 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("run-cancelled-release", STATUS_CANCELLED, None, None)
+            .persist_status(
+                "user-1",
+                "run-cancelled-release",
+                STATUS_CANCELLED,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let before = engine
-            .load_run("run-cancelled-release")
+            .load_run("user-1", "run-cancelled-release")
             .await
             .unwrap()
             .unwrap()
@@ -1513,12 +1662,12 @@ mod tests {
             .len();
 
         engine
-            .mark_user_inputs_released("run-cancelled-release", &[1])
+            .mark_user_inputs_released("user-1", "run-cancelled-release", &[1])
             .await
             .unwrap();
 
         let run = engine
-            .load_run("run-cancelled-release")
+            .load_run("user-1", "run-cancelled-release")
             .await
             .unwrap()
             .unwrap();
@@ -1534,12 +1683,19 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("run-cas", STATUS_PAUSED, Some("user_resume"), None)
+            .persist_status(
+                "user-1",
+                "run-cas",
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+            )
             .await
             .unwrap();
 
         let updated = engine
             .persist_status_if_current(
+                "user-1",
                 "run-cas",
                 &[STATUS_INPUT_QUEUED],
                 STATUS_RUNNING,
@@ -1549,7 +1705,7 @@ mod tests {
             .await
             .unwrap();
 
-        let run = engine.load_run("run-cas").await.unwrap().unwrap();
+        let run = engine.load_run("user-1", "run-cas").await.unwrap().unwrap();
         assert!(!updated);
         assert_eq!(run.status, STATUS_PAUSED);
         assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
@@ -1559,7 +1715,10 @@ mod tests {
     async fn missing_run_does_not_report_cancelled_control_status() {
         let engine = test_engine();
         assert_eq!(
-            engine.check_control_status("missing-run").await.unwrap(),
+            engine
+                .check_control_status("user-1", "missing-run")
+                .await
+                .unwrap(),
             None
         );
     }
@@ -1590,11 +1749,11 @@ mod tests {
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine.start_run("run-2", "user-1", "sess-2").await.unwrap();
         engine
-            .persist_status("run-1", "waiting", Some("user_resume"), None)
+            .persist_status("user-1", "run-1", "waiting", Some("user_resume"), None)
             .await
             .unwrap();
         engine
-            .persist_status("run-2", "completed", None, None)
+            .persist_status("user-1", "run-2", "completed", None, None)
             .await
             .unwrap();
         let active = engine.recover_active_runs().await.unwrap();
@@ -1611,6 +1770,7 @@ mod tests {
             .unwrap();
         engine
             .persist_checkpoint(
+                "user-1",
                 "run-resume",
                 r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"shutdown-run-resume"}"#,
             )
@@ -1624,7 +1784,11 @@ mod tests {
             .expect("graceful checkpointed run should be recoverable");
         assert_eq!(resumed.status, "waiting");
         assert_eq!(resumed.waiting_for.as_deref(), Some("restart_resume"));
-        let durable = engine.load_run("run-resume").await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", "run-resume")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(durable.status, "waiting");
         assert_eq!(durable.waiting_for.as_deref(), Some("restart_resume"));
         assert_eq!(
@@ -1699,49 +1863,61 @@ mod tests {
 
         // Simulate pause
         engine
-            .persist_status("run-1", "paused", Some("user_resume"), None)
+            .persist_status("user-1", "run-1", "paused", Some("user_resume"), None)
             .await
             .unwrap();
         engine
-            .append_event("run-1", serde_json::json!({"event_type": "run_paused"}))
+            .append_event(
+                "user-1",
+                "run-1",
+                serde_json::json!({"event_type": "run_paused"}),
+            )
             .await
             .unwrap();
 
         // Simulate resume
         engine
-            .persist_status("run-1", "running", None, None)
-            .await
-            .unwrap();
-        engine
-            .append_event("run-1", serde_json::json!({"event_type": "run_resumed"}))
-            .await
-            .unwrap();
-
-        // Simulate completion
-        engine.persist_usage("run-1", 2000, 800, 12).await.unwrap();
-        engine
-            .persist_checkpoint("run-1", r#"{"phase":"final","final":true}"#)
-            .await
-            .unwrap();
-        engine
-            .persist_status("run-1", "completed", None, None)
+            .persist_status("user-1", "run-1", "running", None, None)
             .await
             .unwrap();
         engine
             .append_event(
+                "user-1",
+                "run-1",
+                serde_json::json!({"event_type": "run_resumed"}),
+            )
+            .await
+            .unwrap();
+
+        // Simulate completion
+        engine
+            .persist_usage("user-1", "run-1", 2000, 800, 12)
+            .await
+            .unwrap();
+        engine
+            .persist_checkpoint("user-1", "run-1", r#"{"phase":"final","final":true}"#)
+            .await
+            .unwrap();
+        engine
+            .persist_status("user-1", "run-1", "completed", None, None)
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                "user-1",
                 "run-1",
                 serde_json::json!({"event_type": "run_finished", "data": {}}),
             )
             .await
             .unwrap();
 
-        let run = engine.load_run("run-1").await.unwrap().unwrap();
+        let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(run.status, "completed");
         assert_eq!(run.total_prompt_tokens, 2000);
         assert_eq!(run.total_completion_tokens, 800);
         assert_eq!(run.total_tool_calls, 12);
         let checkpoint = engine
-            .load_latest_checkpoint("run-1", Some("phase"))
+            .load_latest_checkpoint("user-1", "run-1", Some("phase"))
             .await
             .unwrap()
             .unwrap();
@@ -1760,10 +1936,10 @@ mod tests {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
-            .persist_status("run-1", "failed", None, Some("OOM killed"))
+            .persist_status("user-1", "run-1", "failed", None, Some("OOM killed"))
             .await
             .unwrap();
-        let run = engine.load_run("run-1").await.unwrap().unwrap();
+        let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(run.status, "failed");
         assert_eq!(run.error_message.as_deref(), Some("OOM killed"));
     }
@@ -1780,7 +1956,7 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("run-crash", "running", None, None)
+            .persist_status("user-1", "run-crash", "running", None, None)
             .await
             .unwrap();
 
@@ -1790,7 +1966,7 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_status("run-wait", "waiting", None, None)
+            .persist_status("user-1", "run-wait", "waiting", None, None)
             .await
             .unwrap();
 
@@ -1804,7 +1980,11 @@ mod tests {
         );
 
         // The crashed running run must now be marked failed in the store
-        let crashed = engine.load_run("run-crash").await.unwrap().unwrap();
+        let crashed = engine
+            .load_run("user-1", "run-crash")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             crashed.status, "failed",
             "crashed running run must be marked failed"
@@ -1816,7 +1996,11 @@ mod tests {
         );
 
         // The waiting run must remain waiting
-        let waiting = engine.load_run("run-wait").await.unwrap().unwrap();
+        let waiting = engine
+            .load_run("user-1", "run-wait")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             waiting.status, "waiting",
             "waiting run must remain waiting for resume"
@@ -1832,6 +2016,7 @@ mod tests {
             .unwrap();
         engine
             .persist_status(
+                "user-1",
                 "run-input-queued",
                 STATUS_INPUT_QUEUED,
                 Some("user_input"),
@@ -1846,7 +2031,11 @@ mod tests {
             recovered.iter().any(|run| run.run_id == "run-input-queued"),
             "input-queued runs must be part of active crash recovery"
         );
-        let durable = engine.load_run("run-input-queued").await.unwrap().unwrap();
+        let durable = engine
+            .load_run("user-1", "run-input-queued")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(durable.status, "failed");
         assert_eq!(
             durable.error_message.as_deref(),

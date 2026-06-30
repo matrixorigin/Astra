@@ -401,8 +401,45 @@ fn key_value_hash(key_value: &serde_json::Value) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn parse_json_column(raw: Option<String>) -> Option<serde_json::Value> {
-    raw.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+fn mcp_decode_error(
+    column: &'static str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ErrorResponse>) {
+    internal_error(format!(
+        "MCP registry decode column `{column}`: {}",
+        message.into()
+    ))
+}
+
+fn required_string(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let value = row.try_get::<String, _>(column).map_err(internal_error)?;
+    if value.trim().is_empty() {
+        return Err(mcp_decode_error(column, "must not be empty"));
+    }
+    Ok(value)
+}
+
+fn optional_string(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    row.try_get::<Option<String>, _>(column)
+        .map_err(internal_error)
+}
+
+fn parse_json_column(
+    column: &'static str,
+    raw: Option<String>,
+) -> Result<Option<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    match raw {
+        Some(value) => serde_json::from_str::<serde_json::Value>(&value)
+            .map(Some)
+            .map_err(|source| mcp_decode_error(column, source.to_string())),
+        None => Ok(None),
+    }
 }
 
 fn canonical_binding_ids(
@@ -695,14 +732,14 @@ impl McpRegistryService for DatabaseMcpRegistryService {
 
         let mut records = Vec::with_capacity(rows.len());
         for row in rows {
-            let encrypted: String = row.try_get("key_value_encrypted").map_err(internal_error)?;
+            let encrypted = required_string(&row, "key_value_encrypted")?;
             records.push(McpRuntimeBindingRecord {
                 binding_id: row.try_get("binding_id").map_err(internal_error)?,
                 mcp_id: row.try_get("mcp_id").map_err(internal_error)?,
-                server_name: row.try_get("server_name").map_err(internal_error)?,
-                server_description: row.try_get("server_description").ok(),
-                transport: row.try_get("transport").map_err(internal_error)?,
-                url: row.try_get("url").map_err(internal_error)?,
+                server_name: required_string(&row, "server_name")?,
+                server_description: optional_string(&row, "server_description")?,
+                transport: required_string(&row, "transport")?,
+                url: required_string(&row, "url")?,
                 key_value: self.decrypt_key_value(&encrypted)?,
                 tools: Vec::new(),
             });
@@ -733,13 +770,15 @@ impl McpRegistryService for DatabaseMcpRegistryService {
                 .iter_mut()
                 .find(|record| record.binding_id == binding_id)
             {
+                let input_schema_raw = optional_string(&row, "input_schema_json")?;
+                let output_schema_raw = optional_string(&row, "output_schema_json")?;
                 record.tools.push(McpDiscoveredToolData {
-                    tool_name: row.try_get("tool_name").map_err(internal_error)?,
-                    public_name: row.try_get("public_name").map_err(internal_error)?,
-                    description: row.try_get("description").ok(),
-                    input_schema_json: parse_json_column(row.try_get("input_schema_json").ok()),
-                    output_schema_json: parse_json_column(row.try_get("output_schema_json").ok()),
-                    schema_hash: row.try_get("schema_hash").map_err(internal_error)?,
+                    tool_name: required_string(&row, "tool_name")?,
+                    public_name: required_string(&row, "public_name")?,
+                    description: optional_string(&row, "description")?,
+                    input_schema_json: parse_json_column("input_schema_json", input_schema_raw)?,
+                    output_schema_json: parse_json_column("output_schema_json", output_schema_raw)?,
+                    schema_hash: required_string(&row, "schema_hash")?,
                 });
             }
         }

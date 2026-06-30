@@ -206,7 +206,7 @@ pub(crate) async fn get_claimed_task_or_release(
     claimed_task_id: &str,
     agent_id: &str,
 ) -> Result<astra_services::TaskRecord, String> {
-    match task_svc.get_task(claimed_task_id).await {
+    match task_svc.get_task(user_id, claimed_task_id).await {
         Ok(Some(task)) => Ok(task),
         Ok(None) => {
             release_claimed_task_after_lookup_failure(
@@ -344,7 +344,7 @@ pub(crate) async fn revert_interrupted_task_to_pending_if_still_owned(
 
     let revert = tokio::time::timeout(
         timeout,
-        task_svc.update_status(task_id, astra_services::TaskStatus::Pending),
+        task_svc.update_status(user_id, task_id, astra_services::TaskStatus::Pending),
     )
     .await;
     match revert {
@@ -686,7 +686,11 @@ mod tests {
             .await
             .unwrap();
         task_svc
-            .update_status(&task_id, astra_services::TaskStatus::InProgress)
+            .update_status(
+                "task-user",
+                &task_id,
+                astra_services::TaskStatus::InProgress,
+            )
             .await
             .unwrap();
         let lease_svc = RecordingReleaseLeaseService::with_holder(&task_id, "agent-1");
@@ -701,7 +705,11 @@ mod tests {
         )
         .await;
 
-        let task = task_svc.get_task(&task_id).await.unwrap().unwrap();
+        let task = task_svc
+            .get_task("task-user", &task_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(task.status, astra_services::TaskStatus::Pending);
     }
 
@@ -721,7 +729,11 @@ mod tests {
             .await
             .unwrap();
         task_svc
-            .update_status(&task_id, astra_services::TaskStatus::InProgress)
+            .update_status(
+                "task-user",
+                &task_id,
+                astra_services::TaskStatus::InProgress,
+            )
             .await
             .unwrap();
         let lease_svc = RecordingReleaseLeaseService::with_holder(&task_id, "agent-2");
@@ -736,7 +748,11 @@ mod tests {
         )
         .await;
 
-        let task = task_svc.get_task(&task_id).await.unwrap().unwrap();
+        let task = task_svc
+            .get_task("task-user", &task_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(task.status, astra_services::TaskStatus::InProgress);
     }
 

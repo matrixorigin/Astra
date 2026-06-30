@@ -2,13 +2,15 @@
 //!
 //! Tests the full path: contract creation → subtask execution → verification → delivery.
 
-use astra_services::durable_task::*;
+use astra_services::{
+    DurableTaskLifecycle, LocalDurableTaskLifecycle, NoopBranchOps, TaskDeliveryReport, TaskScope,
+    VerifierKind,
+};
 use std::sync::Arc;
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 fn make_plan() -> astra_services::task_orchestrator::TaskPlan {
-    use astra_services::durable_task::VerifierKind;
     use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     TaskPlan {
         subtasks: vec![

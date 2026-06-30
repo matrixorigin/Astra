@@ -7,6 +7,7 @@ use crate::durable_task::{ContractStatus, SubtaskStage, TaskContract};
 use crate::session_journal::{self, JournalEvent, JournalEventType};
 use crate::session_restore::{HybridRestoreService, RestoredSession};
 use crate::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
+use astra_core::canonical_names::normalize_name_list as normalized_names;
 
 #[cfg(test)]
 use chrono::Utc;
@@ -628,7 +629,7 @@ fn build_environment_surface(
     runtime_support: &dyn SelfSurfaceRuntimeSupport,
 ) -> EnvironmentSurface {
     let workspace = artifacts.workspace.as_ref();
-    let tool_names = runtime_support.tool_names();
+    let tool_names = normalized_names(runtime_support.tool_names());
     let last_context_trace = latest_context_trace(artifacts);
 
     EnvironmentSurface {
@@ -1266,9 +1267,9 @@ fn build_recent_steps(events: &[JournalEvent], journal_limit: usize) -> Vec<Step
             actor: actor_for_event(event).to_string(),
             phase: phase_for_event_type(&event.event_type).to_string(),
             summary: summarize_event(event),
-            visible_tools: event.visible_tools.clone().unwrap_or_default(),
-            used_tools: event.tools_used.clone().unwrap_or_default(),
-            selected_skills: event.selected_skills.clone().unwrap_or_default(),
+            visible_tools: normalized_names(event.visible_tools.as_deref().unwrap_or(&[])),
+            used_tools: normalized_names(event.tools_used.as_deref().unwrap_or(&[])),
+            selected_skills: normalized_names(event.selected_skills.as_deref().unwrap_or(&[])),
             tool_calls: event
                 .tool_calls
                 .as_ref()
@@ -1334,7 +1335,7 @@ fn build_recent_decisions(
                 .and_then(|ws| ws.last_context_trace.as_ref())
                 .and_then(|trace| trace.captured_at.clone())
                 .unwrap_or_else(|| "workspace".to_string()),
-            visible_tools: trace.visible_tools.clone(),
+            visible_tools: normalized_names(&trace.visible_tools),
             selected_skills: artifacts
                 .workspace
                 .as_ref()
@@ -1349,8 +1350,8 @@ fn build_recent_decisions(
 }
 
 fn decision_from_event(event: &JournalEvent) -> Option<DecisionRecord> {
-    let visible_tools = event.visible_tools.clone().unwrap_or_default();
-    let selected_skills = event.selected_skills.clone().unwrap_or_default();
+    let visible_tools = normalized_names(event.visible_tools.as_deref().unwrap_or(&[]));
+    let selected_skills = normalized_names(event.selected_skills.as_deref().unwrap_or(&[]));
     let has_decision = !visible_tools.is_empty() || !selected_skills.is_empty();
     if !has_decision {
         return None;
@@ -1678,7 +1679,7 @@ fn merged_health_avoidance_tools(artifacts: &SessionArtifacts) -> Vec<String> {
             continue;
         };
         for name in names {
-            if let Some(name) = name.as_str().filter(|name| !name.is_empty()) {
+            if let Some(name) = name.as_str().map(str::trim).filter(|name| !name.is_empty()) {
                 health_avoidance_tools.insert(name.to_string());
             }
         }
@@ -1687,13 +1688,9 @@ fn merged_health_avoidance_tools(artifacts: &SessionArtifacts) -> Vec<String> {
 }
 
 fn merged_skills(workspace: Option<&WorkspaceMetadata>) -> Vec<String> {
-    let mut skills = BTreeSet::new();
-    if let Some(ws) = workspace {
-        for skill in &ws.discovered_skills {
-            skills.insert(skill.clone());
-        }
-    }
-    skills.into_iter().collect()
+    workspace
+        .map(|ws| normalized_names(&ws.discovered_skills))
+        .unwrap_or_default()
 }
 
 fn resolved_sources(artifacts: &SessionArtifacts) -> Vec<&'static str> {
@@ -1715,7 +1712,7 @@ fn latest_active_skill(events: &[JournalEvent]) -> Option<String> {
         event
             .selected_skills
             .as_ref()
-            .and_then(|skills| skills.first().cloned())
+            .and_then(|skills| normalized_names(skills).into_iter().next())
     })
 }
 
@@ -1952,7 +1949,11 @@ fn event_preview(event: &JournalEvent) -> EventPreview {
         ts: event.ts.clone(),
         turn: event.turn,
         error: event.error.clone(),
-        tools_used: event.tools_used.clone(),
+        tools_used: event
+            .tools_used
+            .as_deref()
+            .map(normalized_names)
+            .filter(|tools| !tools.is_empty()),
         metadata: event.metadata.clone(),
         user_input_preview: event.user_input.as_deref().map(|s| truncate(s, 160)),
         assistant_output_preview: event.assistant_output.as_deref().map(|s| truncate(s, 160)),
@@ -1964,9 +1965,13 @@ fn recent_tool_failures(events: &[JournalEvent], limit: usize) -> Vec<ToolFailur
     for event in events.iter().rev() {
         if let Some(tool_calls) = event.tool_calls.as_ref() {
             for call in tool_calls.iter().rev().filter(|call| !call.ok) {
+                let tool = call.name.trim();
+                if tool.is_empty() {
+                    continue;
+                }
                 failures.push(ToolFailureView {
                     ts: event.ts.clone(),
-                    tool: call.name.clone(),
+                    tool: tool.to_string(),
                     error: call.error.clone(),
                     turn: event.turn,
                 });
@@ -2064,7 +2069,9 @@ mod tests {
     impl SelfSurfaceRuntimeSupport for StubRuntimeSupport {
         fn tool_names(&self) -> Vec<String> {
             vec![
+                "".to_string(),
                 "bash".to_string(),
+                " bash ".to_string(),
                 "rg".to_string(),
                 "web_fetch".to_string(),
             ]
@@ -2209,6 +2216,11 @@ mod tests {
         let session_id = "svc-self-snapshot";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
         ws.plan_goal = Some("ship self surface".to_string());
+        ws.discovered_skills = vec![
+            " ".to_string(),
+            " goal-driven-evolution ".to_string(),
+            "goal-driven-evolution".to_string(),
+        ];
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-2".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),
@@ -2247,7 +2259,11 @@ mod tests {
                 turns_compacted: None,
                 facts_stored: None,
                 visible_tools: Some(vec!["bash".to_string()]),
-                selected_skills: Some(vec!["goal-driven-evolution".to_string()]),
+                selected_skills: Some(vec![
+                    " ".to_string(),
+                    " goal-driven-evolution ".to_string(),
+                    "goal-driven-evolution".to_string(),
+                ]),
                 tools_used: Some(vec!["bash".to_string()]),
                 tool_calls: Some(vec![ToolCallRecord {
                     name: "bash".to_string(),
@@ -2296,10 +2312,143 @@ mod tests {
         let snapshot = service.snapshot(session_id, 10).await.unwrap();
 
         assert_eq!(snapshot.run.goal.as_deref(), Some("ship self surface"));
+        assert_eq!(
+            snapshot.run.active_skill.as_deref(),
+            Some("goal-driven-evolution")
+        );
         assert_eq!(snapshot.environment.available_tools, 3);
+        assert_eq!(
+            snapshot.environment.tool_names,
+            vec![
+                "bash".to_string(),
+                "rg".to_string(),
+                "web_fetch".to_string()
+            ]
+        );
+        assert_eq!(
+            snapshot.environment.discovered_skills,
+            vec!["goal-driven-evolution".to_string()]
+        );
         assert_eq!(snapshot.recent_steps.len(), 2);
         assert_eq!(snapshot.recent_decisions.len(), 1);
         assert!(snapshot.acceptance.ok);
+    }
+
+    #[test]
+    fn self_surface_normalizes_tool_and_skill_names() {
+        let session_id = "svc-self-normalized-names";
+        let mut event = JournalEvent::turn(
+            Some(session_id),
+            1,
+            Some("gpt-5.4"),
+            "continue",
+            "done",
+            1,
+            20,
+            30,
+            50,
+        );
+        event.visible_tools = Some(vec![
+            "".to_string(),
+            " rg ".to_string(),
+            "rg".to_string(),
+            " bash".to_string(),
+        ]);
+        event.tools_used = Some(vec![
+            " bash ".to_string(),
+            "".to_string(),
+            "bash".to_string(),
+            "web_fetch".to_string(),
+        ]);
+        event.selected_skills = Some(vec![
+            " review ".to_string(),
+            "review".to_string(),
+            " ".to_string(),
+        ]);
+        event.tool_calls = Some(vec![
+            ToolCallRecord {
+                name: " ".to_string(),
+                ok: false,
+                ms: 1,
+                error: Some("blank name".to_string()),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: " bash ".to_string(),
+                ok: false,
+                ms: 2,
+                error: Some("failed".to_string()),
+                ..Default::default()
+            },
+        ]);
+        event.metadata = Some(serde_json::json!({
+            "health_avoidance_tools": [" flaky_http ", "", "flaky_http"]
+        }));
+
+        let steps = build_recent_steps(std::slice::from_ref(&event), 5);
+        assert_eq!(
+            steps[0].visible_tools,
+            vec!["rg".to_string(), "bash".to_string()]
+        );
+        assert_eq!(
+            steps[0].used_tools,
+            vec!["bash".to_string(), "web_fetch".to_string()]
+        );
+        assert_eq!(steps[0].selected_skills, vec!["review".to_string()]);
+
+        let decision = decision_from_event(&event).expect("dirty names still contain targets");
+        assert_eq!(
+            decision.visible_tools,
+            vec!["rg".to_string(), "bash".to_string()]
+        );
+        assert_eq!(decision.selected_skills, vec!["review".to_string()]);
+
+        let preview = event_preview(&event);
+        assert_eq!(
+            preview.tools_used,
+            Some(vec!["bash".to_string(), "web_fetch".to_string()])
+        );
+        assert_eq!(recent_tool_failures(&[event.clone()], 5)[0].tool, "bash");
+
+        let mut workspace =
+            WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        workspace.last_context_trace = Some(ContextTraceSignal {
+            turn_id: "turn-1".to_string(),
+            captured_at: Some(Utc::now().to_rfc3339()),
+            tool_surface: Some(crate::session_workspace::ContextTraceToolSurface {
+                tools_available: 4,
+                visible_tools: vec![
+                    " ".to_string(),
+                    " rg ".to_string(),
+                    "rg".to_string(),
+                    "bash".to_string(),
+                ],
+                surface_scope: "latest_round".to_string(),
+                latency_ms: 1,
+            }),
+            memory: None,
+            history: None,
+            budget: None,
+            timing: None,
+            explanations: Vec::new(),
+        });
+        let artifacts = LoadedSelfSurfaceArtifacts {
+            session_id: session_id.to_string(),
+            workspace: Some(workspace),
+            restored: None,
+            journal_events: vec![event],
+            latest_full_context_trace: None,
+        };
+
+        let decisions = build_recent_decisions(&artifacts, 5);
+        assert_eq!(
+            decisions.last().unwrap().visible_tools,
+            vec!["rg".to_string(), "bash".to_string()]
+        );
+        assert_eq!(
+            merged_health_avoidance_tools(&artifacts),
+            vec!["flaky_http".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -2323,7 +2472,6 @@ mod tests {
                 false,
                 0,
                 3,
-                1,
                 0,
                 &[],
                 0,

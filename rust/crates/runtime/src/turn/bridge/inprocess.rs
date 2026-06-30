@@ -278,11 +278,16 @@ fn deferred_tools_section_for_edge_profile(
 fn deferred_tools_block_for_bridge_model(
     edge_profile: &Map<String, Value>,
     resolved_model_name: &str,
+    resolved_context_window: Option<u32>,
 ) -> String {
-    crate::turn::deferred_tools_edge_profile::block_for_model(edge_profile, resolved_model_name)
-        .and_then(|text| deferred_tools_section_for_edge_profile(Some(&text)))
-        .map(|section| section.text)
-        .unwrap_or_default()
+    crate::turn::deferred_tools_edge_profile::block_for_model_with_context_window(
+        edge_profile,
+        resolved_model_name,
+        resolved_context_window,
+    )
+    .and_then(|text| deferred_tools_section_for_edge_profile(Some(&text)))
+    .map(|section| section.text)
+    .unwrap_or_default()
 }
 
 /// Extract the always_load (T1) tool names from the CLI-built `edge_profile`.
@@ -528,9 +533,9 @@ fn bridge_usage_from_response_event(
         .and_then(|response| response.get("response"))
         .and_then(|response| response.get("usage"))
         .and_then(Value::as_object)?;
-    let canonical = crate::turn::token_usage::TokenUsage::from_json_map(usage);
-    if !canonical.is_empty() {
-        return Some(canonical);
+    let partial = crate::turn::token_usage::TokenUsage::from_partial_json_map(usage);
+    if !partial.is_empty() {
+        return Some(partial);
     }
     let provider = event
         .metadata
@@ -1219,8 +1224,7 @@ fn bridge_should_record_llm_round(root_runtime_owns_turn_journal: bool) -> bool 
 fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
     tool_calls
         .iter()
-        .filter_map(|tool_call| tool_call.get("function").and_then(Value::as_object))
-        .filter_map(|function| function.get("name").and_then(Value::as_str))
+        .filter_map(tool_call_name)
         .map(std::string::ToString::to_string)
         .collect()
 }
@@ -1228,10 +1232,13 @@ fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
 fn tool_markers_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
     tool_calls
         .iter()
-        .filter_map(|tool_call| tool_call.get("function").and_then(Value::as_object))
-        .filter_map(|function| {
-            let name = function.get("name").and_then(Value::as_str)?;
-            let args = function.get("arguments").and_then(Value::as_str);
+        .filter_map(|tool_call| {
+            let name = tool_call_name(tool_call)?;
+            let args = tool_call
+                .get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("arguments"))
+                .and_then(Value::as_str);
             Some(astra_turn_core::followup_suggestion::tool_marker(
                 name, args,
             ))
@@ -1395,12 +1402,10 @@ impl InProcessChatTurnBridge {
         client_cancel: Option<Arc<CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
         // Extract trusted context injected by dispatch_chat_turn_bridge
-        let user_id = header_str(headers, "x-mo-user-id").unwrap_or_default();
-        let session_id = header_str(headers, "x-mo-session-id").unwrap_or_default();
+        let user_id = required_bridge_header(headers, "x-mo-user-id")?;
+        let session_id = required_bridge_header(headers, "x-mo-session-id")?;
         let full_llm_capture = header_str(headers, "x-mo-full-llm-capture").as_deref() == Some("1");
-        let header_session_turn = header_str(headers, "x-mo-session-turn")
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|turn| *turn > 0);
+        let header_session_turn = optional_positive_u32_header(headers, "x-mo-session-turn")?;
         #[cfg(feature = "bridge-e2e-hooks")]
         let bridge_e2e_authorized = astra_turn_core::bridge_e2e_hooks::authorized(headers);
         #[cfg(not(feature = "bridge-e2e-hooks"))]
@@ -1411,37 +1416,18 @@ impl InProcessChatTurnBridge {
             .unwrap_or_else(|| Uuid::now_v7().to_string());
 
         // Parse request body
-        let payload: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+        let payload = parse_bridge_payload(&body)?;
         let agent_id = payload
             .get("agent_id")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        let messages = payload
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let tool_results = payload
-            .get("tool_results")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let edge_tools = payload
-            .get("edge_tools")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let edge_profile = payload
-            .get("edge_profile")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        let messages = optional_payload_array(&payload, "messages")?;
+        let tool_results = optional_payload_array(&payload, "tool_results")?;
+        let edge_tools = optional_payload_array(&payload, "edge_tools")?;
+        let edge_profile = optional_payload_object(&payload, "edge_profile")?;
         let explain = explain_requested(&payload);
         let selected_model_name = selected_model_name_from_payload(&payload);
-        let round_index = payload
-            .get("round_index")
-            .and_then(Value::as_i64)
-            .unwrap_or(0) as u32;
+        let round_index = bridge_round_index(&payload)?;
         let provider_model_gateway_invocation =
             provider_model_gateway_invocation_from_payload(&payload);
 
@@ -1643,13 +1629,14 @@ impl InProcessChatTurnBridge {
             }
             let mut llm_header_overrides: Option<HashMap<String, String>> = None;
             let mut completions_url_override: Option<String> = None;
-            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, mut cache_capability, fallback_chain) = if use_e2e_llm {
+            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, mut cache_capability, mut model_context_window, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     None::<String>,
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
+                    None,
                     None,
                     None,
                     Vec::<String>::new(),
@@ -1665,6 +1652,7 @@ impl InProcessChatTurnBridge {
                     "provider-runtime".to_string(),
                     "http://127.0.0.1".to_string(),
                     "openai".to_string(),
+                    None,
                     None,
                     None,
                     Vec::<String>::new(),
@@ -1688,6 +1676,7 @@ impl InProcessChatTurnBridge {
                         crate::turn::llm::context::cache_capability_from_model_metadata(
                             m.prompt_cache_capability,
                         ),
+                        m.context_window,
                         m.fallback_chain,
                     ),
                     Err(e) => {
@@ -1774,6 +1763,7 @@ impl InProcessChatTurnBridge {
                             base_url = fb.base_url;
                             provider = fb.provider;
                             request_body_overrides = fb.request_body_overrides;
+                            model_context_window = fb.context_window;
                             cache_capability =
                                 crate::turn::llm::context::cache_capability_from_model_metadata(
                                     fb.prompt_cache_capability,
@@ -2399,6 +2389,7 @@ impl InProcessChatTurnBridge {
             let deferred_block_str = deferred_tools_block_for_bridge_model(
                 &edge_profile,
                 &model_name,
+                model_context_window,
             );
             let bridge_restricted_snapshot = HashSet::new();
             let initial_session_memory_entry = if let Some(memoria) = memoria_client_shared.as_ref()
@@ -2444,6 +2435,7 @@ impl InProcessChatTurnBridge {
                         project_context,
                         &bridge_session_current_date,
                     )
+                    .with_context_window(model_context_window)
                     .with_skill_listing_block(skill_listing_hint_text.as_deref().unwrap_or("")),
                 },
             );
@@ -2533,6 +2525,7 @@ impl InProcessChatTurnBridge {
                 let ctx = crate::turn::wire_assembly::MemoriaContext {
                     session_id: &session_id,
                     model_name: &model_name,
+                    context_window: model_context_window,
                     memoria_client: memoria_client.as_ref().map(|c| {
                         c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient
                     }),
@@ -2585,6 +2578,7 @@ impl InProcessChatTurnBridge {
                                             project_context,
                                             &bridge_session_current_date,
                                         )
+                                        .with_context_window(model_context_window)
                                         .with_skill_listing_block(
                                             skill_listing_hint_text.as_deref().unwrap_or(""),
                                         ),
@@ -2651,7 +2645,10 @@ impl InProcessChatTurnBridge {
             let mut llm_steps: Vec<Value> = Vec::new();
 
             let llm_started = Instant::now();
-            let budget = crate::prompts::budget_for_model(Some(&model_name));
+            let budget = crate::prompts::budget_for_model_with_override(
+                Some(&model_name),
+                model_context_window,
+            );
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
             let mut last_measured_prompt: Option<u64> = None;
@@ -2903,7 +2900,7 @@ impl InProcessChatTurnBridge {
                         loop_tool_calls = tc;
                         // Test fixtures provide raw OpenAI-style usage; normalize
                         // through the same extractor the real provider path uses
-                        // so downstream `TokenUsage::from_json_map` sees canonical
+                        // so downstream partial canonical parsing sees canonical
                         // keys. Bedrock-flavored fixtures are dispatched via the
                         // configured provider string.
                         if !u_delta.is_empty()
@@ -3115,7 +3112,7 @@ impl InProcessChatTurnBridge {
                         .await
                         {
                             Ok(s) => s.boxed(),
-                            Err(e) if astra_core::is_context_window_error(&e.to_lowercase()) => {
+                            Err(e) if astra_core::is_llm_context_window_error(&e) => {
                             record_full_llm_response_event(
                                 &mut turn_event_buffer,
                                 full_llm_capture,
@@ -3141,7 +3138,10 @@ impl InProcessChatTurnBridge {
                             // `MemoriaContext` with tighter budget overrides so
                             // the aggressive path and the main path share one
                             // compaction + summary-client construction flow.
-                            let budget = crate::prompts::budget_for_model(Some(&model_name));
+                            let budget = crate::prompts::budget_for_model_with_override(
+                                Some(&model_name),
+                                model_context_window,
+                            );
                             let compact_config = crate::prompts::CompactConfig::from_env();
                             let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
                                 astra_turn_core::cloud_summary::LlmConnParams {
@@ -3157,6 +3157,7 @@ impl InProcessChatTurnBridge {
                             let aggressive_ctx = crate::turn::wire_assembly::MemoriaContext {
                                 session_id: &session_id,
                                 model_name: &model_name,
+                                context_window: model_context_window,
                                 memoria_client: memoria_client.as_ref().map(|c| {
                                     c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient
                                 }),
@@ -3314,7 +3315,7 @@ impl InProcessChatTurnBridge {
                                             "kind": "context_window",
                                         }),
                                     );
-                                    let kind = astra_core::classify_llm_error(&e2);
+                                    let kind = astra_core::classify_llm_error_message(&e2);
                                     let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
                                         &session_id, agent_id.as_deref(), &model_name, &provider,
                                         &e2, &llm_messages, &pruned_tools,
@@ -3380,10 +3381,10 @@ impl InProcessChatTurnBridge {
                                 "error",
                                 json!({
                                     "error": e.clone(),
-                                    "kind": astra_core::classify_llm_error(&e).as_str(),
+                                    "kind": astra_core::classify_llm_error_message(&e).as_str(),
                                 }),
                             );
-                            let kind = astra_core::classify_llm_error(&e);
+                            let kind = astra_core::classify_llm_error_message(&e);
                             let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
                                 &session_id, agent_id.as_deref(), &model_name, &provider,
                                 &e, &llm_messages, &pruned_tools,
@@ -3920,7 +3921,8 @@ impl InProcessChatTurnBridge {
                     }
                 }
                 let round_ms = loop_started.elapsed().as_millis();
-                let usage_snapshot = crate::turn::token_usage::TokenUsage::from_json_map(&usage);
+                let usage_snapshot =
+                    crate::turn::token_usage::TokenUsage::from_partial_json_map(&usage);
                 astra_core::agent_info!(
                     "llm",
                     "⏱ LLM round done: total={}ms tok_in={} tok_cached={} tok_cache_write={} tok_out={} tools={} model={} sid={} r={}",
@@ -4532,7 +4534,8 @@ impl InProcessChatTurnBridge {
                     .and_then(|function| function.get("name"))
                     .and_then(Value::as_str)
                     .map(|name| json!({ "name": name }));
-                let final_usage = crate::turn::token_usage::TokenUsage::from_json_map(&usage);
+                let final_usage =
+                    crate::turn::token_usage::TokenUsage::from_partial_json_map(&usage);
                 if llm_steps.is_empty() {
                     llm_steps.push(json!({
                         "step": "llm",
@@ -4660,8 +4663,100 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
+}
+
+fn required_bridge_header(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<String, (StatusCode, String)> {
+    header_str(headers, name).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("missing required bridge header {name}"),
+        )
+    })
+}
+
+fn optional_positive_u32_header(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<Option<u32>, (StatusCode, String)> {
+    let Some(value) = header_str(headers, name) else {
+        return Ok(None);
+    };
+    let Some(parsed) = value
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("bridge header {name} must be a positive u32"),
+        ));
+    };
+    Ok(Some(parsed))
+}
+
+fn parse_bridge_payload(body: &Bytes) -> Result<Value, (StatusCode, String)> {
+    let payload = serde_json::from_slice::<Value>(body).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid bridge request JSON: {error}"),
+        )
+    })?;
+    if payload.is_object() {
+        Ok(payload)
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "bridge request body must be a JSON object".to_string(),
+        ))
+    }
+}
+
+fn bridge_round_index(payload: &Value) -> Result<u32, (StatusCode, String)> {
+    let Some(value) = payload.get("round_index") else {
+        return Ok(0);
+    };
+    let Some(round_index) = value.as_u64().and_then(|value| u32::try_from(value).ok()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "round_index must be a non-negative u32".to_string(),
+        ));
+    };
+    Ok(round_index)
+}
+
+fn optional_payload_array(
+    payload: &Value,
+    field: &'static str,
+) -> Result<Vec<Value>, (StatusCode, String)> {
+    match payload.get(field) {
+        Some(Value::Array(values)) => Ok(values.clone()),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("bridge payload field `{field}` must be an array"),
+        )),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn optional_payload_object(
+    payload: &Value,
+    field: &'static str,
+) -> Result<Map<String, Value>, (StatusCode, String)> {
+    match payload.get(field) {
+        Some(Value::Object(values)) => Ok(values.clone()),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("bridge payload field `{field}` must be an object"),
+        )),
+        None => Ok(Map::new()),
+    }
 }
 
 fn explain_requested(payload: &Value) -> bool {
@@ -6243,13 +6338,166 @@ mod tests {
     }
 
     #[test]
+    fn header_str_whitespace_value_returns_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mo-user-id", "   ".parse().unwrap());
+        assert!(header_str(&headers, "x-mo-user-id").is_none());
+    }
+
+    #[test]
     fn header_str_valid_value_returns_some() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-mo-user-id", "user-123".parse().unwrap());
+        headers.insert("x-mo-user-id", " user-123 ".parse().unwrap());
         assert_eq!(
             header_str(&headers, "x-mo-user-id").as_deref(),
             Some("user-123")
         );
+    }
+
+    #[test]
+    fn required_bridge_header_rejects_missing_or_blank_identity() {
+        let mut headers = HeaderMap::new();
+        let err = required_bridge_header(&headers, "x-mo-session-id")
+            .expect_err("missing bridge identity must fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("x-mo-session-id"));
+
+        headers.insert("x-mo-session-id", "   ".parse().unwrap());
+        let err = required_bridge_header(&headers, "x-mo-session-id")
+            .expect_err("blank bridge identity must fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("x-mo-session-id"));
+    }
+
+    #[test]
+    fn required_bridge_header_returns_trimmed_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mo-session-id", " session-123 ".parse().unwrap());
+        assert_eq!(
+            required_bridge_header(&headers, "x-mo-session-id").expect("valid bridge identity"),
+            "session-123"
+        );
+    }
+
+    #[test]
+    fn optional_positive_u32_header_absent_or_blank_returns_none() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            optional_positive_u32_header(&headers, "x-mo-session-turn")
+                .expect("absent header is optional"),
+            None
+        );
+
+        headers.insert("x-mo-session-turn", "   ".parse().unwrap());
+        assert_eq!(
+            optional_positive_u32_header(&headers, "x-mo-session-turn")
+                .expect("blank header is treated as absent"),
+            None
+        );
+    }
+
+    #[test]
+    fn optional_positive_u32_header_accepts_trimmed_positive_u32() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mo-session-turn", " 42 ".parse().unwrap());
+        assert_eq!(
+            optional_positive_u32_header(&headers, "x-mo-session-turn")
+                .expect("positive u32 header"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn optional_positive_u32_header_rejects_invalid_present_values() {
+        for raw in ["0", "-1", "1.5", "not-a-number", "4294967296"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-mo-session-turn", raw.parse().unwrap());
+            let err = optional_positive_u32_header(&headers, "x-mo-session-turn")
+                .expect_err("present invalid numeric header must fail");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert!(err.1.contains("x-mo-session-turn"));
+        }
+    }
+
+    #[test]
+    fn parse_bridge_payload_rejects_invalid_json() {
+        let err = parse_bridge_payload(&Bytes::from_static(b"{not-json"))
+            .expect_err("invalid JSON must not become an empty payload");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("invalid bridge request JSON"));
+    }
+
+    #[test]
+    fn parse_bridge_payload_rejects_non_object_json() {
+        let err = parse_bridge_payload(&Bytes::from_static(br#"[]"#))
+            .expect_err("bridge payload must be an object");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn parse_bridge_payload_accepts_object_json() {
+        let payload =
+            parse_bridge_payload(&Bytes::from_static(br#"{"messages":[]}"#)).expect("valid object");
+        assert_eq!(payload["messages"], json!([]));
+    }
+
+    #[test]
+    fn bridge_round_index_defaults_to_zero_when_absent() {
+        assert_eq!(
+            bridge_round_index(&json!({})).expect("missing round_index defaults to zero"),
+            0
+        );
+    }
+
+    #[test]
+    fn bridge_round_index_accepts_u32() {
+        assert_eq!(
+            bridge_round_index(&json!({"round_index": 7})).expect("valid round_index"),
+            7
+        );
+    }
+
+    #[test]
+    fn bridge_round_index_rejects_negative_fractional_and_overflow() {
+        for payload in [
+            json!({"round_index": -1}),
+            json!({"round_index": 1.5}),
+            json!({"round_index": u64::from(u32::MAX) + 1}),
+        ] {
+            let err =
+                bridge_round_index(&payload).expect_err("invalid round_index must not be coerced");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert!(err.1.contains("round_index"));
+        }
+    }
+
+    #[test]
+    fn optional_payload_array_defaults_only_when_absent() {
+        assert!(
+            optional_payload_array(&json!({}), "tool_results")
+                .expect("absent optional array defaults")
+                .is_empty()
+        );
+
+        let err = optional_payload_array(&json!({"tool_results": {}}), "tool_results")
+            .expect_err("present wrong-type optional array must fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("tool_results"));
+    }
+
+    #[test]
+    fn optional_payload_object_defaults_only_when_absent() {
+        assert!(
+            optional_payload_object(&json!({}), "edge_profile")
+                .expect("absent optional object defaults")
+                .is_empty()
+        );
+
+        let err = optional_payload_object(&json!({"edge_profile": []}), "edge_profile")
+            .expect_err("present wrong-type optional object must fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("edge_profile"));
     }
 
     #[test]
@@ -6612,6 +6860,32 @@ mod tests {
         let event = turn_complete_event(&messages, "Committed the changes.", &tool_calls);
 
         assert_eq!(event["followup_suggestion"], "push it");
+    }
+
+    #[test]
+    fn bridge_tool_call_helpers_canonicalize_names() {
+        let tool_calls = vec![
+            json!({
+                "id": "call-1",
+                "function": {
+                    "name": " git ",
+                    "arguments": r#"{"action":"commit","message":"ship"}"#
+                }
+            }),
+            json!({
+                "id": "call-2",
+                "function": {
+                    "name": "   ",
+                    "arguments": "{}"
+                }
+            }),
+        ];
+
+        assert_eq!(tool_names_from_tool_calls(&tool_calls), vec!["git"]);
+        assert_eq!(
+            tool_markers_from_tool_calls(&tool_calls),
+            vec!["git:commit"]
+        );
     }
 
     // ── P1: L0 anchor appears in system prompt ──────────────────────────
@@ -7969,7 +8243,7 @@ mod tests {
             serde_json::json!(["github"]),
         );
 
-        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o-2024-08-06");
+        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o-2024-08-06", None);
         assert!(
             block.contains("<deferred-tools>"),
             "same effective context budget should preserve the CLI-rendered deferred block"
@@ -7994,7 +8268,7 @@ mod tests {
             ),
         );
 
-        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o");
+        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o", None);
         assert!(
             block.is_empty(),
             "bridge must not render deferred prompt text without the paired names manifest used by validator/tool_search"
@@ -8019,7 +8293,7 @@ mod tests {
             ),
         );
 
-        let block = deferred_tools_block_for_bridge_model(&ep, "claude-sonnet-4");
+        let block = deferred_tools_block_for_bridge_model(&ep, "claude-sonnet-4", None);
         assert!(
             block.is_empty(),
             "bridge must not reuse a deferred block sized for a smaller context window after final model resolution changes the budget"
@@ -8035,7 +8309,7 @@ mod tests {
             Value::String("<deferred-tools>\ngithub\n</deferred-tools>".to_string()),
         );
 
-        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o");
+        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o", None);
         assert!(
             block.is_empty(),
             "bridge must not guess the source budget when the edge_profile omits it"
@@ -8060,7 +8334,7 @@ mod tests {
             ),
         );
 
-        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o");
+        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o", None);
         assert!(
             block.is_empty(),
             "bridge must trust the explicit source context window instead of guessing from the default model budget"

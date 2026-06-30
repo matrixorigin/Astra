@@ -14,12 +14,15 @@ pub async fn run_session_http_matches_agent_sessions_row() {
     let session_id = &ctx.session_id;
     let path = format!("/sessions/{session_id}");
 
-    let row = sqlx::query("SELECT title, user_id, status FROM agent_sessions WHERE session_id = ?")
-        .bind(session_id.as_str())
-        .fetch_optional(&ctx.pool)
-        .await
-        .expect("agent_sessions SELECT bootstrap")
-        .expect("session row should exist after bootstrap POST /sessions");
+    let row = sqlx::query(
+        "SELECT title, user_id, status FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(session_id.as_str())
+    .bind(&ctx.user_id)
+    .fetch_optional(&ctx.pool)
+    .await
+    .expect("agent_sessions SELECT bootstrap")
+    .expect("session row should exist after bootstrap POST /sessions");
 
     let db_title = row.try_get::<String, _>("title").ok();
     let db_uid = row.get::<String, _>("user_id");

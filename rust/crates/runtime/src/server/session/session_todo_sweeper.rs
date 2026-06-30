@@ -171,8 +171,8 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
     // also lock all rows for a session via FOR UPDATE). Without this,
     // a mutator DELETE+INSERT that restores an in_progress row from its
     // stale in-memory snapshot can silently overwrite a sweeper pause.
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT session_id, todo_id, metadata FROM session_todos \
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT user_id, session_id, todo_id, metadata FROM session_todos \
          WHERE status = 'in_progress' \
            AND updated_at < DATE_SUB(NOW(6), INTERVAL ? HOUR) \
          LIMIT ? \
@@ -185,7 +185,7 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
     .map_err(|e| format!("stale-sweep query/decode: {e}"))?;
 
     let mut affected = 0u64;
-    for (session_id, todo_id, metadata) in &rows {
+    for (user_id, session_id, todo_id, metadata) in &rows {
         // Defense-in-depth: skip plan-derived tasks even if the SQL
         // JSON filter missed them (e.g. due to MatrixOne JSON function
         // differences). The plan orchestrator owns their lifecycle.
@@ -193,6 +193,7 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
             if meta.contains("\"plan_subtask_id\"") {
                 tracing::warn!(
                     target: "astra_runtime::session_todo_sweeper",
+                    user_id = %user_id,
                     session_id = %session_id,
                     todo_id = %todo_id,
                     "Stale-sweep: plan-derived task passed SQL filter — \
@@ -212,10 +213,11 @@ pub(crate) async fn run_stale_in_progress_sweep(pool: SharedPool) -> Result<u64,
              SET status = 'paused', \
                  metadata = ?, \
                  updated_at = NOW(6) \
-             WHERE session_id = ? AND todo_id = ? AND status = 'in_progress' \
+             WHERE user_id = ? AND session_id = ? AND todo_id = ? AND status = 'in_progress' \
                AND updated_at < DATE_SUB(NOW(6), INTERVAL ? HOUR)",
         )
         .bind(metadata_json)
+        .bind(user_id)
         .bind(session_id)
         .bind(todo_id)
         .bind(STALE_THRESHOLD_HOURS as i64)
@@ -298,8 +300,8 @@ async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Resul
             .await
             .map_err(|e| format!("completed-auto-archive tx begin: {e}"))?;
 
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT session_id, todo_id FROM session_todos \
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT user_id, session_id, todo_id FROM session_todos \
              WHERE status IN ('completed', 'failed', 'cancelled') \
                AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
              ORDER BY updated_at ASC \
@@ -316,15 +318,17 @@ async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Resul
         }
 
         let mut affected = 0u64;
-        let mut archived_by_session: HashMap<String, HashSet<String>> = HashMap::new();
-        for (session_id, todo_id) in &rows {
+        let mut archived_by_owner_session: HashMap<(String, String), HashSet<String>> =
+            HashMap::new();
+        for (user_id, session_id, todo_id) in &rows {
             let result = sqlx::query(
                 "UPDATE session_todos \
                  SET status = 'archived', archived_at = NOW(6), updated_at = NOW(6) \
-                 WHERE session_id = ? AND todo_id = ? \
+                 WHERE user_id = ? AND session_id = ? AND todo_id = ? \
                    AND status IN ('completed', 'failed', 'cancelled') \
                    AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
             )
+            .bind(user_id)
             .bind(session_id)
             .bind(todo_id)
             .bind(days)
@@ -334,15 +338,16 @@ async fn run_completed_auto_archive_batch(pool: SharedPool, limit: i64) -> Resul
             let rows_affected = result.rows_affected();
             affected = affected.saturating_add(rows_affected);
             if rows_affected > 0 {
-                archived_by_session
-                    .entry(session_id.clone())
+                archived_by_owner_session
+                    .entry((user_id.clone(), session_id.clone()))
                     .or_default()
                     .insert(todo_id.clone());
             }
         }
 
-        for (session_id, archived_ids) in &archived_by_session {
-            detach_auto_archived_dependency_edges(&mut tx, session_id, archived_ids).await?;
+        for ((user_id, session_id), archived_ids) in &archived_by_owner_session {
+            detach_auto_archived_dependency_edges(&mut tx, user_id, session_id, archived_ids)
+                .await?;
         }
 
         tx.commit()
@@ -386,6 +391,7 @@ fn encode_edge_ids(ids: &[String]) -> Result<Option<String>, String> {
 
 async fn detach_auto_archived_dependency_edges(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
     session_id: &str,
     archived_ids: &HashSet<String>,
 ) -> Result<(), String> {
@@ -395,11 +401,13 @@ async fn detach_auto_archived_dependency_edges(
 
     let rows = sqlx::query(
         "SELECT todo_id, blocks, blocked_by FROM session_todos \
-         WHERE session_id = ? \
+         WHERE user_id = ? \
+           AND session_id = ? \
            AND (blocks IS NOT NULL OR blocked_by IS NOT NULL) \
          ORDER BY ordinal ASC \
          FOR UPDATE",
     )
+    .bind(user_id)
     .bind(session_id)
     .fetch_all(&mut **tx)
     .await
@@ -432,10 +440,11 @@ async fn detach_auto_archived_dependency_edges(
         sqlx::query(
             "UPDATE session_todos \
              SET blocks = ?, blocked_by = ? \
-             WHERE session_id = ? AND todo_id = ?",
+             WHERE user_id = ? AND session_id = ? AND todo_id = ?",
         )
         .bind(blocks_json)
         .bind(blocked_by_json)
+        .bind(user_id)
         .bind(session_id)
         .bind(&todo_id)
         .execute(&mut **tx)
@@ -473,8 +482,8 @@ async fn run_archive_gc_batch(pool: SharedPool, limit: i64) -> Result<u64, Strin
             .await
             .map_err(|e| format!("archive-gc tx begin: {e}"))?;
 
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT session_id, todo_id FROM session_todos \
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT user_id, session_id, todo_id FROM session_todos \
              WHERE status = 'archived' \
                AND archived_at IS NOT NULL \
                AND archived_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
@@ -492,13 +501,14 @@ async fn run_archive_gc_batch(pool: SharedPool, limit: i64) -> Result<u64, Strin
         }
 
         let mut affected = 0u64;
-        for (session_id, todo_id) in &rows {
+        for (user_id, session_id, todo_id) in &rows {
             let result = sqlx::query(
                 "DELETE FROM session_todos \
-                 WHERE session_id = ? AND todo_id = ? AND status = 'archived' \
+                 WHERE user_id = ? AND session_id = ? AND todo_id = ? AND status = 'archived' \
                    AND archived_at IS NOT NULL \
                    AND archived_at < DATE_SUB(NOW(6), INTERVAL ? DAY)",
             )
+            .bind(user_id)
             .bind(session_id)
             .bind(todo_id)
             .bind(days)
@@ -907,6 +917,37 @@ mod tests {
         }
     }
 
+    async fn cleanup_sweeper_fixture_for_owner(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        session_id: &str,
+        user_id: &str,
+    ) {
+        sqlx::query("DELETE FROM session_todo_idempotency WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("cleanup session todo sweeper fixture session_todo_idempotency");
+        sqlx::query("DELETE FROM session_todos WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("cleanup session todo sweeper fixture session_todos");
+        sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("cleanup session todo sweeper fixture session_todo_counters");
+        sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("cleanup session todo sweeper fixture agent_sessions");
+    }
+
     #[tokio::test]
     #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
     #[serial_test::serial(session_todo_sweeper_db)]
@@ -928,13 +969,7 @@ mod tests {
 
         let session_id = format!("todo-auto-archive-{}", uuid::Uuid::new_v4());
         let user_id = format!("user-{}", uuid::Uuid::new_v4());
-        let cleanup = || async {
-            let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
-                .bind(&session_id)
-                .execute(&pool)
-                .await;
-        };
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
 
         sqlx::query(
             "INSERT INTO session_todos (\
@@ -973,9 +1008,10 @@ mod tests {
 
         let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT status, CAST(archived_at AS CHAR) AS archived_at, blocks, blocked_by \
-             FROM session_todos WHERE session_id = ? ORDER BY ordinal ASC",
+             FROM session_todos WHERE session_id = ? AND user_id = ? ORDER BY ordinal ASC",
         )
         .bind(&session_id)
+        .bind(&user_id)
         .fetch_all(&pool)
         .await
         .expect("load session_todos");
@@ -994,7 +1030,97 @@ mod tests {
         assert_eq!(rows[4].0, "archived");
         assert!(rows[4].1.is_some(), "{rows:?}");
 
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+    #[serial_test::serial(session_todo_sweeper_db)]
+    async fn completed_auto_archive_detaches_dependencies_only_within_owner_session() {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 to run this ignored test"
+        );
+        let settings = test_matrixone_settings();
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        astra_services::storage::ensure_core_schema(&settings, &catalog)
+            .await
+            .expect("ensure_core_schema");
+        let pool = astra_core::connect_matrixone(&settings)
+            .await
+            .expect("connect matrixone");
+        let shared = astra_core::SharedPool::new(&settings)
+            .await
+            .expect("SharedPool::new");
+
+        let session_id = format!("todo-auto-archive-owner-{}", uuid::Uuid::new_v4());
+        let user_a = format!("user-a-{}", uuid::Uuid::new_v4());
+        let user_b = format!("user-b-{}", uuid::Uuid::new_v4());
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_a).await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_b).await;
+
+        sqlx::query(
+            "INSERT INTO session_todos (\
+                 session_id, todo_id, user_id, ordinal, title, status, blocked_by, archived_at, created_at, updated_at\
+             ) VALUES \
+                 (?, 'task-1', ?, 0, 'old done owner a', 'completed', NULL, NULL, NOW(6), DATE_SUB(NOW(6), INTERVAL 1000 DAY)), \
+                 (?, 'task-2', ?, 1, 'blocked owner a', 'in_progress', '[\"task-1\"]', NULL, NOW(6), NOW(6)), \
+                 (?, 'task-1', ?, 0, 'same id owner b', 'in_progress', NULL, NULL, NOW(6), NOW(6)), \
+                 (?, 'task-2', ?, 1, 'blocked owner b', 'in_progress', '[\"task-1\"]', NULL, NOW(6), NOW(6))",
+        )
+        .bind(&session_id)
+        .bind(&user_a)
+        .bind(&session_id)
+        .bind(&user_a)
+        .bind(&session_id)
+        .bind(&user_b)
+        .bind(&session_id)
+        .bind(&user_b)
+        .execute(&pool)
+        .await
+        .expect("seed owner-colliding session_todos");
+
+        let archived = run_completed_auto_archive_batch(shared, 50)
+            .await
+            .expect("auto archive");
+        assert!(
+            archived >= 1,
+            "global sweeper may also archive unrelated stale rows; got {archived}"
+        );
+
+        let owner_a_blocked_by: Option<String> = sqlx::query_scalar(
+            "SELECT blocked_by FROM session_todos \
+             WHERE user_id = ? AND session_id = ? AND todo_id = 'task-2'",
+        )
+        .bind(&user_a)
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load owner a dependent row");
+        let owner_b_blocked_by: Option<String> = sqlx::query_scalar(
+            "SELECT blocked_by FROM session_todos \
+             WHERE user_id = ? AND session_id = ? AND todo_id = 'task-2'",
+        )
+        .bind(&user_b)
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load owner b dependent row");
+
+        assert!(
+            owner_a_blocked_by.is_none(),
+            "owner a dependency edge should detach after task-1 is archived"
+        );
+        assert_eq!(
+            owner_b_blocked_by.as_deref(),
+            Some("[\"task-1\"]"),
+            "owner b dependency edge must not be detached by owner a archive"
+        );
+
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_a).await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_b).await;
     }
 
     #[tokio::test]
@@ -1021,13 +1147,7 @@ mod tests {
 
         let session_id = format!("todo-auto-archive-bad-edges-{}", uuid::Uuid::new_v4());
         let user_id = format!("user-{}", uuid::Uuid::new_v4());
-        let cleanup = || async {
-            let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
-                .bind(&session_id)
-                .execute(&pool)
-                .await;
-        };
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
 
         sqlx::query(
             "INSERT INTO session_todos (\
@@ -1051,9 +1171,10 @@ mod tests {
 
         let row: (String, Option<String>, Option<String>) = sqlx::query_as(
             "SELECT status, CAST(archived_at AS CHAR) AS archived_at, blocks \
-             FROM session_todos WHERE session_id = ? AND todo_id = ?",
+             FROM session_todos WHERE session_id = ? AND user_id = ? AND todo_id = ?",
         )
         .bind(&session_id)
+        .bind(&user_id)
         .bind("task-1")
         .fetch_one(&pool)
         .await
@@ -1065,7 +1186,7 @@ mod tests {
         assert!(row.1.is_none(), "{row:?}");
         assert_eq!(row.2.as_deref(), Some("not-json"));
 
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -1092,13 +1213,7 @@ mod tests {
 
         let session_id = format!("todo-auto-archive-limit-{}", uuid::Uuid::new_v4());
         let user_id = format!("user-{}", uuid::Uuid::new_v4());
-        let cleanup = || async {
-            let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
-                .bind(&session_id)
-                .execute(&pool)
-                .await;
-        };
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
 
         sqlx::query(
             "INSERT INTO session_todos (\
@@ -1122,9 +1237,10 @@ mod tests {
 
         let counts: Vec<(String, i64)> = sqlx::query_as(
             "SELECT status, COUNT(*) AS count FROM session_todos \
-             WHERE session_id = ? GROUP BY status ORDER BY status",
+             WHERE session_id = ? AND user_id = ? GROUP BY status ORDER BY status",
         )
         .bind(&session_id)
+        .bind(&user_id)
         .fetch_all(&pool)
         .await
         .expect("load status counts");
@@ -1134,7 +1250,7 @@ mod tests {
             "batch limit should archive exactly one old completed row: {counts:?}"
         );
 
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -1161,13 +1277,7 @@ mod tests {
 
         let session_id = format!("todo-archive-gc-limit-{}", uuid::Uuid::new_v4());
         let user_id = format!("user-{}", uuid::Uuid::new_v4());
-        let cleanup = || async {
-            let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
-                .bind(&session_id)
-                .execute(&pool)
-                .await;
-        };
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
 
         sqlx::query(
             "INSERT INTO session_todos (\
@@ -1189,18 +1299,20 @@ mod tests {
             .expect("archive gc batch");
         assert_eq!(deleted, 1);
 
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM session_todos WHERE session_id = ?")
-                .bind(&session_id)
-                .fetch_one(&pool)
-                .await
-                .expect("remaining count");
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_todos WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("remaining count");
         assert_eq!(
             remaining, 1,
             "batch limit should delete exactly one archived row"
         );
 
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -1227,21 +1339,7 @@ mod tests {
 
         let session_id = format!("todo-auto-pause-{}", uuid::Uuid::new_v4());
         let user_id = format!("user-{}", uuid::Uuid::new_v4());
-        let cleanup = || async {
-            let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
-                .bind(&session_id)
-                .execute(&pool)
-                .await;
-            let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
-                .bind(&session_id)
-                .execute(&pool)
-                .await;
-            let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
-                .bind(&session_id)
-                .execute(&pool)
-                .await;
-        };
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
         sqlx::query(
             "INSERT INTO agent_sessions (session_id, user_id, agent_id, title, status, metadata)
              VALUES (?, ?, 'session-todo-sweeper-test', 'session todo sweeper test', 'active', '{}')",
@@ -1270,9 +1368,10 @@ mod tests {
         sqlx::query(
             "UPDATE session_todos \
              SET updated_at = DATE_SUB(NOW(6), INTERVAL 25 HOUR) \
-             WHERE session_id = ? AND todo_id = ?",
+             WHERE session_id = ? AND user_id = ? AND todo_id = ?",
         )
         .bind(&session_id)
+        .bind(&user_id)
         .bind("task-1")
         .execute(&pool)
         .await
@@ -1306,7 +1405,7 @@ mod tests {
             "active list should treat paused work as first-class open work: {active}"
         );
 
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -1333,13 +1432,7 @@ mod tests {
 
         let session_id = format!("todo-auto-pause-badmeta-{}", uuid::Uuid::new_v4());
         let user_id = format!("user-{}", uuid::Uuid::new_v4());
-        let cleanup = || async {
-            let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
-                .bind(&session_id)
-                .execute(&pool)
-                .await;
-        };
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
 
         sqlx::query(
             "INSERT INTO session_todos (\
@@ -1362,9 +1455,11 @@ mod tests {
         );
 
         let row: (String, String) = sqlx::query_as(
-            "SELECT status, metadata FROM session_todos WHERE session_id = ? AND todo_id = ?",
+            "SELECT status, metadata FROM session_todos \
+             WHERE session_id = ? AND user_id = ? AND todo_id = ?",
         )
         .bind(&session_id)
+        .bind(&user_id)
         .bind("task-1")
         .fetch_one(&pool)
         .await
@@ -1377,6 +1472,6 @@ mod tests {
             "invalid_or_non_object_metadata_before_auto_pause"
         );
 
-        cleanup().await;
+        cleanup_sweeper_fixture_for_owner(&pool, &session_id, &user_id).await;
     }
 }

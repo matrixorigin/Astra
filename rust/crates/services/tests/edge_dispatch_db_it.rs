@@ -69,14 +69,14 @@ async fn edge_dispatch_full_lifecycle() {
 
     // 4. Deliver result (with edge_agent_id for auth)
     let ok = svc
-        .deliver_result(&request_id, &agent_id, r#"{"output":"hello"}"#)
+        .deliver_result(&user_id, &request_id, &agent_id, r#"{"output":"hello"}"#)
         .await
         .expect("deliver_result");
     assert!(ok, "deliver_result should return true for existing request");
 
     // 6. wait_result returns the result
     let result = svc
-        .wait_result(&request_id, std::time::Duration::from_secs(5))
+        .wait_result(&user_id, &request_id, std::time::Duration::from_secs(5))
         .await
         .expect("wait_result");
     assert!(
@@ -96,9 +96,10 @@ async fn edge_dispatch_deliver_result_nonexistent_returns_false() {
     require_env();
     let pool = common::setup_pool().await;
     let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user_id = format!("ed-miss-usr-{}", unique_suffix());
 
     let ok = svc
-        .deliver_result("no-such-request", "any-agent", "{}")
+        .deliver_result(&user_id, "no-such-request", "any-agent", "{}")
         .await
         .expect("deliver_result");
     assert!(
@@ -126,7 +127,12 @@ async fn edge_dispatch_deliver_result_wrong_agent_rejected() {
 
     // Try to deliver with a DIFFERENT agent — must be rejected
     let ok = svc
-        .deliver_result(&request_id, "wrong-agent-id", r#"{"output":"stolen"}"#)
+        .deliver_result(
+            &user_id,
+            &request_id,
+            "wrong-agent-id",
+            r#"{"output":"stolen"}"#,
+        )
         .await
         .expect("deliver_result");
     assert!(
@@ -136,7 +142,7 @@ async fn edge_dispatch_deliver_result_wrong_agent_rejected() {
 
     // Verify the original agent can still deliver
     let ok = svc
-        .deliver_result(&request_id, &agent_id, r#"{"output":"legit"}"#)
+        .deliver_result(&user_id, &request_id, &agent_id, r#"{"output":"legit"}"#)
         .await
         .expect("deliver_result");
     assert!(
@@ -163,7 +169,7 @@ async fn edge_dispatch_wait_result_timeout() {
 
     // 200ms timeout — should not be enough to deliver result
     let result = svc
-        .wait_result(&request_id, std::time::Duration::from_millis(200))
+        .wait_result(&user_id, &request_id, std::time::Duration::from_millis(200))
         .await
         .expect("wait_result");
     assert!(result.is_none(), "wait_result should time out (Some=None)");
@@ -192,6 +198,68 @@ async fn edge_dispatch_poll_isolation() {
     assert!(rows.is_empty(), "user B should not see user A's dispatch");
 }
 
+/// request_id uniqueness is scoped by owner; another user may use the same request_id
+/// without seeing or completing the owner's dispatch.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_request_id_is_owner_scoped() {
+    require_env();
+    let (pool, _settings) = common::setup_pool_and_settings().await;
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+
+    let user_a = format!("ed-own-usr-a-{}", unique_suffix());
+    let user_b = format!("ed-own-usr-b-{}", unique_suffix());
+    let agent_a = format!("ed-own-agent-a-{}", unique_suffix());
+    let agent_b = format!("ed-own-agent-b-{}", unique_suffix());
+    let request_id = Uuid::new_v4().to_string();
+
+    let dispatch_a = svc
+        .insert_dispatch(&user_a, &agent_a, &request_id, r#"{"owner":"a"}"#)
+        .await
+        .expect("insert user A dispatch");
+    let dispatch_b = svc
+        .insert_dispatch(&user_b, &agent_b, &request_id, r#"{"owner":"b"}"#)
+        .await
+        .expect("insert user B dispatch with same request_id");
+    assert_ne!(
+        dispatch_a, dispatch_b,
+        "same request_id across owners must create distinct dispatch rows"
+    );
+
+    let wrong_owner = svc
+        .deliver_result(&user_b, &request_id, &agent_a, r#"{"output":"stolen"}"#)
+        .await
+        .expect("wrong owner deliver_result");
+    assert!(
+        !wrong_owner,
+        "matching request_id and agent_id must not cross owner boundary"
+    );
+
+    let ok_a = svc
+        .deliver_result(&user_a, &request_id, &agent_a, r#"{"output":"owner-a"}"#)
+        .await
+        .expect("owner A deliver_result");
+    assert!(ok_a, "owner A should complete its own dispatch");
+    let ok_b = svc
+        .deliver_result(&user_b, &request_id, &agent_b, r#"{"output":"owner-b"}"#)
+        .await
+        .expect("owner B deliver_result");
+    assert!(ok_b, "owner B should complete its own dispatch");
+
+    let result_a = svc
+        .wait_result(&user_a, &request_id, std::time::Duration::from_secs(1))
+        .await
+        .expect("wait owner A result")
+        .expect("owner A result");
+    let result_b = svc
+        .wait_result(&user_b, &request_id, std::time::Duration::from_secs(1))
+        .await
+        .expect("wait owner B result")
+        .expect("owner B result");
+    assert!(result_a.contains("owner-a"));
+    assert!(result_b.contains("owner-b"));
+}
+
 /// cleanup_stale removes completed dispatches older than N seconds.
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
@@ -209,7 +277,7 @@ async fn edge_dispatch_cleanup_stale_removes_completed() {
         .expect("insert_dispatch");
 
     // Complete it
-    svc.deliver_result(&request_id, &agent_id, r#"{"done":true}"#)
+    svc.deliver_result(&user_id, &request_id, &agent_id, r#"{"done":true}"#)
         .await
         .expect("deliver_result");
 
@@ -219,8 +287,9 @@ async fn edge_dispatch_cleanup_stale_removes_completed() {
     sqlx::query(
         "UPDATE edge_pending_dispatch \
          SET completed_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) \
-         WHERE request_id = ?",
+         WHERE user_id = ? AND request_id = ?",
     )
+    .bind(&user_id)
     .bind(&request_id)
     .execute(pool.get())
     .await
@@ -236,7 +305,7 @@ async fn edge_dispatch_cleanup_stale_removes_completed() {
 
     // wait_result now returns None (row was deleted)
     let result = svc
-        .wait_result(&request_id, std::time::Duration::from_millis(100))
+        .wait_result(&user_id, &request_id, std::time::Duration::from_millis(100))
         .await
         .expect("wait_result after cleanup");
     assert!(result.is_none(), "request should be gone after cleanup");

@@ -248,6 +248,8 @@ pub struct ContextBudget {
     pub compact_config: CompactConfig,
 }
 
+pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
+
 impl ContextBudget {
     /// Create a ContextBudget from RuntimeConfig, applying model-specific limits.
     ///
@@ -259,8 +261,18 @@ impl ContextBudget {
         config: &astra_config::runtime_config::RuntimeConfig,
         model: Option<&str>,
     ) -> Self {
+        Self::from_runtime_config_with_context_window(config, model, None)
+    }
+
+    /// Create a ContextBudget from RuntimeConfig, applying an optional
+    /// server-side model registry context_window before static model heuristics.
+    pub fn from_runtime_config_with_context_window(
+        config: &astra_config::runtime_config::RuntimeConfig,
+        model: Option<&str>,
+        context_window_tokens: Option<u32>,
+    ) -> Self {
         // Get model-specific limits
-        let base = budget_for_model(model);
+        let base = budget_for_model_with_override(model, context_window_tokens);
 
         // Apply RuntimeConfig overrides
         Self {
@@ -325,65 +337,40 @@ impl ContextBudget {
 impl Default for ContextBudget {
     fn default() -> Self {
         Self {
-            model_limit: 128_000,
+            model_limit: DEFAULT_CONTEXT_WINDOW_TOKENS,
             compact_threshold: 0.75,
             keep_recent_turns: 6,
             memory_budget_chars: 8_000,
-            output_reserve_ratio: 0.15,
+            output_reserve_ratio: 0.10,
             compact_config: CompactConfig::default(),
         }
     }
 }
 
-/// Return a ContextBudget tuned for a known model name.
+/// Return a context budget for the current model.
+///
+/// Model names are intentionally not used as context-window metadata. If the
+/// model registry has a `context_window`, call
+/// [`budget_for_model_with_override`]; otherwise this returns the generic 200K
+/// default.
 /// Convenience wrapper around [`budget_for_model_with_override`].
 pub fn budget_for_model(model: Option<&str>) -> ContextBudget {
     budget_for_model_with_override(model, None)
 }
 
-/// Return a ContextBudget tuned for a known model name.
+/// Return a context budget for the current model.
 ///
 /// When `config_context_window` is provided (from `.models.yaml` or the DB),
-/// it takes precedence over the hardcoded lookup table. When `None`, falls
-/// back to the shared astra-core context-window lookup keyed by model name.
+/// it is authoritative. When it is absent, use the generic 200K default rather
+/// than inferring from the model name.
 pub fn budget_for_model_with_override(
-    model: Option<&str>,
+    _model: Option<&str>,
     config_context_window: Option<u32>,
 ) -> ContextBudget {
-    if let Some(cw) = config_context_window {
-        let cw = cw as usize;
-        return ContextBudget {
-            model_limit: cw,
-            output_reserve_ratio: if cw >= 128_000 { 0.10 } else { 0.15 },
-            ..Default::default()
-        };
-    }
-
-    let name = model.unwrap_or("");
-    let lower = name.to_ascii_lowercase();
-    let limit = astra_core::runtime_limits::context_window_for_model(name)
+    let limit = config_context_window
         .map(|cw| cw as usize)
-        .unwrap_or(128_000);
-    let reserve = match lower.as_str() {
-        // OpenAI — GPT-5 family (256K context)
-        m if m.contains("gpt-5") => 0.12,
-        // OpenAI — GPT-4o / GPT-4.1 / GPT-4 Turbo (128K, 16K output)
-        m if m.contains("gpt-4o") || m.contains("gpt-4.1") || m.contains("gpt-4-turbo") => 0.12,
-        m if m.contains("gpt-3.5") => 0.12,
-        // Anthropic — Claude 4.6+/4.7 and Gemini / DeepSeek V4 prefer a smaller reserve.
-        m if m.contains("opus-4-6")
-            || m.contains("sonnet-4-6")
-            || m.contains("haiku-4-6")
-            || m.contains("opus-4-7")
-            || m.contains("sonnet-4-7")
-            || m.contains("haiku-4-7")
-            || m.contains("gemini")
-            || m.contains("deepseek-v4") =>
-        {
-            0.10
-        }
-        _ => 0.15,
-    };
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+    let reserve = if limit >= 128_000 { 0.10 } else { 0.15 };
 
     ContextBudget {
         model_limit: limit,
@@ -440,60 +427,24 @@ mod tests {
         })
     }
 
-    // === budget_for_model (model resolution, 15→2) ===
+    // === budget_for_model ===
 
     #[test]
     fn test_budget_for_model() {
-        // gemini 1M
-        let b = budget_for_model(Some("gemini-2.5-pro"));
-        assert_eq!(b.model_limit, 1_000_000);
-        assert_eq!(b.output_reserve_ratio, 0.10);
-
-        // o1 200k
-        let b = budget_for_model(Some("o1"));
-        assert_eq!(b.model_limit, 200_000);
-
-        // o3 200k
-        let b = budget_for_model(Some("o3"));
-        assert_eq!(b.model_limit, 200_000);
-
-        // gpt-5
-        let b = budget_for_model(Some("gpt-5"));
-        assert!(b.model_limit >= 128_000);
-
-        // claude legacy (sonnet-4-20250514 → 200k, reserve 0.10)
-        let b = budget_for_model(Some("claude-sonnet-4-20250514"));
-        assert_eq!(b.model_limit, 128_000);
-        assert_eq!(b.output_reserve_ratio, 0.15);
-
-        // claude 4.6 gets 1M
-        let b = budget_for_model(Some("claude-opus-4-6-20250514"));
-        assert_eq!(b.model_limit, 1_000_000);
-
-        // claude 4.7 gets 1M
-        let b = budget_for_model(Some("claude-sonnet-4-7-20250514"));
-        assert_eq!(b.model_limit, 1_000_000);
-
-        // deepseek v4 gets 1M
-        let b = budget_for_model(Some("deepseek-v4"));
-        assert_eq!(b.model_limit, 1_000_000);
-
-        // qwen 128k
-        let b = budget_for_model(Some("qwen3-coder"));
-        assert_eq!(b.model_limit, 128_000);
-
-        // unknown model defaults
-        let b = budget_for_model(Some("unknown-model-xyz"));
-        assert_eq!(b.model_limit, 128_000);
-        assert_eq!(b.output_reserve_ratio, 0.15);
-
-        // None defaults
-        let b = budget_for_model(None);
-        assert_eq!(b.model_limit, 128_000);
-
-        // empty string defaults
-        let b = budget_for_model(Some(""));
-        assert_eq!(b.model_limit, 128_000);
+        for model in [
+            Some("gemini-2.5-pro"),
+            Some("o1"),
+            Some("gpt-5"),
+            Some("claude-opus-4-6-20250514"),
+            Some("deepseek-v4"),
+            Some("unknown-model-xyz"),
+            None,
+            Some(""),
+        ] {
+            let b = budget_for_model(model);
+            assert_eq!(b.model_limit, DEFAULT_CONTEXT_WINDOW_TOKENS);
+            assert_eq!(b.output_reserve_ratio, 0.10);
+        }
     }
 
     #[test]
@@ -513,32 +464,32 @@ mod tests {
         assert_eq!(b.model_limit, 10_000);
         assert_eq!(b.output_reserve_ratio, 0.15);
 
-        // no override falls back to hardcoded
+        // no override uses the generic default; model names are not metadata
         let b = budget_for_model_with_override(Some("claude-sonnet-4-20250514"), None);
-        assert_eq!(b.model_limit, 128_000);
-        assert_eq!(b.output_reserve_ratio, 0.15);
+        assert_eq!(b.model_limit, DEFAULT_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(b.output_reserve_ratio, 0.10);
 
         // no override for unknown falls back to default
         let b = budget_for_model_with_override(Some("unknown-model"), None);
-        assert_eq!(b.model_limit, 128_000);
-        assert_eq!(b.output_reserve_ratio, 0.15);
+        assert_eq!(b.model_limit, DEFAULT_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(b.output_reserve_ratio, 0.10);
     }
 
     // === effective_input_limit (8→1) ===
 
     #[test]
     fn test_effective_input_limit() {
-        // default: 128k * 0.85 = 108_800
+        // default: 200k * 0.9 = 180_000
         let b = ContextBudget::default();
-        assert_eq!(b.effective_input_limit(), 108_800);
+        assert_eq!(b.effective_input_limit(), 180_000);
 
-        // claude legacy: 200k * 0.9 = 180_000
+        // model names do not change the default without registry metadata
         let b = budget_for_model(Some("claude-sonnet-4-20250514"));
-        assert_eq!(b.effective_input_limit(), 108_800);
+        assert_eq!(b.effective_input_limit(), 180_000);
 
-        // gpt-4o: 128k * 0.88 = 112_640
+        // gpt-4o also uses the default without registry metadata
         let b = budget_for_model(Some("gpt-4o-2024-08-06"));
-        assert_eq!(b.effective_input_limit(), 112_640);
+        assert_eq!(b.effective_input_limit(), 180_000);
 
         // less than model_limit
         let b = ContextBudget::default();
@@ -881,10 +832,10 @@ mod tests {
 
     #[test]
     fn test_capped_output_tokens() {
-        // default (128k model) → 108_800*0.15 = 16320, min(16320, 16384) = 16320
+        // default (200k model) reserves more than the hard cap.
         let b = ContextBudget::default();
         let cap = capped_output_tokens(&b);
-        assert!(cap > 0 && cap <= 16_384);
+        assert_eq!(cap, 16_384);
 
         // large model (>128k)
         let b = budget_for_model(Some("claude-sonnet-4-20250514"));
@@ -899,7 +850,7 @@ mod tests {
         // full_reserve = 4500, min(4500, 8192) = 4500
         assert_eq!(capped_output_tokens(&b), 4_500);
 
-        // very large model
+        // model names do not alter the configured/default budget.
         let b = budget_for_model(Some("gemini-2.5-pro"));
         assert_eq!(capped_output_tokens(&b), 16_384);
     }
@@ -1030,11 +981,11 @@ mod tests {
     fn test_defaults_and_from_runtime_config() {
         // default budget
         let b = ContextBudget::default();
-        assert_eq!(b.model_limit, 128_000);
+        assert_eq!(b.model_limit, DEFAULT_CONTEXT_WINDOW_TOKENS);
         assert_eq!(b.compact_threshold, 0.75);
         assert_eq!(b.keep_recent_turns, 6);
         assert_eq!(b.memory_budget_chars, 8_000);
-        assert_eq!(b.output_reserve_ratio, 0.15);
+        assert_eq!(b.output_reserve_ratio, 0.10);
 
         // default compact config
         let c = CompactConfig::default();
@@ -1043,10 +994,17 @@ mod tests {
         assert_eq!(c.max_ptl_retries, 3);
         assert_eq!(c.summary_min_tier, CompactionTier::CompactHistory);
 
-        // from_runtime_config with claude model
+        // from_runtime_config without registry metadata uses the generic default.
         let config = astra_config::runtime_config::RuntimeConfig::default();
         let budget = ContextBudget::from_runtime_config(&config, Some("claude-sonnet-4-20250514"));
-        assert_eq!(budget.model_limit, 128_000);
+        assert_eq!(budget.model_limit, DEFAULT_CONTEXT_WINDOW_TOKENS);
+
+        let budget = ContextBudget::from_runtime_config_with_context_window(
+            &config,
+            Some("custom-model"),
+            Some(500_000),
+        );
+        assert_eq!(budget.model_limit, 500_000);
 
         // from_runtime_config applies compression settings
         use astra_config::runtime_config::{CompressionConfig, RuntimeConfig};

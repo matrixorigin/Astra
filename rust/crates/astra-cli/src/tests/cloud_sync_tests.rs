@@ -88,6 +88,7 @@ fn display_sync_status_no_crash_full_data() {
         preferences_last_sync: Some(chrono::Utc::now().to_rfc3339()),
         pending_pushes: 2,
         last_error: Some("connection reset by peer".into()),
+        ..Default::default()
     };
     slash_health::display_sync_status(&status);
 }

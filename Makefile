@@ -670,7 +670,7 @@ dev-seed:
 	@NO_PROXY=localhost ./rust/target/debug/astra admin login \
 		--username admin --password 11111111
 	@echo "Loading models from .models.yaml..."
-	@NO_PROXY=localhost ./rust/target/debug/astra admin model load .models.yaml
+	@NO_PROXY=localhost ./rust/target/debug/astra admin model load .models.yaml --update-existing
 	@echo ""
 	@echo "✅ Seed complete — admin@mo.com / 11111111"
 
@@ -839,6 +839,7 @@ test-ignored-integration:
 		echo "Note: no online/Matrix ignored suites selected. Use \`make test-online\` or set ASTRA_TEST_DB_IT=1."; \
 	fi
 	@if [ "$${ASTRA_TEST_DB_IT:-}" = "1" ]; then \
+		FAILED=""; \
 		JOBS_FLAG=""; \
 		if [ "$${ASTRA_TEST_DB_IT_TEST_THREADS:-}" = "1" ]; then \
 			JOBS_FLAG="-j 1"; \
@@ -854,7 +855,7 @@ test-ignored-integration:
 			--tests --run-ignored only \
 			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
 			-E 'not test(/perf_benchmark_/)' \
-			|| FAILED="$$FAILED integration"; \
+				|| FAILED="$$FAILED integration"; \
 		echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 			-p astra-runtime \

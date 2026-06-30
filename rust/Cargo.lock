@@ -658,6 +658,7 @@ dependencies = [
  "tree-sitter-typescript",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

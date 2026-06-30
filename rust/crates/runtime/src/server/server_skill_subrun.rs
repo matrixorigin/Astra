@@ -16,6 +16,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::SharedPool;
+use astra_runtime_env::validate_workspace_id;
 use astra_services::LlmTokenServiceConfig;
 
 use crate::FernetTokenEncryptor;
@@ -227,27 +228,27 @@ impl ServerSkillSubRunExecutor {
 
 impl ServerSkillSubRunExecutor {
     /// Provision a workspace directory for a skill sub-run.
-    fn provision_skill_workspace(&self, skill_name: &str, session_id: &str) -> std::path::PathBuf {
-        let sanitize = |s: &str| -> String {
-            s.chars()
-                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-                .collect()
-        };
-        let safe_session = sanitize(session_id);
-        let safe_skill = sanitize(skill_name);
-        assert!(!safe_session.is_empty(), "session_id must be non-empty");
+    fn provision_skill_workspace(
+        &self,
+        skill_name: &str,
+        session_id: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        validate_workspace_id(session_id)
+            .map_err(|source| format!("invalid skill sub-run session_id: {source}"))?;
+        let safe_skill = crate::skills::loader::sanitize_for_path(skill_name);
 
         let base = std::env::var("ASTRA_SERVER_WORKSPACES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir().join("astra-workspaces"));
         let dir_name = if safe_skill.is_empty() {
-            safe_session.clone()
+            session_id.to_string()
         } else {
-            format!("{}-skill-{}", safe_session, safe_skill)
+            format!("{}-skill-{}", session_id, safe_skill)
         };
         let workspace = base.join(&dir_name);
-        let _ = std::fs::create_dir_all(&workspace);
-        workspace
+        std::fs::create_dir_all(&workspace)
+            .map_err(|error| format!("failed to create skill sub-run workspace: {error}"))?;
+        Ok(workspace)
     }
 }
 
@@ -539,7 +540,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         // ── Wire ServerToolExecutor for skill sub-run tool execution ────
         {
-            let workspace = self.provision_skill_workspace(skill_name, &subrun_session_id);
+            let workspace = self.provision_skill_workspace(skill_name, &subrun_session_id)?;
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
 
             let mut builder = ToolExecutionService::builder();
@@ -688,6 +689,25 @@ mod tests {
         assert_eq!(
             executor.execution_binding_snapshot.as_ref(),
             Some(&snapshot)
+        );
+    }
+
+    #[test]
+    fn provision_skill_workspace_rejects_unsafe_session_identity() {
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-user".to_string(),
+            "test-session".to_string(),
+        );
+
+        let error = executor
+            .provision_skill_workspace("review", "session/123")
+            .expect_err("unsafe session id must fail instead of being sanitized");
+
+        assert!(
+            error.contains("invalid skill sub-run session_id"),
+            "unexpected error: {error}"
         );
     }
 

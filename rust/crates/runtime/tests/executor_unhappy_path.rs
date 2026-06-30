@@ -512,7 +512,7 @@ fn test_workspace_record(workspace_id: &str) -> WorkspaceRecord {
 #[tokio::test]
 async fn partial_workspace_creation_records_cleanup_debts() {
     let store = InMemoryWorkspaceRecordStore::new();
-    let owner_id = "owner-1";
+    let owner_id = "00000000-0000-0000-0000-000000000001";
     let ws_id = "ws-partial-fail";
 
     let record = test_workspace_record(ws_id);
@@ -558,7 +558,7 @@ async fn partial_workspace_creation_records_cleanup_debts() {
 #[tokio::test]
 async fn compound_workspace_failure_multiple_cleanup_debts() {
     let store = InMemoryWorkspaceRecordStore::new();
-    let owner_id = "owner-2";
+    let owner_id = "00000000-0000-0000-0000-000000000002";
     let ws_id = "ws-compound-fail";
 
     let record = test_workspace_record(ws_id);
@@ -641,8 +641,8 @@ async fn cleanup_debt_store_validation_rejects_invalid_input() {
 #[tokio::test]
 async fn workspace_source_cannot_be_claimed_by_two_owners() {
     let store = InMemoryWorkspaceRecordStore::new();
-    let owner_a = "owner-a";
-    let owner_b = "owner-b";
+    let owner_a = "00000000-0000-0000-0000-00000000000a";
+    let owner_b = "00000000-0000-0000-0000-00000000000b";
     let snapshot_id = "snap-123";
 
     let record_a = WorkspaceRecord {

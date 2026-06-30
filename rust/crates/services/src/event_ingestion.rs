@@ -16,18 +16,35 @@
 //!
 //! # Guarantees
 //!
-//! - **At-least-once delivery**: events may be re-sent on retry, deduped by event_id PK
-//! - **Backpressure**: bounded channel; if MatrixOne is slow, local journal is source of truth
+//! - **Retry after acceptance**: flushed batches are retained across transient
+//!   MatrixOne failures and retried; duplicate inserts are deduped by
+//!   `(user_id, event_id)` PK
+//! - **Backpressure**: bounded channel; async callers await capacity, sync
+//!   callers defer when running inside Tokio
 //! - **Graceful shutdown**: flush remaining buffer on drop
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 
+use astra_core::canonical_names::normalize_optional_name;
+
+const SESSION_END_EVENT_TYPE: &str = "session_end";
+pub const MIN_INGESTION_BATCH_SIZE: usize = 1;
+pub const MAX_INGESTION_BATCH_SIZE: usize = 200;
+pub const MIN_INGESTION_FLUSH_INTERVAL_SECS: u64 = 1;
+pub const MAX_INGESTION_FLUSH_INTERVAL_SECS: u64 = 300;
+pub const MIN_INGESTION_CHANNEL_CAPACITY: usize = 1;
+pub const MAX_INGESTION_CHANNEL_CAPACITY: usize = 10_000;
+pub const MIN_INGESTION_RETRIES: u32 = 1;
+pub const MAX_INGESTION_RETRIES: u32 = 8;
+const MAX_SHUTDOWN_DRAIN_PENDING_YIELDS: usize = 64;
+const DISCONNECTED_PENDING_DEFERRAL_LIMIT: usize = 1;
+
 /// Configuration for the ingestion worker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestionConfig {
     /// Max events to accumulate before flushing.
     pub batch_size: usize,
@@ -53,6 +70,26 @@ impl Default for IngestionConfig {
             max_retries: 3,
             redact_content: true,
         }
+    }
+}
+
+impl IngestionConfig {
+    fn normalized(mut self) -> Self {
+        self.batch_size = self
+            .batch_size
+            .clamp(MIN_INGESTION_BATCH_SIZE, MAX_INGESTION_BATCH_SIZE);
+        self.flush_interval_secs = self.flush_interval_secs.clamp(
+            MIN_INGESTION_FLUSH_INTERVAL_SECS,
+            MAX_INGESTION_FLUSH_INTERVAL_SECS,
+        );
+        self.channel_capacity = self.channel_capacity.clamp(
+            MIN_INGESTION_CHANNEL_CAPACITY,
+            MAX_INGESTION_CHANNEL_CAPACITY,
+        );
+        self.max_retries = self
+            .max_retries
+            .clamp(MIN_INGESTION_RETRIES, MAX_INGESTION_RETRIES);
+        self
     }
 }
 
@@ -140,7 +177,10 @@ impl IngestionEvent {
     ///
     /// - `user_id`: the authenticated user (not stored in journal events)
     /// - Generates a unique event_id from session_id + turn + event_type
-    pub fn from_journal_event(event: &crate::session_journal::JournalEvent, user_id: &str) -> Self {
+    pub fn from_journal_event(
+        event: &crate::session_journal::JournalEvent,
+        user_id: &str,
+    ) -> Result<Self, String> {
         Self::from_journal_event_with_redact(event, user_id, false)
     }
 
@@ -152,10 +192,23 @@ impl IngestionEvent {
     /// Event id == version id so INSERT IGNORE on the PK also
     /// handles agent_events dedup — pushing the same config twice
     /// records "the fact of pushing it" exactly once on both tables.
-    pub fn for_config_version(row: &crate::config_version_cloud::ConfigVersionRow) -> Self {
-        Self {
+    pub fn for_config_version(
+        row: &crate::config_version_cloud::ConfigVersionPayload,
+    ) -> Result<Self, String> {
+        let session_id = row
+            .first_seen_session
+            .as_deref()
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "config version push requires first_seen_session for version_id={}",
+                    row.version_id
+                )
+            })?;
+        Ok(Self {
             event_id: row.version_id.clone(),
-            session_id: row.first_seen_session.clone().unwrap_or_default(),
+            session_id: session_id.to_string(),
             user_id: row.user_id.clone(),
             event_type: crate::config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE.to_string(),
             content: Some(row.toml_body.clone()),
@@ -171,7 +224,7 @@ impl IngestionEvent {
             parent_event_id: None,
             parent_event_ids: Vec::new(),
             causal_chain_id: None,
-        }
+        })
     }
 
     /// Like [`from_journal_event`] but optionally replaces the `content` field
@@ -180,11 +233,19 @@ impl IngestionEvent {
         event: &crate::session_journal::JournalEvent,
         user_id: &str,
         redact_content: bool,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let session_id = event
             .session_id
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+            .as_deref()
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "journal event {:?} at {} is missing session_id",
+                    event.event_type, event.ts
+                )
+            })?
+            .to_string();
 
         // Deterministic event_id: hash of (session_id, turn, event_type, ts)
         // This makes re-ingestion idempotent via INSERT IGNORE
@@ -224,15 +285,7 @@ impl IngestionEvent {
             content
         };
 
-        // Token usage as JSON
-        let token_usage = match (event.tokens_in, event.tokens_out) {
-            (Some(inp), Some(out)) => Some(serde_json::json!({
-                "input": inp,
-                "output": out,
-                "total": inp + out,
-            })),
-            _ => None,
-        };
+        let token_usage = canonical_token_usage_json_from_journal_event(event);
 
         let causal_chain_id = event
             .coordination
@@ -245,7 +298,7 @@ impl IngestionEvent {
             .unwrap_or_default();
         let parent_event_id = parent_event_ids.first().cloned();
 
-        Self {
+        Ok(Self {
             event_id,
             session_id,
             user_id: user_id.to_string(),
@@ -259,7 +312,7 @@ impl IngestionEvent {
             parent_event_id,
             parent_event_ids,
             causal_chain_id,
-        }
+        })
     }
 
     /// Expand a JournalEvent into one or more IngestionEvents.
@@ -273,7 +326,7 @@ impl IngestionEvent {
     pub fn expand_journal_event(
         event: &crate::session_journal::JournalEvent,
         user_id: &str,
-    ) -> Vec<Self> {
+    ) -> Result<Vec<Self>, String> {
         Self::expand_journal_event_with_redact(event, user_id, false)
     }
 
@@ -283,8 +336,8 @@ impl IngestionEvent {
         event: &crate::session_journal::JournalEvent,
         user_id: &str,
         redact_content: bool,
-    ) -> Vec<Self> {
-        let main_event = Self::from_journal_event_with_redact(event, user_id, redact_content);
+    ) -> Result<Vec<Self>, String> {
+        let main_event = Self::from_journal_event_with_redact(event, user_id, redact_content)?;
         let session_id = main_event.session_id.clone();
         let uid = main_event.user_id.clone();
         let main_event_id = main_event.event_id.clone();
@@ -294,6 +347,9 @@ impl IngestionEvent {
         // Expand embedded tool_call_records into individual tool_call events
         if let Some(ref tool_calls) = event.tool_calls {
             for (i, tc) in tool_calls.iter().enumerate() {
+                let Some(tool_name) = normalize_optional_name(Some(tc.name.clone())) else {
+                    continue;
+                };
                 // Deterministic event_id: hash of (session_id, turn, tool_call, index)
                 let tc_event_id = {
                     use std::collections::hash_map::DefaultHasher;
@@ -303,16 +359,16 @@ impl IngestionEvent {
                     event.turn.hash(&mut hasher);
                     "tool_call".hash(&mut hasher);
                     i.hash(&mut hasher);
-                    tc.name.hash(&mut hasher);
+                    tool_name.hash(&mut hasher);
                     format!("evt-{:016x}", hasher.finish())
                 };
 
                 let raw_content = if tc.ok {
-                    format!("{} completed in {}ms", tc.name, tc.ms)
+                    format!("{} completed in {}ms", tool_name, tc.ms)
                 } else {
                     format!(
                         "{} failed in {}ms: {}",
-                        tc.name,
+                        tool_name,
                         tc.ms,
                         tc.error.as_deref().unwrap_or("unknown error")
                     )
@@ -324,7 +380,7 @@ impl IngestionEvent {
                 };
 
                 let mut metadata = serde_json::Map::new();
-                metadata.insert("tool_name".into(), Value::String(tc.name.clone()));
+                metadata.insert("tool_name".into(), Value::String(tool_name.clone()));
                 metadata.insert("ok".into(), Value::Bool(tc.ok));
                 metadata.insert("duration_ms".into(), Value::from(tc.ms));
                 metadata.insert(
@@ -354,7 +410,7 @@ impl IngestionEvent {
                     content: Some(content),
                     token_usage: None,
                     llm_model_used: None,
-                    skill_name: Some(tc.name.clone()),
+                    skill_name: Some(tool_name),
                     metadata: Some(Value::Object(metadata)),
                     created_at: event.ts.clone(),
                     parent_event_id: Some(main_event_id.clone()),
@@ -364,7 +420,7 @@ impl IngestionEvent {
             }
         }
 
-        events
+        Ok(events)
     }
 }
 
@@ -373,6 +429,8 @@ impl IngestionEvent {
 pub struct IngestionSender {
     tx: mpsc::Sender<IngestionEvent>,
     overflow_count: Arc<AtomicU64>,
+    pending_deferrals: Arc<AtomicUsize>,
+    max_pending_deferrals: usize,
 }
 
 impl IngestionSender {
@@ -382,6 +440,8 @@ impl IngestionSender {
         Self {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals: DISCONNECTED_PENDING_DEFERRAL_LIMIT,
         }
     }
 
@@ -396,26 +456,88 @@ impl IngestionSender {
             Self {
                 tx,
                 overflow_count: Arc::new(AtomicU64::new(0)),
+                pending_deferrals: Arc::new(AtomicUsize::new(0)),
+                max_pending_deferrals: capacity.max(1),
             },
             rx,
         )
     }
 
-    /// Enqueue an event for async ingestion. Non-blocking; increments overflow counter if channel full.
+    /// Enqueue an event for async ingestion.
+    ///
+    /// Fast path is non-blocking. If the bounded channel is full and a Tokio
+    /// runtime is available, detach a small async send task so the event waits
+    /// for capacity instead of being dropped. `overflow_count` tracks these
+    /// backpressure deferrals and hard closed-channel drops.
     pub fn enqueue(&self, event: IngestionEvent) {
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(event) {
-            let n = self.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::warn!(
-                target: "astra_services::event_ingestion",
-                overflow_count = n,
-                "ingestion channel full; event dropped"
-            );
+        match self.tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                let n = self.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    overflow_count = n,
+                    "ingestion channel full; deferring event until capacity is available"
+                );
+                let tx = self.tx.clone();
+                let overflow_count = self.overflow_count.clone();
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        let pending_deferrals = self.pending_deferrals.clone();
+                        if pending_deferrals
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                                (pending < self.max_pending_deferrals).then_some(pending + 1)
+                            })
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                target: "astra_services::event_ingestion",
+                                overflow_count = n,
+                                max_pending_deferrals = self.max_pending_deferrals,
+                                "ingestion deferred-send queue full; event dropped"
+                            );
+                            return;
+                        }
+                        drop(handle.spawn(async move {
+                            if tx.send(event).await.is_err() {
+                                let n = overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                tracing::warn!(
+                                    target: "astra_services::event_ingestion",
+                                    overflow_count = n,
+                                    "ingestion channel closed while deferred event was waiting; event dropped"
+                                );
+                            }
+                            pending_deferrals.fetch_sub(1, Ordering::Relaxed);
+                        }));
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "astra_services::event_ingestion",
+                            overflow_count = n,
+                            "ingestion channel full outside a Tokio runtime; event dropped"
+                        );
+                    }
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let n = self.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    overflow_count = n,
+                    "ingestion channel closed; event dropped"
+                );
+            }
         }
     }
 
-    /// Total number of events dropped due to a full channel.
+    /// Total number of immediate enqueue overflows and closed-channel drops.
     pub fn overflow_count(&self) -> u64 {
         self.overflow_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn pending_deferral_count(&self) -> usize {
+        self.pending_deferrals.load(Ordering::Relaxed)
     }
 
     /// Enqueue with backpressure (waits if channel full).
@@ -469,23 +591,267 @@ fn ingestion_event_has_parent_edges(event: &IngestionEvent) -> bool {
             .any(|id| !id.trim().is_empty())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanonicalTokenUsage {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+}
+
+impl CanonicalTokenUsage {
+    fn from_journal_event(
+        event: &crate::session_journal::JournalEvent,
+    ) -> Result<Option<Self>, String> {
+        let cached_input_tokens = event.cache_read_tokens.unwrap_or(0);
+        let cache_creation_tokens = event.cache_creation_tokens.unwrap_or(0);
+        let has_any_token_field = event.tokens_in.is_some()
+            || event.tokens_out.is_some()
+            || cached_input_tokens > 0
+            || cache_creation_tokens > 0;
+        if !has_any_token_field {
+            return Ok(None);
+        }
+
+        let input_tokens = event
+            .tokens_in
+            .ok_or_else(|| "token_usage canonicalization: missing tokens_in".to_string())?;
+        let output_tokens = event
+            .tokens_out
+            .ok_or_else(|| "token_usage canonicalization: missing tokens_out".to_string())?;
+        let billable_input = input_tokens
+            .checked_add(cached_input_tokens)
+            .and_then(|value| value.checked_add(cache_creation_tokens))
+            .ok_or_else(|| "token_usage canonicalization: input token overflow".to_string())?;
+        let total_tokens = billable_input
+            .checked_add(output_tokens)
+            .ok_or_else(|| "token_usage canonicalization: total token overflow".to_string())?;
+        Ok(Some(Self {
+            input_tokens,
+            cached_input_tokens,
+            cache_creation_tokens,
+            output_tokens,
+            total_tokens,
+        }))
+    }
+
+    fn from_json(value: &Value) -> Result<Option<Self>, String> {
+        let Some(obj) = value.as_object() else {
+            return Err(format!(
+                "token_usage must be a canonical JSON object, got {value}"
+            ));
+        };
+        let read_required = |key: &str| -> Result<u64, String> {
+            let value = obj
+                .get(key)
+                .ok_or_else(|| format!("token_usage missing canonical field `{key}`"))?;
+            if let Some(value) = value.as_u64() {
+                return Ok(value);
+            }
+            if let Some(value) = value.as_i64() {
+                return u64::try_from(value).map_err(|_| {
+                    format!("token_usage field `{key}` must be non-negative, got {value}")
+                });
+            }
+            Err(format!(
+                "token_usage field `{key}` must be an integer, got {value}"
+            ))
+        };
+        let usage = Self {
+            input_tokens: read_required("input_tokens")?,
+            cached_input_tokens: read_required("cached_input_tokens")?,
+            cache_creation_tokens: read_required("cache_creation_tokens")?,
+            output_tokens: read_required("output_tokens")?,
+            total_tokens: read_required("total_tokens")?,
+        };
+        let expected_total = usage
+            .input_tokens
+            .checked_add(usage.cached_input_tokens)
+            .and_then(|value| value.checked_add(usage.cache_creation_tokens))
+            .and_then(|value| value.checked_add(usage.output_tokens))
+            .ok_or_else(|| "token_usage total overflow".to_string())?;
+        if usage.total_tokens != expected_total {
+            return Err(format!(
+                "token_usage total_tokens mismatch: expected {expected_total}, got {}",
+                usage.total_tokens
+            ));
+        }
+        Ok(Some(usage))
+    }
+
+    fn to_json(self) -> Value {
+        let billable_input = self
+            .input_tokens
+            .saturating_add(self.cached_input_tokens)
+            .saturating_add(self.cache_creation_tokens);
+        serde_json::json!({
+            "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "prompt": billable_input,
+            "completion": self.output_tokens,
+            "cache_read": self.cached_input_tokens,
+            "cache_write": self.cache_creation_tokens,
+            "total": self.total_tokens,
+        })
+    }
+
+    fn input_column(self) -> Result<i64, String> {
+        let billable_input = self
+            .input_tokens
+            .checked_add(self.cached_input_tokens)
+            .and_then(|value| value.checked_add(self.cache_creation_tokens))
+            .ok_or_else(|| "token_usage input column overflow".to_string())?;
+        i64::try_from(billable_input)
+            .map_err(|_| format!("token_usage input column exceeds i64::MAX: {billable_input}"))
+    }
+
+    fn output_column(self) -> Result<i64, String> {
+        i64::try_from(self.output_tokens).map_err(|_| {
+            format!(
+                "token_usage output column exceeds i64::MAX: {}",
+                self.output_tokens
+            )
+        })
+    }
+
+    fn total_column(self) -> Result<i64, String> {
+        i64::try_from(self.total_tokens).map_err(|_| {
+            format!(
+                "token_usage total column exceeds i64::MAX: {}",
+                self.total_tokens
+            )
+        })
+    }
+}
+
+fn canonical_token_usage_json_from_journal_event(
+    event: &crate::session_journal::JournalEvent,
+) -> Option<Value> {
+    CanonicalTokenUsage::from_journal_event(event)
+        .ok()
+        .flatten()
+        .map(CanonicalTokenUsage::to_json)
+}
+
+#[derive(Debug)]
+struct IngestionEventInsertValues<'a> {
+    event: &'a IngestionEvent,
+    token_usage_json: Option<String>,
+    metadata_json: Option<String>,
+    skill_name: Option<String>,
+    token_input: Option<i64>,
+    token_output: Option<i64>,
+    token_total: Option<i64>,
+    created_at: String,
+}
+
+#[derive(Debug, Default)]
+struct TokenUsageDbFields {
+    token_usage_json: Option<String>,
+    token_input: Option<i64>,
+    token_output: Option<i64>,
+    token_total: Option<i64>,
+}
+
+impl<'a> IngestionEventInsertValues<'a> {
+    fn from_event(event: &'a IngestionEvent) -> Result<Self, String> {
+        let usage = match event.token_usage.as_ref() {
+            Some(value) => match CanonicalTokenUsage::from_json(value) {
+                Ok(usage) => usage,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_services::event_ingestion",
+                        user_id = %event.user_id,
+                        session_id = %event.session_id,
+                        event_id = %event.event_id,
+                        event_type = %event.event_type,
+                        error = %error,
+                        "invalid canonical token_usage; storing event without token counters"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let token_fields = match canonical_token_usage_db_fields_or_null(usage) {
+            Ok(fields) => fields,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    user_id = %event.user_id,
+                    session_id = %event.session_id,
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    error = %error,
+                    "canonical token_usage exceeds database token columns; storing event without token counters"
+                );
+                TokenUsageDbFields::default()
+            }
+        };
+        Ok(Self {
+            event,
+            token_usage_json: token_fields.token_usage_json,
+            metadata_json: event.metadata.as_ref().map(Value::to_string),
+            skill_name: normalize_optional_name(event.skill_name.clone()),
+            token_input: token_fields.token_input,
+            token_output: token_fields.token_output,
+            token_total: token_fields.token_total,
+            created_at: iso8601_to_mysql_datetime(&event.created_at),
+        })
+    }
+}
+
+fn canonical_token_usage_db_fields_or_null(
+    usage: Option<CanonicalTokenUsage>,
+) -> Result<TokenUsageDbFields, String> {
+    let Some(usage) = usage else {
+        return Ok(TokenUsageDbFields::default());
+    };
+    let input = usage.input_column()?;
+    let output = usage.output_column()?;
+    let total = usage.total_column()?;
+    Ok(TokenUsageDbFields {
+        token_usage_json: Some(usage.to_json().to_string()),
+        token_input: Some(input),
+        token_output: Some(output),
+        token_total: Some(total),
+    })
+}
+
+fn add_inserted_rows(total: &mut i64, rows_affected: u64, context: &str) -> Result<(), String> {
+    let inserted =
+        crate::storage::rows_affected_to_i64(rows_affected, context).map_err(|e| e.to_string())?;
+    *total = total
+        .checked_add(inserted)
+        .ok_or_else(|| format!("{context}: inserted row total overflow"))?;
+    Ok(())
+}
+
 fn bind_ingestion_event<'q>(
     mut query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
-    event: &'q IngestionEvent,
+    values: &'q IngestionEventInsertValues<'q>,
 ) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+    let event = values.event;
     query = query
         .bind(&event.event_id)
         .bind(&event.session_id)
         .bind(&event.user_id)
         .bind(&event.event_type)
         .bind(&event.content)
-        .bind(event.token_usage.as_ref().map(|v| v.to_string()))
+        .bind(&values.token_usage_json)
         .bind(&event.llm_model_used)
-        .bind(&event.skill_name)
-        .bind(event.metadata.as_ref().map(|v| v.to_string()))
-        .bind(iso8601_to_mysql_datetime(&event.created_at))
+        .bind(&values.skill_name)
+        .bind(&values.metadata_json)
+        .bind(&values.created_at)
         .bind(&event.parent_event_id)
-        .bind(&event.causal_chain_id);
+        .bind(&event.causal_chain_id)
+        .bind(values.token_input)
+        .bind(values.token_output)
+        .bind(values.token_total);
     query
 }
 
@@ -495,6 +861,7 @@ pub struct EventIngestionWorker {
     pool: sqlx::Pool<sqlx::MySql>,
     config: IngestionConfig,
     stats: Arc<std::sync::Mutex<IngestionStats>>,
+    pending_deferrals: Arc<AtomicUsize>,
 }
 
 /// Handle to signal the ingestion worker to shut down immediately.
@@ -522,10 +889,28 @@ impl EventIngestionWorker {
         Arc<std::sync::Mutex<IngestionStats>>,
         tokio::task::JoinHandle<()>,
     ) {
+        let raw_config = config;
+        let config = raw_config.clone().normalized();
+        if config != raw_config {
+            tracing::warn!(
+                target: "astra_services::event_ingestion",
+                requested_batch_size = raw_config.batch_size,
+                batch_size = config.batch_size,
+                requested_flush_interval_secs = raw_config.flush_interval_secs,
+                flush_interval_secs = config.flush_interval_secs,
+                requested_channel_capacity = raw_config.channel_capacity,
+                channel_capacity = config.channel_capacity,
+                requested_max_retries = raw_config.max_retries,
+                max_retries = config.max_retries,
+                "event ingestion config was clamped to supported bounds"
+            );
+        }
         let (tx, rx) = mpsc::channel(config.channel_capacity);
         let stats = Arc::new(std::sync::Mutex::new(IngestionStats::default()));
         let stats_clone = stats.clone();
         let notify = Arc::new(tokio::sync::Notify::new());
+        let pending_deferrals = Arc::new(AtomicUsize::new(0));
+        let max_pending_deferrals = config.channel_capacity;
 
         tracing::info!(
             target: "astra_services::event_ingestion",
@@ -540,6 +925,7 @@ impl EventIngestionWorker {
             pool,
             config,
             stats,
+            pending_deferrals: Arc::clone(&pending_deferrals),
         };
         // Share the same Arc so the handle can signal the worker.
         let shutdown_handle = IngestionShutdownHandle {
@@ -551,8 +937,61 @@ impl EventIngestionWorker {
         let sender = IngestionSender {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals,
+            max_pending_deferrals,
         };
         (sender, shutdown_handle, stats_clone, handle)
+    }
+
+    fn record_event_received(&self) {
+        if let Ok(mut s) = self.stats.lock() {
+            s.events_received += 1;
+        }
+    }
+
+    fn drain_available_channel_events(&mut self, buffer: &mut Vec<IngestionEvent>) -> usize {
+        let mut drained = 0;
+        while let Ok(event) = self.rx.try_recv() {
+            self.record_event_received();
+            buffer.push(event);
+            drained += 1;
+        }
+        drained
+    }
+
+    async fn drain_channel_for_shutdown(&mut self, buffer: &mut Vec<IngestionEvent>) {
+        let mut pending_yields = 0;
+        let mut observed_empty_after_pending_zero = false;
+        loop {
+            let drained = self.drain_available_channel_events(buffer);
+            if drained > 0 {
+                pending_yields = 0;
+                observed_empty_after_pending_zero = false;
+                continue;
+            }
+
+            let pending = self.pending_deferrals.load(Ordering::Relaxed);
+            if pending == 0 {
+                if observed_empty_after_pending_zero {
+                    break;
+                }
+                observed_empty_after_pending_zero = true;
+                tokio::task::yield_now().await;
+                continue;
+            }
+            observed_empty_after_pending_zero = false;
+            if pending_yields >= MAX_SHUTDOWN_DRAIN_PENDING_YIELDS {
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    pending_deferrals = pending,
+                    "event ingestion shutdown drain stopped with deferred sends still pending"
+                );
+                break;
+            }
+
+            pending_yields += 1;
+            tokio::task::yield_now().await;
+        }
     }
 
     async fn run_with_shutdown(mut self, shutdown: Arc<tokio::sync::Notify>) {
@@ -572,13 +1011,9 @@ impl EventIngestionWorker {
                 // audit-#7: bias toward shutdown so a busy `rx` cannot starve the drain branch.
                 biased;
                 _ = shutdown.notified() => {
-                    // Drain any remaining events from the channel before flushing.
-                    while let Ok(event) = self.rx.try_recv() {
-                        if let Ok(mut s) = self.stats.lock() {
-                            s.events_received += 1;
-                        }
-                        buffer.push(event);
-                    }
+                    // Drain remaining events, including deferred `enqueue` sends
+                    // that become ready only after the first drain frees capacity.
+                    self.drain_channel_for_shutdown(&mut buffer).await;
                     if !buffer.is_empty() {
                         self.flush_batch_once(&mut buffer).await;
                     }
@@ -589,9 +1024,7 @@ impl EventIngestionWorker {
                     break;
                 }
                 Some(event) = self.rx.recv() => {
-                    if let Ok(mut s) = self.stats.lock() {
-                        s.events_received += 1;
-                    }
+                    self.record_event_received();
                     buffer.push(event);
                     if buffer.len() >= self.config.batch_size {
                         self.flush_batch(&mut buffer).await;
@@ -659,8 +1092,10 @@ impl EventIngestionWorker {
                             event_count = count,
                             max_retries = self.config.max_retries,
                             error = %e,
-                            "batch flush failed after retries"
+                            "batch flush failed after retries; retaining batch for retry"
                         );
+                        buffer.extend(batch);
+                        return;
                     }
                 }
             }
@@ -717,55 +1152,79 @@ impl EventIngestionWorker {
                 .push(event);
         }
 
-        let mut rows_inserted = 0usize;
+        let mut rows_inserted = 0_i64;
+        let mut inserted_session_end_sessions =
+            std::collections::BTreeSet::<(String, String)>::new();
         for ((user_id, session_id), session_events) in grouped_events {
             let mut plain_events = Vec::new();
+            let mut plain_session_end_events = Vec::new();
             let mut parented_events = Vec::new();
             for event in session_events {
                 if ingestion_event_has_parent_edges(event) {
                     parented_events.push(event);
+                } else if event.event_type == SESSION_END_EVENT_TYPE {
+                    plain_session_end_events.push(event);
                 } else {
                     plain_events.push(event);
                 }
             }
 
-            let mut session_rows_inserted = 0usize;
+            let mut session_rows_inserted = 0_i64;
             if !plain_events.is_empty() {
-                let placeholders: Vec<String> = (0..plain_events.len())
-                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
-                    .collect();
-                let sql = format!(
+                let plain_event_rows = plain_events
+                    .iter()
+                    .map(|event| IngestionEventInsertValues::from_event(event))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
                     "INSERT IGNORE INTO agent_events \
                      (event_id, session_id, user_id, event_type, content, \
                       token_usage, llm_model_used, skill_name, metadata, \
-                      created_at, parent_event_id, causal_chain_id) \
-                     VALUES {}",
-                    placeholders.join(", ")
+                      created_at, parent_event_id, causal_chain_id, \
+                      token_input, token_output, token_total) ",
                 );
+                builder.push_values(plain_event_rows.iter(), |mut row, values| {
+                    let event = values.event;
+                    row.push_bind(&event.event_id)
+                        .push_bind(&event.session_id)
+                        .push_bind(&event.user_id)
+                        .push_bind(&event.event_type)
+                        .push_bind(&event.content)
+                        .push_bind(&values.token_usage_json)
+                        .push_bind(&event.llm_model_used)
+                        .push_bind(&values.skill_name)
+                        .push_bind(&values.metadata_json)
+                        .push_bind(&values.created_at)
+                        .push_bind(&event.parent_event_id)
+                        .push_bind(&event.causal_chain_id)
+                        .push_bind(values.token_input)
+                        .push_bind(values.token_output)
+                        .push_bind(values.token_total);
+                });
 
-                let mut query = sqlx::query(&sql);
-                for event in &plain_events {
-                    query = bind_ingestion_event(query, event);
-                }
-
-                let insert_result = query
+                let insert_result = builder
+                    .build()
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| format!("batch insert ({user_id}/{session_id}): {e}"))?;
-                session_rows_inserted +=
-                    usize::try_from(insert_result.rows_affected()).unwrap_or(usize::MAX);
+                add_inserted_rows(
+                    &mut session_rows_inserted,
+                    insert_result.rows_affected(),
+                    "event_ingestion.batch_insert",
+                )?;
             }
 
-            for event in parented_events {
+            for event in plain_session_end_events.into_iter().chain(parented_events) {
+                let values = IngestionEventInsertValues::from_event(event)?;
                 let insert_result = bind_ingestion_event(
                     sqlx::query(
                         "INSERT IGNORE INTO agent_events \
                          (event_id, session_id, user_id, event_type, content, \
                           token_usage, llm_model_used, skill_name, metadata, \
-                          created_at, parent_event_id, causal_chain_id) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          created_at, parent_event_id, causal_chain_id, \
+                          token_input, token_output, token_total) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     ),
-                    event,
+                    &values,
                 )
                 .execute(&mut *tx)
                 .await
@@ -773,16 +1232,27 @@ impl EventIngestionWorker {
                 if insert_result.rows_affected() == 0 {
                     continue;
                 }
-                session_rows_inserted +=
-                    usize::try_from(insert_result.rows_affected()).unwrap_or(usize::MAX);
-                crate::storage::insert_agent_event_edges(
-                    &mut *tx,
-                    &event.event_id,
-                    event.parent_event_id.as_deref(),
-                    &event.parent_event_ids,
-                )
-                .await
-                .map_err(|e| format!("edge insert for {}: {e}", event.event_id))?;
+                add_inserted_rows(
+                    &mut session_rows_inserted,
+                    insert_result.rows_affected(),
+                    "event_ingestion.single_insert",
+                )?;
+                if event.event_type == SESSION_END_EVENT_TYPE {
+                    inserted_session_end_sessions
+                        .insert((event.user_id.clone(), event.session_id.clone()));
+                }
+                if ingestion_event_has_parent_edges(event) {
+                    crate::storage::insert_agent_event_edges(
+                        &mut *tx,
+                        &event.user_id,
+                        &event.session_id,
+                        &event.event_id,
+                        event.parent_event_id.as_deref(),
+                        &event.parent_event_ids,
+                    )
+                    .await
+                    .map_err(|e| format!("edge insert for {}: {e}", event.event_id))?;
+                }
             }
 
             if session_rows_inserted == 0 {
@@ -792,17 +1262,28 @@ impl EventIngestionWorker {
                 &mut *tx,
                 session_id,
                 user_id,
-                i64::try_from(session_rows_inserted).unwrap_or(i64::MAX),
+                session_rows_inserted,
                 None,
             )
             .await
             .map_err(|e| format!("event_count delta for {session_id}: {e}"))?;
-            rows_inserted += session_rows_inserted;
+            rows_inserted = rows_inserted
+                .checked_add(session_rows_inserted)
+                .ok_or_else(|| {
+                    "event_ingestion.rows_inserted: inserted row total overflow".to_string()
+                })?;
         }
 
         // Log if duplicates were detected (useful for debugging)
-        if rows_inserted < events.len() {
-            let skipped = events.len() - rows_inserted;
+        let requested_event_count = u64::try_from(events.len())
+            .map_err(|_| "event_ingestion.requested_events: len exceeds u64::MAX".to_string())?;
+        let requested_events = crate::storage::rows_affected_to_i64(
+            requested_event_count,
+            "event_ingestion.requested_events",
+        )
+        .map_err(|e| e.to_string())?;
+        if rows_inserted < requested_events {
+            let skipped = requested_events - rows_inserted;
             astra_core::agent_info!(
                 "event_ingestion",
                 "INSERT IGNORE skipped {skipped} duplicates out of {} events",
@@ -810,19 +1291,16 @@ impl EventIngestionWorker {
             );
         }
 
-        // Close sessions that have a session_end event
-        for event in events {
-            if event.event_type == "session_end" {
-                sqlx::query(
-                    "UPDATE agent_sessions SET status = 'ended', ended_at = NOW() \
-                     WHERE session_id = ? AND user_id = ? AND status != 'ended'",
-                )
-                .bind(&event.session_id)
-                .bind(&event.user_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("session close for {}: {e}", event.session_id))?;
-            }
+        for (user_id, session_id) in inserted_session_end_sessions {
+            sqlx::query(
+                "UPDATE agent_sessions SET status = 'ended', ended_at = NOW() \
+                 WHERE session_id = ? AND user_id = ? AND status != 'ended'",
+            )
+            .bind(&session_id)
+            .bind(&user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("session close for {session_id}: {e}"))?;
         }
 
         // Step 4b: dual-write config-version events into the
@@ -833,30 +1311,18 @@ impl EventIngestionWorker {
         // the agent_events row and the config_versions row land
         // together.
         for event in events {
-            if let Some(row) = crate::config_version_cloud::extract_config_version_row(event) {
-                let params = crate::config_version_cloud::config_versions_insert_params(&row);
-                sqlx::query(crate::config_version_cloud::CONFIG_VERSIONS_INSERT_SQL)
-                    .bind(params.version_id)
-                    .bind(params.user_id)
-                    .bind(params.toml_body)
-                    // Cloud side doesn't trust the client's clock
-                    // for ordering; we bind the ISO-8601 timestamp
-                    // from the event but the INSERT's FROM_UNIXTIME
-                    // expects epoch-ms. Events produced by
-                    // `for_config_version` set created_at to "now"
-                    // at enqueue time, which is the closest reliable
-                    // value we have without pushing server-side
-                    // clock assumptions onto clients.
-                    .bind(
-                        chrono::DateTime::parse_from_rfc3339(&event.created_at)
-                            .map(|dt| dt.timestamp_millis())
-                            .unwrap_or(0),
-                    )
-                    .bind(params.first_seen_session)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| format!("config_versions insert for {}: {e}", row.version_id))?;
-            }
+            let Some(payload) = crate::config_version_cloud::extract_config_version_payload(event)?
+            else {
+                continue;
+            };
+            sqlx::query(crate::config_version_cloud::CONFIG_VERSIONS_INSERT_SQL)
+                .bind(&payload.version_id)
+                .bind(&payload.user_id)
+                .bind(&payload.toml_body)
+                .bind(payload.first_seen_session.as_deref())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("config_versions insert for {}: {e}", payload.version_id))?;
         }
 
         tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
@@ -914,6 +1380,43 @@ mod tests {
     }
 
     #[test]
+    fn ingestion_config_normalized_keeps_defaults() {
+        assert_eq!(
+            IngestionConfig::default().normalized(),
+            IngestionConfig::default()
+        );
+    }
+
+    #[test]
+    fn ingestion_config_normalized_clamps_zero_and_unbounded_values() {
+        let zero = IngestionConfig {
+            batch_size: 0,
+            flush_interval_secs: 0,
+            channel_capacity: 0,
+            max_retries: 0,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(zero.batch_size, MIN_INGESTION_BATCH_SIZE);
+        assert_eq!(zero.flush_interval_secs, MIN_INGESTION_FLUSH_INTERVAL_SECS);
+        assert_eq!(zero.channel_capacity, MIN_INGESTION_CHANNEL_CAPACITY);
+        assert_eq!(zero.max_retries, MIN_INGESTION_RETRIES);
+
+        let huge = IngestionConfig {
+            batch_size: usize::MAX,
+            flush_interval_secs: u64::MAX,
+            channel_capacity: usize::MAX,
+            max_retries: u32::MAX,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(huge.batch_size, MAX_INGESTION_BATCH_SIZE);
+        assert_eq!(huge.flush_interval_secs, MAX_INGESTION_FLUSH_INTERVAL_SECS);
+        assert_eq!(huge.channel_capacity, MAX_INGESTION_CHANNEL_CAPACITY);
+        assert_eq!(huge.max_retries, MAX_INGESTION_RETRIES);
+    }
+
+    #[test]
     fn redacted_content_marker_is_deterministic() {
         let a = redacted_content_marker("hello world");
         let b = redacted_content_marker("hello world");
@@ -938,11 +1441,13 @@ mod tests {
             100,
         );
         // Redact off
-        let off = IngestionEvent::from_journal_event_with_redact(&event, "u1", false);
+        let off = IngestionEvent::from_journal_event_with_redact(&event, "u1", false)
+            .expect("valid journal event");
         assert_eq!(off.content.as_deref(), Some("hello world"));
 
         // Redact on
-        let on = IngestionEvent::from_journal_event_with_redact(&event, "u1", true);
+        let on = IngestionEvent::from_journal_event_with_redact(&event, "u1", true)
+            .expect("valid journal event");
         let content = on.content.expect("content present");
         assert!(!content.contains("hello world"));
         assert!(content.starts_with("<redacted: len=11 sha="));
@@ -968,7 +1473,8 @@ mod tests {
             ms: 12,
             ..Default::default()
         }]);
-        let evs = IngestionEvent::expand_journal_event_with_redact(&event, "u1", true);
+        let evs = IngestionEvent::expand_journal_event_with_redact(&event, "u1", true)
+            .expect("valid journal event");
         assert_eq!(evs.len(), 2);
         let main = &evs[0];
         assert!(
@@ -1003,11 +1509,48 @@ mod tests {
     }
 
     #[test]
+    fn add_inserted_rows_accumulates_without_saturating() {
+        let mut total = 40;
+        add_inserted_rows(&mut total, 2, "event_ingestion.test").unwrap();
+        assert_eq!(total, 42);
+    }
+
+    #[test]
+    fn add_inserted_rows_fails_loudly_on_conversion_overflow() {
+        let mut total = 0;
+        let err = add_inserted_rows(&mut total, i64::MAX as u64 + 1, "event_ingestion.test")
+            .expect_err("rows_affected overflow must fail");
+        assert!(
+            err.contains("event_ingestion.test") && err.contains("exceeds i64::MAX"),
+            "error should identify conversion overflow: {err}"
+        );
+        assert_eq!(total, 0, "failed conversion must not mutate total");
+    }
+
+    #[test]
+    fn add_inserted_rows_fails_loudly_on_total_overflow() {
+        let mut total = i64::MAX;
+        let err = add_inserted_rows(&mut total, 1, "event_ingestion.test")
+            .expect_err("total overflow must fail");
+        assert!(
+            err.contains("event_ingestion.test") && err.contains("total overflow"),
+            "error should identify total overflow: {err}"
+        );
+        assert_eq!(total, i64::MAX, "failed add must not mutate total");
+    }
+
+    #[test]
     fn ingestion_event_json_roundtrip() {
         let mut event = test_event("evt-1", "sess-1", "turn_complete");
         event.user_id = "user-1".into();
         event.content = Some("hello world".into());
-        event.token_usage = Some(serde_json::json!({"input": 100, "output": 50}));
+        event.token_usage = Some(serde_json::json!({
+            "input_tokens": 100,
+            "cached_input_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": 50,
+            "total_tokens": 150,
+        }));
         event.llm_model_used = Some("gpt-4".into());
 
         let json = serde_json::to_string(&event).unwrap();
@@ -1033,21 +1576,32 @@ mod tests {
         let sender = IngestionSender {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals: 10,
         };
         sender.enqueue(test_event("e1", "s1", "test"));
     }
 
     #[tokio::test]
-    async fn sender_enqueue_drops_when_channel_full() {
-        let (tx, _rx) = mpsc::channel(1);
+    async fn sender_enqueue_defers_when_channel_full() {
+        let (tx, mut rx) = mpsc::channel(1);
         let sender = IngestionSender {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals: 1,
         };
         sender.enqueue(test_event("e1", "s1", "test"));
-        // This should be silently dropped (channel full, try_send fails)
         sender.enqueue(test_event("e2", "s1", "test"));
-        // No panic = test passes
+
+        let first = rx.recv().await.expect("first event");
+        assert_eq!(first.event_id, "e1");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("deferred send should complete after capacity is freed")
+            .expect("second event");
+        assert_eq!(second.event_id, "e2");
+        assert_eq!(sender.overflow_count(), 1);
     }
 
     // ─── Transform tests ───────────────────────────────────────────────
@@ -1114,7 +1668,8 @@ mod tests {
             &keys,
             false,
         );
-        let ingestion = IngestionEvent::from_journal_event(&journal, "user-z");
+        let ingestion =
+            IngestionEvent::from_journal_event(&journal, "user-z").expect("valid journal event");
         assert!(ingestion.event_type.contains("sync"));
         assert_eq!(ingestion.session_id, "sess-sync");
         let meta = ingestion.metadata.expect("metadata");
@@ -1148,7 +1703,8 @@ mod tests {
             &[],
             true,
         );
-        let ingestion = IngestionEvent::from_journal_event(&journal, "u1");
+        let ingestion =
+            IngestionEvent::from_journal_event(&journal, "u1").expect("valid journal event");
         let cp = ingestion
             .metadata
             .as_ref()
@@ -1202,7 +1758,8 @@ mod tests {
             forked_after_turn: Some(4),
             label: Some("branch".into()),
         });
-        let ingestion = IngestionEvent::from_journal_event(&journal, "user-1");
+        let ingestion =
+            IngestionEvent::from_journal_event(&journal, "user-1").expect("valid journal event");
         assert_eq!(ingestion.causal_chain_id.as_deref(), Some("corr-chain-1"));
         assert_eq!(
             ingestion.parent_event_ids,
@@ -1216,7 +1773,8 @@ mod tests {
     #[test]
     fn transform_turn_event() {
         let journal = make_turn_event();
-        let ingestion = IngestionEvent::from_journal_event(&journal, "user-1");
+        let ingestion =
+            IngestionEvent::from_journal_event(&journal, "user-1").expect("valid journal event");
 
         assert!(ingestion.event_id.starts_with("evt-"));
         assert_eq!(ingestion.session_id, "sess-abc");
@@ -1228,18 +1786,20 @@ mod tests {
         assert!(ingestion.parent_event_id.is_none());
         assert!(ingestion.causal_chain_id.is_none());
 
-        // Token usage present
-        let usage = ingestion.token_usage.unwrap();
-        assert_eq!(usage["input"], 500);
-        assert_eq!(usage["output"], 200);
-        assert_eq!(usage["total"], 700);
+        let usage = ingestion.token_usage.as_ref().unwrap();
+        assert_eq!(usage["input_tokens"], 500);
+        assert_eq!(usage["cached_input_tokens"], 0);
+        assert_eq!(usage["cache_creation_tokens"], 0);
+        assert_eq!(usage["output_tokens"], 200);
+        assert_eq!(usage["total_tokens"], 700);
     }
 
     #[test]
     fn transform_session_start_event() {
         let event =
             crate::session_journal::JournalEvent::session_start(Some("sess-new"), Some("gpt-4"));
-        let ingestion = IngestionEvent::from_journal_event(&event, "user-2");
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "user-2").expect("valid journal event");
 
         assert_eq!(ingestion.session_id, "sess-new");
         assert!(ingestion.event_type.contains("session"));
@@ -1256,7 +1816,8 @@ mod tests {
             "connection refused",
             500,
         );
-        let ingestion = IngestionEvent::from_journal_event(&event, "user-3");
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "user-3").expect("valid journal event");
 
         assert_eq!(ingestion.session_id, "sess-err");
         // Error event: content should be user_input (takes priority) or error
@@ -1266,18 +1827,52 @@ mod tests {
     #[test]
     fn transform_deterministic_event_id() {
         let journal = make_turn_event();
-        let a = IngestionEvent::from_journal_event(&journal, "u1");
-        let b = IngestionEvent::from_journal_event(&journal, "u1");
+        let a = IngestionEvent::from_journal_event(&journal, "u1").expect("valid journal event");
+        let b = IngestionEvent::from_journal_event(&journal, "u1").expect("valid journal event");
         // Same input → same event_id (deterministic for idempotency)
         assert_eq!(a.event_id, b.event_id);
     }
 
     #[test]
-    fn transform_missing_session_id_defaults() {
+    fn transform_missing_session_id_fails_loudly() {
         let mut journal = make_turn_event();
         journal.session_id = None;
-        let ingestion = IngestionEvent::from_journal_event(&journal, "u1");
-        assert_eq!(ingestion.session_id, "unknown");
+        let err = IngestionEvent::from_journal_event(&journal, "u1")
+            .expect_err("missing session_id must not be ingested as a fake session");
+        assert!(err.contains("missing session_id"), "error was: {err}");
+        assert!(
+            err.contains("Turn"),
+            "error should identify event type: {err}"
+        );
+        assert!(
+            err.contains("2025-01-15T10:30:00Z"),
+            "error should identify event timestamp: {err}"
+        );
+    }
+
+    #[test]
+    fn transform_blank_session_id_fails_loudly() {
+        let mut journal = make_turn_event();
+        journal.session_id = Some("   ".into());
+        let err = IngestionEvent::from_journal_event(&journal, "u1")
+            .expect_err("blank session_id must not be ingested as a fake session");
+        assert!(err.contains("missing session_id"), "error was: {err}");
+    }
+
+    #[test]
+    fn expand_missing_session_id_propagates_error() {
+        let mut journal = make_turn_event();
+        journal.session_id = None;
+        journal.tool_calls = Some(vec![crate::session_journal::ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            ms: 1,
+            ..Default::default()
+        }]);
+
+        let err = IngestionEvent::expand_journal_event(&journal, "u1")
+            .expect_err("expansion must reject the whole event when the parent session is missing");
+        assert!(err.contains("missing session_id"), "error was: {err}");
     }
 
     #[test]
@@ -1290,7 +1885,8 @@ mod tests {
             0.6,
             &["github".to_string()],
         );
-        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "u1").expect("valid journal event");
         assert_eq!(ingestion.content.as_deref(), Some("sig_stall"));
     }
 
@@ -1300,6 +1896,8 @@ mod tests {
         let sender = IngestionSender {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals: 10,
         };
         sender.enqueue(test_event("e1", "s1", "test"));
         sender.shutdown();
@@ -1311,7 +1909,8 @@ mod tests {
     #[test]
     fn transform_session_end_event() {
         let event = crate::session_journal::JournalEvent::session_end(Some("sess-end"), 10);
-        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "u1").expect("valid journal event");
         assert_eq!(ingestion.session_id, "sess-end");
         assert!(ingestion.event_type.contains("session"));
         assert!(ingestion.event_type.contains("end"));
@@ -1329,7 +1928,8 @@ mod tests {
             3,
             1,
         );
-        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "u1").expect("valid journal event");
         assert_eq!(ingestion.session_id, "sess-plan");
         assert_eq!(ingestion.event_type, "plan_progress");
         // metadata should carry subtask details
@@ -1351,7 +1951,8 @@ mod tests {
             3,
             2,
         );
-        let events = IngestionEvent::expand_journal_event(&event, "u1");
+        let events =
+            IngestionEvent::expand_journal_event(&event, "u1").expect("valid journal event");
         assert_eq!(
             events.len(),
             1,
@@ -1362,12 +1963,13 @@ mod tests {
 
     #[test]
     fn session_end_event_type_matches_insert_batch_check() {
-        // insert_batch checks `event.event_type == "session_end"` to close sessions.
+        // insert_batch checks this exact event type to close sessions.
         // Verify the transform produces exactly that string.
         let event = crate::session_journal::JournalEvent::session_end(Some("s1"), 5);
-        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "u1").expect("valid journal event");
         assert_eq!(
-            ingestion.event_type, "session_end",
+            ingestion.event_type, SESSION_END_EVENT_TYPE,
             "event_type must be exactly 'session_end' for insert_batch session-close logic"
         );
     }
@@ -1377,7 +1979,8 @@ mod tests {
     #[test]
     fn expand_turn_without_tool_calls_returns_one_event() {
         let journal = make_turn_event();
-        let events = IngestionEvent::expand_journal_event(&journal, "user-1");
+        let events =
+            IngestionEvent::expand_journal_event(&journal, "user-1").expect("valid journal event");
         assert_eq!(events.len(), 1);
         assert!(events[0].event_type.contains("turn"));
     }
@@ -1387,7 +1990,21 @@ mod tests {
         let mut journal = make_turn_event();
         journal.tool_calls = Some(vec![
             crate::session_journal::ToolCallRecord {
-                name: "git".into(),
+                name: " ".into(),
+                ok: true,
+                ms: 1,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+                file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
+                ..Default::default()
+            },
+            crate::session_journal::ToolCallRecord {
+                name: " git ".into(),
                 ok: true,
                 ms: 150,
                 error: None,
@@ -1416,8 +2033,9 @@ mod tests {
             },
         ]);
 
-        let events = IngestionEvent::expand_journal_event(&journal, "user-1");
-        // 1 turn event + 2 tool_call events
+        let events =
+            IngestionEvent::expand_journal_event(&journal, "user-1").expect("valid journal event");
+        // 1 turn event + 2 nonblank tool_call events
         assert_eq!(events.len(), 3, "expected 3 events, got {}", events.len());
 
         // First is the main turn event
@@ -1426,6 +2044,10 @@ mod tests {
         // Second is successful tool_call
         assert_eq!(events[1].event_type, "tool_call");
         assert_eq!(events[1].skill_name.as_deref(), Some("git"));
+        assert_eq!(
+            events[1].metadata.as_ref().unwrap()["tool_name"],
+            serde_json::json!("git")
+        );
         assert!(
             events[1].content.as_ref().unwrap().contains("150ms"),
             "got: {:?}",
@@ -1473,7 +2095,8 @@ mod tests {
             ..Default::default()
         }]);
 
-        let events = IngestionEvent::expand_journal_event(&journal, "u1");
+        let events =
+            IngestionEvent::expand_journal_event(&journal, "u1").expect("valid journal event");
         let tc_event = &events[1];
         let meta = tc_event.metadata.as_ref().unwrap();
         assert_eq!(meta["tool_name"], "bash");
@@ -1497,7 +2120,8 @@ mod tests {
             ..Default::default()
         }]);
 
-        let events = IngestionEvent::expand_journal_event(&journal, "u1");
+        let events =
+            IngestionEvent::expand_journal_event(&journal, "u1").expect("valid journal event");
         let meta = events[1].metadata.as_ref().expect("metadata");
         assert_eq!(meta["tool_name"], "ask_user");
         assert_eq!(meta["ask_user"]["response"]["outcome"], "cancelled");
@@ -1522,8 +2146,8 @@ mod tests {
             ..Default::default()
         }]);
 
-        let a = IngestionEvent::expand_journal_event(&journal, "u1");
-        let b = IngestionEvent::expand_journal_event(&journal, "u1");
+        let a = IngestionEvent::expand_journal_event(&journal, "u1").expect("valid journal event");
+        let b = IngestionEvent::expand_journal_event(&journal, "u1").expect("valid journal event");
         assert_eq!(
             a[1].event_id, b[1].event_id,
             "tool_call events should be deterministic"
@@ -1540,7 +2164,8 @@ mod tests {
             0.6,
             &["github".to_string()],
         );
-        let events = IngestionEvent::expand_journal_event(&event, "u1");
+        let events =
+            IngestionEvent::expand_journal_event(&event, "u1").expect("valid journal event");
         assert_eq!(events.len(), 1, "non-turn events should not be expanded");
     }
 
@@ -1552,6 +2177,8 @@ mod tests {
         let sender = IngestionSender {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals: 3,
         };
 
         for i in 0..3 {
@@ -1568,11 +2195,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sender_enqueue_drops_silently_when_full() {
+    async fn sender_enqueue_defers_until_capacity_is_available() {
         let (tx, mut rx) = mpsc::channel(1);
         let sender = IngestionSender {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals: 1,
         };
 
         sender.enqueue(test_event("e1", "s1", "turn"));
@@ -1580,43 +2209,23 @@ mod tests {
 
         let first = rx.recv().await.unwrap();
         assert_eq!(first.event_id, "e1");
-        assert!(rx.try_recv().is_err(), "e2 should have been dropped");
-    }
-
-    #[test]
-    fn insert_batch_sql_has_correct_placeholder_count() {
-        // Each event needs 12 bind params: event_id, session_id, user_id, event_type,
-        // content, token_usage, llm_model_used, skill_name, metadata,
-        // created_at, parent_event_id, causal_chain_id
-        let n = 5;
-        let placeholders: Vec<String> = (0..n)
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
-            .collect();
-        let sql = format!(
-            "INSERT IGNORE INTO agent_events \
-             (event_id, session_id, user_id, event_type, content, \
-              token_usage, llm_model_used, skill_name, metadata, \
-              created_at, parent_event_id, causal_chain_id) \
-             VALUES {}",
-            placeholders.join(", ")
-        );
-
-        assert_eq!(
-            sql.matches("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").count(),
-            n,
-            "should have {n} placeholder groups"
-        );
-        assert!(sql.contains("INSERT IGNORE"));
-        assert!(sql.contains("parent_event_id"));
-        assert!(sql.contains("causal_chain_id"));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("deferred send should complete")
+            .expect("second event");
+        assert_eq!(second.event_id, "e2");
     }
 
     #[test]
     fn event_id_is_deterministic_across_calls() {
         // Same journal event → same event_id (idempotency guarantee)
         let event = make_turn_event();
-        let id1 = IngestionEvent::from_journal_event(&event, "u1").event_id;
-        let id2 = IngestionEvent::from_journal_event(&event, "u1").event_id;
+        let id1 = IngestionEvent::from_journal_event(&event, "u1")
+            .expect("valid journal event")
+            .event_id;
+        let id2 = IngestionEvent::from_journal_event(&event, "u1")
+            .expect("valid journal event")
+            .event_id;
         assert_eq!(
             id1, id2,
             "event_id must be deterministic for INSERT IGNORE dedup"
@@ -1627,8 +2236,12 @@ mod tests {
     fn event_id_differs_for_different_users() {
         // Different user_id → different event_id (user isolation)
         let event = make_turn_event();
-        let id1 = IngestionEvent::from_journal_event(&event, "user-a").event_id;
-        let id2 = IngestionEvent::from_journal_event(&event, "user-b").event_id;
+        let id1 = IngestionEvent::from_journal_event(&event, "user-a")
+            .expect("valid journal event")
+            .event_id;
+        let id2 = IngestionEvent::from_journal_event(&event, "user-b")
+            .expect("valid journal event")
+            .event_id;
         // event_id is based on session/turn/type/ts, not user_id — so they may be equal
         // but both must be valid evt- prefixed strings
         assert!(id1.starts_with("evt-"), "event_id should have evt- prefix");
@@ -1636,17 +2249,99 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_total_is_sum_of_input_and_output() {
+    fn token_usage_uses_disjoint_canonical_shape_and_derived_columns() {
         let mut event = make_turn_event();
         event.tokens_in = Some(300);
         event.tokens_out = Some(150);
+        event.cache_read_tokens = Some(20);
+        event.cache_creation_tokens = Some(10);
 
-        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
-        let usage = ingestion.token_usage.unwrap();
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "u1").expect("valid journal event");
+        let usage = ingestion.token_usage.as_ref().unwrap();
 
-        assert_eq!(usage["input"], 300);
-        assert_eq!(usage["output"], 150);
-        assert_eq!(usage["total"], 450, "total must equal input + output");
+        assert_eq!(usage["input_tokens"], 300);
+        assert_eq!(usage["cached_input_tokens"], 20);
+        assert_eq!(usage["cache_creation_tokens"], 10);
+        assert_eq!(usage["output_tokens"], 150);
+        assert_eq!(usage["total_tokens"], 480);
+        assert_eq!(usage["prompt"], 330);
+        assert_eq!(usage["completion"], 150);
+        assert_eq!(usage["cache_read"], 20);
+        assert_eq!(usage["cache_write"], 10);
+        assert_eq!(usage["total"], 480);
+
+        let values = IngestionEventInsertValues::from_event(&ingestion).expect("canonical usage");
+        assert_eq!(values.token_input, Some(330));
+        assert_eq!(values.token_output, Some(150));
+        assert_eq!(values.token_total, Some(480));
+    }
+
+    #[test]
+    fn invalid_token_usage_does_not_poison_event_insert_values() {
+        let mut ingestion = test_event("evt-bad-usage", "sess-1", "llm_response");
+        ingestion.token_usage = Some(serde_json::json!({
+            "input_tokens": 10,
+            "cached_input_tokens": 1,
+            "cache_creation_tokens": 0,
+            "output_tokens": 5,
+            "total_tokens": 999,
+        }));
+
+        let values = IngestionEventInsertValues::from_event(&ingestion)
+            .expect("malformed token_usage should not block event persistence");
+
+        assert_eq!(values.token_usage_json, None);
+        assert_eq!(values.token_input, None);
+        assert_eq!(values.token_output, None);
+        assert_eq!(values.token_total, None);
+    }
+
+    #[test]
+    fn token_usage_column_overflow_does_not_poison_event_insert_values() {
+        let input_tokens = i64::MAX as u64 + 1;
+        let mut ingestion = test_event("evt-huge-usage", "sess-1", "llm_response");
+        ingestion.token_usage = Some(serde_json::json!({
+            "input_tokens": input_tokens,
+            "cached_input_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": input_tokens,
+        }));
+
+        let values = IngestionEventInsertValues::from_event(&ingestion)
+            .expect("overflowing token_usage columns should not block event persistence");
+
+        assert_eq!(values.token_usage_json, None);
+        assert_eq!(values.token_input, None);
+        assert_eq!(values.token_output, None);
+        assert_eq!(values.token_total, None);
+    }
+
+    #[test]
+    fn llm_round_high_cache_preserves_usage_when_cache_exceeds_fresh_input() {
+        let mut event = make_turn_event();
+        event.event_type = crate::session_journal::JournalEventType::LlmRound;
+        event.tokens_in = Some(10);
+        event.tokens_out = Some(5);
+        event.cache_read_tokens = Some(1_000);
+        event.cache_creation_tokens = Some(50);
+
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "u1").expect("valid journal event");
+        let usage = ingestion.token_usage.as_ref().unwrap();
+
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["cached_input_tokens"], 1_000);
+        assert_eq!(usage["cache_creation_tokens"], 50);
+        assert_eq!(usage["output_tokens"], 5);
+        assert_eq!(usage["prompt"], 1_060);
+        assert_eq!(usage["total_tokens"], 1_065);
+
+        let values = IngestionEventInsertValues::from_event(&ingestion).expect("canonical usage");
+        assert_eq!(values.token_input, Some(1_060));
+        assert_eq!(values.token_output, Some(5));
+        assert_eq!(values.token_total, Some(1_065));
     }
 
     #[test]
@@ -1655,11 +2350,81 @@ mod tests {
         event.tokens_in = None;
         event.tokens_out = None;
 
-        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "u1").expect("valid journal event");
         assert!(
             ingestion.token_usage.is_none(),
             "token_usage should be None when no token data"
         );
+    }
+
+    #[test]
+    fn token_usage_degrades_to_absent_on_partial_or_overflowing_journal_tokens() {
+        let mut partial = make_turn_event();
+        partial.tokens_out = None;
+        let ingestion = IngestionEvent::from_journal_event(&partial, "u1")
+            .expect("partial token data must not drop the event");
+        assert!(
+            ingestion.token_usage.is_none(),
+            "partial token data should only drop token_usage"
+        );
+
+        let mut overflowing = make_turn_event();
+        overflowing.tokens_in = Some(u64::MAX);
+        overflowing.tokens_out = Some(1);
+        overflowing.cache_read_tokens = Some(1);
+        let ingestion = IngestionEvent::from_journal_event(&overflowing, "u1")
+            .expect("overflowing token data must not drop the event");
+        assert!(
+            ingestion.token_usage.is_none(),
+            "overflowing token buckets should only drop token_usage"
+        );
+    }
+
+    #[test]
+    fn insert_values_drops_invalid_token_usage_without_dropping_event() {
+        let mut event = test_event("evt-noncanonical", "sess-1", "turn_complete");
+        event.token_usage = Some(serde_json::json!({
+            "prompt": 10,
+            "completion": 5,
+        }));
+
+        let values = IngestionEventInsertValues::from_event(&event)
+            .expect("noncanonical token_usage must not drop the event");
+        assert_eq!(values.token_usage_json, None);
+        assert_eq!(values.token_input, None);
+        assert_eq!(values.token_output, None);
+        assert_eq!(values.token_total, None);
+    }
+
+    #[test]
+    fn insert_values_preserve_zero_canonical_token_usage_columns() {
+        let mut event = test_event("evt-zero-usage", "sess-1", "turn_complete");
+        event.token_usage = Some(serde_json::json!({
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }));
+
+        let values = IngestionEventInsertValues::from_event(&event)
+            .expect("zero canonical token usage is valid");
+        assert_eq!(values.token_input, Some(0));
+        assert_eq!(values.token_output, Some(0));
+        assert_eq!(values.token_total, Some(0));
+    }
+
+    #[test]
+    fn insert_values_canonicalize_skill_name() {
+        let mut event = test_event("evt-skill-name", "sess-1", "tool_call");
+        event.skill_name = Some(" skill ".to_string());
+        let values = IngestionEventInsertValues::from_event(&event).expect("valid event");
+        assert_eq!(values.skill_name.as_deref(), Some("skill"));
+
+        event.skill_name = Some(" ".to_string());
+        let values = IngestionEventInsertValues::from_event(&event).expect("valid event");
+        assert_eq!(values.skill_name, None);
     }
 
     #[test]
@@ -1669,7 +2434,8 @@ mod tests {
         event.user_input = Some("user question".into());
         event.error = Some("some error".into());
 
-        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "u1").expect("valid journal event");
         assert_eq!(
             ingestion.content.as_deref(),
             Some("user question"),
@@ -1683,7 +2449,8 @@ mod tests {
         event.user_input = None;
         event.error = Some("connection refused".into());
 
-        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "u1").expect("valid journal event");
         assert_eq!(
             ingestion.content.as_deref(),
             Some("connection refused"),
@@ -1697,25 +2464,74 @@ mod tests {
         assert_eq!(sender.overflow_count(), 0);
     }
 
-    #[test]
-    fn overflow_count_increments_on_full_channel() {
-        // Create a channel with capacity 1
-        let (tx, _rx) = mpsc::channel(1);
+    #[tokio::test]
+    async fn overflow_count_increments_on_full_channel() {
+        let (tx, mut rx) = mpsc::channel(1);
         let sender = IngestionSender {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals: 2,
         };
 
-        // Fill the channel
         sender.enqueue(test_event("e1", "s1", "turn"));
-        // This should overflow (channel capacity is 1)
         sender.enqueue(test_event("e2", "s1", "turn"));
 
         assert_eq!(sender.overflow_count(), 1, "second enqueue should overflow");
 
-        // Third enqueue also overflows
         sender.enqueue(test_event("e3", "s1", "turn"));
         assert_eq!(sender.overflow_count(), 2);
+
+        let first = rx.recv().await.expect("first event");
+        assert_eq!(first.event_id, "e1");
+        let mut deferred = Vec::new();
+        for _ in 0..2 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("deferred send should complete")
+                .expect("deferred event");
+            deferred.push(event.event_id);
+        }
+        deferred.sort();
+        assert_eq!(deferred, vec!["e2".to_string(), "e3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn sender_enqueue_caps_pending_deferrals() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals: 1,
+        };
+
+        sender.enqueue(test_event("e1", "s1", "turn"));
+        sender.enqueue(test_event("e2", "s1", "turn"));
+        sender.enqueue(test_event("e3", "s1", "turn"));
+
+        assert_eq!(sender.overflow_count(), 2);
+        assert_eq!(
+            sender.pending_deferral_count(),
+            1,
+            "only one full-channel event should be allowed to wait for capacity"
+        );
+        assert_eq!(rx.recv().await.expect("first event").event_id, "e1");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("reserved deferred send should complete")
+                .expect("deferred event")
+                .event_id,
+            "e2"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "event beyond the deferred-send cap must be dropped instead of spawning another waiter"
+        );
+        assert_eq!(sender.pending_deferral_count(), 0);
     }
 
     // ── Shutdown handle tests ───────────────────────────────────────────
@@ -1754,6 +2570,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_drains_deferred_full_channel_sends() {
+        let (tx, rx) = mpsc::channel(1);
+        let stats = Arc::new(std::sync::Mutex::new(IngestionStats::default()));
+        let pending_deferrals = Arc::new(AtomicUsize::new(0));
+        let worker = EventIngestionWorker {
+            rx,
+            pool: dummy_pool(),
+            config: IngestionConfig {
+                batch_size: 100,
+                max_retries: 1,
+                ..IngestionConfig::default()
+            }
+            .normalized(),
+            stats: Arc::clone(&stats),
+            pending_deferrals: Arc::clone(&pending_deferrals),
+        };
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals,
+            max_pending_deferrals: 1,
+        };
+
+        sender.enqueue(test_event("e1", "s1", "turn"));
+        sender.enqueue(test_event("e2", "s1", "turn"));
+        assert_eq!(sender.overflow_count(), 1);
+
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let handle = tokio::spawn(worker.run_with_shutdown(Arc::clone(&shutdown)));
+        shutdown.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .expect("worker should stop")
+            .expect("worker task should not panic");
+
+        let s = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(
+            s.events_received, 2,
+            "shutdown drain must include deferred sends that become ready after capacity is freed"
+        );
+        assert_eq!(sender.pending_deferral_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_normalizes_zero_config_before_starting_worker() {
+        let config = IngestionConfig {
+            batch_size: 0,
+            flush_interval_secs: 0,
+            channel_capacity: 0,
+            max_retries: 0,
+            ..Default::default()
+        };
+        let (_sender, shutdown, _stats, jh) = EventIngestionWorker::spawn(dummy_pool(), config);
+
+        shutdown.signal();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), jh).await;
+        assert!(
+            result.is_ok(),
+            "worker should start and stop with normalized zero config"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_flush_retains_batch_for_next_retry_cycle() {
+        let (_tx, rx) = mpsc::channel(1);
+        let stats = Arc::new(std::sync::Mutex::new(IngestionStats::default()));
+        let worker = EventIngestionWorker {
+            rx,
+            pool: dummy_pool(),
+            config: IngestionConfig {
+                max_retries: 1,
+                ..IngestionConfig::default()
+            }
+            .normalized(),
+            stats: Arc::clone(&stats),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut buffer = vec![
+            test_event("failed-e1", "s1", "turn"),
+            test_event("failed-e2", "s1", "turn"),
+        ];
+
+        worker.flush_batch(&mut buffer).await;
+
+        assert_eq!(
+            buffer.len(),
+            2,
+            "normal flush failures must keep the batch in memory for a later retry"
+        );
+        let s = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(s.errors, 1);
+        assert!(
+            s.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("batch flush failed after 1 retries")
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_drains_channel_events() {
         let config = IngestionConfig {
             batch_size: 100,          // large batch so nothing auto-flushes
@@ -1777,9 +2694,21 @@ mod tests {
             s.events_received, 5,
             "all 5 events should be counted (recv + drain)"
         );
+        assert_eq!(
+            s.errors, 1,
+            "shutdown uses a single flush attempt after draining"
+        );
+        assert_eq!(
+            s.flush_count, 0,
+            "dummy pool must fail, so no successful flush should be counted"
+        );
         assert!(
-            s.errors > 0,
-            "flush should have been attempted (and failed on dummy pool)"
+            s.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("shutdown flush failed"),
+            "shutdown drain should report the single-attempt flush failure: {:?}",
+            s.last_error
         );
         drop(sender);
     }
@@ -1796,17 +2725,6 @@ mod tests {
         assert!(
             result.is_ok(),
             "worker should exit cleanly on double signal"
-        );
-    }
-
-    #[test]
-    fn shutdown_path_drains_channel_before_flush() {
-        // Source-level assertion: the shutdown.notified() branch must call
-        // try_recv to drain remaining channel events before flushing.
-        let source = include_str!("event_ingestion.rs");
-        assert!(
-            source.contains("self.rx.try_recv()"),
-            "shutdown branch must drain channel via try_recv before flush_batch_once"
         );
     }
 
@@ -1832,7 +2750,8 @@ mod tests {
             },
         });
         let journal = JournalEvent::context_assembly_recorded(Some("sess-1"), 0, trace.clone());
-        let ingestion = IngestionEvent::from_journal_event(&journal, "user-x");
+        let ingestion =
+            IngestionEvent::from_journal_event(&journal, "user-x").expect("valid journal event");
 
         assert_eq!(ingestion.session_id, "sess-1");
         assert!(
@@ -1853,7 +2772,8 @@ mod tests {
     fn context_assembly_trace_absent_no_metadata_pollution() {
         let mut event = make_turn_event();
         event.context_assembly_trace = None;
-        let ingestion = IngestionEvent::from_journal_event(&event, "user-y");
+        let ingestion =
+            IngestionEvent::from_journal_event(&event, "user-y").expect("valid journal event");
         // Turn events without context_assembly_trace should not have it in metadata
         if let Some(ref meta) = ingestion.metadata {
             assert!(

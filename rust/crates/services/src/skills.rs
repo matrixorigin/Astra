@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, query};
+use sqlx::{Row, mysql::MySqlRow, query};
 
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error,
@@ -158,6 +158,10 @@ const SKILL_LIST_CURSOR_SQL: &str = "\
     AND (skill_name > ? \
      OR (skill_name = ? AND version > ?) \
      OR (skill_name = ? AND version = ? AND skill_id > ?))";
+const UNPUBLISH_USER_SKILL_SQL: &str = "\
+    UPDATE skills_registry \
+    SET is_active = 0, status = 'unpublished', updated_at = NOW() \
+    WHERE skill_name = ? AND source = 'user' AND created_by = ? AND is_active = 1";
 
 /// Visibility rule for database-backed skills.
 ///
@@ -230,6 +234,40 @@ pub fn skill_list_cursor_from_item(
     })
 }
 
+fn optional_string_column(row: &MySqlRow, column: &str) -> Result<Option<String>, sqlx::Error> {
+    row.try_get::<Option<String>, _>(column)
+}
+
+fn optional_i16_column(row: &MySqlRow, column: &str) -> Result<Option<i16>, sqlx::Error> {
+    row.try_get::<Option<i16>, _>(column)
+}
+
+fn skill_metadata_from_definition_json(
+    definition_json: &str,
+) -> Result<Option<serde_json::Value>, serde_json::Error> {
+    let value = serde_json::from_str::<serde_json::Value>(definition_json)?;
+    Ok(if value.is_null() { None } else { Some(value) })
+}
+
+fn skill_list_item_from_row(
+    row: &MySqlRow,
+    source_override: Option<&str>,
+) -> Result<SkillListItem, sqlx::Error> {
+    Ok(SkillListItem {
+        skill_id: row.try_get::<String, _>("skill_id")?,
+        skill_name: row.try_get::<String, _>("skill_name")?,
+        version: row.try_get::<String, _>("version")?,
+        description: optional_string_column(row, "description")?,
+        status: optional_string_column(row, "status")?,
+        source: match source_override {
+            Some(source) => Some(source.to_string()),
+            None => optional_string_column(row, "source")?,
+        },
+        category: optional_string_column(row, "category")?,
+        created_at: optional_string_column(row, "created_at")?,
+    })
+}
+
 // ── Idempotency classifiers ───────────────────────────────────────────────────
 
 /// Row fetched from `skills_registry` when a duplicate key fires during publish.
@@ -239,6 +277,16 @@ pub(crate) struct ExistingPublishRow {
     pub skill_definition: String,
     pub manifest: String,
     pub created_by: Option<String>,
+}
+
+fn existing_publish_row_from_row(row: &MySqlRow) -> Result<ExistingPublishRow, sqlx::Error> {
+    Ok(ExistingPublishRow {
+        skill_name: row.try_get::<String, _>("skill_name")?,
+        version: row.try_get::<String, _>("version")?,
+        skill_definition: row.try_get::<String, _>("skill_definition")?,
+        manifest: row.try_get::<String, _>("manifest")?,
+        created_by: optional_string_column(row, "created_by")?,
+    })
 }
 
 /// Decision returned by [`classify_publish_duplicate`].
@@ -424,22 +472,7 @@ impl SkillService for DatabaseSkillService {
         let mut skills: Vec<SkillListItem> = rows
             .iter()
             .map(|row| -> Result<SkillListItem, _> {
-                Ok(SkillListItem {
-                    skill_id: row
-                        .try_get::<String, _>("skill_id")
-                        .map_err(internal_error)?,
-                    skill_name: row
-                        .try_get::<String, _>("skill_name")
-                        .map_err(internal_error)?,
-                    version: row
-                        .try_get::<String, _>("version")
-                        .map_err(internal_error)?,
-                    description: row.try_get::<String, _>("description").ok(),
-                    status: row.try_get::<String, _>("status").ok(),
-                    source: row.try_get::<String, _>("source").ok(),
-                    category: row.try_get::<String, _>("category").ok(),
-                    created_at: row.try_get::<String, _>("created_at").ok(),
-                })
+                skill_list_item_from_row(row, None).map_err(internal_error)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let has_more = skills.len() > limit as usize;
@@ -531,9 +564,9 @@ impl SkillService for DatabaseSkillService {
             skill_id: row.try_get("skill_id").map_err(internal_error)?,
             skill_name: row.try_get("skill_name").map_err(internal_error)?,
             version: row.try_get("version").map_err(internal_error)?,
-            description: row.try_get("description").ok(),
-            metadata: serde_json::from_str(&def_json).ok(),
-            created_at: row.try_get("created_at").ok(),
+            description: optional_string_column(&row, "description").map_err(internal_error)?,
+            metadata: skill_metadata_from_definition_json(&def_json).map_err(internal_error)?,
+            created_at: optional_string_column(&row, "created_at").map_err(internal_error)?,
         })
     }
 
@@ -565,26 +598,27 @@ impl SkillService for DatabaseSkillService {
             )
         })?;
 
-        let install_count: i64 = query(
+        let install_count_row = query(
             "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND status = 'installed'"
         )
         .bind(&skill_name)
         .fetch_one(&pool)
         .await
-        .map_or(0, |r| r.try_get("cnt").unwrap_or(0));
+        .map_err(internal_error)?;
+        let install_count: i64 = install_count_row.try_get("cnt").map_err(internal_error)?;
 
         Ok(SkillInfoRecord {
             skill_name: row.try_get("skill_name").map_err(internal_error)?,
             version: row.try_get("version").map_err(internal_error)?,
-            description: row.try_get("description").ok(),
-            source: row.try_get("source").ok(),
-            status: row.try_get("status").ok(),
-            created_by: row.try_get("created_by").ok(),
-            category: row.try_get("category").ok(),
+            description: optional_string_column(&row, "description").map_err(internal_error)?,
+            source: optional_string_column(&row, "source").map_err(internal_error)?,
+            status: optional_string_column(&row, "status").map_err(internal_error)?,
+            created_by: optional_string_column(&row, "created_by").map_err(internal_error)?,
+            category: optional_string_column(&row, "category").map_err(internal_error)?,
             install_count,
-            created_at: row.try_get("created_at").ok(),
-            publisher_id: row.try_get("publisher_id").ok(),
-            trust_tier: row.try_get("trust_tier").ok(),
+            created_at: optional_string_column(&row, "created_at").map_err(internal_error)?,
+            publisher_id: optional_string_column(&row, "publisher_id").map_err(internal_error)?,
+            trust_tier: optional_string_column(&row, "trust_tier").map_err(internal_error)?,
         })
     }
 
@@ -612,9 +646,9 @@ impl SkillService for DatabaseSkillService {
         for row in rows {
             versions.push(SkillVersionRecord {
                 version: row.try_get("version").map_err(internal_error)?,
-                status: row.try_get("status").ok(),
-                is_active: row.try_get("is_active").ok(),
-                created_at: row.try_get("created_at").ok(),
+                status: optional_string_column(&row, "status").map_err(internal_error)?,
+                is_active: optional_i16_column(&row, "is_active").map_err(internal_error)?,
+                created_at: optional_string_column(&row, "created_at").map_err(internal_error)?,
             });
         }
         Ok(versions)
@@ -648,17 +682,8 @@ impl SkillService for DatabaseSkillService {
 
                 let items = rows
                     .iter()
-                    .map(|row| SkillListItem {
-                        skill_id: row.try_get::<String, _>("skill_id").unwrap_or_default(),
-                        skill_name: row.try_get::<String, _>("skill_name").unwrap_or_default(),
-                        version: row.try_get::<String, _>("version").unwrap_or_default(),
-                        description: row.try_get::<String, _>("description").ok(),
-                        status: row.try_get::<String, _>("status").ok(),
-                        source: Some(source.clone()),
-                        category: row.try_get::<String, _>("category").ok(),
-                        created_at: row.try_get::<String, _>("created_at").ok(),
-                    })
-                    .collect::<Vec<_>>();
+                    .map(|row| skill_list_item_from_row(row, Some(source.as_str())))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok::<_, sqlx::Error>(items)
             }
         };
@@ -817,17 +842,10 @@ impl SkillService for DatabaseSkillService {
                 .bind(&skill_id)
                 .fetch_optional(&pool)
                 .await
-                .ok()
-                .flatten()
-                .map(|row| ExistingPublishRow {
-                    skill_name: row.try_get::<String, _>("skill_name").unwrap_or_default(),
-                    version: row.try_get::<String, _>("version").unwrap_or_default(),
-                    skill_definition: row
-                        .try_get::<String, _>("skill_definition")
-                        .unwrap_or_default(),
-                    manifest: row.try_get::<String, _>("manifest").unwrap_or_default(),
-                    created_by: row.try_get::<String, _>("created_by").ok(),
-                });
+                .map_err(internal_error)?
+                .map(|row| existing_publish_row_from_row(&row))
+                .transpose()
+                .map_err(internal_error)?;
 
                 match classify_publish_duplicate(
                     dup_row,
@@ -865,36 +883,18 @@ impl SkillService for DatabaseSkillService {
     ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let row = query(
-            "SELECT skill_id, created_by FROM skills_registry WHERE skill_name = ? AND source = 'user' AND is_active = 1"
-        )
-        .bind(&skill_name)
-        .fetch_optional(&pool)
-        .await
-        .map_err(internal_error)?;
-        let row = row.ok_or_else(|| {
-            error_response(
+        let result = query(UNPUBLISH_USER_SKILL_SQL)
+            .bind(&skill_name)
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .map_err(internal_error)?;
+        if result.rows_affected() == 0 {
+            return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("Skill '{}' not found", skill_name),
-            )
-        })?;
-
-        let created_by: String = row.try_get("created_by").map_err(internal_error)?;
-        if created_by != user_id {
-            return Err(error_response(
-                StatusCode::FORBIDDEN,
-                "Not authorized to unpublish this skill",
             ));
         }
-
-        query(
-            "UPDATE skills_registry SET is_active = 0, status = 'unpublished', updated_at = NOW() \
-             WHERE skill_name = ? AND source = 'user'",
-        )
-        .bind(&skill_name)
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
 
         Ok(serde_json::json!({"skill_name": skill_name, "result": "unpublished"}))
     }
@@ -1213,6 +1213,38 @@ mod tests {
         assert!(
             !SKILL_REGISTRY_LIST_SELECT.contains("skill_definition"),
             "list_skills must not read skill_definition (use get_skill for full record)"
+        );
+    }
+
+    #[test]
+    fn unpublish_user_skill_sql_is_owner_bound() {
+        assert!(
+            UNPUBLISH_USER_SKILL_SQL.contains("created_by = ?"),
+            "unpublish must be scoped to the requesting owner"
+        );
+        assert!(
+            UNPUBLISH_USER_SKILL_SQL.contains("is_active = 1"),
+            "unpublish must not rewrite already inactive rows"
+        );
+        assert!(
+            !UNPUBLISH_USER_SKILL_SQL.contains("SELECT"),
+            "unpublish should be a single owner-bound write, not read-then-write"
+        );
+    }
+
+    #[test]
+    fn skill_metadata_from_definition_json_fails_loud_on_invalid_json() {
+        let err = skill_metadata_from_definition_json("{not-json")
+            .expect_err("invalid persisted skill definition JSON must fail");
+        assert!(err.is_syntax(), "{err}");
+    }
+
+    #[test]
+    fn skill_metadata_from_definition_json_maps_json_null_to_absent_metadata() {
+        assert_eq!(skill_metadata_from_definition_json("null").unwrap(), None);
+        assert_eq!(
+            skill_metadata_from_definition_json(r#"{"instructions":"use carefully"}"#).unwrap(),
+            Some(serde_json::json!({"instructions": "use carefully"}))
         );
     }
 

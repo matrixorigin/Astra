@@ -959,7 +959,7 @@ pub async fn run_saas_run_cancel_cross_user_and_owner() {
         delete_json(app, &format!("/chat/runs/{run_id}"), Some(&auth_b)).await;
     assert_eq!(
         st_denied,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "B must not cancel A run: {denied_j}"
     );
 

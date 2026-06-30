@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use astra_core::canonical_names::normalize_name_list;
 use astra_runtime::{
     pipeline::persistence::ToolHealthEntry,
     pipeline::step_protocol::StepCheckpoint,
@@ -182,23 +183,59 @@ where
     I: IntoIterator<Item = String>,
 {
     if tool_call_records.is_empty() {
-        return (fallback_count, fallback_tools.into_iter().collect());
+        return (fallback_count, normalize_name_list(fallback_tools));
     }
 
-    let mut seen = HashSet::new();
     let mut tools_used = Vec::new();
     let mut tool_calls_count = 0u32;
     for record in tool_call_records {
         if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
             continue;
         }
-        tool_calls_count += 1;
-        if seen.insert(record.name.clone()) {
-            tools_used.push(record.name.clone());
+        let name = record.name.trim();
+        if name.is_empty() {
+            continue;
         }
+        tool_calls_count += 1;
+        tools_used.push(name.to_string());
     }
 
-    (tool_calls_count, tools_used)
+    (tool_calls_count, normalize_name_list(tools_used))
+}
+
+fn non_empty_json_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn interruption_visible_text(interruption: &Value, kind: Option<&str>) -> String {
+    let mut text = non_empty_json_str(interruption, "user_message")
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            let kind = kind.unwrap_or("interrupted");
+            let suffix = if interruption
+                .get("resumable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                " You can continue in the next message."
+            } else {
+                ""
+            };
+            format!("[{kind}] Turn interrupted.{suffix}")
+        });
+
+    if let Some(detail) = non_empty_json_str(interruption, "error_detail")
+        && !text.contains(detail)
+    {
+        text.push_str("\n\nStop reason: ");
+        text.push_str(detail);
+    }
+
+    text
 }
 
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
@@ -235,12 +272,19 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     } = ctx;
     let (tool_calls_count, tools_used) =
         resolved_tool_metrics(tool_calls_count, tools_used, &tool_call_records);
+    let has_interruption = interruption.is_some();
     let interruption_kind = interruption
         .as_ref()
         .and_then(|value| value.get("kind"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    let final_state = if interruption_kind.is_some() {
+    let mut full_text = full_text;
+    if full_text.trim().is_empty()
+        && let Some(interruption) = interruption.as_ref()
+    {
+        full_text = interruption_visible_text(interruption, interruption_kind.as_deref());
+    }
+    let final_state = if has_interruption {
         "interrupted"
     } else if full_text.trim().is_empty() {
         "empty"
@@ -315,7 +359,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
 }
 #[cfg(test)]
 mod tests {
-    use super::{StreamResultBuild, build_stream_result};
+    use super::{StreamResultBuild, build_stream_result, resolved_tool_metrics};
     use astra_runtime::pipeline::step_recorder::StepRecorder;
     use astra_runtime::turn::turn_guard::TurnGuard;
     use astra_services::session_journal::ToolCallRecord;
@@ -412,6 +456,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_stream_result_surfaces_empty_text_interruption() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let mut ctx = make_build_ctx(&sr, &tg);
+        ctx.full_text.clear();
+        ctx.interruption = Some(serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "user_message": "[budget_exhausted] 46 tool call(s) completed. A checkpoint was saved. You can continue in the next message.",
+            "error_detail": "The circuit breaker stopped this turn after round 14 because the model kept calling tools after the runtime injected a finalization correction."
+        }));
+
+        let result = build_stream_result(ctx);
+
+        assert_eq!(result.final_state, "interrupted");
+        assert_eq!(
+            result.interruption_kind.as_deref(),
+            Some("budget_exhausted")
+        );
+        assert!(result.full_text.contains("46 tool call(s) completed"));
+        assert!(
+            result
+                .full_text
+                .contains("model kept calling tools after the runtime injected")
+        );
+    }
+
+    #[test]
+    fn build_stream_result_falls_back_when_interruption_lacks_user_message() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let mut ctx = make_build_ctx(&sr, &tg);
+        ctx.full_text = "  ".into();
+        ctx.interruption = Some(serde_json::json!({
+            "kind": "guard_abort",
+            "resumable": false,
+            "error_detail": "guard pipeline abort"
+        }));
+
+        let result = build_stream_result(ctx);
+
+        assert_eq!(result.final_state, "interrupted");
+        assert!(
+            result
+                .full_text
+                .starts_with("[guard_abort] Turn interrupted.")
+        );
+        assert!(
+            result
+                .full_text
+                .contains("Stop reason: guard pipeline abort")
+        );
+    }
+
+    #[test]
+    fn build_stream_result_marks_malformed_interruption_as_interrupted() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let mut ctx = make_build_ctx(&sr, &tg);
+        ctx.full_text.clear();
+        ctx.interruption = Some(serde_json::json!({
+            "resumable": true,
+            "error_detail": "missing kind should not look completed"
+        }));
+
+        let result = build_stream_result(ctx);
+
+        assert_eq!(result.final_state, "interrupted");
+        assert_eq!(result.interruption_kind, None);
+        assert!(
+            result
+                .full_text
+                .starts_with("[interrupted] Turn interrupted.")
+        );
+        assert!(
+            result
+                .full_text
+                .contains("missing kind should not look completed")
+        );
+    }
+
     fn tool_record(name: &str, ok: bool, result_preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
             name: name.into(),
@@ -427,6 +553,38 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn resolved_tool_metrics_canonicalizes_fallback_tool_names() {
+        let (count, tools) = resolved_tool_metrics(
+            4,
+            vec![
+                " bash ".to_string(),
+                "bash".to_string(),
+                String::new(),
+                " read_file".to_string(),
+            ],
+            &[],
+        );
+
+        assert_eq!(count, 4);
+        assert_eq!(tools, vec!["bash".to_string(), "read_file".to_string()]);
+    }
+
+    #[test]
+    fn resolved_tool_metrics_canonicalizes_record_tool_names() {
+        let records = vec![
+            tool_record(" bash ", true, Some("output")),
+            tool_record("bash", true, Some("output")),
+            tool_record(" ", true, Some("output")),
+            tool_record(" read_file", true, Some("contents")),
+        ];
+
+        let (count, tools) = resolved_tool_metrics(0, std::iter::empty(), &records);
+
+        assert_eq!(count, 3);
+        assert_eq!(tools, vec!["bash".to_string(), "read_file".to_string()]);
     }
 
     #[test]

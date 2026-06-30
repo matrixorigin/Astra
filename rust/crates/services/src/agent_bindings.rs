@@ -711,7 +711,15 @@ fn agent_binding_from_row(
         .try_get("capability_servers_json")
         .map_err(internal_error)?;
     let runtime_policy_json: String = row.try_get("runtime_policy_json").map_err(internal_error)?;
-    let metadata_json: Option<String> = row.try_get("metadata_json").ok().flatten();
+    let metadata_json: Option<String> = row.try_get("metadata_json").map_err(internal_error)?;
+    let metadata = metadata_json
+        .as_deref()
+        .map(|raw| {
+            serde_json::from_str(raw).map_err(|error| {
+                internal_error(format!("invalid agent_bindings.metadata_json: {error}"))
+            })
+        })
+        .transpose()?;
     Ok(AgentBindingRecord {
         id: row.try_get("id").map_err(internal_error)?,
         binding_name: row.try_get("binding_name").map_err(internal_error)?,
@@ -722,11 +730,7 @@ fn agent_binding_from_row(
         agent_md: row.try_get("agent_md").map_err(internal_error)?,
         capability_servers: serde_json::from_str(&servers_json).map_err(internal_error)?,
         runtime_policy: serde_json::from_str(&runtime_policy_json).map_err(internal_error)?,
-        metadata: metadata_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(internal_error)?,
+        metadata,
         binding_schema_version: row
             .try_get("binding_schema_version")
             .map_err(internal_error)?,

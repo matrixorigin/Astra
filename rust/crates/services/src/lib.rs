@@ -13,6 +13,7 @@ pub mod contract_generator;
 pub mod coordination;
 pub mod cost_ledger;
 pub mod data_versioning;
+pub mod db_row;
 pub mod decisions;
 pub mod durable_task;
 pub mod edge_context;
@@ -41,12 +42,14 @@ pub mod resource_governor;
 pub mod runs;
 pub mod sandbox;
 pub mod self_surface;
+pub mod service_error;
 pub mod session_analytics;
 pub mod session_artifact_store;
 pub mod session_audit;
 pub mod session_checkpoint;
 pub mod session_fork;
 pub mod session_journal;
+pub(crate) mod session_lifecycle;
 pub mod session_reaper;
 pub mod session_restore;
 pub mod session_workspace;
@@ -176,9 +179,8 @@ pub use durable_task::{
     CloudLlmConfig, CloudLlmJudge, ContractAmendment, ContractStatus, DiffSummary, DurableSubtask,
     DurableTaskLifecycle, LlmJudge, LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle,
     NoopBranchOps, SubtaskDeliverySummary, SubtaskExecutionContext, SubtaskStage,
-    SubtaskVerificationReport, TaskBranchService, TaskContract, TaskDeliveryReport,
-    TaskResumeContext, TaskScope, UnconfiguredDurableTaskLifecycle, VerificationCriterion,
-    VerificationResult, VerificationRunner, VerifierKind,
+    TaskBranchService, TaskContract, TaskDeliveryReport, TaskResumeContext, TaskScope,
+    UnconfiguredDurableTaskLifecycle, VerificationRunner,
 };
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
@@ -245,10 +247,9 @@ pub use pagination::{
 };
 pub use personal_skills::{
     ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore, InstallUserSkill,
-    PersonalSkillError, RAW_SKILL_NORMALIZE_VERSION, RecordUserSkillEvaluation,
-    SKILL_MD_NORMALIZE_VERSION, SubmitUserSkillVersion, UserSkillEvaluationRecord,
-    UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md, normalize_version_or_legacy,
-    skill_md_content_hash,
+    PersonalSkillError, RecordUserSkillEvaluation, SKILL_MD_NORMALIZE_VERSION,
+    SubmitUserSkillVersion, UserSkillEvaluationRecord, UserSkillSourceRecord,
+    UserSkillVersionRecord, normalize_skill_md, skill_md_content_hash,
 };
 pub use prompt_delta::{
     PromptDeltaCounts, PromptRequestObservability, PromptRequestPersistInput,
@@ -268,7 +269,8 @@ pub use runs::{
     UnconfiguredRunLifecycleService, extract_event_type, transform_run_event_for_client,
 };
 pub use sandbox::{
-    DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService,
+    DatabaseSandboxService, SandboxCreateRequestData, SandboxRecord, SandboxService,
+    UnconfiguredSandboxService,
 };
 pub use self_surface::{
     AcceptanceSurface, BudgetConfig, BudgetState, BudgetSurface, CapabilitySurface,
@@ -279,6 +281,7 @@ pub use self_surface::{
     SignalsSurface, StepRecord, SurfaceConstraints, ToolCallView, ToolFailureView, ToolHealthView,
     TraceSurface, VerificationSurface,
 };
+pub use service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 pub use session_artifact_store::{
     DatabaseSessionArtifactStore, LOCAL_SESSION_LAYOUT_VERSION, LocalSessionArtifactStore,
     OwnerScope, OwnerScopeKind, SessionArtifactJsonRecord, SessionArtifactJsonStore,
@@ -319,11 +322,15 @@ pub use task_orchestrator::{
     UnconfiguredTaskService,
 };
 pub use triggers::{
-    DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService,
+    DatabaseTriggerService, TriggerCreateRequestData, TriggerRecord, TriggerService,
+    UnconfiguredTriggerService, WebhookFireData,
 };
 pub use turn_intent_judge::{
     TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError, build_turn_intent_prompt,
     parse_turn_intent_response, turn_intent_judge_messages,
+};
+pub use verification::{
+    SubtaskVerificationReport, VerificationCriterion, VerificationResult, VerifierKind,
 };
 pub use workflows::{
     UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,

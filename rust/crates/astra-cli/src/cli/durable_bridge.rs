@@ -105,16 +105,22 @@ pub async fn generate_contract(
                     Some(amended)
                 }
                 Err(e) => {
-                    eprintln!("  {}  Criteria injection failed: {}", theme::icon_warn(), e,);
+                    let message = e.message;
+                    eprintln!(
+                        "  {}  Criteria injection failed: {}",
+                        theme::icon_warn(),
+                        message,
+                    );
                     None
                 }
             }
         }
         Err(e) => {
+            let message = e.message;
             eprintln!(
                 "  {}  Contract persistence failed: {}",
                 theme::icon_warn(),
-                e
+                message
             );
             None
         }
@@ -177,11 +183,12 @@ pub async fn on_subtask_begin(
             Ok(())
         }
         Err(e) => {
+            let message = e.to_string();
             eprintln!(
                 "  {}  Durable start failed for {}: {}",
                 theme::icon_warn(),
                 subtask_id,
-                e,
+                message,
             );
             if let Some(sub) = durable
                 .contract
@@ -189,9 +196,11 @@ pub async fn on_subtask_begin(
                 .iter_mut()
                 .find(|s| s.id == subtask_id)
             {
-                sub.stage = SubtaskStage::ExecutionFailed { error: e.clone() };
+                sub.stage = SubtaskStage::ExecutionFailed {
+                    error: message.clone(),
+                };
             }
-            Err(e)
+            Err(message)
         }
     }
 }
@@ -212,11 +221,12 @@ pub async fn on_subtask_complete(
         .complete_subtask_execution(&task_id, subtask_id)
         .await
     {
+        let message = e.message;
         eprintln!(
             "  {}  Diff capture failed for {}: {}",
             theme::icon_warn(),
             subtask_id,
-            e,
+            message,
         );
         if let Some(sub) = durable
             .contract
@@ -224,7 +234,7 @@ pub async fn on_subtask_complete(
             .iter_mut()
             .find(|s| s.id == subtask_id)
         {
-            sub.stage = SubtaskStage::ExecutionFailed { error: e };
+            sub.stage = SubtaskStage::ExecutionFailed { error: message };
         }
         return (false, None);
     }
@@ -292,11 +302,12 @@ pub async fn on_subtask_complete(
             (passed, Some(report))
         }
         Err(e) => {
+            let message = e.message;
             eprintln!(
                 "  {}  Verification error for {}: {}",
                 theme::icon_warn(),
                 subtask_id,
-                e,
+                message,
             );
             if let Some(sub) = durable
                 .contract
@@ -304,7 +315,7 @@ pub async fn on_subtask_complete(
                 .iter_mut()
                 .find(|s| s.id == subtask_id)
             {
-                sub.stage = SubtaskStage::ExecutionFailed { error: e };
+                sub.stage = SubtaskStage::ExecutionFailed { error: message };
             }
             (false, None)
         }
@@ -469,12 +480,18 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> Result<bool, St
                 match durable.lifecycle.deliver_task(&task_id).await {
                     Ok(report) => {
                         display_delivery_report(&report);
+                        #[cfg(not(test))]
                         save_delivery_report_json(&report);
                         durable.last_report = Some(report);
                     }
                     Err(e) => {
-                        eprintln!("  {}  Delivery report failed: {}", theme::icon_warn(), e,);
-                        return Err(format!("delivery report failed: {e}"));
+                        let message = e.message;
+                        eprintln!(
+                            "  {}  Delivery report failed: {}",
+                            theme::icon_warn(),
+                            message,
+                        );
+                        return Err(format!("delivery report failed: {message}"));
                     }
                 }
             }
@@ -482,8 +499,13 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> Result<bool, St
             Ok(all_passed)
         }
         Err(e) => {
-            eprintln!("  {}  Global verification error: {}", theme::icon_warn(), e,);
-            Err(format!("global verification failed: {e}"))
+            let message = e.message;
+            eprintln!(
+                "  {}  Global verification error: {}",
+                theme::icon_warn(),
+                message,
+            );
+            Err(format!("global verification failed: {message}"))
         }
     }
 }
@@ -649,31 +671,43 @@ pub(crate) fn display_delivery_report(report: &TaskDeliveryReport) {
     eprintln!("  {}", separator.as_str().dim());
 }
 
+fn delivery_report_filename(report: &TaskDeliveryReport) -> String {
+    format!(
+        ".mo-delivery-{}.json",
+        report.contract_id.chars().take(8).collect::<String>()
+    )
+}
+
+fn save_delivery_report_json_to_dir(
+    report: &TaskDeliveryReport,
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let path = dir.join(delivery_report_filename(report));
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|e| format!("serialize delivery report: {e}"))?;
+    std::fs::write(&path, &json).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// Save the delivery report as JSON to the working directory.
 /// Prints the file path on success (dim grey, non-intrusive).
 pub(crate) fn save_delivery_report_json(report: &TaskDeliveryReport) {
-    let filename = format!(
-        ".mo-delivery-{}.json",
-        report.contract_id.chars().take(8).collect::<String>()
-    );
-    let path = std::env::current_dir().unwrap_or_default().join(&filename);
-    match serde_json::to_string_pretty(report) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, &json) {
-                eprintln!("  {}  Could not save report: {}", theme::icon_warn(), e,);
-            } else {
+    #[cfg(test)]
+    {
+        let _ = report;
+    }
+
+    #[cfg(not(test))]
+    {
+        let dir = std::env::current_dir().unwrap_or_default();
+        match save_delivery_report_json_to_dir(report, &dir) {
+            Ok(path) => {
                 eprintln!(
                     "  {}",
                     format!("📄 Report saved: {}", path.display()).dark_grey(),
                 );
             }
-        }
-        Err(e) => {
-            eprintln!(
-                "  {}  Could not serialize report: {}",
-                theme::icon_warn(),
-                e,
-            );
+            Err(e) => eprintln!("  {}  Could not save report: {}", theme::icon_warn(), e),
         }
     }
 }
@@ -903,20 +937,23 @@ mod tests {
         DurableTaskState, ServerProxyLlmJudge, create_local_lifecycle, create_local_lifecycle_full,
         display_contract_summary, display_delivery_report, display_verification_report,
         generate_contract, on_plan_complete, on_subtask_begin, on_subtask_complete,
-        parse_judge_score,
+        parse_judge_score, save_delivery_report_json_to_dir,
     };
     use crate::lock_recovery::LockRecovery;
-    use astra_services::durable_task::VerifierKind;
     use astra_services::durable_task::{
         ContractStatus, DurableSubtask, SubtaskExecutionContext, SubtaskStage,
     };
     use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     use astra_services::{
-        ContractAmendment, ContractGenerator, DurableTaskLifecycle, LlmJudge,
+        ContractAmendment, ContractGenerator, DurableTaskLifecycle, LlmJudge, ServiceError,
         SubtaskDeliverySummary, SubtaskVerificationReport, TaskDeliveryReport, TaskResumeContext,
-        TaskScope, VerificationCriterion, VerificationResult,
+        TaskScope, VerificationCriterion, VerificationResult, VerifierKind,
     };
     use std::sync::Arc;
+
+    fn service_error(message: impl Into<String>) -> ServiceError {
+        ServiceError::internal(message)
+    }
 
     fn make_test_plan() -> TaskPlan {
         TaskPlan {
@@ -1006,9 +1043,9 @@ mod tests {
             _: &str,
             _: &TaskPlan,
             _: TaskScope,
-        ) -> Result<astra_services::TaskContract, String> {
+        ) -> Result<astra_services::TaskContract, ServiceError> {
             match &self.create_error {
-                Some(error) => Err(error.clone()),
+                Some(error) => Err(ServiceError::internal(error.clone())),
                 None => Ok(self.persisted_contract.clone()),
             }
         }
@@ -1017,10 +1054,10 @@ mod tests {
             &self,
             _: &str,
             amendment: ContractAmendment,
-        ) -> Result<astra_services::TaskContract, String> {
+        ) -> Result<astra_services::TaskContract, ServiceError> {
             *self.amend_calls.lock_recover() += 1;
             if let Some(error) = &self.amend_error {
-                return Err(error.clone());
+                return Err(ServiceError::internal(error.clone()));
             }
 
             let mut amended = self.persisted_contract.clone();
@@ -1040,52 +1077,56 @@ mod tests {
         async fn get_contract(
             &self,
             _: &str,
-        ) -> Result<Option<astra_services::TaskContract>, String> {
+        ) -> Result<Option<astra_services::TaskContract>, ServiceError> {
             Ok(None)
         }
 
-        async fn begin_subtask(&self, _: &str, _: &str) -> Result<SubtaskExecutionContext, String> {
-            Err("stub".into())
+        async fn begin_subtask(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<SubtaskExecutionContext, ServiceError> {
+            Err(ServiceError::internal("stub"))
         }
 
-        async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
-            Err("stub".into())
+        async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), ServiceError> {
+            Err(ServiceError::internal("stub"))
         }
 
-        async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
-            Err("stub".into())
+        async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), ServiceError> {
+            Err(ServiceError::internal("stub"))
         }
 
         async fn verify_subtask(
             &self,
             _: &str,
             _: &str,
-        ) -> Result<SubtaskVerificationReport, String> {
-            Err("stub".into())
+        ) -> Result<SubtaskVerificationReport, ServiceError> {
+            Err(ServiceError::internal("stub"))
         }
 
-        async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
-            Err("stub".into())
+        async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, ServiceError> {
+            Err(ServiceError::internal("stub"))
         }
 
-        async fn pause_task(&self, _: &str) -> Result<(), String> {
-            Err("stub".into())
+        async fn pause_task(&self, _: &str) -> Result<(), ServiceError> {
+            Err(ServiceError::internal("stub"))
         }
 
-        async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
-            Err("stub".into())
+        async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, ServiceError> {
+            Err(ServiceError::internal("stub"))
         }
 
-        async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
-            Err("stub".into())
+        async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, ServiceError> {
+            Err(ServiceError::internal("stub"))
         }
 
-        async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
-            Err("stub".into())
+        async fn snapshot_task_state(&self, _: &str) -> Result<String, ServiceError> {
+            Err(ServiceError::internal("stub"))
         }
 
-        async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
-            Err("stub".into())
+        async fn rollback_task(&self, _: &str, _: &str) -> Result<(), ServiceError> {
+            Err(ServiceError::internal("stub"))
         }
     }
 
@@ -1153,46 +1194,59 @@ mod tests {
                 _: &str,
                 _: &TaskPlan,
                 _: TaskScope,
-            ) -> Result<astra_services::TaskContract, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<astra_services::TaskContract>
+            {
+                Err(service_error("unused"))
             }
 
             async fn amend_contract(
                 &self,
                 _: &str,
                 _: ContractAmendment,
-            ) -> Result<astra_services::TaskContract, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<astra_services::TaskContract>
+            {
+                Err(service_error("unused"))
             }
 
             async fn get_contract(
                 &self,
                 _: &str,
-            ) -> Result<Option<astra_services::TaskContract>, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<Option<astra_services::TaskContract>>
+            {
+                Err(service_error("unused"))
             }
 
             async fn begin_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskExecutionContext, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskExecutionContext> {
+                Err(service_error("unused"))
             }
 
-            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("diff capture failed".into())
+            async fn complete_subtask_execution(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("diff capture failed"))
             }
 
-            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn fail_subtask(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
 
             async fn verify_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskVerificationReport, String> {
+            ) -> astra_services::service_error::ServiceResult<SubtaskVerificationReport>
+            {
                 *self.verify_calls.lock_recover() += 1;
                 Ok(SubtaskVerificationReport {
                     subtask_id: "s1".into(),
@@ -1202,28 +1256,48 @@ mod tests {
                 })
             }
 
-            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
-                Err("unused".into())
+            async fn verify_global(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<Vec<VerificationResult>> {
+                Err(service_error("unused"))
             }
 
-            async fn pause_task(&self, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn pause_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
 
-            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
-                Err("unused".into())
+            async fn resume_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskResumeContext> {
+                Err(service_error("unused"))
             }
 
-            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
-                Err("unused".into())
+            async fn deliver_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskDeliveryReport> {
+                Err(service_error("unused"))
             }
 
-            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
-                Err("unused".into())
+            async fn snapshot_task_state(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<String> {
+                Err(service_error("unused"))
             }
 
-            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn rollback_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
         }
 
@@ -1273,71 +1347,104 @@ mod tests {
                 _: &str,
                 _: &TaskPlan,
                 _: TaskScope,
-            ) -> Result<astra_services::TaskContract, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<astra_services::TaskContract>
+            {
+                Err(service_error("unused"))
             }
 
             async fn amend_contract(
                 &self,
                 _: &str,
                 _: ContractAmendment,
-            ) -> Result<astra_services::TaskContract, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<astra_services::TaskContract>
+            {
+                Err(service_error("unused"))
             }
 
             async fn get_contract(
                 &self,
                 _: &str,
-            ) -> Result<Option<astra_services::TaskContract>, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<Option<astra_services::TaskContract>>
+            {
+                Err(service_error("unused"))
             }
 
             async fn begin_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskExecutionContext, String> {
-                Err("snapshot unavailable".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskExecutionContext> {
+                Err(service_error("snapshot unavailable"))
             }
 
-            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn complete_subtask_execution(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
 
-            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn fail_subtask(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
 
             async fn verify_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskVerificationReport, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskVerificationReport>
+            {
+                Err(service_error("unused"))
             }
 
-            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
-                Err("unused".into())
+            async fn verify_global(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<Vec<VerificationResult>> {
+                Err(service_error("unused"))
             }
 
-            async fn pause_task(&self, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn pause_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
 
-            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
-                Err("unused".into())
+            async fn resume_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskResumeContext> {
+                Err(service_error("unused"))
             }
 
-            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
-                Err("unused".into())
+            async fn deliver_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskDeliveryReport> {
+                Err(service_error("unused"))
             }
 
-            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
-                Err("unused".into())
+            async fn snapshot_task_state(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<String> {
+                Err(service_error("unused"))
             }
 
-            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn rollback_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
         }
 
@@ -1348,10 +1455,10 @@ mod tests {
         };
 
         let err = on_subtask_begin(&mut durable, "s1").await.unwrap_err();
-        assert_eq!(err, "snapshot unavailable");
+        assert_eq!(err, "[internal] snapshot unavailable");
         match &durable.contract.subtasks[0].stage {
             SubtaskStage::ExecutionFailed { error } => {
-                assert_eq!(error, "snapshot unavailable");
+                assert_eq!(error, "[internal] snapshot unavailable");
             }
             other => panic!("unexpected stage: {other:?}"),
         }
@@ -1370,71 +1477,104 @@ mod tests {
                 _: &str,
                 _: &TaskPlan,
                 _: TaskScope,
-            ) -> Result<astra_services::TaskContract, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<astra_services::TaskContract>
+            {
+                Err(service_error("unused"))
             }
 
             async fn amend_contract(
                 &self,
                 _: &str,
                 _: ContractAmendment,
-            ) -> Result<astra_services::TaskContract, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<astra_services::TaskContract>
+            {
+                Err(service_error("unused"))
             }
 
             async fn get_contract(
                 &self,
                 _: &str,
-            ) -> Result<Option<astra_services::TaskContract>, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<Option<astra_services::TaskContract>>
+            {
+                Err(service_error("unused"))
             }
 
             async fn begin_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskExecutionContext, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskExecutionContext> {
+                Err(service_error("unused"))
             }
 
-            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn complete_subtask_execution(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
 
-            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn fail_subtask(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
 
             async fn verify_subtask(
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<SubtaskVerificationReport, String> {
-                Err("unused".into())
+            ) -> astra_services::service_error::ServiceResult<SubtaskVerificationReport>
+            {
+                Err(service_error("unused"))
             }
 
-            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
+            async fn verify_global(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<Vec<VerificationResult>> {
                 Ok(vec![])
             }
 
-            async fn pause_task(&self, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn pause_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
 
-            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
-                Err("unused".into())
+            async fn resume_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskResumeContext> {
+                Err(service_error("unused"))
             }
 
-            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
-                Err("persist failed".into())
+            async fn deliver_task(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<TaskDeliveryReport> {
+                Err(service_error("persist failed"))
             }
 
-            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
-                Err("unused".into())
+            async fn snapshot_task_state(
+                &self,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<String> {
+                Err(service_error("unused"))
             }
 
-            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
-                Err("unused".into())
+            async fn rollback_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> astra_services::service_error::ServiceResult<()> {
+                Err(service_error("unused"))
             }
         }
 
@@ -1516,6 +1656,33 @@ mod tests {
             timestamp: "2026-04-01T00:00:00Z".into(),
         };
         display_delivery_report(&report);
+    }
+
+    #[test]
+    fn delivery_report_json_save_uses_explicit_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = TaskDeliveryReport {
+            task_id: "t1".into(),
+            contract_id: "abcdef123456".into(),
+            goal: "Build a feature".into(),
+            subtask_summaries: vec![],
+            global_verification: vec![],
+            total_turns: 0,
+            total_tokens: 0,
+            total_verifications: 0,
+            risks: vec![],
+            timestamp: "2026-04-01T00:00:00Z".into(),
+        };
+
+        let path = save_delivery_report_json_to_dir(&report, tmp.path()).unwrap();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(".mo-delivery-abcdef12.json")
+        );
+        assert!(path.starts_with(tmp.path()));
+        let saved: TaskDeliveryReport =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.task_id, report.task_id);
     }
 
     #[tokio::test]

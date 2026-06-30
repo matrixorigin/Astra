@@ -39,8 +39,8 @@ pub const CONFIG_VERSIONS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS config_
 /// safe — a duplicate put from the same user returns 0 rows
 /// affected rather than an error.
 pub const CONFIG_VERSIONS_INSERT_SQL: &str = "INSERT IGNORE INTO config_versions \
-     (version_id, user_id, toml_body, created_at, first_seen_session) \
-     VALUES (?, ?, ?, FROM_UNIXTIME(? / 1000.0), ?)";
+     (version_id, user_id, toml_body, first_seen_session) \
+     VALUES (?, ?, ?, ?)";
 
 /// SELECT TOML body by (user_id, version_id) — the primary cloud
 /// fetch used by `astra config sync pull`.
@@ -48,60 +48,21 @@ pub const CONFIG_VERSIONS_SELECT_TOML_SQL: &str =
     "SELECT toml_body FROM config_versions WHERE user_id = ? AND version_id = ?";
 
 /// SELECT recent version metadata for list view.
-pub const CONFIG_VERSIONS_LIST_SQL: &str = "SELECT version_id, user_id, toml_body, UNIX_TIMESTAMP(created_at) * 1000 AS created_at_ms, \
-            first_seen_session \
+pub const CONFIG_VERSIONS_LIST_SQL: &str = "SELECT version_id, user_id, toml_body, first_seen_session \
      FROM config_versions \
      WHERE user_id = ? \
      ORDER BY created_at DESC \
      LIMIT ?";
 
-/// Typed shape of a `config_versions` row. Used by both the push
-/// path (Rust → INSERT binds) and the pull path (SELECT rows →
-/// Rust). Keeping the struct small and flat avoids a drift between
-/// INSERT columns and SELECT projections.
+/// Payload for saving a config version to cloud storage. `created_at`
+/// is intentionally absent: cloud persistence timestamps are assigned
+/// by the database default at insert time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigVersionRow {
+pub struct ConfigVersionPayload {
     pub version_id: String,
     pub user_id: String,
     pub toml_body: String,
-    /// Unix epoch milliseconds. We handle the conversion at the SQL
-    /// boundary so the in-memory type stays plain integer.
-    pub created_at_ms: i64,
     pub first_seen_session: Option<String>,
-}
-
-/// Bind-order placeholder for the INSERT statement. Thin wrapper
-/// over `ConfigVersionRow` that makes the mapping explicit: if
-/// someone adds a column, they must also add a bind position
-/// here, which breaks the schema-shape test.
-#[derive(Debug, Clone)]
-pub struct ConfigVersionInsertParams<'a> {
-    pub version_id: &'a str,
-    pub user_id: &'a str,
-    pub toml_body: &'a str,
-    pub created_at_ms: i64,
-    pub first_seen_session: Option<&'a str>,
-}
-
-/// Build the ordered bind list for `CONFIG_VERSIONS_INSERT_SQL`.
-pub fn config_versions_insert_params(row: &ConfigVersionRow) -> ConfigVersionInsertParams<'_> {
-    ConfigVersionInsertParams {
-        version_id: &row.version_id,
-        user_id: &row.user_id,
-        toml_body: &row.toml_body,
-        created_at_ms: row.created_at_ms,
-        first_seen_session: row.first_seen_session.as_deref(),
-    }
-}
-
-/// Identity parser — kept as a named function so row-shape drift
-/// between the SELECT statement and `ConfigVersionRow` struct
-/// surfaces as a single place to change. Call-sites that read
-/// `MySqlRow` will first extract fields into a `ConfigVersionRow`
-/// and then pass it here (mostly for future extension: redaction,
-/// validation, or mapping alternative on-disk representations).
-pub fn parse_config_version_row(row: &ConfigVersionRow) -> ConfigVersionRow {
-    row.clone()
 }
 
 /// Canonical `event_type` for queued config-version pushes. The
@@ -150,9 +111,9 @@ pub async fn pull_all_into_local_store(
     let mut skipped = 0usize;
 
     for row in rows {
-        let version_id: String = row.try_get("version_id").unwrap_or_default();
-        let toml_body: String = row.try_get("toml_body").unwrap_or_default();
-        let first_seen_session: Option<String> = row.try_get("first_seen_session").ok();
+        let version_id: String = row.try_get("version_id")?;
+        let toml_body: String = row.try_get("toml_body")?;
+        let first_seen_session: Option<String> = row.try_get("first_seen_session")?;
         if version_id.is_empty() || toml_body.is_empty() {
             skipped += 1;
             continue;
@@ -189,34 +150,36 @@ pub async fn pull_all_into_local_store(
 }
 
 /// Turn a queued `IngestionEvent` back into a typed row, iff it was
-/// produced by `IngestionEvent::for_config_version`. Returns `None`
+/// produced by `IngestionEvent::for_config_version`. Returns `Ok(None)`
 /// for any other event_type so the worker can cleanly decide whether
-/// to also write to the `config_versions` table.
-pub fn extract_config_version_row(
+/// to also write to the `config_versions` table. Config-version events
+/// with malformed required payload fail loudly so the batch rolls back.
+pub fn extract_config_version_payload(
     event: &crate::event_ingestion::IngestionEvent,
-) -> Option<ConfigVersionRow> {
+) -> Result<Option<ConfigVersionPayload>, String> {
     if event.event_type != CONFIG_VERSION_SAVED_EVENT_TYPE {
-        return None;
+        return Ok(None);
     }
-    let toml_body = event.content.clone().unwrap_or_default();
-    // Treat empty session_id as "no session" so the roundtrip
-    // matches what `for_config_version` put in (None → empty).
-    let first_seen_session = if event.session_id.is_empty() {
-        None
-    } else {
-        Some(event.session_id.clone())
-    };
-    // created_at on the IngestionEvent is an ISO-8601 string; we
-    // don't carry that back into ConfigVersionRow on the hot path
-    // because the SQL INSERT uses either FROM_UNIXTIME on a bound
-    // epoch-ms value OR the server's CURRENT_TIMESTAMP default.
-    // Scripts that need forensic timestamps read the DATETIME column
-    // directly on the pull side.
-    Some(ConfigVersionRow {
+    let toml_body = event.content.clone().ok_or_else(|| {
+        format!(
+            "config version event {} is missing TOML content",
+            event.event_id
+        )
+    })?;
+    let first_seen_session = event.session_id.trim();
+    if first_seen_session.is_empty() {
+        return Err(format!(
+            "config version event {} is missing session_id",
+            event.event_id
+        ));
+    }
+    // created_at on the IngestionEvent is an ISO-8601 string. We do
+    // not carry it into `config_versions`; the table's database-side
+    // default is the durable forensic timestamp for cloud persistence.
+    Ok(Some(ConfigVersionPayload {
         version_id: event.event_id.clone(),
         user_id: event.user_id.clone(),
         toml_body,
-        created_at_ms: 0,
-        first_seen_session,
-    })
+        first_seen_session: Some(first_seen_session.to_string()),
+    }))
 }

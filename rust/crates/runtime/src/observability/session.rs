@@ -151,7 +151,7 @@ impl ObservabilitySession {
     /// against the exact bytes the model consumed this turn.
     pub fn observe_bridge_injections_partial(
         &mut self,
-        self_observed: BridgeInjectionTexts<'_>,
+        self_observed: BridgeInjectionPreviews<'_>,
         bridge_fingerprints: Option<
             &astra_turn_core::chat_turn_sse_dispatch::BridgeInjectionFingerprints,
         >,
@@ -184,7 +184,7 @@ impl ObservabilitySession {
         // CLI-owned channels: fingerprint from the raw text the CLI
         // already has. Preview is populated so introspect can show
         // the first 80 chars of the actual injection.
-        let BridgeInjectionTexts {
+        let BridgeInjectionPreviews {
             lessons,
             volatile,
             memoria_insights,
@@ -289,20 +289,6 @@ impl ObservabilitySession {
                 );
             }
         }
-    }
-
-    /// Backwards-compat wrapper used by `ObservabilitySession` unit
-    /// tests that pre-date wip-7's fingerprint split. Forwards to
-    /// [`Self::observe_bridge_injections_partial`] with no bridge
-    /// fingerprints — every channel's fingerprint is derived from the
-    /// caller-supplied raw text, which is the shape existing tests
-    /// expect. Production call sites must use
-    /// [`Self::observe_bridge_injections_partial`] with the wire
-    /// fingerprints so bridge-internal channels get tracked via their
-    /// (post-gate) opaque fingerprints.
-    #[cfg(test)]
-    pub fn observe_bridge_injections(&mut self, texts: BridgeInjectionTexts<'_>) {
-        self.observe_bridge_injections_partial(texts, None);
     }
 
     /// Publish the four SelfModel inputs that were previously hard-coded to

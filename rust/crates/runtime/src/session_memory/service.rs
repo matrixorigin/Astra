@@ -1288,8 +1288,14 @@ impl MemoryExtractionService {
         if let Some(sink) = self.local_event_sink.as_ref() {
             sink(&event);
         }
-        let ingestion_event = IngestionEvent::from_journal_event(&event, &self.user_id);
-        self.ingestion.enqueue(ingestion_event);
+        match IngestionEvent::from_journal_event(&event, &self.user_id) {
+            Ok(ingestion_event) => self.ingestion.enqueue(ingestion_event),
+            Err(error) => tracing::warn!(
+                target: "astra_runtime::session_memory",
+                error = %error,
+                "invalid session memory journal event for cloud ingestion"
+            ),
+        }
     }
 
     // ── observatory helpers (all no-op when observatory=None) ────────

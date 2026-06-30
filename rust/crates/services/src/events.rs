@@ -1,13 +1,15 @@
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::{Acquire, MySql, QueryBuilder, Row, query};
+use sqlx::{Acquire, MySql, QueryBuilder, query};
 use uuid::Uuid;
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
+use crate::db_row::RowExt as EventDbRow;
 use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::storage::{agent_session_exists_for_user, bump_agent_session_event_count};
+use astra_core::canonical_names::metadata_tool_name;
 
 const MAX_CAUSAL_CHAIN_EVENTS: i64 = 500;
 
@@ -65,14 +67,6 @@ pub struct EventListRecord {
 pub struct EventListCursor {
     pub created_at: String,
     pub event_id: String,
-}
-
-fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String> {
-    metadata
-        .and_then(|v| v.get("tool_name").or_else(|| v.get("name")))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
 }
 
 fn validate_event_list_limit(limit: u32) -> u32 {
@@ -140,6 +134,128 @@ fn event_list_cursor_from_record(
     })
 }
 
+fn event_row_string(
+    row: &impl EventDbRow,
+    column: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    row.string_column(column)
+        .map_err(|e| internal_error(format!("agent_events decode column `{column}`: {e}")))
+}
+
+fn event_row_optional_string(
+    row: &impl EventDbRow,
+    column: &str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    row.optional_string_column(column)
+        .map_err(|e| internal_error(format!("agent_events decode column `{column}`: {e}")))
+}
+
+fn parse_event_metadata_json(
+    metadata_json: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+    serde_json::from_str(metadata_json)
+        .map_err(|e| internal_error(format!("agent_events metadata JSON decode failed: {e}")))
+}
+
+fn event_count_total(row: &impl EventDbRow) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+    row.i64_column("total")
+        .map_err(|e| internal_error(format!("agent_events decode column `total`: {e}")))
+}
+
+fn agent_session_event_count(
+    row: &impl EventDbRow,
+) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+    row.i64_column("event_count")
+        .map_err(|e| internal_error(format!("agent_sessions decode column `event_count`: {e}")))
+}
+
+fn event_list_can_use_session_summary(filter: &EventListFilter) -> bool {
+    filter.session_id.is_some()
+        && filter.event_type.is_none()
+        && filter.agent_id.is_none()
+        && filter.causal_chain_id.is_none()
+}
+
+fn push_event_list_filters<'a>(qb: &mut QueryBuilder<'a, MySql>, filter: &'a EventListFilter) {
+    qb.push_bind(&filter.user_id);
+    if let Some(sid) = &filter.session_id {
+        qb.push(" AND session_id = ");
+        qb.push_bind(sid);
+    }
+    if let Some(et) = &filter.event_type {
+        qb.push(" AND event_type = ");
+        qb.push_bind(et);
+    }
+    if let Some(aid) = &filter.agent_id {
+        qb.push(" AND agent_id = ");
+        qb.push_bind(aid);
+    }
+    if let Some(ccid) = &filter.causal_chain_id {
+        qb.push(" AND causal_chain_id = ");
+        qb.push_bind(ccid);
+    }
+}
+
+async fn count_events_from_agent_events(
+    pool: &sqlx::Pool<MySql>,
+    filter: &EventListFilter,
+) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+    let mut count_qb = QueryBuilder::<MySql>::new(
+        "SELECT COUNT(event_id) AS total FROM agent_events WHERE user_id = ",
+    );
+    push_event_list_filters(&mut count_qb, filter);
+    let total_row = count_qb
+        .build()
+        .fetch_one(pool)
+        .await
+        .map_err(internal_error)?;
+    event_count_total(&total_row)
+}
+
+async fn list_events_total(
+    pool: &sqlx::Pool<MySql>,
+    filter: &EventListFilter,
+) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+    if !event_list_can_use_session_summary(filter) {
+        return count_events_from_agent_events(pool, filter).await;
+    }
+
+    let session_id = filter.session_id.as_deref().expect("checked above");
+    let session_row = query(
+        "SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(&filter.user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal_error)?;
+    match session_row {
+        Some(row) => agent_session_event_count(&row),
+        None => count_events_from_agent_events(pool, filter).await,
+    }
+}
+
+fn decode_event_record_from_row(
+    row: &impl EventDbRow,
+) -> Result<EventRecord, (StatusCode, Json<ErrorResponse>)> {
+    let metadata_json = event_row_string(row, "metadata_json")?;
+
+    Ok(EventRecord {
+        event_id: event_row_string(row, "event_id")?,
+        user_id: event_row_string(row, "user_id")?,
+        session_id: event_row_string(row, "session_id")?,
+        event_type: event_row_string(row, "event_type")?,
+        content: event_row_string(row, "content")?,
+        agent_id: event_row_optional_string(row, "agent_id")?,
+        agent_version: event_row_optional_string(row, "agent_version")?,
+        parent_event_id: event_row_optional_string(row, "parent_event_id")?,
+        parent_event_ids: Vec::new(),
+        causal_chain_id: event_row_string(row, "causal_chain_id")?,
+        metadata: parse_event_metadata_json(&metadata_json)?,
+        created_at: event_row_string(row, "created_at")?,
+    })
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -201,28 +317,7 @@ impl DatabaseEventService {
     pub fn event_record_from_row(
         row: sqlx::mysql::MySqlRow,
     ) -> Result<EventRecord, (StatusCode, Json<ErrorResponse>)> {
-        let metadata_json: String = row
-            .try_get("metadata_json")
-            .unwrap_or_else(|_| "{}".to_string());
-
-        Ok(EventRecord {
-            event_id: row.try_get("event_id").map_err(internal_error)?,
-            user_id: row.try_get("user_id").map_err(internal_error)?,
-            session_id: row.try_get("session_id").map_err(internal_error)?,
-            event_type: row.try_get("event_type").map_err(internal_error)?,
-            content: row.try_get("content").map_err(internal_error)?,
-            agent_id: row.try_get("agent_id").ok(),
-            agent_version: row.try_get("agent_version").ok(),
-            parent_event_id: row.try_get("parent_event_id").ok(),
-            parent_event_ids: Vec::new(),
-            causal_chain_id: row
-                .try_get::<Option<String>, _>("causal_chain_id")
-                .map_err(internal_error)?
-                .unwrap_or_default(),
-            metadata: serde_json::from_str(&metadata_json)
-                .unwrap_or(serde_json::Value::Object(Default::default())),
-            created_at: row.try_get("created_at").unwrap_or_default(),
-        })
+        decode_event_record_from_row(&row)
     }
 
     async fn hydrate_parent_event_ids<'e, E>(
@@ -236,8 +331,18 @@ impl DatabaseEventService {
             .iter()
             .map(|record| record.event_id.clone())
             .collect();
-        let parent_id_map = crate::storage::load_agent_event_parent_ids(executor, &event_ids)
+        let mut parent_id_map = std::collections::HashMap::new();
+        let Some(user_id) = records.first().map(|record| record.user_id.as_str()) else {
+            return Ok(());
+        };
+        if records.iter().any(|record| record.user_id != user_id) {
+            return Err(internal_error(
+                "cannot hydrate parent event ids for mixed-owner event records",
+            ));
+        }
+        crate::storage::load_agent_event_parent_ids(executor, user_id, &event_ids)
             .await
+            .map(|loaded| parent_id_map.extend(loaded))
             .map_err(internal_error)?;
         for record in records {
             record.parent_event_ids = crate::storage::normalized_parent_event_ids(
@@ -360,6 +465,8 @@ impl EventService for DatabaseEventService {
 
         crate::storage::insert_agent_event_edges(
             &mut *tx,
+            &user_id,
+            &session_id,
             &event_id,
             primary_parent_event_id.as_deref(),
             &normalized_parent_event_ids,
@@ -367,22 +474,26 @@ impl EventService for DatabaseEventService {
         .await
         .map_err(internal_error)?;
 
+        let event_count_delta =
+            crate::storage::rows_affected_to_i64(insert_result.rows_affected(), "create_event")
+                .map_err(internal_error)?;
         bump_agent_session_event_count(
             &mut *tx,
             &session_id,
             &user_id,
-            i64::try_from(insert_result.rows_affected()).unwrap_or(i64::MAX),
+            event_count_delta,
             Some(&event_id),
         )
         .await
         .map_err(internal_error)?;
 
         let select_sql = format!(
-            "SELECT {} FROM agent_events WHERE event_id = ?",
+            "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
             EVENT_DETAIL_SELECT_COLS
         );
         let row = query(&select_sql)
             .bind(&event_id)
+            .bind(&user_id)
             .fetch_one(&mut *tx)
             .await
             .map_err(internal_error)?;
@@ -403,54 +514,13 @@ impl EventService for DatabaseEventService {
 
         let limit = validate_event_list_limit(filter.limit);
 
-        let mut count_qb = QueryBuilder::<MySql>::new(
-            "SELECT COUNT(event_id) AS total FROM agent_events WHERE user_id = ",
-        );
-        count_qb.push_bind(&filter.user_id);
-        if let Some(sid) = &filter.session_id {
-            count_qb.push(" AND session_id = ");
-            count_qb.push_bind(sid);
-        }
-        if let Some(et) = &filter.event_type {
-            count_qb.push(" AND event_type = ");
-            count_qb.push_bind(et);
-        }
-        if let Some(aid) = &filter.agent_id {
-            count_qb.push(" AND agent_id = ");
-            count_qb.push_bind(aid);
-        }
-        if let Some(ccid) = &filter.causal_chain_id {
-            count_qb.push(" AND causal_chain_id = ");
-            count_qb.push_bind(ccid);
-        }
-        let total_row = count_qb
-            .build()
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
-        let total = total_row.try_get::<i64, _>("total").unwrap_or(0);
+        let total = list_events_total(&pool, &filter).await?;
 
         let mut list_qb = QueryBuilder::<MySql>::new(format!(
             "SELECT {} FROM agent_events WHERE user_id = ",
             EVENT_LIST_SELECT_COLS
         ));
-        list_qb.push_bind(&filter.user_id);
-        if let Some(sid) = &filter.session_id {
-            list_qb.push(" AND session_id = ");
-            list_qb.push_bind(sid);
-        }
-        if let Some(et) = &filter.event_type {
-            list_qb.push(" AND event_type = ");
-            list_qb.push_bind(et);
-        }
-        if let Some(aid) = &filter.agent_id {
-            list_qb.push(" AND agent_id = ");
-            list_qb.push_bind(aid);
-        }
-        if let Some(ccid) = &filter.causal_chain_id {
-            list_qb.push(" AND causal_chain_id = ");
-            list_qb.push_bind(ccid);
-        }
+        push_event_list_filters(&mut list_qb, &filter);
         if let Some(cursor) = &filter.cursor {
             let created_at = event_list_cursor_db_created_at(cursor)?;
             let event_id = event_list_cursor_event_id(cursor)?;
@@ -560,25 +630,21 @@ impl EventService for DatabaseEventService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let limit = validate_event_list_limit(limit);
 
-        if !agent_session_exists_for_user(&pool, &session_id, &user_id)
-            .await
-            .map_err(internal_error)?
-        {
+        let session_row = query(
+            "SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+        let Some(session_row) = session_row else {
             return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("Session {} not found", session_id),
             ));
-        }
-
-        let count_row = query(
-            "SELECT COUNT(event_id) AS total FROM agent_events WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(&session_id)
-        .bind(&user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(internal_error)?;
-        let total = count_row.try_get::<i64, _>("total").unwrap_or(0);
+        };
+        let total = agent_session_event_count(&session_row)?;
 
         let mut list_qb = QueryBuilder::<MySql>::new(format!(
             "SELECT {} FROM agent_events WHERE session_id = ",
@@ -658,12 +724,16 @@ impl EventService for DatabaseEventService {
         let record = Self::event_record_from_row(row)?;
 
         let mut tx = pool.begin().await.map_err(internal_error)?;
-        query("DELETE FROM agent_event_edges WHERE child_event_id = ? OR parent_event_id = ?")
-            .bind(&event_id)
-            .bind(&event_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(internal_error)?;
+        query(
+            "DELETE FROM agent_event_edges
+             WHERE user_id = ? AND (child_event_id = ? OR parent_event_id = ?)",
+        )
+        .bind(&user_id)
+        .bind(&event_id)
+        .bind(&event_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
         let delete_result = query("DELETE FROM agent_events WHERE event_id = ? AND user_id = ?")
             .bind(&event_id)
             .bind(&user_id)
@@ -897,25 +967,25 @@ mod tests {
 
     #[test]
     fn metadata_from_tool_name() {
-        let v = serde_json::json!({"tool_name": "bash"});
+        let v = serde_json::json!({"tool_name": " bash "});
         assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "bash");
     }
 
     #[test]
-    fn metadata_from_name_fallback() {
+    fn metadata_name_is_not_a_tool_name_alias() {
         let v = serde_json::json!({"name": "read_file"});
-        assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "read_file");
+        assert!(metadata_tool_name(Some(&v)).is_none());
     }
 
     #[test]
-    fn metadata_prefers_tool_name() {
-        let v = serde_json::json!({"tool_name": "preferred", "name": "fallback"});
+    fn metadata_ignores_ambiguous_name_when_tool_name_exists() {
+        let v = serde_json::json!({"tool_name": "preferred", "name": "read_file"});
         assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "preferred");
     }
 
     #[test]
     fn metadata_trims_quotes() {
-        let v = serde_json::json!({"tool_name": "\"bash\""});
+        let v = serde_json::json!({"tool_name": " \"bash\" "});
         assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "bash");
     }
 
@@ -943,6 +1013,238 @@ mod tests {
     fn default_limits() {
         assert_eq!(default_event_limit(), 50);
         assert_eq!(default_session_event_limit(), 100);
+    }
+
+    #[test]
+    fn event_metadata_json_decode_fails_loudly() {
+        assert!(parse_event_metadata_json(r#"{"ok":true}"#).is_ok());
+        assert!(parse_event_metadata_json("{not-json").is_err());
+    }
+
+    fn list_filter_for_summary_fast_path() -> EventListFilter {
+        EventListFilter {
+            user_id: "user-1".to_string(),
+            session_id: Some("session-1".to_string()),
+            event_type: None,
+            agent_id: None,
+            causal_chain_id: None,
+            limit: 50,
+            cursor: None,
+        }
+    }
+
+    #[test]
+    fn event_list_summary_fast_path_requires_unfiltered_session_scope() {
+        assert!(event_list_can_use_session_summary(
+            &list_filter_for_summary_fast_path()
+        ));
+
+        let mut without_session = list_filter_for_summary_fast_path();
+        without_session.session_id = None;
+        assert!(!event_list_can_use_session_summary(&without_session));
+
+        let mut with_event_type = list_filter_for_summary_fast_path();
+        with_event_type.event_type = Some("tool_call".to_string());
+        assert!(!event_list_can_use_session_summary(&with_event_type));
+
+        let mut with_agent = list_filter_for_summary_fast_path();
+        with_agent.agent_id = Some("agent-1".to_string());
+        assert!(!event_list_can_use_session_summary(&with_agent));
+
+        let mut with_causal_chain = list_filter_for_summary_fast_path();
+        with_causal_chain.causal_chain_id = Some("chain-1".to_string());
+        assert!(!event_list_can_use_session_summary(&with_causal_chain));
+    }
+
+    struct FakeEventDbRow {
+        failed_column: Option<&'static str>,
+        metadata_json: &'static str,
+    }
+
+    impl FakeEventDbRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                metadata_json: r#"{"tool_name":"bash"}"#,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_metadata_json(metadata_json: &'static str) -> Self {
+            Self {
+                metadata_json,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl EventDbRow for FakeEventDbRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "event_id" => "event-1",
+                "user_id" => "user-1",
+                "session_id" => "session-1",
+                "event_type" => "tool_call",
+                "content" => r#"{"cmd":"pwd"}"#,
+                "causal_chain_id" => "chain-1",
+                "metadata_json" => self.metadata_json,
+                "created_at" => "2026-06-26T12:00:00",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "agent_id" => Some("agent-1".to_string()),
+                "agent_version" => Some("1.2.3".to_string()),
+                "parent_event_id" => None,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            match column {
+                "total" => Ok(9),
+                "event_count" => Ok(7),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    fn assert_internal_decode_error(
+        result: Result<impl std::fmt::Debug, (StatusCode, Json<ErrorResponse>)>,
+        column: &str,
+    ) {
+        let (status, Json(body)) = result.unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.detail.contains(&format!("decode column `{column}`")),
+            "error should identify failed column: {:?}",
+            body.detail
+        );
+    }
+
+    #[test]
+    fn event_record_row_decode_preserves_database_values() {
+        let record = decode_event_record_from_row(&FakeEventDbRow::complete()).unwrap();
+
+        assert_eq!(record.event_id, "event-1");
+        assert_eq!(record.user_id, "user-1");
+        assert_eq!(record.session_id, "session-1");
+        assert_eq!(record.event_type, "tool_call");
+        assert_eq!(record.content, r#"{"cmd":"pwd"}"#);
+        assert_eq!(record.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(record.agent_version.as_deref(), Some("1.2.3"));
+        assert_eq!(record.parent_event_id, None);
+        assert_eq!(record.parent_event_ids, Vec::<String>::new());
+        assert_eq!(record.causal_chain_id, "chain-1");
+        assert_eq!(record.metadata, serde_json::json!({"tool_name":"bash"}));
+        assert_eq!(record.created_at, "2026-06-26T12:00:00");
+    }
+
+    #[test]
+    fn event_record_row_decode_fails_loudly_on_missing_columns() {
+        for column in [
+            "event_id",
+            "user_id",
+            "session_id",
+            "event_type",
+            "content",
+            "agent_id",
+            "agent_version",
+            "parent_event_id",
+            "causal_chain_id",
+            "metadata_json",
+            "created_at",
+        ] {
+            assert_internal_decode_error(
+                decode_event_record_from_row(&FakeEventDbRow::fail_on(column)),
+                column,
+            );
+        }
+    }
+
+    #[test]
+    fn event_record_row_decode_fails_loudly_on_invalid_metadata_json() {
+        let (status, Json(body)) =
+            decode_event_record_from_row(&FakeEventDbRow::with_metadata_json("{not-json"))
+                .unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.detail.contains("metadata JSON decode failed"),
+            "error should identify metadata JSON decode failure: {:?}",
+            body.detail
+        );
+    }
+
+    #[test]
+    fn event_count_total_preserves_value_and_fails_loudly() {
+        assert_eq!(event_count_total(&FakeEventDbRow::complete()).unwrap(), 9);
+
+        let (status, Json(body)) =
+            event_count_total(&FakeEventDbRow::fail_on("total")).unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.detail.contains("decode column `total`"),
+            "error should identify total decode failure: {:?}",
+            body.detail
+        );
+    }
+
+    #[test]
+    fn agent_session_event_count_preserves_summary_and_fails_loudly() {
+        assert_eq!(
+            agent_session_event_count(&FakeEventDbRow::complete()).unwrap(),
+            7
+        );
+
+        let (status, Json(body)) =
+            agent_session_event_count(&FakeEventDbRow::fail_on("event_count")).unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.detail
+                .contains("agent_sessions decode column `event_count`"),
+            "error should identify agent_sessions.event_count decode failure: {:?}",
+            body.detail
+        );
+    }
+
+    #[test]
+    fn event_row_optional_string_does_not_swallow_decode_errors() {
+        for column in ["agent_id", "agent_version", "parent_event_id"] {
+            assert_internal_decode_error(
+                event_row_optional_string(&FakeEventDbRow::fail_on(column), column),
+                column,
+            );
+        }
+    }
+
+    #[test]
+    fn event_row_string_does_not_default_missing_required_values() {
+        for column in ["created_at", "metadata_json"] {
+            assert!(
+                event_row_string(&FakeEventDbRow::fail_on(column), column).is_err(),
+                "required event column should not default: {column}"
+            );
+        }
     }
 
     // --- EventRecord → EventResponse conversion ---
@@ -1083,7 +1385,7 @@ mod tests {
              ORDER BY created_at DESC, event_id DESC LIMIT ?"
         );
         let asc_sql = format!(
-            "SELECT {EVENT_LIST_SELECT_COLS} FROM agent_events WHERE session_id = ? \
+            "SELECT {EVENT_LIST_SELECT_COLS} FROM agent_events WHERE session_id = ? AND user_id = ? \
              AND (created_at > ? OR (created_at = ? AND event_id > ?)) \
              ORDER BY created_at ASC, event_id ASC LIMIT ?"
         );

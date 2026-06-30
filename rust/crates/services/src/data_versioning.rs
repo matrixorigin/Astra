@@ -95,6 +95,107 @@ pub fn truncate_content(s: &str, max: usize) -> String {
     }
 }
 
+fn row_string(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    row.try_get(column)
+        .map_err(|err| internal_error(format!("invalid {table}.{column}: {err}")))
+}
+
+fn required_row_string(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let value = row_string(row, table, column)?;
+    if value.trim().is_empty() {
+        return Err(internal_error(format!(
+            "invalid {table}.{column}: value is empty"
+        )));
+    }
+    Ok(value)
+}
+
+fn optional_row_string(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    let value: Option<String> = row
+        .try_get(column)
+        .map_err(|err| internal_error(format!("invalid {table}.{column}: {err}")))?;
+    if value
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(internal_error(format!(
+            "invalid {table}.{column}: value is empty"
+        )));
+    }
+    Ok(value)
+}
+
+fn checkpoint_response_from_row(
+    row: sqlx::mysql::MySqlRow,
+) -> Result<CheckpointResponse, (StatusCode, Json<ErrorResponse>)> {
+    Ok(CheckpointResponse {
+        checkpoint_name: required_row_string(
+            &row,
+            "data_versioning_checkpoints",
+            "checkpoint_name",
+        )?,
+        timestamp: required_row_string(&row, "data_versioning_checkpoints", "created_at")?,
+        description: row.try_get("description").map_err(|err| {
+            internal_error(format!(
+                "invalid data_versioning_checkpoints.description: {err}"
+            ))
+        })?,
+    })
+}
+
+fn event_at_checkpoint_from_row(
+    row: sqlx::mysql::MySqlRow,
+) -> Result<EventAtCheckpoint, (StatusCode, Json<ErrorResponse>)> {
+    let raw_content = row_string(&row, "agent_events", "content")?;
+    Ok(EventAtCheckpoint {
+        event_id: required_row_string(&row, "agent_events", "event_id")?,
+        session_id: required_row_string(&row, "agent_events", "session_id")?,
+        event_type: required_row_string(&row, "agent_events", "event_type")?,
+        content: truncate_content(&raw_content, 500),
+        created_at: required_row_string(&row, "agent_events", "created_at")?,
+    })
+}
+
+fn lineage_node_from_row(
+    row: sqlx::mysql::MySqlRow,
+) -> Result<(LineageNode, LineageContributionContext), (StatusCode, Json<ErrorResponse>)> {
+    let event_id = required_row_string(&row, "agent_events", "event_id")?;
+    let session_id = required_row_string(&row, "agent_events", "session_id")?;
+    let created_at = required_row_string(&row, "agent_events", "created_at")?;
+    let raw_content = row_string(&row, "agent_events", "content")?;
+    let parent_event_id = optional_row_string(&row, "agent_events", "parent_event_id")?;
+    let causal_chain_id = optional_row_string(&row, "agent_events", "causal_chain_id")?;
+    let node = LineageNode {
+        event_id: event_id.clone(),
+        event_type: required_row_string(&row, "agent_events", "event_type")?,
+        content: truncate_content(&raw_content, 500),
+        parent_event_id,
+        parent_event_ids: Vec::new(),
+        contribution_score: None,
+        causal_chain_id,
+        created_at: created_at.clone(),
+    };
+    let context = LineageContributionContext {
+        event_id,
+        session_id,
+        created_at,
+        parent_event_ids: Vec::new(),
+    };
+    Ok((node, context))
+}
+
 #[derive(Clone, Debug)]
 struct LineageContributionContext {
     event_id: String,
@@ -248,10 +349,11 @@ impl DatabaseDataVersioningService {
 
     async fn hydrate_parent_event_ids(
         pool: &sqlx::Pool<sqlx::MySql>,
+        user_id: &str,
         nodes: &mut [LineageNode],
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let event_ids: Vec<String> = nodes.iter().map(|node| node.event_id.clone()).collect();
-        let parent_id_map = crate::storage::load_agent_event_parent_ids(pool, &event_ids)
+        let parent_id_map = crate::storage::load_agent_event_parent_ids(pool, user_id, &event_ids)
             .await
             .map_err(internal_error)?;
         for node in nodes {
@@ -338,11 +440,14 @@ impl DataVersioningService for DatabaseDataVersioningService {
         );
         query(&sql).execute(&pool).await.map_err(internal_error)?;
 
+        let checkpoint_id = uuid::Uuid::new_v4().to_string();
+
         query(
             "INSERT INTO data_versioning_checkpoints \
-             (checkpoint_name, user_id, description, created_at) \
-             VALUES (?, ?, ?, NOW())",
+             (checkpoint_id, checkpoint_name, user_id, description, created_at) \
+             VALUES (?, ?, ?, ?, NOW())",
         )
+        .bind(&checkpoint_id)
         .bind(&request.name)
         .bind(&user_id)
         .bind(&request.description)
@@ -350,11 +455,16 @@ impl DataVersioningService for DatabaseDataVersioningService {
         .await
         .map_err(internal_error)?;
 
-        Ok(CheckpointResponse {
-            checkpoint_name: request.name,
-            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-            description: request.description,
-        })
+        let row = query(
+            "SELECT checkpoint_name, description, \
+             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             FROM data_versioning_checkpoints WHERE checkpoint_id = ?",
+        )
+        .bind(&checkpoint_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error)?;
+        checkpoint_response_from_row(row)
     }
 
     async fn list_checkpoints(
@@ -377,11 +487,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
         let mut checkpoints = Vec::with_capacity(rows.len());
         for row in rows {
-            checkpoints.push(CheckpointResponse {
-                checkpoint_name: row.try_get("checkpoint_name").map_err(internal_error)?,
-                timestamp: row.try_get("created_at").unwrap_or_default(),
-                description: row.try_get("description").ok(),
-            });
+            checkpoints.push(checkpoint_response_from_row(row)?);
         }
         Ok(checkpoints)
     }
@@ -412,7 +518,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
                 format!("Checkpoint '{}' not found", checkpoint_name),
             )
         })?;
-        let cp_ts: String = cp_row.try_get("created_at").unwrap_or_default();
+        let cp_ts = required_row_string(&cp_row, "data_versioning_checkpoints", "created_at")?;
 
         let rows = query(
             "SELECT event_id, session_id, event_type, \
@@ -431,14 +537,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            let raw_content: String = row.try_get("content").unwrap_or_default();
-            events.push(EventAtCheckpoint {
-                event_id: row.try_get("event_id").map_err(internal_error)?,
-                session_id: row.try_get("session_id").map_err(internal_error)?,
-                event_type: row.try_get("event_type").map_err(internal_error)?,
-                content: truncate_content(&raw_content, 500),
-                created_at: row.try_get("created_at").unwrap_or_default(),
-            });
+            events.push(event_at_checkpoint_from_row(row)?);
         }
         Ok(events)
     }
@@ -464,7 +563,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
                 format!("Event '{}' not found", event_id),
             )
         })?;
-        let chain_id: Option<String> = seed.try_get("causal_chain_id").ok();
+        let chain_id = optional_row_string(&seed, "agent_events", "causal_chain_id")?;
 
         let chain_id = chain_id
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Event has no causal chain"))?;
@@ -488,28 +587,11 @@ impl DataVersioningService for DatabaseDataVersioningService {
         let mut nodes = Vec::with_capacity(rows.len());
         let mut contexts = Vec::with_capacity(rows.len());
         for row in rows {
-            let event_id: String = row.try_get("event_id").map_err(internal_error)?;
-            let session_id: String = row.try_get("session_id").map_err(internal_error)?;
-            let raw_content: String = row.try_get("content").unwrap_or_default();
-            let created_at: String = row.try_get("created_at").unwrap_or_default();
-            nodes.push(LineageNode {
-                event_id: event_id.clone(),
-                event_type: row.try_get("event_type").map_err(internal_error)?,
-                content: truncate_content(&raw_content, 500),
-                parent_event_id: row.try_get("parent_event_id").ok(),
-                parent_event_ids: Vec::new(),
-                contribution_score: None,
-                causal_chain_id: row.try_get("causal_chain_id").ok(),
-                created_at: created_at.clone(),
-            });
-            contexts.push(LineageContributionContext {
-                event_id,
-                session_id,
-                created_at,
-                parent_event_ids: Vec::new(),
-            });
+            let (node, context) = lineage_node_from_row(row)?;
+            nodes.push(node);
+            contexts.push(context);
         }
-        Self::hydrate_parent_event_ids(&pool, &mut nodes).await?;
+        Self::hydrate_parent_event_ids(&pool, &user_id, &mut nodes).await?;
         for (context, node) in contexts.iter_mut().zip(nodes.iter()) {
             context.parent_event_ids = node.parent_event_ids.clone();
         }
@@ -554,18 +636,16 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
             match row {
                 Some(row) => {
-                    let event_id: String = row.try_get("event_id").map_err(internal_error)?;
-                    let session_id: String = row.try_get("session_id").map_err(internal_error)?;
-                    let raw_content: String = row.try_get("content").unwrap_or_default();
-                    let parent: Option<String> = row.try_get("parent_event_id").ok();
+                    let (mut node, mut context) = lineage_node_from_row(row)?;
                     let parent_id_map = crate::storage::load_agent_event_parent_ids(
                         &pool,
+                        &user_id,
                         std::slice::from_ref(&eid),
                     )
                     .await
                     .map_err(internal_error)?;
                     let parent_event_ids = crate::storage::normalized_parent_event_ids(
-                        parent.as_deref(),
+                        node.parent_event_id.as_deref(),
                         parent_id_map.get(&eid).map(Vec::as_slice),
                     );
                     for parent_event_id in parent_event_ids.iter().rev() {
@@ -573,26 +653,10 @@ impl DataVersioningService for DatabaseDataVersioningService {
                             stack.push(parent_event_id.clone());
                         }
                     }
-                    let created_at: String = row.try_get("created_at").unwrap_or_default();
-                    chain.push(LineageNode {
-                        event_id: event_id.clone(),
-                        event_type: row.try_get("event_type").map_err(internal_error)?,
-                        content: truncate_content(&raw_content, 500),
-                        parent_event_id: parent,
-                        parent_event_ids,
-                        contribution_score: None,
-                        causal_chain_id: row.try_get("causal_chain_id").ok(),
-                        created_at: created_at.clone(),
-                    });
-                    contexts.push(LineageContributionContext {
-                        event_id,
-                        session_id,
-                        created_at,
-                        parent_event_ids: chain
-                            .last()
-                            .map(|node| node.parent_event_ids.clone())
-                            .unwrap_or_default(),
-                    });
+                    node.parent_event_ids = parent_event_ids;
+                    context.parent_event_ids = node.parent_event_ids.clone();
+                    chain.push(node);
+                    contexts.push(context);
                 }
                 None => break,
             }
@@ -617,11 +681,14 @@ impl DataVersioningService for DatabaseDataVersioningService {
             crate::snapshot_sql::create_snapshot_for_db_sql(&full_name, &self.matrixone.database);
         query(&sql).execute(&pool).await.map_err(internal_error)?;
 
+        let checkpoint_id = uuid::Uuid::new_v4().to_string();
+
         query(
             "INSERT INTO data_versioning_checkpoints \
-             (checkpoint_name, user_id, description, created_at) \
-             VALUES (?, ?, ?, NOW())",
+             (checkpoint_id, checkpoint_name, user_id, description, created_at) \
+             VALUES (?, ?, ?, ?, NOW())",
         )
+        .bind(&checkpoint_id)
         .bind(&full_name)
         .bind(&user_id)
         .bind(format!("Sandbox checkpoint for {}", sandbox_name))
@@ -629,11 +696,16 @@ impl DataVersioningService for DatabaseDataVersioningService {
         .await
         .map_err(internal_error)?;
 
-        Ok(CheckpointResponse {
-            checkpoint_name: full_name,
-            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-            description: Some(format!("Sandbox checkpoint for {}", sandbox_name)),
-        })
+        let row = query(
+            "SELECT checkpoint_name, description, \
+             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             FROM data_versioning_checkpoints WHERE checkpoint_id = ?",
+        )
+        .bind(&checkpoint_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error)?;
+        checkpoint_response_from_row(row)
     }
 
     async fn sandbox_restore(

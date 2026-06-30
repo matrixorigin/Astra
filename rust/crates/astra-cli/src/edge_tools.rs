@@ -1038,6 +1038,14 @@ pub struct ToolExecutor {
     /// source used by self-introspection tools; it is set by the CLI turn
     /// boundary and never inferred from a tool surface default.
     current_model: std::sync::RwLock<Option<String>>,
+    /// Effective per-turn input budget for the active model/config. This is
+    /// populated at the CLI turn boundary so first-round introspection does not
+    /// need to infer context capacity from pressure percentages.
+    current_effective_input_budget_tokens: std::sync::RwLock<Option<u64>>,
+    /// Full provider context window from the server model registry for the
+    /// active model. Kept separate from effective input budget so introspection
+    /// can answer both questions without guessing.
+    current_context_window_tokens: std::sync::RwLock<Option<u64>>,
     /// P3.1 seam: cross-session lessons loaded at session bootstrap.
     /// Populated once via `set_session_lessons`, then passed through on
     /// every `build_self_model_snapshot` for the session's lifetime.
@@ -1178,6 +1186,8 @@ impl ToolExecutor {
             session_memory_observatory: None,
             active_session_id: std::sync::Mutex::new(None),
             current_model: std::sync::RwLock::new(None),
+            current_effective_input_budget_tokens: std::sync::RwLock::new(None),
+            current_context_window_tokens: std::sync::RwLock::new(None),
             session_lessons: std::sync::Mutex::new(Vec::new()),
             latest_skill_diagnosis: std::sync::Mutex::new(None),
             latest_turn_quality_feedback: std::sync::Mutex::new(None),
@@ -1885,6 +1895,12 @@ impl ToolExecutor {
             if let Ok(mut current_model) = self.current_model.write() {
                 *current_model = None;
             }
+            if let Ok(mut budget) = self.current_effective_input_budget_tokens.write() {
+                *budget = None;
+            }
+            if let Ok(mut window) = self.current_context_window_tokens.write() {
+                *window = None;
+            }
         }
         if let Ok(mut guard) = self.active_session_id.lock() {
             *guard = Some(session_id);
@@ -1904,8 +1920,34 @@ impl ToolExecutor {
         }
     }
 
+    pub fn set_current_effective_input_budget_tokens(&self, tokens: u64) {
+        if let Ok(mut guard) = self.current_effective_input_budget_tokens.write() {
+            *guard = (tokens > 0).then_some(tokens);
+        }
+    }
+
+    pub fn set_current_context_window_tokens(&self, tokens: u64) {
+        if let Ok(mut guard) = self.current_context_window_tokens.write() {
+            *guard = (tokens > 0).then_some(tokens);
+        }
+    }
+
     fn current_model(&self) -> Option<String> {
         self.current_model.read().ok().and_then(|g| g.clone())
+    }
+
+    fn current_effective_input_budget_tokens(&self) -> Option<u64> {
+        self.current_effective_input_budget_tokens
+            .read()
+            .ok()
+            .and_then(|g| *g)
+    }
+
+    fn current_context_window_tokens(&self) -> Option<u64> {
+        self.current_context_window_tokens
+            .read()
+            .ok()
+            .and_then(|g| *g)
     }
 
     fn memory_args_with_context(&self, args: &Value) -> Value {
@@ -2173,12 +2215,7 @@ impl ToolExecutor {
     }
 
     fn cloud_plan_summary_status<'a>(&self, plan: &'a Value) -> Option<&'a str> {
-        plan.get("status")
-            // Older server payloads used `phase`; keep accepting that shape so
-            // newer CLIs can talk to pre-migration servers during rolling upgrades.
-            // TODO(#plans): remove this fallback once all servers ship `status` field (≥v2.1).
-            .or_else(|| plan.get("phase"))
-            .and_then(Value::as_str)
+        plan.get("status").and_then(Value::as_str)
     }
 
     fn cloud_plan_summary_id(&self, plan: &Value) -> Option<String> {
@@ -3567,6 +3604,14 @@ impl ToolExecutor {
         let mut snap = snapshot.unwrap_or_default();
         if snap.current_model.is_none() {
             snap.current_model = self.current_model();
+        }
+        if snap.effective_input_budget_tokens == 0 {
+            snap.effective_input_budget_tokens = self
+                .current_effective_input_budget_tokens()
+                .unwrap_or_default();
+        }
+        if snap.context_window_tokens == 0 {
+            snap.context_window_tokens = self.current_context_window_tokens().unwrap_or_default();
         }
 
         // Overlay session-scoped injection freshness. The per-turn
@@ -5619,6 +5664,28 @@ mod tests {
     }
 
     #[test]
+    fn cloud_plan_summary_requires_canonical_status_field() {
+        let executor = test_executor();
+
+        let authoring = serde_json::json!({"plan_id": "p1", "status": "planning"});
+        assert_eq!(
+            executor.cloud_plan_summary_status(&authoring),
+            Some("planning")
+        );
+        assert!(executor.cloud_plan_is_authoring(&authoring));
+
+        let refining = serde_json::json!({"plan_id": "p2", "status": "refining"});
+        assert!(executor.cloud_plan_is_authoring(&refining));
+
+        let old_phase_only = serde_json::json!({"plan_id": "p3", "phase": "planning"});
+        assert_eq!(executor.cloud_plan_summary_status(&old_phase_only), None);
+        assert!(
+            !executor.cloud_plan_is_authoring(&old_phase_only),
+            "phase-only plan summaries must not keep the cloud authoring guard active"
+        );
+    }
+
+    #[test]
     fn runtime_bound_tool_schemas_fail_closed_for_malformed_and_unbound_tools() {
         let executor = test_executor();
         let plugin_schema =
@@ -7121,6 +7188,41 @@ mod tests {
     }
 
     #[test]
+    fn introspect_first_turn_reports_effective_input_budget_from_executor() {
+        let executor = test_executor();
+        executor.set_current_effective_input_budget_tokens(800_000);
+
+        let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
+
+        assert!(
+            out.contains("Effective input budget: 800000 tokens"),
+            "expected first-turn introspect to expose effective budget, got: {out}"
+        );
+        assert!(
+            !out.contains("262144"),
+            "introspect must not expose guessed context-window values, got: {out}"
+        );
+    }
+
+    #[test]
+    fn introspect_first_turn_reports_provider_context_window_from_executor() {
+        let executor = test_executor();
+        executor.set_current_context_window_tokens(1_000_000);
+        executor.set_current_effective_input_budget_tokens(800_000);
+
+        let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
+
+        assert!(
+            out.contains("Provider context window: 1000000 tokens"),
+            "expected first-turn introspect to expose provider context window, got: {out}"
+        );
+        assert!(
+            out.contains("Effective input budget: 800000 tokens"),
+            "expected first-turn introspect to keep effective budget distinct, got: {out}"
+        );
+    }
+
+    #[test]
     fn introspect_reflects_updated_snapshot() {
         let executor = test_executor();
         // Populate a non-trivial snapshot.
@@ -7291,6 +7393,32 @@ mod tests {
         let executor = test_executor();
         let out = executor.handle_introspect(&serde_json::json!({"facet": "Cache"}));
         assert!(out.contains("Cache Diagnosis"), "got: {out}");
+    }
+
+    #[test]
+    fn introspect_diagnostic_depth_includes_step_latency() {
+        let executor = test_executor();
+        executor.update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
+            step_latency: vec![astra_turn_core::introspect::StepLatencySnapshotEntry {
+                step_id: "turn-1-step-3".into(),
+                total_ms: Some(8_978),
+                pre_tool_wait_ms: Some(8_000),
+                first_tool_name: Some("bash".into()),
+                tool_execution_ms: 8,
+                max_tool_execution_ms: 8,
+                tool_call_count: 1,
+                dominant_phase: "model_wait".into(),
+                terminal_event_kind: Some("StepIncomplete".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let out = executor.handle_introspect(&serde_json::json!({"depth": "diagnostic"}));
+
+        assert!(out.contains("## Step Latency"), "got: {out}");
+        assert!(out.contains("model_wait"), "got: {out}");
+        assert!(out.contains("8000"), "got: {out}");
     }
 
     #[test]

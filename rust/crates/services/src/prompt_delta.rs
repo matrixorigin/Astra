@@ -1,8 +1,8 @@
+use crate::db_row::RowExt as PromptDeltaDbRow;
 use astra_core::SharedPool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PromptDeltaCounts {
@@ -62,6 +62,94 @@ pub struct PromptRequestObservability {
     pub message_count: u32,
     pub tool_count: u32,
     pub delta_counts: PromptDeltaCounts,
+}
+
+async fn rollback_prompt_delta_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, context: &'static str) {
+    if let Err(error) = tx.rollback().await {
+        tracing::warn!(target: "astra_services::prompt_delta", context, %error, "prompt delta transaction rollback failed");
+    }
+}
+
+fn prompt_delta_row_string(row: &impl PromptDeltaDbRow, column: &str) -> Result<String, String> {
+    row.string_column(column)
+        .map_err(|error| format!("prompt delta row decode column `{column}`: {error}"))
+}
+
+fn prompt_delta_row_optional_string(
+    row: &impl PromptDeltaDbRow,
+    column: &str,
+) -> Result<Option<String>, String> {
+    row.optional_string_column(column)
+        .map_err(|error| format!("prompt delta row decode column `{column}`: {error}"))
+}
+
+fn prompt_delta_row_i64(row: &impl PromptDeltaDbRow, column: &str) -> Result<i64, String> {
+    row.i64_column(column)
+        .map_err(|error| format!("prompt delta row decode column `{column}`: {error}"))
+}
+
+fn prompt_delta_row_u32(row: &impl PromptDeltaDbRow, column: &str) -> Result<u32, String> {
+    let value = prompt_delta_row_i64(row, column)?;
+    u32::try_from(value)
+        .map_err(|_| format!("prompt delta row column `{column}` out of u32 range: {value}"))
+}
+
+fn prompt_delta_summary_value(row: &impl PromptDeltaDbRow) -> Result<Value, String> {
+    let summary_json = prompt_delta_row_string(row, "summary_json")?;
+    serde_json::from_str(&summary_json)
+        .map_err(|error| format!("prompt request summary_json decode failed: {error}"))
+}
+
+fn prompt_delta_counts_from_summary(summary_value: &Value) -> Result<PromptDeltaCounts, String> {
+    let delta_counts = summary_value
+        .get("delta_counts")
+        .ok_or_else(|| "prompt request summary_json missing `delta_counts`".to_string())?;
+    serde_json::from_value(delta_counts.clone())
+        .map_err(|error| format!("prompt request delta_counts decode failed: {error}"))
+}
+
+fn decode_prompt_request_count(row: &impl PromptDeltaDbRow) -> Result<u32, String> {
+    prompt_delta_row_u32(row, "total")
+}
+
+fn decode_prompt_observability(
+    row: &impl PromptDeltaDbRow,
+) -> Result<PromptRequestObservability, String> {
+    let summary_value = prompt_delta_summary_value(row)?;
+    Ok(PromptRequestObservability {
+        request_id: prompt_delta_row_string(row, "request_id")?,
+        request_hash: prompt_delta_row_string(row, "request_hash")?,
+        message_count: prompt_delta_row_u32(row, "message_count")?,
+        tool_count: prompt_delta_row_u32(row, "tool_count")?,
+        delta_counts: prompt_delta_counts_from_summary(&summary_value)?,
+    })
+}
+
+fn decode_prompt_persist_result(
+    row: &impl PromptDeltaDbRow,
+) -> Result<PromptRequestPersistResult, String> {
+    let summary_value = prompt_delta_summary_value(row)?;
+    Ok(PromptRequestPersistResult {
+        request_id: prompt_delta_row_string(row, "request_id")?,
+        request_hash: prompt_delta_row_string(row, "request_hash")?,
+        previous_request_id: prompt_delta_row_optional_string(row, "previous_request_id")?,
+        message_count: prompt_delta_row_u32(row, "message_count")?,
+        tool_count: prompt_delta_row_u32(row, "tool_count")?,
+        delta_counts: prompt_delta_counts_from_summary(&summary_value)?,
+    })
+}
+
+fn decode_previous_request_id(row: &impl PromptDeltaDbRow) -> Result<String, String> {
+    prompt_delta_row_string(row, "request_id")
+}
+
+fn decode_existing_prompt_chunk(
+    row: &impl PromptDeltaDbRow,
+) -> Result<ExistingPromptChunk, String> {
+    Ok(ExistingPromptChunk {
+        logical_key: prompt_delta_row_string(row, "logical_key")?,
+        chunk_hash: prompt_delta_row_string(row, "chunk_hash")?,
+    })
 }
 
 pub struct PromptRequestPlanInput<'a> {
@@ -145,12 +233,12 @@ pub async fn persist_prompt_request(
     let db = pool.get();
     ensure_session_owner(db, &input.session_id, &input.user_id).await?;
     if let Some(existing) = load_existing_request(db, input, &plan.request_id).await? {
-        return Ok(existing);
+        return existing_prompt_request_or_conflict(input, plan, existing);
     }
 
     let previous_request_id = load_previous_request_id(db, input).await?;
     let previous_chunks = if let Some(previous_request_id) = previous_request_id.as_deref() {
-        load_request_chunks(db, previous_request_id).await?
+        load_request_chunks(db, input, previous_request_id).await?
     } else {
         Vec::new()
     };
@@ -239,6 +327,8 @@ pub async fn persist_prompt_request(
             insert_prompt_delta(
                 &mut tx,
                 PromptDeltaInsert {
+                    user_id: &input.user_id,
+                    session_id: &input.session_id,
                     request_id: &plan.request_id,
                     delta_seq: delta.delta_seq,
                     logical_key: &delta.logical_key,
@@ -257,9 +347,9 @@ pub async fn persist_prompt_request(
     .await;
 
     if let Err(error) = write_result {
-        let _ = tx.rollback().await;
+        rollback_prompt_delta_tx(tx, "persist_prompt_request write failure").await;
         if let Some(existing) = load_existing_request(db, input, &plan.request_id).await? {
-            return Ok(existing);
+            return existing_prompt_request_or_conflict(input, plan, existing);
         }
         return Err(error);
     }
@@ -351,7 +441,7 @@ async fn count_prompt_requests(
         .fetch_one(pool.get())
         .await
         .map_err(|error| error.to_string())?;
-    Ok(row.try_get::<i64, _>("total").unwrap_or(0).max(0) as u32)
+    decode_prompt_request_count(&row)
 }
 
 async fn load_latest_prompt_observability(
@@ -366,31 +456,21 @@ async fn load_latest_prompt_observability(
         .fetch_optional(pool.get())
         .await
         .map_err(|error| error.to_string())?;
-    row.map(prompt_observability_from_row).transpose()
+    row.map(|row| decode_prompt_observability(&row)).transpose()
 }
 
-fn prompt_observability_from_row(
-    row: sqlx::mysql::MySqlRow,
-) -> Result<PromptRequestObservability, String> {
-    let summary_json = row
-        .try_get::<String, _>("summary_json")
-        .map_err(|error| error.to_string())?;
-    let summary_value: Value =
-        serde_json::from_str(&summary_json).map_err(|error| error.to_string())?;
-    let delta_counts = summary_value
-        .get("delta_counts")
-        .cloned()
-        .map(serde_json::from_value::<PromptDeltaCounts>)
-        .transpose()
-        .map_err(|error| error.to_string())?
-        .unwrap_or_default();
-    Ok(PromptRequestObservability {
-        request_id: row.try_get("request_id").unwrap_or_default(),
-        request_hash: row.try_get("request_hash").unwrap_or_default(),
-        message_count: row.try_get::<i64, _>("message_count").unwrap_or(0).max(0) as u32,
-        tool_count: row.try_get::<i64, _>("tool_count").unwrap_or(0).max(0) as u32,
-        delta_counts,
-    })
+fn existing_prompt_request_or_conflict(
+    input: &PromptRequestPersistInput,
+    plan: &PromptRequestPlan,
+    existing: PromptRequestPersistResult,
+) -> Result<PromptRequestPersistResult, String> {
+    if existing.request_hash == plan.request_hash {
+        return Ok(existing);
+    }
+    Err(format!(
+        "prompt_request_records idempotency conflict for request_id={} user_id={} session_id={}: existing request_hash {} != planned {}",
+        plan.request_id, input.user_id, input.session_id, existing.request_hash, plan.request_hash
+    ))
 }
 
 async fn load_existing_request(
@@ -409,28 +489,8 @@ async fn load_existing_request(
     .fetch_optional(pool)
     .await
     .map_err(|error| error.to_string())?;
-    row.map(|row| {
-        let summary_json = row.try_get::<String, _>("summary_json").unwrap_or_default();
-        let summary_value: Value = serde_json::from_str(&summary_json).unwrap_or(Value::Null);
-        let delta_counts = summary_value
-            .get("delta_counts")
-            .cloned()
-            .map(serde_json::from_value::<PromptDeltaCounts>)
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .unwrap_or_default();
-        Ok(PromptRequestPersistResult {
-            request_id: row.try_get("request_id").unwrap_or_default(),
-            request_hash: row.try_get("request_hash").unwrap_or_default(),
-            previous_request_id: row
-                .try_get::<Option<String>, _>("previous_request_id")
-                .unwrap_or(None),
-            message_count: row.try_get::<i64, _>("message_count").unwrap_or(0).max(0) as u32,
-            tool_count: row.try_get::<i64, _>("tool_count").unwrap_or(0).max(0) as u32,
-            delta_counts,
-        })
-    })
-    .transpose()
+    row.map(|row| decode_prompt_persist_result(&row))
+        .transpose()
 }
 
 async fn ensure_session_owner(
@@ -490,33 +550,35 @@ async fn load_previous_request_id(
     .fetch_optional(pool)
     .await
     .map_err(|error| error.to_string())
-    .map(|row| row.and_then(|row| row.try_get::<String, _>("request_id").ok()))
+    .and_then(|row| row.map(|row| decode_previous_request_id(&row)).transpose())
 }
 
 async fn load_request_chunks(
     pool: &sqlx::Pool<sqlx::MySql>,
+    input: &PromptRequestPersistInput,
     request_id: &str,
 ) -> Result<Vec<ExistingPromptChunk>, String> {
     let rows = sqlx::query(
         "SELECT logical_key, chunk_hash
          FROM prompt_deltas
-         WHERE request_id = ? AND op != 'drop' AND chunk_hash IS NOT NULL
+         WHERE user_id = ? AND session_id = ? AND request_id = ?
+           AND op != 'drop' AND chunk_hash IS NOT NULL
          ORDER BY position ASC, delta_seq ASC",
     )
+    .bind(&input.user_id)
+    .bind(&input.session_id)
     .bind(request_id)
     .fetch_all(pool)
     .await
     .map_err(|error| error.to_string())?;
-    Ok(rows
-        .into_iter()
-        .map(|row| ExistingPromptChunk {
-            logical_key: row.try_get("logical_key").unwrap_or_default(),
-            chunk_hash: row.try_get("chunk_hash").unwrap_or_default(),
-        })
-        .collect())
+    rows.into_iter()
+        .map(|row| decode_existing_prompt_chunk(&row))
+        .collect()
 }
 
 struct PromptDeltaInsert<'a> {
+    user_id: &'a str,
+    session_id: &'a str,
     request_id: &'a str,
     delta_seq: i32,
     logical_key: &'a str,
@@ -534,11 +596,12 @@ async fn insert_prompt_delta(
 ) -> Result<(), String> {
     sqlx::query(
         "INSERT INTO prompt_deltas
-         (delta_id, request_id, delta_seq, logical_key, chunk_kind, position,
+         (user_id, session_id, request_id, delta_seq, logical_key, chunk_kind, position,
           op, chunk_id, chunk_hash, previous_chunk_hash, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
     )
-    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(delta.user_id)
+    .bind(delta.session_id)
     .bind(delta.request_id)
     .bind(delta.delta_seq)
     .bind(delta.logical_key)
@@ -660,6 +723,110 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[derive(Clone)]
+    struct FakePromptDeltaRow {
+        failed_column: Option<&'static str>,
+        summary_json: String,
+        previous_request_id: Option<String>,
+        i64_overrides: Vec<(&'static str, i64)>,
+    }
+
+    impl FakePromptDeltaRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                summary_json: json!({
+                    "summary": {"message_roles": []},
+                    "delta_counts": {
+                        "reuse": 1,
+                        "append": 2,
+                        "replace": 3,
+                        "drop": 4
+                    }
+                })
+                .to_string(),
+                previous_request_id: Some("previous-request-1".to_string()),
+                i64_overrides: Vec::new(),
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_summary_json(summary_json: impl Into<String>) -> Self {
+            Self {
+                summary_json: summary_json.into(),
+                ..Self::complete()
+            }
+        }
+
+        fn with_i64(column: &'static str, value: i64) -> Self {
+            Self {
+                i64_overrides: vec![(column, value)],
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl PromptDeltaDbRow for FakePromptDeltaRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "request_id" => "request-1".to_string(),
+                "request_hash" => "hash-1".to_string(),
+                "summary_json" => self.summary_json.clone(),
+                "logical_key" => "message:0:user".to_string(),
+                "chunk_hash" => "chunk-hash-1".to_string(),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            match column {
+                "previous_request_id" => Ok(self.previous_request_id.clone()),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if let Some((_, value)) = self
+                .i64_overrides
+                .iter()
+                .find(|(candidate, _)| *candidate == column)
+            {
+                return Ok(*value);
+            }
+            Ok(match column {
+                "total" => 7,
+                "message_count" => 2,
+                "tool_count" => 3,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+    }
+
+    fn assert_decode_error_mentions(result: Result<impl std::fmt::Debug, String>, needle: &str) {
+        let err = result.expect_err("decode should fail");
+        assert!(
+            err.contains(needle),
+            "error should contain `{needle}`, got `{err}`"
+        );
+    }
+
     #[test]
     fn plan_prompt_request_hash_is_order_stable_for_object_keys() {
         let messages_a = [json!({"role": "system", "content": {"b": 2, "a": 1}})];
@@ -756,5 +923,178 @@ mod tests {
             owner_a.request_hash, owner_b.request_hash,
             "request hash should describe wire content, not ownership"
         );
+    }
+
+    #[test]
+    fn existing_prompt_request_accepts_only_matching_hash() {
+        let messages = [json!({"role": "user", "content": "same prompt"})];
+        let plan = plan_prompt_request(PromptRequestPlanInput {
+            user_id: "owner-a",
+            session_id: "session-a",
+            turn: 2,
+            round: 1,
+            attempt: 0,
+            source: "bridge_inprocess",
+            messages: &messages,
+            tools: &[],
+            max_output_tokens: None,
+        })
+        .expect("plan");
+        let input = PromptRequestPersistInput {
+            session_id: "session-a".to_string(),
+            user_id: "owner-a".to_string(),
+            run_id: None,
+            turn: 2,
+            round: 1,
+            attempt: 0,
+            source: "bridge_inprocess".to_string(),
+            model: "test-model".to_string(),
+            provider: "test".to_string(),
+        };
+        let existing = PromptRequestPersistResult {
+            request_id: plan.request_id.clone(),
+            request_hash: plan.request_hash.clone(),
+            previous_request_id: None,
+            message_count: 1,
+            tool_count: 0,
+            delta_counts: PromptDeltaCounts::default(),
+        };
+        assert!(
+            existing_prompt_request_or_conflict(&input, &plan, existing.clone()).is_ok(),
+            "same idempotency key and same request hash should be a replay"
+        );
+
+        let conflicting = PromptRequestPersistResult {
+            request_hash: "different-hash".to_string(),
+            ..existing
+        };
+        let error = existing_prompt_request_or_conflict(&input, &plan, conflicting)
+            .expect_err("same id with different payload hash must fail");
+        assert!(error.contains("idempotency conflict"));
+        assert!(error.contains(&plan.request_id));
+    }
+
+    #[test]
+    fn prompt_request_count_decode_fails_loudly() {
+        assert_eq!(
+            decode_prompt_request_count(&FakePromptDeltaRow::complete()).expect("count decodes"),
+            7
+        );
+        assert_decode_error_mentions(
+            decode_prompt_request_count(&FakePromptDeltaRow::fail_on("total")),
+            "decode column `total`",
+        );
+        assert_decode_error_mentions(
+            decode_prompt_request_count(&FakePromptDeltaRow::with_i64("total", -1)),
+            "out of u32 range",
+        );
+        assert_decode_error_mentions(
+            decode_prompt_request_count(&FakePromptDeltaRow::with_i64(
+                "total",
+                i64::from(u32::MAX) + 1,
+            )),
+            "out of u32 range",
+        );
+    }
+
+    #[test]
+    fn prompt_observability_decode_preserves_values_and_fails_loudly() {
+        let observability = decode_prompt_observability(&FakePromptDeltaRow::complete())
+            .expect("observability decodes");
+        assert_eq!(observability.request_id, "request-1");
+        assert_eq!(observability.request_hash, "hash-1");
+        assert_eq!(observability.message_count, 2);
+        assert_eq!(observability.tool_count, 3);
+        assert_eq!(
+            observability.delta_counts,
+            PromptDeltaCounts {
+                reuse: 1,
+                append: 2,
+                replace: 3,
+                drop: 4,
+            }
+        );
+
+        for column in [
+            "request_id",
+            "request_hash",
+            "message_count",
+            "tool_count",
+            "summary_json",
+        ] {
+            assert_decode_error_mentions(
+                decode_prompt_observability(&FakePromptDeltaRow::fail_on(column)),
+                &format!("`{column}`"),
+            );
+        }
+        assert_decode_error_mentions(
+            decode_prompt_observability(&FakePromptDeltaRow::with_summary_json("{not-json")),
+            "summary_json decode failed",
+        );
+        assert_decode_error_mentions(
+            decode_prompt_observability(&FakePromptDeltaRow::with_summary_json(
+                json!({"summary": {}}).to_string(),
+            )),
+            "missing `delta_counts`",
+        );
+        assert_decode_error_mentions(
+            decode_prompt_observability(&FakePromptDeltaRow::with_summary_json(
+                json!({"summary": {}, "delta_counts": {"reuse": "bad"}}).to_string(),
+            )),
+            "delta_counts decode failed",
+        );
+    }
+
+    #[test]
+    fn prompt_persist_result_decode_preserves_values_and_fails_loudly() {
+        let result =
+            decode_prompt_persist_result(&FakePromptDeltaRow::complete()).expect("result decodes");
+        assert_eq!(result.request_id, "request-1");
+        assert_eq!(result.request_hash, "hash-1");
+        assert_eq!(
+            result.previous_request_id.as_deref(),
+            Some("previous-request-1")
+        );
+        assert_eq!(result.message_count, 2);
+        assert_eq!(result.tool_count, 3);
+        assert_eq!(result.delta_counts.append, 2);
+
+        for column in [
+            "request_id",
+            "request_hash",
+            "previous_request_id",
+            "message_count",
+            "tool_count",
+            "summary_json",
+        ] {
+            assert_decode_error_mentions(
+                decode_prompt_persist_result(&FakePromptDeltaRow::fail_on(column)),
+                &format!("`{column}`"),
+            );
+        }
+    }
+
+    #[test]
+    fn previous_request_and_chunk_decode_fail_loudly() {
+        assert_eq!(
+            decode_previous_request_id(&FakePromptDeltaRow::complete())
+                .expect("previous id decodes"),
+            "request-1"
+        );
+        assert_decode_error_mentions(
+            decode_previous_request_id(&FakePromptDeltaRow::fail_on("request_id")),
+            "decode column `request_id`",
+        );
+
+        let chunk =
+            decode_existing_prompt_chunk(&FakePromptDeltaRow::complete()).expect("chunk decodes");
+        assert_eq!(chunk.logical_key, "message:0:user");
+        assert_eq!(chunk.chunk_hash, "chunk-hash-1");
+        for column in ["logical_key", "chunk_hash"] {
+            assert_decode_error_mentions(
+                decode_existing_prompt_chunk(&FakePromptDeltaRow::fail_on(column)),
+                &format!("decode column `{column}`"),
+            );
+        }
     }
 }

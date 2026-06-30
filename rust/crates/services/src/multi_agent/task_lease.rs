@@ -12,12 +12,14 @@ use sqlx::Row;
 
 use super::hold_cache::TaskLeaseHoldCache;
 use super::metrics::SharedMultiAgentMetrics;
+use crate::db_row::RowExt as TaskLeaseDbRow;
 use crate::task_orchestrator::{
     AGENT_TASK_DETAIL_SELECT_COLUMNS, MatrixOneTaskService, TaskListItem, TaskRecord, TaskStatus,
 };
 
-/// Default maximum number of tasks to return in a pack pull.
-pub const DEFAULT_TASKS_PACK_LIMIT: u32 = 2000;
+/// Default maximum number of full-detail tasks to return in a pack pull.
+pub const DEFAULT_TASKS_PACK_LIMIT: u32 = 200;
+pub const MAX_TASKS_PACK_LIMIT: u32 = 200;
 
 /// Max candidate tasks to scan when claiming the next lease.
 /// Balances database load against starvation risk: if all candidates in
@@ -46,9 +48,7 @@ pub async fn pull_tasks_pack_mysql_with_limit(
     user_id: &str,
     limit: u32,
 ) -> Result<String, String> {
-    let q = format!(
-        "SELECT {AGENT_TASK_DETAIL_SELECT_COLUMNS} FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC LIMIT {limit}"
-    );
+    let q = tasks_pack_select_sql(limit);
     let rows = sqlx::query(&q)
         .bind(user_id)
         .fetch_all(pool)
@@ -59,6 +59,23 @@ pub async fn pull_tasks_pack_mysql_with_limit(
         out.push(MatrixOneTaskService::parse_mysql_row(&row)?);
     }
     serde_json::to_string(&out).map_err(|e| format!("pull_tasks_pack json: {e}"))
+}
+
+fn clamp_tasks_pack_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_TASKS_PACK_LIMIT)
+}
+
+async fn rollback_task_lease_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, context: &'static str) {
+    if let Err(error) = tx.rollback().await {
+        tracing::warn!(target: "astra_services::task_lease", context, %error, "task lease transaction rollback failed");
+    }
+}
+
+fn tasks_pack_select_sql(limit: u32) -> String {
+    let limit = clamp_tasks_pack_limit(limit);
+    format!(
+        "SELECT {AGENT_TASK_DETAIL_SELECT_COLUMNS} FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC LIMIT {limit}"
+    )
 }
 
 pub async fn push_tasks_pack_held_mysql(
@@ -98,11 +115,11 @@ pub async fn push_tasks_pack_held_mysql(
         // and prevent a stale holder from updating after lease transfer.
         let holder: Option<String> = sqlx::query_scalar(
             "SELECT holder_agent_id FROM task_leases \
-             WHERE task_id = ? AND user_id = ? AND expires_at >= NOW(6) \
+             WHERE user_id = ? AND task_id = ? AND expires_at >= NOW(6) \
              FOR UPDATE",
         )
-        .bind(&t.task_id)
         .bind(user_id)
+        .bind(&t.task_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("push_tasks_pack lease: {e}"))?;
@@ -114,9 +131,9 @@ pub async fn push_tasks_pack_held_mysql(
             }
         }
 
-        sqlx::query("SELECT task_id FROM agent_tasks WHERE task_id = ? AND user_id = ? FOR UPDATE")
-            .bind(&t.task_id)
+        sqlx::query("SELECT task_id FROM agent_tasks WHERE user_id = ? AND task_id = ? FOR UPDATE")
             .bind(user_id)
+            .bind(&t.task_id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| format!("push_tasks_pack task lock: {e}"))?;
@@ -179,6 +196,64 @@ pub struct TaskLeaseView {
     pub holder_edge_id: Option<String>,
     pub expires_at: String,
     pub lease_version: i64,
+}
+
+#[derive(Debug)]
+struct ExistingLeaseClaimState {
+    holder_agent_id: String,
+    expires_at: String,
+    is_active: bool,
+}
+
+fn task_lease_decode_error(context: &str, column: &'static str, error: sqlx::Error) -> String {
+    format!("task_lease {context} decode `{column}`: {error}")
+}
+
+fn decode_existing_lease_claim_state(
+    row: &impl TaskLeaseDbRow,
+) -> Result<ExistingLeaseClaimState, String> {
+    let is_active = row
+        .i8_column("is_active")
+        .map_err(|e| task_lease_decode_error("claim row", "is_active", e))?;
+    let is_active = match is_active {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(format!(
+                "task_lease claim row decode `is_active`: expected 0 or 1, got {value}"
+            ));
+        }
+    };
+
+    Ok(ExistingLeaseClaimState {
+        holder_agent_id: row
+            .string_column("holder_agent_id")
+            .map_err(|e| task_lease_decode_error("claim row", "holder_agent_id", e))?,
+        expires_at: row
+            .string_column("expires_at")
+            .map_err(|e| task_lease_decode_error("claim row", "expires_at", e))?,
+        is_active,
+    })
+}
+
+fn decode_task_lease_view(row: &impl TaskLeaseDbRow) -> Result<TaskLeaseView, String> {
+    Ok(TaskLeaseView {
+        task_id: row
+            .string_column("task_id")
+            .map_err(|e| task_lease_decode_error("view row", "task_id", e))?,
+        holder_agent_id: row
+            .string_column("holder_agent_id")
+            .map_err(|e| task_lease_decode_error("view row", "holder_agent_id", e))?,
+        holder_edge_id: row
+            .optional_string_column("holder_edge_id")
+            .map_err(|e| task_lease_decode_error("view row", "holder_edge_id", e))?,
+        expires_at: row
+            .string_column("expires_at")
+            .map_err(|e| task_lease_decode_error("view row", "expires_at", e))?,
+        lease_version: row
+            .i64_column("lease_version")
+            .map_err(|e| task_lease_decode_error("view row", "lease_version", e))?,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,13 +357,13 @@ async fn persist_granted_lease_locked(
              holder_agent_id = ?, holder_edge_id = ?, \
              expires_at = DATE_ADD(NOW(6), INTERVAL ? SECOND), \
              lease_version = lease_version + 1, updated_at = NOW(6) \
-             WHERE task_id = ? AND user_id = ?",
+             WHERE user_id = ? AND task_id = ?",
         )
         .bind(agent_id)
         .bind(edge_id)
         .bind(ttl_sec)
-        .bind(task_id)
         .bind(user_id)
+        .bind(task_id)
         .execute(&mut **tx)
         .await
         .map_err(|e| format!("lease update: {e}"))?;
@@ -308,25 +383,34 @@ async fn persist_granted_lease_locked(
         .map_err(|e| format!("lease insert: {e}"))?;
     }
 
-    sqlx::query("UPDATE agent_tasks SET agent_id = ?, updated_at = NOW(6) WHERE task_id = ?")
-        .bind(agent_id)
-        .bind(task_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| format!("agent_tasks agent_id: {e}"))?;
+    sqlx::query(
+        "UPDATE agent_tasks SET agent_id = ?, updated_at = NOW(6) \
+         WHERE user_id = ? AND task_id = ?",
+    )
+    .bind(agent_id)
+    .bind(user_id)
+    .bind(task_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| format!("agent_tasks agent_id: {e}"))?;
 
-    let ver: i64 = sqlx::query_scalar("SELECT lease_version FROM task_leases WHERE task_id = ?")
-        .bind(task_id)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|e| format!("lease version read: {e}"))?;
+    let ver: i64 = sqlx::query_scalar(
+        "SELECT lease_version FROM task_leases WHERE user_id = ? AND task_id = ?",
+    )
+    .bind(user_id)
+    .bind(task_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| format!("lease version read: {e}"))?;
 
-    let exp: String =
-        sqlx::query_scalar("SELECT CAST(expires_at AS CHAR) FROM task_leases WHERE task_id = ?")
-            .bind(task_id)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(|e| format!("lease exp read: {e}"))?;
+    let exp: String = sqlx::query_scalar(
+        "SELECT CAST(expires_at AS CHAR) FROM task_leases WHERE user_id = ? AND task_id = ?",
+    )
+    .bind(user_id)
+    .bind(task_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| format!("lease exp read: {e}"))?;
 
     Ok(ClaimedTaskLease {
         task_id: task_id.to_string(),
@@ -383,12 +467,12 @@ impl DatabaseTaskLeaseService {
              holder_edge_id = ?, \
              expires_at = DATE_ADD(NOW(6), INTERVAL ? SECOND), \
              lease_version = lease_version + 1, updated_at = NOW(6) \
-             WHERE task_id = ? AND user_id = ? AND holder_agent_id = ? AND expires_at >= NOW(6)",
+             WHERE user_id = ? AND task_id = ? AND holder_agent_id = ? AND expires_at >= NOW(6)",
         )
         .bind(edge_id)
         .bind(ttl)
-        .bind(task_id)
         .bind(user_id)
+        .bind(task_id)
         .bind(agent_id)
         .execute(&self.pool)
         .await
@@ -579,23 +663,25 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         // Lock task_leases FIRST — ensures release_lease (which locks
         // task_leases) wins the race: if release has the lock, claim
         // blocks until after the lease is deleted, then sees None → Granted.
-        let lease_row = sqlx::query(
+        let mut lease_row = sqlx::query(
             "SELECT holder_agent_id, CAST(expires_at AS CHAR) AS expires_at, \
              CASE WHEN expires_at >= NOW(6) THEN 1 ELSE 0 END AS is_active \
-             FROM task_leases WHERE task_id = ? AND user_id = ? FOR UPDATE",
+             FROM task_leases WHERE user_id = ? AND task_id = ? FOR UPDATE",
         )
-        .bind(task_id)
         .bind(user_id)
+        .bind(task_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("lease select: {e}"))?;
 
-        let task_row =
-            sqlx::query("SELECT user_id, status FROM agent_tasks WHERE task_id = ? FOR UPDATE")
-                .bind(task_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| format!("lease task lock: {e}"))?;
+        let task_row = sqlx::query(
+            "SELECT user_id, status FROM agent_tasks WHERE user_id = ? AND task_id = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("lease task lock: {e}"))?;
 
         let Some(task_row) = task_row else {
             return Err("task not found".to_string());
@@ -612,24 +698,42 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         if !task_status_is_claimable(&task_status) {
             return Err(format!("task is not claimable from status '{task_status}'"));
         }
+
+        if lease_row.is_none() {
+            lease_row = sqlx::query(
+                "SELECT holder_agent_id, CAST(expires_at AS CHAR) AS expires_at, \
+                 CASE WHEN expires_at >= NOW(6) THEN 1 ELSE 0 END AS is_active \
+                 FROM task_leases WHERE user_id = ? AND task_id = ? FOR UPDATE",
+            )
+            .bind(user_id)
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("lease reselect after task lock: {e}"))?;
+        }
+
         let has_existing_lease_row = lease_row.is_some();
 
         if let Some(ref r) = lease_row {
-            let holder: String = r.try_get("holder_agent_id").map_err(|e| e.to_string())?;
-            let exp: String = r.try_get("expires_at").map_err(|e| e.to_string())?;
-            let active: i8 = r.try_get("is_active").unwrap_or(0);
-            if active != 0 && holder != agent_id {
+            let lease = match decode_existing_lease_claim_state(r) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    rollback_task_lease_tx(tx, "claim decode existing lease").await;
+                    return Err(error);
+                }
+            };
+            if lease.is_active && lease.holder_agent_id != agent_id {
                 // Read-only path: no changes to persist — rollback to
                 // release the pool connection cleanly.
                 tracing::warn!(
-                    %holder,
-                    %exp,
+                    holder = %lease.holder_agent_id,
+                    expires_at = %lease.expires_at,
                     "task_lease: contested — held by another agent"
                 );
-                let _ = tx.rollback().await;
+                rollback_task_lease_tx(tx, "claim contested lease").await;
                 return Ok(LeaseClaimResult::Contested {
-                    holder_agent_id: holder,
-                    expires_at: exp,
+                    holder_agent_id: lease.holder_agent_id,
+                    expires_at: lease.expires_at,
                 });
             }
         }
@@ -679,11 +783,11 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         // this lease until we commit.
         let existing = sqlx::query(
             "SELECT holder_agent_id FROM task_leases \
-             WHERE task_id = ? AND user_id = ? AND holder_agent_id = ? \
+             WHERE user_id = ? AND task_id = ? AND holder_agent_id = ? \
              FOR UPDATE",
         )
-        .bind(task_id)
         .bind(user_id)
+        .bind(task_id)
         .bind(agent_id)
         .fetch_optional(&mut *tx)
         .await
@@ -691,7 +795,7 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
 
         if existing.is_none() {
             tracing::warn!("task_lease: release on lease not held by agent");
-            let _ = tx.rollback().await;
+            rollback_task_lease_tx(tx, "release not held").await;
             return Ok(false);
         }
 
@@ -710,10 +814,10 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         .map_err(|e| format!("clear agent_id after lease release: {e}"))?;
 
         sqlx::query(
-            "DELETE FROM task_leases WHERE task_id = ? AND user_id = ? AND holder_agent_id = ?",
+            "DELETE FROM task_leases WHERE user_id = ? AND task_id = ? AND holder_agent_id = ?",
         )
-        .bind(task_id)
         .bind(user_id)
+        .bind(task_id)
         .bind(agent_id)
         .execute(&mut *tx)
         .await
@@ -735,10 +839,10 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         let row = sqlx::query(
             "SELECT task_id, holder_agent_id, holder_edge_id, \
              CAST(expires_at AS CHAR) AS expires_at, lease_version \
-             FROM task_leases WHERE task_id = ? AND user_id = ?",
+             FROM task_leases WHERE user_id = ? AND task_id = ?",
         )
-        .bind(task_id)
         .bind(user_id)
+        .bind(task_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_lease: {e}"))?;
@@ -746,13 +850,7 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         let Some(r) = row else {
             return Ok(None);
         };
-        Ok(Some(TaskLeaseView {
-            task_id: r.try_get("task_id").map_err(|e| e.to_string())?,
-            holder_agent_id: r.try_get("holder_agent_id").map_err(|e| e.to_string())?,
-            holder_edge_id: r.try_get("holder_edge_id").ok().flatten(),
-            expires_at: r.try_get("expires_at").map_err(|e| e.to_string())?,
-            lease_version: r.try_get("lease_version").map_err(|e| e.to_string())?,
-        }))
+        Ok(Some(decode_task_lease_view(&r)?))
     }
 
     #[tracing::instrument(skip(self), fields(user_id = %user_id, task_id = %task_id, agent_id = %agent_id, ttl_sec))]
@@ -845,6 +943,154 @@ mod tests {
     use super::super::edge_registry::{EdgeRegistryService, UnconfiguredEdgeRegistryService};
     use super::*;
 
+    struct FakeTaskLeaseRow {
+        failed_column: Option<&'static str>,
+        holder_edge_id: Option<&'static str>,
+        is_active: i8,
+    }
+
+    impl FakeTaskLeaseRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                holder_edge_id: Some("edge-1"),
+                is_active: 1,
+            }
+        }
+
+        fn without_holder_edge() -> Self {
+            Self {
+                holder_edge_id: None,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_is_active(is_active: i8) -> Self {
+            Self {
+                is_active,
+                ..Self::complete()
+            }
+        }
+    }
+
+    impl TaskLeaseDbRow for FakeTaskLeaseRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            Ok(match column {
+                "task_id" => "task-1",
+                "holder_agent_id" => "agent-1",
+                "expires_at" => "2026-06-26 10:00:00.000000",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            match column {
+                "holder_edge_id" => Ok(self.holder_edge_id.map(str::to_string)),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn i8_column(&self, column: &str) -> Result<i8, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            match column {
+                "is_active" => Ok(self.is_active),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            match column {
+                "lease_version" => Ok(7),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn existing_lease_claim_state_decode_preserves_active_and_expired_states() {
+        let active = decode_existing_lease_claim_state(&FakeTaskLeaseRow::complete()).unwrap();
+        assert_eq!(active.holder_agent_id, "agent-1");
+        assert_eq!(active.expires_at, "2026-06-26 10:00:00.000000");
+        assert!(active.is_active);
+
+        let expired =
+            decode_existing_lease_claim_state(&FakeTaskLeaseRow::with_is_active(0)).unwrap();
+        assert!(!expired.is_active);
+    }
+
+    #[test]
+    fn existing_lease_claim_state_decode_fails_loudly_on_bad_columns_and_invalid_active_flag() {
+        for column in ["holder_agent_id", "expires_at", "is_active"] {
+            let error =
+                decode_existing_lease_claim_state(&FakeTaskLeaseRow::fail_on(column)).unwrap_err();
+            assert!(
+                error.contains("task_lease claim row decode") && error.contains(column),
+                "decode error should identify claim row `{column}`: {error}"
+            );
+        }
+
+        let invalid =
+            decode_existing_lease_claim_state(&FakeTaskLeaseRow::with_is_active(2)).unwrap_err();
+        assert!(
+            invalid.contains("is_active") && invalid.contains("expected 0 or 1"),
+            "invalid active flag should fail loudly: {invalid}"
+        );
+    }
+
+    #[test]
+    fn task_lease_view_decode_preserves_values_and_sql_null_edge_id() {
+        let view = decode_task_lease_view(&FakeTaskLeaseRow::complete()).unwrap();
+        assert_eq!(view.task_id, "task-1");
+        assert_eq!(view.holder_agent_id, "agent-1");
+        assert_eq!(view.holder_edge_id.as_deref(), Some("edge-1"));
+        assert_eq!(view.expires_at, "2026-06-26 10:00:00.000000");
+        assert_eq!(view.lease_version, 7);
+
+        let without_edge = decode_task_lease_view(&FakeTaskLeaseRow::without_holder_edge())
+            .expect("SQL NULL holder_edge_id is valid");
+        assert_eq!(without_edge.holder_edge_id, None);
+    }
+
+    #[test]
+    fn task_lease_view_decode_fails_loudly_on_any_column_error() {
+        for column in [
+            "task_id",
+            "holder_agent_id",
+            "holder_edge_id",
+            "expires_at",
+            "lease_version",
+        ] {
+            let error = decode_task_lease_view(&FakeTaskLeaseRow::fail_on(column)).unwrap_err();
+            assert!(
+                error.contains("task_lease view row decode") && error.contains(column),
+                "decode error should identify view row `{column}`: {error}"
+            );
+        }
+    }
+
     #[test]
     fn task_lease_hold_cache_records_and_releases() {
         let c = TaskLeaseHoldCache::default();
@@ -862,6 +1108,27 @@ mod tests {
         assert_eq!(clamp_ttl_sec(10), 30);
         assert_eq!(clamp_ttl_sec(60), 60);
         assert_eq!(clamp_ttl_sec(200_000), 86_400);
+    }
+
+    #[test]
+    fn task_pack_limit_is_bounded_for_full_detail_rows() {
+        assert_eq!(DEFAULT_TASKS_PACK_LIMIT, MAX_TASKS_PACK_LIMIT);
+        assert_eq!(clamp_tasks_pack_limit(0), 1);
+        assert_eq!(clamp_tasks_pack_limit(50), 50);
+        assert_eq!(
+            clamp_tasks_pack_limit(u32::MAX),
+            MAX_TASKS_PACK_LIMIT,
+            "task pack pull must not allow unbounded full-detail JSON rows"
+        );
+        let sql = tasks_pack_select_sql(u32::MAX);
+        assert!(
+            sql.ends_with(&format!("LIMIT {MAX_TASKS_PACK_LIMIT}")),
+            "task pack SQL must use the clamped limit: {sql}"
+        );
+        assert!(
+            !sql.contains("LIMIT 4294967295"),
+            "task pack SQL must never embed the caller's unbounded limit"
+        );
     }
 
     #[tokio::test]

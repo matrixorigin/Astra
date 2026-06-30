@@ -32,7 +32,7 @@ pub(crate) const DEFAULT_DB_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
 
 /// Default max lifetime for connections in the shared DB pool (seconds).
 /// Override with `ASTRA_DB_POOL_MAX_LIFETIME_SECS`.
-pub(crate) const DEFAULT_DB_POOL_MAX_LIFETIME_SECS: u64 = 300;
+pub(crate) const DEFAULT_DB_POOL_MAX_LIFETIME_SECS: u64 = 1800;
 
 use crate::runtime_limits::{
     DEFAULT_GLOBAL_OUTPUT_LIMIT, DEFAULT_MAX_RETRIEVED, DEFAULT_MAX_TOOL_RETRIES,
@@ -853,7 +853,7 @@ pub struct MatrixOneSettings {
     pub db_pool_acquire_timeout_secs: u64,
     /// Idle timeout in seconds (env `ASTRA_DB_POOL_IDLE_TIMEOUT_SECS`, default 60).
     pub db_pool_idle_timeout_secs: u64,
-    /// Max connection lifetime in seconds (env `ASTRA_DB_POOL_MAX_LIFETIME_SECS`, default 300).
+    /// Max connection lifetime in seconds (env `ASTRA_DB_POOL_MAX_LIFETIME_SECS`, default 1800).
     pub db_pool_max_lifetime_secs: u64,
 }
 
@@ -1363,6 +1363,19 @@ mod tests {
         assert_eq!(
             settings.database_url_with_password(),
             "mysql://alice:secret@db:3306/agent"
+        );
+    }
+
+    #[test]
+    fn matrixone_default_pool_lifetime_avoids_short_recycle_storms() {
+        assert_eq!(DEFAULT_DB_POOL_MAX_LIFETIME_SECS, 1800);
+        assert_eq!(
+            MatrixOneSettings::default().db_pool_max_lifetime_secs,
+            DEFAULT_DB_POOL_MAX_LIFETIME_SECS
+        );
+        assert_eq!(
+            DatabaseConfig::default().max_lifetime_s(),
+            DEFAULT_DB_POOL_MAX_LIFETIME_SECS
         );
     }
 

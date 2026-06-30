@@ -273,7 +273,8 @@ impl MatrixCloudRuntime {
         self.ingestion_stats.lock().ok().map(|s| s.clone())
     }
 
-    /// Number of events silently dropped because the ingestion channel was full.
+    /// Number of immediate ingestion overflows, including bounded deferred sends
+    /// and closed-channel drops.
     pub fn ingestion_overflow_count(&self) -> u64 {
         self.ingestion
             .lock()
@@ -318,7 +319,18 @@ impl MatrixCloudRuntime {
         let Some(sender) = guard.as_ref() else {
             return;
         };
-        for ev in IngestionEvent::expand_journal_event(event, user_id) {
+        let events = match IngestionEvent::expand_journal_event(event, user_id) {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::matrix_cloud_runtime",
+                    error = %error,
+                    "invalid journal event for cloud ingestion"
+                );
+                return;
+            }
+        };
+        for ev in events {
             sender.enqueue(ev);
         }
     }
@@ -330,7 +342,7 @@ impl MatrixCloudRuntime {
     /// via INSERT IGNORE on (user_id, version_id).
     pub fn enqueue_config_version_push(
         &self,
-        row: &astra_services::config_version_cloud::ConfigVersionRow,
+        row: &astra_services::config_version_cloud::ConfigVersionPayload,
     ) {
         let Ok(guard) = self.ingestion.lock() else {
             return;
@@ -338,7 +350,19 @@ impl MatrixCloudRuntime {
         let Some(sender) = guard.as_ref() else {
             return;
         };
-        sender.enqueue(IngestionEvent::for_config_version(row));
+        let event = match IngestionEvent::for_config_version(row) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::matrix_cloud_runtime",
+                    version_id = %row.version_id,
+                    error = %error,
+                    "invalid config version push event"
+                );
+                return;
+            }
+        };
+        sender.enqueue(event);
     }
 
     /// Flush and stop the ingestion worker, then **wait** for the background

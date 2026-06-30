@@ -14,9 +14,9 @@ slow-timeout = { period = "15s", terminate-after = 1 }
 #   sudo sysctl -w fs.aio-max-nr=1048576
 # then run with `cargo nextest run --test-threads N` to override.
 #
-# `make test-offline` / `make test-online` use the `strict` /
-# `strict-online` profiles which DO NOT cap threads — those targets
-# are intended for tuned CI hosts.
+# `make test-offline` uses the `strict` profile without a global cap.
+# `make test-online` uses the `strict-online` profile, which is capped
+# because the live MatrixOne database is a shared external bottleneck.
 test-threads = 2
 
 # All profiles share a uniform 15s per-test-case hard budget. TIMEOUT = FAIL;
@@ -45,14 +45,16 @@ test-threads = "num-cpus"
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 1 }
-test-threads = "num-cpus"
+test-threads = 2
 
 [profile.strict-online-ci]
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 1 }
-# CI hosts should have tuned kernel limits; use full parallelism.
-test-threads = "num-cpus"
+# Online suites share one live MatrixOne instance. Keep CI at the same
+# concurrency as local test-online so connection pressure cannot turn
+# healthy DB tests into EOF/timeouts.
+test-threads = 2
 
 # ── Parallelism caps for heavy integration suites ────────────────────────
 # Group membership is set via `[[profile.X.overrides]]` below. These test
@@ -61,7 +63,7 @@ test-threads = "num-cpus"
 # for everyone, uniformly).
 [test-groups]
 integration_e2e = { max-threads = 2 }
-plan_executor_e2e = { max-threads = 1 }
+cli_agent_e2e = { max-threads = 1 }
 db_scoped_trim = { max-threads = 1 }
 # Tests that create tempfiles/dirs heavily; inotify-sensitive on
 # default-kernel boxes (max_user_instances=128). Cap at 4 so these
@@ -80,7 +82,6 @@ test(/stress_multi_turn_state_continuity_50_turns/)
  or test(/server_session_state_boundary_/)
  or test(/two_hosts_same_input_same_outcome_shape/)
  or test(/e2e_delegation_round_trip_through_loop/)
- or test(/stream_chat_sse_/)
  or test(/rollback_session_state_current_turn_restores_server_self_mod_and_tasks/)
  or package(astra-runtime) and binary(team_delegation_integration)
  or package(astra-runtime) and binary(team_execute_http_integration)
@@ -96,10 +97,12 @@ test(/stress_multi_turn_state_continuity_50_turns/)
 """
 test-group = "integration_e2e"
 
-# `spawn_plan_executor_*` tests serialize fully (1-wide).
+# CLI agent-loop tests share mock HTTP servers, session files, and background
+# task runtimes. Keep them in one group so nextest does not run chat SSE and
+# plan executor flows against each other under the strict profile.
 [[profile.strict.overrides]]
-filter = "test(/spawn_plan_executor_/)"
-test-group = "plan_executor_e2e"
+filter = "package(astra-cli) and (test(/stream_chat_sse_/) or test(/spawn_plan_executor_/))"
+test-group = "cli_agent_e2e"
 
 # Packages that create tempfiles/dirs — inotify-sensitive on default
 # kernels (max_user_instances=128). Cap their parallelism to 4 so
@@ -122,6 +125,28 @@ test-group = "fs_heavy"
 filter = """
 package(astra-plan) and binary(plan_repository_db_it)
  or package(astra-runtime) and binary(system_matrix_http_e2e)
+ or package(astra-runtime) and binary(phase2_web_hydration)
+ or package(astra-runtime) and binary(phase3_context_manifest)
+ or package(astra-runtime) and binary(phase4_state_projection)
+ or package(astra-runtime) and binary(phase5_personal_skill)
+ or package(astra-runtime) and binary(phase6_artifact_preview)
+ or package(astra-runtime) and binary(e2e_joint)
+ or test(/migration_dedupe_removes_duplicate_attempt_tuples/)
+"""
+test-group = "integration_e2e"
+
+# CI reuses the same filters; declared separately so CI config can
+# reference a stable profile name without coupling to local dev defaults.
+[[profile.strict-online-ci.overrides]]
+filter = """
+package(astra-plan) and binary(plan_repository_db_it)
+ or package(astra-runtime) and binary(system_matrix_http_e2e)
+ or package(astra-runtime) and binary(phase2_web_hydration)
+ or package(astra-runtime) and binary(phase3_context_manifest)
+ or package(astra-runtime) and binary(phase4_state_projection)
+ or package(astra-runtime) and binary(phase5_personal_skill)
+ or package(astra-runtime) and binary(phase6_artifact_preview)
+ or package(astra-runtime) and binary(e2e_joint)
  or test(/migration_dedupe_removes_duplicate_attempt_tuples/)
 """
 test-group = "integration_e2e"

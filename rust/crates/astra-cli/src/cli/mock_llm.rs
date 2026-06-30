@@ -21,7 +21,7 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::{get, post};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
@@ -424,6 +424,28 @@ async fn handle_chat_turn(
         .expect("valid HTTP response")
 }
 
+async fn handle_models() -> axum::Json<Value> {
+    axum::Json(serde_json::json!({
+        "models": [
+            {
+                "name": "gpt-5",
+                "is_active": true,
+                "context_window": 200_000
+            },
+            {
+                "name": "test-model",
+                "is_active": true,
+                "context_window": 200_000
+            },
+            {
+                "name": "mock-model",
+                "is_active": true,
+                "context_window": 200_000
+            }
+        ]
+    }))
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /// A running mock LLM server. Drop to shut down.
@@ -448,6 +470,7 @@ impl MockLlmServer {
 
         let app = Router::new()
             .route("/chat/turn", post(handle_chat_turn))
+            .route("/models", get(handle_models))
             .with_state(state);
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();

@@ -8,9 +8,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, query};
+use sqlx::query;
 
 use crate::cost_ledger::{CostLedger, CostLedgerEntry};
+use crate::db_row::RowExt as RuntimePromotionAuditRow;
+use crate::db_row::RowExt as SessionAuditRow;
 use crate::models::PricingData;
 use crate::storage::agent_session_exists_for_user;
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
@@ -24,17 +26,822 @@ fn normalize_tool_name(name: String) -> String {
     }
 }
 
+fn runtime_promotion_row_string(
+    row: &impl RuntimePromotionAuditRow,
+    column: &str,
+) -> AuditResult<String> {
+    row.string_column(column)
+        .map_err(|e| internal_error(format!("runtime promotion decode column `{column}`: {e}")))
+}
+
 fn runtime_promotion_record_from_row(
-    row: &sqlx::mysql::MySqlRow,
-) -> Option<RuntimePromotionRecord> {
-    let metadata: String = row.try_get("metadata").ok()?;
-    let data: RuntimePromotionEventData = serde_json::from_str(&metadata).ok()?;
-    Some(RuntimePromotionRecord::from_event(
-        row.try_get("event_id").ok()?,
-        row.try_get("session_id").ok()?,
-        row.try_get("created_at").ok()?,
+    row: &impl RuntimePromotionAuditRow,
+) -> AuditResult<RuntimePromotionRecord> {
+    let metadata = runtime_promotion_row_string(row, "metadata")?;
+    let data: RuntimePromotionEventData = serde_json::from_str(&metadata).map_err(|e| {
+        internal_error(format!(
+            "runtime promotion metadata JSON decode failed: {e}"
+        ))
+    })?;
+    Ok(RuntimePromotionRecord::from_event(
+        runtime_promotion_row_string(row, "event_id")?,
+        runtime_promotion_row_string(row, "session_id")?,
+        runtime_promotion_row_string(row, "created_at")?,
         data,
     ))
+}
+
+fn audit_decode_error(
+    context: &str,
+    column: &str,
+    error: impl std::fmt::Display,
+) -> (StatusCode, Json<ErrorResponse>) {
+    internal_error(format!(
+        "session audit {context} decode column `{column}`: {error}"
+    ))
+}
+
+fn audit_row_string(
+    row: &impl SessionAuditRow,
+    context: &str,
+    column: &str,
+) -> AuditResult<String> {
+    row.string_column(column)
+        .map_err(|error| audit_decode_error(context, column, error))
+}
+
+fn audit_row_optional_string(
+    row: &impl SessionAuditRow,
+    context: &str,
+    column: &str,
+) -> AuditResult<Option<String>> {
+    row.optional_string_column(column)
+        .map_err(|error| audit_decode_error(context, column, error))
+}
+
+fn audit_row_i64(row: &impl SessionAuditRow, context: &str, column: &str) -> AuditResult<i64> {
+    row.i64_column(column)
+        .map_err(|error| audit_decode_error(context, column, error))
+}
+
+fn audit_row_u32(row: &impl SessionAuditRow, context: &str, column: &str) -> AuditResult<u32> {
+    let value = audit_row_i64(row, context, column)?;
+    u32::try_from(value).map_err(|_| {
+        audit_decode_error(
+            context,
+            column,
+            format!("expected non-negative u32-compatible value, got {value}"),
+        )
+    })
+}
+
+fn audit_row_u64(row: &impl SessionAuditRow, context: &str, column: &str) -> AuditResult<u64> {
+    let value = audit_row_i64(row, context, column)?;
+    u64::try_from(value).map_err(|_| {
+        audit_decode_error(
+            context,
+            column,
+            format!("expected non-negative u64-compatible value, got {value}"),
+        )
+    })
+}
+
+fn audit_row_u64_numeric(
+    row: &impl SessionAuditRow,
+    context: &str,
+    column: &str,
+) -> AuditResult<u64> {
+    match row.i64_column(column) {
+        Ok(value) => u64::try_from(value).map_err(|_| {
+            audit_decode_error(
+                context,
+                column,
+                format!("expected non-negative u64-compatible value, got {value}"),
+            )
+        }),
+        Err(int_error) => match row.f64_column(column) {
+            Ok(value)
+                if value.is_finite()
+                    && value >= 0.0
+                    && value <= u64::MAX as f64
+                    && value.fract() == 0.0 =>
+            {
+                Ok(value as u64)
+            }
+            Ok(value) => Err(audit_decode_error(
+                context,
+                column,
+                format!("expected non-negative integral value, got {value}"),
+            )),
+            Err(_) => Err(audit_decode_error(context, column, int_error)),
+        },
+    }
+}
+
+fn audit_row_f64(row: &impl SessionAuditRow, context: &str, column: &str) -> AuditResult<f64> {
+    row.f64_column(column)
+        .or_else(|_| row.i64_column(column).map(|value| value as f64))
+        .map_err(|error| audit_decode_error(context, column, error))
+}
+
+fn audit_row_non_negative_f64(
+    row: &impl SessionAuditRow,
+    context: &str,
+    column: &str,
+) -> AuditResult<f64> {
+    let value = audit_row_f64(row, context, column)?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(audit_decode_error(
+            context,
+            column,
+            format!("expected non-negative finite value, got {value}"),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct SessionAuditSessionHeader {
+    status: String,
+    created_at: String,
+    ended_at: Option<String>,
+}
+
+fn session_audit_session_header_from_row(
+    row: &impl SessionAuditRow,
+) -> AuditResult<SessionAuditSessionHeader> {
+    Ok(SessionAuditSessionHeader {
+        status: audit_row_string(row, "session_header", "status")?,
+        created_at: audit_row_string(row, "session_header", "created_at")?,
+        ended_at: audit_row_optional_string(row, "session_header", "ended_at")?,
+    })
+}
+
+#[derive(Debug)]
+struct SessionAuditMetrics {
+    turn_count: u32,
+    error_count: u32,
+    stall_count: u32,
+    checkpoint_count: u32,
+    compact_count: u32,
+    execution_boundary_opened_count: u32,
+    execution_boundary_committed_count: u32,
+    execution_boundary_aborted_count: u32,
+    approval_required_count: u32,
+    approval_decision_count: u32,
+    approval_timeout_count: u32,
+    tool_calls_total: u32,
+    tool_calls_failed: u32,
+    tokens_in: u64,
+    tokens_out: u64,
+    first_at: Option<String>,
+    last_at: Option<String>,
+    models_used: Vec<String>,
+}
+
+const SESSION_AUDIT_MODEL_SEP: char = '\u{001f}';
+
+fn session_audit_metrics_from_row(row: &impl SessionAuditRow) -> AuditResult<SessionAuditMetrics> {
+    let models_used = audit_row_optional_string(row, "summary_metrics", "models_concat")?
+        .filter(|models| !models.is_empty())
+        .map(|models| {
+            models
+                .split(SESSION_AUDIT_MODEL_SEP)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(SessionAuditMetrics {
+        turn_count: audit_row_u32(row, "summary_metrics", "turn_count")?,
+        error_count: audit_row_u32(row, "summary_metrics", "error_count")?,
+        stall_count: audit_row_u32(row, "summary_metrics", "stall_count")?,
+        checkpoint_count: audit_row_u32(row, "summary_metrics", "checkpoint_count")?,
+        compact_count: audit_row_u32(row, "summary_metrics", "compact_count")?,
+        execution_boundary_opened_count: audit_row_u32(
+            row,
+            "summary_metrics",
+            "execution_boundary_opened_count",
+        )?,
+        execution_boundary_committed_count: audit_row_u32(
+            row,
+            "summary_metrics",
+            "execution_boundary_committed_count",
+        )?,
+        execution_boundary_aborted_count: audit_row_u32(
+            row,
+            "summary_metrics",
+            "execution_boundary_aborted_count",
+        )?,
+        approval_required_count: audit_row_u32(row, "summary_metrics", "approval_required_count")?,
+        approval_decision_count: audit_row_u32(row, "summary_metrics", "approval_decision_count")?,
+        approval_timeout_count: audit_row_u32(row, "summary_metrics", "approval_timeout_count")?,
+        tool_calls_total: audit_row_u32(row, "summary_metrics", "tool_calls_total")?,
+        tool_calls_failed: audit_row_u32(row, "summary_metrics", "tool_calls_failed")?,
+        tokens_in: audit_row_u64(row, "summary_metrics", "tokens_in")?,
+        tokens_out: audit_row_u64(row, "summary_metrics", "tokens_out")?,
+        first_at: audit_row_optional_string(row, "summary_metrics", "first_at")?,
+        last_at: audit_row_optional_string(row, "summary_metrics", "last_at")?,
+        models_used,
+    })
+}
+
+fn audit_metadata_json(context: &str, column: &str, raw: &str) -> AuditResult<serde_json::Value> {
+    serde_json::from_str(raw).map_err(|error| {
+        audit_decode_error(context, column, format!("invalid metadata JSON: {error}"))
+    })
+}
+
+fn audit_metadata_u32_field(
+    metadata: &serde_json::Value,
+    context: &str,
+    field: &str,
+    fallback: u32,
+) -> AuditResult<u32> {
+    let Some(value) = metadata.get(field) else {
+        return Ok(fallback);
+    };
+    let raw = value.as_u64().ok_or_else(|| {
+        audit_decode_error(
+            context,
+            field,
+            format!("expected non-negative integer, got {value}"),
+        )
+    })?;
+    u32::try_from(raw).map_err(|_| {
+        audit_decode_error(
+            context,
+            field,
+            format!("expected u32-compatible value, got {raw}"),
+        )
+    })
+}
+
+fn audit_metadata_optional_u32_field(
+    metadata: &serde_json::Value,
+    context: &str,
+    field: &str,
+) -> AuditResult<Option<u32>> {
+    let Some(value) = metadata.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = value.as_u64().ok_or_else(|| {
+        audit_decode_error(
+            context,
+            field,
+            format!("expected non-negative integer, got {value}"),
+        )
+    })?;
+    u32::try_from(raw).map(Some).map_err(|_| {
+        audit_decode_error(
+            context,
+            field,
+            format!("expected u32-compatible value, got {raw}"),
+        )
+    })
+}
+
+fn audit_metadata_u64_field(
+    metadata: &serde_json::Value,
+    context: &str,
+    field: &str,
+    fallback: u64,
+) -> AuditResult<u64> {
+    let Some(value) = metadata.get(field) else {
+        return Ok(fallback);
+    };
+    value.as_u64().ok_or_else(|| {
+        audit_decode_error(
+            context,
+            field,
+            format!("expected non-negative integer, got {value}"),
+        )
+    })
+}
+
+fn audit_metadata_optional_u64_field(
+    metadata: &serde_json::Value,
+    context: &str,
+    field: &str,
+) -> AuditResult<Option<u64>> {
+    let Some(value) = metadata.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_u64().map(Some).ok_or_else(|| {
+        audit_decode_error(
+            context,
+            field,
+            format!("expected non-negative integer, got {value}"),
+        )
+    })
+}
+
+fn audit_metadata_optional_f64_field(
+    metadata: &serde_json::Value,
+    context: &str,
+    field: &str,
+) -> AuditResult<Option<f64>> {
+    let Some(value) = metadata.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_f64()
+        .map(Some)
+        .ok_or_else(|| audit_decode_error(context, field, format!("expected number, got {value}")))
+}
+
+fn audit_metadata_optional_string_field(
+    metadata: &serde_json::Value,
+    context: &str,
+    field: &str,
+) -> AuditResult<Option<String>> {
+    let Some(value) = metadata.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_str()
+        .map(String::from)
+        .map(Some)
+        .ok_or_else(|| audit_decode_error(context, field, format!("expected string, got {value}")))
+}
+
+fn audit_metadata_string_field(
+    metadata: &serde_json::Value,
+    context: &str,
+    field: &str,
+    fallback: &str,
+) -> AuditResult<String> {
+    Ok(
+        audit_metadata_optional_string_field(metadata, context, field)?
+            .unwrap_or_else(|| fallback.to_string()),
+    )
+}
+
+fn audit_metadata_string_vec_field(
+    metadata: &serde_json::Value,
+    context: &str,
+    field: &str,
+) -> AuditResult<Vec<String>> {
+    let Some(value) = metadata.get(field) else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_value(value.clone()).map_err(|error| {
+        audit_decode_error(context, field, format!("expected string array: {error}"))
+    })
+}
+
+fn audit_pagination_offset(page: u32, per_page: u32, context: &str) -> AuditResult<u32> {
+    page.max(1)
+        .checked_sub(1)
+        .and_then(|page_index| page_index.checked_mul(per_page.max(1)))
+        .ok_or_else(|| {
+            internal_error(format!(
+                "session audit {context} pagination offset overflow"
+            ))
+        })
+}
+
+fn turn_list_fallback_turn(offset: u32, row_index: usize) -> AuditResult<u32> {
+    let row_index = u32::try_from(row_index).map_err(|_| {
+        internal_error(format!(
+            "session audit turn_list_row decode column `row_index`: row index exceeds u32::MAX: {row_index}"
+        ))
+    })?;
+    offset
+        .checked_add(row_index)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            internal_error(
+                "session audit turn_list_row decode column `turn`: fallback turn overflow",
+            )
+        })
+}
+
+fn turn_list_offset(page: u32, per_page: u32) -> AuditResult<u32> {
+    audit_pagination_offset(page, per_page.clamp(1, 100), "list_turns")
+}
+
+fn turn_summary_from_row(
+    row: &impl SessionAuditRow,
+    fallback_turn: u32,
+) -> AuditResult<TurnSummary> {
+    let content = audit_row_string(row, "turn_list_row", "content")?;
+    let metadata = audit_metadata_json(
+        "turn_list_row",
+        "metadata",
+        &audit_row_string(row, "turn_list_row", "metadata")?,
+    )?;
+    let token_usage = parse_optional_turn_token_usage(
+        audit_row_optional_string(row, "turn_list_row", "token_usage")?,
+        "turn_list_row",
+    )?;
+    let model = audit_row_optional_string(row, "turn_list_row", "llm_model_used")?;
+    let created_at = audit_row_string(row, "turn_list_row", "created_at")?;
+
+    let turn = audit_metadata_u32_field(&metadata, "turn_list_row", "turn", fallback_turn)?;
+    let tool_calls = extract_tool_calls_from_metadata(&metadata);
+    let has_error = metadata
+        .get("error")
+        .map(|value| !value.is_null())
+        .unwrap_or(false);
+    let has_stall = metadata
+        .get("stall_type")
+        .map(|value| !value.is_null())
+        .unwrap_or(false);
+
+    Ok(TurnSummary {
+        turn,
+        user_input_preview: truncate_str(&content, 200),
+        tool_calls,
+        tokens_in: token_usage.input_tokens,
+        cached_input_tokens: token_usage.cached_input_tokens,
+        cache_creation_tokens: token_usage.cache_creation_tokens,
+        tokens_out: token_usage.output_tokens,
+        total_tokens: token_usage.total_tokens,
+        duration_ms: audit_metadata_u64_field(&metadata, "turn_list_row", "duration_ms", 0)?,
+        has_error,
+        has_stall,
+        model,
+        created_at,
+    })
+}
+
+#[derive(Debug)]
+struct TurnDetailParent {
+    event_id: String,
+    content: String,
+    metadata: serde_json::Value,
+    token_usage: ParsedTurnTokenUsage,
+    model: Option<String>,
+    created_at: String,
+}
+
+fn turn_detail_parent_from_row(row: &impl SessionAuditRow) -> AuditResult<TurnDetailParent> {
+    let metadata = audit_metadata_json(
+        "turn_detail_parent",
+        "metadata",
+        &audit_row_string(row, "turn_detail_parent", "metadata")?,
+    )?;
+    Ok(TurnDetailParent {
+        event_id: audit_row_string(row, "turn_detail_parent", "event_id")?,
+        content: audit_row_string(row, "turn_detail_parent", "content")?,
+        metadata,
+        token_usage: parse_optional_turn_token_usage(
+            audit_row_optional_string(row, "turn_detail_parent", "token_usage")?,
+            "turn_detail_parent",
+        )?,
+        model: audit_row_optional_string(row, "turn_detail_parent", "llm_model_used")?,
+        created_at: audit_row_string(row, "turn_detail_parent", "created_at")?,
+    })
+}
+
+fn child_event_from_row(row: &impl SessionAuditRow) -> AuditResult<ChildEvent> {
+    Ok(ChildEvent {
+        event_id: audit_row_string(row, "turn_detail_child", "event_id")?,
+        event_type: audit_row_string(row, "turn_detail_child", "event_type")?,
+        content: audit_row_string(row, "turn_detail_child", "content")?,
+        metadata: audit_metadata_json(
+            "turn_detail_child",
+            "metadata",
+            &audit_row_string(row, "turn_detail_child", "metadata")?,
+        )?,
+        created_at: audit_row_string(row, "turn_detail_child", "created_at")?,
+    })
+}
+
+fn audit_error_entry_from_row(row: &impl SessionAuditRow) -> AuditResult<AuditErrorEntry> {
+    let metadata = audit_metadata_json(
+        "error_list_row",
+        "metadata",
+        &audit_row_string(row, "error_list_row", "metadata")?,
+    )?;
+    let turn = audit_metadata_optional_u32_field(&metadata, "error_list_row", "turn")?;
+
+    Ok(AuditErrorEntry {
+        event_id: audit_row_string(row, "error_list_row", "event_id")?,
+        event_type: audit_row_string(row, "error_list_row", "event_type")?,
+        turn,
+        content: audit_row_string(row, "error_list_row", "content")?,
+        metadata,
+        created_at: audit_row_string(row, "error_list_row", "created_at")?,
+    })
+}
+
+fn tool_latest_error_from_row(row: &impl SessionAuditRow) -> AuditResult<(String, String)> {
+    Ok((
+        normalize_tool_name(audit_row_string(row, "tool_latest_error_row", "tool_name")?),
+        audit_row_string(row, "tool_latest_error_row", "content")?,
+    ))
+}
+
+fn tool_analytics_from_row(
+    row: &impl SessionAuditRow,
+    latest_errors: &HashMap<String, String>,
+) -> AuditResult<ToolAnalytics> {
+    let context = "tool_analytics_row";
+    let name = normalize_tool_name(audit_row_string(row, context, "tool_name")?);
+    let total_calls = audit_row_u32(row, context, "total_calls")?;
+    if total_calls == 0 {
+        return Err(audit_decode_error(
+            context,
+            "total_calls",
+            "expected positive call count",
+        ));
+    }
+    let total_success = audit_row_u32(row, context, "total_success")?;
+    let total_failures = audit_row_u32(row, context, "total_failures")?;
+    if total_success.checked_add(total_failures) != Some(total_calls) {
+        return Err(audit_decode_error(
+            context,
+            "total_calls",
+            format!(
+                "call count mismatch: total={total_calls}, success={total_success}, failures={total_failures}"
+            ),
+        ));
+    }
+    let avg_duration_ms = audit_row_non_negative_f64(row, context, "avg_ms")?;
+    let max_duration_ms = audit_row_u64_numeric(row, context, "max_ms")?;
+    let total_duration_ms = audit_row_u64_numeric(row, context, "total_duration_ms")?;
+
+    Ok(ToolAnalytics {
+        name: name.clone(),
+        call_count: total_calls,
+        success_count: total_success,
+        fail_count: total_failures,
+        success_rate: total_success as f64 / total_calls as f64,
+        avg_duration_ms,
+        max_duration_ms,
+        total_duration_ms,
+        last_error: latest_errors.get(&name).cloned(),
+    })
+}
+
+fn cross_session_tool_analytics_from_row(
+    row: &impl SessionAuditRow,
+    latest_errors: &HashMap<String, String>,
+) -> AuditResult<CrossSessionToolAnalytics> {
+    let context = "cross_session_tool_analytics_row";
+    let name = normalize_tool_name(audit_row_string(row, context, "tool_name")?);
+    let total_calls = audit_row_u32(row, context, "total_calls")?;
+    if total_calls == 0 {
+        return Err(audit_decode_error(
+            context,
+            "total_calls",
+            "expected positive call count",
+        ));
+    }
+    let total_success = audit_row_u32(row, context, "total_success")?;
+    let total_failures = audit_row_u32(row, context, "total_failures")?;
+    if total_success.checked_add(total_failures) != Some(total_calls) {
+        return Err(audit_decode_error(
+            context,
+            "total_calls",
+            format!(
+                "call count mismatch: total={total_calls}, success={total_success}, failures={total_failures}"
+            ),
+        ));
+    }
+    let sessions_used_in = audit_row_u32(row, context, "sessions_used")?;
+    if sessions_used_in == 0 {
+        return Err(audit_decode_error(
+            context,
+            "sessions_used",
+            "expected positive session count",
+        ));
+    }
+
+    Ok(CrossSessionToolAnalytics {
+        name: name.clone(),
+        total_calls,
+        total_success,
+        total_failures,
+        success_rate: total_success as f64 / total_calls as f64,
+        avg_duration_ms: audit_row_non_negative_f64(row, context, "avg_ms")?,
+        max_duration_ms: audit_row_u64_numeric(row, context, "max_ms")?,
+        sessions_used_in,
+        last_error: latest_errors.get(&name).cloned(),
+    })
+}
+
+#[derive(Debug)]
+struct CrossSessionStatsCounters {
+    session_count: u32,
+    total_turns: u32,
+    tokens_in: u64,
+    tokens_out: u64,
+    total_tool_calls: u32,
+    total_tool_failures: u32,
+    total_errors: u32,
+    total_stalls: u32,
+    total_execution_boundaries_opened: u32,
+    total_execution_boundaries_committed: u32,
+    total_execution_boundaries_aborted: u32,
+    total_approval_required: u32,
+    total_approval_decisions: u32,
+    total_approval_timeouts: u32,
+}
+
+fn cross_session_stats_counters_from_row(
+    row: &impl SessionAuditRow,
+) -> AuditResult<CrossSessionStatsCounters> {
+    let context = "cross_session_stats_aggregate";
+    Ok(CrossSessionStatsCounters {
+        session_count: audit_row_u32(row, context, "session_count")?,
+        total_turns: audit_row_u32(row, context, "total_turns")?,
+        tokens_in: audit_row_u64(row, context, "tokens_in")?,
+        tokens_out: audit_row_u64(row, context, "tokens_out")?,
+        total_tool_calls: audit_row_u32(row, context, "total_tool_calls")?,
+        total_tool_failures: audit_row_u32(row, context, "total_tool_failures")?,
+        total_errors: audit_row_u32(row, context, "total_errors")?,
+        total_stalls: audit_row_u32(row, context, "total_stalls")?,
+        total_execution_boundaries_opened: audit_row_u32(
+            row,
+            context,
+            "total_execution_boundaries_opened",
+        )?,
+        total_execution_boundaries_committed: audit_row_u32(
+            row,
+            context,
+            "total_execution_boundaries_committed",
+        )?,
+        total_execution_boundaries_aborted: audit_row_u32(
+            row,
+            context,
+            "total_execution_boundaries_aborted",
+        )?,
+        total_approval_required: audit_row_u32(row, context, "total_approval_required")?,
+        total_approval_decisions: audit_row_u32(row, context, "total_approval_decisions")?,
+        total_approval_timeouts: audit_row_u32(row, context, "total_approval_timeouts")?,
+    })
+}
+
+fn tool_usage_brief_from_row(row: &impl SessionAuditRow) -> AuditResult<ToolUsageBrief> {
+    let context = "cross_session_top_tool_row";
+    let name = normalize_tool_name(audit_row_string(row, context, "tool_name")?);
+    let call_count = audit_row_u32(row, context, "cnt")?;
+    if call_count == 0 {
+        return Err(audit_decode_error(
+            context,
+            "cnt",
+            "expected positive call count",
+        ));
+    }
+    let ok_count = audit_row_u32(row, context, "ok_cnt")?;
+    if ok_count > call_count {
+        return Err(audit_decode_error(
+            context,
+            "ok_cnt",
+            format!("success count exceeds total: success={ok_count}, total={call_count}"),
+        ));
+    }
+    Ok(ToolUsageBrief {
+        name,
+        call_count,
+        success_rate: ok_count as f64 / call_count as f64,
+    })
+}
+
+fn model_usage_brief_from_row(row: &impl SessionAuditRow) -> AuditResult<ModelUsageBrief> {
+    let context = "cross_session_top_model_row";
+    let model = audit_row_string(row, context, "model")?;
+    if model.trim().is_empty() {
+        return Err(audit_decode_error(
+            context,
+            "model",
+            "expected non-empty model",
+        ));
+    }
+    let session_count = audit_row_u32(row, context, "sess_cnt")?;
+    if session_count == 0 {
+        return Err(audit_decode_error(
+            context,
+            "sess_cnt",
+            "expected positive session count",
+        ));
+    }
+    Ok(ModelUsageBrief {
+        model,
+        session_count,
+        total_tokens: audit_row_u64(row, context, "total_tokens")?,
+    })
+}
+
+fn audit_session_list_item_from_row(
+    row: &impl SessionAuditRow,
+) -> AuditResult<AuditSessionListItem> {
+    let context = "audit_session_list_row";
+    let first_ts = audit_row_optional_string(row, context, "first_ts")?;
+    let last_ts = audit_row_optional_string(row, context, "last_ts")?;
+    let duration_secs = compute_duration_secs(first_ts.as_deref(), last_ts.as_deref());
+    Ok(AuditSessionListItem {
+        session_id: audit_row_string(row, context, "session_id")?,
+        status: audit_row_string(row, context, "status")?,
+        turn_count: audit_row_u32(row, context, "turn_count")?,
+        tokens_in: audit_row_u64(row, context, "tokens_in")?,
+        tokens_out: audit_row_u64(row, context, "tokens_out")?,
+        tool_calls_total: audit_row_u32(row, context, "tool_calls")?,
+        error_count: audit_row_u32(row, context, "error_count")?,
+        model: audit_row_optional_string(row, context, "model")?
+            .filter(|model| !model.trim().is_empty()),
+        duration_secs,
+        created_at: audit_row_string(row, context, "created_at")?,
+        ended_at: audit_row_optional_string(row, context, "ended_at")?,
+    })
+}
+
+fn audit_count_from_row(row: &impl SessionAuditRow, context: &str) -> AuditResult<u32> {
+    audit_row_u32(row, context, "cnt")
+}
+
+fn turn_detail_from_parent(
+    turn: u32,
+    parent: TurnDetailParent,
+    child_events: Vec<ChildEvent>,
+) -> AuditResult<TurnDetail> {
+    let tool_calls = extract_tool_calls_from_metadata(&parent.metadata);
+    let error_message =
+        audit_metadata_optional_string_field(&parent.metadata, "turn_detail_parent", "error")?;
+
+    Ok(TurnDetail {
+        turn,
+        user_input: parent.content,
+        assistant_output: audit_metadata_string_field(
+            &parent.metadata,
+            "turn_detail_parent",
+            "assistant_output",
+            "",
+        )?,
+        tool_calls,
+        tokens_in: parent.token_usage.input_tokens,
+        cached_input_tokens: parent.token_usage.cached_input_tokens,
+        cache_creation_tokens: parent.token_usage.cache_creation_tokens,
+        tokens_out: parent.token_usage.output_tokens,
+        total_tokens: parent.token_usage.total_tokens,
+        duration_ms: audit_metadata_u64_field(
+            &parent.metadata,
+            "turn_detail_parent",
+            "duration_ms",
+            0,
+        )?,
+        ttft_ms: audit_metadata_optional_u64_field(
+            &parent.metadata,
+            "turn_detail_parent",
+            "ttft_ms",
+        )?,
+        context_ms: audit_metadata_optional_u64_field(
+            &parent.metadata,
+            "turn_detail_parent",
+            "context_ms",
+        )?,
+        budget_pressure: audit_metadata_optional_f64_field(
+            &parent.metadata,
+            "turn_detail_parent",
+            "budget_pressure",
+        )?,
+        visible_tools: audit_metadata_string_vec_field(
+            &parent.metadata,
+            "turn_detail_parent",
+            "visible_tools",
+        )?,
+        tools_used: audit_metadata_string_vec_field(
+            &parent.metadata,
+            "turn_detail_parent",
+            "tools_used",
+        )?,
+        model: parent.model,
+        has_error: error_message.is_some(),
+        error_message,
+        stall_type: audit_metadata_optional_string_field(
+            &parent.metadata,
+            "turn_detail_parent",
+            "stall_type",
+        )?,
+        plan_subtask_id: audit_metadata_optional_string_field(
+            &parent.metadata,
+            "turn_detail_parent",
+            "plan_subtask_id",
+        )?,
+        created_at: parent.created_at,
+        child_events,
+    })
 }
 
 /// `SUBSTRING(..., 1, N)` caps for `agent_events.content` to avoid full LONGTEXT reads.
@@ -45,6 +852,9 @@ mod agent_events_content_cap {
     pub const TOOL_LAST_ERROR: u32 = 2048;
     pub const ERROR_LIST_ENTRY: u32 = 8192;
 }
+
+const TURN_LIST_TOTAL_SQL: &str = "SELECT COALESCE(MAX(turn_seq), 0) AS cnt FROM agent_events \
+     WHERE session_id = ? AND user_id = ?";
 
 // ── Response types ───────────────────────────────────────────────────────────
 
@@ -179,38 +989,83 @@ struct ParsedTurnTokenUsage {
     total_tokens: u64,
 }
 
-fn parse_turn_token_usage(raw: &str) -> ParsedTurnTokenUsage {
-    let value: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
-    let Some(obj) = value.as_object() else {
-        return ParsedTurnTokenUsage::default();
-    };
-    let read = |primary: &str, legacy: &str| -> u64 {
-        obj.get(primary)
-            .or_else(|| obj.get(legacy))
-            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
-            .unwrap_or(0)
-    };
-    let input_tokens = read("input_tokens", "input");
-    let cached_input_tokens = read("cached_input_tokens", "cached_input");
-    let cache_creation_tokens = read("cache_creation_tokens", "cache_creation");
-    let output_tokens = read("output_tokens", "output");
-    let total_tokens = obj
-        .get("total_tokens")
-        .or_else(|| obj.get("total"))
-        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
-        .unwrap_or_else(|| {
-            input_tokens
-                .saturating_add(cached_input_tokens)
-                .saturating_add(cache_creation_tokens)
-                .saturating_add(output_tokens)
-        });
-    ParsedTurnTokenUsage {
+#[derive(Debug, Deserialize)]
+struct TurnTokenUsageWire {
+    input_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+}
+
+fn parse_optional_turn_token_usage(
+    raw: Option<String>,
+    context: &str,
+) -> AuditResult<ParsedTurnTokenUsage> {
+    match raw {
+        Some(raw) if !raw.trim().is_empty() => parse_turn_token_usage(&raw, context),
+        Some(_) => Err(audit_decode_error(
+            context,
+            "token_usage",
+            "expected canonical token_usage JSON, got empty string",
+        )),
+        None => Ok(ParsedTurnTokenUsage::default()),
+    }
+}
+
+fn non_negative_token_count(value: i64, context: &str, field: &str) -> AuditResult<u64> {
+    u64::try_from(value).map_err(|_| {
+        audit_decode_error(
+            context,
+            field,
+            format!("expected non-negative token count, got {value}"),
+        )
+    })
+}
+
+fn required_token_count(value: Option<i64>, context: &str, field: &str) -> AuditResult<u64> {
+    let value = value.ok_or_else(|| {
+        audit_decode_error(
+            context,
+            field,
+            format!("missing canonical token usage field `{field}`"),
+        )
+    })?;
+    non_negative_token_count(value, context, field)
+}
+
+fn parse_turn_token_usage(raw: &str, context: &str) -> AuditResult<ParsedTurnTokenUsage> {
+    let usage: TurnTokenUsageWire = serde_json::from_str(raw)
+        .map_err(|error| audit_decode_error(context, "token_usage", error))?;
+    let input_tokens = required_token_count(usage.input_tokens, context, "input_tokens")?;
+    let cached_input_tokens =
+        required_token_count(usage.cached_input_tokens, context, "cached_input_tokens")?;
+    let cache_creation_tokens = required_token_count(
+        usage.cache_creation_tokens,
+        context,
+        "cache_creation_tokens",
+    )?;
+    let output_tokens = required_token_count(usage.output_tokens, context, "output_tokens")?;
+    let total_tokens = required_token_count(usage.total_tokens, context, "total_tokens")?;
+    let expected_total = input_tokens
+        .checked_add(cached_input_tokens)
+        .and_then(|value| value.checked_add(cache_creation_tokens))
+        .and_then(|value| value.checked_add(output_tokens))
+        .ok_or_else(|| audit_decode_error(context, "total_tokens", "token total overflow"))?;
+    if total_tokens != expected_total {
+        return Err(audit_decode_error(
+            context,
+            "total_tokens",
+            format!("expected {expected_total}, got {total_tokens}"),
+        ));
+    }
+    Ok(ParsedTurnTokenUsage {
         input_tokens,
         cached_input_tokens,
         cache_creation_tokens,
         output_tokens,
         total_tokens,
-    }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +1122,84 @@ fn summarize_session_cost(
     }
 }
 
+fn pricing_json_number(context: &str, field: &str, value: &serde_json::Value) -> AuditResult<f64> {
+    let Some(number) = value.as_f64() else {
+        return Err(audit_decode_error(
+            context,
+            &format!("pricing_json.{field}"),
+            format!("expected number, got {value}"),
+        ));
+    };
+    if number.is_finite() && number >= 0.0 {
+        Ok(number)
+    } else {
+        Err(audit_decode_error(
+            context,
+            &format!("pricing_json.{field}"),
+            format!("expected non-negative finite number, got {number}"),
+        ))
+    }
+}
+
+fn pricing_json_required_number(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+    field: &str,
+) -> AuditResult<f64> {
+    let Some(value) = obj.get(field) else {
+        return Err(audit_decode_error(
+            context,
+            &format!("pricing_json.{field}"),
+            "missing required pricing field",
+        ));
+    };
+    pricing_json_number(context, field, value)
+}
+
+fn pricing_json_optional_number(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+    field: &str,
+) -> AuditResult<Option<f64>> {
+    match obj.get(field) {
+        Some(value) if !value.is_null() => pricing_json_number(context, field, value).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn active_model_pricing_from_row(
+    row: &impl SessionAuditRow,
+    wanted: &HashSet<&str>,
+) -> AuditResult<Option<(String, PricingData)>> {
+    let context = "active_model_pricing_row";
+    let model_name = audit_row_string(row, context, "model_name")?;
+    if !wanted.contains(model_name.as_str()) {
+        return Ok(None);
+    }
+    let pricing_json =
+        audit_row_optional_string(row, context, "pricing_json")?.ok_or_else(|| {
+            audit_decode_error(context, "pricing_json", "expected pricing JSON, got NULL")
+        })?;
+    let value: serde_json::Value = serde_json::from_str(&pricing_json)
+        .map_err(|error| audit_decode_error(context, "pricing_json", error))?;
+    let Some(obj) = value.as_object() else {
+        return Err(audit_decode_error(
+            context,
+            "pricing_json",
+            format!("expected JSON object, got {value}"),
+        ));
+    };
+    Ok(Some((
+        model_name,
+        PricingData {
+            prompt: pricing_json_required_number(obj, context, "prompt")?,
+            completion: pricing_json_required_number(obj, context, "completion")?,
+            cache_read: pricing_json_optional_number(obj, context, "cache_read")?,
+            cache_write: pricing_json_optional_number(obj, context, "cache_write")?,
+        },
+    )))
+}
+
 async fn load_active_model_pricing_map(
     pool: &sqlx::Pool<sqlx::MySql>,
     models: &[String],
@@ -276,7 +1209,7 @@ async fn load_active_model_pricing_map(
     }
     let wanted: HashSet<&str> = models.iter().map(String::as_str).collect();
     let rows = query(
-        "SELECT model_name, IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json \
+        "SELECT model_name, CAST(pricing AS CHAR) AS pricing_json \
          FROM infra_llm_models WHERE is_active = 1",
     )
     .fetch_all(pool)
@@ -285,15 +1218,30 @@ async fn load_active_model_pricing_map(
 
     let mut pricing_by_model = HashMap::new();
     for row in rows {
-        let model_name: String = row.try_get("model_name").unwrap_or_default();
-        if !wanted.contains(model_name.as_str()) {
-            continue;
+        if let Some((model_name, pricing)) = active_model_pricing_from_row(&row, &wanted)? {
+            pricing_by_model.insert(model_name, pricing);
         }
-        let pricing_json: String = row.try_get("pricing_json").unwrap_or_else(|_| "{}".into());
-        let pricing = serde_json::from_str::<PricingData>(&pricing_json).unwrap_or_default();
-        pricing_by_model.insert(model_name, pricing);
     }
     Ok(pricing_by_model)
+}
+
+fn session_turn_cost_sample_from_row(row: &impl SessionAuditRow) -> AuditResult<TurnCostSample> {
+    let context = "session_turn_cost_sample_row";
+    let model = audit_row_string(row, context, "llm_model_used")?;
+    if model.trim().is_empty() {
+        return Err(audit_decode_error(
+            context,
+            "llm_model_used",
+            "expected non-empty model",
+        ));
+    }
+    let token_usage = audit_row_string(row, context, "token_usage")?;
+    Ok(TurnCostSample {
+        turn_id: audit_row_string(row, context, "event_id")?,
+        agent_id: "root".to_string(),
+        model,
+        usage: parse_turn_token_usage(&token_usage, context)?,
+    })
 }
 
 async fn load_session_turn_cost_samples(
@@ -305,7 +1253,7 @@ async fn load_session_turn_cost_samples(
         "SELECT event_id, llm_model_used, CAST(token_usage AS CHAR) AS token_usage \
          FROM agent_events \
          WHERE session_id = ? AND user_id = ? \
-           AND event_type = 'user_query' \
+           AND event_type IN ('user_query', 'llm_response') \
            AND llm_model_used IS NOT NULL AND llm_model_used != '' \
            AND token_usage IS NOT NULL \
          ORDER BY created_at ASC",
@@ -316,17 +1264,9 @@ async fn load_session_turn_cost_samples(
     .await
     .map_err(internal_error)?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| TurnCostSample {
-            turn_id: row.try_get("event_id").unwrap_or_default(),
-            agent_id: "root".to_string(),
-            model: row.try_get("llm_model_used").unwrap_or_default(),
-            usage: parse_turn_token_usage(
-                &row.try_get::<String, _>("token_usage").unwrap_or_default(),
-            ),
-        })
-        .collect())
+    rows.into_iter()
+        .map(|row| session_turn_cost_sample_from_row(&row))
+        .collect()
 }
 
 /// A child event (tool call or error) linked to a turn via parent_event_id.
@@ -462,6 +1402,7 @@ pub struct CrossSessionToolAnalytics {
 }
 
 pub const RUNTIME_PROMOTION_EVENT_TYPE: &str = "runtime_promotion_verdict";
+pub const MAX_SESSION_RUNTIME_PROMOTION_ROWS: i64 = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -820,10 +1761,7 @@ impl DatabaseSessionAuditService {
         query = query.bind(MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS);
 
         let rows = query.fetch_all(pool).await.map_err(internal_error)?;
-        Ok(rows
-            .iter()
-            .filter_map(runtime_promotion_record_from_row)
-            .collect())
+        rows.iter().map(runtime_promotion_record_from_row).collect()
     }
 }
 
@@ -848,15 +1786,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         let sess_row =
             sess_row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
-        let status: String = sess_row.try_get("status").unwrap_or_default();
-        let created_at: String = sess_row
-            .try_get::<String, _>("created_at")
-            .unwrap_or_default();
-        let ended_at: Option<String> = sess_row.try_get("ended_at").ok();
+        let session_header = session_audit_session_header_from_row(&sess_row)?;
 
         // One pass over agent_events: counts, tokens, duration bounds, distinct models.
         // MatrixOne rejects `SEPARATOR CHAR(31)`; embed the unit-separator as a literal (same as MySQL).
-        const MODEL_SEP: char = '\u{001f}';
         let metrics_row = query(&format!(
             "SELECT \
                COALESCE(MAX(turn_seq), 0) AS turn_count, \
@@ -873,9 +1806,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
                COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) \
                  + COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS tool_calls_total, \
                COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS tool_calls_failed, \
-               COALESCE(SUM(CASE WHEN event_type = 'user_query' AND token_usage IS NOT NULL \
+               COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
                  THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS tokens_in, \
-               COALESCE(SUM(CASE WHEN event_type = 'user_query' AND token_usage IS NOT NULL \
+               COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
                  THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS tokens_out, \
                MIN(created_at) AS first_at, \
                MAX(created_at) AS last_at, \
@@ -885,7 +1818,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                           AND e3.llm_model_used IS NOT NULL) t) AS models_concat \
              FROM agent_events e \
              WHERE e.session_id = ? AND e.user_id = ?",
-            sep = MODEL_SEP,
+            sep = SESSION_AUDIT_MODEL_SEP,
         ))
         .bind(session_id)
         .bind(user_id)
@@ -895,84 +1828,36 @@ impl SessionAuditService for DatabaseSessionAuditService {
         .await
         .map_err(internal_error)?;
 
-        let turn_count: u32 = metrics_row.try_get::<i64, _>("turn_count").unwrap_or(0) as u32;
-        let error_count: u32 = metrics_row.try_get::<i64, _>("error_count").unwrap_or(0) as u32;
-        let stall_count: u32 = metrics_row.try_get::<i64, _>("stall_count").unwrap_or(0) as u32;
-        let checkpoint_count: u32 = metrics_row
-            .try_get::<i64, _>("checkpoint_count")
-            .unwrap_or(0) as u32;
-        let compact_count: u32 = metrics_row.try_get::<i64, _>("compact_count").unwrap_or(0) as u32;
-        let execution_boundary_opened_count: u32 = metrics_row
-            .try_get::<i64, _>("execution_boundary_opened_count")
-            .unwrap_or(0) as u32;
-        let execution_boundary_committed_count: u32 = metrics_row
-            .try_get::<i64, _>("execution_boundary_committed_count")
-            .unwrap_or(0) as u32;
-        let execution_boundary_aborted_count: u32 = metrics_row
-            .try_get::<i64, _>("execution_boundary_aborted_count")
-            .unwrap_or(0) as u32;
-        let approval_required_count: u32 = metrics_row
-            .try_get::<i64, _>("approval_required_count")
-            .unwrap_or(0) as u32;
-        let approval_decision_count: u32 = metrics_row
-            .try_get::<i64, _>("approval_decision_count")
-            .unwrap_or(0) as u32;
-        let approval_timeout_count: u32 = metrics_row
-            .try_get::<i64, _>("approval_timeout_count")
-            .unwrap_or(0) as u32;
-        let tool_calls_total: u32 = metrics_row
-            .try_get::<i64, _>("tool_calls_total")
-            .unwrap_or(0) as u32;
-        let tool_calls_failed: u32 = metrics_row
-            .try_get::<i64, _>("tool_calls_failed")
-            .unwrap_or(0) as u32;
-
-        let tokens_in: i64 = metrics_row.try_get("tokens_in").unwrap_or(0);
-        let tokens_out: i64 = metrics_row.try_get("tokens_out").unwrap_or(0);
-
-        let first_at: Option<String> = metrics_row.try_get("first_at").ok();
-        let last_at: Option<String> = metrics_row.try_get("last_at").ok();
-        let duration_secs = compute_duration_secs(first_at.as_deref(), last_at.as_deref());
-
-        let models_used: Vec<String> = metrics_row
-            .try_get::<String, _>("models_concat")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                s.split(MODEL_SEP)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let metrics = session_audit_metrics_from_row(&metrics_row)?;
+        let duration_secs =
+            compute_duration_secs(metrics.first_at.as_deref(), metrics.last_at.as_deref());
         let turn_costs = load_session_turn_cost_samples(&pool, user_id, session_id).await?;
-        let pricing_by_model = load_active_model_pricing_map(&pool, &models_used).await?;
+        let pricing_by_model = load_active_model_pricing_map(&pool, &metrics.models_used).await?;
         let cost = summarize_session_cost(session_id, turn_costs, &pricing_by_model);
 
         Ok(SessionAuditSummary {
             session_id: session_id.to_string(),
-            status,
-            turn_count,
-            tokens_in: tokens_in as u64,
-            tokens_out: tokens_out as u64,
-            tool_calls_total,
-            tool_calls_failed,
-            error_count,
-            stall_count,
-            checkpoint_count,
-            compact_count,
-            execution_boundary_opened_count,
-            execution_boundary_committed_count,
-            execution_boundary_aborted_count,
-            approval_required_count,
-            approval_decision_count,
-            approval_timeout_count,
-            models_used,
+            status: session_header.status,
+            turn_count: metrics.turn_count,
+            tokens_in: metrics.tokens_in,
+            tokens_out: metrics.tokens_out,
+            tool_calls_total: metrics.tool_calls_total,
+            tool_calls_failed: metrics.tool_calls_failed,
+            error_count: metrics.error_count,
+            stall_count: metrics.stall_count,
+            checkpoint_count: metrics.checkpoint_count,
+            compact_count: metrics.compact_count,
+            execution_boundary_opened_count: metrics.execution_boundary_opened_count,
+            execution_boundary_committed_count: metrics.execution_boundary_committed_count,
+            execution_boundary_aborted_count: metrics.execution_boundary_aborted_count,
+            approval_required_count: metrics.approval_required_count,
+            approval_decision_count: metrics.approval_decision_count,
+            approval_timeout_count: metrics.approval_timeout_count,
+            models_used: metrics.models_used,
             cost,
             duration_secs,
-            created_at,
-            ended_at,
+            created_at: session_header.created_at,
+            ended_at: session_header.ended_at,
         })
     }
 
@@ -988,26 +1873,21 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         let page = params.page.max(1);
         let per_page = params.per_page.clamp(1, 100);
-        let offset = (page - 1) * per_page;
+        let offset = turn_list_offset(page, per_page)?;
 
-        // Count total turn events
-        let count_row = query(
-            "SELECT COUNT(*) AS cnt FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'user_query'",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(internal_error)?;
-        let total: i64 = count_row.try_get("cnt").unwrap_or(0);
+        let count_row = query(TURN_LIST_TOTAL_SQL)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(internal_error)?;
+        let total = audit_row_u32(&count_row, "turn_list_count", "cnt")?;
 
         // Fetch turn events with pagination (cap content in SQL — matches preview length)
         let turn_sql = format!(
-            "SELECT event_id, \
-             SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
+            "SELECT SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
              CAST(token_usage AS CHAR) AS token_usage, llm_model_used, \
-             CAST(metadata AS CHAR) AS metadata, CAST(created_at AS CHAR) AS created_at \
+             COALESCE(CAST(metadata AS CHAR), '{{}}') AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
              ORDER BY created_at ASC \
@@ -1027,55 +1907,14 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .iter()
             .enumerate()
             .map(|(i, row)| {
-                let content: String = row.try_get("content").unwrap_or_default();
-                let meta: String = row.try_get("metadata").unwrap_or_default();
-                let meta_json: serde_json::Value =
-                    serde_json::from_str(&meta).unwrap_or(serde_json::Value::Null);
-                let token_str: String = row.try_get("token_usage").unwrap_or_default();
-                let token_usage = parse_turn_token_usage(&token_str);
-                let model: Option<String> = row.try_get("llm_model_used").ok();
-                let created_at: String = row.try_get("created_at").unwrap_or_default();
-
-                let turn_num = meta_json
-                    .get("turn")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or((offset + i as u32 + 1) as u64)
-                    as u32;
-
-                let tool_calls = extract_tool_calls_from_metadata(&meta_json);
-                let has_error = meta_json
-                    .get("error")
-                    .map(|v| !v.is_null())
-                    .unwrap_or(false);
-                let has_stall = meta_json
-                    .get("stall_type")
-                    .map(|v| !v.is_null())
-                    .unwrap_or(false);
-
-                TurnSummary {
-                    turn: turn_num,
-                    user_input_preview: truncate_str(&content, 200),
-                    tool_calls,
-                    tokens_in: token_usage.input_tokens,
-                    cached_input_tokens: token_usage.cached_input_tokens,
-                    cache_creation_tokens: token_usage.cache_creation_tokens,
-                    tokens_out: token_usage.output_tokens,
-                    total_tokens: token_usage.total_tokens,
-                    duration_ms: meta_json
-                        .get("duration_ms")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    has_error,
-                    has_stall,
-                    model,
-                    created_at,
-                }
+                let fallback_turn = turn_list_fallback_turn(offset, i)?;
+                turn_summary_from_row(row, fallback_turn)
             })
-            .collect();
+            .collect::<AuditResult<Vec<_>>>()?;
 
         Ok(TurnListResponse {
             turns,
-            total: total as u32,
+            total,
             page,
             per_page,
         })
@@ -1096,7 +1935,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let offset = turn.saturating_sub(1);
         let row = query(
             "SELECT event_id, content, CAST(token_usage AS CHAR) AS token_usage, \
-             llm_model_used, CAST(metadata AS CHAR) AS metadata, CAST(created_at AS CHAR) AS created_at \
+             llm_model_used, COALESCE(CAST(metadata AS CHAR), '{}') AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
              ORDER BY created_at ASC \
@@ -1110,33 +1949,13 @@ impl SessionAuditService for DatabaseSessionAuditService {
         .map_err(internal_error)?;
 
         let row = row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Turn not found"))?;
-
-        let event_id: String = row.try_get("event_id").unwrap_or_default();
-        let content: String = row.try_get("content").unwrap_or_default();
-        let meta_str: String = row.try_get("metadata").unwrap_or_default();
-        let meta: serde_json::Value =
-            serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
-        let token_str: String = row.try_get("token_usage").unwrap_or_default();
-        let token_usage = parse_turn_token_usage(&token_str);
-        let model: Option<String> = row.try_get("llm_model_used").ok();
-        let created_at: String = row.try_get("created_at").unwrap_or_default();
-
-        let tool_calls = extract_tool_calls_from_metadata(&meta);
-
-        let visible_tools: Vec<String> = meta
-            .get("visible_tools")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let tools_used: Vec<String> = meta
-            .get("tools_used")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+        let parent = turn_detail_parent_from_row(&row)?;
 
         // Child events may carry huge tool I/O; cap content at the SQL layer.
         let child_sql = format!(
             "SELECT event_id, event_type, \
              SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
-             CAST(metadata AS CHAR) AS metadata, CAST(created_at AS CHAR) AS created_at \
+             COALESCE(CAST(metadata AS CHAR), '{{}}') AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND parent_event_id = ? \
              ORDER BY created_at ASC",
@@ -1145,64 +1964,17 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let child_rows = query(&child_sql)
             .bind(session_id)
             .bind(user_id)
-            .bind(&event_id)
+            .bind(&parent.event_id)
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
 
         let child_events: Vec<ChildEvent> = child_rows
             .iter()
-            .map(|r| {
-                let meta_raw: String = r.try_get("metadata").unwrap_or_default();
-                ChildEvent {
-                    event_id: r.try_get("event_id").unwrap_or_default(),
-                    event_type: r.try_get("event_type").unwrap_or_default(),
-                    content: r.try_get("content").unwrap_or_default(),
-                    metadata: serde_json::from_str(&meta_raw).unwrap_or(serde_json::Value::Null),
-                    created_at: r.try_get("created_at").unwrap_or_default(),
-                }
-            })
-            .collect();
+            .map(child_event_from_row)
+            .collect::<AuditResult<Vec<_>>>()?;
 
-        let assistant_output = meta
-            .get("assistant_output")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        Ok(TurnDetail {
-            turn,
-            user_input: content,
-            assistant_output,
-            tool_calls,
-            tokens_in: token_usage.input_tokens,
-            cached_input_tokens: token_usage.cached_input_tokens,
-            cache_creation_tokens: token_usage.cache_creation_tokens,
-            tokens_out: token_usage.output_tokens,
-            total_tokens: token_usage.total_tokens,
-            duration_ms: meta
-                .get("duration_ms")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            ttft_ms: meta.get("ttft_ms").and_then(|v| v.as_u64()),
-            context_ms: meta.get("context_ms").and_then(|v| v.as_u64()),
-            budget_pressure: meta.get("budget_pressure").and_then(|v| v.as_f64()),
-            visible_tools,
-            tools_used,
-            model,
-            has_error: meta.get("error").map(|v| !v.is_null()).unwrap_or(false),
-            error_message: meta.get("error").and_then(|v| v.as_str()).map(String::from),
-            stall_type: meta
-                .get("stall_type")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            plan_subtask_id: meta
-                .get("plan_subtask_id")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            created_at,
-            child_events,
-        })
+        turn_detail_from_parent(turn, parent, child_events)
     }
 
     async fn list_context_traces(
@@ -1289,11 +2061,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .map_err(internal_error)?;
         let mut latest_errors = std::collections::HashMap::<String, String>::new();
         for row in error_rows {
-            let tool_name = normalize_tool_name(row.try_get("tool_name").unwrap_or_default());
+            let (tool_name, content) = tool_latest_error_from_row(&row)?;
             if latest_errors.contains_key(&tool_name) {
                 continue;
             }
-            let content: String = row.try_get("content").unwrap_or_default();
             if !content.is_empty() {
                 latest_errors.insert(tool_name, content);
             }
@@ -1301,37 +2072,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         let result: Vec<ToolAnalytics> = rows
             .iter()
-            .filter_map(|row| {
-                let name = normalize_tool_name(row.try_get("tool_name").unwrap_or_default());
-                let total_calls = row.try_get::<i64, _>("total_calls").unwrap_or(0) as u32;
-                if total_calls == 0 {
-                    return None;
-                }
-                let total_success = row.try_get::<i64, _>("total_success").unwrap_or(0) as u32;
-                let total_failures = row.try_get::<i64, _>("total_failures").unwrap_or(0) as u32;
-                let total_duration_ms =
-                    row.try_get::<i64, _>("total_duration_ms").unwrap_or(0) as u64;
-                let last_error = latest_errors.get(&name).cloned();
-
-                Some(ToolAnalytics {
-                    name,
-                    call_count: total_calls,
-                    success_count: total_success,
-                    fail_count: total_failures,
-                    success_rate: total_success as f64 / total_calls as f64,
-                    avg_duration_ms: row
-                        .try_get::<f64, _>("avg_ms")
-                        .or_else(|_| row.try_get::<i64, _>("avg_ms").map(|v| v as f64))
-                        .unwrap_or(0.0),
-                    max_duration_ms: row
-                        .try_get::<i64, _>("max_ms")
-                        .or_else(|_| row.try_get::<f64, _>("max_ms").map(|v| v as i64))
-                        .unwrap_or(0) as u64,
-                    total_duration_ms,
-                    last_error,
-                })
-            })
-            .collect();
+            .map(|row| tool_analytics_from_row(row, &latest_errors))
+            .collect::<AuditResult<Vec<_>>>()?;
 
         Ok(result)
     }
@@ -1344,7 +2086,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let list_err_sql = format!(
             "SELECT event_id, event_type, \
              SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
-             CAST(metadata AS CHAR) AS metadata, CAST(created_at AS CHAR) AS created_at \
+             COALESCE(CAST(metadata AS CHAR), '{{}}') AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? \
                AND event_type IN ('turn_error', 'stall_detected', 'error', 'turn_guard_verdict', 'tool_error') \
@@ -1361,24 +2103,11 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         let errors: Vec<AuditErrorEntry> = rows
             .iter()
-            .map(|row| {
-                let meta_str: String = row.try_get("metadata").unwrap_or_default();
-                let meta: serde_json::Value =
-                    serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
-                let turn = meta.get("turn").and_then(|v| v.as_u64()).map(|v| v as u32);
+            .map(audit_error_entry_from_row)
+            .collect::<AuditResult<Vec<_>>>()?;
 
-                AuditErrorEntry {
-                    event_id: row.try_get("event_id").unwrap_or_default(),
-                    event_type: row.try_get("event_type").unwrap_or_default(),
-                    turn,
-                    content: row.try_get("content").unwrap_or_default(),
-                    metadata: meta,
-                    created_at: row.try_get("created_at").unwrap_or_default(),
-                }
-            })
-            .collect();
-
-        let total = errors.len() as u32;
+        let total = u32::try_from(errors.len())
+            .map_err(|_| internal_error("session audit list_errors total exceeds u32::MAX"))?;
         Ok(ErrorListResponse { errors, total })
     }
 
@@ -1396,19 +2125,20 @@ impl SessionAuditService for DatabaseSessionAuditService {
              CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE user_id = ? AND session_id = ? AND event_type = ? \
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC LIMIT ?",
         )
         .bind(user_id)
         .bind(session_id)
         .bind(RUNTIME_PROMOTION_EVENT_TYPE)
+        .bind(MAX_SESSION_RUNTIME_PROMOTION_ROWS)
         .fetch_all(&pool)
         .await
         .map_err(internal_error)?;
 
         let promotions = rows
             .iter()
-            .filter_map(runtime_promotion_record_from_row)
-            .collect::<Vec<_>>();
+            .map(runtime_promotion_record_from_row)
+            .collect::<AuditResult<Vec<_>>>()?;
         Ok(SessionRuntimePromotionListResponse {
             total: promotions.len() as u32,
             promotions,
@@ -1471,7 +2201,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             _ => "s.created_at",
         };
         let order_dir = if params.order == "asc" { "ASC" } else { "DESC" };
-        let offset = (page.saturating_sub(1)) * per_page;
+        let offset = audit_pagination_offset(page, per_page, "list_sessions")?;
 
         // Single query: JOIN + GROUP BY to get stats, model, and counts in one pass.
         // The CTE computes per-session aggregates; outer query handles pagination.
@@ -1479,13 +2209,15 @@ impl SessionAuditService for DatabaseSessionAuditService {
             "SELECT \
                s.session_id, s.status, s.created_at, s.ended_at, \
                COALESCE(MAX(e.turn_seq), 0) AS turn_count, \
-               COALESCE(SUM(e.token_input), 0) AS tokens_in, \
-               COALESCE(SUM(e.token_output), 0) AS tokens_out, \
+               COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
+                 THEN COALESCE(e.token_input, 0) ELSE 0 END), 0) AS tokens_in, \
+               COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
+                 THEN COALESCE(e.token_output, 0) ELSE 0 END), 0) AS tokens_out, \
                COUNT(CASE WHEN e.event_type IN ('tool_call', 'tool_error') THEN 1 END) AS tool_calls, \
                COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_error') THEN 1 END) AS error_count, \
                MIN(e.created_at) AS first_ts, \
                MAX(e.created_at) AS last_ts, \
-               MAX(CASE WHEN e.llm_model_used IS NOT NULL THEN e.llm_model_used END) AS model, \
+               MAX(CASE WHEN e.llm_model_used IS NOT NULL AND e.llm_model_used != '' THEN e.llm_model_used END) AS model, \
                TIMESTAMPDIFF(SECOND, s.created_at, COALESCE(s.ended_at, NOW())) AS duration_secs \
              FROM agent_sessions s \
              LEFT JOIN agent_events e ON e.session_id = s.session_id AND e.user_id = s.user_id \
@@ -1508,25 +2240,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         let sessions: Vec<AuditSessionListItem> = rows
             .iter()
-            .map(|row| {
-                let first_ts: Option<String> = row.try_get("first_ts").ok();
-                let last_ts: Option<String> = row.try_get("last_ts").ok();
-                let duration = compute_duration_secs(first_ts.as_deref(), last_ts.as_deref());
-                AuditSessionListItem {
-                    session_id: row.try_get("session_id").unwrap_or_default(),
-                    status: row.try_get("status").unwrap_or_default(),
-                    turn_count: row.try_get::<i64, _>("turn_count").unwrap_or(0) as u32,
-                    tokens_in: row.try_get::<i64, _>("tokens_in").unwrap_or(0) as u64,
-                    tokens_out: row.try_get::<i64, _>("tokens_out").unwrap_or(0) as u64,
-                    tool_calls_total: row.try_get::<i64, _>("tool_calls").unwrap_or(0) as u32,
-                    error_count: row.try_get::<i64, _>("error_count").unwrap_or(0) as u32,
-                    model: row.try_get::<String, _>("model").ok(),
-                    duration_secs: duration,
-                    created_at: row.try_get("created_at").unwrap_or_default(),
-                    ended_at: row.try_get("ended_at").ok(),
-                }
-            })
-            .collect();
+            .map(audit_session_list_item_from_row)
+            .collect::<AuditResult<Vec<_>>>()?;
 
         // Count total matching (same WHERE + HAVING, no LIMIT)
         let count_sql = format!(
@@ -1550,9 +2265,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let total = cq
             .fetch_one(&pool)
             .await
-            .map_err(internal_error)?
-            .try_get::<i64, _>("cnt")
-            .unwrap_or(0) as u32;
+            .map_err(internal_error)
+            .and_then(|row| audit_count_from_row(&row, "audit_session_list_count"))?;
 
         Ok(AuditSessionListResponse {
             sessions,
@@ -1588,8 +2302,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
             "SELECT \
                COUNT(DISTINCT e.session_id) as session_count, \
                COUNT(CASE WHEN event_type = 'user_query' THEN 1 END) as total_turns, \
-               COALESCE(SUM(token_input), 0) as tokens_in, \
-               COALESCE(SUM(token_output), 0) as tokens_out, \
+               COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+                 THEN COALESCE(token_input, 0) ELSE 0 END), 0) as tokens_in, \
+               COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) as tokens_out, \
                 COUNT(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 END) as total_tool_calls, \
                 COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) as total_tool_failures, \
                 COUNT(CASE WHEN event_type IN ('turn_error', 'error') THEN 1 END) as total_errors, \
@@ -1608,34 +2324,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             aq = aq.bind(v);
         }
         let agg = aq.fetch_one(&pool).await.map_err(internal_error)?;
-
-        let session_count = agg.try_get::<i64, _>("session_count").unwrap_or(0) as u32;
-
-        let total_turns = agg.try_get::<i64, _>("total_turns").unwrap_or(0) as u32;
-        let tokens_in = agg.try_get::<i64, _>("tokens_in").unwrap_or(0) as u64;
-        let tokens_out = agg.try_get::<i64, _>("tokens_out").unwrap_or(0) as u64;
-        let total_tool_calls = agg.try_get::<i64, _>("total_tool_calls").unwrap_or(0) as u32;
-        let total_tool_failures = agg.try_get::<i64, _>("total_tool_failures").unwrap_or(0) as u32;
-        let total_errors = agg.try_get::<i64, _>("total_errors").unwrap_or(0) as u32;
-        let total_stalls = agg.try_get::<i64, _>("total_stalls").unwrap_or(0) as u32;
-        let total_execution_boundaries_opened = agg
-            .try_get::<i64, _>("total_execution_boundaries_opened")
-            .unwrap_or(0) as u32;
-        let total_execution_boundaries_committed = agg
-            .try_get::<i64, _>("total_execution_boundaries_committed")
-            .unwrap_or(0) as u32;
-        let total_execution_boundaries_aborted = agg
-            .try_get::<i64, _>("total_execution_boundaries_aborted")
-            .unwrap_or(0) as u32;
-        let total_approval_required = agg
-            .try_get::<i64, _>("total_approval_required")
-            .unwrap_or(0) as u32;
-        let total_approval_decisions = agg
-            .try_get::<i64, _>("total_approval_decisions")
-            .unwrap_or(0) as u32;
-        let total_approval_timeouts = agg
-            .try_get::<i64, _>("total_approval_timeouts")
-            .unwrap_or(0) as u32;
+        let counters = cross_session_stats_counters_from_row(&agg)?;
 
         // Top tools (by usage count)
         let tools_sql = format!(
@@ -1656,17 +2345,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let tool_rows = tq.fetch_all(&pool).await.map_err(internal_error)?;
         let top_tools: Vec<ToolUsageBrief> = tool_rows
             .iter()
-            .map(|r| {
-                let name = normalize_tool_name(r.try_get("tool_name").unwrap_or_default());
-                let cnt = r.try_get::<i64, _>("cnt").unwrap_or(0) as u32;
-                let ok = r.try_get::<i64, _>("ok_cnt").unwrap_or(0) as u32;
-                ToolUsageBrief {
-                    name,
-                    call_count: cnt,
-                    success_rate: if cnt > 0 { ok as f64 / cnt as f64 } else { 0.0 },
-                }
-            })
-            .collect();
+            .map(tool_usage_brief_from_row)
+            .collect::<AuditResult<Vec<_>>>()?;
 
         // Top models (by session count + tokens)
         let models_sql = format!(
@@ -1675,7 +2355,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                COUNT(DISTINCT session_id) as sess_cnt, \
                COALESCE(SUM(token_total), 0) as total_tokens \
              FROM agent_events e \
-             WHERE {where_clause} AND llm_model_used IS NOT NULL \
+             WHERE {where_clause} AND llm_model_used IS NOT NULL AND llm_model_used != '' \
              GROUP BY model \
              ORDER BY sess_cnt DESC \
              LIMIT 5"
@@ -1687,12 +2367,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let model_rows = mq.fetch_all(&pool).await.map_err(internal_error)?;
         let top_models: Vec<ModelUsageBrief> = model_rows
             .iter()
-            .map(|r| ModelUsageBrief {
-                model: r.try_get("model").unwrap_or_default(),
-                session_count: r.try_get::<i64, _>("sess_cnt").unwrap_or(0) as u32,
-                total_tokens: r.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-            })
-            .collect();
+            .map(model_usage_brief_from_row)
+            .collect::<AuditResult<Vec<_>>>()?;
 
         let runtime_promotion_stats = aggregate_runtime_promotion_stats(
             &self
@@ -1705,26 +2381,26 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 .await?,
         );
 
-        let sc = session_count.max(1) as f64;
+        let sc = counters.session_count.max(1) as f64;
         Ok(CrossSessionStats {
-            session_count,
-            total_turns,
-            total_tokens_in: tokens_in,
-            total_tokens_out: tokens_out,
-            total_tool_calls,
-            total_tool_failures,
-            total_errors,
-            total_stalls,
-            total_execution_boundaries_opened,
-            total_execution_boundaries_committed,
-            total_execution_boundaries_aborted,
-            total_approval_required,
-            total_approval_decisions,
-            total_approval_timeouts,
-            avg_turns_per_session: total_turns as f64 / sc,
-            avg_tokens_per_session: (tokens_in + tokens_out) as f64 / sc,
-            tool_error_rate: if total_tool_calls > 0 {
-                total_tool_failures as f64 / total_tool_calls as f64
+            session_count: counters.session_count,
+            total_turns: counters.total_turns,
+            total_tokens_in: counters.tokens_in,
+            total_tokens_out: counters.tokens_out,
+            total_tool_calls: counters.total_tool_calls,
+            total_tool_failures: counters.total_tool_failures,
+            total_errors: counters.total_errors,
+            total_stalls: counters.total_stalls,
+            total_execution_boundaries_opened: counters.total_execution_boundaries_opened,
+            total_execution_boundaries_committed: counters.total_execution_boundaries_committed,
+            total_execution_boundaries_aborted: counters.total_execution_boundaries_aborted,
+            total_approval_required: counters.total_approval_required,
+            total_approval_decisions: counters.total_approval_decisions,
+            total_approval_timeouts: counters.total_approval_timeouts,
+            avg_turns_per_session: counters.total_turns as f64 / sc,
+            avg_tokens_per_session: (counters.tokens_in + counters.tokens_out) as f64 / sc,
+            tool_error_rate: if counters.total_tool_calls > 0 {
+                counters.total_tool_failures as f64 / counters.total_tool_calls as f64
             } else {
                 0.0
             },
@@ -1809,11 +2485,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let error_rows = eq.fetch_all(&pool).await.map_err(internal_error)?;
         let mut latest_errors = std::collections::HashMap::<String, String>::new();
         for row in error_rows {
-            let tool_name = normalize_tool_name(row.try_get("tool_name").unwrap_or_default());
+            let (tool_name, content) = tool_latest_error_from_row(&row)?;
             if latest_errors.contains_key(&tool_name) {
                 continue;
             }
-            let content: String = row.try_get("content").unwrap_or_default();
             if !content.is_empty() {
                 latest_errors.insert(tool_name, content);
             }
@@ -1821,36 +2496,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         let result: Vec<CrossSessionToolAnalytics> = rows
             .iter()
-            .map(|row| {
-                let name = normalize_tool_name(row.try_get("tool_name").unwrap_or_default());
-                let total_calls = row.try_get::<i64, _>("total_calls").unwrap_or(0) as u32;
-                let total_success = row.try_get::<i64, _>("total_success").unwrap_or(0) as u32;
-                let total_failures = row.try_get::<i64, _>("total_failures").unwrap_or(0) as u32;
-                let last_error = latest_errors.get(&name).cloned();
-
-                CrossSessionToolAnalytics {
-                    name,
-                    total_calls,
-                    total_success,
-                    total_failures,
-                    success_rate: if total_calls > 0 {
-                        total_success as f64 / total_calls as f64
-                    } else {
-                        0.0
-                    },
-                    avg_duration_ms: row
-                        .try_get::<f64, _>("avg_ms")
-                        .or_else(|_| row.try_get::<i64, _>("avg_ms").map(|v| v as f64))
-                        .unwrap_or(0.0),
-                    max_duration_ms: row
-                        .try_get::<i64, _>("max_ms")
-                        .or_else(|_| row.try_get::<f64, _>("max_ms").map(|v| v as i64))
-                        .unwrap_or(0) as u64,
-                    sessions_used_in: row.try_get::<i64, _>("sessions_used").unwrap_or(0) as u32,
-                    last_error,
-                }
-            })
-            .collect();
+            .map(|row| cross_session_tool_analytics_from_row(row, &latest_errors))
+            .collect::<AuditResult<Vec<_>>>()?;
 
         Ok(result)
     }
@@ -2097,11 +2744,874 @@ fn aggregate_runtime_promotion_stats(
 mod tests {
     use super::*;
 
+    const VALID_RUNTIME_PROMOTION_METADATA: &str = r#"{
+        "controller": "adaptive_baseline",
+        "outcome": "queued",
+        "recommendation": "canary",
+        "subject_id": "model-a",
+        "summary": "quality is improving",
+        "turn": 7,
+        "confidence_score": 0.91,
+        "support_score": 0.82,
+        "safety_score": 0.77,
+        "overall_score": 0.84,
+        "blockers": ["needs canary"],
+        "evidence": ["window passed"],
+        "rollback_hint": "hold if errors rise",
+        "run_id": "run-1"
+    }"#;
+
+    #[derive(Clone)]
+    struct FakeRuntimePromotionRow {
+        failed_column: Option<&'static str>,
+        metadata: &'static str,
+    }
+
+    #[derive(Clone)]
+    struct FakeSessionAuditRow {
+        failed_column: Option<&'static str>,
+        negative_column: Option<&'static str>,
+        zero_column: Option<&'static str>,
+        mismatched_tool_counts: bool,
+        metadata: &'static str,
+        token_usage: Option<&'static str>,
+        model: Option<&'static str>,
+        pricing_json: Option<&'static str>,
+    }
+
+    impl FakeRuntimePromotionRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                metadata: VALID_RUNTIME_PROMOTION_METADATA,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_metadata(metadata: &'static str) -> Self {
+            Self {
+                metadata,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl FakeSessionAuditRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                negative_column: None,
+                zero_column: None,
+                mismatched_tool_counts: false,
+                metadata: r#"{"turn": 42, "duration_ms": 321}"#,
+                token_usage: Some(
+                    r#"{"input_tokens": 10, "cached_input_tokens": 2, "cache_creation_tokens": 0, "output_tokens": 5, "total_tokens": 17}"#,
+                ),
+                model: Some("gpt-5"),
+                pricing_json: Some(r#"{"prompt": 2.0, "completion": 8.0, "cache_read": 0.5}"#),
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn negative_on(column: &'static str) -> Self {
+            Self {
+                negative_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn zero_on(column: &'static str) -> Self {
+            Self {
+                zero_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_mismatched_tool_counts() -> Self {
+            Self {
+                mismatched_tool_counts: true,
+                ..Self::complete()
+            }
+        }
+
+        fn with_model(model: &'static str) -> Self {
+            Self {
+                model: Some(model),
+                ..Self::complete()
+            }
+        }
+
+        fn with_metadata(metadata: &'static str) -> Self {
+            Self {
+                metadata,
+                ..Self::complete()
+            }
+        }
+
+        fn with_token_usage(token_usage: &'static str) -> Self {
+            Self {
+                token_usage: Some(token_usage),
+                ..Self::complete()
+            }
+        }
+
+        fn with_pricing_json(pricing_json: Option<&'static str>) -> Self {
+            Self {
+                pricing_json,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl RuntimePromotionAuditRow for FakeRuntimePromotionRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "event_id" => "event-1",
+                "session_id" => "session-1",
+                "metadata" => self.metadata,
+                "created_at" => "2026-06-26 12:00:00",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+    }
+
+    impl SessionAuditRow for FakeSessionAuditRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "event_id" => "event-1",
+                "event_type" => "tool_call",
+                "session_id" => "session-1",
+                "tool_name" => "bash",
+                "model" => self.model.unwrap_or("gpt-5"),
+                "model_name" => self.model.unwrap_or("gpt-5"),
+                "llm_model_used" => self.model.unwrap_or("gpt-5"),
+                "token_usage" => self
+                    .token_usage
+                    .ok_or_else(|| sqlx::Error::ColumnNotFound(column.to_string()))?,
+                "status" => "active",
+                "content" => "hello from audit turn",
+                "metadata" => self.metadata,
+                "created_at" => "2026-06-26 12:00:00",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "ended_at" => None,
+                "first_at" => Some("2026-06-26 12:00:00".to_string()),
+                "last_at" => Some("2026-06-26 12:00:07".to_string()),
+                "first_ts" => Some("2026-06-26 12:00:00".to_string()),
+                "last_ts" => Some("2026-06-26 12:00:07".to_string()),
+                "models_concat" => Some(format!("gpt-5{SESSION_AUDIT_MODEL_SEP}glm-5.2")),
+                "model" => self.model.map(str::to_string),
+                "token_usage" => self.token_usage.map(str::to_string),
+                "llm_model_used" => self.model.map(str::to_string),
+                "pricing_json" => self.pricing_json.map(str::to_string),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if self.negative_column == Some(column) {
+                return Ok(-1);
+            }
+            if self.zero_column == Some(column) {
+                return Ok(0);
+            }
+            Ok(match column {
+                "turn_count" => 9,
+                "error_count" => 1,
+                "stall_count" => 2,
+                "checkpoint_count" => 3,
+                "compact_count" => 4,
+                "execution_boundary_opened_count" => 5,
+                "execution_boundary_committed_count" => 6,
+                "execution_boundary_aborted_count" => 7,
+                "approval_required_count" => 8,
+                "approval_decision_count" => 9,
+                "approval_timeout_count" => 10,
+                "tool_calls_total" => 11,
+                "tool_calls_failed" => 12,
+                "tool_calls" => 4,
+                "tokens_in" => 13,
+                "tokens_out" => 14,
+                "session_count" => 2,
+                "total_turns" => 9,
+                "total_tool_calls" => 4,
+                "total_tool_failures" => 1,
+                "total_errors" => 1,
+                "total_stalls" => 2,
+                "total_execution_boundaries_opened" => 3,
+                "total_execution_boundaries_committed" => 2,
+                "total_execution_boundaries_aborted" => 1,
+                "total_approval_required" => 5,
+                "total_approval_decisions" => 4,
+                "total_approval_timeouts" => 1,
+                "cnt" => 15,
+                "ok_cnt" => {
+                    if self.mismatched_tool_counts {
+                        16
+                    } else {
+                        12
+                    }
+                }
+                "total_calls" => {
+                    if self.mismatched_tool_counts {
+                        5
+                    } else {
+                        4
+                    }
+                }
+                "total_success" => 3,
+                "total_failures" => 1,
+                "sess_cnt" => 2,
+                "total_tokens" => 100,
+                "max_ms" => 40,
+                "total_duration_ms" => 100,
+                "sessions_used" => 2,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn f64_column(&self, column: &str) -> Result<f64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if self.negative_column == Some(column) {
+                return Ok(-1.0);
+            }
+            if self.zero_column == Some(column) {
+                return Ok(0.0);
+            }
+            Ok(match column {
+                "avg_ms" => 25.0,
+                "max_ms" => 40.0,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+    }
+
+    fn assert_audit_internal_error_mentions(
+        result: AuditResult<impl std::fmt::Debug>,
+        needle: &str,
+    ) {
+        let (status, Json(body)) = result.expect_err("decode should fail");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.detail.contains(needle),
+            "audit decode error should identify `{needle}`: {:?}",
+            body.detail
+        );
+    }
+
+    #[test]
+    fn session_audit_summary_header_decode_preserves_values_and_fails_loudly() {
+        let header = session_audit_session_header_from_row(&FakeSessionAuditRow::complete())
+            .expect("session header decodes");
+        assert_eq!(header.status, "active");
+        assert_eq!(header.created_at, "2026-06-26 12:00:00");
+        assert!(header.ended_at.is_none());
+
+        for column in ["status", "created_at", "ended_at"] {
+            assert_audit_internal_error_mentions(
+                session_audit_session_header_from_row(&FakeSessionAuditRow::fail_on(column)),
+                column,
+            );
+        }
+    }
+
+    #[test]
+    fn session_audit_summary_metrics_decode_preserves_values_and_fails_loudly() {
+        let metrics = session_audit_metrics_from_row(&FakeSessionAuditRow::complete())
+            .expect("summary metrics decode");
+        assert_eq!(metrics.turn_count, 9);
+        assert_eq!(metrics.error_count, 1);
+        assert_eq!(metrics.stall_count, 2);
+        assert_eq!(metrics.checkpoint_count, 3);
+        assert_eq!(metrics.compact_count, 4);
+        assert_eq!(metrics.execution_boundary_opened_count, 5);
+        assert_eq!(metrics.execution_boundary_committed_count, 6);
+        assert_eq!(metrics.execution_boundary_aborted_count, 7);
+        assert_eq!(metrics.approval_required_count, 8);
+        assert_eq!(metrics.approval_decision_count, 9);
+        assert_eq!(metrics.approval_timeout_count, 10);
+        assert_eq!(metrics.tool_calls_total, 11);
+        assert_eq!(metrics.tool_calls_failed, 12);
+        assert_eq!(metrics.tokens_in, 13);
+        assert_eq!(metrics.tokens_out, 14);
+        assert_eq!(
+            metrics.models_used,
+            vec!["gpt-5".to_string(), "glm-5.2".to_string()]
+        );
+
+        for column in ["turn_count", "tokens_in", "models_concat"] {
+            assert_audit_internal_error_mentions(
+                session_audit_metrics_from_row(&FakeSessionAuditRow::fail_on(column)),
+                column,
+            );
+        }
+
+        for column in ["turn_count", "tokens_in"] {
+            assert_audit_internal_error_mentions(
+                session_audit_metrics_from_row(&FakeSessionAuditRow::negative_on(column)),
+                "expected non-negative",
+            );
+        }
+    }
+
+    #[test]
+    fn session_audit_turn_list_count_decode_fails_loudly() {
+        assert_eq!(
+            audit_row_u32(&FakeSessionAuditRow::complete(), "turn_list_count", "cnt")
+                .expect("turn list count decodes"),
+            15
+        );
+
+        assert_audit_internal_error_mentions(
+            audit_row_u32(
+                &FakeSessionAuditRow::negative_on("cnt"),
+                "turn_list_count",
+                "cnt",
+            ),
+            "expected non-negative",
+        );
+        assert_audit_internal_error_mentions(
+            audit_row_u32(
+                &FakeSessionAuditRow::fail_on("cnt"),
+                "turn_list_count",
+                "cnt",
+            ),
+            "cnt",
+        );
+    }
+
+    #[test]
+    fn turn_list_total_query_uses_turn_seq_high_watermark_not_count() {
+        assert!(TURN_LIST_TOTAL_SQL.contains("MAX(turn_seq)"));
+        assert!(!TURN_LIST_TOTAL_SQL.contains("COUNT"));
+        assert!(!TURN_LIST_TOTAL_SQL.contains("event_type = 'user_query'"));
+    }
+
+    #[test]
+    fn audit_token_aggregates_use_core_token_events() {
+        let source = include_str!("session_audit.rs");
+        let impl_body = source
+            .split("impl SessionAuditService for DatabaseSessionAuditService")
+            .nth(1)
+            .expect("database audit service impl");
+        let cost_body = source
+            .split("async fn load_session_turn_cost_samples")
+            .nth(1)
+            .and_then(|rest| rest.split("fn turn_summary_from_row").next())
+            .expect("turn cost sample body");
+        let summary_body = impl_body
+            .split("async fn get_summary")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn list_turns").next())
+            .expect("session summary body");
+        let list_body = impl_body
+            .split("async fn list_sessions")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn get_cross_session_stats").next())
+            .expect("session list body");
+        let stats_body = impl_body
+            .split("async fn get_cross_session_stats")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn get_cross_session_tools").next())
+            .expect("cross-session stats body");
+        assert!(
+            summary_body.contains(
+                "event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL"
+            ),
+            "audit session detail should include llm_response token_usage rows"
+        );
+        assert!(
+            cost_body.contains("event_type IN ('user_query', 'llm_response')"),
+            "audit turn cost samples should include llm_response token_usage rows"
+        );
+        assert!(
+            list_body.contains(
+                "e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL"
+            ),
+            "audit session list should aggregate only core token events"
+        );
+        assert!(
+            stats_body.contains(
+                "event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL"
+            ),
+            "cross-session stats should aggregate only core token events"
+        );
+    }
+
+    #[test]
+    fn session_audit_turn_list_pagination_offset_checks_overflow() {
+        assert_eq!(turn_list_offset(0, 0).expect("minimum pagination"), 0);
+        assert_eq!(turn_list_offset(3, 25).expect("normal pagination"), 50);
+
+        assert_audit_internal_error_mentions(
+            turn_list_offset(u32::MAX, 100),
+            "pagination offset overflow",
+        );
+    }
+
+    #[test]
+    fn session_audit_turn_list_row_decode_preserves_values_and_fails_loudly() {
+        let turn =
+            turn_summary_from_row(&FakeSessionAuditRow::complete(), 7).expect("turn row decodes");
+        assert_eq!(turn.turn, 42);
+        assert_eq!(turn.user_input_preview, "hello from audit turn");
+        assert_eq!(turn.tokens_in, 10);
+        assert_eq!(turn.cached_input_tokens, 2);
+        assert_eq!(turn.tokens_out, 5);
+        assert_eq!(turn.total_tokens, 17);
+        assert_eq!(turn.duration_ms, 321);
+        assert_eq!(turn.model.as_deref(), Some("gpt-5"));
+        assert_eq!(turn.created_at, "2026-06-26 12:00:00");
+
+        let fallback_turn = turn_summary_from_row(
+            &FakeSessionAuditRow::with_metadata(r#"{"duration_ms": 11}"#),
+            7,
+        )
+        .expect("turn row without metadata turn uses fallback");
+        assert_eq!(fallback_turn.turn, 7);
+        assert_eq!(fallback_turn.duration_ms, 11);
+
+        assert_audit_internal_error_mentions(
+            turn_summary_from_row(&FakeSessionAuditRow::fail_on("content"), 7),
+            "content",
+        );
+        assert_audit_internal_error_mentions(
+            turn_summary_from_row(&FakeSessionAuditRow::with_metadata("{not-json"), 7),
+            "invalid metadata JSON",
+        );
+        assert_audit_internal_error_mentions(
+            turn_summary_from_row(&FakeSessionAuditRow::with_metadata(r#"{"turn": -1}"#), 7),
+            "expected non-negative integer",
+        );
+        assert_audit_internal_error_mentions(
+            turn_summary_from_row(
+                &FakeSessionAuditRow::with_metadata(r#"{"duration_ms": -1}"#),
+                7,
+            ),
+            "expected non-negative integer",
+        );
+    }
+
+    #[test]
+    fn session_audit_turn_detail_decode_preserves_values_and_fails_loudly() {
+        let parent_metadata = r#"{
+            "assistant_output": "done",
+            "duration_ms": 123,
+            "ttft_ms": 11,
+            "context_ms": 22,
+            "budget_pressure": 0.75,
+            "visible_tools": ["bash", "rg"],
+            "tools_used": ["bash"],
+            "error": "boom",
+            "stall_type": "tool_wait",
+            "plan_subtask_id": "sub-1",
+            "tool_calls": [
+                {"name": "bash", "ok": false, "ms": 10, "error": "boom"}
+            ]
+        }"#;
+        let child = child_event_from_row(&FakeSessionAuditRow::with_metadata(r#"{"ok": true}"#))
+            .expect("child event decodes");
+        assert_eq!(child.event_id, "event-1");
+        assert_eq!(child.event_type, "tool_call");
+        assert_eq!(child.metadata["ok"], true);
+
+        let parent =
+            turn_detail_parent_from_row(&FakeSessionAuditRow::with_metadata(parent_metadata))
+                .expect("turn detail parent decodes");
+        assert_eq!(parent.event_id, "event-1");
+
+        let detail = turn_detail_from_parent(4, parent, vec![child]).expect("detail decodes");
+        assert_eq!(detail.turn, 4);
+        assert_eq!(detail.user_input, "hello from audit turn");
+        assert_eq!(detail.assistant_output, "done");
+        assert_eq!(detail.tokens_in, 10);
+        assert_eq!(detail.cached_input_tokens, 2);
+        assert_eq!(detail.tokens_out, 5);
+        assert_eq!(detail.total_tokens, 17);
+        assert_eq!(detail.duration_ms, 123);
+        assert_eq!(detail.ttft_ms, Some(11));
+        assert_eq!(detail.context_ms, Some(22));
+        assert_eq!(detail.budget_pressure, Some(0.75));
+        assert_eq!(
+            detail.visible_tools,
+            vec!["bash".to_string(), "rg".to_string()]
+        );
+        assert_eq!(detail.tools_used, vec!["bash".to_string()]);
+        assert_eq!(detail.model.as_deref(), Some("gpt-5"));
+        assert!(detail.has_error);
+        assert_eq!(detail.error_message.as_deref(), Some("boom"));
+        assert_eq!(detail.stall_type.as_deref(), Some("tool_wait"));
+        assert_eq!(detail.plan_subtask_id.as_deref(), Some("sub-1"));
+        assert_eq!(detail.child_events.len(), 1);
+
+        assert_audit_internal_error_mentions(
+            turn_detail_parent_from_row(&FakeSessionAuditRow::fail_on("event_id")),
+            "event_id",
+        );
+        assert_audit_internal_error_mentions(
+            turn_detail_parent_from_row(&FakeSessionAuditRow::with_metadata("{not-json")),
+            "invalid metadata JSON",
+        );
+        assert_audit_internal_error_mentions(
+            child_event_from_row(&FakeSessionAuditRow::fail_on("event_type")),
+            "event_type",
+        );
+        assert_audit_internal_error_mentions(
+            child_event_from_row(&FakeSessionAuditRow::with_metadata("{not-json")),
+            "invalid metadata JSON",
+        );
+    }
+
+    #[test]
+    fn session_audit_turn_detail_metadata_fields_fail_loudly() {
+        let invalid_cases = [
+            (r#"{"visible_tools": "bash"}"#, "visible_tools"),
+            (r#"{"tools_used": [1]}"#, "tools_used"),
+            (r#"{"duration_ms": -1}"#, "duration_ms"),
+            (r#"{"ttft_ms": "fast"}"#, "ttft_ms"),
+            (r#"{"context_ms": -1}"#, "context_ms"),
+            (r#"{"budget_pressure": "high"}"#, "budget_pressure"),
+            (r#"{"assistant_output": 1}"#, "assistant_output"),
+            (r#"{"error": {"message": "boom"}}"#, "error"),
+            (r#"{"stall_type": 1}"#, "stall_type"),
+            (r#"{"plan_subtask_id": 1}"#, "plan_subtask_id"),
+        ];
+
+        for (metadata, expected) in invalid_cases {
+            let parent = turn_detail_parent_from_row(&FakeSessionAuditRow::with_metadata(metadata))
+                .expect("invalid detail metadata still decodes as parent row");
+            assert_audit_internal_error_mentions(
+                turn_detail_from_parent(1, parent, Vec::new()),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn session_audit_error_list_row_decode_preserves_values_and_fails_loudly() {
+        let entry = audit_error_entry_from_row(&FakeSessionAuditRow::with_metadata(
+            r#"{"turn": 42, "error": "boom"}"#,
+        ))
+        .expect("error list row decodes");
+
+        assert_eq!(entry.event_id, "event-1");
+        assert_eq!(entry.event_type, "tool_call");
+        assert_eq!(entry.turn, Some(42));
+        assert_eq!(entry.content, "hello from audit turn");
+        assert_eq!(entry.metadata["error"], "boom");
+        assert_eq!(entry.created_at, "2026-06-26 12:00:00");
+
+        let no_turn =
+            audit_error_entry_from_row(&FakeSessionAuditRow::with_metadata(r#"{"error": "boom"}"#))
+                .expect("error list row without turn decodes");
+        assert_eq!(no_turn.turn, None);
+
+        assert_audit_internal_error_mentions(
+            audit_error_entry_from_row(&FakeSessionAuditRow::fail_on("event_id")),
+            "event_id",
+        );
+        assert_audit_internal_error_mentions(
+            audit_error_entry_from_row(&FakeSessionAuditRow::with_metadata("{not-json")),
+            "invalid metadata JSON",
+        );
+        assert_audit_internal_error_mentions(
+            audit_error_entry_from_row(&FakeSessionAuditRow::with_metadata(r#"{"turn": -1}"#)),
+            "expected non-negative integer",
+        );
+        assert_audit_internal_error_mentions(
+            audit_error_entry_from_row(&FakeSessionAuditRow::with_metadata(
+                r#"{"turn": 4294967296}"#,
+            )),
+            "expected u32-compatible",
+        );
+    }
+
+    #[test]
+    fn session_audit_tool_latest_error_row_decode_fails_loudly() {
+        let (tool_name, content) = tool_latest_error_from_row(&FakeSessionAuditRow::complete())
+            .expect("latest tool error row decodes");
+        assert_eq!(tool_name, "bash");
+        assert_eq!(content, "hello from audit turn");
+
+        assert_audit_internal_error_mentions(
+            tool_latest_error_from_row(&FakeSessionAuditRow::fail_on("tool_name")),
+            "tool_name",
+        );
+        assert_audit_internal_error_mentions(
+            tool_latest_error_from_row(&FakeSessionAuditRow::fail_on("content")),
+            "content",
+        );
+    }
+
+    #[test]
+    fn session_audit_tool_analytics_row_decode_preserves_values_and_fails_loudly() {
+        let mut latest_errors = HashMap::new();
+        latest_errors.insert("bash".to_string(), "permission denied".to_string());
+
+        let analytics = tool_analytics_from_row(&FakeSessionAuditRow::complete(), &latest_errors)
+            .expect("tool analytics row decodes");
+        assert_eq!(analytics.name, "bash");
+        assert_eq!(analytics.call_count, 4);
+        assert_eq!(analytics.success_count, 3);
+        assert_eq!(analytics.fail_count, 1);
+        assert_eq!(analytics.success_rate, 0.75);
+        assert_eq!(analytics.avg_duration_ms, 25.0);
+        assert_eq!(analytics.max_duration_ms, 40);
+        assert_eq!(analytics.total_duration_ms, 100);
+        assert_eq!(analytics.last_error.as_deref(), Some("permission denied"));
+
+        assert_audit_internal_error_mentions(
+            tool_analytics_from_row(&FakeSessionAuditRow::fail_on("tool_name"), &latest_errors),
+            "tool_name",
+        );
+        assert_audit_internal_error_mentions(
+            tool_analytics_from_row(
+                &FakeSessionAuditRow::negative_on("total_calls"),
+                &latest_errors,
+            ),
+            "expected non-negative",
+        );
+        assert_audit_internal_error_mentions(
+            tool_analytics_from_row(&FakeSessionAuditRow::zero_on("total_calls"), &latest_errors),
+            "expected positive call count",
+        );
+        assert_audit_internal_error_mentions(
+            tool_analytics_from_row(
+                &FakeSessionAuditRow::with_mismatched_tool_counts(),
+                &latest_errors,
+            ),
+            "call count mismatch",
+        );
+        assert_audit_internal_error_mentions(
+            tool_analytics_from_row(&FakeSessionAuditRow::negative_on("avg_ms"), &latest_errors),
+            "expected non-negative finite value",
+        );
+        assert_audit_internal_error_mentions(
+            tool_analytics_from_row(
+                &FakeSessionAuditRow::negative_on("total_duration_ms"),
+                &latest_errors,
+            ),
+            "expected non-negative",
+        );
+    }
+
+    #[test]
+    fn cross_session_tool_analytics_row_decode_preserves_values_and_fails_loudly() {
+        let mut latest_errors = HashMap::new();
+        latest_errors.insert("bash".to_string(), "timeout".to_string());
+
+        let analytics =
+            cross_session_tool_analytics_from_row(&FakeSessionAuditRow::complete(), &latest_errors)
+                .expect("cross-session tool analytics row decodes");
+        assert_eq!(analytics.name, "bash");
+        assert_eq!(analytics.total_calls, 4);
+        assert_eq!(analytics.total_success, 3);
+        assert_eq!(analytics.total_failures, 1);
+        assert_eq!(analytics.success_rate, 0.75);
+        assert_eq!(analytics.avg_duration_ms, 25.0);
+        assert_eq!(analytics.max_duration_ms, 40);
+        assert_eq!(analytics.sessions_used_in, 2);
+        assert_eq!(analytics.last_error.as_deref(), Some("timeout"));
+
+        assert_audit_internal_error_mentions(
+            cross_session_tool_analytics_from_row(
+                &FakeSessionAuditRow::fail_on("tool_name"),
+                &latest_errors,
+            ),
+            "tool_name",
+        );
+        assert_audit_internal_error_mentions(
+            cross_session_tool_analytics_from_row(
+                &FakeSessionAuditRow::zero_on("total_calls"),
+                &latest_errors,
+            ),
+            "expected positive call count",
+        );
+        assert_audit_internal_error_mentions(
+            cross_session_tool_analytics_from_row(
+                &FakeSessionAuditRow::with_mismatched_tool_counts(),
+                &latest_errors,
+            ),
+            "call count mismatch",
+        );
+        assert_audit_internal_error_mentions(
+            cross_session_tool_analytics_from_row(
+                &FakeSessionAuditRow::zero_on("sessions_used"),
+                &latest_errors,
+            ),
+            "expected positive session count",
+        );
+        assert_audit_internal_error_mentions(
+            cross_session_tool_analytics_from_row(
+                &FakeSessionAuditRow::negative_on("max_ms"),
+                &latest_errors,
+            ),
+            "expected non-negative",
+        );
+    }
+
+    #[test]
+    fn cross_session_stats_aggregate_row_decode_preserves_values_and_fails_loudly() {
+        let counters = cross_session_stats_counters_from_row(&FakeSessionAuditRow::complete())
+            .expect("cross-session stats aggregate decodes");
+        assert_eq!(counters.session_count, 2);
+        assert_eq!(counters.total_turns, 9);
+        assert_eq!(counters.tokens_in, 13);
+        assert_eq!(counters.tokens_out, 14);
+        assert_eq!(counters.total_tool_calls, 4);
+        assert_eq!(counters.total_tool_failures, 1);
+        assert_eq!(counters.total_errors, 1);
+        assert_eq!(counters.total_stalls, 2);
+        assert_eq!(counters.total_execution_boundaries_opened, 3);
+        assert_eq!(counters.total_execution_boundaries_committed, 2);
+        assert_eq!(counters.total_execution_boundaries_aborted, 1);
+        assert_eq!(counters.total_approval_required, 5);
+        assert_eq!(counters.total_approval_decisions, 4);
+        assert_eq!(counters.total_approval_timeouts, 1);
+
+        assert_audit_internal_error_mentions(
+            cross_session_stats_counters_from_row(&FakeSessionAuditRow::fail_on("session_count")),
+            "session_count",
+        );
+        assert_audit_internal_error_mentions(
+            cross_session_stats_counters_from_row(&FakeSessionAuditRow::negative_on("tokens_in")),
+            "expected non-negative",
+        );
+    }
+
+    #[test]
+    fn cross_session_top_tool_row_decode_preserves_values_and_fails_loudly() {
+        let tool = tool_usage_brief_from_row(&FakeSessionAuditRow::complete())
+            .expect("top tool row decodes");
+        assert_eq!(tool.name, "bash");
+        assert_eq!(tool.call_count, 15);
+        assert!((tool.success_rate - 0.8).abs() < 1e-9);
+
+        assert_audit_internal_error_mentions(
+            tool_usage_brief_from_row(&FakeSessionAuditRow::fail_on("tool_name")),
+            "tool_name",
+        );
+        assert_audit_internal_error_mentions(
+            tool_usage_brief_from_row(&FakeSessionAuditRow::zero_on("cnt")),
+            "expected positive call count",
+        );
+        assert_audit_internal_error_mentions(
+            tool_usage_brief_from_row(&FakeSessionAuditRow::with_mismatched_tool_counts()),
+            "success count exceeds total",
+        );
+    }
+
+    #[test]
+    fn cross_session_top_model_row_decode_preserves_values_and_fails_loudly() {
+        let model = model_usage_brief_from_row(&FakeSessionAuditRow::complete())
+            .expect("top model row decodes");
+        assert_eq!(model.model, "gpt-5");
+        assert_eq!(model.session_count, 2);
+        assert_eq!(model.total_tokens, 100);
+
+        assert_audit_internal_error_mentions(
+            model_usage_brief_from_row(&FakeSessionAuditRow::fail_on("model")),
+            "model",
+        );
+        assert_audit_internal_error_mentions(
+            model_usage_brief_from_row(&FakeSessionAuditRow::with_model("")),
+            "expected non-empty model",
+        );
+        assert_audit_internal_error_mentions(
+            model_usage_brief_from_row(&FakeSessionAuditRow::zero_on("sess_cnt")),
+            "expected positive session count",
+        );
+        assert_audit_internal_error_mentions(
+            model_usage_brief_from_row(&FakeSessionAuditRow::negative_on("total_tokens")),
+            "expected non-negative",
+        );
+    }
+
     #[test]
     fn cross_session_input_row_caps_are_positive() {
         const _: () = {
+            assert!(MAX_SESSION_RUNTIME_PROMOTION_ROWS > 0);
             assert!(MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS > 0);
         };
+    }
+
+    #[test]
+    fn runtime_promotion_row_decode_preserves_values_and_fails_loudly() {
+        let record = runtime_promotion_record_from_row(&FakeRuntimePromotionRow::complete())
+            .expect("runtime promotion row decodes");
+        assert_eq!(record.event_id, "event-1");
+        assert_eq!(record.session_id, "session-1");
+        assert_eq!(record.created_at, "2026-06-26 12:00:00");
+        assert_eq!(
+            record.controller,
+            RuntimePromotionController::AdaptiveBaseline
+        );
+        assert_eq!(record.outcome, RuntimePromotionOutcome::Queued);
+        assert_eq!(
+            record.recommendation,
+            RuntimePromotionRecommendation::Canary
+        );
+        assert_eq!(record.subject_id, "model-a");
+        assert_eq!(record.summary, "quality is improving");
+        assert_eq!(record.turn, Some(7));
+        assert_eq!(record.blockers, vec!["needs canary".to_string()]);
+        assert_eq!(record.evidence, vec!["window passed".to_string()]);
+        assert_eq!(record.rollback_hint.as_deref(), Some("hold if errors rise"));
+        assert_eq!(record.run_id.as_deref(), Some("run-1"));
+
+        for column in ["event_id", "session_id", "metadata", "created_at"] {
+            assert_audit_internal_error_mentions(
+                runtime_promotion_record_from_row(&FakeRuntimePromotionRow::fail_on(column)),
+                column,
+            );
+        }
+
+        assert_audit_internal_error_mentions(
+            runtime_promotion_record_from_row(&FakeRuntimePromotionRow::with_metadata("{not-json")),
+            "metadata JSON decode failed",
+        );
+        assert_audit_internal_error_mentions(
+            runtime_promotion_record_from_row(&FakeRuntimePromotionRow::with_metadata("{}")),
+            "metadata JSON decode failed",
+        );
     }
 
     #[test]
@@ -2159,9 +3669,16 @@ mod tests {
                 "cached_input_tokens": 25,
                 "cache_creation_tokens": 5,
                 "output_tokens": 40,
-                "total_tokens": 170
+                "total_tokens": 170,
+                "prompt": 130,
+                "completion": 40,
+                "cache_read": 25,
+                "cache_write": 5,
+                "total": 170
             }"#,
-        );
+            "test_token_usage",
+        )
+        .unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.cached_input_tokens, 25);
         assert_eq!(usage.cache_creation_tokens, 5);
@@ -2170,30 +3687,136 @@ mod tests {
     }
 
     #[test]
-    fn parse_turn_token_usage_supports_legacy_shape() {
-        let usage = parse_turn_token_usage(r#"{"input": 100, "output": 40, "total": 140}"#);
-        assert_eq!(usage.input_tokens, 100);
-        assert_eq!(usage.cached_input_tokens, 0);
-        assert_eq!(usage.cache_creation_tokens, 0);
-        assert_eq!(usage.output_tokens, 40);
-        assert_eq!(usage.total_tokens, 140);
-    }
-
-    #[test]
-    fn parse_turn_token_usage_invalid_json_falls_back_to_zeroes() {
-        let usage = parse_turn_token_usage("{not json");
-        assert_eq!(usage, ParsedTurnTokenUsage::default());
-    }
-
-    #[test]
-    fn parse_turn_token_usage_clamps_negative_values_to_zero() {
-        let usage = parse_turn_token_usage(
-            r#"{"input_tokens": -100, "cached_input_tokens": -5, "output_tokens": 50}"#,
+    fn parse_turn_token_usage_rejects_missing_canonical_fields() {
+        assert_audit_internal_error_mentions(
+            parse_turn_token_usage(
+                r#"{"cached_input_tokens": 0, "cache_creation_tokens": 0, "output_tokens": 40, "total_tokens": 140}"#,
+                "test_token_usage",
+            ),
+            "input_tokens",
         );
-        assert_eq!(usage.input_tokens, 0);
-        assert_eq!(usage.cached_input_tokens, 0);
-        assert_eq!(usage.output_tokens, 50);
-        assert_eq!(usage.total_tokens, 50);
+    }
+
+    #[test]
+    fn parse_turn_token_usage_invalid_json_fails_loudly() {
+        assert_audit_internal_error_mentions(
+            parse_turn_token_usage("{not json", "test_token_usage"),
+            "token_usage",
+        );
+    }
+
+    #[test]
+    fn parse_turn_token_usage_rejects_negative_and_mismatched_totals() {
+        assert_audit_internal_error_mentions(
+            parse_turn_token_usage(
+                r#"{"input_tokens": -100, "cached_input_tokens": 0, "cache_creation_tokens": 0, "output_tokens": 50, "total_tokens": 50}"#,
+                "test_token_usage",
+            ),
+            "input_tokens",
+        );
+        assert_audit_internal_error_mentions(
+            parse_turn_token_usage(
+                r#"{"input_tokens": 100, "cached_input_tokens": 5, "cache_creation_tokens": 0, "output_tokens": 50, "total_tokens": 150}"#,
+                "test_token_usage",
+            ),
+            "total_tokens",
+        );
+    }
+
+    #[test]
+    fn active_model_pricing_row_decode_preserves_values_and_fails_loudly() {
+        let wanted = HashSet::from(["gpt-5"]);
+        let decoded = active_model_pricing_from_row(&FakeSessionAuditRow::complete(), &wanted)
+            .expect("pricing row decodes")
+            .expect("wanted model is retained");
+        assert_eq!(decoded.0, "gpt-5");
+        assert_eq!(decoded.1.prompt, 2.0);
+        assert_eq!(decoded.1.completion, 8.0);
+        assert_eq!(decoded.1.cache_read, Some(0.5));
+        assert_eq!(decoded.1.cache_write, None);
+
+        let not_wanted = HashSet::from(["glm-5.2"]);
+        assert!(
+            active_model_pricing_from_row(&FakeSessionAuditRow::complete(), &not_wanted)
+                .expect("unwanted pricing row still decodes its routing key")
+                .is_none()
+        );
+
+        assert_audit_internal_error_mentions(
+            active_model_pricing_from_row(&FakeSessionAuditRow::fail_on("model_name"), &wanted),
+            "model_name",
+        );
+        assert_audit_internal_error_mentions(
+            active_model_pricing_from_row(&FakeSessionAuditRow::fail_on("pricing_json"), &wanted),
+            "pricing_json",
+        );
+        assert_audit_internal_error_mentions(
+            active_model_pricing_from_row(
+                &FakeSessionAuditRow::with_pricing_json(Some("{not-json")),
+                &wanted,
+            ),
+            "pricing_json",
+        );
+        assert_audit_internal_error_mentions(
+            active_model_pricing_from_row(&FakeSessionAuditRow::with_pricing_json(None), &wanted),
+            "expected pricing JSON",
+        );
+        assert_audit_internal_error_mentions(
+            active_model_pricing_from_row(
+                &FakeSessionAuditRow::with_pricing_json(Some(r#"{"completion": 8.0}"#)),
+                &wanted,
+            ),
+            "pricing_json.prompt",
+        );
+        assert_audit_internal_error_mentions(
+            active_model_pricing_from_row(
+                &FakeSessionAuditRow::with_pricing_json(Some(
+                    r#"{"prompt": 2.0, "completion": -1.0}"#,
+                )),
+                &wanted,
+            ),
+            "non-negative",
+        );
+    }
+
+    #[test]
+    fn session_turn_cost_sample_row_decode_preserves_values_and_fails_loudly() {
+        let sample = session_turn_cost_sample_from_row(&FakeSessionAuditRow::complete())
+            .expect("cost sample row decodes");
+        assert_eq!(sample.turn_id, "event-1");
+        assert_eq!(sample.agent_id, "root");
+        assert_eq!(sample.model, "gpt-5");
+        assert_eq!(sample.usage.input_tokens, 10);
+        assert_eq!(sample.usage.cached_input_tokens, 2);
+        assert_eq!(sample.usage.output_tokens, 5);
+        assert_eq!(sample.usage.total_tokens, 17);
+
+        assert_audit_internal_error_mentions(
+            session_turn_cost_sample_from_row(&FakeSessionAuditRow::fail_on("event_id")),
+            "event_id",
+        );
+        assert_audit_internal_error_mentions(
+            session_turn_cost_sample_from_row(&FakeSessionAuditRow::fail_on("llm_model_used")),
+            "llm_model_used",
+        );
+        assert_audit_internal_error_mentions(
+            session_turn_cost_sample_from_row(&FakeSessionAuditRow::with_model("")),
+            "expected non-empty model",
+        );
+        assert_audit_internal_error_mentions(
+            session_turn_cost_sample_from_row(&FakeSessionAuditRow::fail_on("token_usage")),
+            "token_usage",
+        );
+        assert_audit_internal_error_mentions(
+            session_turn_cost_sample_from_row(&FakeSessionAuditRow::with_token_usage("{not-json")),
+            "token_usage",
+        );
+        assert_audit_internal_error_mentions(
+            session_turn_cost_sample_from_row(&FakeSessionAuditRow::with_token_usage(
+                r#"{"input_tokens": -1}"#,
+            )),
+            "non-negative token count",
+        );
     }
 
     #[test]
@@ -2383,6 +4006,79 @@ mod tests {
         assert_eq!(p.min_turns, Some(5));
         assert_eq!(p.sort, "turns");
         assert_eq!(p.order, "asc");
+    }
+
+    #[test]
+    fn audit_session_list_pagination_offset_checks_overflow() {
+        assert_eq!(
+            audit_pagination_offset(0, 0, "list_sessions").expect("minimum pagination"),
+            0
+        );
+        assert_eq!(
+            audit_pagination_offset(4, 20, "list_sessions").expect("normal pagination"),
+            60
+        );
+        assert_audit_internal_error_mentions(
+            audit_pagination_offset(u32::MAX, 100, "list_sessions"),
+            "pagination offset overflow",
+        );
+    }
+
+    #[test]
+    fn audit_session_list_row_decode_preserves_values_and_fails_loudly() {
+        let item = audit_session_list_item_from_row(&FakeSessionAuditRow::complete())
+            .expect("session list row decodes");
+        assert_eq!(item.session_id, "session-1");
+        assert_eq!(item.status, "active");
+        assert_eq!(item.turn_count, 9);
+        assert_eq!(item.tokens_in, 13);
+        assert_eq!(item.tokens_out, 14);
+        assert_eq!(item.tool_calls_total, 4);
+        assert_eq!(item.error_count, 1);
+        assert_eq!(item.model.as_deref(), Some("gpt-5"));
+        assert_eq!(item.duration_secs, 7.0);
+        assert_eq!(item.created_at, "2026-06-26 12:00:00");
+        assert!(item.ended_at.is_none());
+
+        let empty_model = audit_session_list_item_from_row(&FakeSessionAuditRow::with_model(""))
+            .expect("empty model is treated as absent");
+        assert!(empty_model.model.is_none());
+
+        assert_audit_internal_error_mentions(
+            audit_session_list_item_from_row(&FakeSessionAuditRow::fail_on("session_id")),
+            "session_id",
+        );
+        assert_audit_internal_error_mentions(
+            audit_session_list_item_from_row(&FakeSessionAuditRow::negative_on("tokens_in")),
+            "expected non-negative",
+        );
+        assert_audit_internal_error_mentions(
+            audit_session_list_item_from_row(&FakeSessionAuditRow::fail_on("first_ts")),
+            "first_ts",
+        );
+    }
+
+    #[test]
+    fn audit_session_list_count_decode_fails_loudly() {
+        assert_eq!(
+            audit_count_from_row(&FakeSessionAuditRow::complete(), "audit_session_list_count")
+                .expect("count decodes"),
+            15
+        );
+        assert_audit_internal_error_mentions(
+            audit_count_from_row(
+                &FakeSessionAuditRow::negative_on("cnt"),
+                "audit_session_list_count",
+            ),
+            "expected non-negative",
+        );
+        assert_audit_internal_error_mentions(
+            audit_count_from_row(
+                &FakeSessionAuditRow::fail_on("cnt"),
+                "audit_session_list_count",
+            ),
+            "cnt",
+        );
     }
 
     #[test]

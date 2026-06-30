@@ -9,6 +9,7 @@ pub use enabled::ServerSnapshotSink;
 #[cfg(feature = "harness")]
 mod enabled {
     use astra_harness::{DecisionRecord, RuntimeSnapshot, SnapshotSink};
+    use serde::Serialize;
     use std::collections::VecDeque;
     use std::sync::RwLock;
     use tokio::sync::broadcast;
@@ -46,7 +47,8 @@ mod enabled {
         /// causes the worker to exit; holding the handle lets callers
         /// `await` it if needed.
         _db_worker: Option<tokio::task::JoinHandle<()>>,
-        /// Count of snapshots dropped due to DB channel backpressure.
+        /// Count of snapshots dropped before DB write due to serialization
+        /// failure or queue backpressure.
         dropped_writes: std::sync::atomic::AtomicU64,
     }
 
@@ -81,7 +83,7 @@ mod enabled {
             self
         }
 
-        /// Number of snapshot writes dropped due to DB channel backpressure.
+        /// Number of snapshot writes dropped before DB persistence.
         pub fn dropped_write_count(&self) -> u64 {
             self.dropped_writes
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -129,13 +131,27 @@ mod enabled {
                 .ok()
                 .map(|g| g.clone())
                 .unwrap_or_default();
+            let snapshot_json = match serialize_snapshot_json(&record.snapshot) {
+                Ok(json) => json,
+                Err(e) => {
+                    self.dropped_writes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        error = %e,
+                        dropped_total = self.dropped_writes.load(std::sync::atomic::Ordering::Relaxed),
+                        "harness snapshot serialization failed, DB write dropped"
+                    );
+                    return;
+                }
+            };
             let task = DbWriteTask {
                 snapshot_id: uuid::Uuid::now_v7().to_string(),
                 session_id: self.session_id.clone(),
                 user_id,
                 hook_point: format!("{:?}", record.point),
                 turn_number: record.snapshot.turn_number,
-                snapshot_json: serde_json::to_string(&record.snapshot).unwrap_or_default(),
+                snapshot_json,
                 causal_chain_id: record.snapshot.causal_chain_id.clone(),
             };
             if let Err(e) = tx.try_send(task) {
@@ -148,6 +164,11 @@ mod enabled {
                 );
             }
         }
+    }
+
+    fn serialize_snapshot_json<T: Serialize>(snapshot: &T) -> Result<String, String> {
+        serde_json::to_string(snapshot)
+            .map_err(|source| format!("serialize harness snapshot: {source}"))
     }
 
     async fn db_write_worker(
@@ -205,6 +226,20 @@ mod enabled {
     mod tests {
         use super::*;
         use astra_harness::{HookPoint, RuntimeSnapshot};
+        use serde::Serializer;
+
+        struct FailingSerialize;
+
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                Err(serde::ser::Error::custom(
+                    "forced snapshot serializer failure",
+                ))
+            }
+        }
 
         fn make_record(turn: u32) -> DecisionRecord {
             DecisionRecord {
@@ -221,6 +256,30 @@ mod enabled {
                     ..RuntimeSnapshot::empty()
                 },
             }
+        }
+
+        #[test]
+        fn snapshot_json_serialization_fails_loudly() {
+            let err = serialize_snapshot_json(&FailingSerialize)
+                .expect_err("snapshot serialization errors must be surfaced");
+
+            assert!(
+                err.contains("serialize harness snapshot")
+                    && err.contains("forced snapshot serializer failure"),
+                "snapshot serialization error should retain context: {err}"
+            );
+        }
+
+        #[test]
+        fn snapshot_json_serialization_round_trips_runtime_snapshot() {
+            let record = make_record(7);
+            let json = serialize_snapshot_json(&record.snapshot).expect("serialize snapshot");
+
+            assert!(!json.is_empty(), "snapshot_json must not default to empty");
+            let restored =
+                serde_json::from_str::<RuntimeSnapshot>(&json).expect("snapshot should round trip");
+            assert_eq!(restored.session_id, "srv-test");
+            assert_eq!(restored.turn_number, 7);
         }
 
         #[test]

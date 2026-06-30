@@ -8,12 +8,13 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use crate::db_row::RowExt as SessionArtifactDbRow;
 use astra_core::{MatrixOneSettings, SharedPool};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{Row, mysql::MySqlRow, query};
+use sqlx::query;
 use uuid::Uuid;
 
 /// Structured error type for [`SessionArtifactJsonStore`] operations. Replaces
@@ -41,6 +42,15 @@ pub enum SessionArtifactStoreError {
     #[error("serialize artifact content: {0}")]
     Serialize(#[from] serde_json::Error),
 
+    /// JSON persisted in a database column is malformed.
+    #[error("decode artifact {artifact_id} column {column} as JSON: {source}")]
+    JsonDecode {
+        artifact_id: String,
+        column: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// `sqlx` returned an error from the underlying database.
     #[error("database: {0}")]
     Database(#[from] sqlx::Error),
@@ -57,6 +67,15 @@ pub enum SessionArtifactStoreError {
     /// A write attempted to attach an artifact to a session the user does not own.
     #[error("session {session_id} is not owned by user {user_id}")]
     SessionNotOwned { session_id: String, user_id: String },
+
+    /// A persisted numeric value cannot be represented by the public contract.
+    #[error("invalid artifact {artifact_id} column {column}: value={value}, reason={reason}")]
+    InvalidDatabaseValue {
+        artifact_id: String,
+        column: &'static str,
+        value: String,
+        reason: &'static str,
+    },
 }
 
 pub const LOCAL_SESSION_LAYOUT_VERSION: &str = "v1";
@@ -289,58 +308,109 @@ fn encode_counter(
     }
 }
 
+fn artifact_row_string(
+    row: &impl SessionArtifactDbRow,
+    column: &'static str,
+) -> Result<String, SessionArtifactStoreError> {
+    row.string_column(column)
+        .map_err(SessionArtifactStoreError::Database)
+}
+
+fn artifact_row_optional_string(
+    row: &impl SessionArtifactDbRow,
+    column: &'static str,
+) -> Result<Option<String>, SessionArtifactStoreError> {
+    row.optional_string_column(column)
+        .map_err(SessionArtifactStoreError::Database)
+}
+
+fn artifact_row_optional_u32(
+    row: &impl SessionArtifactDbRow,
+    artifact_id: &str,
+    column: &'static str,
+) -> Result<Option<u32>, SessionArtifactStoreError> {
+    let value = row
+        .optional_i32_column(column)
+        .map_err(SessionArtifactStoreError::Database)?;
+    value
+        .map(|value| {
+            u32::try_from(value).map_err(|_| SessionArtifactStoreError::InvalidDatabaseValue {
+                artifact_id: artifact_id.to_string(),
+                column,
+                value: value.to_string(),
+                reason: "expected non-negative i32",
+            })
+        })
+        .transpose()
+}
+
+fn artifact_row_u32(
+    row: &impl SessionArtifactDbRow,
+    artifact_id: &str,
+    column: &'static str,
+) -> Result<u32, SessionArtifactStoreError> {
+    let value = row
+        .i64_column(column)
+        .map_err(SessionArtifactStoreError::Database)?;
+    u32::try_from(value).map_err(|_| SessionArtifactStoreError::InvalidDatabaseValue {
+        artifact_id: artifact_id.to_string(),
+        column,
+        value: value.to_string(),
+        reason: "expected u32 range",
+    })
+}
+
+fn artifact_row_json(
+    raw: &str,
+    artifact_id: &str,
+    column: &'static str,
+) -> Result<Value, SessionArtifactStoreError> {
+    serde_json::from_str(raw).map_err(|source| SessionArtifactStoreError::JsonDecode {
+        artifact_id: artifact_id.to_string(),
+        column,
+        source,
+    })
+}
+
 fn stored_artifact_from_row(
-    row: &MySqlRow,
+    row: &impl SessionArtifactDbRow,
 ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
-    let artifact_id: String = row.try_get("artifact_id")?;
-    let content_raw: String = row.try_get("content_json")?;
-    let content: Value = serde_json::from_str(&content_raw)?;
-    let metadata = match row.try_get::<Option<String>, _>("metadata_json")? {
-        None => None,
-        Some(raw) => match serde_json::from_str::<Value>(&raw) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_services::session_artifact_store",
-                    %artifact_id,
-                    error = %error,
-                    "failed to parse metadata_json; dropping to keep read path resilient"
-                );
-                None
-            }
-        },
-    };
+    let artifact_id = artifact_row_string(row, "artifact_id")?;
+    let content_raw = artifact_row_string(row, "content_json")?;
+    let content = artifact_row_json(&content_raw, &artifact_id, "content_json")?;
+    let metadata = artifact_row_optional_string(row, "metadata_json")?
+        .map(|raw| artifact_row_json(&raw, &artifact_id, "metadata_json"))
+        .transpose()?;
 
     Ok(StoredSessionArtifact {
-        artifact_id,
-        session_id: row.try_get("session_id")?,
-        user_id: row.try_get("user_id")?,
-        artifact_kind: row.try_get("artifact_kind")?,
-        source: row.try_get("source")?,
-        turn: row
-            .try_get::<Option<i32>, _>("turn")?
-            .and_then(|value| u32::try_from(value).ok()),
-        round: row
-            .try_get::<Option<i32>, _>("round")?
-            .and_then(|value| u32::try_from(value).ok()),
+        session_id: artifact_row_string(row, "session_id")?,
+        user_id: artifact_row_string(row, "user_id")?,
+        artifact_kind: artifact_row_string(row, "artifact_kind")?,
+        source: artifact_row_optional_string(row, "source")?,
+        turn: artifact_row_optional_u32(row, &artifact_id, "turn")?,
+        round: artifact_row_optional_u32(row, &artifact_id, "round")?,
         content,
         metadata,
-        retention_policy: row.try_get("retention_policy").ok(),
-        retention_until: row.try_get("retention_until").ok(),
-        status: row.try_get("status").ok(),
-        referenced_by_manifest_count: row
-            .try_get::<i64, _>("referenced_by_manifest_count")
-            .unwrap_or(0)
-            .max(0) as u32,
-        referenced_by_state_items_count: row
-            .try_get::<i64, _>("referenced_by_state_items_count")
-            .unwrap_or(0)
-            .max(0) as u32,
-        referenced_by_citation_count: row
-            .try_get::<i64, _>("referenced_by_citation_count")
-            .unwrap_or(0)
-            .max(0) as u32,
-        created_at: row.try_get("created_at")?,
+        artifact_id: artifact_id.clone(),
+        retention_policy: artifact_row_optional_string(row, "retention_policy")?,
+        retention_until: artifact_row_optional_string(row, "retention_until")?,
+        status: artifact_row_optional_string(row, "status")?,
+        referenced_by_manifest_count: artifact_row_u32(
+            row,
+            &artifact_id,
+            "referenced_by_manifest_count",
+        )?,
+        referenced_by_state_items_count: artifact_row_u32(
+            row,
+            &artifact_id,
+            "referenced_by_state_items_count",
+        )?,
+        referenced_by_citation_count: artifact_row_u32(
+            row,
+            &artifact_id,
+            "referenced_by_citation_count",
+        )?,
+        created_at: artifact_row_optional_string(row, "created_at")?,
     })
 }
 
@@ -419,11 +489,11 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                     referenced_by_manifest_count, referenced_by_state_items_count, \
                     referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
              FROM session_artifacts \
-             WHERE artifact_id = ? AND session_id = ? AND user_id = ?",
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
         )
-        .bind(&record.artifact_id)
-        .bind(&record.session_id)
         .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
         .fetch_one(&pool)
         .await?;
 
@@ -450,11 +520,11 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                     referenced_by_manifest_count, referenced_by_state_items_count, \
                     referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
              FROM session_artifacts \
-             WHERE artifact_id = ? AND session_id = ? AND user_id = ?",
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
         )
-        .bind(artifact_id)
-        .bind(session_id)
         .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
         .fetch_optional(&pool)
         .await?;
 
@@ -619,6 +689,168 @@ mod tests {
     use super::*;
     use crate::session_journal::JournalDirGuard;
 
+    #[derive(Clone)]
+    struct FakeArtifactRow {
+        failed_column: Option<&'static str>,
+        content_json: String,
+        metadata_json: Option<String>,
+        optional_i32_overrides: Vec<(&'static str, Option<i32>)>,
+        i64_overrides: Vec<(&'static str, i64)>,
+    }
+
+    impl FakeArtifactRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                content_json: serde_json::json!({"ok": true}).to_string(),
+                metadata_json: Some(serde_json::json!({"model": "gpt-5.4"}).to_string()),
+                optional_i32_overrides: Vec::new(),
+                i64_overrides: Vec::new(),
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_content_json(content_json: impl Into<String>) -> Self {
+            Self {
+                content_json: content_json.into(),
+                ..Self::complete()
+            }
+        }
+
+        fn with_metadata_json(metadata_json: Option<String>) -> Self {
+            Self {
+                metadata_json,
+                ..Self::complete()
+            }
+        }
+
+        fn with_optional_i32(column: &'static str, value: Option<i32>) -> Self {
+            Self {
+                optional_i32_overrides: vec![(column, value)],
+                ..Self::complete()
+            }
+        }
+
+        fn with_i64(column: &'static str, value: i64) -> Self {
+            Self {
+                i64_overrides: vec![(column, value)],
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl SessionArtifactDbRow for FakeArtifactRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "artifact_id" => "artifact-1".to_string(),
+                "session_id" => "session-1".to_string(),
+                "user_id" => "user-1".to_string(),
+                "artifact_kind" => "llm_capture".to_string(),
+                "content_json" => self.content_json.clone(),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "source" => Some("server_loop_host".to_string()),
+                "metadata_json" => self.metadata_json.clone(),
+                "retention_policy" => Some("default".to_string()),
+                "retention_until" => Some("2026-06-26 12:00:00".to_string()),
+                "status" => Some("active".to_string()),
+                "created_at" => Some("2026-06-26 10:00:00".to_string()),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn optional_i32_column(&self, column: &str) -> Result<Option<i32>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if let Some((_, value)) = self
+                .optional_i32_overrides
+                .iter()
+                .find(|(candidate, _)| *candidate == column)
+            {
+                return Ok(*value);
+            }
+            Ok(match column {
+                "turn" => Some(4),
+                "round" => Some(2),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if let Some((_, value)) = self
+                .i64_overrides
+                .iter()
+                .find(|(candidate, _)| *candidate == column)
+            {
+                return Ok(*value);
+            }
+            Ok(match column {
+                "referenced_by_manifest_count" => 1,
+                "referenced_by_state_items_count" => 2,
+                "referenced_by_citation_count" => 3,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+    }
+
+    fn assert_database_error_mentions(
+        result: Result<impl std::fmt::Debug, SessionArtifactStoreError>,
+        column: &str,
+    ) {
+        let err = result.expect_err("decode should fail");
+        match err {
+            SessionArtifactStoreError::Database(source) => {
+                assert!(
+                    source.to_string().contains(column),
+                    "database error should contain `{column}`, got `{source}`"
+                );
+            }
+            other => panic!("expected database error, got {other:?}"),
+        }
+    }
+
+    fn assert_json_decode_column(
+        result: Result<impl std::fmt::Debug, SessionArtifactStoreError>,
+        column: &'static str,
+    ) {
+        let err = result.expect_err("decode should fail");
+        assert!(
+            matches!(err, SessionArtifactStoreError::JsonDecode { column: actual, .. } if actual == column),
+            "expected JsonDecode for {column}, got {err:?}"
+        );
+    }
+
+    fn assert_invalid_database_column(
+        result: Result<impl std::fmt::Debug, SessionArtifactStoreError>,
+        column: &'static str,
+    ) {
+        let err = result.expect_err("decode should fail");
+        assert!(
+            matches!(err, SessionArtifactStoreError::InvalidDatabaseValue { column: actual, .. } if actual == column),
+            "expected InvalidDatabaseValue for {column}, got {err:?}"
+        );
+    }
+
     #[test]
     fn local_store_resolves_session_paths_under_override_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -679,6 +911,102 @@ mod tests {
         assert_eq!(value["artifact_kind"], "llm_capture");
         assert_eq!(value["source"], "server_loop_host");
         assert_eq!(value["metadata"]["model"], "gpt-5.4");
+    }
+
+    #[test]
+    fn stored_artifact_row_decode_preserves_values_and_fails_loudly() {
+        let artifact =
+            stored_artifact_from_row(&FakeArtifactRow::complete()).expect("artifact row decodes");
+        assert_eq!(artifact.artifact_id, "artifact-1");
+        assert_eq!(artifact.session_id, "session-1");
+        assert_eq!(artifact.user_id, "user-1");
+        assert_eq!(artifact.artifact_kind, "llm_capture");
+        assert_eq!(artifact.source.as_deref(), Some("server_loop_host"));
+        assert_eq!(artifact.turn, Some(4));
+        assert_eq!(artifact.round, Some(2));
+        assert_eq!(artifact.content["ok"], true);
+        assert_eq!(artifact.metadata.as_ref().unwrap()["model"], "gpt-5.4");
+        assert_eq!(artifact.retention_policy.as_deref(), Some("default"));
+        assert_eq!(
+            artifact.retention_until.as_deref(),
+            Some("2026-06-26 12:00:00")
+        );
+        assert_eq!(artifact.status.as_deref(), Some("active"));
+        assert_eq!(artifact.referenced_by_manifest_count, 1);
+        assert_eq!(artifact.referenced_by_state_items_count, 2);
+        assert_eq!(artifact.referenced_by_citation_count, 3);
+        assert_eq!(artifact.created_at.as_deref(), Some("2026-06-26 10:00:00"));
+
+        for column in [
+            "artifact_id",
+            "session_id",
+            "user_id",
+            "artifact_kind",
+            "source",
+            "turn",
+            "round",
+            "content_json",
+            "metadata_json",
+            "retention_policy",
+            "retention_until",
+            "status",
+            "referenced_by_manifest_count",
+            "referenced_by_state_items_count",
+            "referenced_by_citation_count",
+            "created_at",
+        ] {
+            assert_database_error_mentions(
+                stored_artifact_from_row(&FakeArtifactRow::fail_on(column)),
+                column,
+            );
+        }
+    }
+
+    #[test]
+    fn stored_artifact_row_decode_rejects_bad_json_and_invalid_counters() {
+        assert_json_decode_column(
+            stored_artifact_from_row(&FakeArtifactRow::with_content_json("{not-json")),
+            "content_json",
+        );
+        assert_json_decode_column(
+            stored_artifact_from_row(&FakeArtifactRow::with_metadata_json(Some(
+                "{not-json".to_string(),
+            ))),
+            "metadata_json",
+        );
+        let no_metadata = stored_artifact_from_row(&FakeArtifactRow::with_metadata_json(None))
+            .expect("null metadata decodes");
+        assert_eq!(no_metadata.metadata, None);
+
+        assert_invalid_database_column(
+            stored_artifact_from_row(&FakeArtifactRow::with_optional_i32("turn", Some(-1))),
+            "turn",
+        );
+        assert_invalid_database_column(
+            stored_artifact_from_row(&FakeArtifactRow::with_optional_i32("round", Some(-1))),
+            "round",
+        );
+        assert_invalid_database_column(
+            stored_artifact_from_row(&FakeArtifactRow::with_i64(
+                "referenced_by_manifest_count",
+                -1,
+            )),
+            "referenced_by_manifest_count",
+        );
+        assert_invalid_database_column(
+            stored_artifact_from_row(&FakeArtifactRow::with_i64(
+                "referenced_by_state_items_count",
+                i64::from(u32::MAX) + 1,
+            )),
+            "referenced_by_state_items_count",
+        );
+        assert_invalid_database_column(
+            stored_artifact_from_row(&FakeArtifactRow::with_i64(
+                "referenced_by_citation_count",
+                -1,
+            )),
+            "referenced_by_citation_count",
+        );
     }
 
     #[test]

@@ -378,7 +378,9 @@ struct ResolvedTurnLlmConfig {
     request_body_overrides: Option<Map<String, Value>>,
     completions_url_override: Option<String>,
     request_timeout: Option<Duration>,
-    /// Context window from model config. Falls back to hardcoded table when `None`.
+    /// Context window from explicit model config. `None` means the registry row
+    /// did not provide model metadata; callers must choose an explicit fallback
+    /// policy rather than inferring from the model name.
     context_window: Option<u32>,
 }
 
@@ -851,6 +853,7 @@ pub struct ServerAgenticLoopHost {
     model_override: Option<String>,
     llm_token_service: Option<LlmTokenServiceConfig>,
     resolved_model_name: Option<String>,
+    resolved_context_window: Option<u32>,
     /// Cached LLM connection params from the last successful model resolution.
     /// Used by `summary_client()` to construct the compact-summary client
     /// without re-resolving (model resolution requires async DB call).
@@ -1333,6 +1336,7 @@ impl ServerAgenticLoopHostBuilder {
             model_override: self.model_override,
             llm_token_service: self.llm_token_service,
             resolved_model_name: None,
+            resolved_context_window: None,
             resolved_llm_params: None,
             resolved_llm_config: None,
             edge_tools,
@@ -1456,11 +1460,7 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
     ) -> Result<ResolvedTurnLlmConfig, String> {
         // Skill-level model override takes precedence over the host-level one.
-        let effective_model_override = state
-            .skills
-            .model_override
-            .as_deref()
-            .or(self.model_override.as_deref());
+        let effective_model_override = self.effective_model_override_for_state(state);
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
         resolve_llm_model_for_turn(
             &self.matrixone,
@@ -1473,8 +1473,37 @@ impl ServerAgenticLoopHost {
         .await
     }
 
+    fn effective_model_override_for_state<'a>(
+        &'a self,
+        state: &'a AgenticLoopState,
+    ) -> Option<&'a str> {
+        state
+            .skills
+            .model_override
+            .as_deref()
+            .or(self.model_override.as_deref())
+    }
+
+    fn cached_llm_config_matches_state(&self, state: &AgenticLoopState) -> bool {
+        let Some(config) = self.resolved_llm_config.as_ref() else {
+            return false;
+        };
+        match self.effective_model_override_for_state(state) {
+            Some(requested) => config.model_name.eq_ignore_ascii_case(requested),
+            None => true,
+        }
+    }
+
+    fn clear_resolved_llm_config(&mut self) {
+        self.resolved_model_name = None;
+        self.resolved_context_window = None;
+        self.resolved_llm_params = None;
+        self.resolved_llm_config = None;
+    }
+
     fn remember_resolved_llm_config(&mut self, llm_cfg: &ResolvedTurnLlmConfig) {
         self.resolved_model_name = Some(llm_cfg.model_name.clone());
+        self.resolved_context_window = llm_cfg.context_window;
         self.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
             model_name: llm_cfg.model_name.clone(),
             api_key: llm_cfg.api_key.clone(),
@@ -1489,6 +1518,9 @@ impl ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
     ) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+        if self.resolved_llm_config.is_some() && !self.cached_llm_config_matches_state(state) {
+            self.clear_resolved_llm_config();
+        }
         if let Some(config) = self.resolved_llm_config.as_ref() {
             return Some(Box::new(RequestAwareSummaryClient::from_resolved_config(
                 config, 256,
@@ -1584,27 +1616,13 @@ impl ServerAgenticLoopHost {
             .get("session_lineage")
             .and_then(Value::as_object)
             .and_then(|lineage| lineage.get("parent_session_id"))
-            .and_then(Value::as_str)
-            .or_else(|| {
-                self.edge_profile
-                    .get("parent_session_id")
-                    .and_then(Value::as_str)
-            });
+            .and_then(Value::as_str);
         let lineage_turn = self
             .edge_profile
             .get("session_lineage")
             .and_then(Value::as_object)
-            .and_then(|lineage| {
-                lineage
-                    .get("forked_after_turn")
-                    .or_else(|| lineage.get("forked_at_turn"))
-            })
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                self.edge_profile
-                    .get("forked_at_turn")
-                    .and_then(Value::as_u64)
-            });
+            .and_then(|lineage| lineage.get("forked_after_turn"))
+            .and_then(Value::as_u64);
 
         let interruption = state
             .interruption
@@ -2685,9 +2703,14 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
     ) {
         let mut extras = self.admissible_extras.clone();
-        let deferred_tool_names = self.deferred_tool_names_from_edge_profile();
+        let activatable_deferred_tool_names = self.deferred_tool_names_for_wire_tools(
+            wire_tools,
+            self.resolved_model_name.as_deref(),
+            self.resolved_context_window,
+            state.server_tool_executor.as_deref(),
+        );
         if let Some(executor) = state.server_tool_executor.as_deref() {
-            executor.set_current_activatable_tool_names(deferred_tool_names);
+            executor.set_current_activatable_tool_names(activatable_deferred_tool_names);
             executor.set_current_searchable_tool_schemas(wire_tools);
             extras.extend(executor.activated_deferred_tool_names());
         }
@@ -2710,17 +2733,120 @@ impl ServerAgenticLoopHost {
         }
     }
 
-    fn deferred_tool_names_from_edge_profile(&self) -> HashSet<String> {
-        self.edge_profile
-            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .collect()
+    fn deferred_tool_names_from_edge_profile_for_model(
+        &self,
+        resolved_model_name: Option<&str>,
+        resolved_context_window: Option<u32>,
+    ) -> HashSet<String> {
+        crate::turn::deferred_tools_edge_profile::names_for_model(
+            &self.edge_profile,
+            resolved_model_name,
+            resolved_context_window,
+        )
+    }
+
+    fn deferred_tool_names_for_wire_tools(
+        &self,
+        wire_tools: &[Value],
+        resolved_model_name: Option<&str>,
+        resolved_context_window: Option<u32>,
+        executor: Option<&crate::server::server_tool_executor::ServerToolExecutor>,
+    ) -> HashSet<String> {
+        let deferred_tool_names = self.prompt_deferred_tool_names_for_wire_tools(
+            wire_tools,
+            resolved_model_name,
+            resolved_context_window,
+        );
+        if deferred_tool_names.is_empty() {
+            return HashSet::new();
+        }
+
+        if let Some(executor) = executor {
+            let runtime_bound = executor.runtime_bound_tool_names(deferred_tool_names.clone());
+            if runtime_bound != deferred_tool_names {
+                let removed: Vec<&str> = deferred_tool_names
+                    .difference(&runtime_bound)
+                    .map(String::as_str)
+                    .collect();
+                tracing::warn!(
+                    target: "astra.deferred_tools",
+                    removed = ?removed,
+                    removed_count = removed.len(),
+                    declared_count = deferred_tool_names.len(),
+                    kept_count = runtime_bound.len(),
+                    "deferred manifest filtered: runtime binding removed {} of {} tool(s); \
+                     prompt block will be rendered with the runtime-bound subset",
+                    removed.len(),
+                    deferred_tool_names.len()
+                );
+                return runtime_bound;
+            }
+        }
+        deferred_tool_names
+    }
+
+    fn prompt_deferred_tool_names_for_wire_tools(
+        &self,
+        wire_tools: &[Value],
+        resolved_model_name: Option<&str>,
+        resolved_context_window: Option<u32>,
+    ) -> HashSet<String> {
+        let deferred_tool_names = self.deferred_tool_names_from_edge_profile_for_model(
+            resolved_model_name,
+            resolved_context_window,
+        );
+        if deferred_tool_names.is_empty() {
+            return HashSet::new();
+        }
+
+        let visible_tool_names = astra_turn_core::tool::schema::tool_names_from_schemas(wire_tools);
+        if !deferred_tool_names.is_disjoint(&visible_tool_names) {
+            let overlap: Vec<&str> = deferred_tool_names
+                .intersection(&visible_tool_names)
+                .map(String::as_str)
+                .collect();
+            let retained: HashSet<String> = deferred_tool_names
+                .difference(&visible_tool_names)
+                .cloned()
+                .collect();
+            tracing::warn!(
+                target: "astra.deferred_tools",
+                overlap = ?overlap,
+                deferred_count = deferred_tool_names.len(),
+                visible_count = visible_tool_names.len(),
+                kept_count = retained.len(),
+                "deferred manifest filtered: deferred tool(s) already appear in visible surface; \
+                 prompt block will keep only names that still require activation"
+            );
+            return retained;
+        }
+
+        deferred_tool_names
+    }
+
+    fn deferred_tools_block_for_wire_surface(
+        &self,
+        wire_tools: &[Value],
+        state: &AgenticLoopState,
+        model_name: &str,
+        model_context_window: Option<u32>,
+    ) -> String {
+        let manifest_names = self.deferred_tool_names_for_wire_tools(
+            wire_tools,
+            Some(model_name),
+            model_context_window,
+            state.server_tool_executor.as_deref(),
+        );
+        if manifest_names.is_empty() {
+            return String::new();
+        }
+        crate::turn::deferred_tools_edge_profile::block_for_model_filtered(
+            &self.edge_profile,
+            model_name,
+            model_context_window,
+            &manifest_names,
+        )
+        .unwrap_or_default()
     }
 
     /// Set the extras list (runtime-injected names + plugin names) so
@@ -2815,6 +2941,7 @@ impl ServerAgenticLoopHost {
             model_name,
             None,
             None,
+            None,
             user_content,
         )
     }
@@ -2825,6 +2952,7 @@ impl ServerAgenticLoopHost {
         visible_tools: &[Value],
         provider: &str,
         model_name: &str,
+        model_context_window: Option<u32>,
         cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
         user_content: &str,
@@ -2850,6 +2978,12 @@ impl ServerAgenticLoopHost {
             crate::prompts::PromptTokenBucket::Environment,
         )];
         let restricted_snapshot = state.restricted_tools.clone();
+        let deferred_tools_block = self.deferred_tools_block_for_wire_surface(
+            visible_tools,
+            state,
+            model_name,
+            model_context_window,
+        );
         let cache_cfg =
             PromptCacheConfig::from_cache_capability(cache_capability, provider, model_name);
         crate::turn::llm::context::assemble_context_pipeline(
@@ -2859,7 +2993,8 @@ impl ServerAgenticLoopHost {
                 tool_surface: crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
                     visible_tools,
                     &restricted_snapshot,
-                ),
+                )
+                .with_deferred_tools_block(&deferred_tools_block),
                 runtime_signals: crate::turn::llm::context::RuntimeSignals::new(
                     &self.edge_profile,
                     plan_hint,
@@ -2869,6 +3004,7 @@ impl ServerAgenticLoopHost {
                 cache_cfg: &cache_cfg,
                 provider,
                 model_name,
+                context_window: model_context_window,
                 cache_capability,
                 user_content,
                 query_source: "agentic_loop",
@@ -2913,6 +3049,7 @@ impl ServerAgenticLoopHost {
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
             model_name: &llm_cfg.model_name,
+            context_window: llm_cfg.context_window,
             memoria_client: memoria_client
                 .as_ref()
                 .map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
@@ -2966,7 +3103,7 @@ impl ServerAgenticLoopHost {
 
     /// Convert an [`LlmCallResult`] into a [`ChatTurnSseAccum`].
     fn result_to_accum(result: &LlmCallResult) -> ChatTurnSseAccum {
-        let u = crate::turn::token_usage::TokenUsage::from_json_map(&result.usage);
+        let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
         let prompt_tokens = u.input_tokens;
         let completion_tokens = u.output_tokens;
         let cache_read_tokens = u.cached_input_tokens;
@@ -3282,6 +3419,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &visible_tools,
             &llm_cfg.provider,
             &llm_cfg.model_name,
+            llm_cfg.context_window,
             llm_cfg.cache_capability,
             initial_session_memory_entry.clone(),
             &user_content,
@@ -3336,6 +3474,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         &visible_tools,
                         &llm_cfg.provider,
                         &llm_cfg.model_name,
+                        llm_cfg.context_window,
                         llm_cfg.cache_capability,
                         Some(session_memory_entry),
                         &user_content,
@@ -3698,7 +3837,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             };
 
             {
-                let u = crate::turn::token_usage::TokenUsage::from_json_map(&r.usage);
+                let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&r.usage);
                 state.step_recorder.end_llm_round(
                     &llm_cfg.model_name,
                     u.input_tokens,
@@ -3828,7 +3967,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.final_text_streamed = true;
         }
         if !result.usage.is_empty() {
-            let u = crate::turn::token_usage::TokenUsage::from_json_map(&result.usage);
+            let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
             self.emit_event(json!({
                 "type": "usage",
                 "input_tokens": u.input_tokens,
@@ -4016,7 +4155,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn deferred_tool_names(&self) -> HashSet<String> {
-        self.deferred_tool_names_from_edge_profile()
+        self.deferred_tool_names_from_edge_profile_for_model(
+            self.resolved_model_name.as_deref(),
+            self.resolved_context_window,
+        )
     }
 
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
@@ -4504,10 +4646,9 @@ fn llm_capture_error_response(error: &astra_core::ClassifiedError) -> Value {
     {
         // Canonical-schema guarantee: error artifacts surface `usage` in the
         // same shape as the success path (see `bridge_sse_helpers` and
-        // `turn::token_usage::TokenUsage::to_json_map`). If upstream details
-        // carried OpenAI-style keys (`prompt_tokens`/`completion_tokens`) we
-        // normalize here so downstream consumers have a single schema to
-        // reason about.
+        // `turn::token_usage::TokenUsage::to_json_map`). Provider dialects and
+        // partial canonical-like maps are normalized here so downstream
+        // consumers have a single schema to reason about.
         if let Some(Value::Object(raw_usage)) = details.get("usage").cloned() {
             let canonical = normalize_usage_to_canonical(&raw_usage);
             details.insert("usage".to_string(), Value::Object(canonical));
@@ -4524,19 +4665,11 @@ fn llm_capture_error_response(error: &astra_core::ClassifiedError) -> Value {
 fn normalize_usage_to_canonical(
     raw: &serde_json::Map<String, Value>,
 ) -> serde_json::Map<String, Value> {
-    // Pass-through when already canonical: presence of `cached_input_tokens`
-    // (the canonical cache key; `input_tokens`/`output_tokens` are ambiguous
-    // because Anthropic also uses those names) means the producer already
-    // normalized. Anthropic-dialect detection below takes priority when only
-    // `input_tokens`/`output_tokens` are present alongside the anthropic
-    // cache keys.
+    // Anthropic and canonical shapes both use `input_tokens`/`output_tokens`.
+    // Provider-specific cache keys are the deterministic discriminator and
+    // must be handled before completing a canonical-like map.
     let looks_anthropic = raw.contains_key("cache_read_input_tokens")
         || raw.contains_key("cache_creation_input_tokens");
-    if !looks_anthropic
-        && (raw.contains_key("cached_input_tokens") || raw.contains_key("cache_creation_tokens"))
-    {
-        return raw.clone();
-    }
     // Anthropic dialect (Messages API, deepseek `/anthropic` endpoint, …):
     // `input_tokens`/`output_tokens` plus separate `cache_read_input_tokens`
     // and `cache_creation_input_tokens`. Must be checked BEFORE the generic
@@ -4550,9 +4683,15 @@ fn normalize_usage_to_canonical(
             return canonical.to_json_map();
         }
     }
-    // Canonical fast-path for non-anthropic already-normalized shapes.
-    if raw.contains_key("input_tokens") || raw.contains_key("output_tokens") {
-        return raw.clone();
+    // Canonical or canonical-like shape. Complete missing cache buckets with
+    // zeros and recompute `total_tokens` so error artifacts never surface a
+    // partial token schema.
+    if raw.contains_key("input_tokens")
+        || raw.contains_key("cached_input_tokens")
+        || raw.contains_key("cache_creation_tokens")
+        || raw.contains_key("output_tokens")
+    {
+        return crate::turn::token_usage::TokenUsage::from_partial_json_map(raw).to_json_map();
     }
     // Detect OpenAI dialect (prompt_tokens / completion_tokens / …).
     if raw.contains_key("prompt_tokens") || raw.contains_key("completion_tokens") {
@@ -4986,7 +5125,34 @@ mod tests {
         let response = llm_capture_error_response(&error);
         assert_eq!(response["partial_full_text"].as_str(), Some("half answer"));
         assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(10));
+        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(0));
+        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), Some(0));
+        assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(4));
+        assert_eq!(response["usage"]["total_tokens"].as_i64(), Some(14));
         assert_eq!(response["kind"].as_str(), Some("stream_transport"));
+    }
+
+    #[test]
+    fn llm_capture_error_response_completes_canonical_like_usage() {
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "usage": { "input_tokens": 8, "output_tokens": 3 }
+                    })
+                    .to_string(),
+                );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(8));
+        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(0));
+        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), Some(0));
+        assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(3));
+        assert_eq!(response["usage"]["total_tokens"].as_i64(), Some(11));
+        assert_eq!(
+            response["usage"].as_object().expect("usage object").len(),
+            5,
+            "canonical-like error usage must be completed to the exact canonical schema"
+        );
     }
 
     #[test]
@@ -5014,10 +5180,10 @@ mod tests {
     }
 
     #[test]
-    fn llm_capture_error_response_passes_through_canonical_usage_unchanged() {
-        // When details already speak the canonical dialect we must not touch
-        // them — double-normalization would zero out fields the OpenAI
-        // extractor doesn't know (`cached_input_tokens`, `cache_creation_tokens`).
+    fn llm_capture_error_response_completes_existing_canonical_usage() {
+        // When details already speak the canonical dialect we still normalize
+        // through the canonical struct so the output has exactly one schema
+        // and `total_tokens` is derived from the disjoint buckets.
         let error =
             astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
                 .with_details_json(
@@ -5027,7 +5193,7 @@ mod tests {
                             "cached_input_tokens": 2,
                             "cache_creation_tokens": 1,
                             "output_tokens": 4,
-                            "total_tokens": 18
+                            "total_tokens": 999
                         }
                     })
                     .to_string(),
@@ -5037,6 +5203,7 @@ mod tests {
         assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(2));
         assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), Some(1));
         assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(4));
+        assert_eq!(response["usage"]["total_tokens"].as_i64(), Some(18));
     }
 
     #[test]
@@ -5120,6 +5287,24 @@ mod tests {
         let response = llm_capture_error_response(&error);
         assert_eq!(response["usage"]["tokens_in"].as_i64(), Some(7));
         assert_eq!(response["usage"]["tokens_out"].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn llm_capture_error_response_does_not_invent_buckets_from_total_only_usage() {
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "usage": { "total_tokens": 42 }
+                    })
+                    .to_string(),
+                );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(response["usage"]["total_tokens"].as_i64(), Some(42));
+        assert!(
+            response["usage"].get("input_tokens").is_none(),
+            "total-only usage has no disjoint bucket evidence and must remain an unknown dialect",
+        );
     }
 
     #[test]
@@ -5834,11 +6019,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_turn_pipeline_surfaces_legacy_fork_keys_and_delegation_context() {
+    async fn run_turn_pipeline_ignores_noncanonical_top_level_fork_keys() {
         let mut edge_profile = Map::new();
         edge_profile.insert(
             "parent_session_id".to_string(),
-            Value::String("parent-legacy".to_string()),
+            Value::String("parent-ignored".to_string()),
         );
         edge_profile.insert("forked_at_turn".to_string(), Value::Number(11u64.into()));
         edge_profile.insert(
@@ -5849,15 +6034,15 @@ mod tests {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
-            "u-legacy".to_string(),
-            "s-legacy".to_string(),
+            "u-canonical-lineage".to_string(),
+            "s-canonical-lineage".to_string(),
         )
         .with_edge_profile(edge_profile)
         .build();
 
         let mut state = create_test_state();
-        state.current_session_id = Some("s-legacy".into());
-        state.current_run_id = Some("run-legacy".into());
+        state.current_session_id = Some("s-canonical-lineage".into());
+        state.current_run_id = Some("run-canonical-lineage".into());
         state.recursion_depth = 2;
         state.max_turn_input_tokens = 200_000;
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
@@ -5871,8 +6056,12 @@ mod tests {
         let text = pipeline_outcome_text(&outcome);
 
         assert!(
-            text.contains("Session lineage: parent=parent-legacy · forked_after_turn=11"),
-            "legacy fork keys should map into lifecycle lineage summary: {text}"
+            !text.contains("Session lineage:"),
+            "turn-start lifecycle summary must require canonical session_lineage object: {text}"
+        );
+        assert!(
+            !text.contains("parent-ignored") && !text.contains("forked_after_turn=11"),
+            "top-level fork aliases must not leak into lifecycle summary: {text}"
         );
         assert!(
             text.contains("Delegation context: recursion_depth=2 · agent_id=reviewer-1"),

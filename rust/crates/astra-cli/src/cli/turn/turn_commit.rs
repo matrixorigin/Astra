@@ -205,7 +205,6 @@ fn extend_runtime_sidecar_events(
             verdict.force_stop,
             verdict.nudge_count,
             verdict.total_errors,
-            verdict.health_avoidance_count,
             verdict.total_timeouts,
             &verdict.timeout_dominant_tools,
             verdict.total_cache_hits,

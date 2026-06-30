@@ -228,13 +228,13 @@ async fn l2_32_compaction_invariants_return_zero_after_compaction() {
     let plan = explain_analyze_text(
         &pool,
         &format!(
-            "EXPLAIN ANALYZE SELECT item_id FROM session_state_items FORCE INDEX (idx_state_session_category) \
-             WHERE session_id = '{}' AND category = 'plan_state' ORDER BY updated_at DESC LIMIT 5",
-            session_id
+            "EXPLAIN ANALYZE SELECT item_id FROM session_state_items FORCE INDEX (idx_state_owner_session_status_category) \
+             WHERE user_id = '{}' AND session_id = '{}' AND category = 'plan_state' AND status = 'active' ORDER BY updated_at DESC LIMIT 5",
+            user_id, session_id
         ),
     )
     .await;
-    assert_plan_uses(&plan, "idx_state_session_category");
+    assert_plan_uses(&plan, "idx_state_owner_session_status_category");
 }
 
 #[tokio::test]
@@ -285,11 +285,12 @@ async fn l2_33_active_structured_state_survives_compaction() {
         .unwrap();
     let active_count = sqlx::query(
         "SELECT COUNT(*) AS c FROM session_state_items
-         WHERE session_id = ? AND status = 'active'
+         WHERE session_id = ? AND user_id = ? AND status = 'active'
            AND category IN ('plan_state','decision','finding','benchmark','citation',
                             'todo_state','error_state','delegation_state')",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap()
@@ -334,9 +335,10 @@ async fn l2_34_plan_state_version_does_not_bump_during_compaction() {
         .unwrap();
     let version = sqlx::query(
         "SELECT version FROM session_state_items
-         WHERE session_id = ? AND category = 'plan_state' AND item_key = 'active-plan'",
+         WHERE session_id = ? AND user_id = ? AND category = 'plan_state' AND item_key = 'active-plan'",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap()
@@ -428,22 +430,26 @@ async fn l2_36_delegation_projection_and_retry_supersede_are_transactional() {
         .await
         .unwrap();
     store
-        .create_retry_run_and_supersede(&child_run_id, &retry_run_id, "subtree")
+        .create_retry_run_and_supersede(&user_id, &child_run_id, &retry_run_id, "subtree")
         .await
         .unwrap();
 
     let row = sqlx::query(
         "SELECT
-            (SELECT COUNT(*) FROM session_delegations WHERE child_run_id = ?) AS delegation_count,
+            (SELECT COUNT(*) FROM session_delegations WHERE child_run_id = ? AND user_id = ?) AS delegation_count,
             (SELECT COUNT(*) FROM session_state_items
-             WHERE session_id = ? AND category = 'delegation_state') AS state_count,
-            (SELECT status FROM agent_runs WHERE run_id = ?) AS old_status,
-            (SELECT retry_scope FROM agent_runs WHERE run_id = ?) AS retry_scope",
+             WHERE session_id = ? AND user_id = ? AND category = 'delegation_state') AS state_count,
+            (SELECT status FROM agent_runs WHERE run_id = ? AND user_id = ?) AS old_status,
+            (SELECT retry_scope FROM agent_runs WHERE run_id = ? AND user_id = ?) AS retry_scope",
     )
     .bind(&child_run_id)
+    .bind(&user_id)
     .bind(&session_id)
+    .bind(&user_id)
     .bind(&child_run_id)
+    .bind(&user_id)
     .bind(&retry_run_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap();
@@ -457,13 +463,58 @@ async fn l2_36_delegation_projection_and_retry_supersede_are_transactional() {
     let plan = explain_analyze_text(
         &pool,
         &format!(
-            "EXPLAIN ANALYZE SELECT delegation_id FROM session_delegations FORCE INDEX (idx_delegations_parent) \
-             WHERE parent_run_id = '{}' AND status = 'running' ORDER BY updated_at DESC LIMIT 5",
-            root_run_id
+            "EXPLAIN ANALYZE SELECT delegation_id FROM session_delegations FORCE INDEX (idx_delegations_owner_parent_status_updated) \
+             WHERE user_id = '{}' AND parent_run_id = '{}' AND status = 'running' ORDER BY updated_at DESC LIMIT 5",
+            user_id, root_run_id
         ),
     )
     .await;
-    assert_plan_uses(&plan, "idx_delegations_parent");
+    assert_plan_uses(&plan, "idx_delegations_owner_parent_status_updated");
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn create_retry_run_and_supersede_rejects_wrong_owner_without_mutation() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, run_id) = ids();
+    let retry_run_id = format!("retry-{run_id}");
+    let wrong_user_id = format!("wrong-{user_id}");
+    insert_session(&pool, &session_id, &user_id).await;
+    insert_run(
+        &pool,
+        &session_id,
+        &user_id,
+        &run_id,
+        None,
+        &run_id,
+        &run_id,
+        0,
+        "failed",
+    )
+    .await;
+
+    let err = DatabaseStateProjectionStore::new(pool.clone())
+        .create_retry_run_and_supersede(&wrong_user_id, &run_id, &retry_run_id, "node")
+        .await
+        .expect_err("wrong owner must not supersede or retry another owner's run");
+    assert!(
+        err.to_string().contains("load_old_retry_run"),
+        "wrong-owner retry should fail at owner-bound old-run load: {err}"
+    );
+
+    let row = sqlx::query(
+        "SELECT
+            (SELECT status FROM agent_runs WHERE user_id = ? AND run_id = ?) AS old_status,
+            (SELECT COUNT(*) FROM agent_runs WHERE run_id = ?) AS retry_count",
+    )
+    .bind(&user_id)
+    .bind(&run_id)
+    .bind(&retry_run_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<String, _>("old_status").unwrap(), "failed");
+    assert_eq!(row.try_get::<i64, _>("retry_count").unwrap(), 0);
 }
 
 #[tokio::test]
@@ -492,9 +543,10 @@ async fn l2_37_bubble_up_writes_one_event_per_ancestor_layer() {
         .unwrap();
     let count = sqlx::query(
         "SELECT COUNT(*) AS c FROM session_state_item_events
-         WHERE session_id = ? AND mutation = 'bubble_up'",
+         WHERE session_id = ? AND user_id = ? AND mutation = 'bubble_up'",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap()
@@ -504,13 +556,13 @@ async fn l2_37_bubble_up_writes_one_event_per_ancestor_layer() {
     let plan = explain_analyze_text(
         &pool,
         &format!(
-            "EXPLAIN ANALYZE SELECT id FROM session_state_item_events FORCE INDEX (idx_state_events_session_created) \
-             WHERE session_id = '{}' AND mutation = 'bubble_up' ORDER BY created_at DESC LIMIT 5",
-            session_id
+            "EXPLAIN ANALYZE SELECT id FROM session_state_item_events FORCE INDEX (idx_state_events_owner_session_created) \
+             WHERE user_id = '{}' AND session_id = '{}' AND mutation = 'bubble_up' ORDER BY created_at DESC LIMIT 5",
+            user_id, session_id
         ),
     )
     .await;
-    assert_plan_uses(&plan, "idx_state_events_session_created");
+    assert_plan_uses(&plan, "idx_state_events_owner_session_created");
 }
 
 #[tokio::test]
@@ -595,26 +647,31 @@ async fn l2_38_same_root_tree_allows_sibling_artifact_access() {
             .await
             .unwrap()
     );
-    let artifact_plan = explain_analyze_text(
-        &pool,
-        &format!(
-            "EXPLAIN ANALYZE SELECT artifact_id FROM session_artifacts FORCE INDEX (idx_artifacts_root_scope) \
-             WHERE root_run_id = '{}' AND access_scope = 'same_root_tree' AND status = 'active' ORDER BY updated_at DESC LIMIT 5",
-            root_run_id
-        ),
+    let visible_artifacts: Vec<String> = sqlx::query_scalar(
+        "SELECT artifact_id FROM session_artifacts FORCE INDEX (idx_artifacts_root_scope) \
+         WHERE user_id = ? AND root_run_id = ? AND access_scope = 'same_root_tree' AND status = 'active' \
+         ORDER BY updated_at DESC LIMIT 5",
     )
-    .await;
-    assert_plan_uses(&artifact_plan, "idx_artifacts_root_scope");
-    let grant_plan = explain_analyze_text(
-        &pool,
-        &format!(
-            "EXPLAIN ANALYZE SELECT grant_id FROM session_artifacts_grants FORCE INDEX (idx_artifacts_grants_target) \
-             WHERE target_run_id = '{}' AND artifact_id = '{}' AND (expires_at IS NULL OR expires_at > NOW(6)) LIMIT 5",
-            be_run, artifact_id
-        ),
+    .bind(&user_id)
+    .bind(&root_run_id)
+    .fetch_all(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(visible_artifacts, vec![artifact_id.clone()]);
+
+    let visible_grants: Vec<String> = sqlx::query_scalar(
+        "SELECT grant_id FROM session_artifacts_grants FORCE INDEX (idx_artifacts_grants_target) \
+         WHERE user_id = ? AND session_id = ? AND target_run_id = ? AND artifact_id = ? \
+           AND (expires_at IS NULL OR expires_at > NOW(6)) LIMIT 5",
     )
-    .await;
-    assert_plan_uses(&grant_plan, "idx_artifacts_grants_target");
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&be_run)
+    .bind(&artifact_id)
+    .fetch_all(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(visible_grants, vec![format!("grant-{artifact_id}")]);
 }
 
 #[tokio::test]
@@ -694,9 +751,10 @@ async fn l2_41_personal_skill_activation_pins_frozen_version_id() {
         .unwrap();
     let payload = sqlx::query(
         "SELECT payload_json FROM session_state_items
-         WHERE session_id = ? AND category = 'active_skill' AND item_key = 'review_changes'",
+         WHERE session_id = ? AND user_id = ? AND category = 'active_skill' AND item_key = 'review_changes'",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap()
@@ -732,12 +790,14 @@ async fn l2_42_skill_activation_is_ui_structured_event_not_llm_turn() {
     let row = sqlx::query(
         "SELECT
           (SELECT COUNT(*) FROM agent_events
-           WHERE session_id = ? AND event_type = 'ui.skill.activate' AND llm_model_used IS NULL) AS ui_events,
+           WHERE session_id = ? AND user_id = ? AND event_type = 'ui.skill.activate' AND llm_model_used IS NULL) AS ui_events,
           (SELECT COUNT(*) FROM session_state_item_events
-           WHERE session_id = ? AND category = 'active_skill' AND mutation = 'activate') AS state_events",
+           WHERE session_id = ? AND user_id = ? AND category = 'active_skill' AND mutation = 'activate') AS state_events",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap();
@@ -781,6 +841,7 @@ async fn l3_11b_real_run_engine_populates_projection() {
         .unwrap();
     run_engine
         .persist_status(
+            &user_id,
             &child_run_id,
             "completed",
             None,
@@ -792,13 +853,15 @@ async fn l3_11b_real_run_engine_populates_projection() {
     let row = sqlx::query(
         "SELECT
           (SELECT COUNT(*) FROM session_delegations
-           WHERE delegation_id = ? AND child_run_id = ? AND status = 'completed') AS delegations,
+           WHERE delegation_id = ? AND child_run_id = ? AND user_id = ? AND status = 'completed') AS delegations,
           (SELECT COUNT(*) FROM session_state_items
-           WHERE session_id = ? AND category = 'delegation_state' AND item_key = ?) AS state_items",
+           WHERE session_id = ? AND user_id = ? AND category = 'delegation_state' AND item_key = ?) AS state_items",
     )
     .bind(&delegation_id)
     .bind(&child_run_id)
+    .bind(&user_id)
     .bind(&session_id)
+    .bind(&user_id)
     .bind(&delegation_id)
     .fetch_one(pool.get())
     .await
@@ -898,10 +961,12 @@ async fn l3_11_s05_plan_thrashing_keeps_active_todos_bounded() {
     }
     let row = sqlx::query(
         "SELECT
-          (SELECT COUNT(*) FROM session_plan_todos WHERE session_id = ? AND status = 'active') AS active_count,
-          (SELECT COUNT(*) FROM session_plan_todos WHERE session_id = ? AND status IN ('cancelled', 'backlog')) AS inactive_count",
+          (SELECT COUNT(*) FROM session_plan_todos WHERE user_id = ? AND session_id = ? AND status = 'active') AS active_count,
+          (SELECT COUNT(*) FROM session_plan_todos WHERE user_id = ? AND session_id = ? AND status IN ('cancelled', 'backlog')) AS inactive_count",
     )
+    .bind(&user_id)
     .bind(&session_id)
+    .bind(&user_id)
     .bind(&session_id)
     .fetch_one(pool.get())
     .await
@@ -914,11 +979,12 @@ async fn l3_11_s05_plan_thrashing_keeps_active_todos_bounded() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn can_compact_session_ignores_active_runs_from_other_owners() {
+async fn compact_session_state_rejects_active_runs_from_same_owner() {
     let pool = setup_pool().await;
     let (session_id, user_id, run_id) = ids();
     let other_user_id = format!("other-{user_id}");
     let other_run_id = format!("other-{run_id}");
+    let compaction_run_id = format!("compaction-{run_id}");
     insert_session(&pool, &session_id, &user_id).await;
     insert_run(
         &pool,
@@ -934,13 +1000,16 @@ async fn can_compact_session_ignores_active_runs_from_other_owners() {
     .await;
 
     let store = DatabaseStateProjectionStore::new(pool.clone());
+    // Other-owner active runs must not block compaction.
     store
-        .can_compact_session(&user_id, &session_id)
+        .compact_session_state(&user_id, &session_id, &compaction_run_id, 400)
         .await
         .expect("other-owner active runs must not block owner compaction");
 
+    // Same-owner active run should block compaction.
+    let compaction_run_id2 = format!("compaction2-{run_id}");
     let err = store
-        .can_compact_session(&other_user_id, &session_id)
+        .compact_session_state(&other_user_id, &session_id, &compaction_run_id2, 400)
         .await
         .expect_err("the other owner still has an active run in that session id");
     assert!(
@@ -1073,12 +1142,14 @@ async fn l3_12_s06_compaction_preserves_sixty_todo_tree_skeleton() {
           (SELECT MAX(i.token_estimate)
            FROM context_manifest_items i JOIN context_manifests m ON m.manifest_id = i.manifest_id
            WHERE m.session_id = ? AND m.run_id = ? AND i.zone = 'plan_todo') AS plan_tokens,
-          (SELECT COUNT(*) FROM session_plan_todos WHERE session_id = ? AND parent_todo_id IS NOT NULL) AS child_edges,
-          (SELECT COUNT(*) FROM session_plan_todos WHERE session_id = ? AND status = 'active') AS active_todos",
+          (SELECT COUNT(*) FROM session_plan_todos WHERE user_id = ? AND session_id = ? AND parent_todo_id IS NOT NULL) AS child_edges,
+          (SELECT COUNT(*) FROM session_plan_todos WHERE user_id = ? AND session_id = ? AND status = 'active') AS active_todos",
     )
     .bind(&session_id)
     .bind(&run_id)
+    .bind(&user_id)
     .bind(&session_id)
+    .bind(&user_id)
     .bind(&session_id)
     .fetch_one(pool.get())
     .await
@@ -1146,13 +1217,18 @@ async fn l3_13_s09_sibling_be_agent_reads_dba_migration_artifact() {
             .await
             .unwrap()
     );
-    let content = sqlx::query("SELECT content_json FROM session_artifacts WHERE artifact_id = ?")
-        .bind(&artifact_id)
-        .fetch_one(pool.get())
-        .await
-        .unwrap()
-        .try_get::<String, _>("content_json")
-        .unwrap();
+    let content = sqlx::query(
+        "SELECT content_json FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap()
+    .try_get::<String, _>("content_json")
+    .unwrap();
     assert!(content.contains(migration_sql));
 }
 
@@ -1182,9 +1258,10 @@ async fn l3_14_s10_bubble_up_five_levels_writes_one_event_per_target() {
         .unwrap();
     let count = sqlx::query(
         "SELECT COUNT(*) AS c FROM session_state_item_events
-         WHERE session_id = ? AND mutation = 'bubble_up'",
+         WHERE session_id = ? AND user_id = ? AND mutation = 'bubble_up'",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap()

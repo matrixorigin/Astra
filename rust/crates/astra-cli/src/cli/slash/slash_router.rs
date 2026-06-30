@@ -23,7 +23,7 @@ use crate::cli::{
     },
     command_registry, command_usage, diff_presenter,
     project_instructions::discover_project_instructions,
-    session::{session_checkpointing, session_state::SessionState},
+    session::{session_checkpointing, session_runtime, session_state::SessionState},
     slash::{
         slash_agent, slash_cache, slash_config, slash_inspect, slash_mcp, slash_profile,
         slash_session, slash_stats, slash_sync, slash_task, slash_team, slash_telemetry,
@@ -32,34 +32,19 @@ use crate::cli::{
 };
 
 /// GET `/models` returns `ModelListItemResponse` with field `is_active` (snake_case).
-/// Accept legacy `active` if present; if neither is a bool, treat as active for unknown servers.
 fn model_list_entry_is_active(entry: &serde_json::Value) -> bool {
-    if let Some(v) = entry.get("is_active") {
-        if let Some(b) = v.as_bool() {
-            return b;
-        }
-        // Some gateways / hand-written JSON use 0/1 instead of booleans.
-        if let Some(n) = v.as_i64() {
-            return n != 0;
-        }
-        if let Some(n) = v.as_u64() {
-            return n != 0;
-        }
-    }
-    if let Some(b) = entry.get("active").and_then(|v| v.as_bool()) {
-        return b;
-    }
-    if let Some(n) = entry.get("active").and_then(|v| v.as_i64()) {
-        return n != 0;
-    }
-    true
+    entry
+        .get("is_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
     entry
         .get("name")
-        .or_else(|| entry.get("model_name"))
         .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
 }
 
 fn model_list_entry_id(entry: &serde_json::Value) -> Option<&str> {
@@ -235,10 +220,14 @@ pub(crate) async fn handle_slash_command(
                     );
                     state.cached_pricing = slash_stats::extract_pricing_for_model(&models, &chosen)
                         .unwrap_or_else(|| slash_stats::fallback_pricing(&chosen));
-                    state.context_budget = prompts::ContextBudget::from_runtime_config(
-                        &state.runtime_config,
-                        Some(&chosen),
-                    );
+                    let context_window =
+                        selected_model.and_then(session_runtime::model_list_entry_context_window);
+                    state.context_budget =
+                        prompts::ContextBudget::from_runtime_config_with_context_window(
+                            &state.runtime_config,
+                            Some(&chosen),
+                            context_window,
+                        );
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
@@ -253,6 +242,7 @@ pub(crate) async fn handle_slash_command(
         "/model" => {
             let mut selected_model_id: Option<String> = None;
             let mut selected_model_name: Option<String> = None;
+            let mut context_window = None;
             if let Some(tok) = token {
                 match api.get_models_text(tok).await {
                     Ok(body) => {
@@ -300,6 +290,8 @@ pub(crate) async fn handle_slash_command(
                             selected_model_id = model_list_entry_id(entry).map(ToOwned::to_owned);
                             selected_model_name =
                                 model_list_entry_name(entry).map(ToOwned::to_owned);
+                            context_window =
+                                session_runtime::model_list_entry_context_window(entry);
                         }
 
                         let available: Vec<String> = models
@@ -356,9 +348,10 @@ pub(crate) async fn handle_slash_command(
             let base_model =
                 astra_turn_core::thinking_config::resolve_model_thinking(&selected_model).0;
             state.cached_pricing = slash_stats::fallback_pricing(base_model);
-            state.context_budget = prompts::ContextBudget::from_runtime_config(
+            state.context_budget = prompts::ContextBudget::from_runtime_config_with_context_window(
                 &state.runtime_config,
                 Some(base_model),
+                context_window,
             );
             eprintln!(
                 "{}",
@@ -702,7 +695,7 @@ pub(crate) fn entry_provider(entry: &serde_json::Value) -> Option<&str> {
 mod model_list_json_tests {
     use super::{
         entry_model_id, entry_model_is_active, entry_model_name, find_model_entry_by_name,
-        model_list_entry_is_active, model_list_entry_thinking_capability,
+        model_list_entry_is_active, model_list_entry_name, model_list_entry_thinking_capability,
     };
 
     #[test]
@@ -712,8 +705,8 @@ mod model_list_json_tests {
     }
 
     #[test]
-    fn respects_legacy_active_false() {
-        let v = serde_json::json!({"name": "m", "active": false});
+    fn ignores_legacy_active_field() {
+        let v = serde_json::json!({"name": "m", "active": true});
         assert!(!model_list_entry_is_active(&v));
     }
 
@@ -724,15 +717,23 @@ mod model_list_json_tests {
     }
 
     #[test]
-    fn missing_flags_defaults_true_for_unknown_servers() {
+    fn missing_is_active_fails_closed() {
         let v = serde_json::json!({"name": "m"});
-        assert!(model_list_entry_is_active(&v));
+        assert!(!model_list_entry_is_active(&v));
     }
 
     #[test]
-    fn is_active_numeric_zero_means_inactive() {
-        let v = serde_json::json!({"name": "m", "is_active": 0});
+    fn non_bool_is_active_fails_closed() {
+        let v = serde_json::json!({"name": "m", "is_active": 1});
         assert!(!model_list_entry_is_active(&v));
+    }
+
+    #[test]
+    fn model_name_uses_canonical_name_only() {
+        let canonical = serde_json::json!({"name": "m", "model_name": "old"});
+        let legacy = serde_json::json!({"model_name": "old"});
+        assert_eq!(model_list_entry_name(&canonical), Some("m"));
+        assert_eq!(model_list_entry_name(&legacy), None);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::context_manifest::{
     BudgetV1_8k, ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
     artifact_id_from_raw_ref,
 };
+use crate::db_row::RowExt as StateProjectionDbRow;
 
 pub const PROTECTED_COMPACTION_CATEGORIES: &[&str] = &[
     "plan_state",
@@ -134,6 +135,14 @@ pub enum StateProjectionError {
     InvalidMutation { mutation: String },
     #[error("invalid retry_scope for run {run_id}: {retry_scope}")]
     InvalidRetryScope { run_id: String, retry_scope: String },
+    #[error("invalid database value: operation={operation}, column={column}, reason={reason}")]
+    InvalidDatabaseValue {
+        operation: &'static str,
+        entity: String,
+        column: &'static str,
+        value: String,
+        reason: &'static str,
+    },
     #[error("session {session_id} has active run count {active_count}; compaction rejected")]
     ActiveRunCompaction {
         session_id: String,
@@ -203,6 +212,196 @@ pub struct UserAnchorMemoryItem {
     pub token_estimate: u32,
 }
 
+fn state_projection_row_string(
+    row: &impl StateProjectionDbRow,
+    operation: &'static str,
+    entity: &str,
+    column: &'static str,
+) -> Result<String, StateProjectionError> {
+    row.string_column(column)
+        .map_err(|source| StateProjectionError::Database {
+            operation,
+            entity: entity.to_string(),
+            source,
+        })
+}
+
+fn state_projection_row_optional_string(
+    row: &impl StateProjectionDbRow,
+    operation: &'static str,
+    entity: &str,
+    column: &'static str,
+) -> Result<Option<String>, StateProjectionError> {
+    row.optional_string_column(column)
+        .map_err(|source| StateProjectionError::Database {
+            operation,
+            entity: entity.to_string(),
+            source,
+        })
+}
+
+fn state_projection_row_i64(
+    row: &impl StateProjectionDbRow,
+    operation: &'static str,
+    entity: &str,
+    column: &'static str,
+) -> Result<i64, StateProjectionError> {
+    row.i64_column(column)
+        .map_err(|source| StateProjectionError::Database {
+            operation,
+            entity: entity.to_string(),
+            source,
+        })
+}
+
+fn state_projection_row_non_negative_i64(
+    row: &impl StateProjectionDbRow,
+    operation: &'static str,
+    entity: &str,
+    column: &'static str,
+) -> Result<i64, StateProjectionError> {
+    let value = state_projection_row_i64(row, operation, entity, column)?;
+    if value < 0 {
+        return Err(StateProjectionError::InvalidDatabaseValue {
+            operation,
+            entity: entity.to_string(),
+            column,
+            value: value.to_string(),
+            reason: "expected non-negative integer",
+        });
+    }
+    Ok(value)
+}
+
+fn state_projection_row_u32(
+    row: &impl StateProjectionDbRow,
+    operation: &'static str,
+    entity: &str,
+    column: &'static str,
+) -> Result<u32, StateProjectionError> {
+    let value = state_projection_row_i64(row, operation, entity, column)?;
+    u32::try_from(value).map_err(|_| StateProjectionError::InvalidDatabaseValue {
+        operation,
+        entity: entity.to_string(),
+        column,
+        value: value.to_string(),
+        reason: "expected u32 range",
+    })
+}
+
+fn decode_user_anchor_memory_item(
+    row: &impl StateProjectionDbRow,
+    user_id: &str,
+) -> Result<UserAnchorMemoryItem, StateProjectionError> {
+    const OPERATION: &str = "load_user_anchor_memory";
+    Ok(UserAnchorMemoryItem {
+        item_id: state_projection_row_string(row, OPERATION, user_id, "item_id")?,
+        category: state_projection_row_string(row, OPERATION, user_id, "category")?,
+        item_key: state_projection_row_string(row, OPERATION, user_id, "item_key")?,
+        summary_text: state_projection_row_optional_string(
+            row,
+            OPERATION,
+            user_id,
+            "summary_text",
+        )?,
+        token_estimate: state_projection_row_u32(row, OPERATION, user_id, "token_estimate")?,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactAclRow {
+    user_id: String,
+    access_scope: String,
+    owner_run_id: Option<String>,
+    root_run_id: Option<String>,
+    status: String,
+}
+
+fn decode_artifact_acl_row(
+    row: &impl StateProjectionDbRow,
+    artifact_id: &str,
+) -> Result<ArtifactAclRow, StateProjectionError> {
+    const OPERATION: &str = "load_artifact_acl";
+    Ok(ArtifactAclRow {
+        user_id: state_projection_row_string(row, OPERATION, artifact_id, "user_id")?,
+        access_scope: state_projection_row_string(row, OPERATION, artifact_id, "access_scope")?,
+        owner_run_id: state_projection_row_optional_string(
+            row,
+            OPERATION,
+            artifact_id,
+            "owner_run_id",
+        )?,
+        root_run_id: state_projection_row_optional_string(
+            row,
+            OPERATION,
+            artifact_id,
+            "root_run_id",
+        )?,
+        status: state_projection_row_string(row, OPERATION, artifact_id, "status")?,
+    })
+}
+
+fn decode_backlog_todo_id(
+    row: &impl StateProjectionDbRow,
+    backlog_pool_id: &str,
+) -> Result<String, StateProjectionError> {
+    state_projection_row_string(row, "restore_backlog_pool", backlog_pool_id, "todo_id")
+}
+
+fn decode_run_acl_row(
+    row: &impl StateProjectionDbRow,
+    run_id: &str,
+) -> Result<RunAclRow, StateProjectionError> {
+    const OPERATION: &str = "load_run_acl_for_user";
+    Ok(RunAclRow {
+        user_id: state_projection_row_string(row, OPERATION, run_id, "user_id")?,
+        session_id: state_projection_row_string(row, OPERATION, run_id, "session_id")?,
+        root_run_id: state_projection_row_optional_string(row, OPERATION, run_id, "root_run_id")?,
+        ancestor_path: state_projection_row_optional_string(
+            row,
+            OPERATION,
+            run_id,
+            "ancestor_path",
+        )?,
+        depth: state_projection_row_u32(row, OPERATION, run_id, "depth")?,
+    })
+}
+
+fn decode_run_projection_row(
+    row: &impl StateProjectionDbRow,
+    run_id: &str,
+) -> Result<RunProjectionRow, StateProjectionError> {
+    const OPERATION: &str = "load_run_projection_for_user";
+    Ok(RunProjectionRow {
+        run_id: state_projection_row_string(row, OPERATION, run_id, "run_id")?,
+        user_id: state_projection_row_string(row, OPERATION, run_id, "user_id")?,
+        session_id: state_projection_row_string(row, OPERATION, run_id, "session_id")?,
+        parent_run_id: state_projection_row_optional_string(
+            row,
+            OPERATION,
+            run_id,
+            "parent_run_id",
+        )?,
+        root_run_id: state_projection_row_optional_string(row, OPERATION, run_id, "root_run_id")?,
+        ancestor_path: state_projection_row_optional_string(
+            row,
+            OPERATION,
+            run_id,
+            "ancestor_path",
+        )?,
+        depth: state_projection_row_u32(row, OPERATION, run_id, "depth")?,
+        delegation_id: state_projection_row_optional_string(
+            row,
+            OPERATION,
+            run_id,
+            "delegation_id",
+        )?,
+        agent_id: state_projection_row_optional_string(row, OPERATION, run_id, "agent_id")?,
+        retry_of: state_projection_row_optional_string(row, OPERATION, run_id, "retry_of")?,
+        retry_scope: state_projection_row_optional_string(row, OPERATION, run_id, "retry_scope")?,
+    })
+}
+
 /// One row to be inserted into `session_plan_todos` when a plan is
 /// approved via `exit_plan_mode`. The struct mirrors the columns the
 /// seed step writes; richer fields (`payload_json`, `acceptance_checks`,
@@ -233,16 +432,13 @@ pub trait PlanTodoSink: Send + Sync + std::fmt::Debug {
     /// U-6: mark prior plan's seeded rows as `superseded` so they
     /// don't show alongside the new plan's items in `task.list`.
     /// `keep_plan_id` is the active plan whose rows MUST stay
-    /// active. Default impl is a no-op for sinks that don't track
-    /// plan_id (e.g. legacy tests).
+    /// active.
     async fn supersede_other_plans(
         &self,
-        _user_id: &str,
-        _session_id: &str,
-        _keep_plan_id: &str,
-    ) -> Result<u64, String> {
-        Ok(0)
-    }
+        user_id: &str,
+        session_id: &str,
+        keep_plan_id: &str,
+    ) -> Result<u64, String>;
 }
 
 /// Adapter wrapping `DatabaseStateProjectionStore` so it implements
@@ -293,6 +489,7 @@ impl DatabaseStateProjectionStore {
         Self { pool }
     }
 
+    /// Check whether the session can be compacted (no active runs).
     pub async fn can_compact_session(
         &self,
         user_id: &str,
@@ -311,7 +508,12 @@ impl DatabaseStateProjectionStore {
             entity: session_id.to_string(),
             source,
         })?;
-        let active_count = row.try_get::<i64, _>("active_count").unwrap_or(0);
+        let active_count = state_projection_row_non_negative_i64(
+            &row,
+            "can_compact_session",
+            session_id,
+            "active_count",
+        )?;
         if active_count == 0 {
             Ok(())
         } else {
@@ -347,7 +549,12 @@ impl DatabaseStateProjectionStore {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let invariant_id = row.try_get::<String, _>("invariant_id").unwrap_or_default();
-            let violations = row.try_get::<i64, _>("violations").unwrap_or(0);
+            let violations = state_projection_row_non_negative_i64(
+                &row,
+                "run_compaction_invariant",
+                &invariant_id,
+                "violations",
+            )?;
             out.push((invariant_id, violations));
         }
         Ok(out)
@@ -442,6 +649,12 @@ impl DatabaseStateProjectionStore {
             mutation: "insert".to_string(),
         })
         .await?;
+
+        // A local-only advisory lock would not serialize against run starts
+        // unless every run-start path acquired the same lock. Re-check the DB
+        // invariant instead of silently accepting stale compaction output.
+        self.can_compact_session(user_id, session_id).await?;
+
         let results = self
             .run_compaction_assertions(user_id, session_id, compaction_run_id)
             .await?;
@@ -546,8 +759,10 @@ impl DatabaseStateProjectionStore {
                 "UPDATE session_artifacts
                  SET referenced_by_state_items_count = referenced_by_state_items_count + 1,
                      updated_at = NOW(6)
-                 WHERE artifact_id = ?",
+                 WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
             )
+            .bind(&item.user_id)
+            .bind(&item.session_id)
             .bind(&artifact_id)
             .execute(&mut *tx)
             .await
@@ -569,12 +784,16 @@ impl DatabaseStateProjectionStore {
 
     pub async fn upsert_delegation_projection_for_run(
         &self,
+        user_id: &str,
         child_run_id: &str,
         status: &str,
         agent_id_hint: Option<&str>,
         last_summary_text: Option<&str>,
     ) -> Result<(), StateProjectionError> {
-        let Some(child) = self.load_run_projection(child_run_id).await? else {
+        let Some(child) = self
+            .load_run_projection_for_user(user_id, child_run_id)
+            .await?
+        else {
             return Ok(());
         };
         let Some(parent_run_id) = child.parent_run_id.clone() else {
@@ -583,7 +802,9 @@ impl DatabaseStateProjectionStore {
         let Some(delegation_id) = child.delegation_id.clone() else {
             return Ok(());
         };
-        let parent = self.load_run_projection(&parent_run_id).await?;
+        let parent = self
+            .load_run_projection_for_user(user_id, &parent_run_id)
+            .await?;
         let (root_run_id, ancestor_path, depth) = if let Some(parent) = parent {
             let parent_root = parent.root_run_id.unwrap_or(parent.run_id.clone());
             let parent_path = parent.ancestor_path.unwrap_or(parent.run_id);
@@ -601,14 +822,15 @@ impl DatabaseStateProjectionStore {
                 child.depth.max(1),
             )
         };
-        sqlx::query(
+        let tree_update = sqlx::query(
             "UPDATE agent_runs
              SET root_run_id = ?, ancestor_path = ?, depth = ?, updated_at = NOW(6)
-             WHERE run_id = ?",
+             WHERE user_id = ? AND run_id = ?",
         )
         .bind(&root_run_id)
         .bind(&ancestor_path)
         .bind(i64::from(depth))
+        .bind(user_id)
         .bind(child_run_id)
         .execute(self.pool.get())
         .await
@@ -617,6 +839,13 @@ impl DatabaseStateProjectionStore {
             entity: child_run_id.to_string(),
             source,
         })?;
+        if tree_update.rows_affected() == 0 {
+            return Err(StateProjectionError::Database {
+                operation: "sync_delegation_run_tree",
+                entity: child_run_id.to_string(),
+                source: sqlx::Error::RowNotFound,
+            });
+        }
         self.upsert_delegation_projection(DelegationProjectionUpsert {
             delegation_id,
             user_id: child.user_id,
@@ -889,18 +1118,13 @@ impl DatabaseStateProjectionStore {
         let mut used = 0_u32;
         let mut out = Vec::new();
         for row in rows {
-            let estimate = row.try_get::<i64, _>("token_estimate").unwrap_or(0).max(0) as u32;
+            let item = decode_user_anchor_memory_item(&row, user_id)?;
+            let estimate = item.token_estimate;
             if used.saturating_add(estimate) > token_budget {
                 continue;
             }
             used = used.saturating_add(estimate);
-            out.push(UserAnchorMemoryItem {
-                item_id: row.try_get("item_id").unwrap_or_default(),
-                category: row.try_get("category").unwrap_or_default(),
-                item_key: row.try_get("item_key").unwrap_or_default(),
-                summary_text: row.try_get("summary_text").ok(),
-                token_estimate: estimate,
-            });
+            out.push(item);
         }
         Ok(out)
     }
@@ -951,7 +1175,7 @@ impl DatabaseStateProjectionStore {
                     entity: session_id.to_string(),
                     source,
                 })?;
-        sqlx::query(
+        let insert_result = sqlx::query(
             "INSERT INTO agent_events
              (event_id, session_id, user_id, event_type, content, metadata, created_at)
              VALUES (?, ?, ?, 'ui.skill.activate', ?, ?, NOW(6))",
@@ -965,6 +1189,37 @@ impl DatabaseStateProjectionStore {
         .await
         .map_err(|source| StateProjectionError::Database {
             operation: "insert_skill_activation_event",
+            entity: session_id.to_string(),
+            source,
+        })?;
+        let inserted_events = crate::storage::rows_affected_to_i64(
+            insert_result.rows_affected(),
+            "ui.skill.activate",
+        )
+        .map_err(|source| StateProjectionError::Database {
+            operation: "insert_skill_activation_event",
+            entity: session_id.to_string(),
+            source,
+        })?;
+        if inserted_events <= 0 {
+            return Err(StateProjectionError::Database {
+                operation: "insert_skill_activation_event",
+                entity: session_id.to_string(),
+                source: sqlx::Error::Protocol(
+                    "skill activation event insert affected no rows".into(),
+                ),
+            });
+        }
+        crate::storage::add_agent_session_event_count_or_create(
+            &mut *tx,
+            session_id,
+            user_id,
+            inserted_events,
+            Some(&event_id),
+        )
+        .await
+        .map_err(|source| StateProjectionError::Database {
+            operation: "skill_activation_event_count_delta",
             entity: session_id.to_string(),
             source,
         })?;
@@ -1031,10 +1286,20 @@ impl DatabaseStateProjectionStore {
         requester_run_id: &str,
         requester_delegation_id: Option<&str>,
     ) -> Result<bool, StateProjectionError> {
+        let Some(requester_run) = self
+            .load_run_acl_for_user(requester_user_id, requester_run_id)
+            .await?
+        else {
+            return Ok(false);
+        };
         let Some(artifact) = sqlx::query(
             "SELECT artifact_id, user_id, session_id, access_scope, owner_run_id, root_run_id, status
-             FROM session_artifacts WHERE artifact_id = ?",
+             FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+             LIMIT 1",
         )
+        .bind(requester_user_id)
+        .bind(&requester_run.session_id)
         .bind(artifact_id)
         .fetch_optional(self.pool.get())
         .await
@@ -1046,18 +1311,15 @@ impl DatabaseStateProjectionStore {
         else {
             return Ok(false);
         };
-        let status: String = artifact
-            .try_get("status")
-            .unwrap_or_else(|_| "active".to_string());
+        let artifact = decode_artifact_acl_row(&artifact, artifact_id)?;
+        let status = artifact.status;
         if status != "active" {
             return Ok(false);
         }
-        let artifact_user: String = artifact.try_get("user_id").unwrap_or_default();
-        let scope: String = artifact
-            .try_get("access_scope")
-            .unwrap_or_else(|_| "private".to_string());
-        let owner_run_id: Option<String> = artifact.try_get("owner_run_id").ok();
-        let artifact_root_run_id: Option<String> = artifact.try_get("root_run_id").ok();
+        let artifact_user = artifact.user_id;
+        let scope = artifact.access_scope;
+        let owner_run_id = artifact.owner_run_id;
+        let artifact_root_run_id = artifact.root_run_id;
 
         if owner_run_id.as_deref() == Some(requester_run_id) {
             return Ok(true);
@@ -1069,14 +1331,17 @@ impl DatabaseStateProjectionStore {
             return Ok(false);
         }
         if self
-            .has_artifact_grant(artifact_id, requester_run_id, requester_delegation_id)
+            .has_artifact_grant(
+                artifact_id,
+                requester_user_id,
+                &requester_run.session_id,
+                requester_run_id,
+                requester_delegation_id,
+            )
             .await?
         {
             return Ok(true);
         }
-        let Some(requester_run) = self.load_run_acl(requester_run_id).await? else {
-            return Ok(false);
-        };
         let artifact_root = artifact_root_run_id.unwrap_or_default();
         match scope.as_str() {
             "private" => Ok(false),
@@ -1086,7 +1351,10 @@ impl DatabaseStateProjectionStore {
                 let Some(owner_run_id) = owner_run_id else {
                     return Ok(false);
                 };
-                let Some(owner_run) = self.load_run_acl(&owner_run_id).await? else {
+                let Some(owner_run) = self
+                    .load_run_acl_for_user(requester_user_id, &owner_run_id)
+                    .await?
+                else {
                     return Ok(false);
                 };
                 let same_root = requester_run.root_run_id == owner_run.root_run_id;
@@ -1198,27 +1466,27 @@ impl DatabaseStateProjectionStore {
             entity: backlog_pool_id.to_string(),
             source,
         })?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| row.try_get::<String, _>("todo_id").ok())
-            .collect())
+        rows.into_iter()
+            .map(|row| decode_backlog_todo_id(&row, backlog_pool_id))
+            .collect()
     }
 
     pub async fn create_retry_run_and_supersede(
         &self,
+        user_id: &str,
         old_run_id: &str,
         new_run_id: &str,
         retry_scope: &str,
     ) -> Result<(), StateProjectionError> {
         validate_retry_scope(new_run_id, retry_scope)?;
-        let old =
-            self.load_run_acl(old_run_id)
-                .await?
-                .ok_or_else(|| StateProjectionError::Database {
-                    operation: "load_old_retry_run",
-                    entity: old_run_id.to_string(),
-                    source: sqlx::Error::RowNotFound,
-                })?;
+        let old = self
+            .load_run_acl_for_user(user_id, old_run_id)
+            .await?
+            .ok_or_else(|| StateProjectionError::Database {
+                operation: "load_old_retry_run",
+                entity: old_run_id.to_string(),
+                source: sqlx::Error::RowNotFound,
+            })?;
         let mut tx =
             self.pool
                 .get()
@@ -1229,9 +1497,12 @@ impl DatabaseStateProjectionStore {
                     entity: old_run_id.to_string(),
                     source,
                 })?;
-        sqlx::query(
-            "UPDATE agent_runs SET status = 'superseded', updated_at = NOW(6) WHERE run_id = ?",
+        let supersede = sqlx::query(
+            "UPDATE agent_runs
+             SET status = 'superseded', updated_at = NOW(6)
+             WHERE user_id = ? AND run_id = ?",
         )
+        .bind(user_id)
         .bind(old_run_id)
         .execute(&mut *tx)
         .await
@@ -1240,6 +1511,13 @@ impl DatabaseStateProjectionStore {
             entity: old_run_id.to_string(),
             source,
         })?;
+        if supersede.rows_affected() == 0 {
+            return Err(StateProjectionError::Database {
+                operation: "supersede_old_run",
+                entity: old_run_id.to_string(),
+                source: sqlx::Error::RowNotFound,
+            });
+        }
         let root = old.root_run_id.unwrap_or_else(|| old_run_id.to_string());
         let parent_path = old.ancestor_path.unwrap_or_else(|| old_run_id.to_string());
         sqlx::query(
@@ -1276,11 +1554,13 @@ impl DatabaseStateProjectionStore {
     async fn has_artifact_grant(
         &self,
         artifact_id: &str,
+        user_id: &str,
+        session_id: &str,
         requester_run_id: &str,
         requester_delegation_id: Option<&str>,
     ) -> Result<bool, StateProjectionError> {
         if self
-            .has_artifact_run_grant(artifact_id, requester_run_id)
+            .has_artifact_run_grant(artifact_id, user_id, session_id, requester_run_id)
             .await?
         {
             return Ok(true);
@@ -1290,22 +1570,33 @@ impl DatabaseStateProjectionStore {
             return Ok(false);
         };
 
-        self.has_artifact_delegation_grant(artifact_id, requester_delegation_id)
-            .await
+        self.has_artifact_delegation_grant(
+            artifact_id,
+            user_id,
+            session_id,
+            requester_delegation_id,
+        )
+        .await
     }
 
     async fn has_artifact_run_grant(
         &self,
         artifact_id: &str,
+        user_id: &str,
+        session_id: &str,
         requester_run_id: &str,
     ) -> Result<bool, StateProjectionError> {
         let row = sqlx::query(
             "SELECT grant_id FROM session_artifacts_grants FORCE INDEX (idx_artifacts_grants_target)
-             WHERE target_run_id = ?
+             WHERE user_id = ?
+               AND session_id = ?
+               AND target_run_id = ?
                AND artifact_id = ?
                AND (expires_at IS NULL OR expires_at > NOW(6))
              LIMIT 1",
         )
+        .bind(user_id)
+        .bind(session_id)
         .bind(requester_run_id)
         .bind(artifact_id)
         .fetch_optional(self.pool.get())
@@ -1321,15 +1612,21 @@ impl DatabaseStateProjectionStore {
     async fn has_artifact_delegation_grant(
         &self,
         artifact_id: &str,
+        user_id: &str,
+        session_id: &str,
         requester_delegation_id: &str,
     ) -> Result<bool, StateProjectionError> {
         let row = sqlx::query(
             "SELECT grant_id FROM session_artifacts_grants FORCE INDEX (idx_artifacts_grants_delegation_target)
-             WHERE target_delegation_id = ?
+             WHERE user_id = ?
+               AND session_id = ?
+               AND target_delegation_id = ?
                AND artifact_id = ?
                AND (expires_at IS NULL OR expires_at > NOW(6))
              LIMIT 1",
         )
+        .bind(user_id)
+        .bind(session_id)
         .bind(requester_delegation_id)
         .bind(artifact_id)
         .fetch_optional(self.pool.get())
@@ -1342,58 +1639,48 @@ impl DatabaseStateProjectionStore {
         Ok(row.is_some())
     }
 
-    async fn load_run_acl(&self, run_id: &str) -> Result<Option<RunAclRow>, StateProjectionError> {
+    async fn load_run_acl_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RunAclRow>, StateProjectionError> {
         let row = sqlx::query(
             "SELECT run_id, user_id, session_id, root_run_id, ancestor_path, depth
-             FROM agent_runs WHERE run_id = ?",
+             FROM agent_runs WHERE user_id = ? AND run_id = ?",
         )
+        .bind(user_id)
         .bind(run_id)
         .fetch_optional(self.pool.get())
         .await
         .map_err(|source| StateProjectionError::Database {
-            operation: "load_run_acl",
+            operation: "load_run_acl_for_user",
             entity: run_id.to_string(),
             source,
         })?;
-        Ok(row.map(|row| RunAclRow {
-            user_id: row.try_get("user_id").unwrap_or_default(),
-            session_id: row.try_get("session_id").unwrap_or_default(),
-            root_run_id: row.try_get("root_run_id").ok(),
-            ancestor_path: row.try_get("ancestor_path").ok(),
-            depth: row.try_get::<i64, _>("depth").unwrap_or(0).max(0) as u32,
-        }))
+        row.map(|row| decode_run_acl_row(&row, run_id)).transpose()
     }
 
-    async fn load_run_projection(
+    async fn load_run_projection_for_user(
         &self,
+        user_id: &str,
         run_id: &str,
     ) -> Result<Option<RunProjectionRow>, StateProjectionError> {
         let row = sqlx::query(
             "SELECT run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path,
                     depth, delegation_id, agent_id, retry_of, retry_scope
-             FROM agent_runs WHERE run_id = ?",
+             FROM agent_runs WHERE user_id = ? AND run_id = ?",
         )
+        .bind(user_id)
         .bind(run_id)
         .fetch_optional(self.pool.get())
         .await
         .map_err(|source| StateProjectionError::Database {
-            operation: "load_run_projection",
+            operation: "load_run_projection_for_user",
             entity: run_id.to_string(),
             source,
         })?;
-        Ok(row.map(|row| RunProjectionRow {
-            run_id: row.try_get("run_id").unwrap_or_default(),
-            user_id: row.try_get("user_id").unwrap_or_default(),
-            session_id: row.try_get("session_id").unwrap_or_default(),
-            parent_run_id: row.try_get("parent_run_id").ok(),
-            root_run_id: row.try_get("root_run_id").ok(),
-            ancestor_path: row.try_get("ancestor_path").ok(),
-            depth: row.try_get::<i64, _>("depth").unwrap_or(0).max(0) as u32,
-            delegation_id: row.try_get("delegation_id").ok(),
-            agent_id: row.try_get("agent_id").ok(),
-            retry_of: row.try_get("retry_of").ok(),
-            retry_scope: row.try_get("retry_scope").ok(),
-        }))
+        row.map(|row| decode_run_projection_row(&row, run_id))
+            .transpose()
     }
 }
 
@@ -1485,6 +1772,140 @@ pub fn validate_state_mutation(mutation: &str) -> Result<(), StateProjectionErro
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct FakeStateProjectionRow {
+        failed_column: Option<&'static str>,
+        i64_overrides: Vec<(&'static str, i64)>,
+    }
+
+    impl FakeStateProjectionRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                i64_overrides: Vec::new(),
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_i64(column: &'static str, value: i64) -> Self {
+            Self {
+                i64_overrides: vec![(column, value)],
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl StateProjectionDbRow for FakeStateProjectionRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "item_id" => "item-1",
+                "category" => "decision",
+                "item_key" => "key-1",
+                "user_id" => "user-1",
+                "session_id" => "session-1",
+                "status" => "active",
+                "access_scope" => "delegation",
+                "todo_id" => "todo-1",
+                "run_id" => "run-1",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "summary_text" => Some("summary".to_string()),
+                "owner_run_id" => Some("owner-run".to_string()),
+                "root_run_id" => Some("root-run".to_string()),
+                "ancestor_path" => Some("root-run/run-1".to_string()),
+                "parent_run_id" => Some("parent-run".to_string()),
+                "delegation_id" => Some("delegation-1".to_string()),
+                "agent_id" => Some("agent-1".to_string()),
+                "retry_of" => Some("old-run".to_string()),
+                "retry_scope" => Some("node".to_string()),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if let Some((_, value)) = self
+                .i64_overrides
+                .iter()
+                .find(|(candidate, _)| *candidate == column)
+            {
+                return Ok(*value);
+            }
+            Ok(match column {
+                "active_count" => 1,
+                "violations" => 0,
+                "token_estimate" => 42,
+                "depth" => 2,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+    }
+
+    fn assert_database_error_mentions(
+        result: Result<impl std::fmt::Debug, StateProjectionError>,
+        needle: &str,
+    ) {
+        let err = result.expect_err("decode should fail");
+        match err {
+            StateProjectionError::Database { source, .. } => {
+                assert!(
+                    source.to_string().contains(needle),
+                    "source error should contain `{needle}`, got `{source}`"
+                );
+            }
+            other => panic!("expected database decode error, got {other:?}"),
+        }
+    }
+
+    fn assert_invalid_database_value(
+        result: Result<impl std::fmt::Debug, StateProjectionError>,
+        column: &'static str,
+    ) {
+        let err = result.expect_err("decode should fail");
+        assert!(
+            matches!(err, StateProjectionError::InvalidDatabaseValue { column: actual, .. } if actual == column),
+            "expected invalid database value for {column}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_database_value_display_omits_entity_and_value() {
+        let err = StateProjectionError::InvalidDatabaseValue {
+            operation: "decode_projection",
+            entity: "user-sensitive/session-sensitive".to_string(),
+            column: "token_estimate",
+            value: "secret-value".to_string(),
+            reason: "expected u32 range",
+        };
+        let display = err.to_string();
+        assert!(display.contains("decode_projection"));
+        assert!(display.contains("token_estimate"));
+        assert!(!display.contains("user-sensitive"));
+        assert!(!display.contains("session-sensitive"));
+        assert!(!display.contains("secret-value"));
+    }
+
     #[test]
     fn compaction_invariants_are_owner_bound() {
         for invariant in COMPACTION_INVARIANT_SQL {
@@ -1538,5 +1959,177 @@ mod tests {
             error,
             StateProjectionError::InvalidMutation { mutation } if mutation == "teleport"
         ));
+    }
+
+    #[test]
+    fn state_projection_counter_decoders_fail_loudly() {
+        assert_eq!(
+            state_projection_row_non_negative_i64(
+                &FakeStateProjectionRow::complete(),
+                "can_compact_session",
+                "session-1",
+                "active_count",
+            )
+            .expect("active_count decodes"),
+            1
+        );
+        assert_database_error_mentions(
+            state_projection_row_non_negative_i64(
+                &FakeStateProjectionRow::fail_on("active_count"),
+                "can_compact_session",
+                "session-1",
+                "active_count",
+            ),
+            "active_count",
+        );
+        assert_invalid_database_value(
+            state_projection_row_non_negative_i64(
+                &FakeStateProjectionRow::with_i64("active_count", -1),
+                "can_compact_session",
+                "session-1",
+                "active_count",
+            ),
+            "active_count",
+        );
+    }
+
+    #[test]
+    fn user_anchor_memory_decode_preserves_values_and_fails_loudly() {
+        let item = decode_user_anchor_memory_item(&FakeStateProjectionRow::complete(), "user-1")
+            .expect("anchor memory decodes");
+        assert_eq!(item.item_id, "item-1");
+        assert_eq!(item.category, "decision");
+        assert_eq!(item.item_key, "key-1");
+        assert_eq!(item.summary_text.as_deref(), Some("summary"));
+        assert_eq!(item.token_estimate, 42);
+
+        for column in [
+            "item_id",
+            "category",
+            "item_key",
+            "summary_text",
+            "token_estimate",
+        ] {
+            assert_database_error_mentions(
+                decode_user_anchor_memory_item(&FakeStateProjectionRow::fail_on(column), "user-1"),
+                column,
+            );
+        }
+        assert_invalid_database_value(
+            decode_user_anchor_memory_item(
+                &FakeStateProjectionRow::with_i64("token_estimate", -1),
+                "user-1",
+            ),
+            "token_estimate",
+        );
+        assert_invalid_database_value(
+            decode_user_anchor_memory_item(
+                &FakeStateProjectionRow::with_i64("token_estimate", i64::from(u32::MAX) + 1),
+                "user-1",
+            ),
+            "token_estimate",
+        );
+    }
+
+    #[test]
+    fn artifact_acl_and_backlog_todo_decode_fail_loudly() {
+        let artifact = decode_artifact_acl_row(&FakeStateProjectionRow::complete(), "artifact-1")
+            .expect("artifact acl decodes");
+        assert_eq!(artifact.user_id, "user-1");
+        assert_eq!(artifact.access_scope, "delegation");
+        assert_eq!(artifact.owner_run_id.as_deref(), Some("owner-run"));
+        assert_eq!(artifact.root_run_id.as_deref(), Some("root-run"));
+        assert_eq!(artifact.status, "active");
+
+        for column in [
+            "user_id",
+            "access_scope",
+            "owner_run_id",
+            "root_run_id",
+            "status",
+        ] {
+            assert_database_error_mentions(
+                decode_artifact_acl_row(&FakeStateProjectionRow::fail_on(column), "artifact-1"),
+                column,
+            );
+        }
+
+        assert_eq!(
+            decode_backlog_todo_id(&FakeStateProjectionRow::complete(), "pool-1")
+                .expect("todo id decodes"),
+            "todo-1"
+        );
+        assert_database_error_mentions(
+            decode_backlog_todo_id(&FakeStateProjectionRow::fail_on("todo_id"), "pool-1"),
+            "todo_id",
+        );
+    }
+
+    #[test]
+    fn run_acl_and_projection_decode_fail_loudly() {
+        let acl =
+            decode_run_acl_row(&FakeStateProjectionRow::complete(), "run-1").expect("acl decodes");
+        assert_eq!(acl.user_id, "user-1");
+        assert_eq!(acl.session_id, "session-1");
+        assert_eq!(acl.root_run_id.as_deref(), Some("root-run"));
+        assert_eq!(acl.ancestor_path.as_deref(), Some("root-run/run-1"));
+        assert_eq!(acl.depth, 2);
+
+        for column in [
+            "user_id",
+            "session_id",
+            "root_run_id",
+            "ancestor_path",
+            "depth",
+        ] {
+            assert_database_error_mentions(
+                decode_run_acl_row(&FakeStateProjectionRow::fail_on(column), "run-1"),
+                column,
+            );
+        }
+        assert_invalid_database_value(
+            decode_run_acl_row(&FakeStateProjectionRow::with_i64("depth", -1), "run-1"),
+            "depth",
+        );
+        assert_invalid_database_value(
+            decode_run_acl_row(
+                &FakeStateProjectionRow::with_i64("depth", i64::from(u32::MAX) + 1),
+                "run-1",
+            ),
+            "depth",
+        );
+
+        let projection = decode_run_projection_row(&FakeStateProjectionRow::complete(), "run-1")
+            .expect("projection decodes");
+        assert_eq!(projection.run_id, "run-1");
+        assert_eq!(projection.user_id, "user-1");
+        assert_eq!(projection.session_id, "session-1");
+        assert_eq!(projection.parent_run_id.as_deref(), Some("parent-run"));
+        assert_eq!(projection.root_run_id.as_deref(), Some("root-run"));
+        assert_eq!(projection.ancestor_path.as_deref(), Some("root-run/run-1"));
+        assert_eq!(projection.depth, 2);
+        assert_eq!(projection.delegation_id.as_deref(), Some("delegation-1"));
+        assert_eq!(projection.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(projection.retry_of.as_deref(), Some("old-run"));
+        assert_eq!(projection.retry_scope.as_deref(), Some("node"));
+
+        for column in [
+            "run_id",
+            "user_id",
+            "session_id",
+            "parent_run_id",
+            "root_run_id",
+            "ancestor_path",
+            "depth",
+            "delegation_id",
+            "agent_id",
+            "retry_of",
+            "retry_scope",
+        ] {
+            assert_database_error_mentions(
+                decode_run_projection_row(&FakeStateProjectionRow::fail_on(column), "run-1"),
+                column,
+            );
+        }
     }
 }

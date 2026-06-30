@@ -99,38 +99,27 @@ pub struct QuirksData {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheProtocolData {
-    #[serde(alias = "MarkerExplicit")]
     MarkerExplicit,
-    #[serde(alias = "BedrockCachePoint")]
     BedrockCachePoint,
-    #[serde(alias = "OpenAiAutoPrefix")]
-    #[serde(alias = "openai_auto_prefix")]
+    #[serde(rename = "openai_auto_prefix")]
     OpenAiAutoPrefix,
-    #[serde(alias = "StrictHistoryMatch")]
     StrictHistoryMatch,
-    #[serde(alias = "None")]
     None,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheVolatilePlacementData {
-    #[serde(alias = "MarkerIsolated")]
     MarkerIsolated,
-    #[serde(alias = "TailSuffix")]
     TailSuffix,
-    #[serde(alias = "CurrentUserOnly")]
     CurrentUserOnly,
-    #[serde(alias = "Free")]
     Free,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheReuseScopeData {
-    #[serde(alias = "ConversationTurns")]
     ConversationTurns,
-    #[serde(alias = "IntraTurnRounds")]
     IntraTurnRounds,
 }
 
@@ -286,13 +275,20 @@ impl ThinkingCapability {
             "effort_only" => Some(Self::EffortOnly),
             "native_only" => Some(Self::NativeOnly),
             "none" => Some(Self::None),
-            other => {
-                tracing::warn!(
-                    value = other,
-                    "unknown thinking_capability value in DB — treating as unprobed"
-                );
-                Option::None
-            }
+            _ => Option::None,
+        }
+    }
+
+    fn try_from_db_column(s: Option<&str>) -> Result<Option<Self>, String> {
+        match s {
+            None => Ok(None),
+            Some("both") => Ok(Some(Self::Both)),
+            Some("effort_only") => Ok(Some(Self::EffortOnly)),
+            Some("native_only") => Ok(Some(Self::NativeOnly)),
+            Some("none") => Ok(Some(Self::None)),
+            Some(other) => Err(format!(
+                "invalid infra_llm_models.thinking_capability: {other}"
+            )),
         }
     }
 
@@ -457,42 +453,28 @@ fn build_resolved_active_llm_from_row(
         .try_get("api_key_encrypted")
         .map_err(|e| e.to_string())?;
     let base_url: String = row
-        .try_get("base_url")
-        .ok()
-        .flatten()
+        .try_get::<Option<String>, _>("base_url")
+        .map_err(|e| e.to_string())?
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    let provider: String = row
-        .try_get("provider")
-        .unwrap_or_else(|_| "openai".to_string());
+    let provider: String = row.try_get("provider").map_err(|e| e.to_string())?;
     let api_key = encryptor
         .decrypt(&encrypted)
         .map_err(|e| format!("Decrypt: {e}"))?;
 
     let quirks_json: String = row
         .try_get("quirks_json")
-        .unwrap_or_else(|_| "{}".to_string());
-    let quirks: QuirksData = match serde_json::from_str(&quirks_json) {
-        Ok(q) => q,
-        Err(e) => {
-            let prefix = &quirks_json[..quirks_json.len().min(200)];
-            tracing::error!(
-                target: "astra_services::models",
-                column = "quirks_json",
-                err = %e,
-                payload_prefix = %prefix,
-                "malformed JSON column, using default"
-            );
-            QuirksData::default()
-        }
-    };
+        .map_err(|e| format!("invalid infra_llm_models.quirks: {e}"))?;
+    let quirks: QuirksData = parse_json_column("quirks_json", &quirks_json)?;
 
     let tags_json: String = row
         .try_get("tags_json")
-        .unwrap_or_else(|_| "[]".to_string());
-    let tags: Vec<String> = parse_json_column("tags_json", &tags_json, Vec::new);
+        .map_err(|e| format!("invalid infra_llm_models.tags: {e}"))?;
+    let tags: Vec<String> = parse_json_column("tags_json", &tags_json)?;
 
-    let thinking_cap_str: Option<String> = row.try_get("thinking_capability").ok().flatten();
-    let thinking_capability = ThinkingCapability::from_db(thinking_cap_str.as_deref());
+    let thinking_cap_str: Option<String> = row
+        .try_get("thinking_capability")
+        .map_err(|e| format!("invalid infra_llm_models.thinking_capability: {e}"))?;
+    let thinking_capability = ThinkingCapability::try_from_db_column(thinking_cap_str.as_deref())?;
 
     let fallback_chain = quirks.fallback_chain;
     let wire_model_name = quirks.wire_model_name;
@@ -500,7 +482,10 @@ fn build_resolved_active_llm_from_row(
     let request_body_overrides = quirks.request_body_overrides;
     let request_headers = quirks.request_headers;
 
-    let context_window: Option<i32> = row.try_get("context_window").ok().flatten();
+    let context_window: i32 = row
+        .try_get("context_window")
+        .map_err(|e| format!("invalid infra_llm_models.context_window: {e}"))?;
+    let context_window = model_context_window_from_db(context_window, &model_name)?;
 
     Ok(ResolvedActiveLlmModel {
         model_name,
@@ -513,7 +498,7 @@ fn build_resolved_active_llm_from_row(
         request_body_overrides,
         prompt_cache_capability,
         thinking_capability,
-        context_window: context_window.map(|cw| cw as u32),
+        context_window: Some(context_window),
         request_headers,
     })
 }
@@ -723,10 +708,10 @@ pub fn format_inactive_model_error(requested: &str, canonical: &str) -> String {
 /// Shared columns for all model-resolution queries.
 const RESOLVE_COLS: &str = "\
     model_name, api_key_encrypted, base_url, provider, \
-    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, \
-    IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json, \
-    IFNULL(CAST(tags AS CHAR), '[]') AS tags_json, \
-    thinking_capability";
+    CAST(quirks AS CHAR) AS quirks_json, \
+    CAST(pricing AS CHAR) AS pricing_json, \
+    CAST(tags AS CHAR) AS tags_json, \
+    thinking_capability, context_window";
 const REQUIRED_MODEL_SELECTION_ERROR: &str =
     astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE;
 
@@ -826,7 +811,9 @@ pub async fn resolve_active_llm_model(
         }
     };
 
-    let is_active_int: i16 = row.try_get("is_active").unwrap_or(0);
+    let is_active_int: i16 = row
+        .try_get("is_active")
+        .map_err(|e| format!("invalid infra_llm_models.is_active: {e}"))?;
     if is_active_int == 0 {
         return Err(format_inactive_model_error(name, &canonical));
     }
@@ -878,31 +865,38 @@ pub async fn resolve_reasoning_model(
         );
     }
 
-    // Pick the row with the lowest completion price. See [`rank_cheapest_index`].
     let entries: Vec<(String, String)> = rows
         .iter()
         .map(|row| {
-            let name: String = row.try_get("model_name").unwrap_or_default();
+            let name: String = row
+                .try_get("model_name")
+                .map_err(|e| format!("invalid infra_llm_models.model_name: {e}"))?;
             let pricing_json: String = row
                 .try_get("pricing_json")
-                .unwrap_or_else(|_| "{}".to_string());
-            (name, pricing_json)
+                .map_err(|e| format!("invalid infra_llm_models.pricing: {e}"))?;
+            Ok((name, pricing_json))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
+    // Pick the row with the lowest completion price. See [`rank_cheapest_index`].
     let best_idx = rank_cheapest_index(&entries);
     build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
 }
 
-fn row_has_selector_tag(row: &sqlx::mysql::MySqlRow) -> bool {
+fn row_has_selector_tag(row: &sqlx::mysql::MySqlRow) -> Result<bool, String> {
     let tags_json: String = row
         .try_get("tags_json")
-        .unwrap_or_else(|_| "[]".to_string());
-    tags_json.contains("\"selector\"")
+        .map_err(|e| format!("invalid infra_llm_models.tags: {e}"))?;
+    let tags: Vec<String> = parse_json_column("tags_json", &tags_json)?;
+    Ok(tags.iter().any(|tag| tag == "selector"))
 }
 
-fn row_thinking_capability(row: &sqlx::mysql::MySqlRow) -> Option<ThinkingCapability> {
-    let thinking_cap_str: Option<String> = row.try_get("thinking_capability").ok().flatten();
-    ThinkingCapability::from_db(thinking_cap_str.as_deref())
+fn row_thinking_capability(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<Option<ThinkingCapability>, String> {
+    let thinking_cap_str: Option<String> = row
+        .try_get("thinking_capability")
+        .map_err(|e| format!("invalid infra_llm_models.thinking_capability: {e}"))?;
+    ThinkingCapability::try_from_db_column(thinking_cap_str.as_deref())
 }
 
 /// Priority tiers for model sorting in the memory-selector chain.
@@ -945,39 +939,35 @@ fn memory_model_priority(
     }
 }
 
-fn rank_memory_model_candidate_indices(rows: &[sqlx::mysql::MySqlRow]) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..rows.len()).collect();
-    indices.sort_by(|left, right| {
-        let left_row = &rows[*left];
-        let right_row = &rows[*right];
-        let left_priority = memory_model_priority(
-            row_has_selector_tag(left_row),
-            row_thinking_capability(left_row),
-        );
-        let right_priority = memory_model_priority(
-            row_has_selector_tag(right_row),
-            row_thinking_capability(right_row),
-        );
-        left_priority
-            .cmp(&right_priority)
+fn rank_memory_model_candidate_indices(
+    rows: &[sqlx::mysql::MySqlRow],
+) -> Result<Vec<usize>, String> {
+    let mut keys: Vec<(usize, u8, f64, String)> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let priority =
+                memory_model_priority(row_has_selector_tag(row)?, row_thinking_capability(row)?);
+            let pricing_json: String = row
+                .try_get("pricing_json")
+                .map_err(|e| format!("invalid infra_llm_models.pricing: {e}"))?;
+            let name: String = row
+                .try_get("model_name")
+                .map_err(|e| format!("invalid infra_llm_models.model_name: {e}"))?;
+            Ok((index, priority, score_completion(&pricing_json), name))
+        })
+        .collect::<Result<_, String>>()?;
+    keys.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
             .then_with(|| {
-                let left_pricing: String = left_row
-                    .try_get("pricing_json")
-                    .unwrap_or_else(|_| "{}".to_string());
-                let right_pricing: String = right_row
-                    .try_get("pricing_json")
-                    .unwrap_or_else(|_| "{}".to_string());
-                score_completion(&left_pricing)
-                    .partial_cmp(&score_completion(&right_pricing))
+                left.2
+                    .partial_cmp(&right.2)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .then_with(|| {
-                let left_name: String = left_row.try_get("model_name").unwrap_or_default();
-                let right_name: String = right_row.try_get("model_name").unwrap_or_default();
-                left_name.cmp(&right_name)
-            })
+            .then_with(|| left.3.cmp(&right.3))
     });
-    indices
+    Ok(keys.into_iter().map(|(index, _, _, _)| index).collect())
 }
 
 /// Resolve ordered candidates for memory-related decisions (relevance
@@ -1009,7 +999,7 @@ pub async fn resolve_memory_models(
         return Err("No active LLM model configured.".to_string());
     }
 
-    rank_memory_model_candidate_indices(&rows)
+    rank_memory_model_candidate_indices(&rows)?
         .into_iter()
         .map(|index| build_resolved_active_llm_from_row(&rows[index], encryptor))
         .collect()
@@ -1066,6 +1056,47 @@ fn score_completion(pricing_json: &str) -> f64 {
         .unwrap_or(f64::INFINITY)
 }
 
+fn validate_context_window_value(value: i32, field: &str) -> Result<u32, String> {
+    if value <= 0 {
+        Err(format!(
+            "{field} must be a positive token count, got {value}"
+        ))
+    } else {
+        Ok(value as u32)
+    }
+}
+
+fn require_create_context_window(
+    value: Option<i32>,
+) -> Result<i32, (StatusCode, Json<ErrorResponse>)> {
+    let value = value.ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "context_window is required for registered models".to_string(),
+        )
+    })?;
+    validate_context_window_value(value, "context_window")
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+    Ok(value)
+}
+
+fn validate_update_context_window(
+    value: Option<i32>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if let Some(value) = value {
+        validate_context_window_value(value, "context_window")
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+    }
+    Ok(())
+}
+
+fn model_context_window_from_db(value: i32, model_name: &str) -> Result<u32, String> {
+    validate_context_window_value(
+        value,
+        &format!("infra_llm_models.context_window for model '{model_name}'"),
+    )
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -1113,30 +1144,13 @@ pub struct DatabaseModelService {
     encryptor: std::sync::Arc<FernetTokenEncryptor>,
 }
 
-/// Parse a JSON column with explicit error logging on malformed payloads.
-///
-/// Replaces silent `serde_json::from_str(..).unwrap_or_default()` patterns so
-/// data corruption in MatrixOne JSON columns is observable in logs (target
-/// `astra_services::models`) instead of degrading silently to defaults.
-fn parse_json_column<T, F>(column: &'static str, raw: &str, default: F) -> T
+/// Parse a required JSON column without degrading malformed persisted data to defaults.
+fn parse_json_column<T>(column: &'static str, raw: &str) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned,
-    F: FnOnce() -> T,
 {
-    match serde_json::from_str::<T>(raw) {
-        Ok(v) => v,
-        Err(e) => {
-            let prefix = &raw[..raw.len().min(200)];
-            tracing::error!(
-                target: "astra_services::models",
-                column,
-                err = %e,
-                payload_prefix = %prefix,
-                "malformed JSON column, using default"
-            );
-            default()
-        }
-    }
+    serde_json::from_str::<T>(raw)
+        .map_err(|error| format!("invalid infra_llm_models.{column}: {error}"))
 }
 
 impl DatabaseModelService {
@@ -1154,30 +1168,28 @@ impl DatabaseModelService {
     fn model_record_from_row(
         row: sqlx::mysql::MySqlRow,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        let is_active_int: i16 = row.try_get("is_active").unwrap_or(1);
+        let is_active_int: i16 = row.try_get("is_active").map_err(internal_error)?;
         let input_mod_json: String = row
             .try_get("input_modalities_json")
-            .unwrap_or_else(|_| r#"["text"]"#.to_string());
+            .map_err(internal_error)?;
         let output_mod_json: String = row
             .try_get("output_modalities_json")
-            .unwrap_or_else(|_| r#"["text"]"#.to_string());
+            .map_err(internal_error)?;
         let supported_json: String = row
             .try_get("supported_parameters_json")
-            .unwrap_or_else(|_| "[]".to_string());
-        let pricing_json: String = row
-            .try_get("pricing_json")
-            .unwrap_or_else(|_| "{}".to_string());
-        let tags_json: String = row
-            .try_get("tags_json")
-            .unwrap_or_else(|_| "[]".to_string());
-        let quirks_json: String = row
-            .try_get("quirks_json")
-            .unwrap_or_else(|_| "{}".to_string());
+            .map_err(internal_error)?;
+        let pricing_json: String = row.try_get("pricing_json").map_err(internal_error)?;
+        let tags_json: String = row.try_get("tags_json").map_err(internal_error)?;
+        let quirks_json: String = row.try_get("quirks_json").map_err(internal_error)?;
 
-        let thinking_cap_str: Option<String> = row.try_get("thinking_capability").ok().flatten();
-        let thinking_capability = ThinkingCapability::from_db(thinking_cap_str.as_deref());
-        let thinking_probe_error: Option<String> =
-            row.try_get("thinking_probe_error").ok().flatten();
+        let thinking_cap_str: Option<String> =
+            row.try_get("thinking_capability").map_err(internal_error)?;
+        let thinking_capability =
+            ThinkingCapability::try_from_db_column(thinking_cap_str.as_deref())
+                .map_err(internal_error)?;
+        let thinking_probe_error: Option<String> = row
+            .try_get("thinking_probe_error")
+            .map_err(internal_error)?;
 
         // Build ThinkingProbeResult when the model has been probed (capability is known)
         // OR when a probe error exists (probe ran but failed — surface the error).
@@ -1195,33 +1207,32 @@ impl DatabaseModelService {
             // Never probed.
             (None, None) => None,
         };
+        let model_name: String = row.try_get("model_name").map_err(internal_error)?;
+        let context_window: i32 = row.try_get("context_window").map_err(internal_error)?;
+        let context_window = model_context_window_from_db(context_window, &model_name)
+            .map_err(internal_error)? as i32;
 
         Ok(ModelRecord {
             model_id: row.try_get("model_id").map_err(internal_error)?,
-            name: row.try_get("model_name").map_err(internal_error)?,
+            name: model_name,
             provider: row.try_get("provider").map_err(internal_error)?,
-            base_url: row.try_get("base_url").ok(),
-            description: row.try_get("description").ok(),
+            base_url: row.try_get("base_url").map_err(internal_error)?,
+            description: row.try_get("description").map_err(internal_error)?,
             is_active: is_active_int != 0,
-            context_window: row.try_get("context_window").unwrap_or(128000),
-            max_completion_tokens: row.try_get("max_completion_tokens").ok(),
-            input_modalities: parse_json_column("input_modalities_json", &input_mod_json, || {
-                vec!["text".to_string()]
-            }),
-            output_modalities: parse_json_column(
-                "output_modalities_json",
-                &output_mod_json,
-                || vec!["text".to_string()],
-            ),
-            supported_parameters: parse_json_column(
-                "supported_parameters_json",
-                &supported_json,
-                Default::default,
-            ),
-            pricing: parse_json_column("pricing_json", &pricing_json, Default::default),
-            architecture: row.try_get("architecture").ok(),
-            tags: parse_json_column("tags_json", &tags_json, Default::default),
-            quirks: parse_json_column("quirks_json", &quirks_json, Default::default),
+            context_window,
+            max_completion_tokens: row
+                .try_get("max_completion_tokens")
+                .map_err(internal_error)?,
+            input_modalities: parse_json_column("input_modalities_json", &input_mod_json)
+                .map_err(internal_error)?,
+            output_modalities: parse_json_column("output_modalities_json", &output_mod_json)
+                .map_err(internal_error)?,
+            supported_parameters: parse_json_column("supported_parameters_json", &supported_json)
+                .map_err(internal_error)?,
+            pricing: parse_json_column("pricing_json", &pricing_json).map_err(internal_error)?,
+            architecture: row.try_get("architecture").map_err(internal_error)?,
+            tags: parse_json_column("tags_json", &tags_json).map_err(internal_error)?,
+            quirks: parse_json_column("quirks_json", &quirks_json).map_err(internal_error)?,
             connectivity: None,
             thinking_capability,
             thinking_probe,
@@ -1239,19 +1250,18 @@ impl DatabaseModelService {
 
 pub const MODEL_SELECT_COLS: &str = "\
     model_id, model_name, provider, base_url, description, is_active, \
-    IFNULL(context_window, 128000) AS context_window, max_completion_tokens, architecture, \
-    IFNULL(CAST(input_modalities AS CHAR), '[\"text\"]') AS input_modalities_json, \
-    IFNULL(CAST(output_modalities AS CHAR), '[\"text\"]') AS output_modalities_json, \
-    IFNULL(CAST(supported_parameters AS CHAR), '[]') AS supported_parameters_json, \
-    IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json, \
-    IFNULL(CAST(tags AS CHAR), '[]') AS tags_json, \
-    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, \
+    context_window, max_completion_tokens, architecture, \
+    CAST(input_modalities AS CHAR) AS input_modalities_json, \
+    CAST(output_modalities AS CHAR) AS output_modalities_json, \
+    CAST(supported_parameters AS CHAR) AS supported_parameters_json, \
+    CAST(pricing AS CHAR) AS pricing_json, \
+    CAST(tags AS CHAR) AS tags_json, \
+    CAST(quirks AS CHAR) AS quirks_json, \
     thinking_capability, thinking_probe_error";
 const MODEL_LIST_SELECT_COLS: &str = "\
     model_id, model_name, provider, description, is_active, \
-    IFNULL(context_window, 128000) AS context_window, max_completion_tokens, architecture, \
-    thinking_capability, \
-    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json";
+    context_window, max_completion_tokens, architecture, \
+    thinking_capability";
 const MAX_MODEL_LIST_ROWS: i64 = 200;
 
 #[async_trait]
@@ -1262,6 +1272,7 @@ impl ModelService for DatabaseModelService {
         request: ModelCreateRequestData,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let context_window = require_create_context_window(request.context_window)?;
 
         let existing =
             query("SELECT model_id FROM infra_llm_models WHERE model_name = ? AND provider = ?")
@@ -1344,7 +1355,7 @@ impl ModelService for DatabaseModelService {
         .bind(&base_url)
         .bind(&request.description)
         .bind(is_active)
-        .bind(request.context_window.unwrap_or(128000))
+        .bind(context_window)
         .bind(request.max_completion_tokens)
         .bind(&input_mod)
         .bind(&output_mod)
@@ -1399,19 +1410,27 @@ impl ModelService for DatabaseModelService {
 
         let mut models = Vec::with_capacity(rows.len());
         for row in rows {
-            let is_active_int: i16 = row.try_get("is_active").unwrap_or(1);
+            let is_active_int: i16 = row.try_get("is_active").map_err(internal_error)?;
+            let name: String = row.try_get("model_name").map_err(internal_error)?;
+            let context_window: i32 = row.try_get("context_window").map_err(internal_error)?;
+            let context_window =
+                model_context_window_from_db(context_window, &name).map_err(internal_error)? as i32;
             models.push(ModelListItem {
                 model_id: row.try_get("model_id").map_err(internal_error)?,
-                name: row.try_get("model_name").map_err(internal_error)?,
+                name,
                 provider: row.try_get("provider").map_err(internal_error)?,
-                description: row.try_get("description").ok(),
+                description: row.try_get("description").map_err(internal_error)?,
                 is_active: is_active_int != 0,
-                context_window: row.try_get("context_window").unwrap_or(128000),
-                max_completion_tokens: row.try_get("max_completion_tokens").ok(),
-                architecture: row.try_get("architecture").ok(),
+                context_window,
+                max_completion_tokens: row
+                    .try_get("max_completion_tokens")
+                    .map_err(internal_error)?,
+                architecture: row.try_get("architecture").map_err(internal_error)?,
                 thinking_capability: {
-                    let cap_str: Option<String> = row.try_get("thinking_capability").ok().flatten();
-                    ThinkingCapability::from_db(cap_str.as_deref())
+                    let cap_str: Option<String> =
+                        row.try_get("thinking_capability").map_err(internal_error)?;
+                    ThinkingCapability::try_from_db_column(cap_str.as_deref())
+                        .map_err(internal_error)?
                 },
             });
         }
@@ -1447,10 +1466,11 @@ impl ModelService for DatabaseModelService {
         request: ModelUpdateRequestData,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        validate_update_context_window(request.context_window)?;
 
         let existing = query(
             "SELECT model_id, base_url, provider, \
-                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json \
+                    CAST(quirks AS CHAR) AS quirks_json \
              FROM infra_llm_models WHERE model_name = ?",
         )
         .bind(&model_name)
@@ -1464,23 +1484,16 @@ impl ModelService for DatabaseModelService {
             )
         })?;
         let _model_id: String = existing.try_get("model_id").map_err(internal_error)?;
-        let stored_provider: String = existing
-            .try_get("provider")
-            .unwrap_or_else(|_| {
-                tracing::warn!(model = %model_name, "provider column NULL or missing, defaulting to openai");
-                "openai".to_string()
-            });
+        let stored_provider: String = existing.try_get("provider").map_err(internal_error)?;
         let effective_provider = request.provider.as_deref().unwrap_or(&stored_provider);
 
         // Compute the upstream probe name: request's incoming quirks
         // (when re-sync supplies a new wire_model_name) takes precedence;
         // otherwise fall back to the stored quirks from DB; otherwise the
         // local row name.
-        let stored_quirks_json: String = existing
-            .try_get("quirks_json")
-            .unwrap_or_else(|_| "{}".to_string());
+        let stored_quirks_json: String = existing.try_get("quirks_json").map_err(internal_error)?;
         let stored_quirks: QuirksData =
-            serde_json::from_str(&stored_quirks_json).unwrap_or_default();
+            parse_json_column("quirks_json", &stored_quirks_json).map_err(internal_error)?;
         let probe_name: String = request
             .quirks
             .as_ref()
@@ -1492,10 +1505,9 @@ impl ModelService for DatabaseModelService {
 
         if let Some(api_key) = &request.api_key {
             let encrypted = self.encryptor.encrypt(api_key).map_err(internal_error)?;
-            let base_url: Option<String> = request
-                .base_url
-                .clone()
-                .or_else(|| existing.try_get("base_url").ok());
+            let stored_base_url: Option<String> =
+                existing.try_get("base_url").map_err(internal_error)?;
+            let base_url: Option<String> = request.base_url.clone().or(stored_base_url);
             let check = validate_connectivity(
                 effective_provider,
                 &probe_name,
@@ -1540,7 +1552,7 @@ impl ModelService for DatabaseModelService {
             };
             ($field:ident, $col:expr, json) => {
                 if let Some(val) = &request.$field {
-                    let json_str = serde_json::to_string(val).unwrap_or_else(|_| "{}".to_string());
+                    let json_str = serde_json::to_string(val).map_err(internal_error)?;
                     let sql = format!("UPDATE infra_llm_models SET {} = ?, updated_at = NOW() WHERE model_name = ?", $col);
                     query(&sql).bind(&json_str).bind(&model_name).execute(&pool).await.map_err(internal_error)?;
                 }
@@ -1615,7 +1627,7 @@ impl ModelService for DatabaseModelService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let row = query(
             "SELECT api_key_encrypted, provider, base_url, \
-                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json \
+                    CAST(quirks AS CHAR) AS quirks_json \
              FROM infra_llm_models WHERE model_name = ?",
         )
         .bind(&model_name)
@@ -1631,11 +1643,10 @@ impl ModelService for DatabaseModelService {
 
         let encrypted: String = row.try_get("api_key_encrypted").map_err(internal_error)?;
         let provider: String = row.try_get("provider").map_err(internal_error)?;
-        let base_url: Option<String> = row.try_get("base_url").ok();
-        let quirks_json: String = row
-            .try_get("quirks_json")
-            .unwrap_or_else(|_| "{}".to_string());
-        let quirks: QuirksData = serde_json::from_str(&quirks_json).unwrap_or_default();
+        let base_url: Option<String> = row.try_get("base_url").map_err(internal_error)?;
+        let quirks_json: String = row.try_get("quirks_json").map_err(internal_error)?;
+        let quirks: QuirksData =
+            parse_json_column("quirks_json", &quirks_json).map_err(internal_error)?;
         // For probes we send the UPSTREAM name (wire_model_name override)
         // rather than the local row name, so the probe actually reaches a
         // valid upstream model id. Without this, alias rows like
@@ -2901,6 +2912,42 @@ mod tests {
         assert!(p.prompt < 0.0);
     }
 
+    #[test]
+    fn create_model_requires_explicit_positive_context_window() {
+        let missing = require_create_context_window(None).expect_err("missing must fail");
+        assert_eq!(missing.0, StatusCode::BAD_REQUEST);
+        assert!(missing.1.0.detail.contains("context_window is required"));
+
+        let zero = require_create_context_window(Some(0)).expect_err("zero must fail");
+        assert_eq!(zero.0, StatusCode::BAD_REQUEST);
+        assert!(zero.1.0.detail.contains("positive token count"));
+
+        assert_eq!(
+            require_create_context_window(Some(1_000_000)).unwrap(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn update_model_rejects_non_positive_context_window() {
+        assert!(validate_update_context_window(None).is_ok());
+        let negative = validate_update_context_window(Some(-1)).expect_err("negative must fail");
+        assert_eq!(negative.0, StatusCode::BAD_REQUEST);
+        assert!(negative.1.0.detail.contains("positive token count"));
+    }
+
+    #[test]
+    fn db_context_window_must_be_positive_before_runtime_resolution() {
+        assert_eq!(
+            model_context_window_from_db(1_000_000, "deepseek-v4-pro").unwrap(),
+            1_000_000
+        );
+        let error = model_context_window_from_db(0, "broken-model")
+            .expect_err("zero DB context window must fail loud");
+        assert!(error.contains("broken-model"));
+        assert!(error.contains("positive token count"));
+    }
+
     // -- wire_model_name alias --
 
     #[test]
@@ -3004,8 +3051,8 @@ mod tests {
     }
 
     #[test]
-    fn quirks_prompt_cache_capability_accepts_legacy_variant_names() {
-        let q: QuirksData = serde_json::from_str(
+    fn quirks_prompt_cache_capability_rejects_non_canonical_variant_names() {
+        let err = serde_json::from_str::<QuirksData>(
             r#"{
                 "prompt_cache_capability": {
                     "protocol": "StrictHistoryMatch",
@@ -3014,16 +3061,8 @@ mod tests {
                 }
             }"#,
         )
-        .unwrap();
-
-        assert_eq!(
-            q.prompt_cache_capability,
-            Some(PromptCacheCapabilityData {
-                protocol: PromptCacheProtocolData::StrictHistoryMatch,
-                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
-                reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
-            })
-        );
+        .expect_err("prompt-cache enum values must use canonical snake_case");
+        assert!(err.is_data(), "unexpected error shape: {err}");
     }
 
     #[test]
@@ -3163,14 +3202,6 @@ mod tests {
             prompt_cache_capability_from_models_yaml("missing", Some(&nested)),
             None
         );
-    }
-
-    #[test]
-    fn quirks_unwrap_or_default_on_malformed_gives_safe_defaults() {
-        // This mimics the production pattern in models.rs line 203
-        let malformed = "not json at all";
-        let quirks: QuirksData = serde_json::from_str(malformed).unwrap_or_default();
-        assert_eq!(quirks, QuirksData::default());
     }
 
     // -- ModelListItemResponse / conversions --

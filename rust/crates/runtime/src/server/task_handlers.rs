@@ -89,14 +89,10 @@ pub(super) async fn get_task_handler(
     let task = state
         .execution
         .task_service
-        .get_task(&task_id)
+        .get_task(&user.user_id, &task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
-
-    if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
-    }
 
     Ok(Json(task))
 }
@@ -114,14 +110,10 @@ pub(super) async fn task_progress_handler(
     let task = state
         .execution
         .task_service
-        .get_task(&task_id)
+        .get_task(&user.user_id, &task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
-
-    if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
-    }
 
     // Read plan-progress events from the session journal.
     let session_id = query
@@ -169,7 +161,7 @@ pub(super) async fn create_task_handler(
     let task = state
         .execution
         .task_service
-        .get_task(&task_id)
+        .get_task(&user.user_id, &task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| {
@@ -191,16 +183,13 @@ pub(super) async fn update_task_status_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
 
-    let task = state
+    let _task = state
         .execution
         .task_service
-        .get_task(&task_id)
+        .get_task(&user.user_id, &task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
-    if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
-    }
 
     let status =
         parse_task_status_filter("status", Some(payload.status.as_str()))?.ok_or_else(|| {
@@ -210,7 +199,7 @@ pub(super) async fn update_task_status_handler(
     state
         .execution
         .task_service
-        .update_status(&task_id, status)
+        .update_status(&user.user_id, &task_id, status)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -242,16 +231,13 @@ pub(super) async fn get_task_lease_handler(
     Path(task_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let task = state
+    let _task = state
         .execution
         .task_service
-        .get_task(&task_id)
+        .get_task(&user.user_id, &task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
-    if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
-    }
 
     let view = state
         .execution
@@ -279,16 +265,13 @@ pub(super) async fn post_task_lease_claim_handler(
             "edge_agent_id required",
         ));
     }
-    let task = state
+    let _task = state
         .execution
         .task_service
-        .get_task(&task_id)
+        .get_task(&user.user_id, &task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
-    if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
-    }
 
     let edge_id = edge_id_header(&headers);
     let ttl = body.ttl_sec.unwrap_or(300);
@@ -344,16 +327,13 @@ pub(super) async fn post_task_lease_release_handler(
             "edge_agent_id required",
         ));
     }
-    let task = state
+    let _task = state
         .execution
         .task_service
-        .get_task(&task_id)
+        .get_task(&user.user_id, &task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
-    if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
-    }
 
     let released = state
         .execution
@@ -378,16 +358,13 @@ pub(super) async fn post_task_lease_renew_handler(
             "edge_agent_id required",
         ));
     }
-    let task = state
+    let _task = state
         .execution
         .task_service
-        .get_task(&task_id)
+        .get_task(&user.user_id, &task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
-    if task.user_id != user.user_id {
-        return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
-    }
 
     let edge_id = edge_id_header(&headers);
     let ttl = body.ttl_sec.unwrap_or(300);
@@ -711,16 +688,13 @@ pub(super) async fn task_rpc_handler(
             .and_then(|v| v.as_str())
             .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'task_id' in args"))?
             .to_string();
-        let task = state
+        let _task = state
             .execution
             .task_service
-            .get_task(&task_id)
+            .get_task(user_id, &task_id)
             .await
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "task not found"))?;
-        if task.user_id != user_id {
-            return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
-        }
         Ok(task_id)
     }
 
@@ -752,16 +726,12 @@ pub(super) async fn task_rpc_handler(
             let task = state
                 .execution
                 .task_service
-                .get_task(task_id)
+                .get_task(&user.user_id, task_id)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            // Return None for non-owned tasks the same way as missing
-            // (avoid leaking existence). Wrap as JSON value so client
-            // can deserialize into Option<TaskRecord>.
+            // Wrap as JSON value so client can deserialize into Option<TaskRecord>.
             match task {
-                Some(t) if t.user_id == user.user_id => {
-                    serde_json::to_value(&t).unwrap_or(serde_json::Value::Null)
-                }
+                Some(t) => serde_json::to_value(&t).unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             }
         }
@@ -825,7 +795,7 @@ pub(super) async fn task_rpc_handler(
             state
                 .execution
                 .task_service
-                .update_status(&task_id, status)
+                .update_status(&user.user_id, &task_id, status)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })
@@ -838,7 +808,7 @@ pub(super) async fn task_rpc_handler(
             state
                 .execution
                 .task_service
-                .update_progress(&task_id, pct, done, total)
+                .update_progress(&user.user_id, &task_id, pct, done, total)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })
@@ -849,7 +819,7 @@ pub(super) async fn task_rpc_handler(
             state
                 .execution
                 .task_service
-                .save_checkpoint(&task_id, &checkpoint)
+                .save_checkpoint(&user.user_id, &task_id, &checkpoint)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })
@@ -860,7 +830,7 @@ pub(super) async fn task_rpc_handler(
             state
                 .execution
                 .task_service
-                .update_plan(&task_id, &plan)
+                .update_plan(&user.user_id, &task_id, &plan)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })
@@ -871,7 +841,7 @@ pub(super) async fn task_rpc_handler(
             state
                 .execution
                 .task_service
-                .fail_task(&task_id, error_msg)
+                .fail_task(&user.user_id, &task_id, error_msg)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })
@@ -881,7 +851,7 @@ pub(super) async fn task_rpc_handler(
             state
                 .execution
                 .task_service
-                .complete_task(&task_id)
+                .complete_task(&user.user_id, &task_id)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })
@@ -892,7 +862,7 @@ pub(super) async fn task_rpc_handler(
             state
                 .execution
                 .task_service
-                .complete_task_with_outcome(&task_id, outcome)
+                .complete_task_with_outcome(&user.user_id, &task_id, outcome)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })
@@ -906,7 +876,7 @@ pub(super) async fn task_rpc_handler(
             state
                 .execution
                 .task_service
-                .complete_plan_run(&task_id, pct, done, total, outcome)
+                .complete_plan_run(&user.user_id, &task_id, pct, done, total, outcome)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })
@@ -919,7 +889,13 @@ pub(super) async fn task_rpc_handler(
             state
                 .execution
                 .task_service
-                .record_feedback(&task_id, rating, outcome, completion_time_sec)
+                .record_feedback(
+                    &user.user_id,
+                    &task_id,
+                    rating,
+                    outcome,
+                    completion_time_sec,
+                )
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })
@@ -929,7 +905,7 @@ pub(super) async fn task_rpc_handler(
             state
                 .execution
                 .task_service
-                .increment_replan_count(&task_id)
+                .increment_replan_count(&user.user_id, &task_id)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })
@@ -940,7 +916,7 @@ pub(super) async fn task_rpc_handler(
             let template_id = state
                 .execution
                 .task_service
-                .extract_template(&task_id, goal_pattern)
+                .extract_template(&user.user_id, &task_id, goal_pattern)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             match template_id {
@@ -971,14 +947,11 @@ pub(super) async fn task_rpc_handler(
             serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null)
         }
         "record_template_usage" => {
-            // Template ownership is implicit via the user check at
-            // template creation; we don't re-verify here because
-            // templates are user-scoped at the table level.
             let template_id = required_non_empty_string_arg(&req.args, "template_id")?;
             state
                 .execution
                 .task_service
-                .record_template_usage(template_id)
+                .record_template_usage(&user.user_id, template_id)
                 .await
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             serde_json::json!({ "ok": true })

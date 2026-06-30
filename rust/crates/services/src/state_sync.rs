@@ -41,6 +41,7 @@ pub struct SyncAuditEntry {
     pub sync_type: String,
     pub direction: SyncDirection,
     pub payload_size: usize,
+    pub duration_ms: Option<u64>,
     pub status: String,
     pub error_message: Option<String>,
 }
@@ -140,21 +141,151 @@ async fn run_audit_flusher(
     }
 }
 
+fn audit_insert_sql(row_count: usize) -> String {
+    let mut sql = String::from(
+        "INSERT INTO session_sync_log \
+         (sync_id, user_id, session_id, sync_type, sync_direction, \
+          payload_size, duration_ms, status, error_message, created_at) VALUES ",
+    );
+    for i in 0..row_count {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())");
+    }
+    sql
+}
+
+fn audit_duration_ms_value(duration_ms: Option<u64>) -> Option<i64> {
+    duration_ms.map(|ms| i64::try_from(ms).unwrap_or(i64::MAX))
+}
+
+trait PreferenceSyncRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
+    fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error>;
+}
+
+impl PreferenceSyncRow for sqlx::mysql::MySqlRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error> {
+        self.try_get(column)
+    }
+}
+
+fn decode_existing_preference_row(row: &impl PreferenceSyncRow) -> Result<(String, i32), String> {
+    let value = row
+        .string_column("pref_value")
+        .map_err(|e| format!("push_pref decode pref_value: {e}"))?;
+    let version = row
+        .i32_column("version")
+        .map_err(|e| format!("push_pref decode version: {e}"))?;
+    Ok((value, version))
+}
+
+fn decode_preference_pair(row: &impl PreferenceSyncRow) -> Result<(String, String), String> {
+    let key = row
+        .string_column("pref_key")
+        .map_err(|e| format!("pull_all_prefs decode pref_key: {e}"))?;
+    let value = row
+        .string_column("pref_value")
+        .map_err(|e| format!("pull_all_prefs decode pref_value: {e}"))?;
+    Ok((key, value))
+}
+
+fn next_preference_version(old_version: i32) -> Result<i32, String> {
+    old_version
+        .checked_add(1)
+        .ok_or_else(|| format!("preference version overflow: {old_version}"))
+}
+
+trait SyncStatusRow {
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error>;
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error>;
+    fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error>;
+}
+
+impl SyncStatusRow for sqlx::mysql::MySqlRow {
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+        self.try_get(column)
+    }
+}
+
+fn sync_status_decode_error(column: &str, source: sqlx::Error) -> String {
+    format!("sync status decode {column}: {source}")
+}
+
+fn decode_pending_sync_count(row: &impl SyncStatusRow) -> Result<u32, String> {
+    let count = row
+        .i64_column("cnt")
+        .map_err(|e| sync_status_decode_error("cnt", e))?;
+    if count < 0 {
+        return Err(format!(
+            "sync status decode cnt: invalid negative count {count}"
+        ));
+    }
+    u32::try_from(count).map_err(|_| format!("sync status decode cnt: count too large {count}"))
+}
+
+fn decode_sync_duration_ms(row: &impl SyncStatusRow, column: &str) -> Result<Option<u64>, String> {
+    let Some(duration) = row
+        .optional_i64_column(column)
+        .map_err(|e| sync_status_decode_error(column, e))?
+    else {
+        return Ok(None);
+    };
+    if duration < 0 {
+        return Err(format!(
+            "sync status decode {column}: invalid negative duration {duration}"
+        ));
+    }
+    Ok(Some(duration as u64))
+}
+
+type LatestSyncRow = (Option<String>, Option<String>, Option<u64>);
+
+fn decode_latest_sync_row(row: &impl SyncStatusRow) -> Result<LatestSyncRow, String> {
+    let sync_type = row
+        .optional_string_column("sync_type")
+        .map_err(|e| sync_status_decode_error("sync_type", e))?;
+    let status = row
+        .optional_string_column("status")
+        .map_err(|e| sync_status_decode_error("status", e))?;
+    let duration_ms = decode_sync_duration_ms(row, "duration_ms")?;
+    Ok((sync_type, status, duration_ms))
+}
+
+fn decode_last_sync_error(row: &impl SyncStatusRow) -> Result<Option<String>, String> {
+    row.optional_string_column("error_message")
+        .map_err(|e| sync_status_decode_error("error_message", e))
+}
+
+fn degraded_sync_status(error: impl Into<String>) -> SyncStatus {
+    SyncStatus {
+        preferences_last_sync: None,
+        pending_pushes: 0,
+        last_error: Some(error.into()),
+        last_sync_type: None,
+        last_sync_status: Some("error".to_string()),
+        last_sync_duration_ms: None,
+    }
+}
+
 async fn flush_audit_batch(pool: &sqlx::Pool<sqlx::MySql>, buf: &mut Vec<SyncAuditEntry>) {
     if buf.is_empty() {
         return;
     }
-    let mut sql = String::from(
-        "INSERT INTO session_sync_log \
-         (sync_id, user_id, session_id, sync_type, sync_direction, \
-          payload_size, status, error_message, created_at) VALUES ",
-    );
-    for (i, _) in buf.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        sql.push_str("(?, ?, ?, ?, ?, ?, ?, ?, NOW())");
-    }
+    let sql = audit_insert_sql(buf.len());
     let mut q = sqlx::query(&sql);
     for entry in buf.iter() {
         let dir_str = match entry.direction {
@@ -168,6 +299,7 @@ async fn flush_audit_batch(pool: &sqlx::Pool<sqlx::MySql>, buf: &mut Vec<SyncAud
             .bind(&entry.sync_type)
             .bind(dir_str)
             .bind(entry.payload_size as i64)
+            .bind(audit_duration_ms_value(entry.duration_ms))
             .bind(&entry.status)
             .bind(entry.error_message.as_deref());
     }
@@ -398,6 +530,9 @@ pub struct SyncStatus {
     pub preferences_last_sync: Option<String>,
     pub pending_pushes: u32,
     pub last_error: Option<String>,
+    pub last_sync_type: Option<String>,
+    pub last_sync_status: Option<String>,
+    pub last_sync_duration_ms: Option<u64>,
 }
 
 // ─── State Sync Service Trait ───────────────────────────────────────────────
@@ -518,6 +653,45 @@ impl MatrixOneSyncService {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>, audit: SyncAuditWriter) -> Self {
         Self { pool, audit }
     }
+
+    async fn status_result(&self) -> Result<SyncStatus, String> {
+        let pending_row =
+            sqlx::query("SELECT COUNT(*) as cnt FROM session_sync_log WHERE status = 'pending'")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| format!("sync status pending count query: {e}"))?;
+        let pending = decode_pending_sync_count(&pending_row)?;
+
+        let latest_sync = sqlx::query(
+            "SELECT sync_type, status, duration_ms FROM session_sync_log \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("sync status latest sync query: {e}"))?
+        .map(|row| decode_latest_sync_row(&row))
+        .transpose()?;
+
+        let last_err = sqlx::query(
+            "SELECT error_message FROM session_sync_log \
+             WHERE status = 'error' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("sync status latest error query: {e}"))?
+        .map(|row| decode_last_sync_error(&row))
+        .transpose()?
+        .flatten();
+
+        Ok(SyncStatus {
+            preferences_last_sync: None,
+            pending_pushes: pending,
+            last_error: last_err,
+            last_sync_type: latest_sync.as_ref().and_then(|row| row.0.clone()),
+            last_sync_status: latest_sync.as_ref().and_then(|row| row.1.clone()),
+            last_sync_duration_ms: latest_sync.as_ref().and_then(|row| row.2),
+        })
+    }
 }
 
 #[async_trait]
@@ -532,16 +706,25 @@ impl StateSyncService for MatrixOneSyncService {
         .bind(user_id)
         .bind(key)
         .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten();
+        .await;
 
-        let (old_value, old_version): (Option<String>, Option<i32>) = {
-            use sqlx::Row;
-            match &old_row {
-                Some(row) => (row.try_get("pref_value").ok(), row.try_get("version").ok()),
-                None => (None, None),
+        let old_row = match old_row {
+            Ok(row) => row,
+            Err(e) => {
+                return SyncResult::err(
+                    SyncDirection::Push,
+                    "preference",
+                    format!("push_pref read existing preference: {e}"),
+                );
             }
+        };
+
+        let (old_value, old_version): (Option<String>, i32) = match &old_row {
+            Some(row) => match decode_existing_preference_row(row) {
+                Ok((value, version)) => (Some(value), version),
+                Err(e) => return SyncResult::err(SyncDirection::Push, "preference", e),
+            },
+            None => (None, 0),
         };
 
         // Skip write if value unchanged
@@ -549,7 +732,10 @@ impl StateSyncService for MatrixOneSyncService {
             return SyncResult::ok(SyncDirection::Push, "preference", 0);
         }
 
-        let new_version = old_version.unwrap_or(0) + 1;
+        let new_version = match next_preference_version(old_version) {
+            Ok(version) => version,
+            Err(e) => return SyncResult::err(SyncDirection::Push, "preference", e),
+        };
 
         // Upsert with version increment
         let update_result = sqlx::query(
@@ -640,16 +826,7 @@ impl StateSyncService for MatrixOneSyncService {
         .await
         .map_err(|e| format!("pull_all_prefs: {e}"))?;
 
-        use sqlx::Row;
-        let prefs = rows
-            .iter()
-            .filter_map(|row| {
-                let key: String = row.try_get("pref_key").ok()?;
-                let val: String = row.try_get("pref_value").ok()?;
-                Some((key, val))
-            })
-            .collect();
-        Ok(prefs)
+        rows.iter().map(decode_preference_pair).collect()
     }
 
     async fn pull_plan_templates_pack(&self, user_id: &str) -> Result<String, String> {
@@ -657,7 +834,7 @@ impl StateSyncService for MatrixOneSyncService {
             "SELECT template_id, user_id, goal_pattern, project_type, template_json, \
               success_rate, avg_completion_time, use_count \
               FROM plan_templates \
-              WHERE user_id = ? OR user_id IS NULL \
+              WHERE user_id = ? \
               ORDER BY updated_at DESC \
               LIMIT ?",
         )
@@ -774,24 +951,22 @@ impl StateSyncService for MatrixOneSyncService {
         //    unbounded history on every pull).
         let mut step_runs: Vec<PlanStepRunSyncRow> = Vec::new();
         if !plan_ids.is_empty() {
-            let placeholders = (0..plan_ids.len())
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
+            let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
                 "SELECT run_id, plan_id, subtask_id, attempt, status, session_id, \
                         started_at, finished_at, request_id, error, artifact_ref \
                  FROM plan_step_runs \
-                 WHERE plan_id IN ({placeholders}) \
-                 ORDER BY started_at DESC \
-                 LIMIT ?"
+                 WHERE user_id = ",
             );
-            let mut q = sqlx::query(&sql);
+            query.push_bind(user_id);
+            query.push(" AND plan_id IN (");
+            let mut separated = query.separated(", ");
             for id in &plan_ids {
-                q = q.bind(id);
+                separated.push_bind(id);
             }
-            q = q.bind(MAX_PLAN_STEP_RUN_SYNC_ROWS);
-            let rows = q
+            separated.push_unseparated(") ORDER BY started_at DESC LIMIT ");
+            query.push_bind(MAX_PLAN_STEP_RUN_SYNC_ROWS);
+            let rows = query
+                .build()
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| format!("pull_plans_pack step_runs: {e}"))?;
@@ -881,16 +1056,18 @@ impl StateSyncService for MatrixOneSyncService {
         let mut stored_versions: std::collections::HashMap<String, i64> =
             std::collections::HashMap::with_capacity(owned_plans.len());
         if !owned_plans.is_empty() {
-            let placeholders = std::iter::repeat_n("?", owned_plans.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql =
-                format!("SELECT plan_id, version FROM plans WHERE plan_id IN ({placeholders})");
-            let mut q = sqlx::query(&sql);
+            let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "SELECT plan_id, version FROM plans WHERE user_id = ",
+            );
+            query.push_bind(user_id);
+            query.push(" AND plan_id IN (");
+            let mut separated = query.separated(", ");
             for plan in &owned_plans {
-                q = q.bind(&plan.plan_id);
+                separated.push_bind(&plan.plan_id);
             }
-            let rows = q
+            separated.push_unseparated(")");
+            let rows = query
+                .build()
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| format!("push_plans_pack batch select versions: {e}"))?;
@@ -966,19 +1143,19 @@ impl StateSyncService for MatrixOneSyncService {
         let mut owners: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(run_plan_ids.len());
         if !run_plan_ids.is_empty() {
-            let placeholders = std::iter::repeat_n("?", run_plan_ids.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql =
-                format!("SELECT plan_id, user_id FROM plans WHERE plan_id IN ({placeholders})");
-            let mut q = sqlx::query(&sql);
-            // Hash iteration order is random; capture the order so we can
-            // bind in the same order as the placeholders.
+            let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "SELECT plan_id, user_id FROM plans WHERE user_id = ",
+            );
+            query.push_bind(user_id);
+            query.push(" AND plan_id IN (");
+            let mut separated = query.separated(", ");
             let ordered: Vec<&str> = run_plan_ids.drain().collect();
             for id in &ordered {
-                q = q.bind(*id);
+                separated.push_bind(*id);
             }
-            let rows = q
+            separated.push_unseparated(")");
+            let rows = query
+                .build()
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| format!("push_plans_pack batch select owners: {e}"))?;
@@ -1042,10 +1219,11 @@ impl StateSyncService for MatrixOneSyncService {
             // the moment of sync.
             let res = sqlx::query(
                 "INSERT IGNORE INTO plan_step_runs \
-                     (run_id, plan_id, subtask_id, attempt, status, session_id, \
+                     (user_id, run_id, plan_id, subtask_id, attempt, status, session_id, \
                       started_at, finished_at, request_id, error, artifact_ref) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
+            .bind(user_id)
             .bind(&run.run_id)
             .bind(&run.plan_id)
             .bind(&run.subtask_id)
@@ -1100,38 +1278,9 @@ impl StateSyncService for MatrixOneSyncService {
     }
 
     async fn status(&self) -> SyncStatus {
-        let pending: u32 =
-            sqlx::query("SELECT COUNT(*) as cnt FROM session_sync_log WHERE status = 'pending'")
-                .fetch_optional(&self.pool)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|row| {
-                    use sqlx::Row;
-                    row.try_get::<i64, _>("cnt").ok().map(|c| c as u32)
-                })
-                .unwrap_or(0);
-
-        let last_err = sqlx::query(
-            "SELECT error_message FROM session_sync_log \
-             WHERE status = 'error' ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|row| {
-            use sqlx::Row;
-            row.try_get::<Option<String>, _>("error_message")
-                .ok()
-                .flatten()
-        });
-
-        SyncStatus {
-            preferences_last_sync: None,
-            pending_pushes: pending,
-            last_error: last_err,
-        }
+        self.status_result()
+            .await
+            .unwrap_or_else(degraded_sync_status)
     }
 }
 
@@ -1279,6 +1428,9 @@ mod tests {
         let status = SyncStatus::default();
         assert_eq!(status.pending_pushes, 0);
         assert!(status.last_error.is_none());
+        assert!(status.last_sync_type.is_none());
+        assert!(status.last_sync_status.is_none());
+        assert!(status.last_sync_duration_ms.is_none());
     }
 
     // ── Serialization ──
@@ -1305,6 +1457,9 @@ mod tests {
         let status = svc.status().await;
         assert!(status.last_error.is_none());
         assert_eq!(status.pending_pushes, 0);
+        assert!(status.last_sync_type.is_none());
+        assert!(status.last_sync_status.is_none());
+        assert!(status.last_sync_duration_ms.is_none());
     }
 
     // ── MatrixOneSyncService tests (mock-based) ──
@@ -1380,6 +1535,9 @@ mod tests {
         assert!(status.preferences_last_sync.is_none());
         assert_eq!(status.pending_pushes, 0);
         assert!(status.last_error.is_none());
+        assert!(status.last_sync_type.is_none());
+        assert!(status.last_sync_status.is_none());
+        assert!(status.last_sync_duration_ms.is_none());
     }
 
     #[test]
@@ -1388,6 +1546,9 @@ mod tests {
             preferences_last_sync: Some("2024-01-03T00:00:00Z".to_string()),
             pending_pushes: 3,
             last_error: Some("connection refused".to_string()),
+            last_sync_type: Some("context_trace".to_string()),
+            last_sync_status: Some("success".to_string()),
+            last_sync_duration_ms: Some(91),
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -1399,6 +1560,12 @@ mod tests {
         );
         assert_eq!(restored.pending_pushes, original.pending_pushes);
         assert_eq!(restored.last_error, original.last_error);
+        assert_eq!(restored.last_sync_type, original.last_sync_type);
+        assert_eq!(restored.last_sync_status, original.last_sync_status);
+        assert_eq!(
+            restored.last_sync_duration_ms,
+            original.last_sync_duration_ms
+        );
     }
 
     #[tokio::test]
@@ -1420,6 +1587,242 @@ mod tests {
 
         let result = svc.pull_all_preferences("user1").await;
         assert!(result.unwrap().is_empty());
+    }
+
+    struct FakePreferenceSyncRow {
+        failed_column: Option<&'static str>,
+    }
+
+    impl FakePreferenceSyncRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+            }
+        }
+    }
+
+    impl PreferenceSyncRow for FakePreferenceSyncRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            Ok(match column {
+                "pref_key" => "model",
+                "pref_value" => "gpt-5",
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn i32_column(&self, column: &str) -> Result<i32, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+
+            match column {
+                "version" => Ok(7),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    fn assert_pref_decode_error(result: Result<impl std::fmt::Debug, String>, column: &str) {
+        let error = result.unwrap_err();
+        assert!(
+            error.contains(column),
+            "preference decode error should identify `{column}`: {error}"
+        );
+    }
+
+    struct FakeSyncStatusRow {
+        failed_column: Option<&'static str>,
+        i64_overrides: Vec<(&'static str, i64)>,
+    }
+
+    impl FakeSyncStatusRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                i64_overrides: Vec::new(),
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_i64(column: &'static str, value: i64) -> Self {
+            Self {
+                i64_overrides: vec![(column, value)],
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl SyncStatusRow for FakeSyncStatusRow {
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "sync_type" => Some("preference".to_string()),
+                "status" => Some("success".to_string()),
+                "error_message" => Some("boom".to_string()),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if let Some((_, value)) = self
+                .i64_overrides
+                .iter()
+                .find(|(candidate, _)| *candidate == column)
+            {
+                return Ok(*value);
+            }
+            match column {
+                "cnt" => Ok(3),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            if let Some((_, value)) = self
+                .i64_overrides
+                .iter()
+                .find(|(candidate, _)| *candidate == column)
+            {
+                return Ok(Some(*value));
+            }
+            match column {
+                "duration_ms" => Ok(Some(91)),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    fn assert_sync_status_decode_error(result: Result<impl std::fmt::Debug, String>, needle: &str) {
+        let error = result.expect_err("decode should fail");
+        assert!(
+            error.contains(needle),
+            "sync status decode error should identify `{needle}`: {error}"
+        );
+    }
+
+    #[test]
+    fn existing_preference_decode_preserves_value_and_version() {
+        let (value, version) = decode_existing_preference_row(&FakePreferenceSyncRow::complete())
+            .expect("complete preference row should decode");
+
+        assert_eq!(value, "gpt-5");
+        assert_eq!(version, 7);
+    }
+
+    #[test]
+    fn existing_preference_decode_fails_loudly_on_bad_columns() {
+        for column in ["pref_value", "version"] {
+            assert_pref_decode_error(
+                decode_existing_preference_row(&FakePreferenceSyncRow::fail_on(column)),
+                column,
+            );
+        }
+    }
+
+    #[test]
+    fn pull_all_preference_pair_decode_preserves_key_and_value() {
+        let (key, value) = decode_preference_pair(&FakePreferenceSyncRow::complete())
+            .expect("complete preference pair row should decode");
+
+        assert_eq!(key, "model");
+        assert_eq!(value, "gpt-5");
+    }
+
+    #[test]
+    fn pull_all_preference_pair_decode_fails_loudly_on_bad_columns() {
+        for column in ["pref_key", "pref_value"] {
+            assert_pref_decode_error(
+                decode_preference_pair(&FakePreferenceSyncRow::fail_on(column)),
+                column,
+            );
+        }
+    }
+
+    #[test]
+    fn sync_status_row_decoders_preserve_values_and_fail_loudly() {
+        assert_eq!(
+            decode_pending_sync_count(&FakeSyncStatusRow::complete()).unwrap(),
+            3
+        );
+        assert_sync_status_decode_error(
+            decode_pending_sync_count(&FakeSyncStatusRow::fail_on("cnt")),
+            "cnt",
+        );
+        assert_sync_status_decode_error(
+            decode_pending_sync_count(&FakeSyncStatusRow::with_i64("cnt", -1)),
+            "negative",
+        );
+        assert_sync_status_decode_error(
+            decode_pending_sync_count(&FakeSyncStatusRow::with_i64("cnt", i64::from(u32::MAX) + 1)),
+            "too large",
+        );
+
+        let (sync_type, status, duration) =
+            decode_latest_sync_row(&FakeSyncStatusRow::complete()).unwrap();
+        assert_eq!(sync_type.as_deref(), Some("preference"));
+        assert_eq!(status.as_deref(), Some("success"));
+        assert_eq!(duration, Some(91));
+
+        for column in ["sync_type", "status", "duration_ms"] {
+            assert_sync_status_decode_error(
+                decode_latest_sync_row(&FakeSyncStatusRow::fail_on(column)),
+                column,
+            );
+        }
+        assert_sync_status_decode_error(
+            decode_latest_sync_row(&FakeSyncStatusRow::with_i64("duration_ms", -1)),
+            "negative",
+        );
+
+        assert_eq!(
+            decode_last_sync_error(&FakeSyncStatusRow::complete())
+                .unwrap()
+                .as_deref(),
+            Some("boom")
+        );
+        assert_sync_status_decode_error(
+            decode_last_sync_error(&FakeSyncStatusRow::fail_on("error_message")),
+            "error_message",
+        );
+    }
+
+    #[test]
+    fn next_preference_version_rejects_overflow() {
+        assert_eq!(next_preference_version(0).unwrap(), 1);
+        assert_eq!(next_preference_version(7).unwrap(), 8);
+
+        let err = next_preference_version(i32::MAX).unwrap_err();
+        assert!(
+            err.contains("preference version overflow"),
+            "overflow should be explicit: {err}"
+        );
     }
 
     #[test]
@@ -1464,9 +1867,26 @@ mod tests {
             sync_type: "test".into(),
             direction: SyncDirection::Push,
             payload_size: i,
+            duration_ms: Some(i as u64),
             status: "success".into(),
             error_message: None,
         }
+    }
+
+    #[test]
+    fn audit_insert_sql_records_duration_ms_as_first_class_column() {
+        let sql = audit_insert_sql(2);
+
+        assert!(sql.contains("payload_size, duration_ms, status"));
+        assert_eq!(sql.matches("NOW()").count(), 2);
+        assert_eq!(sql.matches("(?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())").count(), 2);
+    }
+
+    #[test]
+    fn audit_duration_ms_value_preserves_none_and_clamps_overflow() {
+        assert_eq!(audit_duration_ms_value(None), None);
+        assert_eq!(audit_duration_ms_value(Some(42)), Some(42));
+        assert_eq!(audit_duration_ms_value(Some(u64::MAX)), Some(i64::MAX));
     }
 
     fn dummy_pool() -> sqlx::Pool<sqlx::MySql> {
@@ -1475,6 +1895,24 @@ mod tests {
             .acquire_timeout(std::time::Duration::from_millis(1))
             .connect_lazy("mysql://invalid:x@127.0.0.1:1/none")
             .expect("lazy pool")
+    }
+
+    #[tokio::test]
+    async fn matrix_status_surfaces_database_failures_as_degraded_status() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let svc = MatrixOneSyncService::new(dummy_pool(), SyncAuditWriter { tx });
+
+        let status = svc.status().await;
+
+        assert_eq!(status.pending_pushes, 0);
+        assert_eq!(status.last_sync_status.as_deref(), Some("error"));
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("sync status pending count query")),
+            "status should surface the DB failure instead of pretending healthy: {status:?}"
+        );
     }
 
     #[test]

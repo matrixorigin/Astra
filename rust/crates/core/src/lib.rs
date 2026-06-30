@@ -11,6 +11,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
+pub mod canonical_names;
+
 /// Global cap on the sum of `max_connections` across all pools.
 /// Prevents unbounded pool creation from exhausting database connections.
 /// Override with `ASTRA_DB_GLOBAL_MAX_CONNECTIONS` env var.
@@ -396,7 +398,8 @@ pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{
-    ClassifiedError, ErrorKind, classify_llm_error, classify_tool_output, is_context_window_error,
+    ClassifiedError, ErrorKind, classify_llm_error_message, classify_tool_output,
+    is_llm_context_window_error,
 };
 pub use observation::{
     ErrorStreak, EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,

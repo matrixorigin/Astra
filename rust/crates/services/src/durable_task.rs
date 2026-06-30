@@ -17,10 +17,14 @@ use std::sync::Arc;
 
 use astra_logging::redact_known_secret_patterns;
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::event_ingestion::{IngestionEvent, IngestionSender};
 use crate::task_orchestrator::{TaskCheckpoint, TaskPlan};
+pub use crate::verification::{
+    SubtaskVerificationReport, VerificationCriterion, VerificationResult, VerifierKind,
+};
 
 /// Build a reqwest client for durable-task HTTP callbacks.
 ///
@@ -38,7 +42,7 @@ fn build_client_for_url(_url: &str) -> reqwest::Client {
         .expect("durable-task HTTP client config must be valid")
 }
 
-/// Maximum `task_verification_results` rows loaded per task (unbounded `fetch_all` guard).
+/// Maximum `verification_results` rows loaded per contract (unbounded `fetch_all` guard).
 const MAX_VERIFICATION_HISTORY_ROWS: i64 = 10_000;
 
 fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -103,7 +107,7 @@ pub trait LlmJudge: Send + Sync {
 /// agent's context window.
 ///
 /// Key differences from edge-side `HttpLlmJudge`:
-/// - Persists evaluation results in the cloud `task_verification_results` table
+/// - Persists evaluation results in the cloud `verification_results` table
 /// - Can use a separate (cheaper/faster) model configured for cloud verification
 /// - Results are immediately available for cross-session auditing
 ///
@@ -131,6 +135,7 @@ pub struct CloudJudgePersistContext {
     pub task_id: Option<String>,
     pub subtask_id: Option<String>,
     pub session_id: Option<String>,
+    pub user_id: Option<String>,
 }
 
 /// Configuration for the cloud LLM judge.
@@ -181,6 +186,18 @@ impl CloudLlmJudge {
         }
     }
 
+    pub fn set_persist_context(&self, context: CloudJudgePersistContext) {
+        match self.persist_context.lock() {
+            Ok(mut guard) => *guard = context,
+            Err(_) => {
+                tracing::warn!(
+                    target: "astra_services::durable_task",
+                    "failed to set cloud judge persist context because the mutex is poisoned"
+                );
+            }
+        }
+    }
+
     /// Persist an evaluation result to the cloud database.
     async fn persist_result(
         &self,
@@ -202,10 +219,51 @@ impl CloudLlmJudge {
             .ok()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let contract_id = ctx.contract_id.as_deref().unwrap_or("unknown");
-        let task_id = ctx.task_id.as_deref().unwrap_or("unknown");
-        let subtask_id = ctx.subtask_id.as_deref().unwrap_or("unknown");
-        let session_id = ctx.session_id.as_deref().unwrap_or("unknown");
+        let Some(contract_id) = ctx.contract_id.as_deref() else {
+            tracing::warn!(
+                target: "astra_services::durable_task",
+                "skipping cloud judge result persistence without contract_id"
+            );
+            return;
+        };
+        let Some(task_id) = ctx.task_id.as_deref() else {
+            tracing::warn!(
+                target: "astra_services::durable_task",
+                contract_id = %contract_id,
+                "skipping cloud judge result persistence without task_id"
+            );
+            return;
+        };
+        let Some(subtask_id) = ctx.subtask_id.as_deref() else {
+            tracing::warn!(
+                target: "astra_services::durable_task",
+                contract_id = %contract_id,
+                task_id = %task_id,
+                "skipping cloud judge result persistence without subtask_id"
+            );
+            return;
+        };
+        let Some(session_id) = ctx.session_id.as_deref() else {
+            tracing::warn!(
+                target: "astra_services::durable_task",
+                contract_id = %contract_id,
+                task_id = %task_id,
+                subtask_id = %subtask_id,
+                "skipping cloud judge result persistence without session_id"
+            );
+            return;
+        };
+        let Some(user_id) = ctx.user_id.as_deref() else {
+            tracing::warn!(
+                target: "astra_services::durable_task",
+                contract_id = %contract_id,
+                task_id = %task_id,
+                subtask_id = %subtask_id,
+                session_id = %session_id,
+                "skipping cloud judge result persistence without user_id"
+            );
+            return;
+        };
 
         let result_id = {
             use std::hash::{Hash, Hasher};
@@ -221,11 +279,12 @@ impl CloudLlmJudge {
         };
 
         let evidence_with_score = format!("score={score:.2}; {evidence}");
+        let status = if passed { "passed" } else { "failed" };
         if let Err(e) = sqlx::query(
-            "INSERT INTO task_verification_results \
+            "INSERT INTO verification_results \
              (result_id, contract_id, task_id, subtask_id, criterion_id, \
-              session_id, passed, evidence, expected, duration_ms, error_message) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              session_id, user_id, status, evidence, expected, duration_ms, error_message) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&result_id)
         .bind(contract_id)
@@ -233,7 +292,8 @@ impl CloudLlmJudge {
         .bind(subtask_id)
         .bind(criterion_id)
         .bind(session_id)
-        .bind(i16::from(passed))
+        .bind(user_id)
+        .bind(status)
         .bind(&evidence_with_score)
         .bind("cloud_llm_judge")
         .bind(duration_ms as i64)
@@ -636,16 +696,247 @@ impl ContractStatus {
         }
     }
 
-    pub fn parse(s: &str) -> Self {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        Self::try_parse(s).ok_or_else(|| format!("unknown contract status `{s}`"))
+    }
+
+    pub fn try_parse(s: &str) -> Option<Self> {
         match s {
-            "draft" => Self::Draft,
-            "active" => Self::Active,
-            "amended" => Self::Amended,
-            "completed" => Self::Completed,
-            "abandoned" => Self::Abandoned,
-            _ => Self::Draft,
+            "draft" => Some(Self::Draft),
+            "active" => Some(Self::Active),
+            "amended" => Some(Self::Amended),
+            "completed" => Some(Self::Completed),
+            "abandoned" => Some(Self::Abandoned),
+            _ => None,
         }
     }
+}
+
+trait DurableTaskDbRow {
+    fn string_column(&self, column: &'static str) -> Result<String, String>;
+    fn optional_string_column(&self, column: &'static str) -> Result<Option<String>, String>;
+    fn i32_column(&self, column: &'static str) -> Result<i32, String>;
+    fn i64_column(&self, column: &'static str) -> Result<i64, String>;
+}
+
+impl DurableTaskDbRow for sqlx::mysql::MySqlRow {
+    fn string_column(&self, column: &'static str) -> Result<String, String> {
+        use sqlx::Row;
+        self.try_get(column).map_err(|e| e.to_string())
+    }
+
+    fn optional_string_column(&self, column: &'static str) -> Result<Option<String>, String> {
+        use sqlx::Row;
+        self.try_get(column).map_err(|e| e.to_string())
+    }
+
+    fn i32_column(&self, column: &'static str) -> Result<i32, String> {
+        use sqlx::Row;
+        self.try_get(column).map_err(|e| e.to_string())
+    }
+
+    fn i64_column(&self, column: &'static str) -> Result<i64, String> {
+        use sqlx::Row;
+        self.try_get(column).map_err(|e| e.to_string())
+    }
+}
+
+fn contract_row_decode_error(column: &'static str, error: impl std::fmt::Display) -> String {
+    format!("task contract row decode column `{column}`: {error}")
+}
+
+fn contract_string_column(
+    row: &impl DurableTaskDbRow,
+    column: &'static str,
+) -> Result<String, String> {
+    row.string_column(column)
+        .map_err(|e| contract_row_decode_error(column, e))
+}
+
+fn contract_i32_column(row: &impl DurableTaskDbRow, column: &'static str) -> Result<i32, String> {
+    row.i32_column(column)
+        .map_err(|e| contract_row_decode_error(column, e))
+}
+
+fn contract_required_json_column<T: DeserializeOwned>(
+    row: &impl DurableTaskDbRow,
+    column: &'static str,
+) -> Result<T, String> {
+    let raw = row
+        .optional_string_column(column)
+        .map_err(|e| contract_row_decode_error(column, e))?
+        .ok_or_else(|| contract_row_decode_error(column, "expected JSON, found NULL"))?;
+    serde_json::from_str(&raw)
+        .map_err(|e| contract_row_decode_error(column, format!("invalid JSON: {e}")))
+}
+
+fn contract_string_json_column<T: DeserializeOwned>(
+    row: &impl DurableTaskDbRow,
+    column: &'static str,
+) -> Result<T, String> {
+    let raw = contract_string_column(row, column)?;
+    serde_json::from_str(&raw)
+        .map_err(|e| contract_row_decode_error(column, format!("invalid JSON: {e}")))
+}
+
+fn contract_version_from_row(row: &impl DurableTaskDbRow) -> Result<u32, String> {
+    let version = contract_i32_column(row, "version")?;
+    if version <= 0 {
+        return Err(contract_row_decode_error(
+            "version",
+            format!("expected positive version, got {version}"),
+        ));
+    }
+    Ok(version as u32)
+}
+
+fn contract_status_from_row(row: &impl DurableTaskDbRow) -> Result<ContractStatus, String> {
+    let status = contract_string_column(row, "status")?;
+    ContractStatus::try_parse(&status).ok_or_else(|| {
+        contract_row_decode_error("status", format!("unknown contract status `{status}`"))
+    })
+}
+
+fn decode_task_contract_row(
+    row: &impl DurableTaskDbRow,
+) -> crate::service_error::ServiceResult<TaskContract> {
+    let err = |e: String| crate::service_error::ServiceError::persistence(e);
+    Ok(TaskContract {
+        contract_id: contract_string_column(row, "contract_id").map_err(err)?,
+        task_id: contract_string_column(row, "task_id").map_err(err)?,
+        goal: contract_string_column(row, "goal").map_err(err)?,
+        scope: contract_required_json_column(row, "scope_json").map_err(err)?,
+        subtasks: contract_string_json_column(row, "subtasks_json").map_err(err)?,
+        global_verification: contract_string_json_column(row, "criteria_json").map_err(err)?,
+        version: contract_version_from_row(row).map_err(err)?,
+        status: contract_status_from_row(row).map_err(err)?,
+        created_at: contract_string_column(row, "created_at").map_err(err)?,
+        updated_at: contract_string_column(row, "updated_at").map_err(err)?,
+        domain_hint: None,
+        task_type: None,
+        last_global_results: Vec::new(),
+    })
+}
+
+fn verification_history_row_decode_error(
+    column: &'static str,
+    error: impl std::fmt::Display,
+) -> String {
+    format!("verification history row decode column `{column}`: {error}")
+}
+
+fn verification_history_string_column(
+    row: &impl DurableTaskDbRow,
+    column: &'static str,
+) -> Result<String, String> {
+    row.string_column(column)
+        .map_err(|e| verification_history_row_decode_error(column, e))
+}
+
+fn verification_history_required_text_column(
+    row: &impl DurableTaskDbRow,
+    column: &'static str,
+) -> Result<String, String> {
+    row.optional_string_column(column)
+        .map_err(|e| verification_history_row_decode_error(column, e))?
+        .ok_or_else(|| verification_history_row_decode_error(column, "expected text, found NULL"))
+}
+
+fn verification_history_optional_text_column(
+    row: &impl DurableTaskDbRow,
+    column: &'static str,
+) -> Result<Option<String>, String> {
+    row.optional_string_column(column)
+        .map_err(|e| verification_history_row_decode_error(column, e))
+}
+
+fn verification_history_passed(row: &impl DurableTaskDbRow) -> Result<bool, String> {
+    let status = verification_history_string_column(row, "status")?;
+    match status.as_str() {
+        "passed" => Ok(true),
+        "failed" => Ok(false),
+        _ => Err(verification_history_row_decode_error(
+            "status",
+            format!("invalid status value: {status}"),
+        )),
+    }
+}
+
+fn verification_history_duration_ms(row: &impl DurableTaskDbRow) -> Result<u64, String> {
+    let duration_ms = row
+        .i64_column("duration_ms")
+        .map_err(|e| verification_history_row_decode_error("duration_ms", e))?;
+    if duration_ms < 0 {
+        return Err(verification_history_row_decode_error(
+            "duration_ms",
+            format!("expected non-negative duration, got {duration_ms}"),
+        ));
+    }
+    Ok(duration_ms as u64)
+}
+
+fn decode_verification_history_row(
+    row: &impl DurableTaskDbRow,
+) -> Result<(String, VerificationResult, String), String> {
+    let subtask_id = verification_history_string_column(row, "subtask_id")?;
+    let created_at = verification_history_string_column(row, "created_at")?;
+    let result = VerificationResult {
+        criterion_id: verification_history_string_column(row, "criterion_id")?,
+        passed: verification_history_passed(row)?,
+        evidence: verification_history_required_text_column(row, "evidence")?,
+        expected: verification_history_required_text_column(row, "expected")?,
+        duration_ms: verification_history_duration_ms(row)?,
+        error: verification_history_optional_text_column(row, "error_message")?,
+    };
+    Ok((subtask_id, result, created_at))
+}
+
+fn verification_history_reports(
+    decoded_rows: impl IntoIterator<Item = (String, VerificationResult, String)>,
+) -> Result<Vec<SubtaskVerificationReport>, String> {
+    use std::collections::BTreeMap;
+
+    let mut grouped: BTreeMap<String, Vec<(VerificationResult, String)>> = BTreeMap::new();
+    for (subtask_id, result, timestamp) in decoded_rows {
+        grouped
+            .entry(subtask_id)
+            .or_default()
+            .push((result, timestamp));
+    }
+
+    let mut reports = Vec::with_capacity(grouped.len());
+    for (subtask_id, items) in grouped {
+        let timestamp = items
+            .last()
+            .map(|(_, timestamp)| timestamp.clone())
+            .ok_or_else(|| format!("verification history group `{subtask_id}` is empty"))?;
+        let results: Vec<VerificationResult> =
+            items.into_iter().map(|(result, _)| result).collect();
+        let all_required_passed = results.iter().all(|result| result.passed);
+        reports.push(SubtaskVerificationReport {
+            subtask_id,
+            all_required_passed,
+            results,
+            timestamp,
+        });
+    }
+    Ok(reports)
+}
+
+trait MoDiffCountDbRow {
+    fn i64_column(&self, column: &'static str) -> Result<i64, String>;
+}
+
+impl MoDiffCountDbRow for sqlx::mysql::MySqlRow {
+    fn i64_column(&self, column: &'static str) -> Result<i64, String> {
+        use sqlx::Row;
+        self.try_get(column).map_err(|e| e.to_string())
+    }
+}
+
+fn decode_mo_diff_count(row: &impl MoDiffCountDbRow) -> Result<i64, String> {
+    row.i64_column("cnt")
+        .map_err(|error| format!("mo_diff count row decode column `cnt`: {error}"))
 }
 
 // ─── Durable Subtask ────────────────────────────────────────────────────────
@@ -777,12 +1068,6 @@ impl SubtaskStage {
         }
     }
 }
-
-// ─── Verification ───────────────────────────────────────────────────────────
-// Types live in crate::verification; re-export for backward compatibility.
-pub use crate::verification::{
-    SubtaskVerificationReport, VerificationCriterion, VerificationResult, VerifierKind,
-};
 
 // ─── Verification Runner ────────────────────────────────────────────────────
 
@@ -1340,7 +1625,13 @@ async fn run_shell_cmd_streaming(
             _ = token.cancelled() => {
                 // audit-#3: caller asked us to stop. Send SIGKILL (start_kill is
                 // non-blocking) and tear down the reader tasks so nothing leaks.
-                let _ = child.start_kill();
+                if let Err(error) = child.start_kill() {
+                    tracing::warn!(
+                        target: "astra_services::durable_task",
+                        %error,
+                        "failed to kill cancelled verifier child process"
+                    );
+                }
                 stderr_handle.abort();
                 stdout_handle.abort();
                 return Err("cancelled".to_string());
@@ -1579,7 +1870,7 @@ impl TaskBranchOps for TaskBranchService {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| format!("diff: {e}"))?;
-        let count: i64 = sqlx::Row::try_get(&row, "cnt").unwrap_or(0);
+        let count = decode_mo_diff_count(&row)?;
         Ok(DiffSummary {
             snapshot: snapshot.to_string(),
             changed_rows: count,
@@ -2125,61 +2416,77 @@ pub trait DurableTaskLifecycle: Send + Sync {
         goal: &str,
         plan: &TaskPlan,
         scope: TaskScope,
-    ) -> Result<TaskContract, String>;
+    ) -> crate::service_error::ServiceResult<TaskContract>;
 
     async fn amend_contract(
         &self,
         contract_id: &str,
         amendment: ContractAmendment,
-    ) -> Result<TaskContract, String>;
+    ) -> crate::service_error::ServiceResult<TaskContract>;
 
-    async fn get_contract(&self, contract_id: &str) -> Result<Option<TaskContract>, String>;
+    async fn get_contract(
+        &self,
+        contract_id: &str,
+    ) -> crate::service_error::ServiceResult<Option<TaskContract>>;
 
     // ── Execution Phase ──
     async fn begin_subtask(
         &self,
         task_id: &str,
         subtask_id: &str,
-    ) -> Result<SubtaskExecutionContext, String>;
+    ) -> crate::service_error::ServiceResult<SubtaskExecutionContext>;
 
     async fn complete_subtask_execution(
         &self,
         task_id: &str,
         subtask_id: &str,
-    ) -> Result<(), String>;
+    ) -> crate::service_error::ServiceResult<()>;
 
     async fn fail_subtask(
         &self,
         task_id: &str,
         subtask_id: &str,
         error: &str,
-    ) -> Result<(), String>;
+    ) -> crate::service_error::ServiceResult<()>;
 
     // ── Verification Phase ──
     async fn verify_subtask(
         &self,
         task_id: &str,
         subtask_id: &str,
-    ) -> Result<SubtaskVerificationReport, String>;
+    ) -> crate::service_error::ServiceResult<SubtaskVerificationReport>;
 
-    async fn verify_global(&self, task_id: &str) -> Result<Vec<VerificationResult>, String>;
+    async fn verify_global(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<Vec<VerificationResult>>;
 
     // ── Resume / Recovery ──
-    async fn pause_task(&self, task_id: &str) -> Result<(), String>;
+    async fn pause_task(&self, task_id: &str) -> crate::service_error::ServiceResult<()>;
 
     async fn resume_task(
         &self,
         task_id: &str,
         session_id: &str,
-    ) -> Result<TaskResumeContext, String>;
+    ) -> crate::service_error::ServiceResult<TaskResumeContext>;
 
     // ── Delivery ──
-    async fn deliver_task(&self, task_id: &str) -> Result<TaskDeliveryReport, String>;
+    async fn deliver_task(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<TaskDeliveryReport>;
 
     // ── Git4Data ──
-    async fn snapshot_task_state(&self, task_id: &str) -> Result<String, String>;
+    async fn snapshot_task_state(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<String>;
 
-    async fn rollback_task(&self, task_id: &str, snapshot: &str) -> Result<(), String>;
+    async fn rollback_task(
+        &self,
+        task_id: &str,
+        snapshot: &str,
+    ) -> crate::service_error::ServiceResult<()>;
 }
 
 // ─── MatrixOne Implementation ───────────────────────────────────────────────
@@ -2309,7 +2616,20 @@ impl MatrixOneDurableTaskLifecycle {
 
     // ── Private Helpers ──
 
-    async fn load_contract_by_id(&self, contract_id: &str) -> Result<Option<TaskContract>, String> {
+    fn active_user_id(&self, operation: &'static str) -> crate::service_error::ServiceResult<&str> {
+        if self.user_id.trim().is_empty() {
+            return Err(crate::service_error::ServiceError::internal(format!(
+                "{operation} requires MatrixOne durable task lifecycle user context"
+            )));
+        }
+        Ok(self.user_id.as_str())
+    }
+
+    async fn load_contract_by_id(
+        &self,
+        contract_id: &str,
+    ) -> crate::service_error::ServiceResult<Option<TaskContract>> {
+        let user_id = self.active_user_id("load_contract_by_id")?;
         let row = sqlx::query(
             "SELECT contract_id, task_id, user_id, session_id, goal, \
              CAST(scope_json AS CHAR) AS scope_json, \
@@ -2318,12 +2638,15 @@ impl MatrixOneDurableTaskLifecycle {
              version, status, \
              CAST(created_at AS CHAR) AS created_at, \
              CAST(updated_at AS CHAR) AS updated_at \
-             FROM task_contracts WHERE contract_id = ?",
+             FROM task_contracts WHERE contract_id = ? AND user_id = ?",
         )
         .bind(contract_id)
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| format!("load_contract: {e}"))?;
+        .map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("load_contract: {e}"))
+        })?;
 
         match row {
             None => Ok(None),
@@ -2334,7 +2657,11 @@ impl MatrixOneDurableTaskLifecycle {
         }
     }
 
-    async fn load_contract_by_task(&self, task_id: &str) -> Result<Option<TaskContract>, String> {
+    async fn load_contract_by_task(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<Option<TaskContract>> {
+        let user_id = self.active_user_id("load_contract_by_task")?;
         let row = sqlx::query(
             "SELECT contract_id, task_id, user_id, session_id, goal, \
              CAST(scope_json AS CHAR) AS scope_json, \
@@ -2343,13 +2670,16 @@ impl MatrixOneDurableTaskLifecycle {
              version, status, \
              CAST(created_at AS CHAR) AS created_at, \
              CAST(updated_at AS CHAR) AS updated_at \
-             FROM task_contracts WHERE task_id = ? AND status != 'abandoned' \
+             FROM task_contracts WHERE user_id = ? AND task_id = ? AND status != 'abandoned' \
              ORDER BY version DESC LIMIT 1",
         )
+        .bind(user_id)
         .bind(task_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| format!("load_contract_by_task: {e}"))?;
+        .map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("load_contract_by_task: {e}"))
+        })?;
 
         match row {
             None => Ok(None),
@@ -2360,65 +2690,91 @@ impl MatrixOneDurableTaskLifecycle {
         }
     }
 
-    fn parse_contract_row(&self, row: &sqlx::mysql::MySqlRow) -> Result<TaskContract, String> {
+    async fn require_contract_scope_by_task(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<(String, String)> {
+        let user_id = self.active_user_id("require_contract_scope_by_task")?;
+        let row = sqlx::query(
+            "SELECT session_id FROM task_contracts \
+             WHERE user_id = ? AND task_id = ? AND status != 'abandoned' \
+             ORDER BY version DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!(
+                "load_contract_scope_by_task: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            crate::service_error::ServiceError::not_found(format!(
+                "no owner/session scope for task '{task_id}'"
+            ))
+        })?;
+
         use sqlx::Row;
-        let contract_id: String = row.try_get("contract_id").map_err(|e| e.to_string())?;
-        let task_id: String = row.try_get("task_id").map_err(|e| e.to_string())?;
-        let goal: String = row.try_get("goal").map_err(|e| e.to_string())?;
-        let version: i32 = row.try_get("version").unwrap_or(1);
-        let status_str: String = row.try_get("status").unwrap_or_default();
-        let created_at: String = row.try_get("created_at").unwrap_or_default();
-        let updated_at: String = row.try_get("updated_at").unwrap_or_default();
+        let session_id: String = row.try_get("session_id").map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!(
+                "load_contract_scope_by_task.session_id: {e}"
+            ))
+        })?;
 
-        let scope_json: Option<String> = row.try_get("scope_json").ok().flatten();
-        let scope: TaskScope = scope_json
-            .as_deref()
-            .and_then(|j| serde_json::from_str(j).ok())
-            .unwrap_or_default();
-
-        let subtasks_json: String = row.try_get("subtasks_json").map_err(|e| e.to_string())?;
-        let subtasks: Vec<DurableSubtask> =
-            serde_json::from_str(&subtasks_json).map_err(|e| format!("parse subtasks: {e}"))?;
-
-        let criteria_json: String = row.try_get("criteria_json").map_err(|e| e.to_string())?;
-        let global_verification: Vec<VerificationCriterion> =
-            serde_json::from_str(&criteria_json).map_err(|e| format!("parse criteria: {e}"))?;
-
-        Ok(TaskContract {
-            contract_id,
-            task_id,
-            goal,
-            scope,
-            subtasks,
-            global_verification,
-            version: version as u32,
-            status: ContractStatus::parse(&status_str),
-            created_at,
-            updated_at,
-            domain_hint: None,
-            task_type: None,
-            last_global_results: Vec::new(),
-        })
+        Ok((user_id.to_string(), session_id))
     }
 
-    /// Persist a task contract with optimistic locking.
-    /// If `user_id` and `session_id` are provided, they are included in the UPDATE SET clause
-    /// and bound in the INSERT. Otherwise, empty strings are used for new inserts and
-    /// user/session columns are not updated on existing rows.
+    fn parse_contract_row(
+        &self,
+        row: &sqlx::mysql::MySqlRow,
+    ) -> crate::service_error::ServiceResult<TaskContract> {
+        decode_task_contract_row(row)
+    }
+
+    /// Persist a task contract with optimistic locking inside the owner boundary.
     async fn persist_contract(
         &self,
         contract: &TaskContract,
         user_id: Option<&str>,
         session_id: Option<&str>,
-    ) -> Result<(), String> {
-        let scope_json =
-            serde_json::to_string(&contract.scope).map_err(|e| format!("scope json: {e}"))?;
-        let subtasks_json =
-            serde_json::to_string(&contract.subtasks).map_err(|e| format!("subtasks json: {e}"))?;
-        let criteria_json = serde_json::to_string(&contract.global_verification)
-            .map_err(|e| format!("criteria json: {e}"))?;
+    ) -> crate::service_error::ServiceResult<()> {
+        let scope_json = serde_json::to_string(&contract.scope).map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("scope json: {e}"))
+        })?;
+        let subtasks_json = serde_json::to_string(&contract.subtasks).map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("subtasks json: {e}"))
+        })?;
+        let criteria_json = serde_json::to_string(&contract.global_verification).map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("criteria json: {e}"))
+        })?;
 
         let prev_version = contract.version.saturating_sub(1) as i32;
+        let owner_user_id = match user_id {
+            Some(user_id) if !user_id.trim().is_empty() => user_id,
+            _ => self.active_user_id("persist_contract")?,
+        };
+
+        let insert_session_id = session_id
+            .filter(|session_id| !session_id.trim().is_empty())
+            .or_else(|| {
+                if self.session_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.session_id.as_str())
+                }
+            })
+            .ok_or_else(|| {
+                crate::service_error::ServiceError::internal(
+                    "persist_contract requires session context",
+                )
+            })?;
+
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!(
+                "persist_contract begin tx: {e}"
+            ))
+        })?;
 
         // Optimistic locking: try UPDATE with version guard first.
         let updated = if user_id.is_some() {
@@ -2426,26 +2782,31 @@ impl MatrixOneDurableTaskLifecycle {
                 "UPDATE task_contracts SET \
                  subtasks_json = ?, criteria_json = ?, scope_json = ?, \
                  version = ?, status = ?, session_id = ?, user_id = ?, updated_at = NOW() \
-                 WHERE contract_id = ? AND version = ?",
+                 WHERE contract_id = ? AND user_id = ? AND version = ?",
             )
             .bind(&subtasks_json)
             .bind(&criteria_json)
             .bind(&scope_json)
             .bind(contract.version as i32)
             .bind(contract.status.as_str())
-            .bind(session_id.unwrap_or(""))
-            .bind(user_id.unwrap_or(""))
+            .bind(insert_session_id)
+            .bind(owner_user_id)
             .bind(&contract.contract_id)
+            .bind(owner_user_id)
             .bind(prev_version)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| format!("persist_contract update: {e}"))?
+            .map_err(|e| {
+                crate::service_error::ServiceError::persistence(format!(
+                    "persist_contract update: {e}"
+                ))
+            })?
         } else {
             sqlx::query(
                 "UPDATE task_contracts SET \
                  subtasks_json = ?, criteria_json = ?, scope_json = ?, \
                  version = ?, status = ?, updated_at = NOW() \
-                 WHERE contract_id = ? AND version = ?",
+                 WHERE contract_id = ? AND user_id = ? AND version = ?",
             )
             .bind(&subtasks_json)
             .bind(&criteria_json)
@@ -2453,10 +2814,15 @@ impl MatrixOneDurableTaskLifecycle {
             .bind(contract.version as i32)
             .bind(contract.status.as_str())
             .bind(&contract.contract_id)
+            .bind(owner_user_id)
             .bind(prev_version)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| format!("persist_contract update: {e}"))?
+            .map_err(|e| {
+                crate::service_error::ServiceError::persistence(format!(
+                    "persist_contract update: {e}"
+                ))
+            })?
         };
 
         if updated.rows_affected() == 0 {
@@ -2469,103 +2835,94 @@ impl MatrixOneDurableTaskLifecycle {
             )
             .bind(&contract.contract_id)
             .bind(&contract.task_id)
-            .bind(session_id.unwrap_or(""))
-            .bind(user_id.unwrap_or(""))
+            .bind(insert_session_id)
+            .bind(owner_user_id)
             .bind(&contract.goal)
             .bind(&scope_json)
             .bind(&subtasks_json)
             .bind(&criteria_json)
             .bind(contract.version as i32)
             .bind(contract.status.as_str())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await;
 
             match insert_result {
                 Ok(_) => {}
                 Err(e) if e.to_string().contains("Duplicate") => {
-                    return Err(format!(
-                        "persist_contract: version conflict for {} (expected version {})",
-                        contract.contract_id, prev_version
+                    return Err(crate::service_error::ServiceError::conflict_transient(
+                        format!(
+                            "persist_contract: version conflict for {} (expected version {})",
+                            contract.contract_id, prev_version
+                        ),
                     ));
                 }
-                Err(e) => return Err(format!("persist_contract insert: {e}")),
+                Err(e) => {
+                    return Err(crate::service_error::ServiceError::persistence(format!(
+                        "persist_contract insert: {e}"
+                    )));
+                }
             }
         }
+        tx.commit().await.map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!(
+                "persist_contract commit tx: {e}"
+            ))
+        })?;
         Ok(())
     }
 
     async fn load_verification_history(
         &self,
-        task_id: &str,
-    ) -> Result<Vec<SubtaskVerificationReport>, String> {
+        user_id: &str,
+        contract_id: &str,
+    ) -> crate::service_error::ServiceResult<Vec<SubtaskVerificationReport>> {
         let mut rows = sqlx::query(
-            "SELECT subtask_id, criterion_id, passed, evidence, expected, \
+            "SELECT subtask_id, criterion_id, status, evidence, expected, \
              duration_ms, error_message, CAST(created_at AS CHAR) AS created_at \
-             FROM task_verification_results \
-             WHERE task_id = ? ORDER BY created_at DESC LIMIT ?",
+             FROM verification_results \
+             WHERE user_id = ? AND contract_id = ? ORDER BY created_at DESC LIMIT ?",
         )
-        .bind(task_id)
+        .bind(user_id)
+        .bind(contract_id)
         .bind(MAX_VERIFICATION_HISTORY_ROWS)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| format!("load_verification_history: {e}"))?;
+        .map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!(
+                "load_verification_history: {e}"
+            ))
+        })?;
         rows.reverse();
 
-        use sqlx::Row;
-        use std::collections::BTreeMap;
-        let mut grouped: BTreeMap<String, Vec<(VerificationResult, String)>> = BTreeMap::new();
-
-        for row in &rows {
-            let subtask_id: String = row.try_get("subtask_id").unwrap_or_default();
-            let ts: String = row.try_get("created_at").unwrap_or_default();
-            let vr = VerificationResult {
-                criterion_id: row.try_get("criterion_id").unwrap_or_default(),
-                passed: row.try_get::<i32, _>("passed").unwrap_or(0) != 0,
-                evidence: row.try_get("evidence").ok().flatten().unwrap_or_default(),
-                expected: row.try_get("expected").ok().flatten().unwrap_or_default(),
-                duration_ms: row.try_get::<i64, _>("duration_ms").unwrap_or(0) as u64,
-                error: row.try_get("error_message").ok().flatten(),
-            };
-            grouped.entry(subtask_id).or_default().push((vr, ts));
-        }
-
-        let reports: Vec<SubtaskVerificationReport> = grouped
-            .into_iter()
-            .map(|(subtask_id, items)| {
-                let ts = items.last().map(|(_, t)| t.clone()).unwrap_or_default();
-                let results: Vec<VerificationResult> = items.into_iter().map(|(r, _)| r).collect();
-                let all_required_passed = results.iter().all(|r| r.passed);
-                SubtaskVerificationReport {
-                    subtask_id,
-                    all_required_passed,
-                    results,
-                    timestamp: ts,
-                }
-            })
-            .collect();
-        Ok(reports)
+        let decoded_rows = rows
+            .iter()
+            .map(decode_verification_history_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(crate::service_error::ServiceError::persistence)?;
+        verification_history_reports(decoded_rows)
+            .map_err(crate::service_error::ServiceError::persistence)
     }
 
     fn find_subtask_mut<'a>(
         contract: &'a mut TaskContract,
         subtask_id: &str,
-    ) -> Result<&'a mut DurableSubtask, String> {
+    ) -> crate::service_error::ServiceResult<&'a mut DurableSubtask> {
         contract
             .subtasks
             .iter_mut()
             .find(|s| s.id == subtask_id)
-            .ok_or_else(|| format!("subtask '{subtask_id}' not found"))
+            .ok_or_else(|| subtask_not_found(subtask_id))
     }
 
     fn find_subtask<'a>(
         contract: &'a TaskContract,
         subtask_id: &str,
-    ) -> Result<&'a DurableSubtask, String> {
+    ) -> crate::service_error::ServiceResult<&'a DurableSubtask> {
         contract
             .subtasks
             .iter()
             .find(|s| s.id == subtask_id)
-            .ok_or_else(|| format!("subtask '{subtask_id}' not found"))
+            .ok_or_else(|| subtask_not_found(subtask_id))
     }
 }
 
@@ -2578,7 +2935,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         goal: &str,
         plan: &TaskPlan,
         scope: TaskScope,
-    ) -> Result<TaskContract, String> {
+    ) -> crate::service_error::ServiceResult<TaskContract> {
         let contract_id = uuid::Uuid::new_v4().to_string();
         let task_id = uuid::Uuid::new_v4().to_string();
 
@@ -2637,11 +2994,15 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         &self,
         contract_id: &str,
         amendment: ContractAmendment,
-    ) -> Result<TaskContract, String> {
+    ) -> crate::service_error::ServiceResult<TaskContract> {
         let mut contract = self
             .load_contract_by_id(contract_id)
             .await?
-            .ok_or_else(|| format!("contract '{contract_id}' not found"))?;
+            .ok_or_else(|| {
+                crate::service_error::ServiceError::not_found(format!(
+                    "contract '{contract_id}' not found"
+                ))
+            })?;
 
         if let Some(subtasks) = amendment.updated_subtasks {
             contract.subtasks = subtasks;
@@ -2660,7 +3021,10 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         Ok(contract)
     }
 
-    async fn get_contract(&self, contract_id: &str) -> Result<Option<TaskContract>, String> {
+    async fn get_contract(
+        &self,
+        contract_id: &str,
+    ) -> crate::service_error::ServiceResult<Option<TaskContract>> {
         self.load_contract_by_id(contract_id).await
     }
 
@@ -2668,21 +3032,22 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         &self,
         task_id: &str,
         subtask_id: &str,
-    ) -> Result<SubtaskExecutionContext, String> {
-        let mut contract = self
-            .load_contract_by_task(task_id)
-            .await?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+    ) -> crate::service_error::ServiceResult<SubtaskExecutionContext> {
+        let mut contract = self.load_contract_by_task(task_id).await?.ok_or_else(|| {
+            crate::service_error::ServiceError::not_found(format!(
+                "no contract for task '{task_id}'"
+            ))
+        })?;
 
         // Check startability first (immutable borrow)
         {
             let subtask = Self::find_subtask(&contract, subtask_id)?;
             if !subtask.stage.can_start() {
-                return Err(format!(
+                return Err(crate::service_error::ServiceError::invalid(format!(
                     "subtask '{}' in stage '{}' cannot start",
                     subtask_id,
                     subtask.stage.as_str()
-                ));
+                )));
             }
         }
 
@@ -2694,7 +3059,8 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
                 .await,
             subtask_id,
             "snapshot failed",
-        )?;
+        )
+        .map_err(crate::service_error::ServiceError::persistence)?;
 
         // Now mutably update
         let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
@@ -2728,20 +3094,21 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         &self,
         task_id: &str,
         subtask_id: &str,
-    ) -> Result<(), String> {
-        let mut contract = self
-            .load_contract_by_task(task_id)
-            .await?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+    ) -> crate::service_error::ServiceResult<()> {
+        let mut contract = self.load_contract_by_task(task_id).await?.ok_or_else(|| {
+            crate::service_error::ServiceError::not_found(format!(
+                "no contract for task '{task_id}'"
+            ))
+        })?;
 
         let snapshot_name = {
             let subtask = Self::find_subtask(&contract, subtask_id)?;
             if !matches!(subtask.stage, SubtaskStage::Executing) {
-                return Err(format!(
+                return Err(crate::service_error::ServiceError::conflict(format!(
                     "subtask '{}' not executing (stage: {})",
                     subtask_id,
                     subtask.stage.as_str()
-                ));
+                )));
             }
             subtask.snapshot_name.clone()
         };
@@ -2759,11 +3126,11 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
                         error: error.clone(),
                     };
                     if let Err(persist_error) = self.persist_contract(&contract, None, None).await {
-                        return Err(format!(
+                        return Err(crate::service_error::ServiceError::persistence(format!(
                             "{error}; failed to persist execution failure: {persist_error}"
-                        ));
+                        )));
                     }
-                    return Err(error);
+                    return Err(crate::service_error::ServiceError::persistence(error));
                 }
             }
         } else {
@@ -2790,11 +3157,12 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         task_id: &str,
         subtask_id: &str,
         error: &str,
-    ) -> Result<(), String> {
-        let mut contract = self
-            .load_contract_by_task(task_id)
-            .await?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+    ) -> crate::service_error::ServiceResult<()> {
+        let mut contract = self.load_contract_by_task(task_id).await?.ok_or_else(|| {
+            crate::service_error::ServiceError::not_found(format!(
+                "no contract for task '{task_id}'"
+            ))
+        })?;
 
         let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
         subtask.stage = SubtaskStage::ExecutionFailed {
@@ -2809,11 +3177,14 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         &self,
         task_id: &str,
         subtask_id: &str,
-    ) -> Result<SubtaskVerificationReport, String> {
-        let mut contract = self
-            .load_contract_by_task(task_id)
-            .await?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+    ) -> crate::service_error::ServiceResult<SubtaskVerificationReport> {
+        let mut contract = self.load_contract_by_task(task_id).await?.ok_or_else(|| {
+            crate::service_error::ServiceError::not_found(format!(
+                "no contract for task '{task_id}'"
+            ))
+        })?;
+        let (owner_user_id, owner_session_id) =
+            self.require_contract_scope_by_task(task_id).await?;
 
         let subtask = Self::find_subtask(&contract, subtask_id)?;
         // State guard: only verify subtasks ready for verification
@@ -2821,11 +3192,11 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             subtask.stage,
             SubtaskStage::AwaitingVerification | SubtaskStage::Verifying
         ) {
-            return Err(format!(
+            return Err(crate::service_error::ServiceError::conflict(format!(
                 "subtask '{}' not ready for verification (stage: {})",
                 subtask_id,
                 subtask.stage.as_str()
-            ));
+            )));
         }
         let durable_st = subtask.clone();
 
@@ -2844,27 +3215,27 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         let report = runner.verify_subtask(&durable_st).await;
 
         // Persist verification results + contract update atomically
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| format!("begin tx: {e}"))?;
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("begin verify tx: {e}"))
+        })?;
 
         for r in &report.results {
             let result_id = uuid::Uuid::new_v4().to_string();
+            let status = if r.passed { "passed" } else { "failed" };
             sqlx::query(
-                "INSERT INTO task_verification_results \
+                "INSERT INTO verification_results \
                  (result_id, contract_id, task_id, subtask_id, criterion_id, \
-                  session_id, passed, evidence, expected, duration_ms, error_message, attempt) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  session_id, user_id, status, evidence, expected, duration_ms, error_message, attempt) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&result_id)
             .bind(&contract.contract_id)
             .bind(task_id)
             .bind(subtask_id)
             .bind(&r.criterion_id)
-            .bind(&self.session_id)
-            .bind(if r.passed { 1i32 } else { 0i32 })
+            .bind(&owner_session_id)
+            .bind(&owner_user_id)
+            .bind(status)
             .bind(&r.evidence)
             .bind(&r.expected)
             .bind(r.duration_ms as i64)
@@ -2872,7 +3243,11 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             .bind((durable_st.retry_count + 1) as i32)
             .execute(&mut *tx)
             .await
-            .map_err(|e| format!("save_verification in tx: {e}"))?;
+            .map_err(|e| {
+                crate::service_error::ServiceError::persistence(format!(
+                    "save_verification in tx: {e}"
+                ))
+            })?;
         }
 
         // Update stage + git4data actions
@@ -2943,18 +3318,22 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
 
         // Persist contract update inside the same transaction
         {
-            let scope_json =
-                serde_json::to_string(&contract.scope).map_err(|e| format!("scope json: {e}"))?;
-            let subtasks_json = serde_json::to_string(&contract.subtasks)
-                .map_err(|e| format!("subtasks json: {e}"))?;
-            let criteria_json = serde_json::to_string(&contract.global_verification)
-                .map_err(|e| format!("criteria json: {e}"))?;
+            let scope_json = serde_json::to_string(&contract.scope).map_err(|e| {
+                crate::service_error::ServiceError::persistence(format!("scope json: {e}"))
+            })?;
+            let subtasks_json = serde_json::to_string(&contract.subtasks).map_err(|e| {
+                crate::service_error::ServiceError::persistence(format!("subtasks json: {e}"))
+            })?;
+            let criteria_json =
+                serde_json::to_string(&contract.global_verification).map_err(|e| {
+                    crate::service_error::ServiceError::persistence(format!("criteria json: {e}"))
+                })?;
 
             let updated = sqlx::query(
                 "UPDATE task_contracts SET \
                  subtasks_json = ?, criteria_json = ?, scope_json = ?, \
                  version = ?, status = ?, updated_at = NOW() \
-                 WHERE contract_id = ? AND version = ?",
+                 WHERE contract_id = ? AND user_id = ? AND version = ?",
             )
             .bind(&subtasks_json)
             .bind(&criteria_json)
@@ -2962,22 +3341,29 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             .bind(contract.version as i32)
             .bind(contract.status.as_str())
             .bind(&contract.contract_id)
+            .bind(&owner_user_id)
             .bind((contract.version.saturating_sub(1)) as i32)
             .execute(&mut *tx)
             .await
-            .map_err(|e| format!("persist_contract in tx: {e}"))?;
+            .map_err(|e| {
+                crate::service_error::ServiceError::persistence(format!(
+                    "persist_contract in tx: {e}"
+                ))
+            })?;
             if updated.rows_affected() == 0 {
-                return Err(format!(
-                    "persist_contract in tx: version conflict for {} (expected version {})",
-                    contract.contract_id,
-                    contract.version.saturating_sub(1)
+                return Err(crate::service_error::ServiceError::conflict_transient(
+                    format!(
+                        "persist_contract in tx: version conflict for {} (expected version {})",
+                        contract.contract_id,
+                        contract.version.saturating_sub(1)
+                    ),
                 ));
             }
         }
 
-        tx.commit()
-            .await
-            .map_err(|e| format!("commit verify tx: {e}"))?;
+        tx.commit().await.map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("commit verify tx: {e}"))
+        })?;
 
         // Emit verification result event
         let passed_count = report.results.iter().filter(|r| r.passed).count();
@@ -3000,17 +3386,21 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         );
 
         if let Some(error) = rollback_error {
-            return Err(error);
+            return Err(crate::service_error::ServiceError::persistence(error));
         }
 
         Ok(report)
     }
 
-    async fn verify_global(&self, task_id: &str) -> Result<Vec<VerificationResult>, String> {
-        let contract = self
-            .load_contract_by_task(task_id)
-            .await?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+    async fn verify_global(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<Vec<VerificationResult>> {
+        let contract = self.load_contract_by_task(task_id).await?.ok_or_else(|| {
+            crate::service_error::ServiceError::not_found(format!(
+                "no contract for task '{task_id}'"
+            ))
+        })?;
 
         // All required subtasks must be verified
         let unverified: Vec<&DurableSubtask> = contract
@@ -3020,10 +3410,10 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             .collect();
         if !unverified.is_empty() {
             let ids: Vec<&str> = unverified.iter().map(|s| s.id.as_str()).collect();
-            return Err(format!(
+            return Err(crate::service_error::ServiceError::conflict(format!(
                 "subtasks not ready for global verification: {:?}",
                 ids
-            ));
+            )));
         }
 
         self.emit_event(
@@ -3055,11 +3445,12 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         Ok(results)
     }
 
-    async fn pause_task(&self, task_id: &str) -> Result<(), String> {
-        let mut contract = self
-            .load_contract_by_task(task_id)
-            .await?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+    async fn pause_task(&self, task_id: &str) -> crate::service_error::ServiceResult<()> {
+        let mut contract = self.load_contract_by_task(task_id).await?.ok_or_else(|| {
+            crate::service_error::ServiceError::not_found(format!(
+                "no contract for task '{task_id}'"
+            ))
+        })?;
         contract.updated_at = chrono::Utc::now().to_rfc3339();
         self.persist_contract(&contract, None, None).await?;
         Ok(())
@@ -3069,11 +3460,12 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         &self,
         task_id: &str,
         _session_id: &str,
-    ) -> Result<TaskResumeContext, String> {
-        let mut contract = self
-            .load_contract_by_task(task_id)
-            .await?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+    ) -> crate::service_error::ServiceResult<TaskResumeContext> {
+        let mut contract = self.load_contract_by_task(task_id).await?.ok_or_else(|| {
+            crate::service_error::ServiceError::not_found(format!(
+                "no contract for task '{task_id}'"
+            ))
+        })?;
 
         // Reset stuck Executing subtasks to Pending. If we're resuming, any
         // previously Executing subtask was interrupted and should be restartable.
@@ -3100,7 +3492,10 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             .find(|s| matches!(s.stage, SubtaskStage::Executing))
             .map(|s| s.id.clone());
 
-        let verification_history = self.load_verification_history(task_id).await?;
+        let (owner_user_id, _) = self.require_contract_scope_by_task(task_id).await?;
+        let verification_history = self
+            .load_verification_history(&owner_user_id, &contract.contract_id)
+            .await?;
 
         Ok(TaskResumeContext {
             task_id: task_id.to_string(),
@@ -3111,11 +3506,15 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         })
     }
 
-    async fn deliver_task(&self, task_id: &str) -> Result<TaskDeliveryReport, String> {
-        let mut contract = self
-            .load_contract_by_task(task_id)
-            .await?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+    async fn deliver_task(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<TaskDeliveryReport> {
+        let mut contract = self.load_contract_by_task(task_id).await?.ok_or_else(|| {
+            crate::service_error::ServiceError::not_found(format!(
+                "no contract for task '{task_id}'"
+            ))
+        })?;
 
         let subtask_summaries: Vec<SubtaskDeliverySummary> = contract
             .subtasks
@@ -3198,22 +3597,46 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         Ok(report)
     }
 
-    async fn snapshot_task_state(&self, task_id: &str) -> Result<String, String> {
-        let contract = self
-            .load_contract_by_task(task_id)
-            .await?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+    async fn snapshot_task_state(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<String> {
+        let contract = self.load_contract_by_task(task_id).await?.ok_or_else(|| {
+            crate::service_error::ServiceError::not_found(format!(
+                "no contract for task '{task_id}'"
+            ))
+        })?;
         self.branch_ops
             .create_snapshot(task_id, "global", contract.version)
             .await
+            .map_err(crate::service_error::ServiceError::persistence)
     }
 
-    async fn rollback_task(&self, _task_id: &str, snapshot: &str) -> Result<(), String> {
-        self.branch_ops.rollback_to_snapshot(snapshot).await
+    async fn rollback_task(
+        &self,
+        _task_id: &str,
+        snapshot: &str,
+    ) -> crate::service_error::ServiceResult<()> {
+        self.branch_ops
+            .rollback_to_snapshot(snapshot)
+            .await
+            .map_err(crate::service_error::ServiceError::persistence)
     }
 }
 
 // ─── Local File-based Implementation ────────────────────────────────────────
+
+fn task_contract_not_found(task_id: &str) -> crate::service_error::ServiceError {
+    crate::service_error::ServiceError::not_found(format!("no contract for task '{task_id}'"))
+}
+
+fn contract_not_found(contract_id: &str) -> crate::service_error::ServiceError {
+    crate::service_error::ServiceError::not_found(format!("contract '{contract_id}' not found"))
+}
+
+fn subtask_not_found(subtask_id: &str) -> crate::service_error::ServiceError {
+    crate::service_error::ServiceError::not_found(format!("subtask '{subtask_id}' not found"))
+}
 
 /// File-based implementation for development/offline mode.
 pub struct LocalDurableTaskLifecycle {
@@ -3343,34 +3766,52 @@ impl LocalDurableTaskLifecycle {
         self.contracts_dir.join(format!("{contract_id}.json"))
     }
 
-    fn load_local(&self, contract_id: &str) -> Result<Option<TaskContract>, String> {
+    fn load_local(
+        &self,
+        contract_id: &str,
+    ) -> crate::service_error::ServiceResult<Option<TaskContract>> {
         let path = self.contract_path(contract_id);
         if !path.exists() {
             return Ok(None);
         }
-        let data = std::fs::read_to_string(&path).map_err(|e| format!("read contract: {e}"))?;
-        let c: TaskContract = serde_json::from_str(&data).map_err(|e| format!("parse: {e}"))?;
+        let data = std::fs::read_to_string(&path).map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("read contract: {e}"))
+        })?;
+        let c: TaskContract = serde_json::from_str(&data).map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("parse contract: {e}"))
+        })?;
         Ok(Some(c))
     }
 
-    fn save_local(&self, contract: &TaskContract) -> Result<(), String> {
-        std::fs::create_dir_all(&self.contracts_dir)
-            .map_err(|e| format!("mkdir contracts: {e}"))?;
-        let json = serde_json::to_string_pretty(contract).map_err(|e| format!("serialize: {e}"))?;
+    fn save_local(&self, contract: &TaskContract) -> crate::service_error::ServiceResult<()> {
+        std::fs::create_dir_all(&self.contracts_dir).map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("mkdir contracts: {e}"))
+        })?;
+        let json = serde_json::to_string_pretty(contract).map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("serialize contract: {e}"))
+        })?;
         let path = self.contract_path(&contract.contract_id);
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+        std::fs::write(&tmp, &json).map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("write contract: {e}"))
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("rename contract: {e}"))
+        })?;
         Ok(())
     }
 
     /// Scan contracts dir for a task_id match.
-    fn find_by_task(&self, task_id: &str) -> Result<Option<TaskContract>, String> {
+    fn find_by_task(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<Option<TaskContract>> {
         if !self.contracts_dir.exists() {
             return Ok(None);
         }
-        let entries =
-            std::fs::read_dir(&self.contracts_dir).map_err(|e| format!("readdir: {e}"))?;
+        let entries = std::fs::read_dir(&self.contracts_dir).map_err(|e| {
+            crate::service_error::ServiceError::persistence(format!("readdir contracts: {e}"))
+        })?;
         for entry in entries.flatten() {
             if entry
                 .path()
@@ -3398,7 +3839,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         goal: &str,
         plan: &TaskPlan,
         scope: TaskScope,
-    ) -> Result<TaskContract, String> {
+    ) -> crate::service_error::ServiceResult<TaskContract> {
         let contract_id = uuid::Uuid::new_v4().to_string();
         let task_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
@@ -3448,10 +3889,10 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         &self,
         contract_id: &str,
         amendment: ContractAmendment,
-    ) -> Result<TaskContract, String> {
+    ) -> crate::service_error::ServiceResult<TaskContract> {
         let mut contract = self
             .load_local(contract_id)?
-            .ok_or_else(|| format!("contract '{contract_id}' not found"))?;
+            .ok_or_else(|| contract_not_found(contract_id))?;
         if let Some(subtasks) = amendment.updated_subtasks {
             contract.subtasks = subtasks;
         }
@@ -3468,7 +3909,10 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         Ok(contract)
     }
 
-    async fn get_contract(&self, contract_id: &str) -> Result<Option<TaskContract>, String> {
+    async fn get_contract(
+        &self,
+        contract_id: &str,
+    ) -> crate::service_error::ServiceResult<Option<TaskContract>> {
         self.load_local(contract_id)
     }
 
@@ -3476,18 +3920,21 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         &self,
         task_id: &str,
         subtask_id: &str,
-    ) -> Result<SubtaskExecutionContext, String> {
+    ) -> crate::service_error::ServiceResult<SubtaskExecutionContext> {
         let mut contract = self
             .find_by_task(task_id)?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+            .ok_or_else(|| task_contract_not_found(task_id))?;
         let subtask = contract
             .subtasks
             .iter_mut()
             .find(|s| s.id == subtask_id)
-            .ok_or_else(|| format!("subtask '{subtask_id}' not found"))?;
+            .ok_or_else(|| subtask_not_found(subtask_id))?;
 
         if !subtask.stage.can_start() {
-            return Err(format!("subtask '{}' cannot start", subtask_id));
+            return Err(crate::service_error::ServiceError::invalid(format!(
+                "subtask '{}' cannot start",
+                subtask_id
+            )));
         }
 
         // Git4Data: create snapshot before execution
@@ -3497,7 +3944,8 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
                 .await,
             subtask_id,
             "local snapshot failed",
-        )?;
+        )
+        .map_err(crate::service_error::ServiceError::persistence)?;
 
         subtask.snapshot_name = snapshot_name.clone();
         let ctx = SubtaskExecutionContext {
@@ -3525,23 +3973,23 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         &self,
         task_id: &str,
         subtask_id: &str,
-    ) -> Result<(), String> {
+    ) -> crate::service_error::ServiceResult<()> {
         let mut contract = self
             .find_by_task(task_id)?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+            .ok_or_else(|| task_contract_not_found(task_id))?;
         let snapshot_name = {
             let subtask = contract
                 .subtasks
                 .iter()
                 .find(|s| s.id == subtask_id)
-                .ok_or_else(|| format!("subtask '{subtask_id}' not found"))?;
+                .ok_or_else(|| subtask_not_found(subtask_id))?;
 
             if !matches!(subtask.stage, SubtaskStage::Executing) {
-                return Err(format!(
+                return Err(crate::service_error::ServiceError::conflict(format!(
                     "subtask '{}' not executing (stage: {})",
                     subtask_id,
                     subtask.stage.as_str()
-                ));
+                )));
             }
 
             subtask.snapshot_name.clone()
@@ -3559,16 +4007,16 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
                         .subtasks
                         .iter_mut()
                         .find(|s| s.id == subtask_id)
-                        .ok_or_else(|| format!("subtask '{subtask_id}' not found"))?;
+                        .ok_or_else(|| subtask_not_found(subtask_id))?;
                     subtask.stage = SubtaskStage::ExecutionFailed {
                         error: error.clone(),
                     };
                     if let Err(persist_error) = self.save_local(&contract) {
-                        return Err(format!(
+                        return Err(crate::service_error::ServiceError::persistence(format!(
                             "{error}; failed to persist execution failure: {persist_error}"
-                        ));
+                        )));
                     }
-                    return Err(error);
+                    return Err(crate::service_error::ServiceError::persistence(error));
                 }
             }
         } else {
@@ -3579,7 +4027,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             .subtasks
             .iter_mut()
             .find(|s| s.id == subtask_id)
-            .ok_or_else(|| format!("subtask '{subtask_id}' not found"))?;
+            .ok_or_else(|| subtask_not_found(subtask_id))?;
         if let Some(diff) = diff_summary {
             subtask.diff_summary = Some(diff);
         }
@@ -3598,15 +4046,15 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         task_id: &str,
         subtask_id: &str,
         error: &str,
-    ) -> Result<(), String> {
+    ) -> crate::service_error::ServiceResult<()> {
         let mut contract = self
             .find_by_task(task_id)?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+            .ok_or_else(|| task_contract_not_found(task_id))?;
         let subtask = contract
             .subtasks
             .iter_mut()
             .find(|s| s.id == subtask_id)
-            .ok_or_else(|| format!("subtask '{subtask_id}' not found"))?;
+            .ok_or_else(|| subtask_not_found(subtask_id))?;
         subtask.stage = SubtaskStage::ExecutionFailed {
             error: error.to_string(),
         };
@@ -3618,16 +4066,16 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         &self,
         task_id: &str,
         subtask_id: &str,
-    ) -> Result<SubtaskVerificationReport, String> {
+    ) -> crate::service_error::ServiceResult<SubtaskVerificationReport> {
         let mut contract = self
             .find_by_task(task_id)?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+            .ok_or_else(|| task_contract_not_found(task_id))?;
 
         let durable_st = contract
             .subtasks
             .iter()
             .find(|s| s.id == subtask_id)
-            .ok_or_else(|| format!("subtask '{subtask_id}' not found"))?
+            .ok_or_else(|| subtask_not_found(subtask_id))?
             .clone();
 
         // State guard: only verify subtasks ready for verification
@@ -3635,11 +4083,11 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             durable_st.stage,
             SubtaskStage::AwaitingVerification | SubtaskStage::Verifying
         ) {
-            return Err(format!(
+            return Err(crate::service_error::ServiceError::conflict(format!(
                 "subtask '{}' not ready for verification (stage: {})",
                 subtask_id,
                 durable_st.stage.as_str()
-            ));
+            )));
         }
 
         self.emit_event(
@@ -3680,7 +4128,11 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
                 .subtasks
                 .iter_mut()
                 .find(|s| s.id == subtask_id)
-                .ok_or_else(|| format!("subtask '{subtask_id}' disappeared during verification"))?;
+                .ok_or_else(|| {
+                    crate::service_error::ServiceError::invalid(format!(
+                        "subtask '{subtask_id}' disappeared during verification"
+                    ))
+                })?;
             // Store verification results for delivery report
             subtask.last_verification = Some(report.clone());
             if report.all_required_passed {
@@ -3717,7 +4169,9 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
                         .iter_mut()
                         .find(|s| s.id == subtask_id)
                         .ok_or_else(|| {
-                            format!("subtask '{subtask_id}' disappeared during verification")
+                            crate::service_error::ServiceError::invalid(format!(
+                                "subtask '{subtask_id}' disappeared during verification"
+                            ))
                         })?;
                     subtask.stage = SubtaskStage::ExecutionFailed {
                         error: error.clone(),
@@ -3732,7 +4186,11 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
                 .subtasks
                 .iter_mut()
                 .find(|s| s.id == subtask_id)
-                .ok_or_else(|| format!("subtask '{subtask_id}' disappeared during verification"))?;
+                .ok_or_else(|| {
+                    crate::service_error::ServiceError::invalid(format!(
+                        "subtask '{subtask_id}' disappeared during verification"
+                    ))
+                })?;
             subtask.stage = SubtaskStage::Abandoned {
                 reason: format!("failed after {} attempts", subtask.retry_count),
             };
@@ -3752,16 +4210,19 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         self.save_local(&contract)?;
 
         if let Some(error) = rollback_error {
-            return Err(error);
+            return Err(crate::service_error::ServiceError::persistence(error));
         }
 
         Ok(report)
     }
 
-    async fn verify_global(&self, task_id: &str) -> Result<Vec<VerificationResult>, String> {
+    async fn verify_global(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<Vec<VerificationResult>> {
         let mut contract = self
             .find_by_task(task_id)?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+            .ok_or_else(|| task_contract_not_found(task_id))?;
         self.emit_event(
             "global_verification_started",
             serde_json::json!({
@@ -3793,10 +4254,10 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         Ok(results)
     }
 
-    async fn pause_task(&self, task_id: &str) -> Result<(), String> {
+    async fn pause_task(&self, task_id: &str) -> crate::service_error::ServiceResult<()> {
         let mut contract = self
             .find_by_task(task_id)?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+            .ok_or_else(|| task_contract_not_found(task_id))?;
         contract.updated_at = chrono::Utc::now().to_rfc3339();
         self.save_local(&contract)?;
         Ok(())
@@ -3806,10 +4267,10 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         &self,
         task_id: &str,
         _session_id: &str,
-    ) -> Result<TaskResumeContext, String> {
+    ) -> crate::service_error::ServiceResult<TaskResumeContext> {
         let mut contract = self
             .find_by_task(task_id)?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+            .ok_or_else(|| task_contract_not_found(task_id))?;
 
         // Reset stuck Executing subtasks to Pending (same as MatrixOne impl).
         let mut reset_count = 0usize;
@@ -3843,10 +4304,13 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         })
     }
 
-    async fn deliver_task(&self, task_id: &str) -> Result<TaskDeliveryReport, String> {
+    async fn deliver_task(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<TaskDeliveryReport> {
         let mut contract = self
             .find_by_task(task_id)?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+            .ok_or_else(|| task_contract_not_found(task_id))?;
 
         let summaries: Vec<SubtaskDeliverySummary> = contract
             .subtasks
@@ -3920,17 +4384,28 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         Ok(report)
     }
 
-    async fn snapshot_task_state(&self, task_id: &str) -> Result<String, String> {
+    async fn snapshot_task_state(
+        &self,
+        task_id: &str,
+    ) -> crate::service_error::ServiceResult<String> {
         let contract = self
             .find_by_task(task_id)?
-            .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+            .ok_or_else(|| task_contract_not_found(task_id))?;
         self.branch_ops
             .create_snapshot(task_id, "global", contract.version)
             .await
+            .map_err(crate::service_error::ServiceError::persistence)
     }
 
-    async fn rollback_task(&self, _task_id: &str, snapshot: &str) -> Result<(), String> {
-        self.branch_ops.rollback_to_snapshot(snapshot).await
+    async fn rollback_task(
+        &self,
+        _task_id: &str,
+        snapshot: &str,
+    ) -> crate::service_error::ServiceResult<()> {
+        self.branch_ops
+            .rollback_to_snapshot(snapshot)
+            .await
+            .map_err(crate::service_error::ServiceError::persistence)
     }
 }
 
@@ -3938,6 +4413,10 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
 
 /// Returns errors for all operations. Used when no backend is configured.
 pub struct UnconfiguredDurableTaskLifecycle;
+
+fn durable_task_service_not_configured() -> crate::service_error::ServiceError {
+    crate::service_error::ServiceError::internal("durable task service not configured")
+}
 
 #[async_trait]
 impl DurableTaskLifecycle for UnconfiguredDurableTaskLifecycle {
@@ -3948,44 +4427,78 @@ impl DurableTaskLifecycle for UnconfiguredDurableTaskLifecycle {
         _: &str,
         _: &TaskPlan,
         _: TaskScope,
-    ) -> Result<TaskContract, String> {
-        Err("durable task service not configured".into())
+    ) -> crate::service_error::ServiceResult<TaskContract> {
+        Err(durable_task_service_not_configured())
     }
-    async fn amend_contract(&self, _: &str, _: ContractAmendment) -> Result<TaskContract, String> {
-        Err("durable task service not configured".into())
+    async fn amend_contract(
+        &self,
+        _: &str,
+        _: ContractAmendment,
+    ) -> crate::service_error::ServiceResult<TaskContract> {
+        Err(durable_task_service_not_configured())
     }
-    async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> {
-        Err("durable task service not configured".into())
+    async fn get_contract(
+        &self,
+        _: &str,
+    ) -> crate::service_error::ServiceResult<Option<TaskContract>> {
+        Err(durable_task_service_not_configured())
     }
-    async fn begin_subtask(&self, _: &str, _: &str) -> Result<SubtaskExecutionContext, String> {
-        Err("durable task service not configured".into())
+    async fn begin_subtask(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> crate::service_error::ServiceResult<SubtaskExecutionContext> {
+        Err(durable_task_service_not_configured())
     }
-    async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
-        Err("durable task service not configured".into())
+    async fn complete_subtask_execution(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> crate::service_error::ServiceResult<()> {
+        Err(durable_task_service_not_configured())
     }
-    async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
-        Err("durable task service not configured".into())
+    async fn fail_subtask(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> crate::service_error::ServiceResult<()> {
+        Err(durable_task_service_not_configured())
     }
-    async fn verify_subtask(&self, _: &str, _: &str) -> Result<SubtaskVerificationReport, String> {
-        Err("durable task service not configured".into())
+    async fn verify_subtask(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> crate::service_error::ServiceResult<SubtaskVerificationReport> {
+        Err(durable_task_service_not_configured())
     }
-    async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
-        Err("durable task service not configured".into())
+    async fn verify_global(
+        &self,
+        _: &str,
+    ) -> crate::service_error::ServiceResult<Vec<VerificationResult>> {
+        Err(durable_task_service_not_configured())
     }
-    async fn pause_task(&self, _: &str) -> Result<(), String> {
-        Err("durable task service not configured".into())
+    async fn pause_task(&self, _: &str) -> crate::service_error::ServiceResult<()> {
+        Err(durable_task_service_not_configured())
     }
-    async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
-        Err("durable task service not configured".into())
+    async fn resume_task(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> crate::service_error::ServiceResult<TaskResumeContext> {
+        Err(durable_task_service_not_configured())
     }
-    async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
-        Err("durable task service not configured".into())
+    async fn deliver_task(
+        &self,
+        _: &str,
+    ) -> crate::service_error::ServiceResult<TaskDeliveryReport> {
+        Err(durable_task_service_not_configured())
     }
-    async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
-        Err("durable task service not configured".into())
+    async fn snapshot_task_state(&self, _: &str) -> crate::service_error::ServiceResult<String> {
+        Err(durable_task_service_not_configured())
     }
-    async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
-        Err("durable task service not configured".into())
+    async fn rollback_task(&self, _: &str, _: &str) -> crate::service_error::ServiceResult<()> {
+        Err(durable_task_service_not_configured())
     }
 }
 
@@ -3995,9 +4508,496 @@ impl DurableTaskLifecycle for UnconfiguredDurableTaskLifecycle {
 mod tests {
     use super::*;
 
+    mod legacy_glob_import_compile_test {
+        use crate::durable_task::*;
+
+        pub(super) fn assert_verification_types_are_exported() {
+            let _: Option<SubtaskVerificationReport> = None;
+            let _: Option<VerificationCriterion> = None;
+            let _: Option<VerificationResult> = None;
+            let _: Option<VerifierKind> = None;
+        }
+    }
+
     #[test]
     fn verification_history_row_cap_is_positive() {
         const _: () = assert!(MAX_VERIFICATION_HISTORY_ROWS >= 1000);
+    }
+
+    #[test]
+    fn durable_task_glob_reexports_verification_api() {
+        legacy_glob_import_compile_test::assert_verification_types_are_exported();
+    }
+
+    #[test]
+    fn persist_contract_update_insert_path_is_transactional() {
+        let source = include_str!("durable_task.rs");
+        let body = source
+            .split("async fn persist_contract(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn load_verification_history").next())
+            .expect("persist_contract body must be present");
+
+        assert!(
+            body.contains(".begin()"),
+            "persist_contract must open an explicit transaction"
+        );
+        assert!(
+            body.contains(".commit()"),
+            "persist_contract must commit the explicit transaction"
+        );
+        assert!(
+            !body.contains(".execute(&self.pool)"),
+            "persist_contract must not split UPDATE/INSERT across pool connections"
+        );
+        assert!(
+            body.matches(".execute(&mut *tx)").count() >= 3,
+            "persist_contract UPDATE and INSERT paths must execute on the transaction"
+        );
+    }
+
+    #[derive(Clone)]
+    struct FakeContractRow {
+        failed_column: Option<&'static str>,
+        version: i32,
+        status: &'static str,
+        scope_json: Option<&'static str>,
+        subtasks_json: &'static str,
+        criteria_json: &'static str,
+    }
+
+    impl Default for FakeContractRow {
+        fn default() -> Self {
+            Self {
+                failed_column: None,
+                version: 3,
+                status: "active",
+                scope_json: Some(
+                    r#"{"in_scope":["code"],"out_of_scope":["docs"],"assumptions":["tests"]}"#,
+                ),
+                subtasks_json: "[]",
+                criteria_json: "[]",
+            }
+        }
+    }
+
+    impl FakeContractRow {
+        fn fail_on(mut self, column: &'static str) -> Self {
+            self.failed_column = Some(column);
+            self
+        }
+
+        fn with_version(mut self, version: i32) -> Self {
+            self.version = version;
+            self
+        }
+
+        fn with_status(mut self, status: &'static str) -> Self {
+            self.status = status;
+            self
+        }
+
+        fn with_scope_json(mut self, scope_json: Option<&'static str>) -> Self {
+            self.scope_json = scope_json;
+            self
+        }
+
+        fn with_subtasks_json(mut self, subtasks_json: &'static str) -> Self {
+            self.subtasks_json = subtasks_json;
+            self
+        }
+
+        fn with_criteria_json(mut self, criteria_json: &'static str) -> Self {
+            self.criteria_json = criteria_json;
+            self
+        }
+
+        fn maybe_fail(&self, column: &'static str) -> Result<(), String> {
+            if self.failed_column == Some(column) {
+                Err("injected column failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl DurableTaskDbRow for FakeContractRow {
+        fn string_column(&self, column: &'static str) -> Result<String, String> {
+            self.maybe_fail(column)?;
+            let value = match column {
+                "contract_id" => "contract-1",
+                "task_id" => "task-1",
+                "goal" => "ship durable contract",
+                "subtasks_json" => self.subtasks_json,
+                "criteria_json" => self.criteria_json,
+                "status" => self.status,
+                "created_at" => "2026-06-25 10:00:00",
+                "updated_at" => "2026-06-25 11:00:00",
+                other => return Err(format!("unexpected string column `{other}`")),
+            };
+            Ok(value.to_string())
+        }
+
+        fn optional_string_column(&self, column: &'static str) -> Result<Option<String>, String> {
+            self.maybe_fail(column)?;
+            match column {
+                "scope_json" => Ok(self.scope_json.map(str::to_string)),
+                other => Err(format!("unexpected optional string column `{other}`")),
+            }
+        }
+
+        fn i32_column(&self, column: &'static str) -> Result<i32, String> {
+            self.maybe_fail(column)?;
+            match column {
+                "version" => Ok(self.version),
+                other => Err(format!("unexpected i32 column `{other}`")),
+            }
+        }
+
+        fn i64_column(&self, column: &'static str) -> Result<i64, String> {
+            self.maybe_fail(column)?;
+            Err(format!("unexpected i64 column `{column}`"))
+        }
+    }
+
+    fn assert_contract_row_error(row: FakeContractRow, expected: &[&str]) {
+        let err = decode_task_contract_row(&row).expect_err("row decode should fail");
+        assert_eq!(
+            err.kind,
+            crate::service_error::ServiceErrorKind::Persistence,
+            "persisted contract row decode failures must be classified as persistence errors"
+        );
+        for needle in expected {
+            assert!(
+                err.message.contains(needle),
+                "expected error to contain `{needle}`, got `{err}`"
+            );
+        }
+    }
+
+    #[test]
+    fn task_contract_row_decode_preserves_database_values() {
+        let contract = decode_task_contract_row(&FakeContractRow::default()).unwrap();
+
+        assert_eq!(contract.contract_id, "contract-1");
+        assert_eq!(contract.task_id, "task-1");
+        assert_eq!(contract.goal, "ship durable contract");
+        assert_eq!(contract.scope.in_scope, vec!["code"]);
+        assert_eq!(contract.scope.out_of_scope, vec!["docs"]);
+        assert_eq!(contract.scope.assumptions, vec!["tests"]);
+        assert!(contract.subtasks.is_empty());
+        assert!(contract.global_verification.is_empty());
+        assert_eq!(contract.version, 3);
+        assert_eq!(contract.status, ContractStatus::Active);
+        assert_eq!(contract.created_at, "2026-06-25 10:00:00");
+        assert_eq!(contract.updated_at, "2026-06-25 11:00:00");
+    }
+
+    #[test]
+    fn task_contract_row_decode_fails_loudly_on_any_selected_column_error() {
+        for column in [
+            "contract_id",
+            "task_id",
+            "goal",
+            "scope_json",
+            "subtasks_json",
+            "criteria_json",
+            "version",
+            "status",
+            "created_at",
+            "updated_at",
+        ] {
+            assert_contract_row_error(
+                FakeContractRow::default().fail_on(column),
+                &[
+                    "task contract row decode",
+                    column,
+                    "injected column failure",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn task_contract_row_decode_rejects_invalid_json_status_and_version() {
+        assert_contract_row_error(
+            FakeContractRow::default().with_scope_json(Some("not-json")),
+            &["scope_json", "invalid JSON"],
+        );
+        assert_contract_row_error(
+            FakeContractRow::default().with_scope_json(None),
+            &["scope_json", "expected JSON, found NULL"],
+        );
+        assert_contract_row_error(
+            FakeContractRow::default().with_subtasks_json("not-json"),
+            &["subtasks_json", "invalid JSON"],
+        );
+        assert_contract_row_error(
+            FakeContractRow::default().with_criteria_json("not-json"),
+            &["criteria_json", "invalid JSON"],
+        );
+        assert_contract_row_error(
+            FakeContractRow::default().with_status("mystery"),
+            &["status", "unknown contract status"],
+        );
+        assert_contract_row_error(
+            FakeContractRow::default().with_version(0),
+            &["version", "expected positive version"],
+        );
+        assert_contract_row_error(
+            FakeContractRow::default().with_version(-1),
+            &["version", "expected positive version"],
+        );
+    }
+
+    #[derive(Clone)]
+    struct FakeVerificationHistoryRow {
+        failed_column: Option<&'static str>,
+        status: &'static str,
+        evidence: Option<&'static str>,
+        expected: Option<&'static str>,
+        duration_ms: Option<i64>,
+        error_message: Option<&'static str>,
+    }
+
+    impl Default for FakeVerificationHistoryRow {
+        fn default() -> Self {
+            Self {
+                failed_column: None,
+                status: "passed",
+                evidence: Some("observed output"),
+                expected: Some("expected output"),
+                duration_ms: Some(42),
+                error_message: None,
+            }
+        }
+    }
+
+    impl FakeVerificationHistoryRow {
+        fn fail_on(mut self, column: &'static str) -> Self {
+            self.failed_column = Some(column);
+            self
+        }
+
+        fn with_status(mut self, status: &'static str) -> Self {
+            self.status = status;
+            self
+        }
+
+        fn with_evidence(mut self, evidence: Option<&'static str>) -> Self {
+            self.evidence = evidence;
+            self
+        }
+
+        fn with_expected(mut self, expected: Option<&'static str>) -> Self {
+            self.expected = expected;
+            self
+        }
+
+        fn with_duration_ms(mut self, duration_ms: Option<i64>) -> Self {
+            self.duration_ms = duration_ms;
+            self
+        }
+
+        fn with_error_message(mut self, error_message: Option<&'static str>) -> Self {
+            self.error_message = error_message;
+            self
+        }
+
+        fn maybe_fail(&self, column: &'static str) -> Result<(), String> {
+            if self.failed_column == Some(column) {
+                Err("injected column failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl DurableTaskDbRow for FakeVerificationHistoryRow {
+        fn string_column(&self, column: &'static str) -> Result<String, String> {
+            self.maybe_fail(column)?;
+            let value = match column {
+                "subtask_id" => "subtask-1",
+                "criterion_id" => "criterion-1",
+                "status" => self.status,
+                "created_at" => "2026-06-25 12:00:00",
+                other => return Err(format!("unexpected string column `{other}`")),
+            };
+            Ok(value.to_string())
+        }
+
+        fn optional_string_column(&self, column: &'static str) -> Result<Option<String>, String> {
+            self.maybe_fail(column)?;
+            let value = match column {
+                "evidence" => self.evidence,
+                "expected" => self.expected,
+                "error_message" => self.error_message,
+                other => return Err(format!("unexpected optional string column `{other}`")),
+            };
+            Ok(value.map(str::to_string))
+        }
+
+        fn i32_column(&self, column: &'static str) -> Result<i32, String> {
+            Err(format!("unexpected i32 column `{column}`"))
+        }
+
+        fn i64_column(&self, column: &'static str) -> Result<i64, String> {
+            self.maybe_fail(column)?;
+            match column {
+                "duration_ms" => self
+                    .duration_ms
+                    .ok_or_else(|| "NULL duration_ms".to_string()),
+                other => Err(format!("unexpected i64 column `{other}`")),
+            }
+        }
+    }
+
+    fn assert_verification_history_row_error(row: FakeVerificationHistoryRow, expected: &[&str]) {
+        let err =
+            decode_verification_history_row(&row).expect_err("verification row decode should fail");
+        for needle in expected {
+            assert!(
+                err.contains(needle),
+                "expected error to contain `{needle}`, got `{err}`"
+            );
+        }
+    }
+
+    fn verification_result_for_test(id: &str, passed: bool) -> VerificationResult {
+        VerificationResult {
+            criterion_id: id.to_string(),
+            passed,
+            evidence: format!("evidence-{id}"),
+            expected: format!("expected-{id}"),
+            duration_ms: 1,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn verification_history_row_decode_preserves_database_values() {
+        let (subtask_id, result, timestamp) = decode_verification_history_row(
+            &FakeVerificationHistoryRow::default().with_error_message(Some("network failure")),
+        )
+        .unwrap();
+
+        assert_eq!(subtask_id, "subtask-1");
+        assert_eq!(timestamp, "2026-06-25 12:00:00");
+        assert_eq!(result.criterion_id, "criterion-1");
+        assert!(result.passed);
+        assert_eq!(result.evidence, "observed output");
+        assert_eq!(result.expected, "expected output");
+        assert_eq!(result.duration_ms, 42);
+        assert_eq!(result.error.as_deref(), Some("network failure"));
+    }
+
+    #[test]
+    fn verification_history_row_decode_fails_loudly_on_any_selected_column_error() {
+        for column in [
+            "subtask_id",
+            "criterion_id",
+            "status",
+            "evidence",
+            "expected",
+            "duration_ms",
+            "error_message",
+            "created_at",
+        ] {
+            assert_verification_history_row_error(
+                FakeVerificationHistoryRow::default().fail_on(column),
+                &[
+                    "verification history row decode",
+                    column,
+                    "injected column failure",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn verification_history_row_decode_rejects_corrupt_audit_values() {
+        assert_verification_history_row_error(
+            FakeVerificationHistoryRow::default().with_status("invalid"),
+            &["status", "verification history row decode"],
+        );
+        assert_verification_history_row_error(
+            FakeVerificationHistoryRow::default().with_evidence(None),
+            &["evidence", "expected text, found NULL"],
+        );
+        assert_verification_history_row_error(
+            FakeVerificationHistoryRow::default().with_expected(None),
+            &["expected", "expected text, found NULL"],
+        );
+        assert_verification_history_row_error(
+            FakeVerificationHistoryRow::default().with_duration_ms(None),
+            &["duration_ms", "NULL duration_ms"],
+        );
+        assert_verification_history_row_error(
+            FakeVerificationHistoryRow::default().with_duration_ms(Some(-1)),
+            &["duration_ms", "expected non-negative duration"],
+        );
+    }
+
+    #[test]
+    fn verification_history_reports_group_by_subtask_and_compute_pass_state() {
+        let reports = verification_history_reports(vec![
+            (
+                "subtask-b".to_string(),
+                verification_result_for_test("b-1", true),
+                "2026-06-25 12:00:00".to_string(),
+            ),
+            (
+                "subtask-b".to_string(),
+                verification_result_for_test("b-2", false),
+                "2026-06-25 12:05:00".to_string(),
+            ),
+            (
+                "subtask-a".to_string(),
+                verification_result_for_test("a-1", true),
+                "2026-06-25 11:00:00".to_string(),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].subtask_id, "subtask-a");
+        assert!(reports[0].all_required_passed);
+        assert_eq!(reports[0].timestamp, "2026-06-25 11:00:00");
+        assert_eq!(reports[1].subtask_id, "subtask-b");
+        assert!(!reports[1].all_required_passed);
+        assert_eq!(reports[1].timestamp, "2026-06-25 12:05:00");
+        assert_eq!(reports[1].results.len(), 2);
+    }
+
+    struct FakeMoDiffCountRow {
+        count: Result<i64, String>,
+    }
+
+    impl MoDiffCountDbRow for FakeMoDiffCountRow {
+        fn i64_column(&self, column: &'static str) -> Result<i64, String> {
+            if column != "cnt" {
+                return Err(format!("unexpected i64 column `{column}`"));
+            }
+            self.count.clone()
+        }
+    }
+
+    #[test]
+    fn mo_diff_count_decode_preserves_value_and_fails_loudly() {
+        assert_eq!(
+            decode_mo_diff_count(&FakeMoDiffCountRow { count: Ok(7) }).unwrap(),
+            7
+        );
+
+        let error = decode_mo_diff_count(&FakeMoDiffCountRow {
+            count: Err("injected cnt failure".to_string()),
+        })
+        .expect_err("mo_diff count decode must fail loudly");
+        assert!(
+            error.contains("mo_diff count row decode column `cnt`")
+                && error.contains("injected cnt failure"),
+            "error should identify cnt decode failure: {error}"
+        );
     }
 
     #[test]
@@ -4098,7 +5098,7 @@ mod tests {
             ContractStatus::Completed,
             ContractStatus::Abandoned,
         ] {
-            assert_eq!(ContractStatus::parse(status.as_str()), *status);
+            assert_eq!(ContractStatus::parse(status.as_str()).unwrap(), *status);
         }
     }
 
@@ -4802,6 +5802,13 @@ mod tests {
     }
 
     #[test]
+    fn subtask_not_found_uses_not_found_error_kind() {
+        let error = subtask_not_found("sub-missing");
+        assert_eq!(error.kind, crate::service_error::ServiceErrorKind::NotFound);
+        assert!(error.message.contains("sub-missing"));
+    }
+
+    #[test]
     fn diff_summary_or_err_surfaces_failures() {
         let diff = DiffSummary {
             snapshot: "snap-1".into(),
@@ -4891,7 +5898,10 @@ mod tests {
             .begin_subtask(&contract.task_id, "sub-1")
             .await
             .unwrap_err();
-        assert!(err.contains("local snapshot failed for sub-1: disk full"));
+        assert!(
+            err.message
+                .contains("local snapshot failed for sub-1: disk full")
+        );
 
         let persisted = svc
             .get_contract(&contract.contract_id)
@@ -5110,7 +6120,9 @@ mod tests {
         let err = svc.verify_global(&contract.task_id).await.unwrap_err();
         sabotage.await.unwrap();
         assert!(
-            err.contains("mkdir contracts") || err.contains("write:") || err.contains("rename:"),
+            err.message.contains("mkdir contracts")
+                || err.message.contains("write:")
+                || err.message.contains("rename:"),
             "unexpected error: {err}"
         );
 
@@ -5349,7 +6361,10 @@ mod tests {
             .begin_subtask(&contract.task_id, "sub-1")
             .await
             .unwrap_err();
-        assert!(err.contains("local snapshot failed for sub-1: mock snapshot failure"));
+        assert!(
+            err.message
+                .contains("local snapshot failed for sub-1: mock snapshot failure")
+        );
 
         // subtask must remain restartable; no half-applied Executing state
         let c = svc
@@ -5409,7 +6424,10 @@ mod tests {
             .complete_subtask_execution(&contract.task_id, "sub-1")
             .await
             .unwrap_err();
-        assert!(err.contains("local diff capture failed for sub-1: mock diff failure"));
+        assert!(
+            err.message
+                .contains("local diff capture failed for sub-1: mock diff failure")
+        );
 
         let c = svc
             .get_contract(&contract.contract_id)
@@ -5647,7 +6665,10 @@ mod tests {
             .verify_subtask(&contract.task_id, "sub-1")
             .await
             .unwrap_err();
-        assert!(err.contains("rollback failed for sub-1: mock rollback failure"));
+        assert!(
+            err.message
+                .contains("rollback failed for sub-1: mock rollback failure")
+        );
 
         let c = svc
             .get_contract(&contract.contract_id)
@@ -5981,7 +7002,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.contains("not ready for verification"),
+            err.message.contains("not ready for verification"),
             "unexpected error: {err}"
         );
 
@@ -5992,7 +7013,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.contains("not ready for verification"),
+            err.message.contains("not ready for verification"),
             "unexpected error: {err}"
         );
     }
@@ -6324,6 +7345,7 @@ mod tests {
         assert!(ctx.task_id.is_none());
         assert!(ctx.subtask_id.is_none());
         assert!(ctx.session_id.is_none());
+        assert!(ctx.user_id.is_none());
     }
 
     // ─── parse_test_output tests ────────────────────────────────────────────
@@ -6932,10 +7954,14 @@ Time:        3.456 s
     // -----------------------------------------------------------------------
 
     #[test]
-    fn contract_status_parse_unknown_defaults_to_draft() {
-        assert_eq!(ContractStatus::parse("unknown"), ContractStatus::Draft);
-        assert_eq!(ContractStatus::parse(""), ContractStatus::Draft);
-        assert_eq!(ContractStatus::parse("ACTIVE"), ContractStatus::Draft); // case-sensitive
+    fn contract_status_parse_unknown_fails_loudly() {
+        for raw in ["unknown", "", "ACTIVE"] {
+            let error = ContractStatus::parse(raw).expect_err("unknown status must fail");
+            assert!(
+                error.contains("unknown contract status"),
+                "error should identify status corruption: {error}"
+            );
+        }
     }
 
     #[test]
@@ -6948,7 +7974,7 @@ Time:        3.456 s
             ContractStatus::Abandoned,
         ] {
             let s = status.as_str();
-            assert_eq!(ContractStatus::parse(s), status);
+            assert_eq!(ContractStatus::parse(s).unwrap(), status);
         }
     }
 

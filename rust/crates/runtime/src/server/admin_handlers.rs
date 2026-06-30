@@ -245,7 +245,9 @@ pub(super) async fn admin_cleanup_handler(
         .ok_or_else(|| internal_error("database pool not available"))?;
 
     let policy = astra_services::RetentionPolicy::default();
-    let results = astra_services::cleanup_expired_data(pool.get(), &policy).await;
+    let results = astra_services::cleanup_expired_data(pool.get(), &policy)
+        .await
+        .map_err(internal_error)?;
 
     let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
     let details: Vec<serde_json::Value> = results

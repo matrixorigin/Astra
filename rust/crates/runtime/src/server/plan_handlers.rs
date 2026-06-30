@@ -720,7 +720,7 @@ pub(super) async fn create_plan_handler(
     let plan_id = PlanModeState::generate_plan_id(&goal);
     state
         .plan_repo
-        .save(&plan_id, &mut plan_state, None)
+        .save(&user.user_id, &plan_id, &mut plan_state, None)
         .await
         .map_err(map_plan_load_err)?;
 
@@ -792,11 +792,7 @@ pub(super) async fn list_plans_handler(
                 warning: None,
             }));
         };
-        let plan_state = match state
-            .plan_repo
-            .load_owned(&active_plan_id, &user.user_id)
-            .await
-        {
+        let plan_state = match state.plan_repo.load(&user.user_id, &active_plan_id).await {
             Ok(state) => state,
             Err(PlanLoadError::NotFound(_)) => {
                 return Ok(Json(PlanListResponse {
@@ -860,7 +856,7 @@ pub(super) async fn get_plan_handler(
 
     let plan_state = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
     let phase = plan_state.infer_phase();
@@ -895,7 +891,7 @@ pub(super) async fn update_plan_handler(
 
     let plan_state = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
 
@@ -925,7 +921,7 @@ pub(super) async fn execute_plan_handler(
 
     let mut plan_state = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
     let original_plan_state = plan_state.clone();
@@ -1013,7 +1009,7 @@ pub(super) async fn execute_plan_handler(
     let expected = resolve_expected_version(&plan_state, req.expected_version);
     if let Err(error) = state
         .plan_repo
-        .save(&plan_id, &mut plan_state, expected)
+        .save(&user.user_id, &plan_id, &mut plan_state, expected)
         .await
     {
         if let Some(rollback) = task_board_rollback.take() {
@@ -1043,7 +1039,12 @@ pub(super) async fn execute_plan_handler(
         let mut rollback_plan = original_plan_state;
         if let Err(restore_error) = state
             .plan_repo
-            .save(&plan_id, &mut rollback_plan, Some(plan_state.version))
+            .save(
+                &user.user_id,
+                &plan_id,
+                &mut rollback_plan,
+                Some(plan_state.version),
+            )
             .await
         {
             restore_errors.push(format!("plan rollback failed: {restore_error}"));
@@ -1122,7 +1123,7 @@ pub(super) async fn exit_plan_mode_handler(
 
     let mut plan_state = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
 
@@ -1163,7 +1164,7 @@ pub(super) async fn exit_plan_mode_handler(
 
     state
         .plan_repo
-        .save(&plan_id, &mut plan_state, expected)
+        .save(&user.user_id, &plan_id, &mut plan_state, expected)
         .await
         .map_err(map_plan_load_err)?;
 
@@ -1240,7 +1241,7 @@ pub(super) async fn rewind_plan_handler(
 
     let mut plan_state = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
     check_version(&plan_state, req.expected_version)?;
@@ -1307,6 +1308,7 @@ pub(super) async fn rewind_plan_handler(
     let aborted_runs = match state
         .plan_repo
         .save_existing_and_abort_open_step_runs(
+            &user.user_id,
             &plan_id,
             &mut plan_state,
             expected_version,
@@ -1374,7 +1376,7 @@ pub(super) async fn redo_step_handler(
 
     let mut plan_state = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
     check_version(&plan_state, req.expected_version)?;
@@ -1425,7 +1427,12 @@ pub(super) async fn redo_step_handler(
     // In-memory/test repos start empty too, so the first attempt is 1 there.
     let prior_runs = match state
         .plan_repo
-        .list_step_runs(&plan_id, Some(&resolved_subtask_id), DEFAULT_RUNS_LIMIT)
+        .list_step_runs(
+            &user.user_id,
+            &plan_id,
+            Some(&resolved_subtask_id),
+            DEFAULT_RUNS_LIMIT,
+        )
         .await
     {
         Ok(runs) => runs,
@@ -1458,6 +1465,7 @@ pub(super) async fn redo_step_handler(
     let aborted_runs = match state
         .plan_repo
         .save_existing_and_abort_open_step_runs(
+            &user.user_id,
             &plan_id,
             &mut plan_state,
             expected_version,
@@ -1521,7 +1529,7 @@ pub(super) async fn start_step_run_handler(
 
     let plan_state = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
 
@@ -1576,14 +1584,17 @@ pub(super) async fn start_step_run_handler(
 
     let run_id = match state
         .plan_repo
-        .record_step_run(astra_plan::NewStepRun {
-            plan_id: &plan_id,
-            subtask_id: &req.subtask_id,
-            attempt: req.attempt,
-            status: TaskStatus::InProgress,
-            session_id: &req.session_id,
-            request_id: &req.request_id,
-        })
+        .record_step_run(
+            &user.user_id,
+            astra_plan::NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: &req.subtask_id,
+                attempt: req.attempt,
+                status: TaskStatus::InProgress,
+                session_id: &req.session_id,
+                request_id: &req.request_id,
+            },
+        )
         .await
     {
         Ok(run_id) => run_id,
@@ -1669,7 +1680,7 @@ pub(super) async fn post_completed_step_run_handler(
 
     let plan_state = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
 
@@ -1719,6 +1730,7 @@ pub(super) async fn post_completed_step_run_handler(
     let run_id = match state
         .plan_repo
         .record_completed_step_run(
+            &user.user_id,
             astra_plan::NewStepRun {
                 plan_id: &plan_id,
                 subtask_id: &req.subtask_id,
@@ -1800,13 +1812,13 @@ pub(super) async fn finish_step_run_handler(
     // Ownership check so unrelated users can't finalize someone else's runs.
     let plan_state = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
 
     let existing = state
         .plan_repo
-        .get_step_run(&plan_id, &run_id)
+        .get_step_run(&user.user_id, &plan_id, &run_id)
         .await
         .map_err(map_plan_load_err)?;
 
@@ -1847,6 +1859,7 @@ pub(super) async fn finish_step_run_handler(
     if let Err(error) = state
         .plan_repo
         .finalize_step_run(
+            &user.user_id,
             &plan_id,
             &run_id,
             req.status,
@@ -1873,7 +1886,7 @@ pub(super) async fn finish_step_run_handler(
     // the previous list_step_runs + find which was O(N) over all plan runs.
     let finalized = state
         .plan_repo
-        .get_step_run(&plan_id, &run_id)
+        .get_step_run(&user.user_id, &plan_id, &run_id)
         .await
         .map_err(map_plan_load_err)?;
 
@@ -1920,13 +1933,14 @@ pub(super) async fn list_step_runs_handler(
     // Ownership check before listing so we don't leak existence of unowned plans.
     let _ = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
 
     let runs = state
         .plan_repo
         .list_step_runs(
+            &user.user_id,
             &plan_id,
             q.subtask_id.as_deref(),
             q.limit.unwrap_or(DEFAULT_RUNS_LIMIT),
@@ -1947,7 +1961,7 @@ pub(super) async fn plan_status_handler(
 
     let plan_state = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
     let phase = plan_state.infer_phase();
@@ -1979,14 +1993,14 @@ pub(super) async fn delete_plan_handler(
     // Verify ownership before deleting (404, not 403, for non-owners).
     let loaded = state
         .plan_repo
-        .load_owned(&plan_id, &user.user_id)
+        .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
     let session_hint = loaded.session_hint.clone();
 
     state
         .plan_repo
-        .delete(&plan_id)
+        .delete(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
 
@@ -2127,19 +2141,29 @@ mod tests {
         SharedPool::new(&settings).await.expect("connect matrixone")
     }
 
-    async fn cleanup_session_todos(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
-        let _ = sqlx::query("DELETE FROM session_todos WHERE session_id = ?")
+    async fn cleanup_session_todos(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        session_id: &str,
+        user_id: &str,
+    ) {
+        sqlx::query("DELETE FROM session_todos WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
+            .bind(user_id)
             .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ?")
+            .await
+            .expect("cleanup plan handler fixture session_todos");
+        sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
+            .bind(user_id)
             .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+            .await
+            .expect("cleanup plan handler fixture session_todo_counters");
+        sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
             .bind(session_id)
+            .bind(user_id)
             .execute(pool)
-            .await;
+            .await
+            .expect("cleanup plan handler fixture agent_sessions");
     }
 
     async fn prepare_session_todo_owner(
@@ -2147,7 +2171,7 @@ mod tests {
         session_id: &str,
         user_id: &str,
     ) {
-        cleanup_session_todos(pool, session_id).await;
+        cleanup_session_todos(pool, session_id, user_id).await;
         sqlx::query(
             "INSERT INTO agent_sessions (session_id, user_id, agent_id, title, status, metadata)
              VALUES (?, ?, 'plan-handler-test', 'plan handler test', 'active', '{}')",
@@ -2893,7 +2917,7 @@ mod tests {
                 == Some("plan-matrixone-visible")
         }));
 
-        cleanup_session_todos(&pool, &session_id).await;
+        cleanup_session_todos(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -2951,7 +2975,7 @@ mod tests {
             "existing MatrixOne task must survive mirror failure: {tasks:?}"
         );
 
-        cleanup_session_todos(&pool, &session_id).await;
+        cleanup_session_todos(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -3030,7 +3054,7 @@ mod tests {
         );
         assert!(task.subtasks.is_empty(), "{task:?}");
 
-        cleanup_session_todos(&pool, &session_id).await;
+        cleanup_session_todos(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -3100,7 +3124,7 @@ mod tests {
             "repeat approval should create a fresh in-progress task: {tasks:?}"
         );
 
-        cleanup_session_todos(&pool, &session_id).await;
+        cleanup_session_todos(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -3175,7 +3199,7 @@ mod tests {
             "paused plan should explain automatic handoff: {paused:?}"
         );
 
-        cleanup_session_todos(&pool, &session_id).await;
+        cleanup_session_todos(&pool, &session_id, &user_id).await;
     }
 
     #[tokio::test]
@@ -3253,7 +3277,7 @@ mod tests {
             "MatrixOne completed task-board history should remain terminal: {after_redo:?}"
         );
 
-        cleanup_session_todos(&pool, &session_id).await;
+        cleanup_session_todos(&pool, &session_id, &user_id).await;
     }
 
     // ── error mapping tests ──────────────────────────────────────────────

@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use astra_core::agent_warn;
+use astra_core::{agent_warn, canonical_names::normalize_optional_name};
 use serde_json::Value;
 
 use crate::chat_turn_heuristics::{
@@ -338,11 +338,11 @@ pub fn ingest_agentic_turn_stream(
 
     for tc in snap.tool_calls {
         if let Some(name) = tool_call_name(tc) {
-            st.all_tools_used.insert(name.to_string());
+            insert_tool_used(st.all_tools_used, name.to_string());
         }
     }
     for i in 0..edge_round_len {
-        st.all_tools_used.insert(edge_tool_name(i));
+        insert_tool_used(st.all_tools_used, edge_tool_name(i));
     }
     *st.has_any_usage = *st.has_any_usage || snap.has_usage;
 
@@ -364,14 +364,13 @@ pub fn ingest_agentic_turn_stream(
             }
             k
         } else {
-            let lower = err.to_lowercase();
-            if astra_core::is_context_window_error(&lower) {
+            if astra_core::is_llm_context_window_error(err) {
                 *st.consecutive_context_window_errors =
                     st.consecutive_context_window_errors.saturating_add(1);
                 astra_core::ErrorKind::ContextWindow
             } else {
                 *st.consecutive_context_window_errors = 0;
-                astra_core::classify_llm_error(err)
+                astra_core::classify_llm_error_message(err)
             }
         };
         return AgenticTurnIngestOutcome::Fatal(astra_core::ClassifiedError::new(
@@ -448,6 +447,12 @@ fn record_prompt_calibration_success(
         .saturating_add(snap.cache_creation_tokens);
     if snap.has_usage && billable_input > 0 {
         *st.last_measured_prompt_tokens = Some(billable_input);
+    }
+}
+
+fn insert_tool_used(target: &mut HashSet<String>, name: String) {
+    if let Some(name) = normalize_optional_name(Some(name)) {
+        target.insert(name);
     }
 }
 
@@ -830,6 +835,60 @@ mod tests {
     }
 
     #[test]
+    fn fatal_unclassified_error_uses_core_llm_classifier() {
+        let cases = [
+            (
+                "Error: pool timed out while waiting for an open connection",
+                astra_core::ErrorKind::ConnectionPoolExhausted,
+            ),
+            (
+                "Error: Could not validate credentials",
+                astra_core::ErrorKind::Auth,
+            ),
+            (
+                "The security token included in the request is expired",
+                astra_core::ErrorKind::Auth,
+            ),
+        ];
+
+        for (message, expected_kind) in cases {
+            let err = Some(message.to_string());
+            let snap = AgenticTurnStreamSnapshot {
+                ttft_ms: None,
+                session_id: &None,
+                run_id: &None,
+                full_text: "",
+                tool_calls: &[],
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                has_usage: false,
+                error_message: &err,
+                error_kind: None,
+            };
+            let mut pack = Pack::new();
+            pack.consecutive_context_window_errors = 3;
+            let out = ingest_agentic_turn_stream(
+                &snap,
+                0,
+                |_| String::new(),
+                "hi",
+                &[],
+                true,
+                pack.ingest_mut(),
+            );
+
+            assert!(
+                matches!(out, AgenticTurnIngestOutcome::Fatal(ref e)
+                    if e.kind == expected_kind && e.message == message),
+                "unexpected ingest outcome for {message:?}: {out:?}"
+            );
+            assert_eq!(pack.consecutive_context_window_errors, 0);
+        }
+    }
+
+    #[test]
     fn break_when_no_tools_and_no_edge() {
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: Some(12),
@@ -927,6 +986,79 @@ mod tests {
         );
         assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
         assert!(pack.all_tools_used.contains("read_file"));
+    }
+
+    #[test]
+    fn has_tool_calls_canonicalizes_tool_names_before_recording() {
+        let tcs = vec![
+            json!({"name": " read_file ", "arguments": {}}),
+            json!({"name": "read_file", "arguments": {}}),
+            json!({"name": " ", "arguments": {}}),
+        ];
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &tcs,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: false,
+            error_message: &None,
+            error_kind: None,
+        };
+        let mut pack = Pack::new();
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "hi",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+
+        assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
+        assert_eq!(pack.total_tool_calls, 3);
+        assert_eq!(
+            pack.all_tools_used,
+            HashSet::from(["read_file".to_string()])
+        );
+    }
+
+    #[test]
+    fn edge_tool_names_are_canonicalized_before_recording() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &[],
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: false,
+            error_message: &None,
+            error_kind: None,
+        };
+        let mut pack = Pack::new();
+        let tool_names = [" bash ", "bash", " "];
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            tool_names.len(),
+            |i| tool_names[i].to_string(),
+            "hi",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+
+        assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
+        assert_eq!(pack.total_tool_calls, 3);
+        assert_eq!(pack.all_tools_used, HashSet::from(["bash".to_string()]));
     }
 
     #[test]

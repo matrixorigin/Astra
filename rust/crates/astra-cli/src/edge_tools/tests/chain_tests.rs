@@ -319,7 +319,6 @@ async fn run_chain_invalid_format_returns_error() {
         result.contains("Error: Invalid chain format"),
         "should return error for invalid chain: {result}"
     );
-    assert!(!result.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL));
 }
 
 #[tokio::test]
@@ -349,7 +348,6 @@ async fn run_chain_blocks_recursive_child_chain() {
         result.contains("Error: Invalid chain"),
         "should return error for recursive/unknown tool chain: {result}"
     );
-    assert!(!result.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL));
 }
 
 #[tokio::test]

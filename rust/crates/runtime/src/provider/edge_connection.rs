@@ -355,11 +355,9 @@ mod tests {
             ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
                 Ok(vec![])
             }
-            async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
-                Ok(())
-            }
             async fn deliver_result(
                 &self,
+                _user_id: &str,
                 _request_id: &str,
                 _edge_agent_id: &str,
                 _result_json: &str,
@@ -368,6 +366,7 @@ mod tests {
             }
             async fn fail_dispatch(
                 &self,
+                _user_id: &str,
                 _request_id: &str,
                 _reason: &str,
             ) -> Result<bool, String> {
@@ -375,6 +374,7 @@ mod tests {
             }
             async fn wait_result(
                 &self,
+                _user_id: &str,
                 _request_id: &str,
                 _timeout: std::time::Duration,
             ) -> Result<Option<String>, String> {

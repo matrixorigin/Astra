@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::Value;
 use sqlx::{Row, query};
+use std::time::Duration;
 
 use super::service::EvaluationService;
 use super::types::*;
@@ -23,6 +24,8 @@ const LOOP_DRIFT_DELTA_THRESHOLD: f64 = 0.10;
 const TRUST_SLO_TARGET: f64 = 0.95;
 const ZERO_IQR_NOISE_BAND: f64 = 0.05;
 const SESSION_QUALITY_LEVEL: &str = "session";
+const MEMORIA_CONNECT_TIMEOUT_SECS: u64 = 10;
+const MEMORIA_REQUEST_TIMEOUT_SECS: u64 = 30;
 const UPSERT_SESSION_QUALITY_ASSESSMENT_SQL: &str = "INSERT INTO eval_quality_assessments \
      (assessment_id, user_id, target_id, score, step_count, level) \
      VALUES (?, ?, ?, ?, ?, ?) \
@@ -34,6 +37,362 @@ const UPSERT_SESSION_QUALITY_ASSESSMENT_SQL: &str = "INSERT INTO eval_quality_as
        level = VALUES(level), \
        updated_at = CURRENT_TIMESTAMP(6)";
 
+trait EvaluationRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error>;
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error>;
+    fn i8_column(&self, column: &str) -> Result<i8, sqlx::Error>;
+    fn f64_column(&self, column: &str) -> Result<f64, sqlx::Error>;
+    fn optional_f64_column(&self, column: &str) -> Result<Option<f64>, sqlx::Error>;
+}
+
+impl EvaluationRow for sqlx::mysql::MySqlRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn i8_column(&self, column: &str) -> Result<i8, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn f64_column(&self, column: &str) -> Result<f64, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn optional_f64_column(&self, column: &str) -> Result<Option<f64>, sqlx::Error> {
+        self.try_get(column)
+    }
+}
+
+fn evaluation_decode_error(
+    context: &str,
+    column: &str,
+    error: impl std::fmt::Display,
+) -> (StatusCode, axum::Json<astra_core::ErrorResponse>) {
+    internal_error(format!(
+        "evaluation {context} decode column `{column}`: {error}"
+    ))
+}
+
+fn evaluation_row_string(
+    row: &impl EvaluationRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<String> {
+    row.string_column(column)
+        .map_err(|error| evaluation_decode_error(context, column, error))
+}
+
+fn evaluation_required_non_empty_string(
+    row: &impl EvaluationRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<String> {
+    let value = evaluation_row_string(row, context, column)?;
+    if value.trim().is_empty() {
+        return Err(evaluation_decode_error(
+            context,
+            column,
+            "expected non-empty string",
+        ));
+    }
+    Ok(value)
+}
+
+fn evaluation_optional_non_empty_string(
+    row: &impl EvaluationRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<Option<String>> {
+    let value = row
+        .optional_string_column(column)
+        .map_err(|error| evaluation_decode_error(context, column, error))?;
+    if matches!(value.as_deref(), Some(value) if value.trim().is_empty()) {
+        return Err(evaluation_decode_error(
+            context,
+            column,
+            "expected optional string to be non-empty when present",
+        ));
+    }
+    Ok(value)
+}
+
+fn evaluation_row_i64(row: &impl EvaluationRow, context: &str, column: &str) -> ServiceResult<i64> {
+    row.i64_column(column)
+        .map_err(|error| evaluation_decode_error(context, column, error))
+}
+
+fn evaluation_row_non_negative_i64(
+    row: &impl EvaluationRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<i64> {
+    let value = evaluation_row_i64(row, context, column)?;
+    if value < 0 {
+        return Err(evaluation_decode_error(
+            context,
+            column,
+            format!("expected non-negative integer, got {value}"),
+        ));
+    }
+    Ok(value)
+}
+
+fn evaluation_row_bool_i8(
+    row: &impl EvaluationRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<bool> {
+    let value = row
+        .i8_column(column)
+        .map_err(|error| evaluation_decode_error(context, column, error))?;
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(evaluation_decode_error(
+            context,
+            column,
+            format!("expected boolean 0 or 1, got {value}"),
+        )),
+    }
+}
+
+fn evaluation_row_f64(row: &impl EvaluationRow, context: &str, column: &str) -> ServiceResult<f64> {
+    row.f64_column(column)
+        .map_err(|error| evaluation_decode_error(context, column, error))
+}
+
+fn evaluation_finite_f64(
+    row: &impl EvaluationRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<f64> {
+    let value = evaluation_row_f64(row, context, column)?;
+    if !value.is_finite() {
+        return Err(evaluation_decode_error(
+            context,
+            column,
+            format!("expected finite number, got {value}"),
+        ));
+    }
+    Ok(value)
+}
+
+fn evaluation_score(row: &impl EvaluationRow, context: &str, column: &str) -> ServiceResult<f64> {
+    let score = evaluation_finite_f64(row, context, column)?;
+    if !(0.0..=1.0).contains(&score) {
+        return Err(evaluation_decode_error(
+            context,
+            column,
+            format!("expected score in 0..=1, got {score}"),
+        ));
+    }
+    Ok(score)
+}
+
+fn evaluation_optional_score(
+    row: &impl EvaluationRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<Option<f64>> {
+    let score = row
+        .optional_f64_column(column)
+        .map_err(|error| evaluation_decode_error(context, column, error))?;
+    match score {
+        Some(score) if !score.is_finite() || !(0.0..=1.0).contains(&score) => {
+            Err(evaluation_decode_error(
+                context,
+                column,
+                format!("expected optional score in 0..=1 when present, got {score}"),
+            ))
+        }
+        score => Ok(score),
+    }
+}
+
+fn evaluation_non_negative_pair(
+    row: &impl EvaluationRow,
+    context: &str,
+    total_column: &str,
+    part_column: &str,
+) -> ServiceResult<(i64, i64)> {
+    let total = evaluation_row_non_negative_i64(row, context, total_column)?;
+    let part = evaluation_row_non_negative_i64(row, context, part_column)?;
+    if part > total {
+        return Err(evaluation_decode_error(
+            context,
+            part_column,
+            format!("expected `{part_column}` <= `{total_column}`, got {part} > {total}"),
+        ));
+    }
+    Ok((total, part))
+}
+
+fn quality_trend_point_from_row(
+    row: &impl EvaluationRow,
+    model: Option<String>,
+) -> ServiceResult<QualityTrendPoint> {
+    let context = "quality_trend_row";
+    let avg_score = evaluation_score(row, context, "avg_score")?;
+    let count = evaluation_row_non_negative_i64(row, context, "cnt")?;
+    Ok(QualityTrendPoint {
+        date: evaluation_required_non_empty_string(row, context, "dt")?,
+        avg_score,
+        avg_score_interval: sampled_confidence_interval(avg_score, count),
+        count,
+        model,
+    })
+}
+
+fn quality_trend_score_from_row(row: &impl EvaluationRow) -> ServiceResult<f64> {
+    evaluation_score(row, "quality_trend_score_row", "score")
+}
+
+fn drift_score_from_row(row: &impl EvaluationRow) -> ServiceResult<(String, String, f64)> {
+    let context = "drift_score_row";
+    let level = evaluation_required_non_empty_string(row, context, "level")?;
+    let window_bucket = evaluation_required_non_empty_string(row, context, "window_bucket")?;
+    if !matches!(window_bucket.as_str(), "current" | "previous") {
+        return Err(evaluation_decode_error(
+            context,
+            "window_bucket",
+            format!("expected `current` or `previous`, got `{window_bucket}`"),
+        ));
+    }
+    let score = evaluation_score(row, context, "score")?;
+    Ok((level, window_bucket, score))
+}
+
+fn gate_result_from_row(row: &impl EvaluationRow) -> ServiceResult<GateResultResponse> {
+    let context = "gate_result_row";
+    let sessions_tested = evaluation_row_non_negative_i64(row, context, "sessions_tested")?;
+    let error_rate = evaluation_score(row, context, "error_rate")?;
+    let score_delta = evaluation_finite_f64(row, context, "score_delta")?;
+    Ok(GateResultResponse {
+        gate_id: evaluation_required_non_empty_string(row, context, "gate_id")?,
+        change_type: evaluation_required_non_empty_string(row, context, "change_type")?,
+        change_id: evaluation_required_non_empty_string(row, context, "change_id")?,
+        sessions_tested,
+        error_rate,
+        error_rate_interval: sampled_confidence_interval(error_rate, sessions_tested),
+        score_delta,
+        score_delta_interval: sampled_value_interval(score_delta, sessions_tested),
+        passed: evaluation_row_bool_i8(row, context, "passed")?,
+        created_at: evaluation_optional_non_empty_string(row, context, "created_at")?,
+    })
+}
+
+fn calibration_sample_from_row(row: &impl EvaluationRow) -> ServiceResult<(f64, f64)> {
+    let context = "calibration_sample_row";
+    Ok((
+        evaluation_score(row, context, "confidence")?,
+        evaluation_score(row, context, "quality_score")?,
+    ))
+}
+
+fn session_score_from_row(row: &impl EvaluationRow) -> ServiceResult<SessionScoreResponse> {
+    let context = "session_score_row";
+    let score = evaluation_score(row, context, "score")?;
+    Ok(SessionScoreResponse {
+        session_id: evaluation_required_non_empty_string(row, context, "target_id")?,
+        score,
+        score_interval: ConfidenceInterval::exact(score),
+        chain_count: evaluation_row_non_negative_i64(row, context, "chain_count")?,
+    })
+}
+
+fn gate_validation_score_from_row(row: &impl EvaluationRow) -> ServiceResult<f64> {
+    evaluation_score(row, "gate_validation_score_row", "score")
+}
+
+fn trust_count_pair_from_row(row: &impl EvaluationRow, context: &str) -> ServiceResult<(i64, i64)> {
+    evaluation_non_negative_pair(row, context, "total", "safe_cnt")
+}
+
+fn slo_entry_from_row(row: &impl EvaluationRow) -> ServiceResult<SloEntry> {
+    let context = "slo_dashboard_row";
+    let (total, safe) = trust_count_pair_from_row(row, context)?;
+    let actual = trust_ratio(total, safe);
+    Ok(SloEntry {
+        agent_id: evaluation_required_non_empty_string(row, context, "agent_id")?,
+        slo_name: "trust_ratio".into(),
+        target: TRUST_SLO_TARGET,
+        actual,
+        actual_interval: sampled_confidence_interval(actual, total),
+        met: actual >= TRUST_SLO_TARGET,
+    })
+}
+
+fn slo_history_point_from_row(row: &impl EvaluationRow) -> ServiceResult<SloHistoryPoint> {
+    let context = "slo_history_row";
+    let (total, safe) = trust_count_pair_from_row(row, context)?;
+    let value = trust_ratio(total, safe);
+    Ok(SloHistoryPoint {
+        date: evaluation_required_non_empty_string(row, context, "dt")?,
+        value,
+        value_interval: sampled_confidence_interval(value, total),
+        target: TRUST_SLO_TARGET,
+        met: value >= TRUST_SLO_TARGET,
+    })
+}
+
+fn observability_turn_count_from_row(row: &impl EvaluationRow) -> ServiceResult<i64> {
+    evaluation_row_non_negative_i64(row, "observability_turn_count_row", "turn_count")
+}
+
+fn observability_quality_score_from_row(row: &impl EvaluationRow) -> ServiceResult<f64> {
+    evaluation_score(row, "observability_quality_row", "session_quality")
+}
+
+fn skill_metrics_from_row(row: &impl EvaluationRow) -> ServiceResult<SkillMetrics> {
+    let context = "skill_metrics_row";
+    let (total, success) = evaluation_non_negative_pair(row, context, "total", "ok_cnt")?;
+    let success_rate = skill_success_rate(total, success);
+    Ok(SkillMetrics {
+        total_invocations: total,
+        success_count: success,
+        success_rate,
+        success_rate_interval: sampled_confidence_interval(success_rate, total),
+    })
+}
+
+fn training_sample_from_row(row: &impl EvaluationRow) -> ServiceResult<ExtractedTrainingSample> {
+    let context = "training_sample_row";
+    Ok(ExtractedTrainingSample {
+        session_id: evaluation_required_non_empty_string(row, context, "session_id")?,
+        quality_score: evaluation_score(row, context, "quality_score")?,
+        step_count: evaluation_row_non_negative_i64(row, context, "step_count")?,
+        avg_confidence: evaluation_optional_score(row, context, "avg_confidence")?,
+        trace_count: evaluation_row_non_negative_i64(row, context, "trace_count")?,
+        quality_updated_at: evaluation_optional_non_empty_string(
+            row,
+            context,
+            "quality_updated_at",
+        )?,
+        latest_context_trace_at: evaluation_optional_non_empty_string(
+            row,
+            context,
+            "latest_context_trace_at",
+        )?,
+    })
+}
+
+fn training_dataset_export_from_row(row: &impl EvaluationRow) -> ServiceResult<(String, i64)> {
+    let context = "training_dataset_export_row";
+    Ok((
+        evaluation_required_non_empty_string(row, context, "dataset_json")?,
+        evaluation_row_non_negative_i64(row, context, "sample_count")?,
+    ))
+}
+
 fn clamp_eval_limit(limit: i32) -> i32 {
     limit.clamp(1, MAX_EVALUATION_ROWS)
 }
@@ -44,6 +403,23 @@ fn clamp_eval_days(days: i32) -> i32 {
 
 fn clamp_extract_limit(limit: i32) -> i32 {
     limit.clamp(1, MAX_EXTRACT_SAMPLES)
+}
+
+fn memoria_connect_timeout() -> Duration {
+    Duration::from_secs(MEMORIA_CONNECT_TIMEOUT_SECS)
+}
+
+fn memoria_request_timeout() -> Duration {
+    Duration::from_secs(MEMORIA_REQUEST_TIMEOUT_SECS)
+}
+
+fn memoria_http_client(headers: HeaderMap) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(memoria_connect_timeout())
+        .timeout(memoria_request_timeout())
+        .default_headers(headers)
+        .build()
 }
 
 fn session_quality_assessment_id(session_id: &str) -> String {
@@ -974,13 +1350,7 @@ impl DatabaseEvaluationService {
             HeaderValue::from_str(&format!("Bearer {master_key}")).map_err(internal_error)?,
         );
 
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .default_headers(headers)
-            .build()
-            .map_err(internal_error)?;
+        let client = memoria_http_client(headers).map_err(internal_error)?;
 
         let response = client.get(url).send().await.map_err(internal_error)?;
         if !response.status().is_success() {
@@ -1014,7 +1384,7 @@ impl EvaluationService for DatabaseEvaluationService {
         if let Some(ref model) = normalized_model {
             trend_query = trend_query.bind(model);
         }
-        let rows = trend_query.fetch_all(&pool).await.unwrap_or_default();
+        let rows = trend_query.fetch_all(&pool).await.map_err(internal_error)?;
 
         let mut scores_query = query(quality_trend_scores_query(normalized_model.as_deref()))
             .bind(user_id)
@@ -1025,26 +1395,16 @@ impl EvaluationService for DatabaseEvaluationService {
         let raw_scores: Vec<f64> = scores_query
             .fetch_all(&pool)
             .await
-            .unwrap_or_default()
+            .map_err(internal_error)?
             .into_iter()
-            .filter_map(|row| row.try_get("score").ok())
-            .collect();
+            .map(|row| quality_trend_score_from_row(&row))
+            .collect::<ServiceResult<_>>()?;
         let noise_filtered = noise_filtered_average(&raw_scores);
 
         let points: Vec<QualityTrendPoint> = rows
             .iter()
-            .map(|r| {
-                let avg_score = r.try_get("avg_score").unwrap_or(0.0);
-                let count = r.try_get("cnt").unwrap_or(0);
-                QualityTrendPoint {
-                    date: r.try_get("dt").unwrap_or_default(),
-                    avg_score,
-                    avg_score_interval: sampled_confidence_interval(avg_score, count),
-                    count,
-                    model: normalized_model.clone(),
-                }
-            })
-            .collect();
+            .map(|row| quality_trend_point_from_row(row, normalized_model.clone()))
+            .collect::<ServiceResult<_>>()?;
 
         let total_events: i64 = points.iter().map(|p| p.count).sum();
         let overall_avg = compute_overall_avg(&points);
@@ -1082,17 +1442,11 @@ impl EvaluationService for DatabaseEvaluationService {
         .bind(lookback_days)
         .fetch_all(&pool)
         .await
-        .unwrap_or_default();
+        .map_err(internal_error)?;
 
         let mut scores_by_level = std::collections::BTreeMap::<String, (Vec<f64>, Vec<f64>)>::new();
         for row in &rows {
-            let level = row
-                .try_get::<String, _>("level")
-                .unwrap_or_else(|_| "unknown".into());
-            let window_bucket = row
-                .try_get::<String, _>("window_bucket")
-                .unwrap_or_else(|_| "previous".into());
-            let score = row.try_get::<f64, _>("score").unwrap_or(0.0);
+            let (level, window_bucket, score) = drift_score_from_row(row)?;
             let entry = scores_by_level.entry(level).or_default();
             if window_bucket == "current" {
                 entry.0.push(score);
@@ -1134,30 +1488,12 @@ impl EvaluationService for DatabaseEvaluationService {
         .bind(limit)
         .fetch_all(&pool)
         .await
-        .unwrap_or_default();
+        .map_err(internal_error)?;
 
         let gates: Vec<GateResultResponse> = rows
             .iter()
-            .map(|r| {
-                let sessions_tested = r.try_get("sessions_tested").unwrap_or(0);
-                let error_rate = r.try_get("error_rate").unwrap_or(0.0);
-                GateResultResponse {
-                    gate_id: r.try_get("gate_id").unwrap_or_default(),
-                    change_type: r.try_get("change_type").unwrap_or_default(),
-                    change_id: r.try_get("change_id").unwrap_or_default(),
-                    sessions_tested,
-                    error_rate,
-                    error_rate_interval: sampled_confidence_interval(error_rate, sessions_tested),
-                    score_delta: r.try_get("score_delta").unwrap_or(0.0),
-                    score_delta_interval: sampled_value_interval(
-                        r.try_get("score_delta").unwrap_or(0.0),
-                        sessions_tested,
-                    ),
-                    passed: r.try_get::<i8, _>("passed").unwrap_or(0) != 0,
-                    created_at: r.try_get("created_at").ok(),
-                }
-            })
-            .collect();
+            .map(gate_result_from_row)
+            .collect::<ServiceResult<_>>()?;
         let total = gates.len();
         Ok(GateHistoryResponse { gates, total })
     }
@@ -1207,15 +1543,8 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let samples: Vec<(f64, f64)> = rows
             .iter()
-            .filter_map(|row| {
-                let confidence: Option<f64> = row.try_get("confidence").ok();
-                let quality: Option<f64> = row.try_get("quality_score").ok();
-                match (confidence, quality) {
-                    (Some(c), Some(q)) => Some((c, q)),
-                    _ => None,
-                }
-            })
-            .collect();
+            .map(calibration_sample_from_row)
+            .collect::<ServiceResult<_>>()?;
 
         let summary = summarize_calibration_samples(&samples);
         let noise_filtered_summary =
@@ -1273,20 +1602,12 @@ impl EvaluationService for DatabaseEvaluationService {
         .bind(limit)
         .fetch_all(&pool)
         .await
-        .unwrap_or_default();
+        .map_err(internal_error)?;
 
         let sessions: Vec<SessionScoreResponse> = rows
             .iter()
-            .map(|r| {
-                let score = r.try_get("score").unwrap_or(0.0);
-                SessionScoreResponse {
-                    session_id: r.try_get("target_id").unwrap_or_default(),
-                    score,
-                    score_interval: ConfidenceInterval::exact(score.clamp(0.0, 1.0)),
-                    chain_count: r.try_get("chain_count").unwrap_or(0),
-                }
-            })
-            .collect();
+            .map(session_score_from_row)
+            .collect::<ServiceResult<_>>()?;
         let total = sessions.len();
         Ok(SessionScoresListResponse { sessions, total })
     }
@@ -1337,8 +1658,8 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let scores = rows
             .iter()
-            .map(|row| row.try_get::<f64, _>("score").unwrap_or(0.0))
-            .collect::<Vec<_>>();
+            .map(gate_validation_score_from_row)
+            .collect::<ServiceResult<Vec<_>>>()?;
         let summary = summarize_gate_validation(
             &scores,
             request.golden_session_count,
@@ -1503,8 +1824,8 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let row = query(
             "SELECT COUNT(*) AS total, \
-             SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
-                  THEN 1 ELSE 0 END) AS safe_cnt \
+             COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
+                  THEN 1 ELSE 0 END), 0) AS safe_cnt \
              FROM agent_events \
              WHERE user_id = ? \
                AND event_type = 'hallucination_check' \
@@ -1515,15 +1836,10 @@ impl EvaluationService for DatabaseEvaluationService {
         .bind(agent_id)
         .bind(days)
         .fetch_one(&pool)
-        .await;
+        .await
+        .map_err(internal_error)?;
 
-        let (total, safe) = match row {
-            Ok(r) => (
-                r.try_get::<i64, _>("total").unwrap_or(0),
-                r.try_get::<i64, _>("safe_cnt").unwrap_or(0),
-            ),
-            Err(_) => (0, 0),
-        };
+        let (total, safe) = trust_count_pair_from_row(&row, "trust_report_row")?;
 
         let ratio = trust_ratio(total, safe);
         let trust_ratio_interval = sampled_confidence_interval(ratio, total);
@@ -1563,25 +1879,12 @@ impl EvaluationService for DatabaseEvaluationService {
         .bind(period_days)
         .fetch_all(&pool)
         .await
-        .unwrap_or_default();
+        .map_err(internal_error)?;
 
         let agents = rows
             .iter()
-            .map(|row| {
-                let agent_id = row.try_get::<String, _>("agent_id").unwrap_or_default();
-                let total = row.try_get::<i64, _>("total").unwrap_or(0);
-                let safe = row.try_get::<i64, _>("safe_cnt").unwrap_or(0);
-                let actual = trust_ratio(total, safe);
-                SloEntry {
-                    agent_id,
-                    slo_name: "trust_ratio".into(),
-                    target: TRUST_SLO_TARGET,
-                    actual,
-                    actual_interval: sampled_confidence_interval(actual, total),
-                    met: actual >= TRUST_SLO_TARGET,
-                }
-            })
-            .collect();
+            .map(slo_entry_from_row)
+            .collect::<ServiceResult<_>>()?;
 
         Ok(SloDashboardResponse {
             period_days,
@@ -1616,23 +1919,12 @@ impl EvaluationService for DatabaseEvaluationService {
         .bind(days)
         .fetch_all(&pool)
         .await
-        .unwrap_or_default();
+        .map_err(internal_error)?;
 
         let history = rows
             .iter()
-            .map(|row| {
-                let total = row.try_get::<i64, _>("total").unwrap_or(0);
-                let safe = row.try_get::<i64, _>("safe_cnt").unwrap_or(0);
-                let value = trust_ratio(total, safe);
-                SloHistoryPoint {
-                    date: row.try_get::<String, _>("dt").unwrap_or_default(),
-                    value,
-                    value_interval: sampled_confidence_interval(value, total),
-                    target: TRUST_SLO_TARGET,
-                    met: value >= TRUST_SLO_TARGET,
-                }
-            })
-            .collect();
+            .map(slo_history_point_from_row)
+            .collect::<ServiceResult<_>>()?;
 
         Ok(SloHistoryResponse {
             agent_id: agent_id.to_string(),
@@ -1664,11 +1956,11 @@ impl EvaluationService for DatabaseEvaluationService {
         .bind(days)
         .fetch_all(&pool)
         .await
-        .unwrap_or_default();
+        .map_err(internal_error)?;
         let turn_counts_raw: Vec<i64> = session_turn_rows
             .into_iter()
-            .filter_map(|row| row.try_get("turn_count").ok())
-            .collect();
+            .map(|row| observability_turn_count_from_row(&row))
+            .collect::<ServiceResult<_>>()?;
         let total_decisions = turn_counts_raw.iter().sum();
         let turn_counts: Vec<f64> = turn_counts_raw.iter().map(|count| *count as f64).collect();
         let session = summarize_session_metrics(&turn_counts);
@@ -1703,16 +1995,16 @@ impl EvaluationService for DatabaseEvaluationService {
         .bind(days)
         .fetch_all(&pool)
         .await
-        .unwrap_or_default();
+        .map_err(internal_error)?;
         let decision_quality_scores: Vec<f64> = decision_quality_rows
             .into_iter()
-            .filter_map(|row| row.try_get("session_quality").ok())
-            .collect();
+            .map(|row| observability_quality_score_from_row(&row))
+            .collect::<ServiceResult<_>>()?;
         let decision = summarize_decision_metrics(total_decisions, &decision_quality_scores);
 
         let skill_row = query(
             "SELECT COUNT(*) AS total, \
-             SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END) AS ok_cnt \
+             COALESCE(SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END), 0) AS ok_cnt \
              FROM skill_selection_events \
              WHERE user_id = ? \
                AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY)",
@@ -1720,27 +2012,10 @@ impl EvaluationService for DatabaseEvaluationService {
         .bind(user_id)
         .bind(days)
         .fetch_one(&pool)
-        .await;
+        .await
+        .map_err(internal_error)?;
 
-        let skill = match skill_row {
-            Ok(r) => {
-                let total: i64 = r.try_get("total").unwrap_or(0);
-                let success: i64 = r.try_get("ok_cnt").unwrap_or(0);
-                let success_rate = skill_success_rate(total, success);
-                SkillMetrics {
-                    total_invocations: total,
-                    success_count: success,
-                    success_rate,
-                    success_rate_interval: sampled_confidence_interval(success_rate, total),
-                }
-            }
-            Err(_) => SkillMetrics {
-                total_invocations: 0,
-                success_count: 0,
-                success_rate: 0.0,
-                success_rate_interval: ConfidenceInterval::ZERO,
-            },
-        };
+        let skill = skill_metrics_from_row(&skill_row)?;
 
         Ok(ObservabilityMetricsResponse {
             agent_id: agent_id.to_string(),
@@ -1886,16 +2161,8 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let samples = rows
             .iter()
-            .map(|row| ExtractedTrainingSample {
-                session_id: row.try_get("session_id").unwrap_or_default(),
-                quality_score: row.try_get("quality_score").unwrap_or(0.0),
-                step_count: row.try_get("step_count").unwrap_or(0),
-                avg_confidence: row.try_get("avg_confidence").ok(),
-                trace_count: row.try_get("trace_count").unwrap_or(0),
-                quality_updated_at: row.try_get("quality_updated_at").ok(),
-                latest_context_trace_at: row.try_get("latest_context_trace_at").ok(),
-            })
-            .collect::<Vec<_>>();
+            .map(training_sample_from_row)
+            .collect::<ServiceResult<Vec<_>>>()?;
         let dataset_id = uuid::Uuid::now_v7().to_string();
         let status = training_dataset_status(samples.len()).to_string();
         let request_payload = ExtractedTrainingDataRequest {
@@ -1967,10 +2234,9 @@ impl EvaluationService for DatabaseEvaluationService {
             ));
         };
 
-        let dataset_json: String = row.try_get("dataset_json").unwrap_or_default();
+        let (dataset_json, samples_exported) = training_dataset_export_from_row(&row)?;
         let dataset: ExtractedTrainingDataset =
             serde_json::from_str(&dataset_json).map_err(internal_error)?;
-        let samples_exported = row.try_get("sample_count").unwrap_or(0);
         let (normalized_format, content_type, content) = match export_format {
             ExportFormat::Jsonl => (
                 "jsonl".to_string(),
@@ -2013,6 +2279,487 @@ impl EvaluationService for DatabaseEvaluationService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeQualityTrendRow {
+        failed_column: Option<&'static str>,
+        empty_column: Option<&'static str>,
+        avg_score: f64,
+        count: i64,
+        score: f64,
+    }
+
+    impl FakeQualityTrendRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                empty_column: None,
+                avg_score: 0.75,
+                count: 8,
+                score: 0.82,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn empty_on(column: &'static str) -> Self {
+            Self {
+                empty_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_avg_score(avg_score: f64) -> Self {
+            Self {
+                avg_score,
+                ..Self::complete()
+            }
+        }
+
+        fn with_count(count: i64) -> Self {
+            Self {
+                count,
+                ..Self::complete()
+            }
+        }
+
+        fn with_score(score: f64) -> Self {
+            Self {
+                score,
+                ..Self::complete()
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn text(&self, column: &str, value: &'static str) -> String {
+            if self.empty_column == Some(column) {
+                String::new()
+            } else {
+                value.to_string()
+            }
+        }
+    }
+
+    impl EvaluationRow for FakeQualityTrendRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "dt" => Ok(self.text(column, "2026-06-26")),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "dt" => Ok(Some(self.text(column, "2026-06-26"))),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "cnt" => Ok(self.count),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn i8_column(&self, column: &str) -> Result<i8, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn f64_column(&self, column: &str) -> Result<f64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "avg_score" => Ok(self.avg_score),
+                "score" => Ok(self.score),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_f64_column(&self, column: &str) -> Result<Option<f64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "avg_score" => Ok(Some(self.avg_score)),
+                "score" => Ok(Some(self.score)),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeEvaluationRow {
+        failed_column: Option<&'static str>,
+        strings: std::collections::BTreeMap<&'static str, Option<String>>,
+        i64s: std::collections::BTreeMap<&'static str, i64>,
+        i8s: std::collections::BTreeMap<&'static str, i8>,
+        f64s: std::collections::BTreeMap<&'static str, f64>,
+        optional_f64s: std::collections::BTreeMap<&'static str, Option<f64>>,
+    }
+
+    impl FakeEvaluationRow {
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::default()
+            }
+        }
+
+        fn string(mut self, column: &'static str, value: impl Into<String>) -> Self {
+            self.strings.insert(column, Some(value.into()));
+            self
+        }
+
+        fn optional_string_none(mut self, column: &'static str) -> Self {
+            self.strings.insert(column, None);
+            self
+        }
+
+        fn i64(mut self, column: &'static str, value: i64) -> Self {
+            self.i64s.insert(column, value);
+            self
+        }
+
+        fn i8(mut self, column: &'static str, value: i8) -> Self {
+            self.i8s.insert(column, value);
+            self
+        }
+
+        fn f64(mut self, column: &'static str, value: f64) -> Self {
+            self.f64s.insert(column, value);
+            self.optional_f64s.insert(column, Some(value));
+            self
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl EvaluationRow for FakeEvaluationRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match self.strings.get(column) {
+                Some(Some(value)) => Ok(value.clone()),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            self.strings
+                .get(column)
+                .cloned()
+                .ok_or_else(|| sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            self.i64s
+                .get(column)
+                .copied()
+                .ok_or_else(|| sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn i8_column(&self, column: &str) -> Result<i8, sqlx::Error> {
+            self.maybe_fail(column)?;
+            self.i8s
+                .get(column)
+                .copied()
+                .ok_or_else(|| sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn f64_column(&self, column: &str) -> Result<f64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            self.f64s
+                .get(column)
+                .copied()
+                .ok_or_else(|| sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+
+        fn optional_f64_column(&self, column: &str) -> Result<Option<f64>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            self.optional_f64s
+                .get(column)
+                .copied()
+                .ok_or_else(|| sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+    }
+
+    fn assert_evaluation_internal_error_mentions(
+        result: ServiceResult<impl std::fmt::Debug>,
+        needle: &str,
+    ) {
+        let (status, axum::Json(body)) = result.expect_err("decode should fail");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.detail.contains(needle),
+            "evaluation decode error should identify `{needle}`: {:?}",
+            body.detail
+        );
+    }
+
+    #[test]
+    fn quality_trend_row_decode_preserves_values_and_fails_loudly() {
+        let point =
+            quality_trend_point_from_row(&FakeQualityTrendRow::complete(), Some("glm".into()))
+                .unwrap();
+        assert_eq!(point.date, "2026-06-26");
+        assert_eq!(point.avg_score, 0.75);
+        assert_eq!(point.count, 8);
+        assert_eq!(point.model.as_deref(), Some("glm"));
+
+        for column in ["dt", "avg_score", "cnt"] {
+            assert_evaluation_internal_error_mentions(
+                quality_trend_point_from_row(&FakeQualityTrendRow::fail_on(column), None),
+                column,
+            );
+        }
+
+        assert_evaluation_internal_error_mentions(
+            quality_trend_point_from_row(&FakeQualityTrendRow::empty_on("dt"), None),
+            "expected non-empty string",
+        );
+        assert_evaluation_internal_error_mentions(
+            quality_trend_point_from_row(&FakeQualityTrendRow::with_count(-1), None),
+            "non-negative integer",
+        );
+        for avg_score in [-0.1, 1.1] {
+            assert_evaluation_internal_error_mentions(
+                quality_trend_point_from_row(&FakeQualityTrendRow::with_avg_score(avg_score), None),
+                "avg_score",
+            );
+        }
+    }
+
+    #[test]
+    fn quality_trend_score_row_decode_preserves_values_and_fails_loudly() {
+        assert_eq!(
+            quality_trend_score_from_row(&FakeQualityTrendRow::complete()).unwrap(),
+            0.82
+        );
+
+        assert_evaluation_internal_error_mentions(
+            quality_trend_score_from_row(&FakeQualityTrendRow::fail_on("score")),
+            "score",
+        );
+        for score in [-0.1, 1.1] {
+            assert_evaluation_internal_error_mentions(
+                quality_trend_score_from_row(&FakeQualityTrendRow::with_score(score)),
+                "score",
+            );
+        }
+    }
+
+    #[test]
+    fn remaining_evaluation_row_decoders_preserve_values() {
+        let drift_row = FakeEvaluationRow::default()
+            .string("level", "session")
+            .string("window_bucket", "current")
+            .f64("score", 0.77);
+        assert_eq!(
+            drift_score_from_row(&drift_row).unwrap(),
+            ("session".to_string(), "current".to_string(), 0.77)
+        );
+
+        let gate_row = FakeEvaluationRow::default()
+            .string("gate_id", "gate-1")
+            .string("change_type", "tool_surface")
+            .string("change_id", "change-1")
+            .string("created_at", "2026-06-26T12:00:00")
+            .i64("sessions_tested", 5)
+            .f64("error_rate", 0.2)
+            .f64("score_delta", -0.08)
+            .i8("passed", 1);
+        let gate = gate_result_from_row(&gate_row).unwrap();
+        assert_eq!(gate.gate_id, "gate-1");
+        assert_eq!(gate.sessions_tested, 5);
+        assert_eq!(gate.score_delta, -0.08);
+        assert!(gate.passed);
+        assert_eq!(gate.created_at.as_deref(), Some("2026-06-26T12:00:00"));
+
+        let calibration_row = FakeEvaluationRow::default()
+            .f64("confidence", 0.62)
+            .f64("quality_score", 0.71);
+        assert_eq!(
+            calibration_sample_from_row(&calibration_row).unwrap(),
+            (0.62, 0.71)
+        );
+
+        let session_row = FakeEvaluationRow::default()
+            .string("target_id", "session-1")
+            .f64("score", 0.9)
+            .i64("chain_count", 3);
+        let session = session_score_from_row(&session_row).unwrap();
+        assert_eq!(session.session_id, "session-1");
+        assert_eq!(session.score, 0.9);
+        assert_eq!(session.chain_count, 3);
+
+        let slo_row = FakeEvaluationRow::default()
+            .string("agent_id", "agent-1")
+            .i64("total", 5)
+            .i64("safe_cnt", 4);
+        let slo = slo_entry_from_row(&slo_row).unwrap();
+        assert_eq!(slo.agent_id, "agent-1");
+        assert_eq!(slo.actual, 0.8);
+        assert!(!slo.met);
+
+        let history_row = FakeEvaluationRow::default()
+            .string("dt", "2026-06-26")
+            .i64("total", 2)
+            .i64("safe_cnt", 1);
+        let history = slo_history_point_from_row(&history_row).unwrap();
+        assert_eq!(history.date, "2026-06-26");
+        assert_eq!(history.value, 0.5);
+
+        let observability_turn_row = FakeEvaluationRow::default().i64("turn_count", 9);
+        assert_eq!(
+            observability_turn_count_from_row(&observability_turn_row).unwrap(),
+            9
+        );
+        let observability_quality_row = FakeEvaluationRow::default().f64("session_quality", 0.86);
+        assert_eq!(
+            observability_quality_score_from_row(&observability_quality_row).unwrap(),
+            0.86
+        );
+
+        let skill_row = FakeEvaluationRow::default()
+            .i64("total", 10)
+            .i64("ok_cnt", 7);
+        let skill = skill_metrics_from_row(&skill_row).unwrap();
+        assert_eq!(skill.total_invocations, 10);
+        assert_eq!(skill.success_count, 7);
+        assert_eq!(skill.success_rate, 0.7);
+
+        let training_row = FakeEvaluationRow::default()
+            .string("session_id", "session-2")
+            .f64("quality_score", 0.93)
+            .i64("step_count", 4)
+            .f64("avg_confidence", 0.81)
+            .i64("trace_count", 6)
+            .string("quality_updated_at", "2026-06-26T12:00:00")
+            .optional_string_none("latest_context_trace_at");
+        let sample = training_sample_from_row(&training_row).unwrap();
+        assert_eq!(sample.session_id, "session-2");
+        assert_eq!(sample.avg_confidence, Some(0.81));
+        assert_eq!(sample.latest_context_trace_at, None);
+
+        let export_row = FakeEvaluationRow::default()
+            .string("dataset_json", "{\"schema_version\":1,\"samples\":[]}")
+            .i64("sample_count", 0);
+        assert_eq!(
+            training_dataset_export_from_row(&export_row).unwrap(),
+            ("{\"schema_version\":1,\"samples\":[]}".to_string(), 0)
+        );
+    }
+
+    #[test]
+    fn remaining_evaluation_row_decoders_fail_loudly() {
+        assert_evaluation_internal_error_mentions(
+            drift_score_from_row(&FakeEvaluationRow::fail_on("level")),
+            "level",
+        );
+        assert_evaluation_internal_error_mentions(
+            drift_score_from_row(
+                &FakeEvaluationRow::default()
+                    .string("level", "session")
+                    .string("window_bucket", "stale")
+                    .f64("score", 0.7),
+            ),
+            "window_bucket",
+        );
+        assert_evaluation_internal_error_mentions(
+            gate_result_from_row(
+                &FakeEvaluationRow::default()
+                    .string("gate_id", "gate-1")
+                    .string("change_type", "tool_surface")
+                    .string("change_id", "change-1")
+                    .string("created_at", "2026-06-26T12:00:00")
+                    .i64("sessions_tested", 5)
+                    .f64("error_rate", 0.2)
+                    .f64("score_delta", -0.08)
+                    .i8("passed", 2),
+            ),
+            "passed",
+        );
+        assert_evaluation_internal_error_mentions(
+            calibration_sample_from_row(
+                &FakeEvaluationRow::default()
+                    .f64("confidence", 1.2)
+                    .f64("quality_score", 0.71),
+            ),
+            "confidence",
+        );
+        assert_evaluation_internal_error_mentions(
+            session_score_from_row(
+                &FakeEvaluationRow::default()
+                    .string("target_id", "")
+                    .f64("score", 0.9)
+                    .i64("chain_count", 3),
+            ),
+            "non-empty string",
+        );
+        assert_evaluation_internal_error_mentions(
+            trust_count_pair_from_row(
+                &FakeEvaluationRow::default()
+                    .i64("total", 1)
+                    .i64("safe_cnt", 2),
+                "trust_report_row",
+            ),
+            "safe_cnt",
+        );
+        assert_evaluation_internal_error_mentions(
+            training_sample_from_row(
+                &FakeEvaluationRow::default()
+                    .string("session_id", "session-2")
+                    .f64("quality_score", 0.93)
+                    .i64("step_count", 4)
+                    .f64("avg_confidence", 1.1)
+                    .i64("trace_count", 6)
+                    .string("quality_updated_at", "2026-06-26T12:00:00")
+                    .optional_string_none("latest_context_trace_at"),
+            ),
+            "avg_confidence",
+        );
+        assert_evaluation_internal_error_mentions(
+            training_sample_from_row(
+                &FakeEvaluationRow::default()
+                    .string("session_id", "session-2")
+                    .f64("quality_score", 0.93)
+                    .i64("step_count", 4)
+                    .f64("avg_confidence", 0.8)
+                    .i64("trace_count", 6)
+                    .string("quality_updated_at", "")
+                    .optional_string_none("latest_context_trace_at"),
+            ),
+            "optional string",
+        );
+        assert_evaluation_internal_error_mentions(
+            training_dataset_export_from_row(
+                &FakeEvaluationRow::default()
+                    .string("dataset_json", "{}")
+                    .i64("sample_count", -1),
+            ),
+            "non-negative integer",
+        );
+    }
 
     // ── clamp helpers ───────────────────────────────────────────────────
 
@@ -2468,6 +3215,14 @@ mod tests {
 
     #[test]
     fn session_quality_assessment_upsert_query_updates_existing_rows() {
+        assert!(
+            UPSERT_SESSION_QUALITY_ASSESSMENT_SQL
+                .contains("(assessment_id, user_id, target_id, score, step_count, level)")
+        );
+        assert!(
+            !UPSERT_SESSION_QUALITY_ASSESSMENT_SQL.contains("session_id"),
+            "session quality uses target_id with level='session'; do not add a duplicate required session_id column"
+        );
         assert!(UPSERT_SESSION_QUALITY_ASSESSMENT_SQL.contains("ON DUPLICATE KEY UPDATE"));
         assert!(
             UPSERT_SESSION_QUALITY_ASSESSMENT_SQL.contains("updated_at = CURRENT_TIMESTAMP(6)")
@@ -2850,23 +3605,16 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
 
-    /// audit-A5: the Memoria evaluation client must have a timeout so a hung
-    /// Memoria server cannot block the Axum handler indefinitely.
     #[test]
-    fn evaluation_memoria_client_has_timeout() {
-        let source = include_str!("database.rs");
-        let fn_start = source
-            .find("async fn retrieve_from_memoria")
-            .expect("retrieve_from_memoria must exist");
-        let end = (fn_start + 800).min(source.len());
-        let body = &source[fn_start..end];
+    fn memoria_http_client_timeout_policy_is_bounded() {
         assert!(
-            body.contains("connect_timeout("),
-            "evaluation Memoria client must set connect_timeout"
+            memoria_connect_timeout() <= memoria_request_timeout(),
+            "connect timeout cannot exceed the full request timeout"
         );
         assert!(
-            body.contains(".timeout("),
-            "evaluation Memoria client must set request timeout"
+            memoria_request_timeout() <= std::time::Duration::from_secs(60),
+            "Memoria calls must stay bounded so evaluation handlers cannot hang indefinitely"
         );
+        memoria_http_client(HeaderMap::new()).expect("Memoria HTTP client builder");
     }
 }

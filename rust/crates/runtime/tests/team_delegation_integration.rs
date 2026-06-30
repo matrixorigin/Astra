@@ -141,7 +141,7 @@ async fn full_pipeline_team_execution() {
 
     // Verify run was persisted
     let run = run_engine
-        .load_run(&report.parent_run_id)
+        .load_run("test-user", &report.parent_run_id)
         .await
         .unwrap()
         .unwrap();
@@ -259,7 +259,7 @@ async fn orchestrator_empty_team_fails_validation() {
 
     // Parent run should be marked failed
     let run = run_engine
-        .load_run(&report.parent_run_id)
+        .load_run("test-user", &report.parent_run_id)
         .await
         .unwrap()
         .unwrap();
@@ -340,7 +340,7 @@ async fn orchestrator_persists_events_and_checkpoint() {
     assert_eq!(report.status, TeamExecutionStatus::Completed);
 
     let run = run_engine
-        .load_run(&report.parent_run_id)
+        .load_run("test-user", &report.parent_run_id)
         .await
         .unwrap()
         .unwrap();
@@ -361,7 +361,7 @@ async fn orchestrator_persists_events_and_checkpoint() {
 
     // Typed checkpoint should be set
     let checkpoint = run_engine
-        .load_latest_checkpoint(&report.parent_run_id, Some("phase"))
+        .load_latest_checkpoint("test-user", &report.parent_run_id, Some("phase"))
         .await
         .unwrap()
         .expect("typed team checkpoint should be persisted");
@@ -915,12 +915,12 @@ async fn concurrent_same_team_executions_have_distinct_runs_and_history_records(
     assert_ne!(report_a.delegation_id, report_b.delegation_id);
 
     let run_a = run_engine
-        .load_run(&report_a.parent_run_id)
+        .load_run("test-user", &report_a.parent_run_id)
         .await
         .unwrap()
         .expect("run A should be persisted");
     let run_b = run_engine
-        .load_run(&report_b.parent_run_id)
+        .load_run("test-user", &report_b.parent_run_id)
         .await
         .unwrap()
         .expect("run B should be persisted");

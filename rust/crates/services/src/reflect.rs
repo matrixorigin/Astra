@@ -261,6 +261,209 @@ fn build_evidence_graph(
 }
 pub type ServiceResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
 
+trait ReflectRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error>;
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error>;
+}
+
+impl ReflectRow for sqlx::mysql::MySqlRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+        self.try_get(column)
+    }
+
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+        self.try_get(column)
+    }
+}
+
+fn reflect_decode_error(
+    context: &str,
+    column: &str,
+    error: impl std::fmt::Display,
+) -> (StatusCode, Json<ErrorResponse>) {
+    internal_error(format!(
+        "reflect {context} decode column `{column}`: {error}"
+    ))
+}
+
+fn reflect_row_string(row: &impl ReflectRow, context: &str, column: &str) -> ServiceResult<String> {
+    row.string_column(column)
+        .map_err(|error| reflect_decode_error(context, column, error))
+}
+
+fn reflect_row_optional_string(
+    row: &impl ReflectRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<Option<String>> {
+    row.optional_string_column(column)
+        .map_err(|error| reflect_decode_error(context, column, error))
+}
+
+fn reflect_row_required_non_empty_string(
+    row: &impl ReflectRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<String> {
+    let value = reflect_row_string(row, context, column)?;
+    if value.trim().is_empty() {
+        return Err(reflect_decode_error(
+            context,
+            column,
+            "expected non-empty string",
+        ));
+    }
+    Ok(value)
+}
+
+fn reflect_row_i64(row: &impl ReflectRow, context: &str, column: &str) -> ServiceResult<i64> {
+    row.i64_column(column)
+        .map_err(|error| reflect_decode_error(context, column, error))
+}
+
+fn reflect_row_non_negative_i64(
+    row: &impl ReflectRow,
+    context: &str,
+    column: &str,
+) -> ServiceResult<i64> {
+    let value = reflect_row_i64(row, context, column)?;
+    if value < 0 {
+        return Err(reflect_decode_error(
+            context,
+            column,
+            format!("expected non-negative integer, got {value}"),
+        ));
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Clone)]
+struct ReflectOverviewAgg {
+    total_events: i64,
+    unique_skills: i64,
+    error_count: i64,
+    first_event: Option<String>,
+    last_event: Option<String>,
+}
+
+fn reflect_overview_agg_from_row(row: &impl ReflectRow) -> ServiceResult<ReflectOverviewAgg> {
+    let context = "overview_agg_row";
+    let total_events = reflect_row_non_negative_i64(row, context, "total_events")?;
+    let unique_skills = reflect_row_non_negative_i64(row, context, "unique_skills")?;
+    let error_count = reflect_row_non_negative_i64(row, context, "error_count")?;
+
+    if unique_skills > total_events {
+        return Err(reflect_decode_error(
+            context,
+            "unique_skills",
+            format!("expected <= total_events {total_events}, got {unique_skills}"),
+        ));
+    }
+    if error_count > total_events {
+        return Err(reflect_decode_error(
+            context,
+            "error_count",
+            format!("expected <= total_events {total_events}, got {error_count}"),
+        ));
+    }
+
+    Ok(ReflectOverviewAgg {
+        total_events,
+        unique_skills,
+        error_count,
+        first_event: reflect_row_optional_string(row, context, "first_event")?,
+        last_event: reflect_row_optional_string(row, context, "last_event")?,
+    })
+}
+
+fn reflect_count_pair_from_row(
+    row: &impl ReflectRow,
+    context: &str,
+    label_column: &str,
+) -> ServiceResult<(String, i64)> {
+    Ok((
+        reflect_row_required_non_empty_string(row, context, label_column)?,
+        reflect_row_non_negative_i64(row, context, "cnt")?,
+    ))
+}
+
+fn decision_agg_from_row(row: &impl ReflectRow) -> ServiceResult<DecisionAgg> {
+    let context = "decision_agg_row";
+    let cnt = reflect_row_non_negative_i64(row, context, "cnt")?;
+    let models_used = reflect_row_non_negative_i64(row, context, "models_used")?;
+    if models_used > cnt {
+        return Err(reflect_decode_error(
+            context,
+            "models_used",
+            format!("expected <= cnt {cnt}, got {models_used}"),
+        ));
+    }
+
+    Ok(DecisionAgg {
+        decision_type: reflect_row_required_non_empty_string(row, context, "decision_type")?,
+        cnt,
+        models_used,
+    })
+}
+
+fn error_pattern_from_row(row: &impl ReflectRow) -> ServiceResult<ErrorPattern> {
+    let context = "error_pattern_row";
+    Ok(ErrorPattern {
+        skill_name: reflect_row_required_non_empty_string(row, context, "skill_name")?,
+        event_type: reflect_row_required_non_empty_string(row, context, "event_type")?,
+        fail_count: reflect_row_non_negative_i64(row, context, "fail_count")?,
+        sample_error: reflect_row_string(row, context, "sample_error")?,
+    })
+}
+
+fn raw_error_from_row(row: &impl ReflectRow) -> ServiceResult<RawError> {
+    let context = "raw_error_row";
+    Ok(RawError {
+        skill_name: reflect_row_required_non_empty_string(row, context, "skill_name")?,
+        event_type: reflect_row_required_non_empty_string(row, context, "event_type")?,
+        content: reflect_row_string(row, context, "content")?,
+    })
+}
+
+fn evidence_decision_from_row(row: &impl ReflectRow) -> ServiceResult<EvidenceDecision> {
+    let context = "evidence_decision_row";
+    let Some(decision_output_json) =
+        reflect_row_optional_string(row, context, "decision_output_json")?
+    else {
+        return Err(reflect_decode_error(
+            context,
+            "decision_output_json",
+            "expected decision output JSON, got NULL",
+        ));
+    };
+    Ok(EvidenceDecision {
+        decision_id: reflect_row_required_non_empty_string(row, context, "decision_id")?,
+        event_id: reflect_row_required_non_empty_string(row, context, "event_id")?,
+        decision_type: reflect_row_required_non_empty_string(row, context, "decision_type")?,
+        decision_output: serde_json::from_str(&decision_output_json)
+            .map_err(|error| reflect_decode_error(context, "decision_output_json", error))?,
+        created_at: reflect_row_required_non_empty_string(row, context, "created_at")?,
+    })
+}
+
+fn evidence_event_from_row(row: &impl ReflectRow) -> ServiceResult<EvidenceEvent> {
+    let context = "evidence_event_row";
+    Ok(EvidenceEvent {
+        event_id: reflect_row_required_non_empty_string(row, context, "event_id")?,
+        event_type: reflect_row_required_non_empty_string(row, context, "event_type")?,
+        content: reflect_row_string(row, context, "content")?,
+        skill_name: reflect_row_optional_string(row, context, "skill_name")?,
+        parent_event_id: reflect_row_optional_string(row, context, "parent_event_id")?,
+        causal_chain_id: reflect_row_optional_string(row, context, "causal_chain_id")?,
+        created_at: reflect_row_required_non_empty_string(row, context, "created_at")?,
+    })
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -584,7 +787,7 @@ impl DatabaseReflectService {
         let decision_limit = i64::from(last_n.clamp(1, 50));
         let decision_rows = query(
             "SELECT d.decision_id, d.event_id, d.decision_type, \
-               IFNULL(CAST(d.decision_output AS CHAR), '{}') AS decision_output_json, \
+               CAST(d.decision_output AS CHAR) AS decision_output_json, \
                DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM ctx_decision_audits d \
              JOIN agent_events e ON e.event_id = d.event_id AND e.session_id = d.session_id AND e.user_id = ? \
@@ -601,20 +804,8 @@ impl DatabaseReflectService {
 
         let decisions: Vec<EvidenceDecision> = decision_rows
             .iter()
-            .map(|row| {
-                let decision_output_json: String = row
-                    .try_get("decision_output_json")
-                    .unwrap_or_else(|_| "{}".to_string());
-                EvidenceDecision {
-                    decision_id: row.try_get("decision_id").unwrap_or_default(),
-                    event_id: row.try_get("event_id").unwrap_or_default(),
-                    decision_type: row.try_get("decision_type").unwrap_or_default(),
-                    decision_output: serde_json::from_str(&decision_output_json)
-                        .unwrap_or(serde_json::Value::Object(Default::default())),
-                    created_at: row.try_get("created_at").unwrap_or_default(),
-                }
-            })
-            .collect();
+            .map(evidence_decision_from_row)
+            .collect::<ServiceResult<Vec<_>>>()?;
 
         let event_limit = std::cmp::max(decision_limit * 10, 50);
         let event_rows = query(
@@ -635,19 +826,12 @@ impl DatabaseReflectService {
 
         let recent_events: Vec<EvidenceEvent> = event_rows
             .iter()
-            .map(|row| EvidenceEvent {
-                event_id: row.try_get("event_id").unwrap_or_default(),
-                event_type: row.try_get("event_type").unwrap_or_default(),
-                content: row.try_get("content").unwrap_or_default(),
-                skill_name: row.try_get("skill_name").ok(),
-                parent_event_id: row.try_get("parent_event_id").ok(),
-                causal_chain_id: row.try_get("causal_chain_id").ok(),
-                created_at: row.try_get("created_at").unwrap_or_default(),
-            })
-            .collect();
+            .map(evidence_event_from_row)
+            .collect::<ServiceResult<Vec<_>>>()?;
 
         let parent_id_map = crate::storage::load_agent_event_parent_ids(
             pool,
+            user_id,
             &recent_events
                 .iter()
                 .map(|event| event.event_id.clone())
@@ -748,8 +932,8 @@ impl ReflectService for DatabaseReflectService {
             "SELECT \
                COUNT(*) AS total_events, \
                COUNT(DISTINCT skill_name) AS unique_skills, \
-               SUM(CASE WHEN event_type IN ('error', 'tool_error', 'stall_detected') \
-                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%' THEN 1 ELSE 0 END) AS error_count, \
+               COALESCE(SUM(CASE WHEN event_type IN ('error', 'tool_error', 'stall_detected') \
+                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%' THEN 1 ELSE 0 END), 0) AS error_count, \
                CAST(MIN(created_at) AS CHAR) AS first_event, \
                CAST(MAX(created_at) AS CHAR) AS last_event \
              FROM agent_events WHERE session_id = ? AND user_id = ?",
@@ -760,18 +944,16 @@ impl ReflectService for DatabaseReflectService {
         .await
         .map_err(|e| internal_error(format!("overview query: {e}")))?;
 
-        let total_events: i64 = overview_row.try_get("total_events").unwrap_or(0);
-        let unique_skills: i64 = overview_row.try_get("unique_skills").unwrap_or(0);
-        let error_count: i64 = overview_row.try_get("error_count").unwrap_or(0);
-        let first_event: Option<String> = overview_row.try_get("first_event").unwrap_or(None);
-        let last_event: Option<String> = overview_row.try_get("last_event").unwrap_or(None);
+        let overview_agg = reflect_overview_agg_from_row(&overview_row)?;
 
         // Compute duration in Rust from timestamp strings
-        let duration_minutes =
-            compute_duration_minutes(first_event.as_deref(), last_event.as_deref());
+        let duration_minutes = compute_duration_minutes(
+            overview_agg.first_event.as_deref(),
+            overview_agg.last_event.as_deref(),
+        );
 
-        let error_rate_pct = if total_events > 0 {
-            (error_count as f64 / total_events as f64) * 100.0
+        let error_rate_pct = if overview_agg.total_events > 0 {
+            (overview_agg.error_count as f64 / overview_agg.total_events as f64) * 100.0
         } else {
             0.0
         };
@@ -790,12 +972,8 @@ impl ReflectService for DatabaseReflectService {
 
         let top_event_types: Vec<(String, i64)> = event_type_rows
             .iter()
-            .map(|row| {
-                let et: String = row.try_get("event_type").unwrap_or_default();
-                let cnt: i64 = row.try_get("cnt").unwrap_or(0);
-                (et, cnt)
-            })
-            .collect();
+            .map(|row| reflect_count_pair_from_row(row, "event_type_agg_row", "event_type"))
+            .collect::<ServiceResult<_>>()?;
 
         // Top skills
         let skill_rows = query(
@@ -811,12 +989,8 @@ impl ReflectService for DatabaseReflectService {
 
         let top_skills: Vec<(String, i64)> = skill_rows
             .iter()
-            .map(|row| {
-                let sn: String = row.try_get("skill_name").unwrap_or_default();
-                let cnt: i64 = row.try_get("cnt").unwrap_or(0);
-                (sn, cnt)
-            })
-            .collect();
+            .map(|row| reflect_count_pair_from_row(row, "skill_agg_row", "skill_name"))
+            .collect::<ServiceResult<_>>()?;
 
         // Decision aggregation
         let decision_rows = query(
@@ -834,19 +1008,12 @@ impl ReflectService for DatabaseReflectService {
         .await
         .map_err(|e| internal_error(format!("decisions query: {e}")))?;
 
-        let total_decisions: i64 = decision_rows
-            .iter()
-            .map(|row| row.try_get::<i64, _>("cnt").unwrap_or(0))
-            .sum();
-
         let decision_aggs: Vec<DecisionAgg> = decision_rows
             .iter()
-            .map(|row| DecisionAgg {
-                decision_type: row.try_get("decision_type").unwrap_or_default(),
-                cnt: row.try_get("cnt").unwrap_or(0),
-                models_used: row.try_get("models_used").unwrap_or(0),
-            })
-            .collect();
+            .map(decision_agg_from_row)
+            .collect::<ServiceResult<_>>()?;
+
+        let total_decisions: i64 = decision_aggs.iter().map(|agg| agg.cnt).sum();
 
         // Error patterns (aggregated, for insights)
         let error_patterns = if analysis_view_queries_error_patterns(&request.analysis_view) {
@@ -867,13 +1034,8 @@ impl ReflectService for DatabaseReflectService {
 
             ep_rows
                 .iter()
-                .map(|row| ErrorPattern {
-                    skill_name: row.try_get("skill_name").unwrap_or_default(),
-                    event_type: row.try_get("event_type").unwrap_or_default(),
-                    fail_count: row.try_get("fail_count").unwrap_or(0),
-                    sample_error: row.try_get("sample_error").unwrap_or_default(),
-                })
-                .collect()
+                .map(error_pattern_from_row)
+                .collect::<ServiceResult<_>>()?
         } else {
             Vec::new()
         };
@@ -897,12 +1059,8 @@ impl ReflectService for DatabaseReflectService {
 
             err_rows
                 .iter()
-                .map(|row| RawError {
-                    skill_name: row.try_get("skill_name").unwrap_or_default(),
-                    event_type: row.try_get("event_type").unwrap_or_default(),
-                    content: row.try_get("content").unwrap_or_default(),
-                })
-                .collect::<Vec<_>>()
+                .map(raw_error_from_row)
+                .collect::<ServiceResult<Vec<_>>>()?
         };
 
         let diagnoses = build_diagnoses(&raw_errors);
@@ -910,11 +1068,11 @@ impl ReflectService for DatabaseReflectService {
         // ── Build report ─────────────────────────────────────────────────
 
         let overview = SessionOverview {
-            total_events,
+            total_events: overview_agg.total_events,
             total_decisions,
             duration_minutes,
-            unique_skills_used: unique_skills,
-            error_count,
+            unique_skills_used: overview_agg.unique_skills,
+            error_count: overview_agg.error_count,
             error_rate_pct,
             top_event_types,
             top_skills,
@@ -1189,6 +1347,469 @@ mod tests {
             top_event_types: vec![],
             top_skills,
         }
+    }
+
+    #[derive(Clone)]
+    struct FakeReflectRow {
+        failed_column: Option<&'static str>,
+        empty_column: Option<&'static str>,
+        decision_output_json: Option<&'static str>,
+        skill_name: Option<&'static str>,
+        parent_event_id: Option<&'static str>,
+        causal_chain_id: Option<&'static str>,
+    }
+
+    impl FakeReflectRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                empty_column: None,
+                decision_output_json: Some(r#"{"visible_tools":["bash"],"reason":"inspect"}"#),
+                skill_name: Some("bash"),
+                parent_event_id: Some("evt-user"),
+                causal_chain_id: Some("chain-1"),
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn empty_on(column: &'static str) -> Self {
+            Self {
+                empty_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_decision_output_json(decision_output_json: Option<&'static str>) -> Self {
+            Self {
+                decision_output_json,
+                ..Self::complete()
+            }
+        }
+
+        fn without_optional_links() -> Self {
+            Self {
+                skill_name: None,
+                parent_event_id: None,
+                causal_chain_id: None,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn text(&self, column: &str, value: &'static str) -> String {
+            if self.empty_column == Some(column) {
+                String::new()
+            } else {
+                value.to_string()
+            }
+        }
+    }
+
+    impl ReflectRow for FakeReflectRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "decision_id" => self.text(column, "decision-1"),
+                "event_id" => self.text(column, "evt-user"),
+                "decision_type" => self.text(column, "tool_surface"),
+                "event_type" => self.text(column, "user_query"),
+                "content" => self.text(column, "list files"),
+                "created_at" => self.text(column, "2026-06-26T12:00:00"),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "decision_output_json" => self.decision_output_json.map(str::to_string),
+                "skill_name" => self.skill_name.map(str::to_string),
+                "parent_event_id" => self.parent_event_id.map(str::to_string),
+                "causal_chain_id" => self.causal_chain_id.map(str::to_string),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeReflectAggRow {
+        failed_column: Option<&'static str>,
+        empty_column: Option<&'static str>,
+        total_events: i64,
+        unique_skills: i64,
+        error_count: i64,
+        cnt: i64,
+        models_used: i64,
+        fail_count: i64,
+        first_event: Option<&'static str>,
+        last_event: Option<&'static str>,
+        sample_error: &'static str,
+        content: &'static str,
+    }
+
+    impl FakeReflectAggRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                empty_column: None,
+                total_events: 10,
+                unique_skills: 3,
+                error_count: 2,
+                cnt: 4,
+                models_used: 2,
+                fail_count: 3,
+                first_event: Some("2026-06-26 09:00:00"),
+                last_event: Some("2026-06-26 09:15:00"),
+                sample_error: "permission denied",
+                content: "tool failed with permission denied",
+            }
+        }
+
+        fn empty_overview() -> Self {
+            Self {
+                total_events: 0,
+                unique_skills: 0,
+                error_count: 0,
+                first_event: None,
+                last_event: None,
+                ..Self::complete()
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn empty_on(column: &'static str) -> Self {
+            Self {
+                empty_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_overview_counts(total_events: i64, unique_skills: i64, error_count: i64) -> Self {
+            Self {
+                total_events,
+                unique_skills,
+                error_count,
+                ..Self::complete()
+            }
+        }
+
+        fn with_decision_counts(cnt: i64, models_used: i64) -> Self {
+            Self {
+                cnt,
+                models_used,
+                ..Self::complete()
+            }
+        }
+
+        fn with_fail_count(fail_count: i64) -> Self {
+            Self {
+                fail_count,
+                ..Self::complete()
+            }
+        }
+
+        fn maybe_fail(&self, column: &str) -> Result<(), sqlx::Error> {
+            if self.failed_column == Some(column) {
+                Err(sqlx::Error::ColumnNotFound(column.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn text(&self, column: &str, value: &'static str) -> String {
+            if self.empty_column == Some(column) {
+                String::new()
+            } else {
+                value.to_string()
+            }
+        }
+    }
+
+    impl ReflectRow for FakeReflectAggRow {
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Ok(match column {
+                "event_type" => self.text(column, "tool_error"),
+                "skill_name" => self.text(column, "bash"),
+                "decision_type" => self.text(column, "tool_surface"),
+                "sample_error" => self.text(column, self.sample_error),
+                "content" => self.text(column, self.content),
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            self.maybe_fail(column)?;
+            Ok(match column {
+                "first_event" => self.first_event,
+                "last_event" => self.last_event,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .map(str::to_string))
+        }
+
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            self.maybe_fail(column)?;
+            match column {
+                "total_events" => Ok(self.total_events),
+                "unique_skills" => Ok(self.unique_skills),
+                "error_count" => Ok(self.error_count),
+                "cnt" => Ok(self.cnt),
+                "models_used" => Ok(self.models_used),
+                "fail_count" => Ok(self.fail_count),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    fn assert_reflect_internal_error_mentions(
+        result: ServiceResult<impl std::fmt::Debug>,
+        needle: &str,
+    ) {
+        let (status, Json(body)) = result.expect_err("decode should fail");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.detail.contains(needle),
+            "reflect decode error should identify `{needle}`: {:?}",
+            body.detail
+        );
+    }
+
+    #[test]
+    fn reflect_overview_agg_row_decode_preserves_values_and_fails_loudly() {
+        let overview = reflect_overview_agg_from_row(&FakeReflectAggRow::complete())
+            .expect("overview decodes");
+        assert_eq!(overview.total_events, 10);
+        assert_eq!(overview.unique_skills, 3);
+        assert_eq!(overview.error_count, 2);
+        assert_eq!(overview.first_event.as_deref(), Some("2026-06-26 09:00:00"));
+        assert_eq!(overview.last_event.as_deref(), Some("2026-06-26 09:15:00"));
+
+        let empty = reflect_overview_agg_from_row(&FakeReflectAggRow::empty_overview())
+            .expect("empty overview decodes");
+        assert_eq!(empty.total_events, 0);
+        assert_eq!(empty.error_count, 0);
+        assert!(empty.first_event.is_none());
+        assert!(empty.last_event.is_none());
+
+        for column in [
+            "total_events",
+            "unique_skills",
+            "error_count",
+            "first_event",
+            "last_event",
+        ] {
+            assert_reflect_internal_error_mentions(
+                reflect_overview_agg_from_row(&FakeReflectAggRow::fail_on(column)),
+                column,
+            );
+        }
+
+        for (row, needle) in [
+            (
+                FakeReflectAggRow::with_overview_counts(-1, 0, 0),
+                "total_events",
+            ),
+            (
+                FakeReflectAggRow::with_overview_counts(1, 2, 0),
+                "unique_skills",
+            ),
+            (
+                FakeReflectAggRow::with_overview_counts(1, 0, 2),
+                "error_count",
+            ),
+        ] {
+            assert_reflect_internal_error_mentions(reflect_overview_agg_from_row(&row), needle);
+        }
+    }
+
+    #[test]
+    fn reflect_count_pair_row_decode_preserves_values_and_fails_loudly() {
+        let pair = reflect_count_pair_from_row(
+            &FakeReflectAggRow::complete(),
+            "event_type_agg_row",
+            "event_type",
+        )
+        .expect("count pair decodes");
+        assert_eq!(pair, ("tool_error".to_string(), 4));
+
+        assert_reflect_internal_error_mentions(
+            reflect_count_pair_from_row(
+                &FakeReflectAggRow::fail_on("event_type"),
+                "event_type_agg_row",
+                "event_type",
+            ),
+            "event_type",
+        );
+        assert_reflect_internal_error_mentions(
+            reflect_count_pair_from_row(
+                &FakeReflectAggRow::empty_on("event_type"),
+                "event_type_agg_row",
+                "event_type",
+            ),
+            "expected non-empty string",
+        );
+        assert_reflect_internal_error_mentions(
+            reflect_count_pair_from_row(
+                &FakeReflectAggRow {
+                    cnt: -1,
+                    ..FakeReflectAggRow::complete()
+                },
+                "event_type_agg_row",
+                "event_type",
+            ),
+            "cnt",
+        );
+    }
+
+    #[test]
+    fn reflect_decision_agg_row_decode_preserves_values_and_fails_loudly() {
+        let agg = decision_agg_from_row(&FakeReflectAggRow::complete()).expect("decision decodes");
+        assert_eq!(agg.decision_type, "tool_surface");
+        assert_eq!(agg.cnt, 4);
+        assert_eq!(agg.models_used, 2);
+
+        for column in ["decision_type", "cnt", "models_used"] {
+            assert_reflect_internal_error_mentions(
+                decision_agg_from_row(&FakeReflectAggRow::fail_on(column)),
+                column,
+            );
+        }
+        assert_reflect_internal_error_mentions(
+            decision_agg_from_row(&FakeReflectAggRow::empty_on("decision_type")),
+            "expected non-empty string",
+        );
+        assert_reflect_internal_error_mentions(
+            decision_agg_from_row(&FakeReflectAggRow::with_decision_counts(1, 2)),
+            "models_used",
+        );
+    }
+
+    #[test]
+    fn reflect_error_rows_decode_preserve_values_and_fail_loudly() {
+        let pattern =
+            error_pattern_from_row(&FakeReflectAggRow::complete()).expect("pattern decodes");
+        assert_eq!(pattern.skill_name, "bash");
+        assert_eq!(pattern.event_type, "tool_error");
+        assert_eq!(pattern.fail_count, 3);
+        assert_eq!(pattern.sample_error, "permission denied");
+
+        let raw = raw_error_from_row(&FakeReflectAggRow::complete()).expect("raw error decodes");
+        assert_eq!(raw.skill_name, "bash");
+        assert_eq!(raw.event_type, "tool_error");
+        assert_eq!(raw.content, "tool failed with permission denied");
+
+        for column in ["skill_name", "event_type", "fail_count", "sample_error"] {
+            assert_reflect_internal_error_mentions(
+                error_pattern_from_row(&FakeReflectAggRow::fail_on(column)),
+                column,
+            );
+        }
+        assert_reflect_internal_error_mentions(
+            error_pattern_from_row(&FakeReflectAggRow::with_fail_count(-1)),
+            "fail_count",
+        );
+        assert_reflect_internal_error_mentions(
+            raw_error_from_row(&FakeReflectAggRow::empty_on("skill_name")),
+            "expected non-empty string",
+        );
+        assert_reflect_internal_error_mentions(
+            raw_error_from_row(&FakeReflectAggRow::fail_on("content")),
+            "content",
+        );
+    }
+
+    #[test]
+    fn evidence_decision_row_decode_preserves_values_and_fails_loudly() {
+        let decision =
+            evidence_decision_from_row(&FakeReflectRow::complete()).expect("decision row decodes");
+        assert_eq!(decision.decision_id, "decision-1");
+        assert_eq!(decision.event_id, "evt-user");
+        assert_eq!(decision.decision_type, "tool_surface");
+        assert_eq!(
+            decision.decision_output,
+            serde_json::json!({"visible_tools":["bash"],"reason":"inspect"})
+        );
+        assert_eq!(decision.created_at, "2026-06-26T12:00:00");
+
+        assert_reflect_internal_error_mentions(
+            evidence_decision_from_row(&FakeReflectRow::fail_on("decision_id")),
+            "decision_id",
+        );
+        assert_reflect_internal_error_mentions(
+            evidence_decision_from_row(&FakeReflectRow::empty_on("event_id")),
+            "expected non-empty string",
+        );
+        assert_reflect_internal_error_mentions(
+            evidence_decision_from_row(&FakeReflectRow::fail_on("decision_output_json")),
+            "decision_output_json",
+        );
+        assert_reflect_internal_error_mentions(
+            evidence_decision_from_row(&FakeReflectRow::with_decision_output_json(None)),
+            "expected decision output JSON",
+        );
+        assert_reflect_internal_error_mentions(
+            evidence_decision_from_row(&FakeReflectRow::with_decision_output_json(Some(
+                "{not-json",
+            ))),
+            "decision_output_json",
+        );
+    }
+
+    #[test]
+    fn evidence_event_row_decode_preserves_values_and_fails_loudly() {
+        let event =
+            evidence_event_from_row(&FakeReflectRow::complete()).expect("event row decodes");
+        assert_eq!(event.event_id, "evt-user");
+        assert_eq!(event.event_type, "user_query");
+        assert_eq!(event.content, "list files");
+        assert_eq!(event.skill_name.as_deref(), Some("bash"));
+        assert_eq!(event.parent_event_id.as_deref(), Some("evt-user"));
+        assert_eq!(event.causal_chain_id.as_deref(), Some("chain-1"));
+        assert_eq!(event.created_at, "2026-06-26T12:00:00");
+
+        let event =
+            evidence_event_from_row(&FakeReflectRow::without_optional_links()).expect("event row");
+        assert!(event.skill_name.is_none());
+        assert!(event.parent_event_id.is_none());
+        assert!(event.causal_chain_id.is_none());
+
+        assert_reflect_internal_error_mentions(
+            evidence_event_from_row(&FakeReflectRow::fail_on("event_type")),
+            "event_type",
+        );
+        assert_reflect_internal_error_mentions(
+            evidence_event_from_row(&FakeReflectRow::empty_on("created_at")),
+            "expected non-empty string",
+        );
+        assert_reflect_internal_error_mentions(
+            evidence_event_from_row(&FakeReflectRow::fail_on("skill_name")),
+            "skill_name",
+        );
     }
 
     #[test]

@@ -46,7 +46,6 @@ pub fn tool_result_content_for_model_unbounded(tool_name: &str, content: &str) -
             .to_string(),
         _ => content.to_string(),
     };
-    let content = astra_core::error_kind::strip_tool_binding_sentinel(&content).into_owned();
     let sanitized = sanitize_tool_output_for_llm(&content);
     if sanitized.stripped_lines > 0 {
         agent_warn!(
@@ -255,17 +254,6 @@ mod tests {
         let raw = "Replaced successfully";
         let out = tool_result_content_for_model("str_replace", raw);
         assert_eq!(out, raw);
-    }
-
-    #[test]
-    fn strips_tool_binding_sentinel_for_model_context() {
-        let raw = format!(
-            "Error: tool `agent_fanout` runtime binding is unavailable. {}",
-            astra_core::error_kind::TOOL_BINDING_SENTINEL
-        );
-        let out = tool_result_content_for_model("agent_fanout", &raw);
-        assert!(!out.contains(astra_core::error_kind::TOOL_BINDING_SENTINEL));
-        assert!(out.contains("runtime binding is unavailable"));
     }
 
     #[test]

@@ -157,7 +157,7 @@ fn chat_stream_bridge_fallback_payload(
         .as_ref()
         .and_then(|c| c.get("test_llm_stream_blocks"))
         .cloned();
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "session_id": chat_data.session_id.as_deref(),
         "agent_id": chat_data.agent_id.as_deref(),
         "selected_model": chat_data.selected_model.as_ref(),
@@ -175,18 +175,23 @@ fn chat_stream_bridge_fallback_payload(
         "runtime_system_prompt": chat_data.runtime_system_prompt.as_deref(),
         "edge_executor_id": chat_data.edge_executor_id.as_deref(),
         "capabilities": &chat_data.capabilities,
-        "edge_profile": edge_profile,
         "execution_budget": chat_data.execution_budget.as_ref(),
         "explain": chat_data.explain,
         "interaction_mode": chat_data.interaction_mode,
-        "test_llm_stream_blocks": test_llm_stream_blocks,
         "messages": [
             {
                 "role": "user",
                 "content": chat_data.message.as_str(),
             }
         ],
-    })
+    });
+    if let Some(edge_profile) = edge_profile {
+        payload["edge_profile"] = edge_profile;
+    }
+    if let Some(test_llm_stream_blocks) = test_llm_stream_blocks {
+        payload["test_llm_stream_blocks"] = test_llm_stream_blocks;
+    }
+    payload
 }
 
 #[cfg(any(test, feature = "bridge-e2e-hooks"))]
@@ -752,6 +757,8 @@ mod tests {
             serde_json::json!(["database", "local"])
         );
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash", "read_file"]));
+        assert!(!obj.contains_key("edge_profile"));
+        assert!(!obj.contains_key("test_llm_stream_blocks"));
     }
 
     #[test]

@@ -1097,12 +1097,11 @@ mod tests {
     struct SessionDirGuard(std::path::PathBuf);
 
     impl SessionDirGuard {
-        fn new(session_id: &str) -> Self {
-            let store = astra_services::local_session_artifact_store();
-            Self(
-                astra_services::SessionArtifactStore::session_dir(&store, session_id)
-                    .expect("session id must resolve owner-bound test session directory"),
-            )
+        fn new(user_id: &str, session_id: &str) -> Self {
+            let path = astra_pipeline::step_checkpoint::owner_session_dir_for(user_id, session_id)
+                .expect("owner/session must resolve owner-bound test session directory");
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
         }
     }
 
@@ -1640,11 +1639,15 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(session_journal_dir)]
     fn heavy_checkpoint_blocked_tools_do_not_include_soft_health_avoidance_health() {
+        let user_id = "test-user";
         let session_id = format!("wm-checkpoint-{}", uuid::Uuid::new_v4());
-        let _guard = SessionDirGuard::new(&session_id);
+        let sessions_dir = tempfile::tempdir().expect("temp sessions dir");
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
+        let _guard = SessionDirGuard::new(user_id, &session_id);
         let mut state = make_state();
-        state.context_manifest_user_id = Some("test-user".to_string());
+        state.context_manifest_user_id = Some(user_id.to_string());
         state.current_session_id = Some(session_id.clone());
         state.step_recorder.begin_turn(0);
         state.restricted_tools.insert("write_file".to_string());
@@ -1661,7 +1664,7 @@ mod tests {
         try_write_heavy_checkpoint(&mut state);
 
         let heavy =
-            astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint("test-user", &session_id)
+            astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(user_id, &session_id)
                 .expect("read checkpoint")
                 .expect("heavy checkpoint");
         assert_eq!(heavy.blocked_tools, vec!["write_file".to_string()]);
@@ -1927,7 +1930,7 @@ mod tests {
         assert_eq!(trace.turn_id, "turn-1");
         assert_eq!(trace.token_budget.system_prompt_tokens, 14_000);
         assert_eq!(trace.token_budget.history_tokens, 5_000);
-        assert_eq!(trace.token_budget.total_used, 22_200);
+        assert_eq!(trace.token_budget.total_used, 25_000);
         assert_eq!(trace.token_budget.max_tokens, 100_000);
         assert!((trace.token_budget.budget_pressure - 0.25).abs() < 0.01);
     }

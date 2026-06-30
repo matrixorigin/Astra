@@ -10,10 +10,12 @@
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
-use sqlx::Row;
+use sqlx::{MySql, Row};
 
 use super::metrics::{SharedMultiAgentMetrics, saturating_decrement};
+use crate::db_row::RowExt as EdgeDispatchDbRow;
 
+#[derive(Debug)]
 pub struct EdgeDispatchRow {
     pub dispatch_id: i64,
     pub user_id: String,
@@ -22,6 +24,12 @@ pub struct EdgeDispatchRow {
     pub payload_json: String,
     pub result_json: Option<String>,
     pub status: String,
+}
+
+async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'static str) {
+    if let Err(error) = tx.rollback().await {
+        tracing::warn!(context, %error, "edge_dispatch rollback failed");
+    }
 }
 
 #[async_trait]
@@ -43,24 +51,29 @@ pub trait EdgeDispatchService: Send + Sync {
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String>;
 
-    /// Mark dispatches as 'dispatched' (the edge WS has been sent).
-    async fn mark_dispatched(&self, dispatch_ids: &[i64]) -> Result<(), String>;
-
     /// Deliver a tool result (from HTTP callback or WS) — updates status to 'completed'.
-    /// `edge_agent_id` must match the dispatch record to prevent cross-user injection.
+    /// `user_id` and `edge_agent_id` must match the dispatch record to prevent
+    /// cross-owner or cross-agent injection.
     async fn deliver_result(
         &self,
+        user_id: &str,
         request_id: &str,
         edge_agent_id: &str,
         result_json: &str,
     ) -> Result<bool, String>;
 
     /// Move an in-flight dispatch to a failed terminal state.
-    async fn fail_dispatch(&self, request_id: &str, reason: &str) -> Result<bool, String>;
+    async fn fail_dispatch(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<bool, String>;
 
     /// Poll for a specific request's result. Returns Some(result_json) when completed.
     async fn wait_result(
         &self,
+        user_id: &str,
         request_id: &str,
         timeout: std::time::Duration,
     ) -> Result<Option<String>, String>;
@@ -95,6 +108,49 @@ impl DatabaseEdgeDispatchService {
     }
 }
 
+fn edge_dispatch_decode_error(context: &str, column: &'static str, error: sqlx::Error) -> String {
+    format!("edge_dispatch {context} decode `{column}`: {error}")
+}
+
+fn decode_claimed_dispatch_row(row: &impl EdgeDispatchDbRow) -> Result<EdgeDispatchRow, String> {
+    Ok(EdgeDispatchRow {
+        dispatch_id: row
+            .i64_column("dispatch_id")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "dispatch_id", e))?,
+        user_id: row
+            .string_column("user_id")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "user_id", e))?,
+        edge_agent_id: row
+            .string_column("edge_agent_id")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "edge_agent_id", e))?,
+        request_id: row
+            .string_column("request_id")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "request_id", e))?,
+        payload_json: row
+            .string_column("payload_json")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "payload_json", e))?,
+        result_json: row
+            .optional_string_column("result_json")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "result_json", e))?,
+        status: "dispatched".to_string(),
+    })
+}
+
+fn decode_terminal_result_json(row: &impl EdgeDispatchDbRow) -> Result<String, String> {
+    row.optional_string_column("result_json")
+        .map_err(|e| edge_dispatch_decode_error("wait_result terminal row", "result_json", e))?
+        .ok_or_else(|| "edge_dispatch wait_result terminal row missing `result_json`".to_string())
+}
+
+fn validate_claimed_dispatch_update_count(expected: usize, actual: u64) -> Result<(), String> {
+    if actual == expected as u64 {
+        return Ok(());
+    }
+    Err(format!(
+        "edge_dispatch poll UPDATE claimed {expected} rows but updated {actual}"
+    ))
+}
+
 #[async_trait]
 impl EdgeDispatchService for DatabaseEdgeDispatchService {
     #[tracing::instrument(skip(self, payload_json), fields(user_id = %user_id, edge_agent_id = %edge_agent_id, request_id = %request_id))]
@@ -105,11 +161,13 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         request_id: &str,
         payload_json: &str,
     ) -> Result<i64, String> {
-        // Idempotent insert: request_id has a UNIQUE constraint, so
-        // duplicate calls return the existing dispatch_id instead of
-        // erroring.
+        // Idempotent insert inside an owner boundary: the same request_id is
+        // reusable by another user, but duplicate calls for the same user
+        // return the existing dispatch_id instead of erroring.
         match sqlx::query(
-            "INSERT INTO edge_pending_dispatch (user_id, edge_agent_id, request_id, payload_json, status)              VALUES (?, ?, ?, ?, 'pending')",
+            "INSERT INTO edge_pending_dispatch \
+             (user_id, edge_agent_id, request_id, payload_json, status) \
+             VALUES (?, ?, ?, ?, 'pending')",
         )
         .bind(user_id)
         .bind(edge_agent_id)
@@ -129,8 +187,9 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 if msg.contains("1062") || msg.contains("Duplicate entry") {
                     // Race or retry: fetch the existing row.
                     let (existing_id,): (i64,) = sqlx::query_as(
-                        "SELECT dispatch_id FROM edge_pending_dispatch WHERE request_id = ?",
+                        "SELECT dispatch_id FROM edge_pending_dispatch WHERE user_id = ? AND request_id = ?",
                     )
+                    .bind(user_id)
                     .bind(request_id)
                     .fetch_one(&self.pool)
                     .await
@@ -175,7 +234,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         {
             Ok(r) => r,
             Err(e) => {
-                let _ = tx.rollback().await;
+                rollback_edge_dispatch_tx(tx, "poll select").await;
                 return Err(format!("edge_dispatch poll SELECT: {e}"));
             }
         };
@@ -187,86 +246,56 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             return Ok(vec![]);
         }
 
-        // Mark claimed rows as dispatched within the same transaction
-        let ids: Vec<i64> = rows
+        let claimed_rows: Vec<EdgeDispatchRow> = match rows
             .iter()
-            .map(|r| {
-                r.try_get::<i64, _>("dispatch_id")
-                    .map_err(|e: sqlx::Error| e.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(decode_claimed_dispatch_row)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                rollback_edge_dispatch_tx(tx, "decode claimed rows").await;
+                return Err(e);
+            }
+        };
 
-        let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-        let update_sql = format!(
+        // Mark claimed rows as dispatched within the same transaction.
+        let ids: Vec<i64> = claimed_rows.iter().map(|row| row.dispatch_id).collect();
+
+        let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "UPDATE edge_pending_dispatch \
              SET status = 'dispatched', dispatched_at = NOW(6) \
-             WHERE dispatch_id IN ({}) AND status = 'pending'",
-            placeholders.join(",")
+             WHERE dispatch_id IN (",
         );
-        let mut uq = sqlx::query(&update_sql);
+        let mut separated = update.separated(", ");
         for id in &ids {
-            uq = uq.bind(id);
+            separated.push_bind(*id);
         }
-        if let Err(e) = uq.execute(&mut *tx).await {
-            let _ = tx.rollback().await;
-            return Err(format!("edge_dispatch poll UPDATE: {e}"));
+        separated.push_unseparated(") AND status = 'pending'");
+        let update_result = match update.build().execute(&mut *tx).await {
+            Ok(result) => result,
+            Err(e) => {
+                rollback_edge_dispatch_tx(tx, "poll update").await;
+                return Err(format!("edge_dispatch poll UPDATE: {e}"));
+            }
+        };
+        if let Err(e) =
+            validate_claimed_dispatch_update_count(ids.len(), update_result.rows_affected())
+        {
+            rollback_edge_dispatch_tx(tx, "validate claimed dispatch count").await;
+            return Err(e);
         }
 
         tx.commit()
             .await
             .map_err(|e| format!("edge_dispatch poll commit: {e}"))?;
 
-        rows.iter()
-            .map(|r| {
-                Ok(EdgeDispatchRow {
-                    dispatch_id: r
-                        .try_get("dispatch_id")
-                        .map_err(|e: sqlx::Error| e.to_string())?,
-                    user_id: r
-                        .try_get("user_id")
-                        .map_err(|e: sqlx::Error| e.to_string())?,
-                    edge_agent_id: r
-                        .try_get("edge_agent_id")
-                        .map_err(|e: sqlx::Error| e.to_string())?,
-                    request_id: r
-                        .try_get("request_id")
-                        .map_err(|e: sqlx::Error| e.to_string())?,
-                    payload_json: r
-                        .try_get("payload_json")
-                        .map_err(|e: sqlx::Error| e.to_string())?,
-                    result_json: r.try_get("result_json").ok(),
-                    status: "dispatched".to_string(),
-                })
-            })
-            .collect()
-    }
-
-    async fn mark_dispatched(&self, dispatch_ids: &[i64]) -> Result<(), String> {
-        if dispatch_ids.is_empty() {
-            return Ok(());
-        }
-        // Safety belt: only mark rows still in 'pending' state.
-        // The primary claiming happens atomically inside poll_pending(),
-        // but this method remains for callers that bypass poll.
-        let placeholders: Vec<String> = dispatch_ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "UPDATE edge_pending_dispatch SET status = 'dispatched', dispatched_at = NOW(6) \
-             WHERE dispatch_id IN ({}) AND status = 'pending'",
-            placeholders.join(",")
-        );
-        let mut q = sqlx::query(&sql);
-        for id in dispatch_ids {
-            q = q.bind(id);
-        }
-        q.execute(&self.pool)
-            .await
-            .map_err(|e| format!("edge_dispatch mark_dispatched: {e}"))?;
-        Ok(())
+        Ok(claimed_rows)
     }
 
     #[tracing::instrument(skip(self, result_json), fields(request_id = %request_id, edge_agent_id = %edge_agent_id))]
     async fn deliver_result(
         &self,
+        user_id: &str,
         request_id: &str,
         edge_agent_id: &str,
         result_json: &str,
@@ -275,9 +304,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let n = sqlx::query(
             "UPDATE edge_pending_dispatch \
              SET status = 'completed', result_json = ?, completed_at = NOW(6) \
-             WHERE request_id = ? AND edge_agent_id = ? AND status IN ('pending', 'dispatched')",
+             WHERE user_id = ? AND request_id = ? AND edge_agent_id = ? AND status IN ('pending', 'dispatched')",
         )
         .bind(result_json)
+        .bind(user_id)
         .bind(request_id)
         .bind(edge_agent_id)
         .execute(&self.pool)
@@ -292,7 +322,12 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
     }
 
     #[tracing::instrument(skip(self), fields(request_id = %request_id, reason = %reason))]
-    async fn fail_dispatch(&self, request_id: &str, reason: &str) -> Result<bool, String> {
+    async fn fail_dispatch(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
         let output = format!("edge dispatch {reason}");
         let result_json = serde_json::json!({
             "request_id": request_id,
@@ -304,9 +339,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let n = sqlx::query(
             "UPDATE edge_pending_dispatch \
              SET status = 'failed', result_json = ?, completed_at = NOW(6) \
-             WHERE request_id = ? AND status IN ('pending', 'dispatched')",
+             WHERE user_id = ? AND request_id = ? AND status IN ('pending', 'dispatched')",
         )
         .bind(result_json)
+        .bind(user_id)
         .bind(request_id)
         .execute(&self.pool)
         .await
@@ -321,6 +357,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
     #[tracing::instrument(skip(self), fields(request_id = %request_id, timeout_ms = timeout.as_millis()))]
     async fn wait_result(
         &self,
+        user_id: &str,
         request_id: &str,
         timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
@@ -328,8 +365,9 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let mut iterations: u32 = 0;
         loop {
             let row = sqlx::query(
-                "SELECT CAST(result_json AS CHAR) AS result_json, status FROM edge_pending_dispatch WHERE request_id = ?",
+                "SELECT CAST(result_json AS CHAR) AS result_json, status FROM edge_pending_dispatch WHERE user_id = ? AND request_id = ?",
             )
+            .bind(user_id)
             .bind(request_id)
             .fetch_optional(&self.pool)
             .await
@@ -340,12 +378,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                     let status: String = r.try_get("status").map_err(|e| e.to_string())?;
                     match status.as_str() {
                         "completed" => {
-                            let result: Option<String> = r.try_get("result_json").ok();
-                            return Ok(result);
+                            return Ok(Some(decode_terminal_result_json(&r)?));
                         }
                         "failed" => {
-                            let result: Option<String> = r.try_get("result_json").ok();
-                            return Ok(result);
+                            return Ok(Some(decode_terminal_result_json(&r)?));
                         }
                         _ => {} // still pending or dispatched
                     }
@@ -432,22 +468,26 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
     ) -> Result<Vec<EdgeDispatchRow>, String> {
         Err("edge dispatch service not configured".to_string())
     }
-    async fn mark_dispatched(&self, _dispatch_ids: &[i64]) -> Result<(), String> {
-        Err("edge dispatch service not configured".to_string())
-    }
     async fn deliver_result(
         &self,
+        _user_id: &str,
         _request_id: &str,
         _edge_agent_id: &str,
         _result_json: &str,
     ) -> Result<bool, String> {
         Err("edge dispatch service not configured".to_string())
     }
-    async fn fail_dispatch(&self, _request_id: &str, _reason: &str) -> Result<bool, String> {
+    async fn fail_dispatch(
+        &self,
+        _user_id: &str,
+        _request_id: &str,
+        _reason: &str,
+    ) -> Result<bool, String> {
         Err("edge dispatch service not configured".to_string())
     }
     async fn wait_result(
         &self,
+        _user_id: &str,
         _request_id: &str,
         _timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
@@ -455,5 +495,155 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
     }
     async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
         Err("edge dispatch service not configured".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeEdgeDispatchRow {
+        failed_column: Option<&'static str>,
+        result_json: Option<String>,
+    }
+
+    impl FakeEdgeDispatchRow {
+        fn complete() -> Self {
+            Self {
+                failed_column: None,
+                result_json: Some(r#"{"status":"completed"}"#.to_string()),
+            }
+        }
+
+        fn pending_without_result() -> Self {
+            Self {
+                failed_column: None,
+                result_json: None,
+            }
+        }
+
+        fn fail_on(column: &'static str) -> Self {
+            Self {
+                failed_column: Some(column),
+                ..Self::complete()
+            }
+        }
+    }
+
+    impl EdgeDispatchDbRow for FakeEdgeDispatchRow {
+        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+            match column {
+                "dispatch_id" => Ok(42),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+            Ok(match column {
+                "user_id" => "user-1",
+                "edge_agent_id" => "edge-1",
+                "request_id" => "request-1",
+                "payload_json" => r#"{"tool":"agent_fanout"}"#,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+            .to_string())
+        }
+
+        fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+            match column {
+                "result_json" => Ok(self.result_json.clone()),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn claimed_dispatch_row_decode_preserves_values() {
+        let row = decode_claimed_dispatch_row(&FakeEdgeDispatchRow::complete()).unwrap();
+
+        assert_eq!(row.dispatch_id, 42);
+        assert_eq!(row.user_id, "user-1");
+        assert_eq!(row.edge_agent_id, "edge-1");
+        assert_eq!(row.request_id, "request-1");
+        assert_eq!(row.payload_json, r#"{"tool":"agent_fanout"}"#);
+        assert_eq!(
+            row.result_json.as_deref(),
+            Some(r#"{"status":"completed"}"#)
+        );
+        assert_eq!(row.status, "dispatched");
+    }
+
+    #[test]
+    fn claimed_dispatch_row_decode_preserves_null_result_for_pending_rows() {
+        let row = decode_claimed_dispatch_row(&FakeEdgeDispatchRow::pending_without_result())
+            .expect("pending row with null result_json is valid");
+
+        assert_eq!(row.result_json, None);
+        assert_eq!(row.status, "dispatched");
+    }
+
+    #[test]
+    fn claimed_dispatch_row_decode_fails_loudly_on_any_column_error() {
+        for column in [
+            "dispatch_id",
+            "user_id",
+            "edge_agent_id",
+            "request_id",
+            "payload_json",
+            "result_json",
+        ] {
+            let error =
+                decode_claimed_dispatch_row(&FakeEdgeDispatchRow::fail_on(column)).unwrap_err();
+            assert!(
+                error.contains("edge_dispatch poll row decode") && error.contains(column),
+                "decode error should identify poll row column `{column}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_result_json_fails_loudly_when_missing_or_undecodable() {
+        let missing = decode_terminal_result_json(&FakeEdgeDispatchRow::pending_without_result())
+            .expect_err("terminal row must carry result_json");
+        assert!(
+            missing.contains("terminal row missing `result_json`"),
+            "missing terminal result should be explicit: {missing}"
+        );
+
+        let decode_error =
+            decode_terminal_result_json(&FakeEdgeDispatchRow::fail_on("result_json"))
+                .expect_err("terminal result decode errors must not become None");
+        assert!(
+            decode_error.contains("edge_dispatch wait_result terminal row decode `result_json`"),
+            "decode error should identify terminal result_json: {decode_error}"
+        );
+    }
+
+    #[test]
+    fn terminal_result_json_preserves_payload() {
+        let result = decode_terminal_result_json(&FakeEdgeDispatchRow::complete()).unwrap();
+
+        assert_eq!(result, r#"{"status":"completed"}"#);
+    }
+
+    #[test]
+    fn claimed_dispatch_update_count_must_match_selected_rows() {
+        validate_claimed_dispatch_update_count(2, 2).expect("matching counts are valid");
+
+        let error = validate_claimed_dispatch_update_count(2, 1)
+            .expect_err("claim/update mismatch must fail loudly");
+        assert!(
+            error.contains("claimed 2 rows but updated 1"),
+            "error should identify claim/update mismatch: {error}"
+        );
     }
 }

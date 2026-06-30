@@ -2044,9 +2044,32 @@ mod tests {
 
     #[test]
     fn introspect_snapshot_includes_host_lifecycle_summary() {
-        let state = make_state();
+        let mut state = make_state();
+        state.step_recorder.begin_turn_with_context(1, 0);
+        let visible_tools = vec!["bash".to_string()];
+        state.step_recorder.record_plan(&visible_tools, 0.0, 100);
+        state.step_recorder.begin_act(1);
+        state.step_recorder.begin_tool_with_key_and_args_preview(
+            "bash",
+            "call-1",
+            None,
+            Some("{\"command\":\"pwd\"}"),
+        );
+        state.step_recorder.complete_tool("bash", false, 8, false);
+        state.step_recorder.end_turn(false);
+
         let snapshot = build_introspect_snapshot(&state, "turn-start lifecycle".to_string(), None);
         assert_eq!(snapshot.lifecycle_summary, "turn-start lifecycle");
+        assert_eq!(snapshot.step_latency.len(), 1);
+        assert_eq!(
+            snapshot.step_latency[0].first_tool_name.as_deref(),
+            Some("bash")
+        );
+        assert_eq!(snapshot.step_latency[0].tool_execution_ms, 8);
+        assert_eq!(
+            snapshot.step_latency[0].terminal_event_kind.as_deref(),
+            Some("StepIncomplete")
+        );
     }
 
     #[test]

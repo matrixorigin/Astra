@@ -230,16 +230,20 @@ async fn try_edge_dispatch(
         return EdgeTransportAttempt::TransportDisconnected;
     }
     let wait_dispatch = dispatch.clone();
+    let wait_user_id = request.user_id.clone();
     let wait_request_id = request_id.clone();
     let wait_result = async move {
         wait_dispatch
-            .wait_result(&wait_request_id, plan.wait_timeout())
+            .wait_result(&wait_user_id, &wait_request_id, plan.wait_timeout())
             .await
     };
     let result_json = if let Some(token) = cancel_token.as_ref() {
         tokio::select! {
             _ = token.cancelled() => {
-                if let Err(e) = dispatch.fail_dispatch(&request_id, TOOL_ERROR_KIND_CANCELLED).await {
+                if let Err(e) = dispatch
+                    .fail_dispatch(&request.user_id, &request_id, TOOL_ERROR_KIND_CANCELLED)
+                    .await
+                {
                     tracing::warn!(
                         error = %e,
                         request_id = %request_id,
@@ -259,7 +263,10 @@ async fn try_edge_dispatch(
         wait_result.await.ok().flatten()
     };
     let Some(result_json) = result_json else {
-        if let Err(e) = dispatch.fail_dispatch(&request_id, "expired").await {
+        if let Err(e) = dispatch
+            .fail_dispatch(&request.user_id, &request_id, "expired")
+            .await
+        {
             tracing::warn!(
                 error = %e,
                 request_id = %request_id,

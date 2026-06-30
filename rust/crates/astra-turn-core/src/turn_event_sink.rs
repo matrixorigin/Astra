@@ -11,6 +11,7 @@
 //!   (single writer per field at any point in the SSE parse).
 //! - `snapshot()` takes a non-consuming snapshot, safe on poisoned mutexes.
 
+use astra_core::canonical_names::{append_unique_names, normalize_name_list};
 use astra_services::session_journal::ToolCallRecord;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -181,7 +182,7 @@ impl IncrementalTurnState {
 
     /// Replace the deduplicated tools-used list with the latest authoritative set.
     pub fn replace_tools_used(&self, tools_used: Vec<String>) {
-        *unwrap_lock(&self.tools_used) = tools_used;
+        *unwrap_lock(&self.tools_used) = normalize_name_list(tools_used);
     }
 
     /// Push a tool call record for incremental accumulation.
@@ -200,9 +201,7 @@ impl IncrementalTurnState {
     /// allocating a `String` for the lookup.
     pub fn add_tool_used(&self, name: &str) {
         let mut guard = unwrap_lock(&self.tools_used);
-        if !guard.iter().any(|n| n == name) {
-            guard.push(name.to_owned());
-        }
+        append_unique_names(&mut guard, [name]);
     }
 
     /// Set the session id (first-wins).
@@ -354,6 +353,8 @@ mod tests {
     fn tools_used_deduplicates() {
         let state = IncrementalTurnState::default();
         state.add_tool_used("bash");
+        state.add_tool_used(" bash ");
+        state.add_tool_used(" ");
         state.add_tool_used("read_file");
         state.add_tool_used("bash"); // duplicate
         let snap = state.snapshot();
@@ -366,7 +367,11 @@ mod tests {
         state.push_tool_record(tool_record("read_file", true, 42, None));
         state.add_tool_used("read_file");
         state.replace_tool_records(vec![tool_record("bash", false, 100, Some("boom"))]);
-        state.replace_tools_used(vec!["bash".to_string()]);
+        state.replace_tools_used(vec![
+            " bash ".to_string(),
+            "bash".to_string(),
+            String::new(),
+        ]);
         let snap = state.snapshot();
         assert_eq!(snap.tool_call_records.len(), 1);
         assert_eq!(snap.tool_call_records[0].name, "bash");

@@ -294,9 +294,10 @@ async fn l2_31_unknown_tool_gets_fallback_preview_budget() {
     assert_eq!(fallback_bytes, 400);
     let row = sqlx::query(
         "SELECT COUNT(*) AS c FROM agent_events
-         WHERE session_id = ? AND event_type = 'preview_template_missing'",
+         WHERE session_id = ? AND user_id = ? AND event_type = 'preview_template_missing'",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap();
@@ -437,10 +438,11 @@ async fn l3_7_s02_ten_gb_retrieval_manifest_records_three_stage_fallbacks() {
 
     let degrade_count = sqlx::query(
         "SELECT COUNT(*) AS c FROM agent_events
-         WHERE session_id = ? AND event_type IN
+         WHERE session_id = ? AND user_id = ? AND event_type IN
          ('retrieval.structured_timeout', 'retrieval.fts_empty', 'retrieval.vector_stale')",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap()
@@ -577,9 +579,10 @@ async fn l3_8_s14_small_window_ambiguity_stays_under_budget_and_asks_user() {
     );
     let candidate_count = sqlx::query(
         "SELECT COUNT(*) AS c FROM agent_events
-         WHERE session_id = ? AND event_type = 'user_prompt_request'",
+         WHERE session_id = ? AND user_id = ? AND event_type = 'user_prompt_request'",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap()

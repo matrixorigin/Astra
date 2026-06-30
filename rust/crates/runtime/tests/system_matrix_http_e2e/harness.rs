@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 use astra_core::SharedPool;
 use astra_core::config::AppSettings;
 use astra_runtime::{DatabaseEvaluationService, MemoriaForwarder, build_app, build_server_state};
+use astra_services::{DatabaseSessionService, SessionService};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -432,31 +433,22 @@ pub fn seeded_selected_model(ctx: &MatrixE2eCtx) -> Value {
     selected_model(seeded_model_name(ctx))
 }
 
-pub async fn cleanup_session_data(pool: &sqlx::MySqlPool, session_id: &str) {
-    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
-        .bind(session_id)
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
-        .bind(session_id)
-        .execute(pool)
-        .await;
-    let _ = sqlx::query(
-        "DELETE edge FROM agent_event_edges edge \
-         JOIN agent_events ev ON edge.child_event_id = ev.event_id \
-         WHERE ev.session_id = ?",
-    )
-    .bind(session_id)
-    .execute(pool)
-    .await;
-    let _ = sqlx::query("DELETE FROM agent_events WHERE session_id = ?")
-        .bind(session_id)
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
-        .bind(session_id)
-        .execute(pool)
-        .await;
+pub async fn cleanup_session_data(shared_pool: &SharedPool, user_id: &str, session_id: &str) {
+    let service =
+        DatabaseSessionService::new(shared_pool.settings().clone()).with_pool(shared_pool.clone());
+    match service
+        .delete_session(session_id.to_string(), user_id.to_string())
+        .await
+    {
+        Ok(()) => {}
+        Err((StatusCode::NOT_FOUND, _)) => {}
+        Err((status, body)) => {
+            panic!(
+                "cleanup_session_data failed for user_id={user_id} session_id={session_id}: status={status} body={:?}",
+                body.0
+            );
+        }
+    }
 }
 
 pub async fn cleanup_edge_registry(pool: &sqlx::MySqlPool, user_id: &str, edge_agent_id: &str) {
@@ -473,7 +465,8 @@ pub async fn cleanup_task_rows(pool: &sqlx::MySqlPool, user_id: &str, task_id: &
         .bind(task_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query("DELETE FROM agent_tasks WHERE task_id = ?")
+    let _ = sqlx::query("DELETE FROM agent_tasks WHERE user_id = ? AND task_id = ?")
+        .bind(user_id)
         .bind(task_id)
         .execute(pool)
         .await;
@@ -496,6 +489,7 @@ pub fn row_get_opt_i64(r: &MySqlRow, col: &str) -> Option<i64> {
 /// Avoids fixed `sleep` after `/chat/turn` SSE (faster on hot DB, less flaky on cold).
 pub async fn wait_for_agent_event_types(
     pool: &sqlx::MySqlPool,
+    user_id: &str,
     session_id: &str,
     types: &[&str],
     timeout: std::time::Duration,
@@ -505,9 +499,11 @@ pub async fn wait_for_agent_event_types(
         let mut ok = true;
         for et in types {
             let n: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = ?",
+                "SELECT COUNT(*) FROM agent_events \
+                 WHERE session_id = ? AND user_id = ? AND event_type = ?",
             )
             .bind(session_id)
+            .bind(user_id)
             .bind(*et)
             .fetch_one(pool)
             .await
@@ -522,7 +518,7 @@ pub async fn wait_for_agent_event_types(
         }
         if tokio::time::Instant::now() >= deadline {
             panic!(
-                "timeout ({timeout:?}) waiting for agent_events types {types:?} for session_id={session_id}"
+                "timeout ({timeout:?}) waiting for agent_events types {types:?} for user_id={user_id} session_id={session_id}"
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -564,6 +560,7 @@ pub async fn wait_for_run_status(
 pub struct MatrixE2eCtx {
     pub app: Router,
     pub pool: sqlx::MySqlPool,
+    pub shared_pool: SharedPool,
     /// Logical MatrixOne database (includes `ASTRA_DATABASE_PREFIX` + `ASTRA_DATABASE`).
     pub matrixone_database: String,
     pub memoria: Arc<E2eMemoriaStub>,
@@ -643,6 +640,7 @@ pub async fn bootstrap() -> BootstrapResult {
     let evaluation_pool = SharedPool::new(&matrixone_settings)
         .await
         .expect("connect MatrixOne shared pool for evaluation");
+    let session_lifecycle_pool = evaluation_pool.clone();
     let memoria_health_base_url = start_mock_memoria_health().await;
     let state = state.with_evaluation_service(Arc::new(
         DatabaseEvaluationService::new(matrixone_settings)
@@ -755,7 +753,8 @@ pub async fn bootstrap() -> BootstrapResult {
             "name": mock_model,
             "provider": "mock",
             "api_key": "unused",
-            "base_url": "http://127.0.0.1:1"
+            "base_url": "http://127.0.0.1:1",
+            "context_window": 200000
         }),
     )
     .await;
@@ -765,6 +764,7 @@ pub async fn bootstrap() -> BootstrapResult {
         ctx: MatrixE2eCtx {
             app,
             pool,
+            shared_pool: session_lifecycle_pool,
             matrixone_database,
             memoria,
             user_id,

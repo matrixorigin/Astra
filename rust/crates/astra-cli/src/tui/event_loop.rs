@@ -343,6 +343,11 @@ fn total_input_tokens(
         .saturating_add(cache_creation_tokens)
 }
 
+fn footer_token_budget_from_context_trace(trace: &ContextAssemblyTrace) -> Option<(u64, u64)> {
+    let limit = u64::from(trace.token_budget.max_tokens);
+    (limit > 0).then_some((u64::from(trace.token_budget.total_used), limit))
+}
+
 fn latest_context_trace_since(
     state: &crate::cli::session::session_state::SessionState,
     baseline_cached_turn_id: Option<&str>,
@@ -444,9 +449,10 @@ fn try_dispatch_agent_kill_sentinel(
         // user-facing); if it's a durable task this is the only path
         // that actually marks it Cancelled in MatrixOne.
         let aid = agent_id_owned.clone();
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         tokio::spawn(async move {
             if let Err(e) = task_service
-                .update_status(&aid, astra_services::TaskStatus::Cancelled)
+                .update_status(&user_id, &aid, astra_services::TaskStatus::Cancelled)
                 .await
             {
                 tracing::debug!(
@@ -2190,12 +2196,17 @@ pub(crate) async fn run_tui_session(
                                                                             && let Some(ref svc) = task_service_for_cancel
                                                                         {
                                                                             let svc = svc.clone();
+                                                                            let user_id = std::sync::Arc::new(
+                                                                                crate::cli::cli_config::cli_utils::cli_user_id(),
+                                                                            );
                                                                             let errs = super::cancel_fanout::fanout(
                                                                                 &ids,
                                                                                 move |id| {
                                                                                     let svc = svc.clone();
+                                                                                    let user_id = user_id.clone();
                                                                                     async move {
                                                                                         svc.update_status(
+                                                                                            user_id.as_str(),
                                                                                             &id,
                                                                                             astra_services::TaskStatus::Cancelled,
                                                                                         )
@@ -2821,14 +2832,11 @@ pub(crate) async fn run_tui_session(
                                     if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
                                     bottom_pane.footer.token_usage = Some(format!("{}↑ {}↓", state.total_prompt_tokens, state.total_completion_tokens));
                                     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
-                                    // Footer "N% (Mk)" chip shows the CONTEXT WINDOW for
-                                    // the most recent turn — i.e. how many input tokens
-                                    // the model saw this turn, not cumulative session
-                                    // totals. Cumulative would climb to 100% within a few
-                                    // turns on any non-trivial chat and the chip becomes
-                                    // meaningless. The default 200k budget covers
-                                    // Anthropic Opus/Sonnet 4.x; per-model limits will
-                                    // land in a later pass.
+                                    // Footer "N% (Mk)" chip shows context-window occupancy
+                                    // from the latest context assembly trace. Do not use
+                                    // provider usage/billing totals here: multi-round turns
+                                    // report the same cached prefix repeatedly, which makes
+                                    // the footer look far fuller than the actual request.
                                     let turn_prompt = state.total_prompt_tokens - pre_prompt_tokens;
                                     let turn_completion = state.total_completion_tokens - pre_completion_tokens;
                                     let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
@@ -2838,8 +2846,15 @@ pub(crate) async fn run_tui_session(
                                         turn_cache_read,
                                         turn_cache_creation,
                                     );
-                                    bottom_pane.footer.token_budget =
-                                        Some((turn_input, 200_000));
+                                    let footer_context_trace = latest_context_trace_since(
+                                        &state,
+                                        pre_cached_context_trace_turn_id.as_deref(),
+                                        pre_context_trace_count,
+                                    )
+                                    .or_else(|| state.latest_context_assembly_trace.clone());
+                                    bottom_pane.footer.token_budget = footer_context_trace
+                                        .as_ref()
+                                        .and_then(footer_token_budget_from_context_trace);
 
                                     // Turn summary: dispatch to ChatWidget,
                                     // which builds the TurnSummaryCell and
@@ -3918,6 +3933,7 @@ mod tests {
     use super::*;
     use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
     use crate::tui::background_tasks::BgTaskEvent;
+    use crate::tui::status_line::{StatusContext, StatusLine};
     use astra_runtime::turn::run_control::RunInputProvider;
     use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
     use astra_turn_core::orchestration_types::{
@@ -3950,6 +3966,39 @@ mod tests {
                 .unwrap_or("missing");
             panic!("background shell {id} did not terminate; current status: {status}");
         });
+    }
+
+    #[test]
+    fn footer_budget_uses_context_trace_not_round_accumulated_provider_input() {
+        let mut trace = ContextAssemblyTrace::default();
+        trace.token_budget.total_used = 20_687;
+        trace.token_budget.max_tokens = 800_000;
+
+        let budget = footer_token_budget_from_context_trace(&trace);
+        assert_eq!(budget, Some((20_687, 800_000)));
+
+        let plain = StatusLine::from_context(&StatusContext {
+            token_budget: budget,
+            ..StatusContext::default()
+        })
+        .plain();
+        assert!(
+            plain.contains("3%"),
+            "footer should use trace pressure, not 41k/200k billing math: {plain:?}"
+        );
+        assert!(
+            !plain.contains("21%"),
+            "footer regressed to accumulated provider input over default 200k: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn footer_budget_hides_when_context_trace_has_no_limit() {
+        let mut trace = ContextAssemblyTrace::default();
+        trace.token_budget.total_used = 20_687;
+        trace.token_budget.max_tokens = 0;
+
+        assert_eq!(footer_token_budget_from_context_trace(&trace), None);
     }
 
     fn agent_info(
@@ -5217,7 +5266,9 @@ mod tests {
         let provider = astra_core::sync_poison::recover_mutex_lock(&run_control)
             .clone()
             .expect("run control should stay installed");
-        let polled = provider.poll_user_inputs("run-local", 0).await;
+        let polled = provider
+            .poll_user_inputs("local-user", "run-local", 0)
+            .await;
         assert_eq!(
             polled.inputs.len(),
             1,

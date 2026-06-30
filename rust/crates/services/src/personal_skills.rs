@@ -11,7 +11,6 @@ use uuid::Uuid;
 use crate::state_projection::{DatabaseStateProjectionStore, StateProjectionError};
 
 pub const SKILL_MD_NORMALIZE_VERSION: &str = "skill_md_v1";
-pub const RAW_SKILL_NORMALIZE_VERSION: &str = "raw_v1";
 
 #[derive(Debug, Error)]
 pub enum PersonalSkillError {
@@ -34,7 +33,7 @@ pub enum PersonalSkillError {
         operation: &'static str,
         entity: String,
         #[source]
-        source: StateProjectionError,
+        source: Box<StateProjectionError>,
     },
     #[error("invalid skill version status {status}")]
     InvalidStatus { status: String },
@@ -81,6 +80,7 @@ pub struct UserSkillVersionRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserSkillEvaluationRecord {
     pub evaluation_id: String,
+    pub owner_user_id: String,
     pub source_id: String,
     pub version_id: String,
     pub run_id: Option<String>,
@@ -290,7 +290,9 @@ impl DatabasePersonalSkillStore {
             entity: owner_user_id.to_string(),
             source,
         })?;
-        Ok(rows.into_iter().map(source_from_row).collect())
+        rows.into_iter()
+            .map(|row| source_from_row(row, "list_user_skill_sources", owner_user_id))
+            .collect()
     }
 
     pub async fn list_versions(
@@ -315,7 +317,9 @@ impl DatabasePersonalSkillStore {
             entity: skill_name.to_string(),
             source,
         })?;
-        rows.into_iter().map(version_from_row).collect()
+        rows.into_iter()
+            .map(|row| version_from_row(row, "list_user_skill_versions", skill_name))
+            .collect()
     }
 
     pub async fn activate_version(
@@ -344,7 +348,7 @@ impl DatabasePersonalSkillStore {
             .map_err(|source| PersonalSkillError::StateProjection {
                 operation: "activate_user_skill_version",
                 entity: version_id.to_string(),
-                source,
+                source: Box::new(source),
             })?;
         Ok(version)
     }
@@ -390,7 +394,12 @@ impl DatabasePersonalSkillStore {
             source,
         })?;
         if let Some(row) = existing {
-            let existing_id: String = row.try_get("installation_id").unwrap_or_default();
+            let existing_id = row_string(
+                &row,
+                "load_existing_skill_installation",
+                skill_name,
+                "installation_id",
+            )?;
             sqlx::query(
                 "UPDATE skill_installations
                  SET skill_version = ?, status = 'installed', scope = ?, session_id = ?,
@@ -438,6 +447,8 @@ impl DatabasePersonalSkillStore {
 
     pub async fn record_evaluation(
         &self,
+        owner_user_id: &str,
+        skill_name: &str,
         request: RecordUserSkillEvaluation,
     ) -> Result<UserSkillEvaluationRecord, PersonalSkillError> {
         let evaluation_id = format!("skill-eval-{}", Uuid::new_v4());
@@ -448,20 +459,31 @@ impl DatabasePersonalSkillStore {
                 entity: request.version_id.clone(),
                 source,
             })?;
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO user_skill_evaluations
-             (evaluation_id, source_id, version_id, run_id, hits, suspects, false_positives,
-              payload_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+             (evaluation_id, owner_user_id, source_id, version_id, run_id, hits, suspects,
+              false_positives, payload_json, created_at)
+             SELECT ?, sources.owner_user_id, versions.source_id, versions.version_id,
+                    ?, ?, ?, ?, ?, NOW(6)
+             FROM user_skill_sources sources
+             JOIN user_skill_versions versions
+               ON versions.source_id = sources.source_id
+             WHERE sources.owner_user_id = ?
+               AND sources.skill_name = ?
+               AND sources.source_id = ?
+               AND versions.version_id = ?
+             LIMIT 1",
         )
         .bind(&evaluation_id)
-        .bind(&request.source_id)
-        .bind(&request.version_id)
         .bind(&request.run_id)
         .bind(request.hits as i64)
         .bind(request.suspects as i64)
         .bind(request.false_positives as i64)
         .bind(&payload_json)
+        .bind(owner_user_id)
+        .bind(skill_name)
+        .bind(&request.source_id)
+        .bind(&request.version_id)
         .execute(self.pool.get())
         .await
         .map_err(|source| PersonalSkillError::Database {
@@ -469,20 +491,28 @@ impl DatabasePersonalSkillStore {
             entity: request.version_id.clone(),
             source,
         })?;
+        if result.rows_affected() == 0 {
+            return Err(PersonalSkillError::VersionNotFound {
+                owner_user_id: owner_user_id.to_string(),
+                skill_name: skill_name.to_string(),
+                version_id: request.version_id,
+            });
+        }
         let row = sqlx::query(
-            "SELECT evaluation_id, source_id, version_id, run_id, hits, suspects,
+            "SELECT evaluation_id, owner_user_id, source_id, version_id, run_id, hits, suspects,
                     false_positives, payload_json, CAST(created_at AS CHAR) AS created_at
-             FROM user_skill_evaluations WHERE evaluation_id = ?",
+             FROM user_skill_evaluations WHERE owner_user_id = ? AND evaluation_id = ?",
         )
+        .bind(owner_user_id)
         .bind(&evaluation_id)
         .fetch_one(self.pool.get())
         .await
         .map_err(|source| PersonalSkillError::Database {
             operation: "load_user_skill_evaluation",
-            entity: evaluation_id,
+            entity: evaluation_id.clone(),
             source,
         })?;
-        evaluation_from_row(row)
+        evaluation_from_row(row, "load_user_skill_evaluation", &evaluation_id)
     }
 
     pub async fn auto_activate_candidates(
@@ -502,10 +532,16 @@ impl DatabasePersonalSkillStore {
             entity: owner_user_id.to_string(),
             source,
         })?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| row.try_get::<String, _>("skill_name").ok())
-            .collect())
+        rows.into_iter()
+            .map(|row| {
+                row_string(
+                    &row,
+                    "load_auto_activate_skill_candidates",
+                    owner_user_id,
+                    "skill_name",
+                )
+            })
+            .collect()
     }
 
     async fn load_source(
@@ -541,7 +577,8 @@ impl DatabasePersonalSkillStore {
             entity: skill_name.to_string(),
             source,
         })?;
-        Ok(row.map(source_from_row))
+        row.map(|row| source_from_row(row, "load_user_skill_source", skill_name))
+            .transpose()
     }
 
     async fn load_version_by_id(
@@ -567,7 +604,8 @@ impl DatabasePersonalSkillStore {
             entity: version_id.to_string(),
             source,
         })?;
-        row.map(version_from_row).transpose()
+        row.map(|row| version_from_row(row, "load_user_skill_version", version_id))
+            .transpose()
     }
 
     async fn latest_published_version(
@@ -589,7 +627,15 @@ impl DatabasePersonalSkillStore {
             entity: skill_name.to_string(),
             source,
         })?;
-        Ok(row.and_then(|row| row.try_get::<String, _>("version").ok()))
+        row.map(|row| {
+            row_string(
+                &row,
+                "load_latest_published_user_skill_version",
+                skill_name,
+                "version",
+            )
+        })
+        .transpose()
     }
 }
 
@@ -603,13 +649,6 @@ pub fn normalize_skill_md(manifest_json: &Value, content_markdown: &str) -> Stri
 
 pub fn skill_md_content_hash(manifest_json: &Value, content_markdown: &str) -> String {
     sha256_prefixed(&normalize_skill_md(manifest_json, content_markdown))
-}
-
-pub fn normalize_version_or_legacy(value: Option<&str>) -> &str {
-    match value {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => RAW_SKILL_NORMALIZE_VERSION,
-    }
 }
 
 fn canonical_json(value: &Value) -> String {
@@ -691,25 +730,110 @@ fn validate_version_status(status: &str) -> Result<(), PersonalSkillError> {
     }
 }
 
-fn source_from_row(row: sqlx::mysql::MySqlRow) -> UserSkillSourceRecord {
-    UserSkillSourceRecord {
-        source_id: row.try_get("source_id").unwrap_or_default(),
-        owner_user_id: row.try_get("owner_user_id").unwrap_or_default(),
-        skill_name: row.try_get("skill_name").unwrap_or_default(),
-        visibility: row.try_get("visibility").unwrap_or_default(),
-        status: row.try_get("status").unwrap_or_default(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-        updated_at: row.try_get("updated_at").unwrap_or_default(),
+fn db_error(
+    operation: &'static str,
+    entity: impl Into<String>,
+    source: sqlx::Error,
+) -> PersonalSkillError {
+    PersonalSkillError::Database {
+        operation,
+        entity: entity.into(),
+        source,
     }
+}
+
+fn invalid_database_value(
+    operation: &'static str,
+    entity: &str,
+    column: &str,
+    message: impl Into<String>,
+) -> PersonalSkillError {
+    db_error(
+        operation,
+        entity,
+        sqlx::Error::Decode(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "personal skill decode column `{column}`: {}",
+                message.into()
+            ),
+        ))),
+    )
+}
+
+fn row_string(
+    row: &sqlx::mysql::MySqlRow,
+    operation: &'static str,
+    entity: &str,
+    column: &'static str,
+) -> Result<String, PersonalSkillError> {
+    let value = row
+        .try_get::<String, _>(column)
+        .map_err(|source| db_error(operation, entity, source))?;
+    if value.trim().is_empty() {
+        return Err(invalid_database_value(
+            operation,
+            entity,
+            column,
+            "must not be empty",
+        ));
+    }
+    Ok(value)
+}
+
+fn row_optional_string(
+    row: &sqlx::mysql::MySqlRow,
+    operation: &'static str,
+    entity: &str,
+    column: &'static str,
+) -> Result<Option<String>, PersonalSkillError> {
+    row.try_get::<Option<String>, _>(column)
+        .map_err(|source| db_error(operation, entity, source))
+}
+
+fn row_non_negative_i64(
+    row: &sqlx::mysql::MySqlRow,
+    operation: &'static str,
+    entity: &str,
+    column: &'static str,
+) -> Result<i64, PersonalSkillError> {
+    let value = row
+        .try_get::<i64, _>(column)
+        .map_err(|source| db_error(operation, entity, source))?;
+    if value < 0 {
+        return Err(invalid_database_value(
+            operation,
+            entity,
+            column,
+            format!("expected non-negative integer, got {value}"),
+        ));
+    }
+    Ok(value)
+}
+
+fn source_from_row(
+    row: sqlx::mysql::MySqlRow,
+    operation: &'static str,
+    entity: &str,
+) -> Result<UserSkillSourceRecord, PersonalSkillError> {
+    Ok(UserSkillSourceRecord {
+        source_id: row_string(&row, operation, entity, "source_id")?,
+        owner_user_id: row_string(&row, operation, entity, "owner_user_id")?,
+        skill_name: row_string(&row, operation, entity, "skill_name")?,
+        visibility: row_string(&row, operation, entity, "visibility")?,
+        status: row_string(&row, operation, entity, "status")?,
+        created_at: row_string(&row, operation, entity, "created_at")?,
+        updated_at: row_string(&row, operation, entity, "updated_at")?,
+    })
 }
 
 fn version_from_row(
     row: sqlx::mysql::MySqlRow,
+    operation: &'static str,
+    entity: &str,
 ) -> Result<UserSkillVersionRecord, PersonalSkillError> {
-    let version_id = row.try_get::<String, _>("version_id").unwrap_or_default();
-    let manifest_raw = row
-        .try_get::<String, _>("manifest_json")
-        .unwrap_or_else(|_| "{}".to_string());
+    let version_id = row_string(&row, operation, entity, "version_id")?;
+    let manifest_raw = row_string(&row, operation, entity, "manifest_json")?;
     let manifest_json =
         serde_json::from_str(&manifest_raw).map_err(|source| PersonalSkillError::Json {
             operation: "deserialize_skill_manifest",
@@ -718,35 +842,28 @@ fn version_from_row(
         })?;
     Ok(UserSkillVersionRecord {
         version_id,
-        source_id: row.try_get("source_id").unwrap_or_default(),
-        owner_user_id: row.try_get("owner_user_id").unwrap_or_default(),
-        skill_name: row.try_get("skill_name").unwrap_or_default(),
-        version: row.try_get("version").unwrap_or_default(),
+        source_id: row_string(&row, operation, entity, "source_id")?,
+        owner_user_id: row_string(&row, operation, entity, "owner_user_id")?,
+        skill_name: row_string(&row, operation, entity, "skill_name")?,
+        version: row_string(&row, operation, entity, "version")?,
         manifest_json,
-        content_markdown: row.try_get("content_markdown").unwrap_or_default(),
-        content_hash: row.try_get("content_hash").unwrap_or_default(),
-        normalize_version: normalize_version_or_legacy(
-            row.try_get::<String, _>("normalize_version")
-                .ok()
-                .as_deref(),
-        )
-        .to_string(),
-        token_estimate: row.try_get::<i64, _>("token_estimate").unwrap_or(0).max(0) as u32,
-        status: row.try_get("status").unwrap_or_default(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-        updated_at: row.try_get("updated_at").unwrap_or_default(),
+        content_markdown: row_string(&row, operation, entity, "content_markdown")?,
+        content_hash: row_string(&row, operation, entity, "content_hash")?,
+        normalize_version: row_string(&row, operation, entity, "normalize_version")?,
+        token_estimate: row_non_negative_i64(&row, operation, entity, "token_estimate")? as u32,
+        status: row_string(&row, operation, entity, "status")?,
+        created_at: row_string(&row, operation, entity, "created_at")?,
+        updated_at: row_string(&row, operation, entity, "updated_at")?,
     })
 }
 
 fn evaluation_from_row(
     row: sqlx::mysql::MySqlRow,
+    operation: &'static str,
+    entity: &str,
 ) -> Result<UserSkillEvaluationRecord, PersonalSkillError> {
-    let evaluation_id = row
-        .try_get::<String, _>("evaluation_id")
-        .unwrap_or_default();
-    let payload_raw = row
-        .try_get::<String, _>("payload_json")
-        .unwrap_or_else(|_| "null".to_string());
+    let evaluation_id = row_string(&row, operation, entity, "evaluation_id")?;
+    let payload_raw = row_string(&row, operation, entity, "payload_json")?;
     let payload_json =
         serde_json::from_str(&payload_raw).map_err(|source| PersonalSkillError::Json {
             operation: "deserialize_skill_evaluation",
@@ -755,14 +872,15 @@ fn evaluation_from_row(
         })?;
     Ok(UserSkillEvaluationRecord {
         evaluation_id,
-        source_id: row.try_get("source_id").unwrap_or_default(),
-        version_id: row.try_get("version_id").unwrap_or_default(),
-        run_id: row.try_get("run_id").ok(),
-        hits: row.try_get::<i64, _>("hits").unwrap_or(0).max(0) as u64,
-        suspects: row.try_get::<i64, _>("suspects").unwrap_or(0).max(0) as u64,
-        false_positives: row.try_get::<i64, _>("false_positives").unwrap_or(0).max(0) as u64,
+        owner_user_id: row_string(&row, operation, entity, "owner_user_id")?,
+        source_id: row_string(&row, operation, entity, "source_id")?,
+        version_id: row_string(&row, operation, entity, "version_id")?,
+        run_id: row_optional_string(&row, operation, entity, "run_id")?,
+        hits: row_non_negative_i64(&row, operation, entity, "hits")? as u64,
+        suspects: row_non_negative_i64(&row, operation, entity, "suspects")? as u64,
+        false_positives: row_non_negative_i64(&row, operation, entity, "false_positives")? as u64,
         payload_json,
-        created_at: row.try_get("created_at").unwrap_or_default(),
+        created_at: row_string(&row, operation, entity, "created_at")?,
     })
 }
 

@@ -15,6 +15,9 @@ use crate::personal_skills::{
     CreateUserSkillSource, DatabasePersonalSkillStore, SubmitUserSkillVersion,
 };
 
+type HarnessResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
+type SkillRuleReviewIds = (String, String);
+
 const SKILLIFY_HARNESS_ID: &str = "skillify";
 const SKILLIFY_VERSION_ID: &str = "skillify.v1";
 const SKILLIFY_TEMPLATE_ID: &str = "skillify.v1";
@@ -501,17 +504,17 @@ impl DatabaseHarnessService {
         let row =
             row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "harness run not found"))?;
         Ok(HarnessRunRecord {
-            harness_run_id: row.try_get("harness_run_id").map_err(internal_error)?,
-            harness_id: row.try_get("harness_id").map_err(internal_error)?,
-            version_id: row.try_get("version_id").map_err(internal_error)?,
-            user_id: row.try_get("user_id").map_err(internal_error)?,
-            session_id: row.try_get("session_id").ok(),
-            status: row.try_get("status").map_err(internal_error)?,
-            input_json: parse_json_cell(&row, "input_json"),
-            output_json: parse_json_cell(&row, "output_json"),
-            error: row.try_get("error").ok(),
-            created_at: row.try_get("created_at").unwrap_or_default(),
-            updated_at: row.try_get("updated_at").unwrap_or_default(),
+            harness_run_id: required_harness_string(&row, "harness_runs", "harness_run_id")?,
+            harness_id: required_harness_string(&row, "harness_runs", "harness_id")?,
+            version_id: required_harness_string(&row, "harness_runs", "version_id")?,
+            user_id: required_harness_string(&row, "harness_runs", "user_id")?,
+            session_id: optional_harness_string(&row, "harness_runs", "session_id")?,
+            status: required_harness_string(&row, "harness_runs", "status")?,
+            input_json: parse_json_cell(&row, "harness_runs", "input_json")?,
+            output_json: parse_json_cell(&row, "harness_runs", "output_json")?,
+            error: optional_harness_string(&row, "harness_runs", "error")?,
+            created_at: required_harness_string(&row, "harness_runs", "created_at")?,
+            updated_at: required_harness_string(&row, "harness_runs", "updated_at")?,
         })
     }
 
@@ -542,7 +545,7 @@ impl DatabaseHarnessService {
 
         let row =
             row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "harness item not found"))?;
-        Ok(item_from_row(row))
+        item_from_row(row)
     }
 
     async fn load_skill_draft(
@@ -570,7 +573,7 @@ impl DatabaseHarnessService {
 
         let row =
             row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "skill draft not found"))?;
-        let mut draft = skill_draft_from_row(row);
+        let mut draft = skill_draft_from_row(row)?;
         draft.rules = self
             .load_skill_rules(harness_run_id, skill_draft_id)
             .await?;
@@ -600,7 +603,7 @@ impl DatabaseHarnessService {
         let mut rules = rows
             .into_iter()
             .map(skill_rule_from_row)
-            .collect::<Vec<_>>();
+            .collect::<HarnessResult<Vec<_>>>()?;
         for rule in &mut rules {
             rule.citations = self
                 .load_skill_rule_citations(harness_run_id, &rule.skill_rule_id)
@@ -630,7 +633,7 @@ impl DatabaseHarnessService {
         .fetch_all(self.pool.get())
         .await
         .map_err(internal_error)?;
-        Ok(rows.into_iter().map(citation_from_row).collect())
+        rows.into_iter().map(citation_from_row).collect()
     }
 
     async fn load_item_locked(
@@ -660,7 +663,7 @@ impl DatabaseHarnessService {
         .map_err(internal_error)?;
         let row =
             row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "harness item not found"))?;
-        Ok(item_from_row(row))
+        item_from_row(row)
     }
 
     async fn load_skill_rules_locked(
@@ -684,7 +687,7 @@ impl DatabaseHarnessService {
         .fetch_all(&mut **tx)
         .await
         .map_err(internal_error)?;
-        Ok(rows.into_iter().map(skill_rule_from_row).collect())
+        rows.into_iter().map(skill_rule_from_row).collect()
     }
 
     async fn load_skill_draft_locked(
@@ -712,7 +715,7 @@ impl DatabaseHarnessService {
         .map_err(internal_error)?;
         let row =
             row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "skill draft not found"))?;
-        let mut draft = skill_draft_from_row(row);
+        let mut draft = skill_draft_from_row(row)?;
         draft.rules = self
             .load_skill_rules_locked(tx, harness_run_id, skill_draft_id)
             .await?;
@@ -744,7 +747,7 @@ impl DatabaseHarnessService {
         .map_err(internal_error)?;
         let row =
             row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "skill rule not found"))?;
-        Ok(skill_rule_from_row(row))
+        skill_rule_from_row(row)
     }
 
     async fn validate_session_ownership(
@@ -810,18 +813,23 @@ impl DatabaseHarnessService {
             .await
             .map_err(internal_error)?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| SkillifyEvent {
-                event_id: row.try_get("event_id").unwrap_or_default(),
-                session_id: row.try_get("session_id").unwrap_or_default(),
-                source_id: row.try_get("session_id").unwrap_or_default(),
-                source_type: "session".to_string(),
-                title: row.try_get("session_id").unwrap_or_default(),
-                event_type: row.try_get("event_type").unwrap_or_default(),
-                content: row.try_get("content").unwrap_or_default(),
+        rows.into_iter()
+            .map(|row| {
+                let event_id = required_harness_string(&row, "agent_events", "event_id")?;
+                let session_id = required_harness_string(&row, "agent_events", "session_id")?;
+                let event_type = required_harness_string(&row, "agent_events", "event_type")?;
+                let content = required_harness_string(&row, "agent_events", "content")?;
+                Ok(SkillifyEvent {
+                    source_id: event_id.clone(),
+                    source_type: "session_event".to_string(),
+                    title: skillify_session_event_title(&session_id, &event_type),
+                    event_id,
+                    session_id,
+                    event_type,
+                    content,
+                })
             })
-            .collect())
+            .collect::<HarnessResult<Vec<_>>>()
     }
 
     fn normalize_source_files(
@@ -1010,6 +1018,7 @@ impl HarnessService for DatabaseHarnessService {
 
             for (index, rule) in draft.rules.iter().enumerate() {
                 let skill_rule_id = format!("harness-skill-rule-{}", Uuid::new_v4());
+                let review_item_id = skill_rule_review_item_id(&skill_rule_id);
                 let source_count = unique_rule_source_count(rule);
                 sqlx::query(
                     "INSERT INTO harness_skill_rules
@@ -1026,6 +1035,42 @@ impl HarnessService for DatabaseHarnessService {
                 .bind(&rule.rationale)
                 .bind(rule.confidence)
                 .bind(source_count)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+
+                let item_locator_json = json!({
+                    "type": "skill_rule",
+                    "skill_draft_id": &skill_draft_id,
+                    "skill_rule_id": &skill_rule_id,
+                });
+                let item_input_json = json!({
+                    "skill_draft_id": &skill_draft_id,
+                    "candidate_name": &draft.candidate_name,
+                    "rule_index": index,
+                    "citation_count": rule.citations.len(),
+                });
+                let item_proposed_output_json = skill_rule_review_payload(
+                    &rule.rule_type,
+                    &rule.statement,
+                    &rule.rationale,
+                    rule.confidence,
+                    source_count,
+                );
+                sqlx::query(
+                    "INSERT INTO harness_items
+                     (item_id, harness_run_id, parent_item_id, item_type, locator_json,
+                      input_json, proposed_output_json, final_output_json, status, confidence,
+                      created_at, updated_at)
+                     VALUES (?, ?, ?, 'skill_rule', ?, ?, ?, '{}', 'pending_review', ?, NOW(6), NOW(6))",
+                )
+                .bind(&review_item_id)
+                .bind(&harness_run_id)
+                .bind(&skill_draft_id)
+                .bind(item_locator_json.to_string())
+                .bind(item_input_json.to_string())
+                .bind(item_proposed_output_json.to_string())
+                .bind(rule.confidence)
                 .execute(&mut *tx)
                 .await
                 .map_err(internal_error)?;
@@ -1056,7 +1101,7 @@ impl HarnessService for DatabaseHarnessService {
                     )
                     .bind(citation_id)
                     .bind(&harness_run_id)
-                    .bind(&skill_rule_id)
+                    .bind(&review_item_id)
                     .bind(&skill_draft_id)
                     .bind(&skill_rule_id)
                     .bind(&citation.source_id)
@@ -1110,7 +1155,7 @@ impl HarnessService for DatabaseHarnessService {
         .fetch_all(self.pool.get())
         .await
         .map_err(internal_error)?;
-        Ok(rows.into_iter().map(item_from_row).collect())
+        rows.into_iter().map(item_from_row).collect()
     }
 
     async fn decide_item(
@@ -1135,6 +1180,7 @@ impl HarnessService for DatabaseHarnessService {
             return Ok(current);
         }
         let decision = request.decision.trim();
+        let skill_rule_link = skill_rule_review_item_ids(&current)?;
         let (status, final_output) = match decision {
             "approve" => ("approved", current.proposed_output_json.clone()),
             "reject" => ("rejected", json!({})),
@@ -1185,7 +1231,74 @@ impl HarnessService for DatabaseHarnessService {
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
+
+        if let Some((skill_draft_id, skill_rule_id)) = skill_rule_link {
+            let current_rule = self
+                .load_skill_rule_locked(&mut tx, &harness_run_id, &skill_draft_id, &skill_rule_id)
+                .await?;
+            let rule_status = skill_rule_status_for_item_decision(decision);
+            let statement = final_output
+                .get("statement")
+                .and_then(Value::as_str)
+                .unwrap_or(&current_rule.statement)
+                .trim()
+                .to_string();
+            if statement.is_empty() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "rule statement must not be empty",
+                ));
+            }
+            let rationale = final_output
+                .get("rationale")
+                .and_then(Value::as_str)
+                .unwrap_or(&current_rule.rationale)
+                .trim()
+                .to_string();
+            let rule_before_json = json!({
+                "status": current_rule.status.clone(),
+                "statement": current_rule.statement.clone(),
+                "rationale": current_rule.rationale.clone(),
+            });
+            let rule_after_json = json!({
+                "status": rule_status,
+                "statement": statement.clone(),
+                "rationale": rationale.clone(),
+                "payload": final_output.clone(),
+            });
+            let rule_decision_history_json = append_decision_history(
+                &current_rule.decision_history_json,
+                decision_history_entry(
+                    decision,
+                    &user_id,
+                    request.reason.as_deref(),
+                    request.idempotency_key.as_deref(),
+                    rule_before_json,
+                    rule_after_json,
+                ),
+            );
+            sqlx::query(
+                "UPDATE harness_skill_rules
+                 SET status = ?, statement = ?, rationale = ?, decision_history_json = ?, updated_at = NOW(6)
+                 WHERE harness_run_id = ? AND skill_draft_id = ? AND skill_rule_id = ?",
+            )
+            .bind(rule_status)
+            .bind(statement)
+            .bind(rationale)
+            .bind(rule_decision_history_json.to_string())
+            .bind(&harness_run_id)
+            .bind(&skill_draft_id)
+            .bind(&skill_rule_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            refresh_skill_draft_after_rule_decision(&mut tx, &harness_run_id, &skill_draft_id)
+                .await?;
+        }
         update_skillify_run_counts(&mut tx, &harness_run_id).await?;
+        if skill_rule_review_item_ids(&current)?.is_some() {
+            update_skillify_draft_counts(&mut tx, &harness_run_id).await?;
+        }
         tx.commit().await.map_err(internal_error)?;
         self.load_item(&harness_run_id, &item_id).await
     }
@@ -1215,7 +1328,7 @@ impl HarnessService for DatabaseHarnessService {
 
         let mut drafts = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut draft = skill_draft_from_row(row);
+            let mut draft = skill_draft_from_row(row)?;
             draft.rules = self
                 .load_skill_rules(&harness_run_id, &draft.skill_draft_id)
                 .await?;
@@ -1486,8 +1599,8 @@ impl HarnessService for DatabaseHarnessService {
              WHERE harness_run_id = ? AND skill_draft_id = ? AND skill_rule_id = ?",
         )
         .bind(status)
-        .bind(statement)
-        .bind(rationale)
+        .bind(&statement)
+        .bind(&rationale)
         .bind(decision_history_json.to_string())
         .bind(&harness_run_id)
         .bind(&skill_draft_id)
@@ -1495,7 +1608,57 @@ impl HarnessService for DatabaseHarnessService {
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
+        let review_item_id = skill_rule_review_item_id(&skill_rule_id);
+        let review_item = self
+            .load_item_locked(&mut tx, &harness_run_id, &review_item_id)
+            .await?;
+        let item_status = item_status_for_skill_rule_status(status);
+        let item_final_output = if item_status == "approved" {
+            skill_rule_review_payload(
+                &current.rule_type,
+                &statement,
+                &rationale,
+                current.confidence,
+                current.source_count,
+            )
+        } else {
+            json!({})
+        };
+        let item_before_json = json!({
+            "status": review_item.status.clone(),
+            "proposed_output_json": review_item.proposed_output_json.clone(),
+            "final_output_json": review_item.final_output_json.clone(),
+        });
+        let item_after_json = json!({
+            "status": item_status,
+            "final_output_json": item_final_output.clone(),
+        });
+        let item_decision_history_json = append_decision_history(
+            &review_item.decision_history_json,
+            decision_history_entry(
+                decision,
+                &user_id,
+                request.reason.as_deref(),
+                request.idempotency_key.as_deref(),
+                item_before_json,
+                item_after_json,
+            ),
+        );
+        sqlx::query(
+            "UPDATE harness_items
+             SET status = ?, final_output_json = ?, decision_history_json = ?, updated_at = NOW(6)
+             WHERE harness_run_id = ? AND item_id = ?",
+        )
+        .bind(item_status)
+        .bind(item_final_output.to_string())
+        .bind(item_decision_history_json.to_string())
+        .bind(&harness_run_id)
+        .bind(&review_item_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
         refresh_skill_draft_after_rule_decision(&mut tx, &harness_run_id, &skill_draft_id).await?;
+        update_skillify_run_counts(&mut tx, &harness_run_id).await?;
         update_skillify_draft_counts(&mut tx, &harness_run_id).await?;
         tx.commit().await.map_err(internal_error)?;
         self.load_skill_draft(&harness_run_id, &skill_draft_id)
@@ -1830,6 +1993,108 @@ struct SkillifyEvent {
     content: String,
 }
 
+fn required_harness_string(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> HarnessResult<String> {
+    let value: String = row
+        .try_get(column)
+        .map_err(|err| internal_error(format!("invalid {table}.{column}: {err}")))?;
+    if value.trim().is_empty() {
+        return Err(internal_error(format!(
+            "invalid {table}.{column}: value is empty"
+        )));
+    }
+    Ok(value)
+}
+
+fn optional_harness_string(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> HarnessResult<Option<String>> {
+    let value: Option<String> = row
+        .try_get(column)
+        .map_err(|err| internal_error(format!("invalid {table}.{column}: {err}")))?;
+    if value
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(internal_error(format!(
+            "invalid {table}.{column}: value is empty"
+        )));
+    }
+    Ok(value)
+}
+
+fn skillify_session_event_title(session_id: &str, event_type: &str) -> String {
+    format!("{event_type} ({session_id})")
+}
+
+fn skill_rule_review_item_id(skill_rule_id: &str) -> String {
+    format!("harness-item-{skill_rule_id}")
+}
+
+fn skill_rule_review_item_ids(
+    item: &HarnessItemRecord,
+) -> HarnessResult<Option<SkillRuleReviewIds>> {
+    if item.item_type != "skill_rule" {
+        return Ok(None);
+    }
+    let skill_draft_id = item
+        .locator_json
+        .get("skill_draft_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| internal_error("skill_rule review item missing locator.skill_draft_id"))?;
+    let skill_rule_id = item
+        .locator_json
+        .get("skill_rule_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| internal_error("skill_rule review item missing locator.skill_rule_id"))?;
+    Ok(Some((
+        skill_draft_id.to_string(),
+        skill_rule_id.to_string(),
+    )))
+}
+
+fn skill_rule_status_for_item_decision(decision: &str) -> &'static str {
+    match decision {
+        "approve" => "approved",
+        "reject" => "rejected",
+        "edit" => "edited",
+        "request_revision" => "needs_revision",
+        _ => "proposed",
+    }
+}
+
+fn item_status_for_skill_rule_status(status: &str) -> &'static str {
+    match harness_skill_rule_status_kind(status) {
+        HarnessSkillRuleStatusKind::Approved | HarnessSkillRuleStatusKind::Edited => "approved",
+        HarnessSkillRuleStatusKind::Rejected => "rejected",
+        HarnessSkillRuleStatusKind::NeedsRevision => "needs_revision",
+        _ => "pending_review",
+    }
+}
+
+fn skill_rule_review_payload(
+    rule_type: &str,
+    statement: &str,
+    rationale: &str,
+    confidence: Option<f64>,
+    source_count: i64,
+) -> Value {
+    json!({
+        "rule_type": rule_type,
+        "statement": statement,
+        "rationale": rationale,
+        "confidence": confidence,
+        "source_count": source_count,
+    })
+}
+
 fn skillify_source_packet_from_event(event: &SkillifyEvent) -> SkillifySourcePacket {
     SkillifySourcePacket {
         event_id: event.event_id.clone(),
@@ -2043,89 +2308,150 @@ fn normalize_session_ids(session_ids: Vec<String>) -> Vec<String> {
     out
 }
 
-fn item_from_row(row: sqlx::mysql::MySqlRow) -> HarnessItemRecord {
-    HarnessItemRecord {
-        item_id: row.try_get("item_id").unwrap_or_default(),
-        harness_run_id: row.try_get("harness_run_id").unwrap_or_default(),
-        item_type: row.try_get("item_type").unwrap_or_default(),
-        locator_json: parse_json_cell(&row, "locator_json"),
-        input_json: parse_json_cell(&row, "input_json"),
-        proposed_output_json: parse_json_cell(&row, "proposed_output_json"),
-        final_output_json: parse_json_cell(&row, "final_output_json"),
-        decision_history_json: parse_json_cell(&row, "decision_history_json"),
-        status: row.try_get("status").unwrap_or_default(),
-        confidence: row.try_get("confidence").ok(),
-        assigned_to: row.try_get("assigned_to").ok(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-        updated_at: row.try_get("updated_at").unwrap_or_default(),
-    }
+fn item_from_row(row: sqlx::mysql::MySqlRow) -> HarnessResult<HarnessItemRecord> {
+    Ok(HarnessItemRecord {
+        item_id: required_harness_string(&row, "harness_items", "item_id")?,
+        harness_run_id: required_harness_string(&row, "harness_items", "harness_run_id")?,
+        item_type: required_harness_string(&row, "harness_items", "item_type")?,
+        locator_json: parse_json_cell(&row, "harness_items", "locator_json")?,
+        input_json: parse_json_cell(&row, "harness_items", "input_json")?,
+        proposed_output_json: parse_json_cell(&row, "harness_items", "proposed_output_json")?,
+        final_output_json: parse_json_cell(&row, "harness_items", "final_output_json")?,
+        decision_history_json: parse_json_cell(&row, "harness_items", "decision_history_json")?,
+        status: required_harness_string(&row, "harness_items", "status")?,
+        confidence: row
+            .try_get("confidence")
+            .map_err(|err| internal_error(format!("invalid harness_items.confidence: {err}")))?,
+        assigned_to: optional_harness_string(&row, "harness_items", "assigned_to")?,
+        created_at: required_harness_string(&row, "harness_items", "created_at")?,
+        updated_at: required_harness_string(&row, "harness_items", "updated_at")?,
+    })
 }
 
-fn skill_rule_from_row(row: sqlx::mysql::MySqlRow) -> HarnessSkillRuleRecord {
-    HarnessSkillRuleRecord {
-        skill_rule_id: row.try_get("skill_rule_id").unwrap_or_default(),
-        skill_draft_id: row.try_get("skill_draft_id").unwrap_or_default(),
-        harness_run_id: row.try_get("harness_run_id").unwrap_or_default(),
-        rule_type: row.try_get("rule_type").unwrap_or_default(),
-        statement: row.try_get("statement").unwrap_or_default(),
-        rationale: row.try_get("rationale").unwrap_or_default(),
-        decision_history_json: parse_json_cell(&row, "decision_history_json"),
-        status: row.try_get("status").unwrap_or_default(),
-        confidence: row.try_get("confidence").ok(),
-        source_count: row.try_get("source_count").unwrap_or(0),
-        created_by_node_id: row.try_get("created_by_node_id").ok(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-        updated_at: row.try_get("updated_at").unwrap_or_default(),
+fn skill_rule_from_row(row: sqlx::mysql::MySqlRow) -> HarnessResult<HarnessSkillRuleRecord> {
+    Ok(HarnessSkillRuleRecord {
+        skill_rule_id: required_harness_string(&row, "harness_skill_rules", "skill_rule_id")?,
+        skill_draft_id: required_harness_string(&row, "harness_skill_rules", "skill_draft_id")?,
+        harness_run_id: required_harness_string(&row, "harness_skill_rules", "harness_run_id")?,
+        rule_type: required_harness_string(&row, "harness_skill_rules", "rule_type")?,
+        statement: required_harness_string(&row, "harness_skill_rules", "statement")?,
+        rationale: required_harness_string(&row, "harness_skill_rules", "rationale")?,
+        decision_history_json: parse_json_cell(
+            &row,
+            "harness_skill_rules",
+            "decision_history_json",
+        )?,
+        status: required_harness_string(&row, "harness_skill_rules", "status")?,
+        confidence: row.try_get("confidence").map_err(|err| {
+            internal_error(format!("invalid harness_skill_rules.confidence: {err}"))
+        })?,
+        source_count: row.try_get("source_count").map_err(|err| {
+            internal_error(format!("invalid harness_skill_rules.source_count: {err}"))
+        })?,
+        created_by_node_id: optional_harness_string(
+            &row,
+            "harness_skill_rules",
+            "created_by_node_id",
+        )?,
+        created_at: required_harness_string(&row, "harness_skill_rules", "created_at")?,
+        updated_at: required_harness_string(&row, "harness_skill_rules", "updated_at")?,
         citations: Vec::new(),
-    }
+    })
 }
 
-fn citation_from_row(row: sqlx::mysql::MySqlRow) -> HarnessCitationRecord {
-    HarnessCitationRecord {
-        citation_id: row.try_get("citation_id").unwrap_or_default(),
-        harness_run_id: row.try_get("harness_run_id").unwrap_or_default(),
-        item_id: row.try_get("item_id").unwrap_or_default(),
-        skill_draft_id: row.try_get("skill_draft_id").ok(),
-        skill_rule_id: row.try_get("skill_rule_id").ok(),
-        source_id: row.try_get("source_id").ok(),
-        source_locator_json: parse_json_cell(&row, "source_locator_json"),
-        source_snapshot_ref: row.try_get("source_snapshot_ref").ok(),
-        source_content_hash: row.try_get("source_content_hash").ok(),
-        source_metadata_json: parse_json_cell(&row, "source_metadata_json"),
-        artifact_id: row.try_get("artifact_id").ok(),
-        quote_hash: row.try_get("quote_hash").ok(),
-        evidence_text_preview: row.try_get("evidence_text_preview").ok(),
-        relevance_score: row.try_get("relevance_score").ok(),
-        created_by_node_id: row.try_get("created_by_node_id").ok(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-    }
+fn citation_from_row(row: sqlx::mysql::MySqlRow) -> HarnessResult<HarnessCitationRecord> {
+    Ok(HarnessCitationRecord {
+        citation_id: required_harness_string(&row, "harness_citations", "citation_id")?,
+        harness_run_id: required_harness_string(&row, "harness_citations", "harness_run_id")?,
+        item_id: required_harness_string(&row, "harness_citations", "item_id")?,
+        skill_draft_id: optional_harness_string(&row, "harness_citations", "skill_draft_id")?,
+        skill_rule_id: optional_harness_string(&row, "harness_citations", "skill_rule_id")?,
+        source_id: optional_harness_string(&row, "harness_citations", "source_id")?,
+        source_locator_json: parse_json_cell(&row, "harness_citations", "source_locator_json")?,
+        source_snapshot_ref: optional_harness_string(
+            &row,
+            "harness_citations",
+            "source_snapshot_ref",
+        )?,
+        source_content_hash: optional_harness_string(
+            &row,
+            "harness_citations",
+            "source_content_hash",
+        )?,
+        source_metadata_json: parse_json_cell(&row, "harness_citations", "source_metadata_json")?,
+        artifact_id: optional_harness_string(&row, "harness_citations", "artifact_id")?,
+        quote_hash: optional_harness_string(&row, "harness_citations", "quote_hash")?,
+        evidence_text_preview: optional_harness_string(
+            &row,
+            "harness_citations",
+            "evidence_text_preview",
+        )?,
+        relevance_score: row.try_get("relevance_score").map_err(|err| {
+            internal_error(format!("invalid harness_citations.relevance_score: {err}"))
+        })?,
+        created_by_node_id: optional_harness_string(
+            &row,
+            "harness_citations",
+            "created_by_node_id",
+        )?,
+        created_at: required_harness_string(&row, "harness_citations", "created_at")?,
+    })
 }
 
-fn skill_draft_from_row(row: sqlx::mysql::MySqlRow) -> HarnessSkillDraftRecord {
-    HarnessSkillDraftRecord {
-        skill_draft_id: row.try_get("skill_draft_id").unwrap_or_default(),
-        harness_run_id: row.try_get("harness_run_id").unwrap_or_default(),
-        candidate_name: row.try_get("candidate_name").unwrap_or_default(),
-        description: row.try_get("description").unwrap_or_default(),
-        target_scope: row.try_get("target_scope").unwrap_or_default(),
-        publish_visibility: row.try_get("publish_visibility").unwrap_or_default(),
-        content_markdown: row.try_get("content_markdown").unwrap_or_default(),
-        source_summary_json: parse_json_cell(&row, "source_summary_json"),
-        decision_history_json: parse_json_cell(&row, "decision_history_json"),
-        status: row.try_get("status").unwrap_or_default(),
-        confidence: row.try_get("confidence").ok(),
-        created_by_node_id: row.try_get("created_by_node_id").ok(),
-        revision: row.try_get("revision").unwrap_or(0),
-        published_version_id: row.try_get("published_version_id").ok(),
-        created_at: row.try_get("created_at").unwrap_or_default(),
-        updated_at: row.try_get("updated_at").unwrap_or_default(),
+fn skill_draft_from_row(row: sqlx::mysql::MySqlRow) -> HarnessResult<HarnessSkillDraftRecord> {
+    Ok(HarnessSkillDraftRecord {
+        skill_draft_id: required_harness_string(&row, "harness_skill_drafts", "skill_draft_id")?,
+        harness_run_id: required_harness_string(&row, "harness_skill_drafts", "harness_run_id")?,
+        candidate_name: required_harness_string(&row, "harness_skill_drafts", "candidate_name")?,
+        description: required_harness_string(&row, "harness_skill_drafts", "description")?,
+        target_scope: required_harness_string(&row, "harness_skill_drafts", "target_scope")?,
+        publish_visibility: required_harness_string(
+            &row,
+            "harness_skill_drafts",
+            "publish_visibility",
+        )?,
+        content_markdown: required_harness_string(
+            &row,
+            "harness_skill_drafts",
+            "content_markdown",
+        )?,
+        source_summary_json: parse_json_cell(&row, "harness_skill_drafts", "source_summary_json")?,
+        decision_history_json: parse_json_cell(
+            &row,
+            "harness_skill_drafts",
+            "decision_history_json",
+        )?,
+        status: required_harness_string(&row, "harness_skill_drafts", "status")?,
+        confidence: row.try_get("confidence").map_err(|err| {
+            internal_error(format!("invalid harness_skill_drafts.confidence: {err}"))
+        })?,
+        created_by_node_id: optional_harness_string(
+            &row,
+            "harness_skill_drafts",
+            "created_by_node_id",
+        )?,
+        revision: row.try_get("revision").map_err(|err| {
+            internal_error(format!("invalid harness_skill_drafts.revision: {err}"))
+        })?,
+        published_version_id: optional_harness_string(
+            &row,
+            "harness_skill_drafts",
+            "published_version_id",
+        )?,
+        created_at: required_harness_string(&row, "harness_skill_drafts", "created_at")?,
+        updated_at: required_harness_string(&row, "harness_skill_drafts", "updated_at")?,
         rules: Vec::new(),
-    }
+    })
 }
 
-fn parse_json_cell(row: &sqlx::mysql::MySqlRow, column: &str) -> Value {
-    let text: String = row.try_get(column).unwrap_or_else(|_| "{}".to_string());
-    serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+fn parse_json_cell(
+    row: &sqlx::mysql::MySqlRow,
+    table: &'static str,
+    column: &'static str,
+) -> HarnessResult<Value> {
+    let text = required_harness_string(row, table, column)?;
+    serde_json::from_str(&text)
+        .map_err(|err| internal_error(format!("invalid {table}.{column}: {err}")))
 }
 
 fn decision_history_entry(
@@ -2188,8 +2514,8 @@ async fn update_skillify_run_counts(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let row = sqlx::query(
         "SELECT
-            SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
-            SUM(CASE WHEN status = 'pending_review' THEN 1 ELSE 0 END) AS pending_count,
+            COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved_count,
+            COALESCE(SUM(CASE WHEN status = 'pending_review' THEN 1 ELSE 0 END), 0) AS pending_count,
             COUNT(*) AS candidate_count
          FROM harness_items
          WHERE harness_run_id = ?",
@@ -2198,9 +2524,9 @@ async fn update_skillify_run_counts(
     .fetch_one(&mut **tx)
     .await
     .map_err(internal_error)?;
-    let approved_count: i64 = row.try_get("approved_count").unwrap_or(0);
-    let pending_count: i64 = row.try_get("pending_count").unwrap_or(0);
-    let candidate_count: i64 = row.try_get("candidate_count").unwrap_or(0);
+    let approved_count: i64 = row.try_get("approved_count").map_err(internal_error)?;
+    let pending_count: i64 = row.try_get("pending_count").map_err(internal_error)?;
+    let candidate_count: i64 = row.try_get("candidate_count").map_err(internal_error)?;
     let status = if pending_count > 0 {
         "waiting_for_review"
     } else {
@@ -2230,9 +2556,9 @@ async fn update_skillify_draft_counts(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let row = sqlx::query(
         "SELECT
-            SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END) AS published_count,
-            SUM(CASE WHEN status IN ('ready_to_publish', 'approved') THEN 1 ELSE 0 END) AS ready_count,
-            SUM(CASE WHEN status IN ('pending_rule_review', 'pending_skill_review', 'needs_revision') THEN 1 ELSE 0 END) AS pending_count,
+            COALESCE(SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END), 0) AS published_count,
+            COALESCE(SUM(CASE WHEN status IN ('ready_to_publish', 'approved') THEN 1 ELSE 0 END), 0) AS ready_count,
+            COALESCE(SUM(CASE WHEN status IN ('pending_rule_review', 'pending_skill_review', 'needs_revision') THEN 1 ELSE 0 END), 0) AS pending_count,
             COUNT(*) AS skill_draft_count
          FROM harness_skill_drafts
          WHERE harness_run_id = ?",
@@ -2241,10 +2567,10 @@ async fn update_skillify_draft_counts(
     .fetch_one(&mut **tx)
     .await
     .map_err(internal_error)?;
-    let published_count: i64 = row.try_get("published_count").unwrap_or(0);
-    let ready_count: i64 = row.try_get("ready_count").unwrap_or(0);
-    let pending_count: i64 = row.try_get("pending_count").unwrap_or(0);
-    let skill_draft_count: i64 = row.try_get("skill_draft_count").unwrap_or(0);
+    let published_count: i64 = row.try_get("published_count").map_err(internal_error)?;
+    let ready_count: i64 = row.try_get("ready_count").map_err(internal_error)?;
+    let pending_count: i64 = row.try_get("pending_count").map_err(internal_error)?;
+    let skill_draft_count: i64 = row.try_get("skill_draft_count").map_err(internal_error)?;
     let status = if skill_draft_count > 0 && published_count == skill_draft_count {
         "completed"
     } else if pending_count > 0 {
@@ -2256,7 +2582,7 @@ async fn update_skillify_draft_counts(
     };
     let rule_row = sqlx::query(
         "SELECT
-            SUM(CASE WHEN status IN ('approved', 'edited') THEN 1 ELSE 0 END) AS approved_rule_count,
+            COALESCE(SUM(CASE WHEN status IN ('approved', 'edited') THEN 1 ELSE 0 END), 0) AS approved_rule_count,
             COUNT(*) AS rule_count
          FROM harness_skill_rules
          WHERE harness_run_id = ?",
@@ -2265,8 +2591,10 @@ async fn update_skillify_draft_counts(
     .fetch_one(&mut **tx)
     .await
     .map_err(internal_error)?;
-    let approved_rule_count: i64 = rule_row.try_get("approved_rule_count").unwrap_or(0);
-    let rule_count: i64 = rule_row.try_get("rule_count").unwrap_or(0);
+    let approved_rule_count: i64 = rule_row
+        .try_get("approved_rule_count")
+        .map_err(internal_error)?;
+    let rule_count: i64 = rule_row.try_get("rule_count").map_err(internal_error)?;
     let current_output_json: String = sqlx::query_scalar(
         "SELECT IFNULL(CAST(output_json AS CHAR), '{}') FROM harness_runs WHERE harness_run_id = ?",
     )
@@ -2315,11 +2643,13 @@ async fn refresh_skill_draft_after_rule_decision(
     .fetch_one(&mut **tx)
     .await
     .map_err(internal_error)?;
-    let candidate_name: String = draft_row.try_get("candidate_name").unwrap_or_default();
-    let description: String = draft_row.try_get("description").unwrap_or_default();
+    let candidate_name =
+        required_harness_string(&draft_row, "harness_skill_drafts", "candidate_name")?;
+    let description = required_harness_string(&draft_row, "harness_skill_drafts", "description")?;
     let rule_rows = sqlx::query(
         "SELECT skill_rule_id, skill_draft_id, harness_run_id, rule_type, statement,
-                rationale, status, confidence, source_count, created_by_node_id,
+                rationale, IFNULL(CAST(decision_history_json AS CHAR), '[]') AS decision_history_json,
+                status, confidence, source_count, created_by_node_id,
                 CAST(created_at AS CHAR) AS created_at,
                 CAST(updated_at AS CHAR) AS updated_at
          FROM harness_skill_rules
@@ -2334,7 +2664,7 @@ async fn refresh_skill_draft_after_rule_decision(
     let rules = rule_rows
         .into_iter()
         .map(skill_rule_from_row)
-        .collect::<Vec<_>>();
+        .collect::<HarnessResult<Vec<_>>>()?;
     let status = derive_harness_skill_draft_status(&rules);
     let content_markdown = render_skill_markdown_from_rules(&candidate_name, &description, &rules);
     sqlx::query(

@@ -69,8 +69,13 @@ impl TokenUsage {
         m
     }
 
-    /// Parse back from our canonical shape. Missing fields default to 0.
-    pub fn from_json_map(m: &Map<String, Value>) -> Self {
+    /// Build usage from an internal partial map.
+    ///
+    /// This is intentionally tolerant because some runtime aggregation paths
+    /// accumulate the canonical buckets incrementally. Persisted events must
+    /// use the stricter DB-side canonical validation before writing token
+    /// usage columns.
+    pub fn from_partial_json_map(m: &Map<String, Value>) -> Self {
         let read = |k: &str| -> u64 {
             m.get(k)
                 .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
@@ -271,8 +276,27 @@ mod tests {
         assert_eq!(m["cache_creation_tokens"], json!(6));
         assert_eq!(m["output_tokens"], json!(789));
         assert_eq!(m["total_tokens"], json!(963));
-        let back = TokenUsage::from_json_map(&m);
+        let back = TokenUsage::from_partial_json_map(&m);
         assert_eq!(back, original);
+    }
+
+    #[test]
+    fn partial_json_map_missing_buckets_default_to_zero() {
+        let m = obj(json!({
+            "input_tokens": 7,
+            "output_tokens": 3,
+        }));
+        let usage = TokenUsage::from_partial_json_map(&m);
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input_tokens: 7,
+                cached_input_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 3,
+            }
+        );
+        assert_eq!(usage.total_tokens(), 10);
     }
 
     // ── Dialect routing ────────────────────────────────────────────────��───

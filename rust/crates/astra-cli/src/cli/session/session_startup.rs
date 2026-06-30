@@ -761,16 +761,24 @@ pub(crate) async fn complete_session_startup(
     let startup_token = session_runtime::fresh_access_token(api, profile).await;
 
     if let Some(token) = startup_token.as_deref() {
-        match session_runtime::resolve_server_default_model(api, token).await {
-            session_runtime::ServerDefaultModel::Selected(model) => {
-                if state.model.is_none() {
-                    state.model = Some(model);
+        if astra_core::model_override::normalize_model_override(state.model.as_deref()).is_some() {
+            let _ = session_runtime::ensure_state_default_model(api, token, state).await;
+        } else {
+            match session_runtime::resolve_server_default_model(api, token).await {
+                session_runtime::ServerDefaultModel::Selected(selection) => {
+                    state.context_budget =
+                        astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
+                            &state.runtime_config,
+                            Some(&selection.name),
+                            selection.context_window,
+                        );
+                    state.model = Some(selection.name);
                 }
+                session_runtime::ServerDefaultModel::NoModels => {
+                    state.model = Some("⚠ none".to_string());
+                }
+                session_runtime::ServerDefaultModel::Unavailable => {}
             }
-            session_runtime::ServerDefaultModel::NoModels => {
-                state.model = Some("⚠ none".to_string());
-            }
-            session_runtime::ServerDefaultModel::Unavailable => {}
         }
     }
     tracer.phase("model_check");
