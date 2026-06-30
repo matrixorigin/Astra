@@ -280,10 +280,11 @@ impl ToolExecutionService {
     where
         L: ServerLocalToolTransport + ?Sized,
     {
-        let binding = match self.authorize_tool_request(&request) {
+        let transport_request = request.with_transport_arguments();
+        let binding = match self.authorize_tool_request(&transport_request) {
             Ok(binding) => binding,
             Err(ref err) => {
-                return capability_denied_result(&request, &err.0, err.1.clone());
+                return capability_denied_result(&transport_request, &err.0, err.1.clone());
             }
         };
 
@@ -292,18 +293,18 @@ impl ToolExecutionService {
             .disabled_tools
             .read()
             .await
-            .contains(&request.tool_name)
+            .contains(&transport_request.tool_name)
         {
             let mut meta = serde_json::Map::new();
             meta.insert("tool_disabled".to_string(), serde_json::Value::Bool(true));
             meta.insert(
                 "tool_name".to_string(),
-                serde_json::Value::String(request.tool_name.clone()),
+                serde_json::Value::String(transport_request.tool_name.clone()),
             );
             return astra_tools::ToolResult {
                 output: format!(
                     "Tool `{}` is currently disabled by the server administrator.",
-                    request.tool_name
+                    transport_request.tool_name
                 ),
                 metadata: Some(meta),
                 is_error: true,
@@ -314,7 +315,7 @@ impl ToolExecutionService {
         match route {
             ToolExecutionRouteKind::ServerLocal | ToolExecutionRouteKind::ServerControlPlane => {
                 execute_local_route(
-                    &request,
+                    &transport_request,
                     &binding,
                     route,
                     local_transport,
@@ -324,19 +325,19 @@ impl ToolExecutionService {
             }
             ToolExecutionRouteKind::ServerRuntime | ToolExecutionRouteKind::RequestScopedMcp => {
                 let mut result = execute_local_route(
-                    &request,
+                    &transport_request,
                     &binding,
                     route,
                     local_transport,
                     cancel_token.as_ref(),
                 )
                 .await;
-                append_route_binding_metadata(&mut result, route, &request);
+                append_route_binding_metadata(&mut result, route, &transport_request);
                 result
             }
             ToolExecutionRouteKind::EdgeBound => {
                 execute_edge_bound(
-                    request,
+                    transport_request,
                     &binding,
                     self.edge_connection_pool.clone(),
                     self.edge_dispatch_service.clone(),
@@ -348,7 +349,7 @@ impl ToolExecutionService {
             }
             ToolExecutionRouteKind::GatewayRelay => {
                 execute_gateway_relay(
-                    request,
+                    transport_request,
                     &binding,
                     self.gateway_relay_transport.clone(),
                     cancel_token,
@@ -357,7 +358,7 @@ impl ToolExecutionService {
             }
             ToolExecutionRouteKind::SandboxResidentAgent => {
                 execute_sandbox_resident_agent(
-                    request,
+                    transport_request,
                     &binding,
                     self.sandbox_resident_agent_transport.clone(),
                     cancel_token,
@@ -365,7 +366,7 @@ impl ToolExecutionService {
                 .await
             }
             ToolExecutionRouteKind::Unsupported => {
-                unsupported_workspace_executor_result(&request, &binding)
+                unsupported_workspace_executor_result(&transport_request, &binding)
             }
         }
     }

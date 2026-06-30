@@ -35,6 +35,38 @@ impl ServerLocalToolTransport for CountingLocalTransport {
     }
 }
 
+struct CapturingLocalTransport {
+    args: Mutex<Option<Value>>,
+}
+
+impl CapturingLocalTransport {
+    fn new() -> Self {
+        Self {
+            args: Mutex::new(None),
+        }
+    }
+
+    fn args(&self) -> Value {
+        self.args
+            .lock()
+            .expect("captured local args lock")
+            .clone()
+            .expect("captured local args")
+    }
+}
+
+#[async_trait]
+impl ServerLocalToolTransport for CapturingLocalTransport {
+    async fn execute_server_local_tool(
+        &self,
+        request: &ToolExecutionRequest,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        *self.args.lock().expect("captured local args lock") = Some(request.args.clone());
+        astra_tools::ToolResult::text("captured-local".to_string())
+    }
+}
+
 struct PendingLocalTransport {
     calls: AtomicUsize,
     execute_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -203,6 +235,42 @@ impl ExternalTransport for StaticGatewayRelayTransport {
             &request,
             &binding,
             &self.output,
+        ))
+    }
+}
+
+struct CapturingGatewayRelayTransport {
+    args: Mutex<Option<Value>>,
+}
+
+impl CapturingGatewayRelayTransport {
+    fn new() -> Self {
+        Self {
+            args: Mutex::new(None),
+        }
+    }
+
+    fn args(&self) -> Value {
+        self.args
+            .lock()
+            .expect("captured gateway args lock")
+            .clone()
+            .expect("captured gateway args")
+    }
+}
+
+#[async_trait]
+impl ExternalTransport for CapturingGatewayRelayTransport {
+    async fn execute_tool(
+        &self,
+        request: ToolExecutionRequest,
+        binding: astra_runtime_env::RunBinding,
+    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
+        *self.args.lock().expect("captured gateway args lock") = Some(request.args.clone());
+        Ok(runtime_outcome_for_request(
+            &request,
+            &binding,
+            "captured-gateway",
         ))
     }
 }
@@ -653,6 +721,27 @@ fn route_boundary_events_require_call_id_without_mutating_result_metadata() {
     assert!(boundary.transport_finished_event(&result, 1).is_none());
     assert!(boundary.tool_call_end_event(&result, 1).is_none());
     assert!(result.metadata.is_none());
+}
+
+#[tokio::test]
+async fn local_transport_receives_args_without_internal_tool_metadata() {
+    let service = ToolExecutionService::new_for_test();
+    let local = CapturingLocalTransport::new();
+    let mut request = request(
+        "bash",
+        WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
+        ExecutorBinding::server_local(),
+    );
+    request.args = serde_json::json!({
+        "command": "pwd",
+        "_tool_call_id": "call-1",
+        "_run_id": "run-1",
+    });
+
+    let result = service.execute(request, &local).await;
+
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(local.args(), serde_json::json!({"command": "pwd"}));
 }
 
 #[tokio::test]
@@ -1534,6 +1623,46 @@ async fn gateway_relay_executes_through_configured_transport() {
     assert_eq!(metadata["executor"]["transport"], "gateway_relay");
     assert_eq!(metadata["runtime"]["session_manager"], "nvidia_open_shell");
     assert_eq!(metadata["runtime"]["launch_driver"], "open_shell_gateway");
+}
+
+#[tokio::test]
+async fn gateway_relay_receives_args_without_internal_tool_metadata() {
+    let gateway = Arc::new(CapturingGatewayRelayTransport::new());
+    let service = ToolExecutionService::builder()
+        .gateway_relay_transport(gateway.clone())
+        .build();
+    let local = CountingLocalTransport::new();
+    let mut request = request(
+        "bash",
+        WorkspaceBinding {
+            kind: WorkspaceBindingKind::CloudWorkspace,
+            display_name: "OpenShell workspace".to_string(),
+            cwd: Some("/sandbox".to_string()),
+            authority: WorkspaceAuthority::ReadWrite,
+            fallback_policy: FallbackPolicy::Disabled,
+        },
+        ExecutorBinding {
+            kind: ExecutorBindingKind::OrchestratorManaged,
+            executor_id: "openshell-gateway".to_string(),
+            display_name: "OpenShell Gateway".to_string(),
+            transport: ToolTransportKind::GatewayRelay,
+            status: ExecutorStatus::Online,
+        },
+    );
+    request.runtime = Some(astra_runtime_env::RuntimeBinding::nvidia_openshell(
+        "openshell-runtime",
+    ));
+    request.args = serde_json::json!({
+        "command": "pwd",
+        "_tool_call_id": "call-gateway",
+        "_run_id": "run-gateway",
+    });
+
+    let result = service.execute(request, &local).await;
+
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(local.calls(), 0);
+    assert_eq!(gateway.args(), serde_json::json!({"command": "pwd"}));
 }
 
 #[tokio::test]

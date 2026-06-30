@@ -22,8 +22,10 @@ min_connections = 1           # Min idle connections (env: ASTRA_DB_POOL_MIN_CON
 # access_ttl_minutes = 10080            # Access token TTL (default: 7 days)
 # refresh_ttl_days = 30                 # Refresh token TTL
 # bridge_secret = "CHANGE-ME"           # Bridge HMAC secret (≥32 chars)
-# auth_mode = "local_jwt"               # local_jwt | trusted_moi
 # token_encryption_key = ""             # Fernet key for LLM API key encryption
+# external_providers = [
+#   { id = "moi", display_name = "MOI", external_auth_endpoint = "http://moi-catalog/api/v1/astra/external-auth" }
+# ]
 # NB: Dev setups without proper secrets need ASTRA_ALLOW_INSECURE_DEFAULTS=1
 
 # ── HTTP API Server ──────────────────────────────────────────────────────────

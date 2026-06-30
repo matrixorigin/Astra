@@ -15,12 +15,22 @@ import { requireRuntimeClient } from "@/lib/runtime-client";
 const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
 const mockListModelSummaries = vi.mocked(listModelSummaries);
 
+function runtimeClient(
+  accessToken: string | undefined,
+  listModels: ReturnType<typeof vi.fn>,
+) {
+  return {
+    config: { accessToken },
+    sdk: { listModels },
+  };
+}
+
 describe("/api/models", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("exposes active runtime models using name first and model_id when name is missing", async () => {
+  it("exposes active runtime models using model_id as id and name as display label", async () => {
     const listModels = vi.fn().mockResolvedValue([
       {
         model_id: "row-flash",
@@ -44,7 +54,9 @@ describe("/api/models", () => {
         is_active: false,
       },
     ]);
-    mockRequireRuntimeClient.mockResolvedValue({ sdk: { listModels } } as never);
+    mockRequireRuntimeClient.mockResolvedValue(
+      runtimeClient("astra-access", listModels) as never,
+    );
 
     const response = await GET();
     const payload = await response.json();
@@ -52,7 +64,7 @@ describe("/api/models", () => {
     expect(payload.source).toBe("astra");
     expect(payload.items).toHaveLength(2);
     expect(payload.items[0]).toMatchObject({
-      id: "deepseek-v4-flash-anthropic",
+      id: "row-flash",
       name: "deepseek-v4-flash-anthropic",
       tier: "included",
     });

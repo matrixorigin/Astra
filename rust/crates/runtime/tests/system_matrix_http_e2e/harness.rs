@@ -30,14 +30,6 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 static E2E_ENV_INIT: OnceLock<()> = OnceLock::new();
-static SERVER_STATE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-const EXTERNAL_JWT_E2E_SECRET: &str = "trusted_moi_system_e2e_secret_key_123456";
-const EXTERNAL_JWT_E2E_EXP: u64 = 4_102_444_800; // 2100-01-01T00:00:00Z
-
-fn server_state_env_lock() -> &'static Mutex<()> {
-    SERVER_STATE_ENV_LOCK.get_or_init(|| Mutex::new(()))
-}
 
 pub fn require_system_e2e_env() {
     assert_eq!(
@@ -140,63 +132,12 @@ pub fn build_e2e_access_token(user_id: &str, username: &str, exp_unix: u64) -> S
     )
 }
 
-fn set_env_var_for_e2e(name: &str, value: &str) {
-    // SAFETY: this is guarded by `SERVER_STATE_ENV_LOCK`, so no concurrent env mutation/read among
-    // system E2E bootstrap paths.
-    unsafe {
-        std::env::set_var(name, value);
-    }
-}
-
-fn restore_env_var_for_e2e(name: &str, old_value: Option<String>) {
-    // SAFETY: this is guarded by `SERVER_STATE_ENV_LOCK`, so no concurrent env mutation/read among
-    // system E2E bootstrap paths.
-    unsafe {
-        if let Some(v) = old_value {
-            std::env::set_var(name, v);
-        } else {
-            std::env::remove_var(name);
-        }
-    }
-}
-
-async fn build_state_with_mode(
-    memoria: Arc<E2eMemoriaStub>,
-    trusted_moi_mode: bool,
-) -> (astra_runtime::AppState, String, String) {
-    let _env_guard = server_state_env_lock().lock().await;
+async fn build_state(memoria: Arc<E2eMemoriaStub>) -> (astra_runtime::AppState, String, String) {
     dotenvy::dotenv().ok();
-
-    let prev_auth_mode = std::env::var("ASTRA_AUTH_MODE").ok();
-    let prev_trusted_secret = std::env::var("ASTRA_EXTERNAL_JWT_SECRET").ok();
-    let prev_trusted_algorithm = std::env::var("ASTRA_EXTERNAL_JWT_ALGORITHM").ok();
-    let prev_trusted_issuer = std::env::var("ASTRA_EXTERNAL_JWT_ISSUER").ok();
-    let prev_trusted_audience = std::env::var("ASTRA_EXTERNAL_JWT_AUDIENCE").ok();
-    let prev_trusted_leeway = std::env::var("ASTRA_EXTERNAL_JWT_LEEWAY_SECS").ok();
-
-    if trusted_moi_mode {
-        set_env_var_for_e2e("ASTRA_AUTH_MODE", "trusted_moi");
-        set_env_var_for_e2e("ASTRA_EXTERNAL_JWT_SECRET", EXTERNAL_JWT_E2E_SECRET);
-        set_env_var_for_e2e("ASTRA_EXTERNAL_JWT_ALGORITHM", "HS256");
-        restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_ISSUER", None);
-        restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_AUDIENCE", None);
-        set_env_var_for_e2e("ASTRA_EXTERNAL_JWT_LEEWAY_SECS", "30");
-    } else {
-        // Force local mode for this bootstrap path so service auth mode is deterministic.
-        set_env_var_for_e2e("ASTRA_AUTH_MODE", "local_jwt");
-    }
-
     let settings = AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
     let matrixone_database = settings.matrixone.database.clone();
     let url = settings.matrixone.database_url_with_password();
     let state = build_server_state(settings).await;
-
-    restore_env_var_for_e2e("ASTRA_AUTH_MODE", prev_auth_mode);
-    restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_SECRET", prev_trusted_secret);
-    restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_ALGORITHM", prev_trusted_algorithm);
-    restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_ISSUER", prev_trusted_issuer);
-    restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_AUDIENCE", prev_trusted_audience);
-    restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_LEEWAY_SECS", prev_trusted_leeway);
 
     (
         state
@@ -634,35 +575,10 @@ pub struct MatrixE2eCtx {
     pub suffix: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum E2eAuthMode {
-    LocalJwt,
-    TrustedMoi,
-}
-
-pub fn current_auth_mode() -> E2eAuthMode {
-    dotenvy::dotenv().ok();
-    let mode = std::env::var("ASTRA_AUTH_MODE")
-        .unwrap_or_else(|_| "local_jwt".to_string())
-        .trim()
-        .to_ascii_lowercase();
-    match mode.as_str() {
-        "" | "local_jwt" | "local" | "database" => E2eAuthMode::LocalJwt,
-        "trusted_moi" => E2eAuthMode::TrustedMoi,
-        other => panic!("unsupported ASTRA_AUTH_MODE in e2e: {other}"),
-    }
-}
-
 pub struct BootstrapResult {
     pub ctx: MatrixE2eCtx,
     pub auth_header: String,
     pub refresh_token: String,
-    pub auth_mode: E2eAuthMode,
-}
-
-pub struct TrustedMoiBootstrapResult {
-    pub ctx: MatrixE2eCtx,
-    pub auth_header: String,
 }
 
 pub const E2E_PASSWORD: &str = "E2e-matrix-pass-9";
@@ -708,27 +624,12 @@ pub async fn revoke_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
 
 /// Build app, connect pool, register user, refresh token, create session (with cleanup of stale rows).
 pub async fn bootstrap() -> BootstrapResult {
-    match current_auth_mode() {
-        E2eAuthMode::LocalJwt => bootstrap_local_jwt().await,
-        E2eAuthMode::TrustedMoi => {
-            let trusted = bootstrap_trusted_moi().await;
-            BootstrapResult {
-                ctx: trusted.ctx,
-                auth_header: trusted.auth_header,
-                refresh_token: String::new(),
-                auth_mode: E2eAuthMode::TrustedMoi,
-            }
-        }
-    }
-}
-
-async fn bootstrap_local_jwt() -> BootstrapResult {
     // Use low bcrypt cost in tests to avoid multi-second hashing in debug builds.
     // SAFETY: set before any code reads this variable; the tokio runtime has
     // worker threads but none are reading ASTRA_BCRYPT_COST yet.
     unsafe { std::env::set_var("ASTRA_BCRYPT_COST", "4") };
     let memoria = Arc::new(E2eMemoriaStub::default());
-    let (state, matrixone_database, url) = build_state_with_mode(memoria.clone(), false).await;
+    let (state, matrixone_database, url) = build_state(memoria.clone()).await;
 
     let pool = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(4)
@@ -825,6 +726,10 @@ async fn bootstrap_local_jwt() -> BootstrapResult {
     assert_eq!(st_me2, StatusCode::OK, "me after refresh: {me2}");
     assert_eq!(me2["user_id"].as_str(), Some(user_id.as_str()));
 
+    let (st_memory_h, memory_h) =
+        get_json(&app, "/memory/health", Some(auth_header.as_str()), &[]).await;
+    assert_eq!(st_memory_h, StatusCode::OK, "memory health: {memory_h}");
+
     let (st_sess, sess) = post_json(
         &app,
         "/sessions",
@@ -870,120 +775,5 @@ async fn bootstrap_local_jwt() -> BootstrapResult {
         },
         auth_header,
         refresh_token,
-        auth_mode: E2eAuthMode::LocalJwt,
-    }
-}
-
-/// Build app in `trusted_moi` mode and bootstrap an external user token/session.
-pub async fn bootstrap_trusted_moi() -> TrustedMoiBootstrapResult {
-    let memoria = Arc::new(E2eMemoriaStub::default());
-    let (state, matrixone_database, url) = build_state_with_mode(memoria.clone(), true).await;
-
-    let pool = sqlx::mysql::MySqlPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("connect MatrixOne for assertions");
-    let matrixone_settings = AppSettings::from_env()
-        .expect("AppSettings::from_env (see astra-server env)")
-        .matrixone;
-    let evaluation_pool = SharedPool::new(&matrixone_settings)
-        .await
-        .expect("connect MatrixOne shared pool for evaluation");
-    let memoria_health_base_url = start_mock_memoria_health().await;
-    let state = state.with_evaluation_service(Arc::new(
-        DatabaseEvaluationService::new(matrixone_settings)
-            .with_pool(evaluation_pool)
-            .with_memoria_config(
-                memoria_health_base_url,
-                Some("system-e2e-mock-master-key".to_string()),
-            ),
-    ));
-    let app = build_app(state);
-
-    let suffix = Uuid::new_v4().simple().to_string();
-    let username = format!("moi_matrix_{suffix}");
-    let email = format!("moi_matrix_{suffix}@e2e.test");
-    // Keep external user id within 36 chars so it can fit service tables that use VARCHAR(36).
-    let user_id = format!("moi_{}", &suffix[..28]);
-    let edge_agent_id = format!("edge-{suffix}");
-
-    let token = build_hs256_jwt(
-        EXTERNAL_JWT_E2E_SECRET,
-        json!({
-            "sub": user_id,
-            "username": username,
-            "email": email,
-            "name": "Trusted Moi E2E",
-            "exp": EXTERNAL_JWT_E2E_EXP
-        }),
-    );
-    let auth_header = format!("Bearer {token}");
-
-    let (st_me, me) = get_json(&app, "/auth/me", Some(auth_header.as_str()), &[]).await;
-    assert_eq!(st_me, StatusCode::OK, "trusted_moi me: {me}");
-    let user_id = me["user_id"]
-        .as_str()
-        .expect("trusted_moi /auth/me user_id")
-        .to_string();
-    let username = me["username"]
-        .as_str()
-        .expect("trusted_moi /auth/me username")
-        .to_string();
-
-    let (st_sess, sess) = post_json(
-        &app,
-        "/sessions",
-        Some(auth_header.as_str()),
-        json!({ "title": "trusted moi matrix session", "metadata": { "suite": "trusted_moi" } }),
-    )
-    .await;
-    assert_eq!(
-        st_sess,
-        StatusCode::CREATED,
-        "trusted_moi create session: {sess}"
-    );
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let row =
-        sqlx::query("SELECT 1 AS owned FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(&session_id)
-            .bind(user_id.as_str())
-            .fetch_optional(&pool)
-            .await
-            .expect("trusted_moi session owner select");
-    assert!(
-        row.is_some(),
-        "trusted_moi session should be owned by external user id"
-    );
-
-    cleanup_edge_registry(&pool, &user_id, &edge_agent_id).await;
-
-    // Seed a mock model directly in DB so run-lifecycle tests don't depend on admin auth mode.
-    let mock_model = format!("mock-{suffix}");
-    let model_id = Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO infra_llm_models (model_id, model_name, provider, base_url, is_active) \
-         VALUES (?, ?, 'mock', 'http://127.0.0.1:1', 1)",
-    )
-    .bind(&model_id)
-    .bind(&mock_model)
-    .execute(&pool)
-    .await
-    .expect("trusted_moi seed mock model");
-
-    TrustedMoiBootstrapResult {
-        ctx: MatrixE2eCtx {
-            app,
-            pool,
-            matrixone_database,
-            memoria,
-            user_id,
-            username,
-            session_id,
-            edge_agent_id,
-            suffix,
-        },
-        auth_header,
     }
 }

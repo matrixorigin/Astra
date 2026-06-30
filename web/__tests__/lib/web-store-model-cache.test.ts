@@ -1,7 +1,7 @@
 // @vitest-environment node
 
 import { WebRuntimeClient } from "@/lib/runtime-client/server";
-import { requireKnownBackendModelName } from "@/lib/api/web-store";
+import { resolveBackendModelName } from "@/lib/api/web-store";
 import { resetModelCacheForTests } from "@/lib/api/model-cache";
 
 vi.mock("@/lib/runtime-client/server", async (importOriginal) => {
@@ -38,135 +38,67 @@ function makeRuntime(overrides: Partial<{ accessToken: string | null }> = {}) {
   return { client, mockListModels };
 }
 
-describe("requireKnownBackendModelName", () => {
+describe("resolveBackendModelName", () => {
   beforeEach(() => {
     resetModelCacheForTests();
   });
 
-  it("accepts an exact canonical model name from listModels", async () => {
+  it("resolves model name on first call via listModels", async () => {
     const { client, mockListModels } = makeRuntime();
     mockListModels.mockResolvedValue([
-      { model_id: "model-row-1", name: "sonnet-4.6-adaptive" },
+      { model_id: "sonnet-4.6-adaptive", name: "Sonnet 4.6" },
     ]);
 
-    const result = await requireKnownBackendModelName(client, "sonnet-4.6-adaptive");
-    expect(result).toBe("sonnet-4.6-adaptive");
+    const result = await resolveBackendModelName(client, "sonnet-4.6-adaptive");
+    expect(result).toEqual({ id: "sonnet-4.6-adaptive", model: "Sonnet 4.6" });
     expect(mockListModels).toHaveBeenCalledTimes(1);
   });
 
-  it("trims the requested model before validating it", async () => {
+  it("caches listModels — second call does not call listModels again", async () => {
     const { client, mockListModels } = makeRuntime();
     mockListModels.mockResolvedValue([
-      { model_id: "model-row-1", name: "sonnet-4.6-adaptive" },
+      { model_id: "sonnet-4.6-adaptive", name: "Sonnet 4.6" },
     ]);
 
-    const result = await requireKnownBackendModelName(
-      client,
-      "  sonnet-4.6-adaptive  ",
-    );
-    expect(result).toBe("sonnet-4.6-adaptive");
-  });
-
-  it("rejects database model_id values instead of mapping them", async () => {
-    const { client, mockListModels } = makeRuntime();
-    mockListModels.mockResolvedValue([
-      { model_id: "model-row-1", name: "sonnet-4.6-adaptive" },
-    ]);
-
-    await expect(
-      requireKnownBackendModelName(client, "model-row-1"),
-    ).rejects.toThrow('Unknown model "model-row-1"');
-  });
-
-  it("accepts model_id only when the runtime model has no name", async () => {
-    const { client, mockListModels } = makeRuntime();
-    mockListModels.mockResolvedValue([
-      { model_id: "model-row-1", name: null },
-      { model_id: "model-row-2" },
-    ]);
-
-    await expect(
-      requireKnownBackendModelName(client, "model-row-1"),
-    ).resolves.toBe("model-row-1");
-    await expect(
-      requireKnownBackendModelName(client, "model-row-2"),
-    ).resolves.toBe("model-row-2");
-  });
-
-  it("caches listModels for repeated exact canonical names", async () => {
-    const { client, mockListModels } = makeRuntime();
-    mockListModels.mockResolvedValue([
-      { model_id: "model-row-1", name: "sonnet-4.6-adaptive" },
-    ]);
-
-    await requireKnownBackendModelName(client, "sonnet-4.6-adaptive");
-    await requireKnownBackendModelName(client, "sonnet-4.6-adaptive");
+    await resolveBackendModelName(client, "sonnet-4.6-adaptive");
+    await resolveBackendModelName(client, "sonnet-4.6-adaptive");
+    // With cache: only 1 call
     expect(mockListModels).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects unknown model strings instead of forwarding them", async () => {
+  it("returns original model string when listModels does not match", async () => {
     const { client, mockListModels } = makeRuntime();
     mockListModels.mockResolvedValue([
-      { model_id: "model-row-1", name: "opus-4.7" },
+      { model_id: "opus-4.7", name: "Opus 4.7" },
     ]);
 
-    await expect(
-      requireKnownBackendModelName(client, "unknown-model-xyz"),
-    ).rejects.toThrow('Unknown model "unknown-model-xyz"');
-  });
-
-  it("rejects a DeepSeek Pro alias instead of choosing the first DeepSeek model", async () => {
-    const { client, mockListModels } = makeRuntime();
-    mockListModels.mockResolvedValue([
-      {
-        model_id: "be784f7f-b188-4f53-b7eb-997a9f95f66c",
-        name: "deepseek-v4-flash-anthropic",
-      },
-      {
-        model_id: "0ca5bdfb-471f-4776-b2d8-2d4bedf1e50a",
-        name: "deepseek-v4-pro-official",
-      },
-    ]);
-
-    await expect(
-      requireKnownBackendModelName(client, "deepseek-v4-pro"),
-    ).rejects.toThrow('Unknown model "deepseek-v4-pro"');
+    const result = await resolveBackendModelName(client, "unknown-model-xyz");
+    expect(result).toEqual({ model: "unknown-model-xyz" });
   });
 
   it("rejects missing model before listModels lookup", async () => {
     const { client, mockListModels } = makeRuntime();
 
-    await expect(requireKnownBackendModelName(client, "")).rejects.toThrow(
+    await expect(resolveBackendModelName(client, "")).rejects.toThrow(
       "model is required",
     );
     expect(mockListModels).not.toHaveBeenCalled();
   });
 
-  it("rejects and invalidates the cache on listModels errors", async () => {
+  it("rejects when listModels fails", async () => {
     const { client, mockListModels } = makeRuntime();
-    mockListModels
-      .mockRejectedValueOnce(new Error("Network error"))
-      .mockResolvedValueOnce([
-        { model_id: "model-row-1", name: "sonnet-4.6-adaptive" },
-      ]);
+    mockListModels.mockRejectedValue(new Error("Network error"));
 
     await expect(
-      requireKnownBackendModelName(client, "sonnet-4.6-adaptive"),
-    ).rejects.toThrow("resolve runtime model: Network error");
-    const result = await requireKnownBackendModelName(
-      client,
-      "sonnet-4.6-adaptive",
-    );
-    expect(result).toBe("sonnet-4.6-adaptive");
-    expect(mockListModels).toHaveBeenCalledTimes(2);
+      resolveBackendModelName(client, "sonnet-4.6-adaptive"),
+    ).rejects.toThrow("resolve backend model failed: Network error");
   });
 
-  it("rejects before listModels when runtime auth is missing", async () => {
+  it("skips listModels when no accessToken", async () => {
     const { client, mockListModels } = makeRuntime({ accessToken: null });
 
-    await expect(
-      requireKnownBackendModelName(client, "sonnet-4.6-adaptive"),
-    ).rejects.toThrow("Runtime authentication is missing.");
+    const result = await resolveBackendModelName(client, "sonnet-4.6-adaptive");
+    expect(result).toEqual({ model: "sonnet-4.6-adaptive" });
     expect(mockListModels).not.toHaveBeenCalled();
   });
 });

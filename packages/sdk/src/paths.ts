@@ -3,44 +3,49 @@
  * Keep in sync with `rust/crates/astra-thin-client/src/paths.rs`.
  */
 
-export const PATH_AUTH_REGISTER = '/auth/register';
-export const PATH_AUTH_LOGIN = '/auth/login';
-export const PATH_AUTH_REFRESH = '/auth/refresh';
-export const PATH_AUTH_LOGOUT = '/auth/logout';
-export const PATH_AUTH_ME = '/auth/me';
+export const PATH_AUTH_REGISTER = "/auth/register";
+export const PATH_AUTH_LOGIN = "/auth/login";
+export const PATH_AUTH_REFRESH = "/auth/refresh";
+export const PATH_AUTH_LOGOUT = "/auth/logout";
+export const PATH_AUTH_ME = "/auth/me";
+export const PATH_AUTH_EXTERNAL_PROVIDERS = "/auth/external/providers";
+export const PATH_AUTH_EXTERNAL_LOGIN = "/auth/external/login";
 
-export const PATH_SESSIONS = '/sessions';
+export const PATH_SESSIONS = "/sessions";
 
-export const PATH_CHAT = '/chat';
-export const PATH_CHAT_STREAM = '/chat/stream';
+export const PATH_CHAT = "/chat";
+export const PATH_CHAT_STREAM = "/chat/stream";
 
-export const PATH_MODELS = '/models';
-export const PATH_AGENT_BINDINGS = '/agent-bindings';
-export const PATH_MODEL_GATEWAYS = '/model-gateways';
+export const PATH_MODELS = "/models";
+export const PATH_AGENT_BINDINGS = "/agent-bindings";
+export const PATH_MODEL_GATEWAYS = "/model-gateways";
 
-export const PATH_MEMORY_STORE = '/memory/store';
-export const PATH_MEMORY_SEARCH = '/memory/search';
-export const PATH_MEMORY_RETRIEVE = '/memory/retrieve';
-export const PATH_MEMORY_PURGE = '/memory/purge';
+export const PATH_MEMORY_STORE = "/memory/store";
+export const PATH_MEMORY_SEARCH = "/memory/search";
+export const PATH_MEMORY_RETRIEVE = "/memory/retrieve";
+export const PATH_MEMORY_PURGE = "/memory/purge";
 
-export const PATH_SKILLS = '/skills';
-export const PATH_SKILLS_PUBLISH = '/skills/publish';
+export const PATH_SKILLS = "/skills";
+export const PATH_SKILLS_PUBLISH = "/skills/publish";
 
-export const PATH_RUNS = '/runs';
+export const PATH_RUNS = "/runs";
 
-export const PATH_EVENTS = '/events';
+export const PATH_EVENTS = "/events";
 
-export const PATH_EDGES_STATUS = '/edges/status';
+export const PATH_EDGES_STATUS = "/edges/status";
 
-export const PATH_TOOLS_RESULT = '/tools/result';
-export const PATH_APPROVAL_RESPOND = '/approval/respond';
-export const PATH_AGENTS_EDGE = '/agents/edge';
-export const PATH_AGENTS_EDGE_HEARTBEAT = '/agents/edge/heartbeat';
+export const PATH_TOOLS_RESULT = "/tools/result";
+export const PATH_APPROVAL_RESPOND = "/approval/respond";
+export const PATH_AGENTS_EDGE = "/agents/edge";
+export const PATH_AGENTS_EDGE_HEARTBEAT = "/agents/edge/heartbeat";
 
 /** Join optional gateway prefix (e.g. `/api`) with an API path that starts with `/`. */
-export function joinApiPath(pathPrefix: string | undefined, path: string): string {
-  const p = (pathPrefix ?? '').replace(/\/$/, '');
-  const x = path.startsWith('/') ? path : `/${path}`;
+export function joinApiPath(
+  pathPrefix: string | undefined,
+  path: string,
+): string {
+  const p = (pathPrefix ?? "").replace(/\/$/, "");
+  const x = path.startsWith("/") ? path : `/${path}`;
   return p ? `${p}${x}` : x;
 }
 
@@ -83,8 +88,8 @@ export function sessionArtifactsPath(sessionId: string): string {
 function isSafePathSegment(value: string): boolean {
   return (
     value.length > 0 &&
-    value !== '.' &&
-    value !== '..' &&
+    value !== "." &&
+    value !== ".." &&
     /^[A-Za-z0-9._-]+$/.test(value)
   );
 }
@@ -104,12 +109,18 @@ export function sessionArtifactLatestPath(
   return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}/artifacts/latest/${artifactKind}`;
 }
 
-export function sessionArtifactPath(sessionId: string, artifactId: string): string | null {
+export function sessionArtifactPath(
+  sessionId: string,
+  artifactId: string,
+): string | null {
   if (!isSafePathSegment(artifactId)) return null;
   return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}/artifacts/${artifactId}`;
 }
 
-export function sessionArtifactDownloadPath(sessionId: string, artifactId: string): string | null {
+export function sessionArtifactDownloadPath(
+  sessionId: string,
+  artifactId: string,
+): string | null {
   if (!isSafePathSegment(artifactId)) return null;
   return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}/artifacts/${artifactId}/download`;
 }
@@ -203,14 +214,16 @@ export function modelGatewayDisablePath(modelGatewayId: string): string {
 }
 
 /** Build `?a=1&b=2` from plain values (skips undefined / null). */
-export function buildQueryString(params: Record<string, string | number | undefined | null>): string {
+export function buildQueryString(
+  params: Record<string, string | number | undefined | null>,
+): string {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === null) continue;
     q.set(k, String(v));
   }
   const s = q.toString();
-  return s ? `?${s}` : '';
+  return s ? `?${s}` : "";
 }
 
 export function taskLeasePath(taskId: string): string {
@@ -230,4 +243,4 @@ export function taskLeaseRenewPath(taskId: string): string {
 }
 
 /** HTTP header for edge transport instance id (matches Rust `ASTRA_EDGE_ID_HEADER`). */
-export const ASTRA_EDGE_ID_HEADER = 'X-Astra-Edge-Id';
+export const ASTRA_EDGE_ID_HEADER = "X-Astra-Edge-Id";

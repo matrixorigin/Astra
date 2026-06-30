@@ -9,7 +9,7 @@
 //! **Client → Server** (JSON text frames):
 //! ```text
 //! {"type": "auth", "token": "Bearer ..."}
-//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "selected_model": {"model": "..."}, "execution_budget": {"initial_turns": 12, "hard_turn_limit": 24}, "explain": false, "interaction_mode": "auto", "plan_subtask_id": "...", "is_plan_subtask": true}
+//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "selected_model": {"model": "..."}, "skill_search": {...}, "execution_budget": {"initial_turns": 12, "hard_turn_limit": 24}, "explain": false, "interaction_mode": "auto", "plan_subtask_id": "...", "is_plan_subtask": true}
 //! {"type": "cancel_run", "run_id": "..."}
 //! {"type": "pause_run", "run_id": "..."}
 //! {"type": "resume_run", "run_id": "..."}
@@ -100,6 +100,8 @@ pub(super) struct WsChatMessage {
     #[serde(default)]
     agent_id: Option<String>,
     selected_model: astra_services::runs::SelectedModelRequest,
+    #[serde(default)]
+    skill_search: Option<astra_core::SkillSearchSettings>,
     #[serde(default)]
     allow_skills: Option<Vec<String>>,
     #[serde(default)]
@@ -536,6 +538,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     session_id,
                                     agent_id,
                                     selected_model,
+                                    skill_search,
                                     allow_skills,
                                     allow_skill_sources,
                                     allow_tools,
@@ -554,6 +557,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     session_id,
                                     agent_id,
                                     selected_model,
+                                    skill_search,
                                     allow_skills,
                                     allow_skill_sources,
                                     allow_tools,
@@ -667,6 +671,7 @@ async fn handle_chat_message(
     requested_session_id: Option<String>,
     agent_id: Option<String>,
     selected_model: astra_services::runs::SelectedModelRequest,
+    skill_search: Option<astra_core::SkillSearchSettings>,
     allow_skills: Option<Vec<String>>,
     allow_skill_sources: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
@@ -690,6 +695,7 @@ async fn handle_chat_message(
         request_session_id,
         agent_id,
         selected_model,
+        skill_search,
         allow_skills,
         allow_skill_sources,
         allow_tools,
@@ -944,6 +950,7 @@ fn build_bridge_chat_payload(
     content: &str,
     agent_id: Option<String>,
     model: Option<String>,
+    skill_search: Option<astra_core::SkillSearchSettings>,
     allow_skills: Option<Vec<String>>,
     allow_skill_sources: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
@@ -959,6 +966,7 @@ fn build_bridge_chat_payload(
         "session_id": session_id,
         "agent_id": agent_id,
         "model": model,
+        "skill_search": skill_search,
         "allow_skills": allow_skills,
         "allow_skill_sources": allow_skill_sources,
         "allow_tools": allow_tools,
@@ -989,6 +997,7 @@ fn build_ws_chat_request(
     session_id: Option<String>,
     agent_id: Option<String>,
     selected_model: astra_services::runs::SelectedModelRequest,
+    skill_search: Option<astra_core::SkillSearchSettings>,
     allow_skills: Option<Vec<String>>,
     allow_skill_sources: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
@@ -1004,21 +1013,27 @@ fn build_ws_chat_request(
         message: content.to_string(),
         parts: Vec::new(),
         attachments: Vec::new(),
+        runtime_system_prompt: None,
         session_id,
         full_llm_capture: false,
         agent_id,
         model,
         selected_model: Some(selected_model),
+        capability_descriptors: None,
+        provider_runtime_authorized: false,
         agent_binding: None,
         runtime_auth: None,
+        runtime_skill_binding: None,
         runtime_profile: None,
         llm_token_service: None,
+        skill_search,
         allow_skills,
         allow_skill_sources,
         allow_tools,
         workspace_binding: None,
         executor_binding: None,
         runtime_mcp_bindings: Vec::new(),
+        mcp_binding_ids: None,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
         edge_executor_id: None,
         capabilities: Vec::new(),
@@ -2120,13 +2135,13 @@ mod tests {
             _session_id: String,
             _user_id: String,
             _limit: u32,
-            _cursor: Option<astra_services::SessionActivityCursor>,
+            _cursor: Option<astra_services::auth::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: Vec::new(),
                 total: 0,
-                limit: 1,
+                limit: 20,
                 next_cursor: None,
             })
         }
@@ -2153,7 +2168,7 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "selected_model": {"model": "gpt-5.4"}, "allow_skills": ["plan"], "allow_skill_sources": ["database"], "allow_tools": ["bash"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
+        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "selected_model": {"model": "gpt-5.4"}, "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_skill_sources": ["database"], "allow_tools": ["bash"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage(message) => {
@@ -2162,6 +2177,7 @@ mod tests {
                     session_id,
                     agent_id,
                     selected_model,
+                    skill_search,
                     allow_skills,
                     allow_skill_sources,
                     allow_tools,
@@ -2176,6 +2192,14 @@ mod tests {
                 assert_eq!(session_id, Some("s1".into()));
                 assert_eq!(agent_id.as_deref(), Some("agent-1"));
                 assert_eq!(selected_model.model, "gpt-5.4");
+                assert_eq!(
+                    skill_search,
+                    Some(astra_core::SkillSearchSettings {
+                        dynamic_surface: false,
+                        min_catalog_size: 12,
+                        surface_cap: 20,
+                    })
+                );
                 assert_eq!(allow_skills, Some(vec!["plan".into()]));
                 assert_eq!(allow_skill_sources, Some(vec!["database".into()]));
                 assert_eq!(allow_tools, Some(vec!["bash".into()]));
@@ -2210,6 +2234,7 @@ mod tests {
                     content,
                     selected_model,
                     agent_id,
+                    skill_search,
                     allow_skills,
                     allow_skill_sources,
                     allow_tools,
@@ -2222,6 +2247,7 @@ mod tests {
                 assert_eq!(content, "你好");
                 assert_eq!(selected_model.model, "gpt-5.4");
                 assert!(agent_id.is_none());
+                assert!(skill_search.is_none());
                 assert!(allow_skills.is_none());
                 assert!(allow_skill_sources.is_none());
                 assert!(allow_tools.is_none());
@@ -2242,13 +2268,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_chat_message_rejects_legacy_skill_search() {
-        let json = r#"{"type": "message", "content": "hello", "selected_model": {"model": "gpt-5.4"}, "skill_search": {"dynamic_surface": false}}"#;
-        serde_json::from_str::<WsClientMessage>(json)
-            .expect_err("legacy skill_search must stay out of the websocket wire shape");
-    }
-
-    #[test]
     fn bridge_payload_preserves_runtime_request_fields() {
         let mut context = serde_json::Map::new();
         context.insert("edge_tools".into(), serde_json::json!([{"name": "bash"}]));
@@ -2259,6 +2278,11 @@ mod tests {
             "hello",
             Some("agent-1".into()),
             Some("gpt-5.4".into()),
+            Some(astra_core::SkillSearchSettings {
+                dynamic_surface: false,
+                min_catalog_size: 12,
+                surface_cap: 20,
+            }),
             Some(vec!["plan".into()]),
             Some(vec!["database".into()]),
             Some(vec!["bash".into()]),
@@ -2274,7 +2298,9 @@ mod tests {
         assert_eq!(payload["session_id"], "session-1");
         assert_eq!(payload["agent_id"], "agent-1");
         assert_eq!(payload["model"], "gpt-5.4");
-        assert!(payload.get("skill_search").is_none());
+        assert_eq!(payload["skill_search"]["dynamic_surface"], false);
+        assert_eq!(payload["skill_search"]["min_catalog_size"], 12);
+        assert_eq!(payload["skill_search"]["surface_cap"], 20);
         assert_eq!(payload["allow_skills"], serde_json::json!(["plan"]));
         assert_eq!(
             payload["allow_skill_sources"],
@@ -2297,6 +2323,7 @@ mod tests {
             "hello",
             Some("agent-1".into()),
             Some("gpt-5.4".into()),
+            None,
             Some(vec![" plan ".into(), "PLAN".into(), "analyze".into()]),
             Some(vec![" local ".into(), "MCP".into(), "local".into()]),
             Some(vec![" bash ".into(), "BASH".into(), "read_file".into()]),
@@ -2330,9 +2357,15 @@ mod tests {
             Some("session-1".into()),
             Some("agent-1".into()),
             astra_services::runs::SelectedModelRequest {
+                id: None,
                 model: "gpt-5.4".into(),
                 gateway: None,
             },
+            Some(astra_core::SkillSearchSettings {
+                dynamic_surface: false,
+                min_catalog_size: 12,
+                surface_cap: 20,
+            }),
             Some(vec!["plan".into()]),
             Some(vec!["database".into()]),
             Some(vec!["bash".into(), "read_file".into()]),
@@ -2360,6 +2393,14 @@ mod tests {
                 .as_ref()
                 .map(|selected| selected.model.as_str()),
             Some("gpt-5.4")
+        );
+        assert_eq!(
+            request.skill_search,
+            Some(astra_core::SkillSearchSettings {
+                dynamic_surface: false,
+                min_catalog_size: 12,
+                surface_cap: 20,
+            })
         );
         assert_eq!(
             request.execution_budget,

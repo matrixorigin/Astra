@@ -291,6 +291,24 @@ impl ExecutionBindingState {
     }
 }
 
+impl ToolExecutionRequest {
+    pub(crate) fn with_transport_arguments(&self) -> Self {
+        let mut request = self.clone();
+        request.args = transport_tool_arguments(&request.args);
+        request
+    }
+}
+
+pub(crate) fn transport_tool_arguments(args: &Value) -> Value {
+    let Some(map) = args.as_object() else {
+        return args.clone();
+    };
+    let mut public = map.clone();
+    public.remove("_tool_call_id");
+    public.remove("_run_id");
+    Value::Object(public)
+}
+
 fn tool_call_id(args: &Value) -> Option<&str> {
     args.get("_tool_call_id").and_then(Value::as_str)
 }
@@ -396,6 +414,23 @@ mod tests {
         );
 
         assert!(state.runtime().is_none());
+    }
+
+    #[test]
+    fn transport_tool_arguments_remove_only_astra_internal_metadata() {
+        let args = json!({
+            "query": "select 1",
+            "_tool_call_id": "call-1",
+            "_run_id": "run-1",
+            "_domain_parameter": "must remain"
+        });
+
+        let projected = transport_tool_arguments(&args);
+
+        assert_eq!(projected["query"], "select 1");
+        assert_eq!(projected["_domain_parameter"], "must remain");
+        assert!(projected.get("_tool_call_id").is_none(), "{projected:?}");
+        assert!(projected.get("_run_id").is_none(), "{projected:?}");
     }
 
     #[test]

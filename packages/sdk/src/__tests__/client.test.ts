@@ -225,24 +225,23 @@ describe("AstraClient — Sessions", () => {
       total: 3,
       limit: 2,
       next_cursor: {
-        updated_at: "2026-04-01T10:00:00.123456",
-        session_id: "s1",
+        updated_at: "2026-06-29T08:00:00Z",
+        session_id: "session-2",
       },
     });
     const result = await createClient().listRuntimeSessions({
       limit: 2,
       cursor: {
-        updated_at: "2026-04-01T10:00:00.123456",
-        session_id: "s1",
+        updated_at: "2026-06-29T08:00:00Z",
+        session_id: "session-1",
       },
     });
     expect(result.total).toBe(3);
-    expect(result.next_cursor?.session_id).toBe("s1");
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
       .calls[0][0] as string;
     expect(url).toContain("limit=2");
-    expect(url).toContain("after_updated_at=2026-04-01T10%3A00%3A00.123456");
-    expect(url).toContain("after_session_id=s1");
+    expect(url).toContain("after_updated_at=2026-06-29T08%3A00%3A00Z");
+    expect(url).toContain("after_session_id=session-1");
   });
 
   test("deleteSession", async () => {
@@ -679,34 +678,12 @@ describe("AstraClient — Session lifecycle and reflect", () => {
       session_id: "sx",
       activities: [],
       total: 0,
-      limit: 5,
-      next_cursor: null,
     });
     const r = await createClient().getSessionActivity("sx", { limit: 5 });
     expect(r.total).toBe(0);
-    expect(r.limit).toBe(5);
-    expect(r.next_cursor).toBeNull();
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/activity");
     expect(url).toContain("limit=5");
-  });
-
-  test("getSessionActivity with cursor", async () => {
-    globalThis.fetch = mockFetch(200, {
-      session_id: "sx",
-      activities: [],
-      total: 0,
-      limit: 10,
-      next_cursor: null,
-    });
-    const r = await createClient().getSessionActivity("sx", {
-      limit: 10,
-      cursor: { created_at: "2024-01-01T00:00:00.000000", log_id: "log-42" },
-    });
-    expect(r.total).toBe(0);
-    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    expect(url).toContain("after_created_at=2024-01-01T00%3A00%3A00.000000");
-    expect(url).toContain("after_log_id=log-42");
   });
 
   test("getSessionReflect", async () => {
@@ -728,7 +705,7 @@ describe("AstraClient — Session lifecycle and reflect", () => {
   test("getSessionDecisionTrace", async () => {
     globalThis.fetch = mockFetch(200, {
       session_id: "sx",
-      focus: "tool_surface",
+      focus: "tool_selection",
       overview: {},
       diagnoses: [],
       insights: [],
@@ -753,14 +730,14 @@ describe("AstraClient — Events and edges", () => {
     });
     await createClient().getSessionEvents("sid", {
       cursor: {
-        created_at: "2026-04-01T10:00:00.123456",
-        event_id: "evt-1",
+        created_at: "2026-06-29T08:00:00Z",
+        event_id: "event-1",
       },
     });
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/events/session/sid");
-    expect(url).toContain("after_created_at=2026-04-01T10%3A00%3A00.123456");
-    expect(url).toContain("after_event_id=evt-1");
+    expect(url).toContain("after_created_at=2026-06-29T08%3A00%3A00Z");
+    expect(url).toContain("after_event_id=event-1");
   });
 
   test("listEvents", async () => {
@@ -768,26 +745,13 @@ describe("AstraClient — Events and edges", () => {
       events: [],
       total: 0,
       limit: 50,
-      next_cursor: {
-        created_at: "2026-04-01T10:00:00.123456",
-        event_id: "evt-1",
-      },
+      next_cursor: null,
     });
-    const result = await createClient().listEvents({
-      sessionId: "s1",
-      limit: 20,
-      cursor: {
-        created_at: "2026-04-01T10:00:00.123456",
-        event_id: "evt-1",
-      },
-    });
+    await createClient().listEvents({ sessionId: "s1", limit: 20 });
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/events?");
     expect(url).toContain("session_id=s1");
     expect(url).toContain("limit=20");
-    expect(url).toContain("after_created_at=2026-04-01T10%3A00%3A00.123456");
-    expect(url).toContain("after_event_id=evt-1");
-    expect(result.next_cursor?.event_id).toBe("evt-1");
   });
 
   test("getCausalChain", async () => {
@@ -895,7 +859,7 @@ describe("AstraClient — Skills", () => {
       ],
       total: 1,
       limit: 50,
-      next_cursor: null,
+      offset: 0,
     });
     const result = await createClient().listSkills();
     expect(result).toHaveLength(1);
@@ -931,21 +895,20 @@ describe("AstraClient — Skills", () => {
     const result = await createClient().listRuntimeSkills({
       limit: 1,
       cursor: {
-        skill_name: "web-search",
-        version: "2",
-        skill_id: "id2",
+        skill_name: "code-search",
+        version: "1",
+        skill_id: "id1",
       },
     });
     expect(result.total).toBe(11);
     expect(result.skills?.[0]?.source).toBe("database");
-    expect(result.next_cursor?.skill_id).toBe("id2");
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
       .calls[0][0] as string;
     expect(url).toContain("/skills");
     expect(url).toContain("limit=1");
-    expect(url).toContain("after_skill_name=web-search");
-    expect(url).toContain("after_version=2");
-    expect(url).toContain("after_skill_id=id2");
+    expect(url).toContain("after_skill_name=code-search");
+    expect(url).toContain("after_version=1");
+    expect(url).toContain("after_skill_id=id1");
   });
 });
 
@@ -982,7 +945,7 @@ describe("AstraClient — thin protocol", () => {
     } as unknown as Response);
     const client = createClient();
     await client.postToolResult(
-      { request_id: "req1", status: "completed", output: "out" },
+      { request_id: "req1", status: "ok", output: "out" },
       { edgeExecutorId: "edge-1" },
     );
     const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
@@ -1045,9 +1008,7 @@ describe("AstraClient — Errors", () => {
       ok: true,
       status: 200,
       text: () =>
-        Promise.resolve(
-          '{"sessions":[], "total":0, "limit":20, "next_cursor":null}',
-        ),
+        Promise.resolve('{"sessions":[], "total":0, "limit":20, "offset":0}'),
       headers: new Headers(),
     } as unknown as Response);
 
@@ -1067,9 +1028,7 @@ describe("AstraClient — Errors", () => {
       ok: true,
       status: 200,
       text: () =>
-        Promise.resolve(
-          '{"sessions":[], "total":0, "limit":20, "next_cursor":null}',
-        ),
+        Promise.resolve('{"sessions":[], "total":0, "limit":20, "offset":0}'),
       headers: new Headers(),
     } as unknown as Response);
 
@@ -1209,6 +1168,15 @@ describe("chatRequestToWire", () => {
     expect(body.selected_model).toEqual({ model: "kimi", gateway: "" });
   });
 
+  test("preserves selectedModel.id for external runtime context", () => {
+    const body = chatRequestToWire({
+      message: "m",
+      selectedModel: { id: "model-kimi", model: "kimi" },
+    });
+
+    expect(body.selected_model).toEqual({ id: "model-kimi", model: "kimi" });
+  });
+
   test("full snake_case mapping: session, agent, selected model, binding, context, plan, edge, capabilities, budget, bindings", () => {
     const body = chatRequestToWire({
       message: "q",
@@ -1220,7 +1188,7 @@ describe("chatRequestToWire", () => {
       },
       sessionId: "sess-1",
       agentId: "ag-1",
-      selectedModel: { model: "kimi", gateway: "gateway-a" },
+      selectedModel: { id: "model-kimi", model: "kimi", gateway: "gateway-a" },
       agentBinding: {
         id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
         capabilityServerRefs: {
@@ -1263,7 +1231,7 @@ describe("chatRequestToWire", () => {
       },
       session_id: "sess-1",
       agent_id: "ag-1",
-      selected_model: { model: "kimi", gateway: "gateway-a" },
+      selected_model: { id: "model-kimi", model: "kimi", gateway: "gateway-a" },
       agent_binding: {
         id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
         capability_server_refs: {

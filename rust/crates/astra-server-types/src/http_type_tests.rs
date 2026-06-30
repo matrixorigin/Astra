@@ -9,6 +9,7 @@ type DefaultCase<'a> = (&'a str, Box<dyn Fn() -> String>);
 #[test]
 fn default_functions_return_expected_values() {
     let cases: &[DefaultCase] = &[
+        ("days", Box::new(|| default_days().to_string())),
         (
             "admin_scope",
             Box::new(|| default_admin_scope().to_string()),
@@ -29,8 +30,20 @@ fn default_functions_return_expected_values() {
             "admin_audit_limit",
             Box::new(|| default_admin_audit_limit().to_string()),
         ),
+        (
+            "signal_types",
+            Box::new(|| format!("{:?}", default_signal_types())),
+        ),
     ];
-    let expected = &["global", "50", "compression", "jsonl", "100"];
+    let expected = &[
+        "7",
+        "global",
+        "50",
+        "compression",
+        "jsonl",
+        "100",
+        r#"["wrong_skill"]"#,
+    ];
     for ((label, f), exp) in cases.iter().zip(expected) {
         assert_eq!(f(), *exp, "default_{label}");
     }
@@ -51,7 +64,8 @@ fn deserialization_applies_defaults() {
     // SessionListQuery
     let q: SessionListQuery = serde_json::from_str("{}").unwrap();
     assert_eq!(q.limit, 50);
-    assert_eq!(q.cursor().unwrap(), None);
+    assert!(q.after_updated_at.is_none());
+    assert!(q.after_session_id.is_none());
 
     // RunStreamQuery
     let q: RunStreamQuery = serde_json::from_str("{}").unwrap();
@@ -60,6 +74,11 @@ fn deserialization_applies_defaults() {
     // ChatRouteRequest
     let q: ChatRouteRequest = serde_json::from_str("{}").unwrap();
     assert_eq!(q.query, "");
+
+    // LearningTriggerRequest
+    let req: LearningTriggerRequest = serde_json::from_str("{}").unwrap();
+    assert_eq!(req.days, 7);
+    assert!(!req.force);
 
     // AdminTokenCreateRequest
     let req: AdminTokenCreateRequest = serde_json::from_str(r#"{"token_type":"api_key"}"#).unwrap();
@@ -86,7 +105,17 @@ fn chat_request_all_fields() {
         "message": "hello",
         "session_id": "s1",
         "agent_id": "a1",
-        "selected_model": {"model": "gpt-4"},
+        "selected_model": {"id": "model-gpt-4", "model": "gpt-4"},
+        "capability_descriptors": {
+            "model_gateway": {
+                "id": "moi-model-gateway",
+                "type": "model_gateway",
+                "transport": "http",
+                "endpoint_url": "http://catalog:8081/api/v1/model-gateway",
+                "protocol": "openai_responses",
+                "metadata": {}
+            }
+        },
         "llm_token_service": {
             "url": "http://catalog:8081/api/v1/llm-token",
             "timeout_ms": 2500
@@ -112,6 +141,19 @@ fn chat_request_all_fields() {
             .as_ref()
             .map(|selected| selected.model.as_str()),
         Some("gpt-4")
+    );
+    assert_eq!(
+        req.selected_model
+            .as_ref()
+            .and_then(|selected| selected.id.as_deref()),
+        Some("model-gpt-4")
+    );
+    assert_eq!(
+        req.capability_descriptors
+            .as_ref()
+            .and_then(|descriptors| descriptors.model_gateway.as_ref())
+            .map(|descriptor| descriptor.endpoint_url.as_str()),
+        Some("http://catalog:8081/api/v1/model-gateway")
     );
     assert_eq!(
         req.llm_token_service.as_ref().map(|v| v.url.as_str()),
@@ -156,17 +198,14 @@ fn chat_request_rejects_legacy_top_level_model_field() {
 }
 
 #[test]
-fn chat_request_rejects_mcp_binding_ids_unknown_field() {
+fn chat_request_rejects_external_auth_body_envelope() {
     let result = serde_json::from_str::<ChatRequest>(
-        r#"{"message":"hello","selected_model":{"model":"gpt-4"},"mcp_binding_ids":[301]}"#,
+        r#"{"message":"hello","selected_model":{"model":"gpt-4"},"external_auth":{"provider_id":"moi","action":"authorize_request"}}"#,
     );
-    assert!(
-        result.is_err(),
-        "mcp_binding_ids must not remain a request field"
-    );
+    assert!(result.is_err(), "external auth must not be in chat body");
     let err = result.err().unwrap();
     assert!(
-        err.to_string().contains("unknown field `mcp_binding_ids`"),
+        err.to_string().contains("unknown field `external_auth`"),
         "unexpected error: {err}"
     );
 }
@@ -288,39 +327,36 @@ fn auth_register_request_without_display_name() {
 }
 
 #[test]
+fn learning_trigger_request_all_fields() {
+    let input = json!({
+        "days": 14,
+        "force": true,
+        "signal_types": ["slow_execution", "high_cost"],
+        "weights": {"alpha": 0.5}
+    });
+    let req: LearningTriggerRequest = serde_json::from_value(input).unwrap();
+    assert_eq!(req.days, 14);
+    assert!(req.force);
+    assert_eq!(req.signal_types, vec!["slow_execution", "high_cost"]);
+    let w = req.weights.unwrap();
+    assert_eq!(w.get("alpha").unwrap(), &json!(0.5));
+}
+
+#[test]
 fn session_list_query_all_fields() {
     let input = json!({
         "agent_id": "a1",
         "session_status": "active",
         "limit": 20,
-        "after_updated_at": "2026-04-01T10:00:00.123456",
-        "after_session_id": "s1"
+        "after_updated_at": "2024-01-02T00:00:00Z",
+        "after_session_id": "s5"
     });
     let q: SessionListQuery = serde_json::from_value(input).unwrap();
     assert_eq!(q.agent_id.as_deref(), Some("a1"));
     assert_eq!(q.session_status.as_deref(), Some("active"));
     assert_eq!(q.limit, 20);
-    assert_eq!(
-        q.cursor().unwrap(),
-        Some(SessionListCursor {
-            updated_at: "2026-04-01T10:00:00.123456".into(),
-            session_id: "s1".into(),
-        })
-    );
-}
-
-#[test]
-fn session_list_query_requires_complete_cursor() {
-    let q: SessionListQuery = serde_json::from_value(json!({
-        "after_updated_at": "2026-04-01T10:00:00.123456"
-    }))
-    .unwrap();
-    let (status, body) = q.cursor().unwrap_err();
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body.detail,
-        "session list cursor requires both after_updated_at and after_session_id"
-    );
+    assert_eq!(q.after_updated_at.as_deref(), Some("2024-01-02T00:00:00Z"));
+    assert_eq!(q.after_session_id.as_deref(), Some("s5"));
 }
 
 #[test]
@@ -532,16 +568,14 @@ fn auth_register_response_serializes() {
         username: "alice".into(),
         email: "a@b.com".into(),
         display_name: Some("Alice".into()),
-        roles: vec!["astra_user".into(), "astra_admin".into()],
-        is_admin: true,
+        roles: vec!["user".into()],
+        is_admin: false,
         access_token: "at".into(),
         refresh_token: "rt".into(),
         token_type: "Bearer".into(),
         expires_in: 3600,
     };
     let v = serde_json::to_value(&resp).unwrap();
-    assert_eq!(v["roles"], json!(["astra_user", "astra_admin"]));
-    assert_eq!(v["is_admin"], true);
     assert_eq!(v["user_id"], "u1");
     assert_eq!(v["access_token"], "at");
     assert_eq!(v["display_name"], "Alice");
@@ -567,54 +601,7 @@ fn session_list_response_serializes() {
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["sessions"], json!([]));
     assert_eq!(v["total"], 0);
-}
-
-#[test]
-fn session_activity_query_requires_complete_cursor() {
-    let missing_log = SessionActivityQuery {
-        limit: 10,
-        after_created_at: Some("2026-04-01T10:00:00.123456".into()),
-        after_log_id: None,
-    };
-    let (status, body) = missing_log.cursor().unwrap_err();
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body.detail,
-        "session activity cursor requires both after_created_at and after_log_id"
-    );
-
-    let cursor = SessionActivityQuery {
-        limit: 10,
-        after_created_at: Some("2026-04-01T10:00:00.123456".into()),
-        after_log_id: Some("log-1".into()),
-    }
-    .cursor()
-    .unwrap();
-    assert_eq!(
-        cursor,
-        Some(SessionActivityCursor {
-            created_at: "2026-04-01T10:00:00.123456".into(),
-            log_id: "log-1".into(),
-        })
-    );
-}
-
-#[test]
-fn session_activity_response_serializes_next_cursor() {
-    let resp = SessionActivityResponse {
-        session_id: "s1".into(),
-        activities: vec![],
-        total: 2,
-        limit: 1,
-        next_cursor: Some(SessionActivityCursor {
-            created_at: "2026-04-01T10:00:00.123456".into(),
-            log_id: "log-1".into(),
-        }),
-    };
-    let v = serde_json::to_value(&resp).unwrap();
-    assert_eq!(v["session_id"], "s1");
-    assert_eq!(v["limit"], 1);
-    assert_eq!(v["next_cursor"]["log_id"], "log-1");
+    assert!(v["next_cursor"].is_null());
 }
 
 #[test]
@@ -878,7 +865,7 @@ fn session_list_record_to_response() {
         total: 1,
         limit: 50,
         next_cursor: Some(SessionListCursor {
-            updated_at: "2026-04-01T10:00:00.123456".into(),
+            updated_at: "2024-01-01T00:00:00Z".into(),
             session_id: "s1".into(),
         }),
     };
@@ -887,11 +874,10 @@ fn session_list_record_to_response() {
     assert_eq!(resp.total, 1);
     assert_eq!(resp.limit, 50);
     assert_eq!(
-        resp.next_cursor,
-        Some(SessionListCursor {
-            updated_at: "2026-04-01T10:00:00.123456".into(),
-            session_id: "s1".into(),
-        })
+        resp.next_cursor
+            .as_ref()
+            .map(|cursor| cursor.session_id.as_str()),
+        Some("s1")
     );
 
     // empty
@@ -905,6 +891,7 @@ fn session_list_record_to_response() {
     assert!(resp.sessions.is_empty());
     assert_eq!(resp.total, 0);
     assert_eq!(resp.limit, 20);
+    assert!(resp.next_cursor.is_none());
 }
 
 #[test]
@@ -1041,12 +1028,15 @@ fn chat_request_into_data_maps_all_fields() {
         message: "hello".into(),
         parts: vec![json!({"type": "text", "text": "hello"})],
         attachments: vec![json!({"id": "att-1", "kind": "file"})],
+        runtime_system_prompt: Some("Runtime SQL scope db_name: retail.".into()),
         session_id: Some("s1".into()),
         agent_id: Some("a1".into()),
         selected_model: Some(astra_services::runs::SelectedModelRequest {
+            id: None,
             model: "gpt-4".into(),
             gateway: None,
         }),
+        capability_descriptors: None,
         agent_binding: None,
         runtime_auth: None,
         runtime_profile: None,
@@ -1056,6 +1046,7 @@ fn chat_request_into_data_maps_all_fields() {
             url: "http://catalog:8081/api/v1/llm-token".into(),
             timeout_ms: Some(2500),
         }),
+        skill_search: Some(astra_core::SkillSearchSettings::default()),
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
@@ -1069,6 +1060,7 @@ fn chat_request_into_data_maps_all_fields() {
                 "Bearer runtime-token".to_string(),
             )]),
         }],
+        mcp_binding_ids: None,
         context: Some(ctx.clone()),
         edge_executor_id: Some("edge-1".into()),
         capabilities: vec!["bash".into(), "fs".into()],
@@ -1089,6 +1081,10 @@ fn chat_request_into_data_maps_all_fields() {
         data.attachments,
         vec![json!({"id": "att-1", "kind": "file"})]
     );
+    assert_eq!(
+        data.runtime_system_prompt.as_deref(),
+        Some("Runtime SQL scope db_name: retail.")
+    );
     assert_eq!(data.session_id.as_deref(), Some("s1"));
     assert_eq!(data.agent_id.as_deref(), Some("a1"));
     assert_eq!(data.model.as_deref(), Some("gpt-4"));
@@ -1100,8 +1096,13 @@ fn chat_request_into_data_maps_all_fields() {
         data.llm_token_service.as_ref().and_then(|v| v.timeout_ms),
         Some(2500)
     );
+    assert_eq!(
+        data.skill_search,
+        Some(astra_core::SkillSearchSettings::default())
+    );
     assert_eq!(data.runtime_mcp_bindings.len(), 1);
     assert_eq!(data.runtime_mcp_bindings[0].id, "external_nl2sql");
+    assert!(data.mcp_binding_ids.is_none());
     assert_eq!(data.context, Some(ctx));
     assert_eq!(data.edge_executor_id.as_deref(), Some("edge-1"));
     assert_eq!(data.capabilities, vec!["bash", "fs"]);
@@ -1127,11 +1128,13 @@ fn chat_request_into_data_maps_defaults() {
     assert_eq!(data.message, "test");
     assert!(data.parts.is_empty());
     assert!(data.attachments.is_empty());
+    assert!(data.runtime_system_prompt.is_none());
     assert!(data.session_id.is_none());
     assert!(data.agent_id.is_none());
     assert!(data.model.is_none());
     assert!(data.llm_token_service.is_none());
     assert!(data.runtime_mcp_bindings.is_empty());
+    assert!(data.mcp_binding_ids.is_none());
     assert!(data.context.is_none());
     assert!(data.edge_executor_id.is_none());
     assert!(data.capabilities.is_empty());
@@ -1147,19 +1150,23 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         message: "do step".into(),
         parts: Vec::new(),
         attachments: Vec::new(),
+        runtime_system_prompt: None,
         session_id: None,
         agent_id: None,
         selected_model: None,
+        capability_descriptors: None,
         agent_binding: None,
         runtime_auth: None,
         runtime_profile: None,
         workspace_binding: None,
         executor_binding: None,
         llm_token_service: None,
+        skill_search: None,
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
         runtime_mcp_bindings: Vec::new(),
+        mcp_binding_ids: None,
         context: None,
         edge_executor_id: None,
         capabilities: Vec::new(),

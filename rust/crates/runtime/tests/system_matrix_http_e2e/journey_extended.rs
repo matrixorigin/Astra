@@ -8,8 +8,8 @@ use sqlx::Row;
 use std::time::Duration;
 
 use super::harness::{
-    E2E_PASSWORD, E2eAuthMode, bootstrap, collect_sse_body_text, delete_json, delete_no_content,
-    get_json, grant_astra_admin_role, post_empty, post_json, put_json, seeded_selected_model,
+    E2E_PASSWORD, bootstrap, collect_sse_body_text, delete_json, delete_no_content, get_json,
+    grant_astra_admin_role, post_empty, post_json, put_json, seeded_selected_model,
 };
 use astra_services::session_journal::{JournalEventType, read_journal};
 use axum::{body::Body, http::Request};
@@ -140,87 +140,56 @@ pub async fn run_auth_and_session_negative_paths() {
         "GET /sessions without auth: {j_sess}"
     );
 
-    match b.auth_mode {
-        E2eAuthMode::LocalJwt => {
-            let dup_email = format!("dup_{}@e2e.test", ctx.suffix);
-            let (st_dup, j_dup) = post_json(
-                app,
-                "/auth/register",
-                None,
-                json!({
-                    "username": ctx.username,
-                    "email": dup_email,
-                    "password": "DifferentPass-1",
-                    "display_name": "duplicate probe"
-                }),
-            )
-            .await;
-            assert_eq!(
-                st_dup,
-                StatusCode::BAD_REQUEST,
-                "duplicate username register: {j_dup}"
-            );
-            assert_eq!(
-                j_dup["detail"].as_str(),
-                Some("Username already exists"),
-                "duplicate username detail: {j_dup}"
-            );
+    let dup_email = format!("dup_{}@e2e.test", ctx.suffix);
+    let (st_dup, j_dup) = post_json(
+        app,
+        "/auth/register",
+        None,
+        json!({
+            "username": ctx.username,
+            "email": dup_email,
+            "password": "DifferentPass-1",
+            "display_name": "duplicate probe"
+        }),
+    )
+    .await;
+    assert_eq!(
+        st_dup,
+        StatusCode::BAD_REQUEST,
+        "duplicate username register: {j_dup}"
+    );
+    assert_eq!(
+        j_dup["detail"].as_str(),
+        Some("Username already exists"),
+        "duplicate username detail: {j_dup}"
+    );
 
-            let (st_bad_login, j_bad) = post_json(
-                app,
-                "/auth/login",
-                None,
-                json!({ "username": ctx.username, "password": "wrong-password-not-real" }),
-            )
-            .await;
-            assert_eq!(
-                st_bad_login,
-                StatusCode::UNAUTHORIZED,
-                "bad password login: {j_bad}"
-            );
-            assert_eq!(
-                j_bad["detail"].as_str(),
-                Some("Invalid username or password"),
-                "bad login detail: {j_bad}"
-            );
+    let (st_bad_login, j_bad) = post_json(
+        app,
+        "/auth/login",
+        None,
+        json!({ "username": ctx.username, "password": "wrong-password-not-real" }),
+    )
+    .await;
+    assert_eq!(
+        st_bad_login,
+        StatusCode::UNAUTHORIZED,
+        "bad password login: {j_bad}"
+    );
+    assert_eq!(
+        j_bad["detail"].as_str(),
+        Some("Invalid username or password"),
+        "bad login detail: {j_bad}"
+    );
 
-            // Sanity: login still works after negative calls.
-            let (st_ok, j_ok) = post_json(
-                app,
-                "/auth/login",
-                None,
-                json!({ "username": ctx.username, "password": E2E_PASSWORD }),
-            )
-            .await;
-            assert_eq!(st_ok, StatusCode::OK, "login still ok: {j_ok}");
-        }
-        E2eAuthMode::TrustedMoi => {
-            for (path, payload) in [
-                (
-                    "/auth/register",
-                    json!({
-                        "username": "should-not-work",
-                        "email": "should-not-work@e2e.test",
-                        "password": "ignored"
-                    }),
-                ),
-                ("/auth/login", json!({ "username": "x", "password": "y" })),
-                ("/auth/refresh", json!({ "refresh_token": "not-used" })),
-            ] {
-                let (status, body) = post_json(app, path, None, payload).await;
-                assert_eq!(
-                    status,
-                    StatusCode::FORBIDDEN,
-                    "trusted_moi local auth endpoint should be disabled: {path} {body}"
-                );
-                assert_eq!(
-                    body["detail"].as_str(),
-                    Some("Local auth endpoints are disabled in trusted_moi mode"),
-                    "trusted_moi local auth detail: {path} {body}"
-                );
-            }
-        }
-    }
+    let (st_ok, j_ok) = post_json(
+        app,
+        "/auth/login",
+        None,
+        json!({ "username": ctx.username, "password": E2E_PASSWORD }),
+    )
+    .await;
+    assert_eq!(st_ok, StatusCode::OK, "login still ok: {j_ok}");
 
     ctx.pool.close().await;
 }
@@ -316,7 +285,7 @@ pub async fn run_edge_callback_http_boundary_failures() {
         None,
         json!({
             "request_id": format!("tool-unauth-{}", ctx.suffix),
-            "status": "completed",
+            "status": "ok",
             "output": "ignored",
             "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                 &format!("tool-unauth-{}", ctx.suffix),
@@ -352,7 +321,7 @@ pub async fn run_edge_callback_http_boundary_failures() {
         "/tools/result",
         Some(auth.as_str()),
         json!({
-            "status": "completed",
+            "status": "ok",
             "output": "missing request id"
         }),
     )
@@ -394,8 +363,8 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
     let payload = json!({
         "agent_id": "system-matrix-dup-tool-agent",
         "session_id": ctx.session_id,
-        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "read the duplicate path" }],
+        "selected_model": seeded_selected_model(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -464,7 +433,7 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
                     Some(b.auth_header.as_str()),
                     json!({
                         "request_id": "tc-dup-tool-1",
-                        "status": "completed",
+                        "status": "ok",
                         "output": tool_output,
                         "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                             "tc-dup-tool-1",
@@ -567,8 +536,8 @@ pub async fn run_chat_turn_partial_batch_failure() {
     let payload = json!({
         "agent_id": "system-matrix-partial-batch-agent",
         "session_id": ctx.session_id,
-        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "read two files and continue even if one fails" }],
+        "selected_model": seeded_selected_model(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -644,7 +613,7 @@ pub async fn run_chat_turn_partial_batch_failure() {
                 Some(b.auth_header.as_str()),
                 json!({
                     "request_id": "tc-partial-1",
-                    "status": "completed",
+                    "status": "ok",
                     "output": ok_output,
                     "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                         "tc-partial-1",
@@ -667,7 +636,7 @@ pub async fn run_chat_turn_partial_batch_failure() {
                 Some(b.auth_header.as_str()),
                 json!({
                     "request_id": "tc-partial-2",
-                    "status": "failed",
+                    "status": "error",
                     "output": err_output,
                     "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                         "tc-partial-2",
@@ -734,8 +703,8 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
     let payload = json!({
         "agent_id": "system-matrix-race-agent",
         "session_id": ctx.session_id,
-        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "read two files even if callbacks arrive out of order" }],
+        "selected_model": seeded_selected_model(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -815,7 +784,7 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
                     Some(b.auth_header.as_str()),
                     json!({
                         "request_id": "tc-race-2",
-                        "status": "completed",
+                        "status": "ok",
                         "output": second_output,
                         "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                             "tc-race-2",
@@ -831,7 +800,7 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
                         Some(b.auth_header.as_str()),
                         json!({
                             "request_id": "tc-race-1",
-                            "status": "completed",
+                            "status": "ok",
                             "output": first_output,
                             "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                                 "tc-race-1",
@@ -902,8 +871,8 @@ pub async fn run_same_session_concurrent_turns_isolated() {
     let payload_a = json!({
         "agent_id": "system-matrix-overlap-agent",
         "session_id": session_id,
-        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "same-session overlap request A" }],
+        "selected_model": seeded_selected_model(ctx),
         "test_llm_rounds": [{
             "full_text": "Overlap response A"
         }]
@@ -911,8 +880,8 @@ pub async fn run_same_session_concurrent_turns_isolated() {
     let payload_b = json!({
         "agent_id": "system-matrix-overlap-agent",
         "session_id": ctx.session_id,
-        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "same-session overlap request B" }],
+        "selected_model": seeded_selected_model(ctx),
         "test_llm_rounds": [{
             "full_text": "Overlap response B"
         }]
@@ -1039,8 +1008,8 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
     let tool_turn_payload = json!({
         "agent_id": "system-matrix-overlap-agent",
         "session_id": ctx.session_id,
-        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "waiting overlap tool turn" }],
+        "selected_model": seeded_selected_model(ctx),
         "edge_tools": [{
             "type": "function",
             "function": {
@@ -1144,8 +1113,8 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
                 json!({
                     "agent_id": "system-matrix-overlap-agent",
                     "session_id": ctx.session_id,
-                    "selected_model": seeded_selected_model(ctx),
                     "messages": [{ "role": "user", "content": "waiting overlap plain turn" }],
+                    "selected_model": seeded_selected_model(ctx),
                     "test_llm_rounds": [{
                         "full_text": "Waiting overlap plain turn finished."
                     }]
@@ -1161,7 +1130,7 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
                 Some(b.auth_header.as_str()),
                 json!({
                     "request_id": "tc-overlap-wait-1",
-                    "status": "completed",
+                    "status": "ok",
                     "output": tool_output,
                     "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
                         "tc-overlap-wait-1",
@@ -1231,26 +1200,6 @@ pub async fn run_models_admin_crud_with_db() {
     let auth = b.auth_header.as_str();
     let pool = &ctx.pool;
     let model_name = format!("e2e_mtx_mdl_{}", ctx.suffix);
-
-    if b.auth_mode == E2eAuthMode::TrustedMoi {
-        let (st_forbidden, body) = post_json(
-            app,
-            "/models",
-            Some(auth),
-            json!({
-                "name": model_name,
-                "provider": "mock",
-                "api_key": "e2e-key-not-used"
-            }),
-        )
-        .await;
-        assert!(
-            st_forbidden == StatusCode::UNAUTHORIZED || st_forbidden == StatusCode::FORBIDDEN,
-            "trusted_moi admin model CRUD should be blocked by current admin auth path: {body}"
-        );
-        ctx.pool.close().await;
-        return;
-    }
 
     grant_astra_admin_role(&ctx.pool, &ctx.user_id).await;
 

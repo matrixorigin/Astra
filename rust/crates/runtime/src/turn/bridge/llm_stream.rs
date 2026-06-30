@@ -7,8 +7,7 @@
 //! - Per-model rate-limit cooldown tracking
 //! - Degraded tool-call recovery from XML-like text content
 
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use axum::body::Bytes;
@@ -18,10 +17,10 @@ use uuid::Uuid;
 
 use crate::turn::bridge::sse_helpers::render_sse;
 use crate::turn::llm::client::{
-    LLM_MAX_RETRIES, LlmCancel, apply_provider_auth, build_provider_request_body_with_overrides,
-    consolidate_system_messages, llm_request_url_for_provider, llm_retry_base_ms,
-    parse_openai_sse_json_stream, provider_uses_anthropic_messages, provider_uses_bedrock_converse,
-    sleep_ms_or_llm_cancel,
+    LLM_MAX_RETRIES, LlmCancel, apply_llm_header_overrides, apply_provider_auth,
+    build_provider_request_body_with_overrides, consolidate_system_messages, llm_request_url,
+    llm_request_url_for_provider, llm_retry_base_ms, parse_openai_sse_json_stream,
+    provider_uses_anthropic_messages, provider_uses_bedrock_converse, sleep_ms_or_llm_cancel,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
@@ -981,6 +980,9 @@ pub(crate) async fn call_llm_stream(
         client_cancel,
         thinking,
         None,
+        None,
+        None,
+        None,
     )
     .await
 }
@@ -999,6 +1001,9 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
     client_cancel: Option<Arc<CancellationToken>>,
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     request_body_overrides: Option<&Map<String, Value>>,
+    header_overrides: Option<&HashMap<String, String>>,
+    completions_url_override: Option<&str>,
+    request_timeout: Option<Duration>,
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
     let cooldown = rate_limit_cooldown();
     // `model_key` addresses the per-local-row rate-limit state. Two local
@@ -1067,7 +1072,13 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
         request_body_overrides,
     );
 
-    let url = llm_request_url_for_provider(base_url, provider, upstream_name, true);
+    let url = llm_request_url(
+        base_url,
+        completions_url_override,
+        provider,
+        upstream_name,
+        true,
+    );
     let req_bytes = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
 
     // Total budget guard: abort if retries + cooldown delays exceed the budget.
@@ -1093,7 +1104,11 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
-        req = apply_provider_auth(req, provider, api_key, None);
+        req = apply_provider_auth(req, provider, api_key, header_overrides);
+        req = apply_llm_header_overrides(req, header_overrides);
+        if let Some(timeout) = request_timeout {
+            req = req.timeout(timeout);
+        }
 
         let request_start = std::time::Instant::now();
         let response = match req.json(&body).send().await {
@@ -1137,6 +1152,11 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
             let api_key_for_fallback = api_key.to_string();
             let base_url_for_fallback = base_url.to_string();
             let provider_for_fallback = provider.to_string();
+            let header_overrides_for_fallback = header_overrides.cloned();
+            let request_body_overrides_for_fallback = request_body_overrides.cloned();
+            let completions_url_override_for_fallback =
+                completions_url_override.map(str::to_string);
+            let request_timeout_for_fallback = request_timeout;
             let max_out_for_fallback = max_output_tokens;
             let idle_pre = crate::turn::llm::client::stream_idle_timeout();
             let idle_post = crate::turn::llm::client::stream_idle_timeout_after_progress();
@@ -1194,10 +1214,10 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                                         max_out_for_fallback,
                                         fb_timeout,
                                         wire_model_for_fallback.as_deref(),
-                                        None,
-                                        None,
-                                        None,
-                                        None,
+                                        header_overrides_for_fallback.as_ref(),
+                                        request_body_overrides_for_fallback.as_ref(),
+                                        completions_url_override_for_fallback.as_deref(),
+                                        request_timeout_for_fallback,
                                         &astra_turn_core::thinking_config::ThinkingConfig::Off,
                                     )
                                     .await
@@ -1290,10 +1310,10 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                                             max_out_for_fallback,
                                             fb_timeout,
                                             wire_model_for_fallback.as_deref(),
-                                            None,
-                                            None,
-                                            None,
-                                            None,
+                                            header_overrides_for_fallback.as_ref(),
+                                            request_body_overrides_for_fallback.as_ref(),
+                                            completions_url_override_for_fallback.as_deref(),
+                                            request_timeout_for_fallback,
                                             &astra_turn_core::thinking_config::ThinkingConfig::Off,
                                         )
                                         .await

@@ -3406,7 +3406,7 @@ mod tests {
         crate::tool_registry::surface::ToolSurface::build(
             schemas,
             &astra_config::ToolSurfaceConfig {
-                always_load_tools: vec![],
+                pinned_tools: vec![],
             },
             &[],
         )
@@ -3446,7 +3446,7 @@ mod tests {
         let surface = crate::tool_registry::surface::ToolSurface::build(
             schemas,
             &astra_config::ToolSurfaceConfig {
-                always_load_tools: vec![],
+                pinned_tools: vec![],
             },
             &[],
         );
@@ -3485,7 +3485,7 @@ mod tests {
         let surface = crate::tool_registry::surface::ToolSurface::build(
             schemas,
             &astra_config::ToolSurfaceConfig {
-                always_load_tools: vec![],
+                pinned_tools: vec![],
             },
             &[],
         );
@@ -3545,7 +3545,7 @@ mod tests {
         let surface = crate::tool_registry::surface::ToolSurface::build(
             schemas,
             &astra_config::ToolSurfaceConfig {
-                always_load_tools: vec![],
+                pinned_tools: vec![],
             },
             &[],
         );

@@ -538,15 +538,76 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS auth_refresh_tokens (
             token_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NULL,
             token_hash VARCHAR(255) NOT NULL,
             token_prefix VARCHAR(16) NULL,
             expires_at DATETIME(6) NOT NULL,
             is_revoked SMALLINT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_auth_refresh_tokens_hash (token_hash),
+            INDEX idx_auth_refresh_tokens_session (session_id),
             INDEX idx_auth_refresh_tokens_user_expires (user_id, expires_at),
             INDEX idx_auth_refresh_tokens_expires_at (expires_at),
             INDEX idx_auth_refresh_tokens_prefix (token_prefix)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "auth_refresh_tokens",
+        "session_id",
+        "ALTER TABLE auth_refresh_tokens ADD COLUMN session_id VARCHAR(64) NULL",
+    )
+    .await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "auth_refresh_tokens",
+        "idx_auth_refresh_tokens_session",
+        "ALTER TABLE auth_refresh_tokens ADD INDEX idx_auth_refresh_tokens_session (session_id)",
+    )
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS auth_external_identities (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            provider_id VARCHAR(64) NOT NULL,
+            external_subject VARCHAR(255) NOT NULL,
+            astra_user_id VARCHAR(64) NOT NULL,
+            username VARCHAR(255) NOT NULL,
+            email VARCHAR(255) NULL,
+            display_name VARCHAR(255) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_auth_external_identity_provider_subject (provider_id, external_subject),
+            INDEX idx_auth_external_identities_user (astra_user_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS auth_external_sessions (
+            external_session_id VARCHAR(64) PRIMARY KEY,
+            provider_id VARCHAR(64) NOT NULL,
+            astra_user_id VARCHAR(64) NOT NULL,
+            external_subject VARCHAR(255) NOT NULL,
+            provider_scope_id VARCHAR(255) NOT NULL,
+            provider_scope_display_name VARCHAR(255) NULL,
+            encrypted_provider_session_handle TEXT NOT NULL,
+            encrypted_runtime_context_json TEXT NULL,
+            runtime_context_expires_at DATETIME(6) NULL,
+            status VARCHAR(32) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            expires_at DATETIME(6) NOT NULL,
+            INDEX idx_auth_external_sessions_user (astra_user_id),
+            INDEX idx_auth_external_sessions_provider_subject (provider_id, external_subject),
+            INDEX idx_auth_external_sessions_scope (provider_id, provider_scope_id),
+            INDEX idx_auth_external_sessions_status_expires (status, expires_at)
         )",
     )
     .execute(&pool)
@@ -733,6 +794,56 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
+
+    for (column, ddl) in [
+        (
+            "agent_binding_id",
+            "ALTER TABLE agent_runs ADD COLUMN agent_binding_id VARCHAR(64) NULL",
+        ),
+        (
+            "agent_binding_name",
+            "ALTER TABLE agent_runs ADD COLUMN agent_binding_name VARCHAR(255) NULL",
+        ),
+        (
+            "agent_binding_schema_version",
+            "ALTER TABLE agent_runs ADD COLUMN agent_binding_schema_version VARCHAR(32) NULL",
+        ),
+        (
+            "selected_model_json",
+            "ALTER TABLE agent_runs ADD COLUMN selected_model_json LONGTEXT NULL",
+        ),
+        (
+            "selected_model_name",
+            "ALTER TABLE agent_runs ADD COLUMN selected_model_name VARCHAR(255) NULL",
+        ),
+        (
+            "selected_model_gateway",
+            "ALTER TABLE agent_runs ADD COLUMN selected_model_gateway VARCHAR(128) NULL",
+        ),
+        (
+            "capability_server_refs_json",
+            "ALTER TABLE agent_runs ADD COLUMN capability_server_refs_json LONGTEXT NULL",
+        ),
+        (
+            "runtime_profile",
+            "ALTER TABLE agent_runs ADD COLUMN runtime_profile VARCHAR(64) NULL",
+        ),
+    ] {
+        add_column_if_missing(&pool, &settings.database, "agent_runs", column, ddl).await?;
+    }
+
+    for (index, ddl) in [
+        (
+            "idx_agent_runs_binding",
+            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_binding (agent_binding_id, created_at)",
+        ),
+        (
+            "idx_agent_runs_model_gateway",
+            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_model_gateway (selected_model_gateway, created_at)",
+        ),
+    ] {
+        add_index_if_missing(&pool, &settings.database, "agent_runs", index, ddl).await?;
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_run_events (
@@ -1708,6 +1819,22 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
+    query(
+        "CREATE TABLE IF NOT EXISTS model_gateways (
+            id VARCHAR(128) PRIMARY KEY,
+            resolve_url LONGTEXT NOT NULL,
+            model_protocol VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            metadata_json LONGTEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            disabled_at DATETIME(6) NULL,
+            INDEX idx_model_gateways_status_created (status, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
     // via `astra admin config set/get/unset` (first key: `reasoning_model_name`).
     query(
@@ -1898,6 +2025,28 @@ pub async fn ensure_core_schema(
             UNIQUE KEY uq_edge_dispatch_request_id (request_id),
             INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status),
             INDEX idx_edge_dispatch_created (created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_bindings (
+            id VARCHAR(64) PRIMARY KEY,
+            binding_name VARCHAR(255) NOT NULL,
+            idempotency_key VARCHAR(255) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            agent_md LONGTEXT NOT NULL,
+            capability_servers_json LONGTEXT NOT NULL,
+            runtime_policy_json LONGTEXT NOT NULL,
+            metadata_json LONGTEXT NULL,
+            binding_schema_version VARCHAR(32) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            disabled_at DATETIME(6) NULL,
+            UNIQUE KEY uq_agent_bindings_name (binding_name),
+            UNIQUE KEY uq_agent_bindings_idempotency_key (idempotency_key),
+            INDEX idx_agent_bindings_status_created (status, created_at)
         )",
     )
     .execute(&pool)

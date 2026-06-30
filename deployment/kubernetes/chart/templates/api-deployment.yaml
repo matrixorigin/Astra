@@ -14,6 +14,10 @@ spec:
       component: api
   template:
     metadata:
+      {{- if .Values.api.serverConfig.enabled }}
+      annotations:
+        checksum/server-config: {{ .Values.api.serverConfig.content | sha256sum }}
+      {{- end }}
       labels:
         app: astra
         component: api
@@ -62,6 +66,22 @@ spec:
             port: http
           initialDelaySeconds: 15
           periodSeconds: 30
+        {{- if .Values.api.serverConfig.enabled }}
+        volumeMounts:
+        - name: server-config
+          mountPath: /etc/astra/server.toml
+          subPath: server.toml
+          readOnly: true
+        {{- end }}
+      {{- if .Values.api.serverConfig.enabled }}
+      volumes:
+      - name: server-config
+        configMap:
+          name: {{ .Release.Name }}-api-server-config
+          items:
+          - key: server.toml
+            path: server.toml
+      {{- end }}
 ---
 {{- if .Values.api.hpa.enabled }}
 apiVersion: autoscaling/v2

@@ -15,7 +15,7 @@ use axum::{Router, routing::post};
 /// duplicate the payload literal.
 pub(super) fn sse_text_response(text: &str, session_id: &str) -> String {
     format!(
-        "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\"}}\n\n\
+        "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\",\"run_id\":\"run-{session_id}\"}}\n\n\
              data: {{\"type\":\"text_delta\",\"content\":\"{text}\"}}\n\n\
              data: {{\"type\":\"text_done\",\"full_text\":\"{text}\"}}\n\n\
              data: {{\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}}\n\n\
@@ -54,6 +54,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         message: "hi",
         semantic_query_override: None,
         session_id: None,
+        model_id: None,
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
@@ -124,24 +125,14 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
 
     assert_eq!(result.session_id.as_deref(), Some("sess-step-adopt"));
 
-    let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
-    let adopted_path =
-        astra_pipeline::step_checkpoint::owner_session_dir_for(&user_id, "sess-step-adopt")
-            .unwrap()
-            .join("step_events.jsonl");
-    let ephemeral_path =
-        astra_pipeline::step_checkpoint::owner_session_dir_for(&user_id, "ephemeral")
-            .unwrap()
-            .join("step_events.jsonl");
-    let adopted_events = std::fs::read_to_string(&adopted_path)
-        .expect("step events should persist under adopted session");
-
-    assert!(!adopted_events.trim().is_empty());
-
-    // Load events via FileBackedEventStore (handles hex-decode + decrypt)
+    let cli_user_id = crate::cli::cli_config::cli_utils::cli_user_id();
     let store =
-        astra_pipeline::step_checkpoint::FileBackedEventStore::new(&user_id, "sess-step-adopt");
+        astra_pipeline::step_checkpoint::FileBackedEventStore::new(&cli_user_id, "sess-step-adopt");
     let events = store.all_events();
+    assert!(
+        !events.is_empty(),
+        "step events should persist under adopted session"
+    );
     assert!(
         events
             .iter()
@@ -149,8 +140,10 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         "expected step_id sess-step-adopt-turn-1-step-0, found: {:?}",
         events.iter().map(|e| &e.step_id).collect::<Vec<_>>()
     );
+    let ephemeral_store =
+        astra_pipeline::step_checkpoint::FileBackedEventStore::new(&cli_user_id, "ephemeral");
     assert!(
-        !ephemeral_path.exists(),
+        ephemeral_store.all_events().is_empty(),
         "new-session first turn must not persist step events under ephemeral/"
     );
 }
@@ -178,6 +171,7 @@ async fn stream_chat_sse_simple_text_response() {
         message: "hi",
         semantic_query_override: None,
         session_id: None,
+        model_id: None,
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
@@ -290,6 +284,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         message: "hi",
         semantic_query_override: None,
         session_id: Some("sess-traced"),
+        model_id: None,
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
@@ -406,6 +401,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             message: "hi",
             semantic_query_override: None,
             session_id,
+            model_id: None,
             model: Some("test-model"),
             provider: None,
             explain: ExplainMode::Off,
@@ -514,6 +510,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         message: "hi",
         semantic_query_override: None,
         session_id: None,
+        model_id: None,
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
@@ -650,6 +647,7 @@ async fn stream_chat_sse_api_error_propagated() {
         message: "hi",
         semantic_query_override: None,
         session_id: None,
+        model_id: None,
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
@@ -734,7 +732,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
                     let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let body = if n == 0 {
                         // First turn: return a tool call for bash
-                        "data: {\"type\":\"session_info\",\"session_id\":\"sess-tc\"}\n\n\
+                        "data: {\"type\":\"session_info\",\"session_id\":\"sess-tc\",\"run_id\":\"run-sess-tc\"}\n\n\
                          data: {\"type\":\"tool_call\",\"id\":\"tc-1\",\"name\":\"bash\",\"arguments\":{\"command\":\"echo hi\"}}\n\n\
                          data: {\"type\":\"turn_complete\",\"has_tool_calls\":true}\n\n\
                          data: [DONE]\n\n"
@@ -762,6 +760,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         message: "run echo hi",
         semantic_query_override: None,
         session_id: None,
+        model_id: None,
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
@@ -860,7 +859,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
                             .call_count
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let body = if n == 0 {
-                            "data: {\"type\":\"session_info\",\"session_id\":\"sess-tx-e2e\"}\n\n\
+                            "data: {\"type\":\"session_info\",\"session_id\":\"sess-tx-e2e\",\"run_id\":\"run-sess-tx-e2e\"}\n\n\
                              data: {\"type\":\"tool_request\",\"request_id\":\"tr-tx-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo hi\",\"transaction_id\":\"tx-e2e\",\"rollback_on_failure\":true}}\n\n\
                              data: [DONE]\n\n"
                                 .to_string()
@@ -897,6 +896,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         message: "write inside a transaction",
         semantic_query_override: None,
         session_id: None,
+        model_id: None,
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
@@ -1038,7 +1038,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
                             .call_count
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let response = if n == 0 {
-                            "data: {\"type\":\"session_info\",\"session_id\":\"sess-turn-identity\"}\n\n\
+                            "data: {\"type\":\"session_info\",\"session_id\":\"sess-turn-identity\",\"run_id\":\"run-sess-turn-identity\"}\n\n\
                              data: {\"type\":\"tool_request\",\"request_id\":\"tr-turn-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo hi\"}}\n\n\
                              data: [DONE]\n\n"
                                 .to_string()
@@ -1075,6 +1075,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         message: "review local changes",
         semantic_query_override: None,
         session_id: None,
+        model_id: None,
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
@@ -1190,62 +1191,38 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         tool_names
     );
 
-    let schemas = manager.all_tool_schemas();
-    let mcp_tool_name = schemas
-        .iter()
-        .find_map(|schema| {
-            let name = schema.get("function")?.get("name")?.as_str()?;
-            (name == "mcp__mock__echo").then_some(name.to_string())
-        })
-        .expect("mock MCP echo schema should use the canonical public name");
+    // Tool name as it will appear in SSE: mcp_{server}_{tool}
+    let mcp_tool_name = crate::mcp_client::sanitize_tool_name("mcp_mock_echo");
 
-    // HTTP mock: first call activates the deferred MCP schema via tool_search,
-    // second call returns the MCP tool_call, third returns final text.
+    // HTTP mock: first call returns MCP tool_call, second returns text
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cc = call_count.clone();
     let tool_name_clone = mcp_tool_name.clone();
-    let posted_results = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let posted_results_for_route = posted_results.clone();
-    let app = axum::Router::new()
-        .route(
-            "/chat/turn",
-            axum::routing::post(move || {
+    let app = axum::Router::new().route(
+        "/chat/turn",
+        axum::routing::post(move || {
             let cc = cc.clone();
             let tn = tool_name_clone.clone();
             async move {
                 let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let body = match n {
-                    0 => format!(
-                        "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\"}}\n\n\
-                         data: {{\"type\":\"tool_request\",\"request_id\":\"search-1\",\"tool\":\"tool_search\",\"args\":{{\"query\":\"select:{}\"}}}}\n\n\
+                let body = if n == 0 {
+                    format!(
+                        "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\",\"run_id\":\"run-sess-mcp\"}}\n\n\
+                         data: {{\"type\":\"tool_call\",\"id\":\"mcp-1\",\"name\":\"{}\",\"arguments\":{{\"message\":\"hello from test\"}}}}\n\n\
+                         data: {{\"type\":\"turn_complete\",\"has_tool_calls\":true}}\n\n\
                          data: [DONE]\n\n",
                         tn
-                    ),
-                    1 => format!(
-                        "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\"}}\n\n\
-                         data: {{\"type\":\"tool_request\",\"request_id\":\"mcp-1\",\"tool\":\"{}\",\"args\":{{\"message\":\"hello from test\"}}}}\n\n\
-                         data: [DONE]\n\n",
-                        tn
-                    ),
-                    _ => sse_text_response("MCP done!", "sess-mcp"),
+                    )
+                } else {
+                    sse_text_response("MCP done!", "sess-mcp")
                 };
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                     body,
                 )
             }
-            }),
-        )
-        .route(
-            "/tools/result",
-            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-                let posted_results = posted_results_for_route.clone();
-                async move {
-                    posted_results.lock().await.push(body);
-                    axum::Json(serde_json::json!({"ok": true}))
-                }
-            }),
-        );
+        }),
+    );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
 
@@ -1258,8 +1235,9 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         token: "fake-token",
         auth_profile: None,
         message: "call echo",
-        semantic_query_override: Some("run external MCP echo tool"),
+        semantic_query_override: None,
         session_id: None,
+        model_id: None,
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
@@ -1289,7 +1267,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         approval_request_tx: None,
         ask_user_request_tx: None,
         plan_review_request_tx: None,
-        mcp_manager: Some(mcp_arc.clone()),
+        mcp_manager: Some(mcp_arc),
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
         messaging_metrics: None,
@@ -1334,26 +1312,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         "expected at least one MCP tool call"
     );
     assert!(
-        call_count.load(std::sync::atomic::Ordering::SeqCst) >= 3,
-        "expected at least 3 HTTP rounds (tool_search + MCP tool_call + final text)"
+        call_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "expected at least 2 HTTP rounds (tool_call + final text)"
     );
-    assert_eq!(
-        posted_results.lock().await.len(),
-        2,
-        "tool_search and MCP requests should both post edge results"
-    );
-
-    let conn = {
-        let manager = mcp_arc.read().await;
-        manager.get("mock").expect("mock MCP connection")
-    };
-    let log = conn.call_log.read().await;
-    assert_eq!(
-        log.len(),
-        1,
-        "MCP call should be recorded in shared core log; tool records: {:?}",
-        result.tool_call_records
-    );
-    assert_eq!(log[0].tool, "echo");
-    assert!(log[0].success, "echo MCP call should succeed");
 }

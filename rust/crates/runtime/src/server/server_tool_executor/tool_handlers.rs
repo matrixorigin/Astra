@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use astra_turn_core::tool::schema::{retain_tool_schemas_by_names, tool_schema_name};
+use astra_turn_core::tool::schema::tool_schema_name;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -148,12 +148,7 @@ impl ToolHandler<ServerToolExecutor> for ToolSearchToolHandler {
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
-        let mut pool = context.capability_filtered_server_tool_schemas();
-        pool.extend(context.external_schemas_snapshot("external_schemas_tool_search"));
-        let Some(searchable_names) = context.current_searchable_tool_names() else {
-            return tool_result_from_output(astra_tools::tool_search::tool_search(&[], args));
-        };
-        retain_tool_schemas_by_names(&mut pool, &searchable_names);
+        let pool = context.current_tool_search_pool_schemas();
         tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args))
     }
 }

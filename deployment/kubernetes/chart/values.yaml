@@ -22,6 +22,9 @@ api:
   env: {}
   # Extra env vars, e.g.:
   #   JWT_SECRET: "change-me"
+  serverConfig:
+    enabled: false
+    content: ""
 
 # ─── MatrixOne [opt] ───────────────────────────────────────
 matrixone:

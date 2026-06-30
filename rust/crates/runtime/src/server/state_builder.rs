@@ -28,7 +28,7 @@ pub async fn build_server_state(
         FernetTokenEncryptor::from_key(settings.token_encryption_key.as_deref())
             .map_err(Box::<dyn std::error::Error>::from)?,
     );
-    let auth_service = core::build_auth_service(&settings, &shared_pool)?;
+    let auth_service = core::build_auth_service(&settings, &shared_pool, &shared_encryptor)?;
 
     let state = core::build_core_state(&settings, &shared_pool, &shared_encryptor, auth_service);
     let state = core::install_turn_persistence_services(state, &settings, &shared_pool);

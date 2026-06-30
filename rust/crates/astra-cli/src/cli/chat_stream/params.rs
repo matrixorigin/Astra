@@ -319,6 +319,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// knows the message is an active-thread follow-up attachment.
     pub(crate) semantic_query_override: Option<&'a str>,
     pub(crate) session_id: Option<&'a str>,
+    pub(crate) model_id: Option<String>,
     pub(crate) model: Option<&'a str>,
     /// Explicit provider hint for provider-specific cache/compaction behavior.
     /// Prefer this over model-name heuristics when the resolved provider is known.
@@ -500,6 +501,7 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub auth_profile: Option<&'a str>,
     pub message: &'a str,
+    pub model_id: Option<&'a str>,
     pub model: Option<&'a str>,
     pub provider: Option<&'a str>,
     pub explain: ExplainMode,
@@ -566,6 +568,7 @@ impl<'a> ChatTurnParams<'a> {
             message: ctx.message,
             semantic_query_override: None,
             session_id,
+            model_id: ctx.model_id.map(ToOwned::to_owned),
             model: ctx.model,
             provider: ctx.provider,
             explain: ctx.explain,

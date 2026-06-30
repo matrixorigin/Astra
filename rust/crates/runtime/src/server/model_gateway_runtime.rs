@@ -28,6 +28,8 @@ struct ModelResolveResponse {
 #[serde(deny_unknown_fields)]
 struct ModelInvokeDescriptor {
     url: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 fn model_gateway_http_client() -> &'static reqwest::Client {
@@ -154,10 +156,24 @@ fn validate_descriptor(
         ));
     }
     validate_invoke_url(&descriptor.invoke.url)?;
+    validate_invoke_timeout(descriptor.invoke.timeout_ms)?;
     Ok(LlmTokenServiceConfig {
         url: descriptor.invoke.url,
-        timeout_ms: None,
+        timeout_ms: descriptor.invoke.timeout_ms,
     })
+}
+
+fn validate_invoke_timeout(
+    timeout_ms: Option<u64>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if timeout_ms == Some(0) {
+        return Err(error_response_coded(
+            StatusCode::BAD_GATEWAY,
+            "model gateway descriptor invoke.timeout_ms must be positive when present",
+            "model_gateway_descriptor_invalid",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_invoke_url(url: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -216,6 +232,7 @@ mod tests {
 
     fn selected_model() -> SelectedModelRequest {
         SelectedModelRequest {
+            id: None,
             model: "gpt-4.1".to_string(),
             gateway: Some("gw-1".to_string()),
         }
@@ -232,13 +249,14 @@ mod tests {
                 protocol: ModelProtocol::OpenAiChatCompletions,
                 invoke: ModelInvokeDescriptor {
                     url: "https://models.example.com/v1/chat/completions".to_string(),
+                    timeout_ms: Some(120_000),
                 },
             },
         )
         .expect("descriptor should be accepted");
 
         assert_eq!(config.url, "https://models.example.com/v1/chat/completions");
-        assert_eq!(config.timeout_ms, None);
+        assert_eq!(config.timeout_ms, Some(120_000));
     }
 
     #[test]
@@ -252,6 +270,7 @@ mod tests {
                 protocol: ModelProtocol::OpenAiChatCompletions,
                 invoke: ModelInvokeDescriptor {
                     url: "https://models.example.com/v1/chat/completions".to_string(),
+                    timeout_ms: None,
                 },
             },
         )
@@ -275,10 +294,35 @@ mod tests {
                 protocol: ModelProtocol::OpenAiChatCompletions,
                 invoke: ModelInvokeDescriptor {
                     url: "https://models.example.com/v1/chat/completions?token=secret".to_string(),
+                    timeout_ms: None,
                 },
             },
         )
         .expect_err("invoke URL must not carry query credentials");
+
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            err.1.error_code.as_deref(),
+            Some("model_gateway_descriptor_invalid")
+        );
+    }
+
+    #[test]
+    fn descriptor_rejects_zero_invoke_timeout() {
+        let err = validate_descriptor(
+            &gateway(),
+            &selected_model(),
+            ModelResolveResponse {
+                model: "gpt-4.1".to_string(),
+                status: "ready".to_string(),
+                protocol: ModelProtocol::OpenAiChatCompletions,
+                invoke: ModelInvokeDescriptor {
+                    url: "https://models.example.com/v1/chat/completions".to_string(),
+                    timeout_ms: Some(0),
+                },
+            },
+        )
+        .expect_err("invoke timeout must be positive when present");
 
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -314,7 +358,8 @@ mod tests {
                 "status": "ready",
                 "protocol": "openai_chat_completions",
                 "invoke": {
-                    "url": "https://models.example.com/v1/chat/completions"
+                    "url": "https://models.example.com/v1/chat/completions",
+                    "timeout_ms": 120000
                 }
             }))
         }
@@ -339,6 +384,7 @@ mod tests {
                 .expect("gateway resolve should succeed");
 
         assert_eq!(config.url, "https://models.example.com/v1/chat/completions");
+        assert_eq!(config.timeout_ms, Some(120_000));
         assert_eq!(
             capture.authorization.lock().await.as_deref(),
             Some("Bearer runtime-grant")

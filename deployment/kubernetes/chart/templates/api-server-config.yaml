@@ -1,0 +1,13 @@
+{{- if .Values.api.serverConfig.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-api-server-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: astra
+    component: api
+data:
+  server.toml: |
+{{ .Values.api.serverConfig.content | nindent 4 }}
+{{- end }}

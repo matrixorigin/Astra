@@ -40,8 +40,19 @@ host-facing published port; the API container listens on port `17001`.
 - `ASTRA_JWT_REFRESH_TTL_DAYS` (default `7`)
 - `ASTRA_TOKEN_ENCRYPTION_KEY` (Fernet key)
 - `ASTRA_BRIDGE_SECRET`
-- `ASTRA_AUTH_MODE` — `local_jwt` (default) or `trusted_moi`
-- External-IdP mode only: `ASTRA_EXTERNAL_JWT_SECRET`, `ASTRA_EXTERNAL_JWT_ALGORITHM`, `ASTRA_EXTERNAL_JWT_ISSUER`, `ASTRA_EXTERNAL_JWT_AUDIENCE`, `ASTRA_EXTERNAL_JWT_LEEWAY_SECS`
+
+### External Auth Providers
+
+External identities are configured as server-side providers under `auth.external_providers` in
+`server.toml`. Astra exchanges a provider login for a normal Astra session instead of switching
+the server into a separate auth mode.
+
+```toml
+[auth]
+external_providers = [
+  { id = "moi", display_name = "MOI", external_auth_endpoint = "http://moi-catalog/api/v1/astra/external-auth" }
+]
+```
 
 ### LLM
 

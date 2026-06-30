@@ -413,6 +413,14 @@ pub(crate) async fn prepare_agent_binding_skill_resolver(
     build_resolver(endpoint_url, response.skills)
 }
 
+pub(crate) async fn prepare_runtime_skill_resolver(
+    server_id: &str,
+    endpoint_url: &str,
+    authorization: &str,
+) -> Result<Option<Arc<dyn SkillResolver>>, (StatusCode, Json<ErrorResponse>)> {
+    prepare_agent_binding_skill_resolver(server_id, endpoint_url, authorization).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

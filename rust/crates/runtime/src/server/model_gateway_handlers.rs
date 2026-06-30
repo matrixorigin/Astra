@@ -18,11 +18,19 @@ impl From<&astra_services::ModelGatewayRecord> for ModelGatewayCreateResponse {
 
 pub(super) async fn create_model_gateway_handler(
     State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     request: Result<Json<astra_services::ModelGatewayCreateRequestData>, JsonRejection>,
 ) -> Result<Json<ModelGatewayCreateResponse>, (StatusCode, Json<ErrorResponse>)> {
     let Json(request) = request.map_err(model_gateway_json_rejection_to_error)?;
-    let _user = state.auth_service.current_user(&headers).await?;
+    let _principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(&method, &uri, &headers, "/model-gateways"),
+        )
+        .await?;
     let record = state.model_gateway_service.create_gateway(request).await?;
     Ok(Json((&record).into()))
 }

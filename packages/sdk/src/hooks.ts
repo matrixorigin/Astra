@@ -303,448 +303,434 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
     }
   }, [config.sessionId]);
 
-  const processEvent = useCallback(
-    (event: StreamEvent, generation?: number) => {
-      // Guard against stale events from an aborted stream leaking into the
-      // new stream's state (accumulatedTextRef, toolCallMapRef, etc.).
-      const expectedGeneration = generation ?? streamGenerationRef.current;
-      const isStale = () => streamGenerationRef.current !== expectedGeneration;
+  const processEvent = useCallback((event: StreamEvent, generation?: number) => {
+    // Guard against stale events from an aborted stream leaking into the
+    // new stream's state (accumulatedTextRef, toolCallMapRef, etc.).
+    const expectedGeneration = generation ?? streamGenerationRef.current;
+    const isStale = () => streamGenerationRef.current !== expectedGeneration;
 
-      const upsertToolCall = (
-        callId: string,
-        build: (existing: ToolCall | undefined) => ToolCall,
-      ) => {
-        const existing = toolCallMapRef.current.get(callId);
-        toolCallMapRef.current.set(callId, compactToolCall(build(existing)));
-        dispatch({
-          type: "SET_TOOL_CALLS",
-          toolCalls: Array.from(toolCallMapRef.current.values()),
-        });
-      };
+    const upsertToolCall = (
+      callId: string,
+      build: (existing: ToolCall | undefined) => ToolCall,
+    ) => {
+      const existing = toolCallMapRef.current.get(callId);
+      toolCallMapRef.current.set(callId, compactToolCall(build(existing)));
+      dispatch({
+        type: "SET_TOOL_CALLS",
+        toolCalls: Array.from(toolCallMapRef.current.values()),
+      });
+    };
 
-      const applyRunExecutionBoundary = () => {
-        const fields = runBoundaryFieldsFromEvent(event);
-        dispatch({
-          type: "SET_WORKSPACE_BINDING",
-          workspace: fields.workspace,
-          executor: fields.executor,
-          transport: fields.transport ?? undefined,
-          fallbackPolicy: fields.fallbackPolicy ?? undefined,
-        });
-      };
+    const applyRunExecutionBoundary = () => {
+      const fields = runBoundaryFieldsFromEvent(event);
+      dispatch({
+        type: "SET_WORKSPACE_BINDING",
+        workspace: fields.workspace,
+        executor: fields.executor,
+        transport: fields.transport ?? undefined,
+        fallbackPolicy: fields.fallbackPolicy ?? undefined,
+      });
+    };
 
-      // Drop events from an earlier stream that completed after abort.
-      if (isStale()) {
-        return;
-      }
+    // Drop events from an earlier stream that completed after abort.
+    if (isStale()) {
+      return;
+    }
 
-      if (event.type === "run_blocked") {
+    if (event.type === "run_blocked") {
+      applyRunExecutionBoundary();
+      const reason = extractBlockedReason(event) ?? "blocked";
+      const blockedRunId = runIdFromEvent(event);
+      dispatch({
+        type: "SET_RUN_STATUS",
+        status: "blocked",
+        waitingFor: reason,
+      });
+      if (blockedRunId) dispatch({ type: "SET_RUN_ID", runId: blockedRunId });
+      return;
+    }
+
+    switch (event.type) {
+      case "session_info":
+        dispatch({ type: "SET_SESSION_ID", sessionId: event.session_id });
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        break;
+
+      case "run_started":
         applyRunExecutionBoundary();
-        const reason = extractBlockedReason(event) ?? "blocked";
-        const blockedRunId = runIdFromEvent(event);
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
         dispatch({
           type: "SET_RUN_STATUS",
-          status: "blocked",
-          waitingFor: reason,
+          status: "running",
+          waitingFor: null,
         });
-        if (blockedRunId) dispatch({ type: "SET_RUN_ID", runId: blockedRunId });
-        return;
+        break;
+
+      case "workspace_bound":
+      case "executor_bound":
+      case "executor_status_changed":
+        applyRunExecutionBoundary();
+        break;
+
+      case "run_paused":
+        applyRunExecutionBoundary();
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({ type: "SET_RUN_STATUS", status: "paused" });
+        break;
+
+      case "run_resumed":
+        applyRunExecutionBoundary();
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status: "running",
+          waitingFor: null,
+        });
+        break;
+
+      case "run_waiting": {
+        applyRunExecutionBoundary();
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        const projection = projectRunWaitingState(event);
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status: projection.status,
+          waitingFor: projection.waitingFor,
+        });
+        break;
       }
 
-      switch (event.type) {
-        case "session_info":
-          dispatch({ type: "SET_SESSION_ID", sessionId: event.session_id });
-          if (event.run_id)
-            dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-          break;
+      case "run_error":
+        applyRunExecutionBoundary();
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status: "failed",
+          waitingFor: null,
+        });
+        dispatch({
+          type: "SET_ERROR",
+          error: event.message ?? event.error ?? "Astra run failed.",
+        });
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
+        });
+        break;
 
-        case "run_started":
-          applyRunExecutionBoundary();
-          if (event.run_id)
-            dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-          dispatch({
-            type: "SET_RUN_STATUS",
-            status: "running",
-            waitingFor: null,
-          });
-          break;
+      case "run_interrupted":
+        applyRunExecutionBoundary();
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status: "paused",
+          waitingFor: event.waiting_for ?? "user_resume",
+        });
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
+        });
+        break;
 
-        case "workspace_bound":
-        case "executor_bound":
-        case "executor_status_changed":
-          applyRunExecutionBoundary();
-          break;
+      case "text_delta":
+        accumulatedTextRef.current += event.content;
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [
+                ...prev.slice(0, -1),
+                { ...last, content: accumulatedTextRef.current },
+              ];
+            }
+            return prev;
+          },
+        });
+        break;
 
-        case "run_paused":
-          applyRunExecutionBoundary();
-          if (event.run_id)
-            dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-          dispatch({ type: "SET_RUN_STATUS", status: "paused" });
-          break;
-
-        case "run_resumed":
-          applyRunExecutionBoundary();
-          if (event.run_id)
-            dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-          dispatch({
-            type: "SET_RUN_STATUS",
-            status: "running",
-            waitingFor: null,
-          });
-          break;
-
-        case "run_waiting": {
-          applyRunExecutionBoundary();
-          if (event.run_id)
-            dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-          const projection = projectRunWaitingState(event);
-          dispatch({
-            type: "SET_RUN_STATUS",
-            status: projection.status,
-            waitingFor: projection.waitingFor,
-          });
-          break;
-        }
-
-        case "run_error":
-          applyRunExecutionBoundary();
-          if (event.run_id)
-            dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-          dispatch({
-            type: "SET_RUN_STATUS",
-            status: "failed",
-            waitingFor: null,
-          });
-          dispatch({
-            type: "SET_ERROR",
-            error: event.message ?? event.error ?? "Astra run failed.",
-          });
-          dispatch({ type: "SET_STREAMING", isStreaming: false });
-          dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
-          dispatch({
-            type: "SET_MESSAGES",
-            messages: (prev) => {
-              const last = prev[prev.length - 1];
-              if (last?.role === "assistant" && last.streaming) {
-                return [...prev.slice(0, -1), { ...last, streaming: false }];
-              }
-              return prev;
-            },
-          });
-          break;
-
-        case "run_interrupted":
-          applyRunExecutionBoundary();
-          if (event.run_id)
-            dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-          dispatch({
-            type: "SET_RUN_STATUS",
-            status: "paused",
-            waitingFor: event.waiting_for ?? "user_resume",
-          });
-          dispatch({ type: "SET_STREAMING", isStreaming: false });
-          dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
-          dispatch({
-            type: "SET_MESSAGES",
-            messages: (prev) => {
-              const last = prev[prev.length - 1];
-              if (last?.role === "assistant" && last.streaming) {
-                return [...prev.slice(0, -1), { ...last, streaming: false }];
-              }
-              return prev;
-            },
-          });
-          break;
-
-        case "text_delta":
-          accumulatedTextRef.current += event.content;
-          dispatch({
-            type: "SET_MESSAGES",
-            messages: (prev) => {
-              const last = prev[prev.length - 1];
-              if (last?.role === "assistant" && last.streaming) {
-                return [
-                  ...prev.slice(0, -1),
-                  { ...last, content: accumulatedTextRef.current },
-                ];
-              }
-              return prev;
-            },
-          });
-          break;
-
-        case "reasoning_delta":
-          accumulatedThinkingRef.current += event.content;
-          dispatch({
-            type: "SET_MESSAGES",
-            messages: (prev) => {
-              const last = prev[prev.length - 1];
-              if (last?.role === "assistant" && last.thinking) {
-                return [
-                  ...prev.slice(0, -1),
-                  {
-                    ...last,
-                    thinking: {
-                      content: accumulatedThinkingRef.current,
-                      done: false,
-                    },
+      case "reasoning_delta":
+        accumulatedThinkingRef.current += event.content;
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.thinking) {
+              return [
+                ...prev.slice(0, -1),
+                {
+                  ...last,
+                  thinking: {
+                    content: accumulatedThinkingRef.current,
+                    done: false,
                   },
-                ];
-              }
-              return prev;
-            },
-          });
-          break;
+                },
+              ];
+            }
+            return prev;
+          },
+        });
+        break;
 
-        case "reasoning_done":
-          dispatch({
-            type: "SET_MESSAGES",
-            messages: (prev) => {
-              const last = prev[prev.length - 1];
-              if (last?.role === "assistant" && last.thinking) {
-                return [
-                  ...prev.slice(0, -1),
-                  { ...last, thinking: { ...last.thinking, done: true } },
-                ];
-              }
-              return prev;
-            },
-          });
-          break;
+      case "reasoning_done":
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.thinking) {
+              return [
+                ...prev.slice(0, -1),
+                { ...last, thinking: { ...last.thinking, done: true } },
+              ];
+            }
+            return prev;
+          },
+        });
+        break;
 
-        case "tool_call": {
-          const toolCall = event.tool_call;
-          const fn = toolCall.function;
-          const callId =
-            toolCall.id ?? toolCall.call_id ?? fn?.id ?? fn?.call_id;
-          if (!callId) break;
-          upsertToolCall(callId, (existing) => ({
-            callId,
-            tool:
-              fn?.name ??
-              toolCall.name ??
-              toolCall.tool ??
-              existing?.tool ??
-              "tool",
-            arguments:
-              valueToToolString(
-                fn?.arguments ?? toolCall.arguments ?? toolCall.args,
-              ) ?? existing?.arguments,
-            status: existing?.status ?? "running",
-            startedAt: existing?.startedAt ?? Date.now(),
-            ...executionFieldsFromEvent(event),
-          }));
-          break;
-        }
-
-        case "tool_call_start":
-        case "tool_transport_started": {
-          const args =
-            event.type === "tool_call_start"
-              ? event.arguments
-              : valueToToolString(event.arguments);
-          upsertToolCall(event.call_id, (existing) => ({
-            ...existing,
-            callId: event.call_id,
-            tool: event.tool ?? existing?.tool ?? "tool",
-            arguments: args ?? existing?.arguments,
-            status: "running",
-            startedAt: existing?.startedAt ?? Date.now(),
-            ...executionFieldsFromEvent(event),
-          }));
-          break;
-        }
-
-        case "tool_routing_decision": {
-          upsertToolCall(event.call_id, (existing) => ({
-            ...existing,
-            callId: event.call_id,
-            tool: event.tool ?? existing?.tool ?? "tool",
-            status: existing?.status ?? "running",
-            startedAt: existing?.startedAt ?? Date.now(),
-            ...executionFieldsFromEvent(event),
-          }));
-          break;
-        }
-
-        case "tool_call_end": {
-          upsertToolCall(event.call_id, (existing) => ({
-            ...existing,
-            callId: event.call_id,
-            tool: existing?.tool ?? "tool",
-            result: event.result,
-            status: toolTerminalStatus(event),
-            startedAt: existing?.startedAt ?? Date.now(),
-            finishedAt: Date.now(),
-            ...executionFieldsFromEvent(event),
-          }));
-          break;
-        }
-
-        case "tool_transport_completed":
-        case "tool_transport_failed": {
-          upsertToolCall(event.call_id, (existing) => ({
-            ...existing,
-            callId: event.call_id,
-            tool: event.tool ?? existing?.tool ?? "tool",
-            result:
-              event.type === "tool_transport_completed"
-                ? (valueToToolString(event.result) ?? existing?.result)
-                : (event.error ?? existing?.result),
-            status: toolTerminalStatus(event),
-            startedAt: existing?.startedAt ?? Date.now(),
-            finishedAt: Date.now(),
-            ...executionFieldsFromEvent(event),
-          }));
-          break;
-        }
-
-        case "usage":
-          dispatch({
-            type: "SET_USAGE",
-            usage: (prev) => ({
-              promptTokens: prev.promptTokens + event.prompt_tokens,
-              completionTokens: prev.completionTokens + event.completion_tokens,
-              totalTokens:
-                prev.totalTokens +
-                event.prompt_tokens +
-                event.completion_tokens,
-              cacheCreationTokens:
-                prev.cacheCreationTokens + (event.cache_creation_tokens ?? 0),
-              cacheReadTokens:
-                prev.cacheReadTokens + (event.cache_read_tokens ?? 0),
-            }),
-          });
-          break;
-
-        case "plan_created":
-        case "plan_revised":
-          dispatch({
-            type: "SET_PLAN",
-            plan: {
-              planId: event.plan.plan_id,
-              title: event.plan.title,
-              subtasks: event.plan.subtasks.map(
-                (s: { id: string; title: string; status?: string }) => ({
-                  id: s.id,
-                  title: s.title,
-                  status: (s.status ?? "pending") as
-                    | "pending"
-                    | "running"
-                    | "done"
-                    | "error",
-                }),
-              ),
-            },
-          });
-          break;
-
-        case "plan_step_start":
-          dispatch({
-            type: "SET_PLAN",
-            plan: (prev) =>
-              prev
-                ? {
-                    ...prev,
-                    activeStepId: event.subtask_id ?? event.step,
-                    subtasks: prev.subtasks.map((s) =>
-                      s.id === (event.subtask_id ?? event.step)
-                        ? { ...s, status: "running" as const }
-                        : s,
-                    ),
-                  }
-                : null,
-          });
-          break;
-
-        case "plan_step_done":
-          dispatch({
-            type: "SET_PLAN",
-            plan: (prev) =>
-              prev
-                ? {
-                    ...prev,
-                    subtasks: prev.subtasks.map((s) =>
-                      s.id === (event.subtask_id ?? event.step)
-                        ? {
-                            ...s,
-                            status: planStepResultStatus(event.result),
-                          }
-                        : s,
-                    ),
-                  }
-                : null,
-          });
-          break;
-
-        case "error":
-          dispatch({ type: "SET_ERROR", error: event.message });
-          break;
-
-        case "turn_complete":
-          dispatch({ type: "SET_STREAMING", isStreaming: false });
-          dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
-          dispatch({
-            type: "SET_MESSAGES",
-            messages: (prev) => {
-              const last = prev[prev.length - 1];
-              if (last?.role === "assistant" && last.streaming) {
-                return [...prev.slice(0, -1), { ...last, streaming: false }];
-              }
-              return prev;
-            },
-          });
-          break;
-
-        case "run_finished":
-        case "run_cancelled":
-          applyRunExecutionBoundary();
-          dispatch({ type: "SET_STREAMING", isStreaming: false });
-          dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
-          if (event.run_id)
-            dispatch({ type: "SET_RUN_ID", runId: event.run_id });
-          dispatch({
-            type: "SET_RUN_STATUS",
-            status:
-              event.type === "run_cancelled"
-                ? "cancelled"
-                : (event.status ?? "completed"),
-            waitingFor: null,
-          });
-          dispatch({
-            type: "SET_MESSAGES",
-            messages: (prev) => {
-              const last = prev[prev.length - 1];
-              if (last?.role === "assistant" && last.streaming) {
-                return [...prev.slice(0, -1), { ...last, streaming: false }];
-              }
-              return prev;
-            },
-          });
-          break;
-
-        case "agent_delegated":
-        case "agent_spawned":
-        case "agent_waiting":
-        case "agent_progress":
-        case "agent_completed":
-        case "agent_failed":
-        case "agent_cancelled":
-        case "agent_interrupted":
-          dispatch({ type: "ADD_AGENT_EVENT", event });
-          break;
+      case "tool_call": {
+        const toolCall = event.tool_call;
+        const fn = toolCall.function;
+        const callId = toolCall.id ?? toolCall.call_id ?? fn?.id ?? fn?.call_id;
+        if (!callId) break;
+        upsertToolCall(callId, (existing) => ({
+          callId,
+          tool:
+            fn?.name ??
+            toolCall.name ??
+            toolCall.tool ??
+            existing?.tool ??
+            "tool",
+          arguments:
+            valueToToolString(
+              fn?.arguments ?? toolCall.arguments ?? toolCall.args,
+            ) ?? existing?.arguments,
+          status: existing?.status ?? "running",
+          startedAt: existing?.startedAt ?? Date.now(),
+          ...executionFieldsFromEvent(event),
+        }));
+        break;
       }
-    },
-    [],
-  );
+
+      case "tool_call_start":
+      case "tool_transport_started": {
+        const args =
+          event.type === "tool_call_start"
+            ? event.arguments
+            : valueToToolString(event.arguments);
+        upsertToolCall(event.call_id, (existing) => ({
+          ...existing,
+          callId: event.call_id,
+          tool: event.tool ?? existing?.tool ?? "tool",
+          arguments: args ?? existing?.arguments,
+          status: "running",
+          startedAt: existing?.startedAt ?? Date.now(),
+          ...executionFieldsFromEvent(event),
+        }));
+        break;
+      }
+
+      case "tool_routing_decision": {
+        upsertToolCall(event.call_id, (existing) => ({
+          ...existing,
+          callId: event.call_id,
+          tool: event.tool ?? existing?.tool ?? "tool",
+          status: existing?.status ?? "running",
+          startedAt: existing?.startedAt ?? Date.now(),
+          ...executionFieldsFromEvent(event),
+        }));
+        break;
+      }
+
+      case "tool_call_end": {
+        upsertToolCall(event.call_id, (existing) => ({
+          ...existing,
+          callId: event.call_id,
+          tool: existing?.tool ?? "tool",
+          result: event.result,
+          status: toolTerminalStatus(event),
+          startedAt: existing?.startedAt ?? Date.now(),
+          finishedAt: Date.now(),
+          ...executionFieldsFromEvent(event),
+        }));
+        break;
+      }
+
+      case "tool_transport_completed":
+      case "tool_transport_failed": {
+        upsertToolCall(event.call_id, (existing) => ({
+          ...existing,
+          callId: event.call_id,
+          tool: event.tool ?? existing?.tool ?? "tool",
+          result:
+            event.type === "tool_transport_completed"
+              ? (valueToToolString(event.result) ?? existing?.result)
+              : (event.error ?? existing?.result),
+          status:
+            event.type === "tool_transport_failed" || event.success === false
+              ? "error"
+              : "done",
+          startedAt: existing?.startedAt ?? Date.now(),
+          finishedAt: Date.now(),
+          ...executionFieldsFromEvent(event),
+        }));
+        break;
+      }
+
+      case "usage":
+        dispatch({
+          type: "SET_USAGE",
+          usage: (prev) => ({
+            promptTokens: prev.promptTokens + event.prompt_tokens,
+            completionTokens: prev.completionTokens + event.completion_tokens,
+            totalTokens:
+              prev.totalTokens + event.prompt_tokens + event.completion_tokens,
+            cacheCreationTokens:
+              prev.cacheCreationTokens + (event.cache_creation_tokens ?? 0),
+            cacheReadTokens:
+              prev.cacheReadTokens + (event.cache_read_tokens ?? 0),
+          }),
+        });
+        break;
+
+      case "plan_created":
+      case "plan_revised":
+        dispatch({
+          type: "SET_PLAN",
+          plan: {
+            planId: event.plan.plan_id,
+            title: event.plan.title,
+            subtasks: event.plan.subtasks.map(
+              (s: { id: string; title: string; status?: string }) => ({
+                id: s.id,
+                title: s.title,
+                status: (s.status ?? "pending") as
+                  | "pending"
+                  | "running"
+                  | "done"
+                  | "error",
+              }),
+            ),
+          },
+        });
+        break;
+
+      case "plan_step_start":
+        dispatch({
+          type: "SET_PLAN",
+          plan: (prev) =>
+            prev
+              ? {
+                  ...prev,
+                  activeStepId: event.subtask_id ?? event.step,
+                  subtasks: prev.subtasks.map((s) =>
+                    s.id === (event.subtask_id ?? event.step)
+                      ? { ...s, status: "running" as const }
+                      : s,
+                  ),
+                }
+              : null,
+        });
+        break;
+
+      case "plan_step_done":
+        dispatch({
+          type: "SET_PLAN",
+          plan: (prev) =>
+            prev
+              ? {
+                  ...prev,
+                  subtasks: prev.subtasks.map((s) =>
+                    s.id === (event.subtask_id ?? event.step)
+                      ? {
+                          ...s,
+                          status: planStepResultStatus(event.result),
+                        }
+                      : s,
+                  ),
+                }
+              : null,
+        });
+        break;
+
+      case "error":
+        dispatch({ type: "SET_ERROR", error: event.message });
+        break;
+
+      case "turn_complete":
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
+        });
+        break;
+
+      case "run_finished":
+      case "run_cancelled":
+        applyRunExecutionBoundary();
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
+        dispatch({
+          type: "SET_RUN_STATUS",
+          status:
+            event.type === "run_cancelled"
+              ? "cancelled"
+              : (event.status ?? "completed"),
+          waitingFor: null,
+        });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
+        });
+        break;
+
+      case "agent_delegated":
+      case "agent_spawned":
+      case "agent_waiting":
+      case "agent_progress":
+      case "agent_completed":
+      case "agent_failed":
+      case "agent_cancelled":
+      case "agent_interrupted":
+        dispatch({ type: "ADD_AGENT_EVENT", event });
+        break;
+    }
+  }, []);
 
   const sendMessage = useCallback(
     (content: string) => {
       if (!config.model) {
-        dispatch({
-          type: "SET_ERROR",
-          error: "selectedModel.model is required",
-        });
+        dispatch({ type: "SET_ERROR", error: "selectedModel.model is required" });
         dispatch({ type: "SET_RUN_STATUS", status: null, waitingFor: null });
         dispatch({ type: "SET_STREAMING", isStreaming: false });
         return;
@@ -824,22 +810,27 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
   const stop = useCallback(() => {
     streamGenerationRef.current += 1;
     controllerRef.current?.abort();
-    toolCallMapRef.current = new Map(
-      Array.from(toolCallMapRef.current.entries()).map(([callId, call]) => [
-        callId,
-        call.status === "running"
-          ? compactToolCall({
-              ...call,
-              status: "cancelled",
-              finishedAt: call.finishedAt ?? Date.now(),
-            })
-          : call,
-      ]),
-    );
-    dispatch({
-      type: "SET_TOOL_CALLS",
-      toolCalls: Array.from(toolCallMapRef.current.values()),
-    });
+    const stoppedAt = Date.now();
+    let updatedToolCalls = false;
+    for (const [callId, toolCall] of toolCallMapRef.current) {
+      if (toolCall.status === "running") {
+        toolCallMapRef.current.set(
+          callId,
+          compactToolCall({
+            ...toolCall,
+            status: "cancelled",
+            finishedAt: stoppedAt,
+          }),
+        );
+        updatedToolCalls = true;
+      }
+    }
+    if (updatedToolCalls) {
+      dispatch({
+        type: "SET_TOOL_CALLS",
+        toolCalls: Array.from(toolCallMapRef.current.values()),
+      });
+    }
     dispatch({ type: "SET_STREAMING", isStreaming: false });
     dispatch({ type: "SET_RUN_STATUS", status: "cancelled", waitingFor: null });
     dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });

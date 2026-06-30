@@ -164,7 +164,7 @@ fn tools_array_byte_stable_when_plugin_registers() {
 #[test]
 fn user_can_always_load_a_plugin_via_config() {
     let cfg = ToolSurfaceConfig {
-        always_load_tools: vec!["mcp__weather".into()],
+        pinned_tools: vec!["mcp__weather".into()],
     };
 
     let plugin_schemas = vec![weather_plugin().schema.clone()];

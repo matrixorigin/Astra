@@ -18,8 +18,8 @@ use astra_services::session_restore::COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND;
 use astra_services::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND;
 
 use super::harness::{
-    E2E_PASSWORD, E2eAuthMode, bootstrap, bootstrap_trusted_moi, cleanup_session_data, get_json,
-    post_json, seeded_selected_model, selected_model,
+    E2E_PASSWORD, bootstrap, cleanup_session_data, get_json, post_json, seeded_selected_model,
+    selected_model,
 };
 
 async fn collect_full_sse_stream(
@@ -1013,43 +1013,36 @@ pub async fn run_session_artifact_http_matches_session_artifacts_rows() {
         "artifact id must not be readable through a different session path: {wrong_session_j}"
     );
 
-    let (other_app, other_auth) = match b.auth_mode {
-        E2eAuthMode::LocalJwt => {
-            let b_suffix = Uuid::new_v4().simple().to_string();
-            let short = &b_suffix[..12];
-            let b_username = format!("art_iso_{short}");
-            let b_email = format!("art_iso_{short}@e2e.test");
+    let b_suffix = Uuid::new_v4().simple().to_string();
+    let short = &b_suffix[..12];
+    let b_username = format!("art_iso_{short}");
+    let b_email = format!("art_iso_{short}@e2e.test");
 
-            let (st_reg, reg_b) = post_json(
-                &ctx.app,
-                "/auth/register",
-                None,
-                json!({
-                    "username": b_username,
-                    "email": b_email,
-                    "password": E2E_PASSWORD,
-                    "display_name": "Artifact isolation B"
-                }),
-            )
-            .await;
-            assert_eq!(st_reg, StatusCode::CREATED, "register B: {reg_b}");
+    let (st_reg, reg_b) = post_json(
+        &ctx.app,
+        "/auth/register",
+        None,
+        json!({
+            "username": b_username,
+            "email": b_email,
+            "password": E2E_PASSWORD,
+            "display_name": "Artifact isolation B"
+        }),
+    )
+    .await;
+    assert_eq!(st_reg, StatusCode::CREATED, "register B: {reg_b}");
 
-            let (st_login, login_j) = post_json(
-                &ctx.app,
-                "/auth/login",
-                None,
-                json!({ "username": b_username, "password": E2E_PASSWORD }),
-            )
-            .await;
-            assert_eq!(st_login, StatusCode::OK, "login B: {login_j}");
-            let access_b = login_j["access_token"].as_str().expect("B access_token");
-            (ctx.app.clone(), format!("Bearer {access_b}"))
-        }
-        E2eAuthMode::TrustedMoi => {
-            let other = bootstrap_trusted_moi().await;
-            (other.ctx.app.clone(), other.auth_header)
-        }
-    };
+    let (st_login, login_j) = post_json(
+        &ctx.app,
+        "/auth/login",
+        None,
+        json!({ "username": b_username, "password": E2E_PASSWORD }),
+    )
+    .await;
+    assert_eq!(st_login, StatusCode::OK, "login B: {login_j}");
+    let access_b = login_j["access_token"].as_str().expect("B access_token");
+    let other_app = ctx.app.clone();
+    let other_auth = format!("Bearer {access_b}");
 
     let (st_foreign_list, foreign_list_j) =
         get_json(&other_app, &list_path, Some(&other_auth), &[]).await;
@@ -1352,43 +1345,36 @@ pub async fn run_session_artifact_latest_and_download_routes() {
         String::from_utf8_lossy(&wrong_download_body)
     );
 
-    let (other_app, other_auth) = match b.auth_mode {
-        E2eAuthMode::LocalJwt => {
-            let b_suffix = Uuid::new_v4().simple().to_string();
-            let short = &b_suffix[..12];
-            let b_username = format!("art_dl_{short}");
-            let b_email = format!("art_dl_{short}@e2e.test");
+    let b_suffix = Uuid::new_v4().simple().to_string();
+    let short = &b_suffix[..12];
+    let b_username = format!("art_dl_{short}");
+    let b_email = format!("art_dl_{short}@e2e.test");
 
-            let (st_reg, reg_b) = post_json(
-                &ctx.app,
-                "/auth/register",
-                None,
-                json!({
-                    "username": b_username,
-                    "email": b_email,
-                    "password": E2E_PASSWORD,
-                    "display_name": "Artifact download isolation B"
-                }),
-            )
-            .await;
-            assert_eq!(st_reg, StatusCode::CREATED, "register B: {reg_b}");
+    let (st_reg, reg_b) = post_json(
+        &ctx.app,
+        "/auth/register",
+        None,
+        json!({
+            "username": b_username,
+            "email": b_email,
+            "password": E2E_PASSWORD,
+            "display_name": "Artifact download isolation B"
+        }),
+    )
+    .await;
+    assert_eq!(st_reg, StatusCode::CREATED, "register B: {reg_b}");
 
-            let (st_login, login_j) = post_json(
-                &ctx.app,
-                "/auth/login",
-                None,
-                json!({ "username": b_username, "password": E2E_PASSWORD }),
-            )
-            .await;
-            assert_eq!(st_login, StatusCode::OK, "login B: {login_j}");
-            let access_b = login_j["access_token"].as_str().expect("B access_token");
-            (ctx.app.clone(), format!("Bearer {access_b}"))
-        }
-        E2eAuthMode::TrustedMoi => {
-            let other = bootstrap_trusted_moi().await;
-            (other.ctx.app.clone(), other.auth_header)
-        }
-    };
+    let (st_login, login_j) = post_json(
+        &ctx.app,
+        "/auth/login",
+        None,
+        json!({ "username": b_username, "password": E2E_PASSWORD }),
+    )
+    .await;
+    assert_eq!(st_login, StatusCode::OK, "login B: {login_j}");
+    let access_b = login_j["access_token"].as_str().expect("B access_token");
+    let other_app = ctx.app.clone();
+    let other_auth = format!("Bearer {access_b}");
 
     let (st_foreign_latest, foreign_latest_j) =
         get_json(&other_app, &latest_path, Some(&other_auth), &[]).await;
@@ -1568,7 +1554,6 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
     ctx.pool.close().await;
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_bridge_failure_session_artifact_latest_and_download_routes(
     title: &str,
     suite: &str,
@@ -1598,8 +1583,8 @@ async fn run_bridge_failure_session_artifact_latest_and_download_routes(
     let payload = json!({
         "agent_id": agent_id,
         "session_id": &session_id,
-        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": user_message }],
+        "selected_model": seeded_selected_model(ctx),
         "test_llm_stream_blocks": stream_blocks
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;
@@ -3078,8 +3063,8 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
     let payload = json!({
         "agent_id": "system-matrix-bridge-tail-parse-artifact",
         "session_id": &session_id,
-        "selected_model": seeded_selected_model(ctx),
         "messages": [{ "role": "user", "content": "trigger a bridge tail parse failure after partial state" }],
+        "selected_model": seeded_selected_model(ctx),
         "test_llm_stream_blocks": [
             format!("data: {{\"type\":\"text_delta\",\"content\":\"{partial_text}\"}}\n\n"),
             format!("data: {{\"type\":\"reasoning_delta\",\"content\":\"{partial_reasoning}\"}}\n\n"),

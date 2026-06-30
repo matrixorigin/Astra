@@ -22,9 +22,8 @@ use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
-    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host, runtime_manifest_for_model,
+    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
 };
-use crate::turn::observation_store::default_observation_store;
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
@@ -72,9 +71,6 @@ pub struct ServerSkillSubRunExecutor {
     request_constraints: RequestConstraints,
     /// Session ID for the parent run.
     session_id: String,
-    /// Owner ID for the parent run. Skill sub-runs inherit this owner for
-    /// step artifacts instead of deriving identity from generated subrun IDs.
-    user_id: String,
     /// Edge connection pool for routing tool calls to connected edges.
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Shared tool_call dedup state from the parent host. When set, the sub-run
@@ -100,7 +96,6 @@ impl ServerSkillSubRunExecutor {
     pub fn new(
         matrixone: MatrixOneSettings,
         encryptor: Arc<FernetTokenEncryptor>,
-        user_id: String,
         session_id: String,
     ) -> Self {
         Self {
@@ -117,7 +112,6 @@ impl ServerSkillSubRunExecutor {
             forward_headers: HashMap::new(),
             request_constraints: Default::default(),
             session_id,
-            user_id,
             edge_connection_pool: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             dedup_state: None,
@@ -299,7 +293,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         // Resolve per-model workflow-guard policy before `effective_model` is
         // consumed by `.with_model(...)` below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_policy
+            .tool_selection
             .resolve_for_model(effective_model.as_deref());
 
         // Build the host for the sub-run.
@@ -385,8 +379,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
-        let step_recorder =
-            StepRecorder::new(&self.user_id, &subrun_session_id, &subrun_session_id);
+        let step_recorder = StepRecorder::new("", &subrun_session_id, &subrun_session_id);
 
         let mut state = AgenticLoopState {
             messages,
@@ -398,11 +391,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: effective_model.clone(),
-            runtime_manifest: runtime_manifest_for_model(
-                "server_skill_subrun",
-                "server_skill_subrun",
-                effective_model.as_deref(),
-            ),
+            runtime_manifest: None,
             recursion_depth: child_recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,
@@ -411,10 +400,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            textless_stop_retries: 0,
-            last_finish_reason: None,
             total_evidence_tool_calls: 0,
             has_any_usage: false,
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
             turn_budget_hint_emitted_90: false,
@@ -519,6 +508,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
+            observation_journal: Default::default(),
+            observation_store: None,
             session_memory_state: Default::default(),
             session_memory_llm_params: None,
             compact_strategy,
@@ -544,8 +535,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                     crate::turn::harness_adapter::HarnessSlot::empty()
                 }
             },
-            observation_journal: Default::default(),
-            observation_store: default_observation_store(),
         };
 
         // ── Wire ServerToolExecutor for skill sub-run tool execution ────
@@ -587,7 +576,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         // audit-#8: avoid underflow if remaining_turns somehow exceeds the cap.
         let turns = SUBRUN_MAX_TURNS.saturating_sub(state.remaining_turns) as u32;
-        let tokens_used = state.provider_total_tokens().min(u32::MAX as u64) as u32;
+        let tokens_used = (state.total_prompt + state.total_completion) as u32;
 
         Ok(SubRunResult {
             output: state.final_text,
@@ -634,10 +623,8 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
-            "test-user".to_string(),
             "test-session".to_string(),
         );
-        assert_eq!(executor.user_id, "test-user");
         assert!(executor.cancel_token.is_none());
         assert!(executor.skill_resolver.is_none());
         assert!(executor.llm_token_service.is_none());
@@ -652,7 +639,6 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
-            "test-user".to_string(),
             "test-session".to_string(),
         )
         .with_default_model(Some("claude-sonnet-4-20250514".to_string()))
@@ -679,7 +665,6 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
-            "test-user".to_string(),
             "test-session".to_string(),
         )
         .with_inherited_permissions(inherited_permissions);
@@ -696,7 +681,6 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
-            "test-user".to_string(),
             "test-session".to_string(),
         )
         .with_execution_binding_snapshot(snapshot.clone());
@@ -719,7 +703,6 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
-            "test-user".to_string(),
             "test-session".to_string(),
         );
         // NOTE: empty `allowed_tools` here is intentional and SAFE because

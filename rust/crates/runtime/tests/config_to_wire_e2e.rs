@@ -1,4 +1,4 @@
-//! P0-T end-to-end: user's `runtime.toml` `[tool_surface].always_load_tools`
+//! P0-T end-to-end: user's `runtime.toml` `[tool_surface].pinned_tools`
 //! flows all the way through `RuntimeConfig::load` → `ToolSurface::build`
 //! → always_load schemas that would be sent on the wire as `tools[]`.
 //!
@@ -63,11 +63,11 @@ fn with_user_runtime_toml<F: FnOnce(&RuntimeConfig)>(contents: &str, f: F) {
 
 #[test]
 #[serial_test::serial]
-fn user_always_load_tools_dash_entry_is_ignored_in_wire() {
+fn user_pinned_tools_dash_entry_is_ignored_in_wire() {
     with_user_runtime_toml(
         r#"
 [tool_surface]
-always_load_tools = ["-grep"]
+pinned_tools = ["-grep"]
 "#,
         |config| {
             let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
@@ -87,11 +87,11 @@ always_load_tools = ["-grep"]
 
 #[test]
 #[serial_test::serial]
-fn user_always_load_tools_adds_github_to_wire() {
+fn user_pinned_tools_adds_github_to_wire() {
     with_user_runtime_toml(
         r#"
 [tool_surface]
-always_load_tools = ["github"]
+pinned_tools = ["github"]
 "#,
         |config| {
             let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
@@ -144,7 +144,7 @@ fn malformed_toml_falls_back_to_defaults_silently() {
     with_user_runtime_toml(
         r#"
 [tool_surface
-always_load_tools = ["github
+pinned_tools = ["github
 "#,
         |config| {
             let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);

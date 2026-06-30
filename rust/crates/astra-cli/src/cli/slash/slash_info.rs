@@ -1261,6 +1261,7 @@ pub(crate) async fn handle_info_command(
                 message: &prompt,
                 semantic_query_override: None,
                 session_id: state.session_id.as_deref(),
+                model_id: None,
                 model: state.model.as_deref(),
                 provider: None,
                 explain: state.explain,

@@ -14,7 +14,7 @@
 //!
 //! The default T1 set is the coding core, derived from
 //! `astra_runtime_env::ToolSpec::load_policy`.
-//! Users can add extra T1 tools via `runtime.tool_surface.always_load_tools` in TOML.
+//! Users can add extra T1 tools via `runtime.tool_surface.pinned_tools` in TOML.
 //!
 //! Implementation is complete and wired into production.
 
@@ -113,7 +113,7 @@ impl ToolSurface {
     ///
     /// Algorithm:
     /// 1. Start from names classified as `ToolLoadPolicy::AlwaysLoad`.
-    /// 2. Apply `cfg.always_load_tools`: a known tool name adds that tool to
+    /// 2. Apply `cfg.pinned_tools`: a known tool name adds that tool to
     ///    always_load. Unknown or malformed entries are ignored.
     /// 3. Partition the union of catalog + plugins: names in the resolved
     ///    always_load set → `always_load_schemas`; everything else → `deferred`.
@@ -159,7 +159,7 @@ impl ToolSurface {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        for entry in &cfg.always_load_tools {
+        for entry in &cfg.pinned_tools {
             let trimmed = entry.trim();
             if trimmed.is_empty() {
                 continue;
@@ -170,7 +170,7 @@ impl ToolSurface {
                 tracing::warn!(
                     target: "astra.tool_surface",
                     entry = trimmed,
-                    "tool_surface.always_load_tools: unknown tool name '{trimmed}' ignored — typo or renamed tool?"
+                    "tool_surface.pinned_tools: unknown tool name '{trimmed}' ignored — typo or renamed tool?"
                 );
             }
         }

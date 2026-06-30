@@ -10,7 +10,7 @@ import {
   beginStreamingMessage,
   ensureChatBackendSession,
   getChat,
-  requireKnownBackendModelName,
+  resolveBackendModelName,
   selectedWebModel,
   setChatActiveRun,
   updateChatWorkspaceSelection,
@@ -642,12 +642,12 @@ export async function POST(
       const requestedModel = selectedWebModel(
         body.options?.model ?? chat.chat.model,
       );
-      const [ensuredSessionId, model] = await Promise.all([
+      const [ensuredSessionId, selectedModel] = await Promise.all([
         ensureChatBackendSession(ownerUserId, chatId, {
           model: requestedModel,
           runtime,
         }),
-        requireKnownBackendModelName(runtime, requestedModel),
+        resolveBackendModelName(runtime, requestedModel),
       ]);
       runtimeSessionId = ensuredSessionId;
       emit({
@@ -674,7 +674,7 @@ export async function POST(
           parts: [],
           attachments: body.attachments ?? [],
           session_id: runtimeSessionId,
-          selected_model: { model },
+          selected_model: selectedModel,
           allow_skills: activeSkills.length ? activeSkills : undefined,
           workspace_binding: workspaceBindings.workspaceBinding,
           executor_binding: workspaceBindings.executorBinding,

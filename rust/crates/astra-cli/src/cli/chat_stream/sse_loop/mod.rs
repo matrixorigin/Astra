@@ -230,7 +230,7 @@ pub(crate) async fn stream_chat_sse(
     let term_width = terminal_width_usize();
     // Capture the model id up front for later `resolve_for_model` calls —
     // `p.model` (Option<&str>) gets consumed into `host.model` below.
-    let model_id_for_policy = p.model;
+    let model_id_for_policy = p.model_id.as_deref().or(p.model);
     let runtime_manifest =
         runtime_manifest_for_model("cli_turn_selection", "cli_edge", model_id_for_policy);
     let tool_policy_config = astra_config::runtime_config::RuntimeConfig::load().tool_policy;
@@ -592,6 +592,7 @@ pub(crate) async fn stream_chat_sse(
         token: p.token.to_string(),
         auth_profile: p.auth_profile,
         model: p.model,
+        model_id: p.model_id.clone(),
         explain: p.explain,
         render_md: p.render_md,
         term_width,

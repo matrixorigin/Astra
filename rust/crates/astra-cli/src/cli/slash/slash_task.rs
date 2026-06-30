@@ -378,6 +378,7 @@ pub(crate) async fn handle_task_command(
                     message: &prompt,
                     semantic_query_override: None,
                     session_id: bg_session_id.as_deref(),
+                    model_id: None,
                     model: bg_model.as_deref(),
                     provider: None,
                     explain: ExplainMode::Off,

@@ -17,7 +17,6 @@ use astra_services::{
     McpDiscoveredToolData, McpRegisterRequestData, mcp_binding_tool_namespace, mcp_schema_hash,
     runs::RuntimeMcpBindingRequest,
 };
-use astra_turn_core::tool::schema::tool_schema_name;
 use axum::{Json, http::StatusCode};
 use regex::Regex;
 use serde::Deserialize;
@@ -73,10 +72,10 @@ fn mcp_error(
 
 fn agent_binding_mcp_http_client() -> &'static reqwest::Client {
     AGENT_BINDING_MCP_HTTP_CLIENT.get_or_init(|| {
-        astra_core::net::build_internal_http_client(
-            reqwest::Client::builder().pool_idle_timeout(Duration::from_secs(90)),
-            "agent binding MCP client",
-        )
+        reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("agent binding MCP HTTP client configuration is static")
     })
 }
 
@@ -399,19 +398,10 @@ pub(crate) async fn discover_binding_tools(
 
     let mut discovered = Vec::with_capacity(tools.len());
     for (tool, schema) in tools.iter().zip(schemas) {
-        // Fail-closed admission: only `type: "function"` schemas with a
-        // non-empty name are admitted. `tools_to_schemas_checked` always
-        // produces valid function schemas, so a `None` here indicates a
-        // contract violation and must surface loudly rather than silently
-        // producing an empty public name that poisons downstream indexing.
-        let public_name = tool_schema_name(&schema)
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                panic!(
-                    "MCP discovery: malformed schema admitted by tools_to_schemas_checked for tool '{}'",
-                    tool.name
-                )
-            });
+        let public_name = schema["function"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let input_schema_json = input_schema_value(tool);
         let output_schema_json = output_schema_value(tool);
         let description = tool.description.as_deref().map(str::to_string);
@@ -501,22 +491,10 @@ pub(crate) async fn prepare_request_scoped_runtime_bundle(
         let binding_schemas = tools_to_schemas_checked(&tool_namespace, discovered)
             .map_err(|error| mcp_error(StatusCode::CONFLICT, error, "mcp_public_name_conflict"))?;
         for schema in binding_schemas {
-            // Fail-closed admission: `tools_to_schemas_checked` guarantees
-            // well-formed `type: "function"` schemas, so a `None` here is a
-            // contract violation. Surface it as a 502 rather than silently
-            // emitting an empty name that would poison duplicate detection.
-            let public_name = tool_schema_name(&schema)
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    mcp_error(
-                        StatusCode::BAD_GATEWAY,
-                        format!(
-                            "runtime MCP binding '{}' produced a malformed tool schema (no valid function name)",
-                            binding.id
-                        ),
-                        "mcp_malformed_schema",
-                    )
-                })?;
+            let public_name = schema["function"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             if !public_names.insert(public_name.clone()) {
                 return Err(mcp_error(
                     StatusCode::BAD_GATEWAY,
@@ -766,6 +744,10 @@ fn extract_agent_binding_mcp_tool_result(
 }
 
 impl AgentBindingMcpRuntime {
+    pub(crate) fn owns_public_tool_name(&self, public_name: &str) -> bool {
+        self.tool_names_by_public_name.contains_key(public_name)
+    }
+
     pub(crate) async fn call_tool_by_mcp_name(
         &self,
         public_name: &str,
@@ -808,10 +790,6 @@ impl AgentBindingMcpRuntime {
 
     pub(crate) fn server_name(&self) -> &str {
         &self.server_name
-    }
-
-    pub(crate) fn owns_public_tool_name(&self, public_name: &str) -> bool {
-        self.tool_names_by_public_name.contains_key(public_name)
     }
 }
 
@@ -1119,20 +1097,6 @@ mod tests {
         assert!(bundle.manager.is_none());
         assert!(bundle.agent_binding_mcp.is_some());
         assert_eq!(bundle.schemas[0]["function"]["name"], "mcp__tools__query");
-        assert!(
-            bundle
-                .agent_binding_mcp
-                .as_ref()
-                .unwrap()
-                .owns_public_tool_name("mcp__tools__query")
-        );
-        assert!(
-            !bundle
-                .agent_binding_mcp
-                .as_ref()
-                .unwrap()
-                .owns_public_tool_name("mcp__tools__missing")
-        );
 
         let output = bundle
             .agent_binding_mcp

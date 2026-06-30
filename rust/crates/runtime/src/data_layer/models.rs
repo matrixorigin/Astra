@@ -45,7 +45,19 @@ pub async fn list_models_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ModelListItemResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let principal = state.auth_service.current_principal(&headers).await?;
+    if principal.is_external() {
+        let catalog = state.auth_service.external_catalog(&principal).await?;
+        return Ok(Json(
+            catalog
+                .models
+                .into_iter()
+                .map(ModelListItem::from)
+                .map(ModelListItemResponse::from)
+                .collect(),
+        ));
+    }
+    let user = principal.user;
     let is_admin = state.admin.authorizer.require_admin(&headers).await.is_ok();
     let models = state
         .model_service

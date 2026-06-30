@@ -1,4 +1,4 @@
-//! Top-level `/chat` (streaming) JSON body skeleton before `edge_tools`, `tool_results`, and skill context.
+//! Top-level `/chat` (streaming) JSON body skeleton before `edge_tools`, `tool_results`, and selector hints.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -15,6 +15,7 @@ pub struct ChatTurnBasePayloadInput<'a> {
     pub messages: &'a [Value],
     pub session_id: Option<&'a str>,
     pub agent_id: Option<&'a str>,
+    pub model_id: Option<&'a str>,
     pub model: Option<&'a str>,
     pub interaction_mode: Option<&'a str>,
     pub explain_verbose: bool,
@@ -36,6 +37,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         messages,
         session_id,
         agent_id,
+        model_id,
         model,
         interaction_mode,
         explain_verbose,
@@ -63,12 +65,12 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
     if let Some(model) = model
         && let Some(obj) = payload.as_object_mut()
     {
-        obj.insert(
-            "selected_model".to_string(),
-            json!({
-                "model": model,
-            }),
-        );
+        let mut selected_model = serde_json::Map::new();
+        if let Some(model_id) = model_id {
+            selected_model.insert("id".to_string(), json!(model_id));
+        }
+        selected_model.insert("model".to_string(), json!(model));
+        obj.insert("selected_model".to_string(), Value::Object(selected_model));
     }
     if thinking.is_enabled() {
         if let Some(obj) = payload.as_object_mut() {
@@ -91,9 +93,9 @@ pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills:
     }
 }
 
-/// Deduped skill names that affected this `/chat` request: message-detected
-/// system skills ([`super::chat_turn_edge_profile::detect_active_system_skills_in_message`])
-/// and skills whose instruction bodies were merged successfully.
+/// Deduped skill names that affected this `/chat` request: selector-chosen registry skills,
+/// message-detected system skills ([`super::chat_turn_edge_profile::detect_active_system_skills_in_message`]),
+/// and registry skills whose instruction bodies were merged successfully.
 pub fn merge_invoked_skills_into_edge_profile(payload: &mut Value, invoked_skills: &[String]) {
     if invoked_skills.is_empty() {
         return;
@@ -166,6 +168,7 @@ mod tests {
             messages: &msgs,
             session_id: None,
             agent_id: Some("test-agent"),
+            model_id: Some("model-gpt-test"),
             model: Some("gpt-test"),
             interaction_mode: Some("auto"),
             explain_verbose: false,
@@ -180,6 +183,7 @@ mod tests {
         assert_eq!(p["session_id"], Value::Null);
         assert_eq!(p["agent_id"], "test-agent");
         assert!(p.get("model").is_none());
+        assert_eq!(p["selected_model"]["id"], "model-gpt-test");
         assert_eq!(p["selected_model"]["model"], "gpt-test");
         assert_eq!(p["interaction_mode"], "auto");
         assert_eq!(p["explain"], json!(true));
@@ -199,6 +203,7 @@ mod tests {
             messages: &[],
             session_id: Some("sess-1"),
             agent_id: None,
+            model_id: None,
             model: Some("m"),
             interaction_mode: None,
             explain_verbose: true,
@@ -221,6 +226,7 @@ mod tests {
             messages: &[],
             session_id: None,
             agent_id: None,
+            model_id: None,
             model: Some("claude-thinking"),
             interaction_mode: Some("non_interactive"),
             explain_verbose: false,
@@ -243,6 +249,7 @@ mod tests {
             messages: &[],
             session_id: None,
             agent_id: None,
+            model_id: None,
             model: Some("gpt-4o"),
             interaction_mode: None,
             explain_verbose: false,
@@ -344,8 +351,8 @@ mod tests {
     fn attach_filtered_edge_tools_excludes_by_name() {
         let mut p = json!({});
         let schemas = vec![
-            json!({"type": "function", "function": {"name": "bash"}}),
-            json!({"type": "function", "function": {"name": "danger"}}),
+            json!({"function": {"name": "bash"}}),
+            json!({"function": {"name": "danger"}}),
         ];
         let mut r = HashSet::new();
         r.insert("danger".into());

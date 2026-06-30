@@ -20,7 +20,7 @@ fn cached_is_deserializable_as_expected() {
     // Compare a couple of fields that shouldn't be affected by timing.
     assert_eq!(cached.version, fresh.version);
     assert_eq!(
-        cached.tool_surface.always_load_tools,
-        fresh.tool_surface.always_load_tools
+        cached.tool_surface.pinned_tools,
+        fresh.tool_surface.pinned_tools
     );
 }

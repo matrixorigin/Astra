@@ -166,6 +166,8 @@ pub const AUTH_LOGIN: &str = "/auth/login";
 pub const AUTH_REFRESH: &str = "/auth/refresh";
 pub const AUTH_LOGOUT: &str = "/auth/logout";
 pub const AUTH_ME: &str = "/auth/me";
+pub const AUTH_EXTERNAL_PROVIDERS: &str = "/auth/external/providers";
+pub const AUTH_EXTERNAL_LOGIN: &str = "/auth/external/login";
 
 pub const HEALTH: &str = "/health";
 
@@ -383,6 +385,8 @@ mod tests {
             AUTH_REFRESH,
             AUTH_LOGOUT,
             AUTH_ME,
+            AUTH_EXTERNAL_PROVIDERS,
+            AUTH_EXTERNAL_LOGIN,
             HEALTH,
             MODELS,
             SKILLS,

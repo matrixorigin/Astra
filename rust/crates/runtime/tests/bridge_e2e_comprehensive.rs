@@ -189,7 +189,7 @@ impl SessionService for StubSession {
         _: String,
         _: String,
         _: u32,
-        _: Option<astra_services::SessionActivityCursor>,
+        _: Option<astra_services::auth::SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         Ok(SessionActivityRecord {
             session_id: "s-comp-created".into(),
@@ -198,6 +198,93 @@ impl SessionService for StubSession {
             limit: 1,
             next_cursor: None,
         })
+    }
+}
+
+#[derive(Clone)]
+struct StubModelService;
+
+fn bridge_test_model_record(name: String) -> astra_services::ModelRecord {
+    astra_services::ModelRecord {
+        model_id: format!("model-{name}"),
+        name,
+        provider: "openai".to_string(),
+        base_url: Some("https://models.example.test/v1".to_string()),
+        description: Some("Bridge E2E mock model".to_string()),
+        is_active: true,
+        context_window: 128_000,
+        max_completion_tokens: None,
+        input_modalities: Vec::new(),
+        output_modalities: Vec::new(),
+        supported_parameters: Vec::new(),
+        pricing: Default::default(),
+        architecture: None,
+        tags: Vec::new(),
+        quirks: Default::default(),
+        connectivity: None,
+        thinking_capability: None,
+        thinking_probe: None,
+    }
+}
+
+#[async_trait]
+impl astra_services::ModelService for StubModelService {
+    async fn create_model(
+        &self,
+        _: String,
+        _: astra_services::ModelCreateRequestData,
+    ) -> Result<astra_services::ModelRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+
+    async fn list_models(
+        &self,
+        _: String,
+        _: bool,
+    ) -> Result<Vec<astra_services::ModelListItem>, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(vec![astra_services::ModelListItem {
+            model_id: "model-mock-model".to_string(),
+            name: "mock-model".to_string(),
+            provider: "openai".to_string(),
+            description: Some("Bridge E2E mock model".to_string()),
+            is_active: true,
+            context_window: 128_000,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        }])
+    }
+
+    async fn get_model(
+        &self,
+        model_name: String,
+    ) -> Result<astra_services::ModelRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        if model_name == "mock-model" {
+            return Ok(bridge_test_model_record(model_name));
+        }
+        Err((
+            StatusCode::NOT_FOUND,
+            axum::Json(ErrorResponse::new("model not found")),
+        ))
+    }
+
+    async fn update_model(
+        &self,
+        _: String,
+        _: astra_services::ModelUpdateRequestData,
+    ) -> Result<astra_services::ModelRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+
+    async fn delete_model(&self, _: String) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+
+    async fn check_model(
+        &self,
+        model_name: String,
+    ) -> Result<astra_services::ModelRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        self.get_model(model_name).await
     }
 }
 
@@ -355,6 +442,7 @@ fn build_test_app(cap: AllCaptures) -> Router {
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
         .with_session_service(Arc::new(StubSession))
+        .with_model_service(Arc::new(StubModelService))
         .with_turn_core_event_writer(Arc::new(CapCoreWriter(cap.clone())))
         .with_turn_tool_event_writer(Arc::new(CapToolWriter(cap.clone())))
         .with_turn_auxiliary_event_writer(Arc::new(CapAuxWriter(cap.clone())))

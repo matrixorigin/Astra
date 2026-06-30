@@ -13,6 +13,14 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/auth/logout", post(auth_handlers::auth_logout_handler))
         .route("/auth/me", get(auth_handlers::auth_me_handler))
         .route(
+            "/auth/external/providers",
+            get(auth_handlers::auth_external_providers_handler),
+        )
+        .route(
+            "/auth/external/login",
+            post(auth_handlers::auth_external_login_handler),
+        )
+        .route(
             "/memory/store",
             post(auth_handlers::memory_proxy_store_handler),
         )

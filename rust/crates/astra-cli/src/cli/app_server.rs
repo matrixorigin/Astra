@@ -422,6 +422,7 @@ async fn run_turn(
         api: &ctx.api,
         auth_profile: ctx.auth_profile.as_deref(),
         message: &message,
+        model_id: None,
         model: model.as_deref(),
         provider: None,
         explain: explain_mode,

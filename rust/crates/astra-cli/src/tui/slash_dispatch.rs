@@ -129,8 +129,35 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // ── Auth forms (inline TUI card instead of dropping out to
         //    bare-terminal prompts that looked disjoint and stole keys) ─
         "/login" => {
-            use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
-            ctx.open_deferred_view("Opened login", Box::new(LoginView::new(LoginMode::Login)));
+            use crate::tui::bottom_pane::login_view::{
+                ExternalLoginProvider, LoginMode, LoginView,
+            };
+            let (providers, provider_error) =
+                match crate::cli::auth_flow::fetch_external_providers(ctx.api).await {
+                    Ok(providers) => (
+                        providers
+                            .into_iter()
+                            .map(|provider| ExternalLoginProvider {
+                                id: provider.id,
+                                display_name: provider.display_name,
+                                credential_type: provider.credential_type,
+                            })
+                            .collect(),
+                        None,
+                    ),
+                    Err(err) => (
+                        Vec::new(),
+                        Some(format!("Failed to load external providers: {err}")),
+                    ),
+                };
+            ctx.open_deferred_view(
+                "Opened login",
+                Box::new(LoginView::new_with_external_providers(
+                    LoginMode::Login,
+                    providers,
+                    provider_error,
+                )),
+            );
             SlashResult::Deferred
         }
         "/register" => {
@@ -2706,12 +2733,14 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
         ctx.state.model = None;
         crate::cli::slash::slash_config::set_active_model_for_display(None);
+        crate::cli::slash::slash_config::set_active_model_id_for_request(None);
         ctx.bottom_pane.footer.model = None;
         ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
     };
     ctx.state.model = Some(name.to_string());
     crate::cli::slash::slash_config::set_active_model_for_display(Some(name.to_string()));
+    crate::cli::slash::slash_config::set_active_model_id_for_request(None);
     ctx.bottom_pane.footer.model = Some(name.to_string());
     ctx.show_response(format!("Set model to {name}"));
 }
@@ -2721,6 +2750,7 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ctx.state.model = None;
     crate::cli::slash::slash_config::set_active_model_for_display(None);
+    crate::cli::slash::slash_config::set_active_model_id_for_request(None);
     ctx.bottom_pane.footer.model = None;
     ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
     SlashResult::Handled

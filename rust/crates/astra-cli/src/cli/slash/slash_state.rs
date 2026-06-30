@@ -73,6 +73,7 @@ impl<'a> CompactCtx<'a> {
             message,
             semantic_query_override: None,
             session_id: self.state.session_id.as_deref(),
+            model_id: None,
             model: self.state.model.as_deref(),
             provider: None,
             explain: ExplainMode::Off,

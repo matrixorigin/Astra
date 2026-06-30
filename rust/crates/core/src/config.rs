@@ -240,10 +240,19 @@ pub struct AuthConfig {
     pub refresh_ttl_days: Option<u64>,
     /// Bridge HMAC secret (required in production).
     pub bridge_secret: Option<String>,
-    /// Authentication mode: local_jwt, trusted_moi.
-    pub auth_mode: Option<String>,
     /// Fernet key for encrypting LLM API keys.
     pub token_encryption_key: Option<String>,
+    /// External auth providers that can exchange into normal Astra sessions.
+    pub external_providers: Vec<ExternalAuthProviderConfig>,
+}
+
+/// Server-side external auth provider configuration.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ExternalAuthProviderConfig {
+    pub id: String,
+    pub display_name: String,
+    pub external_auth_endpoint: String,
 }
 
 impl fmt::Debug for AuthConfig {
@@ -260,11 +269,11 @@ impl fmt::Debug for AuthConfig {
                 "bridge_secret",
                 &self.bridge_secret.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("auth_mode", &self.auth_mode)
             .field(
                 "token_encryption_key",
                 &self.token_encryption_key.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("external_providers", &self.external_providers)
             .finish()
     }
 }
@@ -277,10 +286,12 @@ impl AuthConfig {
             jwt_secret,
             jwt_algorithm,
             bridge_secret,
-            auth_mode,
             token_encryption_key
         );
         merge_option_copy_fields!(self, other, access_ttl_minutes, refresh_ttl_days);
+        if !other.external_providers.is_empty() {
+            self.external_providers = other.external_providers.clone();
+        }
     }
     fn apply_env_overrides(&mut self) {
         apply_env_override_str(&mut self.jwt_secret, "ASTRA_JWT_SECRET");
@@ -288,9 +299,87 @@ impl AuthConfig {
         apply_env_override(&mut self.access_ttl_minutes, "ASTRA_JWT_ACCESS_TTL_MINUTES");
         apply_env_override(&mut self.refresh_ttl_days, "ASTRA_JWT_REFRESH_TTL_DAYS");
         apply_env_override_str(&mut self.bridge_secret, "ASTRA_BRIDGE_SECRET");
-        apply_env_override_str(&mut self.auth_mode, "ASTRA_AUTH_MODE");
         apply_env_override_str(&mut self.token_encryption_key, "ASTRA_TOKEN_ENCRYPTION_KEY");
     }
+
+    fn validate(&self) -> Result<(), String> {
+        reject_deprecated_auth_env()?;
+        let mut ids = std::collections::HashSet::new();
+        for provider in &self.external_providers {
+            validate_exact_non_empty("auth.external_providers[].id", &provider.id)?;
+            validate_exact_non_empty(
+                "auth.external_providers[].display_name",
+                &provider.display_name,
+            )?;
+            validate_exact_non_empty(
+                "auth.external_providers[].external_auth_endpoint",
+                &provider.external_auth_endpoint,
+            )?;
+            if !ids.insert(provider.id.as_str()) {
+                return Err(format!(
+                    "auth.external_providers id '{}' is duplicated",
+                    provider.id
+                ));
+            }
+            reqwest::Url::parse(&provider.external_auth_endpoint).map_err(|error| {
+                format!(
+                    "auth.external_providers '{}'.external_auth_endpoint is invalid: {error}",
+                    provider.id
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn reject_deprecated_auth_env() -> Result<(), String> {
+    for key in [
+        "ASTRA_AUTH_MODE",
+        "ASTRA_EXTERNAL_JWT_SECRET",
+        "ASTRA_EXTERNAL_JWT_ALGORITHM",
+        "ASTRA_EXTERNAL_JWT_ISSUER",
+        "ASTRA_EXTERNAL_JWT_AUDIENCE",
+        "ASTRA_EXTERNAL_JWT_LEEWAY_SECS",
+    ] {
+        if std::env::var_os(key).is_some() {
+            return Err(format!(
+                "{key} is no longer supported; configure auth.external_providers for external auth"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_deprecated_auth_toml(toml_content: &str) -> Result<(), ConfigError> {
+    let table = toml_content
+        .parse::<toml::Table>()
+        .map_err(|e| ConfigError::InvalidValue(format!("failed to parse TOML: {}", e)))?;
+    if table
+        .get("auth")
+        .and_then(|auth| auth.get("auth_mode"))
+        .is_some()
+    {
+        return Err(ConfigError::InvalidValue(
+            "auth.auth_mode is no longer supported; configure auth.external_providers for external auth"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_non_empty(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if value.trim() != value {
+        return Err(format!(
+            "{field} must not have leading or trailing whitespace"
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(())
 }
 
 /// HTTP API server settings.
@@ -507,6 +596,7 @@ impl ServerConfig {
             .database
             .validate()
             .map_err(ConfigError::InvalidValue)?;
+        config.auth.validate().map_err(ConfigError::InvalidValue)?;
 
         // Validate runtime config after all overrides are applied.
         config
@@ -527,6 +617,7 @@ impl ServerConfig {
 
     /// Parse configuration from a TOML string.
     pub(crate) fn parse(toml_content: &str) -> Result<Self, ConfigError> {
+        reject_deprecated_auth_toml(toml_content)?;
         toml::from_str(toml_content)
             .map_err(|e| ConfigError::InvalidValue(format!("failed to parse TOML: {}", e)))
     }
@@ -550,6 +641,40 @@ impl ServerConfig {
     }
 }
 
+/// Skill catalog surfacing knobs forwarded through chat/runtime request protocols.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSearchSettings {
+    /// Dynamic surface flag.
+    #[serde(default = "default_dynamic_surface")]
+    pub dynamic_surface: bool,
+
+    /// Minimum catalog size.
+    #[serde(default)]
+    pub min_catalog_size: usize,
+
+    /// Surface cap.
+    #[serde(default = "default_surface_cap")]
+    pub surface_cap: usize,
+}
+
+fn default_dynamic_surface() -> bool {
+    true
+}
+
+fn default_surface_cap() -> usize {
+    20
+}
+
+impl Default for SkillSearchSettings {
+    fn default() -> Self {
+        Self {
+            dynamic_surface: true,
+            min_catalog_size: 0,
+            surface_cap: 20,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AppSettings {
     pub matrixone: MatrixOneSettings,
@@ -558,6 +683,7 @@ pub struct AppSettings {
     pub memoria: MemoriaSettings,
     pub bridge_secret: String,
     pub token_encryption_key: Option<String>,
+    pub external_auth_providers: Vec<ExternalAuthProviderConfig>,
     pub database_bootstrap_catalog: String,
     /// Tools disabled at deployment time (deployment.toml → server.toml → env).
     pub disabled_tools: Vec<String>,
@@ -606,7 +732,6 @@ impl AppSettings {
                 "ASTRA_JWT_ACCESS_TTL_MINUTES" => sc.auth.access_ttl_minutes.map(|v| v.to_string()),
                 "ASTRA_JWT_REFRESH_TTL_DAYS" => sc.auth.refresh_ttl_days.map(|v| v.to_string()),
                 "ASTRA_BRIDGE_SECRET" => sc.auth.bridge_secret.clone(),
-                "ASTRA_AUTH_MODE" => sc.auth.auth_mode.clone(),
                 "ASTRA_TOKEN_ENCRYPTION_KEY" => sc.auth.token_encryption_key.clone(),
                 // API
                 "ASTRA_API_HOST" => Some(sc.api.host().to_string()),
@@ -625,6 +750,7 @@ impl AppSettings {
         };
         let mut settings = Self::from_lookup(lookup)?;
         settings.disabled_tools = sc.deployment.disabled_tools.clone();
+        settings.external_auth_providers = sc.auth.external_providers.clone();
         Ok(settings)
     }
 
@@ -706,6 +832,7 @@ impl AppSettings {
                 "dev-bridge-secret-change-me",
             )?,
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
+            external_auth_providers: Vec::new(),
             disabled_tools: Self::disabled_tools_from_lookup(&lookup),
         })
     }
@@ -1578,7 +1705,6 @@ jwt_algorithm = "HS512"
 access_ttl_minutes = 1440
 refresh_ttl_days = 7
 bridge_secret = "bridge-secret"
-auth_mode = "trusted_moi"
 token_encryption_key = "fernet-key"
 
 [api]
@@ -1597,7 +1723,6 @@ cors_origins = ["http://localhost:3000", "https://example.com"]
         assert_eq!(config.auth.access_ttl_minutes, Some(1440));
         assert_eq!(config.auth.refresh_ttl_days, Some(7));
         assert_eq!(config.auth.bridge_secret.as_deref(), Some("bridge-secret"));
-        assert_eq!(config.auth.auth_mode.as_deref(), Some("trusted_moi"));
         assert_eq!(
             config.auth.token_encryption_key.as_deref(),
             Some("fernet-key")
@@ -1625,6 +1750,22 @@ cors_origins = ["http://localhost:3000", "https://example.com"]
     fn server_config_parse_invalid_toml() {
         let result = ServerConfig::parse("[invalid");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn server_config_parse_rejects_deprecated_auth_mode() {
+        let result = ServerConfig::parse(
+            r#"
+[auth]
+auth_mode = "legacy"
+"#,
+        );
+        assert!(
+            result
+                .expect_err("deprecated auth_mode should be rejected")
+                .to_string()
+                .contains("auth.auth_mode is no longer supported")
+        );
     }
 
     #[test]
@@ -1756,6 +1897,17 @@ cors_origins = ["http://localhost:3000", "https://example.com"]
                 );
             },
         );
+    }
+
+    #[test]
+    fn server_config_validate_rejects_deprecated_auth_env() {
+        temp_env::with_var("ASTRA_AUTH_MODE", Some("legacy"), || {
+            let err = ServerConfig::default()
+                .auth
+                .validate()
+                .expect_err("deprecated auth env should be rejected");
+            assert!(err.contains("ASTRA_AUTH_MODE is no longer supported"));
+        });
     }
 
     #[test]

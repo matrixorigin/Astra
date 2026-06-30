@@ -104,7 +104,7 @@ fn internal_runtime_tool_specs_do_not_have_public_schemas() {
 #[test]
 fn surface_build_rejects_internal_builtin_schemas_from_any_pool() {
     let cfg = ToolSurfaceConfig {
-        always_load_tools: vec!["delete_file".to_string(), "missing_type".to_string()],
+        pinned_tools: vec!["delete_file".to_string(), "missing_type".to_string()],
     };
     let surface = ToolSurface::build(
         vec![
@@ -237,7 +237,7 @@ fn surface_snapshot_exposes_visible_tools_and_tier_counts() {
 #[test]
 fn config_always_load_tools_additive_appends_to_defaults() {
     let cfg = ToolSurfaceConfig {
-        always_load_tools: vec!["github".into(), "memory".into()],
+        pinned_tools: vec!["github".into(), "memory".into()],
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
@@ -252,7 +252,7 @@ fn config_always_load_tools_additive_appends_to_defaults() {
 #[test]
 fn config_always_load_tools_unknown_name_does_not_remove_defaults() {
     let cfg = ToolSurfaceConfig {
-        always_load_tools: vec!["not_a_real_tool".into()],
+        pinned_tools: vec!["not_a_real_tool".into()],
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
@@ -273,7 +273,7 @@ fn empty_and_malformed_config_entries_are_ignored_not_panic() {
     // unknown names, and surrounding whitespace. They must not panic or change
     // defaults.
     let cfg = ToolSurfaceConfig {
-        always_load_tools: vec![
+        pinned_tools: vec![
             "".into(),
             "-".into(),
             "--foo".into(),
@@ -298,7 +298,7 @@ fn empty_and_malformed_config_entries_are_ignored_not_panic() {
 #[test]
 fn unknown_tool_name_in_config_is_ignored_not_panic() {
     let cfg = ToolSurfaceConfig {
-        always_load_tools: vec!["not_a_real_tool".into(), "-also_not_real".into()],
+        pinned_tools: vec!["not_a_real_tool".into(), "-also_not_real".into()],
     };
     // Should not panic; unknown names simply do nothing.
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
@@ -536,7 +536,7 @@ fn deferred_manifest_names_follow_rendered_budget_subset() {
 #[test]
 fn custom_type_is_rejected_while_missing_type_function_shorthand_can_be_always_load() {
     let cfg = ToolSurfaceConfig {
-        always_load_tools: vec!["missing_type".to_string(), "custom_shape".to_string()],
+        pinned_tools: vec!["missing_type".to_string(), "custom_shape".to_string()],
     };
     let surface = ToolSurface::build(
         vec![

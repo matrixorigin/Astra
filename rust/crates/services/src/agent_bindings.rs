@@ -17,9 +17,6 @@ use astra_core::{
 };
 
 const BINDING_ID_INSERT_MAX_ATTEMPTS: usize = 5;
-const AGENT_BINDING_SELECT_COLS: &str = "\
-    id, binding_name, idempotency_key, status, agent_md, capability_servers_json, \
-    runtime_policy_json, metadata_json, binding_schema_version, created_at, disabled_at";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +113,10 @@ pub struct AgentBindingRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_at: Option<String>,
 }
+
+const AGENT_BINDING_COLUMNS: &str = "id, binding_name, idempotency_key, status, agent_md, \
+     capability_servers_json, runtime_policy_json, metadata_json, binding_schema_version, \
+     created_at, disabled_at";
 
 impl AgentBindingRecord {
     pub fn payload(&self) -> AgentBindingPayload {
@@ -667,7 +668,7 @@ async fn load_binding_row(
     pool: &sqlx::Pool<MySql>,
     id: &str,
 ) -> Result<Option<AgentBindingRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let sql = format!("SELECT {AGENT_BINDING_SELECT_COLS} FROM agent_bindings WHERE id = ?");
+    let sql = format!("SELECT {AGENT_BINDING_COLUMNS} FROM agent_bindings WHERE id = ?");
     let row = query(&sql)
         .bind(id)
         .fetch_optional(pool)
@@ -681,7 +682,7 @@ async fn load_binding_by_idempotency_key(
     idempotency_key: &str,
 ) -> Result<Option<AgentBindingRecord>, (StatusCode, Json<ErrorResponse>)> {
     let sql =
-        format!("SELECT {AGENT_BINDING_SELECT_COLS} FROM agent_bindings WHERE idempotency_key = ?");
+        format!("SELECT {AGENT_BINDING_COLUMNS} FROM agent_bindings WHERE idempotency_key = ?");
     let row = query(&sql)
         .bind(idempotency_key)
         .fetch_optional(pool)
@@ -694,8 +695,7 @@ async fn load_binding_by_name(
     pool: &sqlx::Pool<MySql>,
     binding_name: &str,
 ) -> Result<Option<AgentBindingRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let sql =
-        format!("SELECT {AGENT_BINDING_SELECT_COLS} FROM agent_bindings WHERE binding_name = ?");
+    let sql = format!("SELECT {AGENT_BINDING_COLUMNS} FROM agent_bindings WHERE binding_name = ?");
     let row = query(&sql)
         .bind(binding_name)
         .fetch_optional(pool)

@@ -171,7 +171,7 @@ impl SessionService for StubSession {
         _: String,
         _: String,
         _: u32,
-        _: Option<astra_services::SessionActivityCursor>,
+        _: Option<astra_services::auth::SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         unreachable!()
     }

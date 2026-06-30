@@ -42,6 +42,9 @@ pub(super) struct JwtClaims {
     pub(super) username: Option<String>,
     #[serde(rename = "type")]
     pub(super) token_type: Option<String>,
+    pub(super) sid: Option<String>,
+    pub(super) origin: Option<String>,
+    pub(super) provider_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -50,6 +53,12 @@ pub(super) struct JwtTokenClaims {
     pub(super) username: Option<String>,
     #[serde(rename = "type")]
     pub(super) token_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) provider_id: Option<String>,
     pub(super) exp: usize,
     pub(super) iat: usize,
     /// Random JWT ID — ensures tokens issued in the same second are unique.
@@ -103,6 +112,9 @@ mod tests {
             sub: sub.into(),
             username: Some("testuser".into()),
             token_type: token_type.into(),
+            sid: Some("session-123".into()),
+            origin: Some("internal".into()),
+            provider_id: None,
             exp: 0,
             iat: 0,
             jti: String::new(),
@@ -118,6 +130,8 @@ mod tests {
         assert_eq!(decoded.sub.as_deref(), Some("user-123"));
         assert_eq!(decoded.username.as_deref(), Some("testuser"));
         assert_eq!(decoded.token_type.as_deref(), Some("access"));
+        assert_eq!(decoded.sid.as_deref(), Some("session-123"));
+        assert_eq!(decoded.origin.as_deref(), Some("internal"));
     }
 
     #[test]
@@ -218,6 +232,9 @@ mod tests {
             sub: "user-minimal".into(),
             username: None,
             token_type: "access".into(),
+            sid: None,
+            origin: None,
+            provider_id: None,
             exp: 0,
             iat: 0,
             jti: String::new(),

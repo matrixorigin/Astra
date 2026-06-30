@@ -174,7 +174,7 @@ impl SessionService for LedgerE2eSession {
         _session_id: String,
         _user_id: String,
         _limit: u32,
-        _cursor: Option<astra_services::SessionActivityCursor>,
+        _cursor: Option<astra_services::auth::SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         unreachable!()
     }

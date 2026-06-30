@@ -34,6 +34,56 @@ fn cli_version_flag_prints_package_version() {
     assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
 }
 
+#[test]
+fn cli_login_defaults_to_astra_user() {
+    let cli = Cli::try_parse_from([
+        "astra",
+        "login",
+        "--username",
+        "alice",
+        "--password",
+        "secret",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Some(Command::Login(args)) => {
+            assert_eq!(args.username.as_deref(), Some("alice"));
+            assert_eq!(args.password.as_deref(), Some("secret"));
+            assert_eq!(args.external_provider, None);
+            assert_eq!(args.external_scope, None);
+        }
+        other => panic!("expected login command, got {other:?}"),
+    }
+}
+
+#[test]
+fn cli_login_external_provider_is_explicit() {
+    let cli = Cli::try_parse_from([
+        "astra",
+        "login",
+        "--external-provider",
+        "moi",
+        "--external-scope",
+        "workspace-1",
+        "--username",
+        "admin",
+        "--password",
+        "admin",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Some(Command::Login(args)) => {
+            assert_eq!(args.username.as_deref(), Some("admin"));
+            assert_eq!(args.password.as_deref(), Some("admin"));
+            assert_eq!(args.external_provider.as_deref(), Some("moi"));
+            assert_eq!(args.external_scope.as_deref(), Some("workspace-1"));
+        }
+        other => panic!("expected login command, got {other:?}"),
+    }
+}
+
 // ── Flag tables ───────────────────────────────────────────────────────
 
 #[test]

@@ -35,18 +35,14 @@
 //! - **`e2e_matrix_same_session_waiting_turn_overlap_isolated`** — a same-session tool-backed
 //!   handoff can overlap a second plain turn without leaking the second turn's response into the
 //!   first stream (or vice versa).
-//! - **`e2e_matrix_auth_session_negative_paths`** — `GET /sessions` without auth (401), plus
-//!   mode-aware auth negatives: in `local_jwt` validates duplicate register/bad login; in
-//!   `trusted_moi` validates local auth endpoints are disabled (replaces stub `auth_contract` /
+//! - **`e2e_matrix_auth_session_negative_paths`** — `GET /sessions` without auth (401), duplicate
+//!   register, bad login, and successful login after negative calls (replaces stub `auth_contract` /
 //!   `session_contract` negative coverage).
 //! - **`e2e_matrix_memory_proxy_user_isolation`** — unauthenticated memory returns 401; spoofed
 //!   `user_id` / `session_id` in body are overwritten to JWT user on forward (replaces `memory_contract`
 //!   isolation tests).
 //! - **`e2e_matrix_models_admin_crud`** — grant `astra_admin`, `POST/PUT/DELETE /models` with
 //!   `provider: mock` + `infra_llm_models` SQL checks (replaces `model_crud_contract`).
-//! - **`e2e_matrix_trusted_moi_user_system_integration`** — run server in `trusted_moi` mode,
-//!   authenticate via external JWT claims, verify local auth endpoints are disabled, and assert
-//!   session/memory ownership maps to upstream user id.
 //! - **`e2e_matrix_stream_session_and_run_status`** — `POST /chat/stream` with mock LLM → verify
 //!   `agent_sessions` row persisted, run transitions to `completed`, `events_count > 0`.
 //! - **`e2e_matrix_stream_context_trace_persistence`** — `POST /chat/stream` → verify
@@ -79,7 +75,7 @@
 //!   deterministic when multiple artifacts share the same `created_at`, returning the newest
 //!   artifact consistently instead of relying on database tie behavior.
 //! - **`e2e_matrix_evaluation_reads`** — evaluation GETs (`x-user-id`), optional agent seed for trust/SLO/
-//!   observability.
+//!   observability, plus memory health/metrics.
 //! - **`e2e_matrix_context_decision_chain`** — `POST /events` → `/context` → `/decisions` + `ctx_snapshots` /
 //!   `ctx_decision_audits` SQL.
 //! - **`e2e_matrix_chat_route_models`** — `POST /chat/route` shape + `GET /models`.
@@ -133,7 +129,6 @@ mod journey_team_data_fidelity_matrix;
 mod journey_team_http_negatives_matrix;
 mod journey_team_isolation_matrix;
 mod journey_team_snapshots_matrix;
-mod journey_trusted_moi;
 
 use harness::require_system_e2e_env;
 
@@ -142,13 +137,8 @@ use harness::require_system_e2e_env;
 async fn product_matrix_api_journey_hits_multiple_tables() {
     require_system_e2e_env();
     let mut b = harness::bootstrap().await;
-    journey_full::run_product_matrix_full_journey(
-        &b.ctx,
-        &b.auth_header,
-        &mut b.refresh_token,
-        b.auth_mode,
-    )
-    .await;
+    journey_full::run_product_matrix_full_journey(&b.ctx, &mut b.auth_header, &mut b.refresh_token)
+        .await;
     b.ctx.pool.close().await;
 }
 
@@ -263,13 +253,6 @@ async fn e2e_matrix_memory_proxy_user_isolation() {
 async fn e2e_matrix_models_admin_crud() {
     require_system_e2e_env();
     journey_extended::run_models_admin_crud_with_db().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_trusted_moi_user_system_integration() {
-    require_system_e2e_env();
-    journey_trusted_moi::run_trusted_moi_user_system_integration().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

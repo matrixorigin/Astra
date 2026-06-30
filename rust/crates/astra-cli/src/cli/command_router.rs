@@ -3,7 +3,9 @@ use crate::cli::arg_render::{
     render_diff_args, render_grep_args, render_memory_args, render_messaging_args,
     render_permissions_args, render_review_args, render_task_args, render_team_args,
 };
-use crate::cli::auth_flow::{clear_profile_auth, do_login, do_register, is_auth_error};
+use crate::cli::auth_flow::{
+    clear_profile_auth, do_external_login, do_login, do_register, is_auth_error,
+};
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
     TaskRunArgs, TaskSubcommand, TaskWorkerArgs,
@@ -45,7 +47,7 @@ use crate::cli::slash::slash_info::handle_info_command;
 use crate::cli::slash::slash_inspect;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
 use crate::cli::slash::slash_messaging::handle_messaging_command;
-use crate::cli::slash::{slash_agent, slash_task, slash_team, slash_telemetry};
+use crate::cli::slash::{slash_agent, slash_router, slash_task, slash_team, slash_telemetry};
 use crate::cli::stream::streaming_types::StreamResult;
 use crate::cli::surface::task_checkpoint_surface::encode_task_failure_message;
 use crate::cli::task::task_command_utils::task_run_title;
@@ -362,21 +364,69 @@ fn effective_one_shot_model<'a>(
         .or_else(|| fallback_model.filter(|model| !model.trim().is_empty()))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedOneShotModel {
+    model: Option<String>,
+    model_id: Option<String>,
+}
+
 async fn resolve_one_shot_model(
     api: &astra_thin_client::ThinClient,
     token: &str,
     explicit_model: Option<&str>,
     restored_model: Option<&str>,
     fallback_model: Option<&str>,
-) -> Option<String> {
-    if let Some(model) = effective_one_shot_model(explicit_model, restored_model, fallback_model) {
-        return Some(model.to_string());
+) -> Result<ResolvedOneShotModel, String> {
+    let model = if let Some(model) =
+        effective_one_shot_model(explicit_model, restored_model, fallback_model)
+    {
+        Some(model.to_string())
+    } else {
+        match session_runtime::resolve_server_default_model(api, token).await {
+            session_runtime::ServerDefaultModel::Selected(model) => Some(model),
+            session_runtime::ServerDefaultModel::NoModels
+            | session_runtime::ServerDefaultModel::Unavailable => None,
+        }
+    };
+    let Some(model) = model else {
+        return Ok(ResolvedOneShotModel {
+            model: None,
+            model_id: None,
+        });
+    };
+    let body = api
+        .get_models_text(token)
+        .await
+        .map_err(|err| format!("failed to list models for selected model '{model}': {err}"))?;
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|err| format!("failed to parse model list response: {err}"))?;
+    resolve_one_shot_model_from_catalog_value(&model, &value)
+}
+
+fn resolve_one_shot_model_from_catalog_value(
+    model: &str,
+    value: &serde_json::Value,
+) -> Result<ResolvedOneShotModel, String> {
+    let models = value
+        .as_array()
+        .or_else(|| value.get("models").and_then(|value| value.as_array()))
+        .ok_or_else(|| "model list response did not include a models array".to_string())?;
+    let entry = slash_router::find_model_entry_by_name(models, model)
+        .ok_or_else(|| format!("selected model '{model}' was not returned by /models"))?;
+    if !slash_router::entry_model_is_active(entry) {
+        return Err(format!("selected model '{model}' is inactive"));
     }
-    match session_runtime::resolve_server_default_model(api, token).await {
-        session_runtime::ServerDefaultModel::Selected(model) => Some(model),
-        session_runtime::ServerDefaultModel::NoModels
-        | session_runtime::ServerDefaultModel::Unavailable => None,
-    }
+    let model_id = slash_router::entry_model_id(entry)
+        .ok_or_else(|| format!("selected model '{model}' did not include model_id in /models"))?
+        .to_string();
+    let model_name = slash_router::entry_model_name(entry)
+        .unwrap_or(model)
+        .to_string();
+
+    Ok(ResolvedOneShotModel {
+        model: Some(model_name),
+        model_id: Some(model_id),
+    })
 }
 
 fn effective_one_shot_permission_mode(
@@ -489,14 +539,16 @@ async fn execute_headless_task_body(
     let (_creds, profile_name, _, _token) = get_profile_and_token(profile)?;
     let token = fresh_access_token_or_error(api, profile).await?;
     let session_id = session_routing.server_session_id.clone();
-    let effective_model = resolve_one_shot_model(
+    let resolved_model = resolve_one_shot_model(
         api,
         &token,
         None,
         session_routing.restored_model(),
         global_model,
     )
-    .await;
+    .await?;
+    let effective_model = resolved_model.model;
+    let effective_model_id = resolved_model.model_id;
     let effective_permission_mode = effective_one_shot_permission_mode(
         None,
         false,
@@ -573,6 +625,7 @@ async fn execute_headless_task_body(
         auth_profile: profile,
         message: &prompt,
         model: effective_model.as_deref(),
+        model_id: effective_model_id.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
         render_md: terminal::size().is_ok() && !options.quiet && !options.json,
@@ -1296,14 +1349,16 @@ async fn execute_cli_command_impl(
             )
             .await?;
             let session_id = session_routing.server_session_id.clone();
-            let effective_model = resolve_one_shot_model(
+            let resolved_model = resolve_one_shot_model(
                 api,
                 &token,
                 None,
                 session_routing.restored_model(),
                 global_model.as_deref(),
             )
-            .await;
+            .await?;
+            let effective_model = resolved_model.model;
+            let effective_model_id = resolved_model.model_id;
             let effective_permission_mode = effective_one_shot_permission_mode(
                 None,
                 auto_approve,
@@ -1323,6 +1378,7 @@ async fn execute_cli_command_impl(
                 auth_profile: profile.as_deref(),
                 message: &message,
                 model: effective_model.as_deref(),
+                model_id: effective_model_id.as_deref(),
                 provider: None,
                 explain: ExplainMode::Off,
                 render_md: terminal::size().is_ok(),
@@ -1431,7 +1487,19 @@ async fn execute_cli_command_impl(
             );
             let username = prompt_or("Username", args.username)?;
             let password = prompt_password_masked("Password", args.password)?;
-            do_login(api, profile.as_deref(), &username, &password).await?;
+            if let Some(provider_id) = args.external_provider.as_deref() {
+                do_external_login(
+                    api,
+                    profile.as_deref(),
+                    provider_id,
+                    args.external_scope.as_deref(),
+                    &username,
+                    &password,
+                )
+                .await?;
+            } else {
+                do_login(api, profile.as_deref(), &username, &password).await?;
+            }
             eprintln!(
                 "{}",
                 "  ✓  Logged in. Run `astra` to start chatting.".green()
@@ -1788,14 +1856,16 @@ async fn execute_cli_command_impl(
             )
             .await?;
             let session_id = session_routing.server_session_id.clone();
-            let effective_model = resolve_one_shot_model(
+            let resolved_model = resolve_one_shot_model(
                 api,
                 &token,
                 args.model.as_deref(),
                 session_routing.restored_model(),
                 global_model.as_deref(),
             )
-            .await;
+            .await?;
+            let effective_model = resolved_model.model;
+            let effective_model_id = resolved_model.model_id;
             let effective_permission_mode = effective_one_shot_permission_mode(
                 args.permission_mode.as_deref(),
                 args.auto_approve || auto_approve,
@@ -1875,6 +1945,7 @@ async fn execute_cli_command_impl(
                 auth_profile: profile.as_deref(),
                 message: &message,
                 model: effective_model.as_deref(),
+                model_id: effective_model_id.as_deref(),
                 provider: None,
                 explain: explain_mode,
                 render_md,
@@ -2532,8 +2603,10 @@ pub(crate) async fn run_print_mode(
         resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
             .await?;
     let session_id = session_routing.server_session_id.clone();
-    let effective_model =
-        resolve_one_shot_model(api, &token, None, session_routing.restored_model(), model).await;
+    let resolved_model =
+        resolve_one_shot_model(api, &token, None, session_routing.restored_model(), model).await?;
+    let effective_model = resolved_model.model;
+    let effective_model_id = resolved_model.model_id;
     let effective_permission_mode = effective_one_shot_permission_mode(
         None,
         false,
@@ -2582,6 +2655,7 @@ pub(crate) async fn run_print_mode(
         auth_profile: profile,
         message: &message,
         model: effective_model.as_deref(),
+        model_id: effective_model_id.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
         render_md: false,

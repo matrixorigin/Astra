@@ -208,6 +208,7 @@ impl AgenticLoopHost for SubRunHost {
             session_id: state.current_session_id.as_deref(),
             agent_id: Some(self.agent_id.as_str()),
             model: effective_model,
+            model_id: None,
             interaction_mode: Some(interaction_mode.label()),
             explain_verbose: false,
             explain_on: false,

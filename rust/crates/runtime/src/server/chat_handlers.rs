@@ -1,7 +1,12 @@
 use super::bridge_prep::normalize_chat_turn_session_error;
 use super::header_utils::collect_forward_headers;
 use super::*;
-use crate::server::run::handlers::transform_stream_run_events_for_client;
+use crate::server::{
+    external_runtime_context::{
+        inject_effective_runtime_context, inject_effective_runtime_context_body,
+    },
+    run::handlers::transform_stream_run_events_for_client,
+};
 use axum::extract::rejection::JsonRejection;
 
 fn chat_request_json_rejection_to_error(
@@ -16,55 +21,6 @@ fn chat_request_json_rejection_to_error(
         );
     }
     error_response(StatusCode::BAD_REQUEST, detail)
-}
-
-#[allow(clippy::result_large_err)]
-fn validate_chat_request_selected_model(
-    endpoint: &'static str,
-    selected_model: Option<&astra_services::runs::SelectedModelRequest>,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let Some(selected_model) = selected_model else {
-        tracing::warn!(
-            target: "astra_runtime::server::chat_handlers",
-            reason = "missing_model_selection",
-            endpoint,
-            "selected_model.model is required before chat request can create or bind a session",
-        );
-        return Err(astra_core::error_response_coded(
-            StatusCode::BAD_REQUEST,
-            astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE,
-            "missing_model_selection",
-        ));
-    };
-    validate_exact_selected_model_string(
-        "selected_model.model",
-        &selected_model.model,
-        "selected_model_invalid",
-    )?;
-    if let Some(gateway) = selected_model.gateway.as_deref() {
-        validate_exact_selected_model_string(
-            "selected_model.gateway",
-            gateway,
-            "selected_model_invalid",
-        )?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::result_large_err)]
-fn validate_exact_selected_model_string(
-    field: &'static str,
-    value: &str,
-    error_code: &'static str,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
-        return Err(astra_core::error_response_coded(
-            StatusCode::BAD_REQUEST,
-            format!("{field} must be a non-empty exact string"),
-            error_code,
-        ));
-    }
-    Ok(())
 }
 
 /// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
@@ -204,20 +160,19 @@ fn chat_stream_bridge_fallback_payload(
     serde_json::json!({
         "session_id": chat_data.session_id.as_deref(),
         "agent_id": chat_data.agent_id.as_deref(),
-        "selected_model": chat_data
-            .selected_model
-            .as_ref()
-            .map(|selected_model| serde_json::json!(selected_model)),
+        "selected_model": chat_data.selected_model.as_ref(),
         "llm_token_service": chat_data
             .llm_token_service
             .as_ref()
             .map(|config| serde_json::json!(config)),
+        "skill_search": chat_data.skill_search.as_ref(),
         "allow_skills": allow_skills,
         "allow_skill_sources": allow_skill_sources,
         "allow_tools": allow_tools,
         "context": chat_data.context.as_ref(),
         "parts": &chat_data.parts,
         "attachments": &chat_data.attachments,
+        "runtime_system_prompt": chat_data.runtime_system_prompt.as_deref(),
         "edge_executor_id": chat_data.edge_executor_id.as_deref(),
         "capabilities": &chat_data.capabilities,
         "edge_profile": edge_profile,
@@ -247,12 +202,20 @@ fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>>
 
 pub(super) async fn chat_handler(
     State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     request: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
     let Json(request) = request.map_err(chat_request_json_rejection_to_error)?;
-    let user = state.auth_service.current_user(&headers).await?;
-    validate_chat_request_selected_model("/chat", request.selected_model.as_ref())?;
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(&method, &uri, &headers, "/chat"),
+        )
+        .await?;
+    let user = principal.user.clone();
     let mut chat_data = chat_request_into_data(request);
     chat_data.forward_headers = collect_forward_headers(&headers);
     let resolved = resolve_or_create_chat_session(
@@ -265,6 +228,7 @@ pub(super) async fn chat_handler(
     .await?;
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
+    inject_effective_runtime_context(&state, &principal, &mut chat_data).await?;
     let run = state
         .execution
         .run_lifecycle_service
@@ -275,6 +239,8 @@ pub(super) async fn chat_handler(
 
 pub(super) async fn chat_stream_handler(
     State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     request: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
@@ -285,15 +251,18 @@ pub(super) async fn chat_stream_handler(
             return sse_error_response_from_error(status, error.0);
         }
     };
-    let user = match state.auth_service.current_user(&headers).await {
-        Ok(user) => user,
+    let principal = match state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(&method, &uri, &headers, "/chat/stream"),
+        )
+        .await
+    {
+        Ok(principal) => principal,
         Err((status, error)) => return sse_error_response_from_error(status, error.0),
     };
-    if let Err((status, error)) =
-        validate_chat_request_selected_model("/chat/stream", request.selected_model.as_ref())
-    {
-        return sse_error_response_from_error(status, error.0);
-    }
+    let user = principal.user.clone();
 
     let mut chat_data = chat_request_into_data(request);
     chat_data.forward_headers = collect_forward_headers(&headers);
@@ -311,6 +280,11 @@ pub(super) async fn chat_stream_handler(
     };
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
+    if let Err((status, error)) =
+        inject_effective_runtime_context(&state, &principal, &mut chat_data).await
+    {
+        return sse_error_response_from_error(status, error.0);
+    }
 
     // Bridge E2E hooks: when test secret is present and NO test_llm_rounds in
     // context, route through bridge. When test_llm_rounds IS present, fall
@@ -365,14 +339,27 @@ pub(super) async fn chat_stream_handler(
 
 pub(super) async fn chat_turn_handler(
     State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let user = match state.auth_service.current_user(&headers).await {
-        Ok(user) => user,
+    let principal = match state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(&method, &uri, &headers, "/chat/turn"),
+        )
+        .await
+    {
+        Ok(principal) => principal,
         Err((status, error)) => return sse_error_response(status, error.0.detail),
     };
-    dispatch_chat_turn_bridge(&state, &user, &headers, body).await
+    let body = match inject_effective_runtime_context_body(&state, &principal, body).await {
+        Ok(body) => body,
+        Err((status, error)) => return sse_error_response(status, error.0.detail),
+    };
+    dispatch_chat_turn_bridge(&state, &principal.user, &headers, body).await
 }
 
 pub(super) async fn dispatch_chat_turn_bridge(
@@ -414,7 +401,7 @@ pub(super) async fn dispatch_chat_turn_bridge(
 
     let prepared = match prepare_chat_turn_bridge_body(state, user, body, None).await {
         Ok(result) => result,
-        Err((status, error)) => return sse_error_response_from_error(status, error.0),
+        Err((status, error)) => return sse_error_response(status, error.0.detail),
     };
     if let Some(trusted_session_id) = prepared.trusted_session_id.as_deref() {
         bridge_headers.insert(
@@ -560,7 +547,8 @@ pub(super) async fn chat_route_handler(
 
 #[cfg(test)]
 mod tests {
-    use astra_services::runs::{ChatRequestData, SelectedModelRequest};
+    use astra_core::SkillSearchSettings;
+    use astra_services::runs::ChatRequestData;
 
     use super::*;
 
@@ -633,20 +621,26 @@ mod tests {
             message: "hello".to_string(),
             parts: Vec::new(),
             attachments: Vec::new(),
+            runtime_system_prompt: Some("Runtime SQL scope db_name: retail.".to_string()),
             session_id: Some("s1".to_string()),
             full_llm_capture: false,
             agent_id: Some("a1".to_string()),
             model: Some("gpt-4".to_string()),
-            selected_model: Some(SelectedModelRequest {
-                model: "gpt-4".to_string(),
-                gateway: None,
-            }),
+            selected_model: None,
+            capability_descriptors: None,
+            provider_runtime_authorized: false,
             agent_binding: None,
             runtime_auth: None,
+            runtime_skill_binding: None,
             runtime_profile: None,
             llm_token_service: Some(astra_services::LlmTokenServiceConfig {
                 url: "http://catalog:8081/api/v1/llm-token".to_string(),
                 timeout_ms: Some(2500),
+            }),
+            skill_search: Some(SkillSearchSettings {
+                dynamic_surface: false,
+                min_catalog_size: 12,
+                surface_cap: 20,
             }),
             allow_skills: Some(vec!["plan".to_string()]),
             allow_skill_sources: None,
@@ -654,6 +648,7 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
+            mcp_binding_ids: Some(vec![301]),
             context: Some(context),
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -670,12 +665,17 @@ mod tests {
         assert!(obj.contains_key("messages"));
         assert!(obj.contains_key("session_id"));
         assert!(!obj.contains_key("model"));
-        assert_eq!(obj["selected_model"]["model"], "gpt-4");
         assert_eq!(obj["execution_budget"]["initial_turns"], 3);
         assert_eq!(obj["execution_budget"]["hard_turn_limit"], 7);
+        assert_eq!(
+            obj["runtime_system_prompt"],
+            "Runtime SQL scope db_name: retail."
+        );
         assert_eq!(obj["explain"], true);
         assert_eq!(obj["interaction_mode"], "auto");
-        assert!(!obj.contains_key("skill_search"));
+        assert_eq!(obj["skill_search"]["dynamic_surface"], false);
+        assert_eq!(obj["skill_search"]["min_catalog_size"], 12);
+        assert_eq!(obj["skill_search"]["surface_cap"], 20);
         assert_eq!(
             obj["llm_token_service"]["url"],
             "http://catalog:8081/api/v1/llm-token"
@@ -684,6 +684,7 @@ mod tests {
         assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
         assert_eq!(obj["allow_skill_sources"], serde_json::Value::Null);
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
+        assert!(!obj.contains_key("mcp_binding_ids"));
         assert_eq!(
             obj["edge_profile"]["system_prompt_override"],
             "override text"
@@ -699,18 +700,20 @@ mod tests {
             message: "hello".to_string(),
             parts: Vec::new(),
             attachments: Vec::new(),
+            runtime_system_prompt: None,
             session_id: Some("s1".to_string()),
             full_llm_capture: false,
             agent_id: Some("a1".to_string()),
             model: Some("gpt-4".to_string()),
-            selected_model: Some(SelectedModelRequest {
-                model: "gpt-4".to_string(),
-                gateway: None,
-            }),
+            selected_model: None,
+            capability_descriptors: None,
+            provider_runtime_authorized: false,
             agent_binding: None,
             runtime_auth: None,
+            runtime_skill_binding: None,
             runtime_profile: None,
             llm_token_service: None,
+            skill_search: None,
             allow_skills: Some(vec![
                 " plan ".to_string(),
                 "PLAN".to_string(),
@@ -729,6 +732,7 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
+            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -908,13 +912,13 @@ mod session_resolution_tests {
             _session_id: String,
             _user_id: String,
             _limit: u32,
-            _cursor: Option<astra_services::SessionActivityCursor>,
+            _cursor: Option<astra_services::auth::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
                 total: 0,
-                limit: 1,
+                limit: 20,
                 next_cursor: None,
             })
         }
@@ -1025,7 +1029,6 @@ mod session_resolution_tests {
 #[cfg(test)]
 mod chat_stream_bridge_fallback_tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use astra_core::error_response_coded;
     use astra_services::runs::{
@@ -1120,22 +1123,6 @@ mod chat_stream_bridge_fallback_tests {
 
     #[derive(Clone)]
     struct CaptureEnabledSessionService;
-
-    #[derive(Clone, Default)]
-    struct CountingSessionService {
-        create_calls: Arc<AtomicUsize>,
-        get_calls: Arc<AtomicUsize>,
-    }
-
-    impl CountingSessionService {
-        fn create_calls(&self) -> usize {
-            self.create_calls.load(Ordering::SeqCst)
-        }
-
-        fn get_calls(&self) -> usize {
-            self.get_calls.load(Ordering::SeqCst)
-        }
-    }
 
     #[derive(Clone, Default)]
     struct RecordingCreateRunLifecycle {
@@ -1233,13 +1220,13 @@ mod chat_stream_bridge_fallback_tests {
             _session_id: String,
             _user_id: String,
             _limit: u32,
-            _cursor: Option<astra_services::SessionActivityCursor>,
+            _cursor: Option<astra_services::auth::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
                 total: 0,
-                limit: 1,
+                limit: 20,
                 next_cursor: None,
             })
         }
@@ -1325,101 +1312,13 @@ mod chat_stream_bridge_fallback_tests {
             _session_id: String,
             _user_id: String,
             _limit: u32,
-            _cursor: Option<astra_services::SessionActivityCursor>,
+            _cursor: Option<astra_services::auth::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
-                total: 0,
-                limit: 1,
-                next_cursor: None,
-            })
-        }
-    }
-
-    #[async_trait]
-    impl SessionService for CountingSessionService {
-        async fn create_session(
-            &self,
-            user_id: String,
-            request: SessionCreateRequestData,
-        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-            self.create_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(SessionRecord {
-                session_id: "s-counting-created".to_string(),
-                user_id,
-                agent_id: request.agent_id,
-                title: Some("Created".to_string()),
-                metadata: request.metadata.unwrap_or_default(),
-                status: "active".to_string(),
-                event_count: 0,
-                created_at: "2026-01-01T00:00:00".to_string(),
-                updated_at: Some("2026-01-01T00:00:00".to_string()),
-                ended_at: None,
-            })
-        }
-
-        async fn list_sessions(
-            &self,
-            _filter: SessionListFilter,
-        ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
-            Ok(SessionListRecord {
-                sessions: Vec::new(),
                 total: 0,
                 limit: 20,
-                next_cursor: None,
-            })
-        }
-
-        async fn get_session(
-            &self,
-            session_id: String,
-            user_id: String,
-        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-            self.get_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(SessionRecord {
-                session_id,
-                user_id,
-                agent_id: None,
-                title: Some("Existing".to_string()),
-                metadata: serde_json::Map::new(),
-                status: "active".to_string(),
-                event_count: 0,
-                created_at: "2026-01-01T00:00:00".to_string(),
-                updated_at: Some("2026-01-01T00:00:00".to_string()),
-                ended_at: None,
-            })
-        }
-
-        async fn update_session(
-            &self,
-            session_id: String,
-            user_id: String,
-            _request: SessionUpdateRequestData,
-        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-            self.get_session(session_id, user_id).await
-        }
-
-        async fn delete_session(
-            &self,
-            _session_id: String,
-            _user_id: String,
-        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-            Ok(())
-        }
-
-        async fn get_session_activity(
-            &self,
-            _session_id: String,
-            _user_id: String,
-            _limit: u32,
-            _cursor: Option<astra_services::SessionActivityCursor>,
-        ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
-            Ok(SessionActivityRecord {
-                session_id: String::new(),
-                activities: vec![],
-                total: 0,
-                limit: 1,
                 next_cursor: None,
             })
         }
@@ -1927,107 +1826,6 @@ mod chat_stream_bridge_fallback_tests {
     }
 
     #[tokio::test]
-    async fn chat_stream_missing_selected_model_fails_before_session_resolution() {
-        let sessions = CountingSessionService::default();
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_session_service(Arc::new(sessions.clone()))
-                .with_run_lifecycle_service(Arc::new(StubConfiguredLifecycle)),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/chat/stream")
-                    .header("authorization", "Bearer good-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"message":"hi"}"#))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
-        assert!(text.contains("\"type\":\"error\""));
-        assert!(text.contains("\"error_code\":\"missing_model_selection\""));
-        assert!(!text.contains("\"type\":\"session_info\""));
-        assert_eq!(sessions.create_calls(), 0);
-        assert_eq!(sessions.get_calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn chat_missing_selected_model_fails_before_session_resolution() {
-        let sessions = CountingSessionService::default();
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_session_service(Arc::new(sessions.clone()))
-                .with_run_lifecycle_service(Arc::new(StubConfiguredLifecycle)),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/chat")
-                    .header("authorization", "Bearer good-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"message":"hi"}"#))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let text = String::from_utf8(body.to_vec()).expect("body should be utf8");
-        assert!(text.contains("\"error_code\":\"missing_model_selection\""));
-        assert_eq!(sessions.create_calls(), 0);
-        assert_eq!(sessions.get_calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn chat_turn_missing_selected_model_returns_typed_sse_error_before_session_info() {
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_session_service(Arc::new(StubSessionService)),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/chat/turn")
-                    .header("authorization", "Bearer good-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
-        assert!(text.contains("\"type\":\"error\""));
-        assert!(text.contains("\"error_code\":\"missing_model_selection\""));
-        assert!(!text.contains("\"type\":\"session_info\""));
-    }
-
-    #[tokio::test]
     async fn chat_stream_agent_binding_skill_discovery_error_redacts_runtime_auth_in_sse() {
         use axum::{Router, routing::post};
 
@@ -2115,9 +1913,7 @@ mod chat_stream_bridge_fallback_tests {
                     .uri("/chat/stream")
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"message":"hi","selected_model":{"model":"demo-model"}}"#,
-                    ))
+                    .body(Body::from(r#"{"message":"hi"}"#))
                     .expect("request should build"),
             )
             .await
@@ -2156,7 +1952,7 @@ mod chat_stream_bridge_fallback_tests {
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"session_id":"capture-session","message":"hi","selected_model":{"model":"demo-model"}}"#,
+                        r#"{"session_id":"capture-session","message":"hi"}"#,
                     ))
                     .expect("request should build"),
             )
@@ -2189,7 +1985,7 @@ mod chat_stream_bridge_fallback_tests {
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"session_id":"capture-session","message":"hi","selected_model":{"model":"demo-model"}}"#,
+                        r#"{"session_id":"capture-session","message":"hi"}"#,
                     ))
                     .expect("request should build"),
             )
@@ -2219,9 +2015,7 @@ mod chat_stream_bridge_fallback_tests {
                     .uri("/chat/stream")
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"message":"hi","selected_model":{"model":"demo-model"}}"#,
-                    ))
+                    .body(Body::from(r#"{"message":"hi"}"#))
                     .expect("request should build"),
             )
             .await
@@ -2291,9 +2085,7 @@ mod chat_stream_bridge_fallback_tests {
                     .uri("/chat/stream")
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"message":"hi","selected_model":{"model":"demo-model"}}"#,
-                    ))
+                    .body(Body::from(r#"{"message":"hi"}"#))
                     .expect("request should build"),
             )
             .await

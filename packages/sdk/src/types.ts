@@ -56,16 +56,6 @@ export type StreamEventType =
   | "tool_output_delta"
   | "tool_execution_completed";
 
-export type ToolEventStatus =
-  | "running"
-  | "done"
-  | "completed"
-  | "error"
-  | "failed"
-  | "timed_out"
-  | "cancelled"
-  | "skipped";
-
 export type SessionInfoEvent = {
   type: "session_info";
   session_id: string;
@@ -227,9 +217,7 @@ export type ToolCallEndEvent = {
   type: "tool_call_end";
   call_id: string;
   result?: string;
-  status?: ToolEventStatus;
   success?: boolean;
-  skipped?: boolean;
   duration_ms?: number;
   error_kind?: string;
   blocked?: boolean;
@@ -450,9 +438,7 @@ export type ToolTransportCompletedEvent = {
   call_id: string;
   tool?: string;
   result?: unknown;
-  status?: ToolEventStatus;
   success?: boolean;
-  skipped?: boolean;
   duration_ms?: number;
 } & ExecutionBindingFields;
 
@@ -461,10 +447,6 @@ export type ToolTransportFailedEvent = {
   call_id: string;
   tool?: string;
   error?: string;
-  status?: Exclude<
-    ToolEventStatus,
-    "running" | "done" | "completed" | "skipped"
-  >;
   error_kind?: string;
   blocked?: boolean;
   success?: false;
@@ -606,10 +588,7 @@ export type StreamEvent = (
 ) & { index?: number };
 
 export type ConnectionState =
-  | "disconnected"
-  | "connecting"
-  | "connected"
-  | "error";
+  "disconnected" | "connecting" | "connected" | "error";
 
 // ─── Chat / Workspace Types ────────────────────────────────────────
 
@@ -758,6 +737,7 @@ export type ChatRequest = {
   sessionId?: string;
   agentId?: string;
   selectedModel: {
+    id?: string;
     model: string;
     gateway?: string;
   };
@@ -979,13 +959,6 @@ export type RuntimeSessionListResponse = {
   next_cursor?: RuntimeSessionListCursor | null;
 };
 
-/**
- * Cursor for session list pagination.
- *
- * `updated_at` carries `COALESCE(updated_at, created_at)` — the ordering key,
- * not strictly the `updated_at` column. Sessions that were never updated will
- * have their `created_at` timestamp here.
- */
 export type RuntimeSessionListCursor = {
   updated_at: string;
   session_id: string;
@@ -1005,7 +978,7 @@ export type RuntimeSessionUpdateBody = {
 
 export type RuntimeSessionListParams = {
   limit?: number;
-  cursor?: RuntimeSessionListCursor;
+  cursor?: RuntimeSessionListCursor | null;
 };
 
 export type RuntimeTranscriptItemResponse = {
@@ -1141,7 +1114,7 @@ export type RuntimeSkillListCursor = {
 
 export type RuntimeSkillListParams = {
   limit?: number;
-  cursor?: RuntimeSkillListCursor;
+  cursor?: RuntimeSkillListCursor | null;
 };
 
 /** JSON body for `POST /skills` — matches services `RegisterSkillRequest`. */
@@ -1347,7 +1320,7 @@ export type EventListFilters = {
   agentId?: string;
   causalChainId?: string;
   limit?: number;
-  cursor?: EventListCursor;
+  cursor?: EventListCursor | null;
 };
 
 // ─── Edge status ───────────────────────────────────────────────────
@@ -1367,7 +1340,7 @@ export type EdgeStatusResponse = {
 
 export type ToolResultRequestBody = {
   request_id: string;
-  status: "completed" | "failed" | "skipped";
+  status: string;
   output?: string;
   duration_ms?: number;
 };

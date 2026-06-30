@@ -876,7 +876,7 @@ mod tests {
             _session_id: String,
             _user_id: String,
             _limit: u32,
-            _cursor: Option<astra_services::SessionActivityCursor>,
+            _cursor: Option<astra_services::auth::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionActivityRecord {
                 session_id: String::new(),

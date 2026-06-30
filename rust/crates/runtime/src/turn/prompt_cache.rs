@@ -941,7 +941,7 @@ mod tests {
     #[test]
     fn cache_static_prefix_tool_names_follow_toml_surface_additions() {
         let cfg = ToolSurfaceConfig {
-            always_load_tools: vec!["github".into(), "not_a_real_tool".into()],
+            pinned_tools: vec!["github".into(), "not_a_real_tool".into()],
         };
         let always_load = resolve_always_load_tool_names_for_config(&cfg);
 

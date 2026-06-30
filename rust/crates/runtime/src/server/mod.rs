@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     response::Response,
     routing::{delete, get, post},
 };
@@ -31,6 +31,7 @@ pub mod conflict_resolver;
 pub mod delegation;
 pub mod device_lease_sweeper;
 mod edge;
+mod external_runtime_context;
 pub mod harness;
 pub(crate) mod header_utils;
 mod http_helpers;
@@ -77,6 +78,24 @@ pub(crate) mod tool_file_runtime;
 pub(crate) mod tool_introspect;
 pub(crate) mod tool_local_execution;
 pub(crate) mod tool_local_transport;
+
+fn external_request_descriptor(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    route: &'static str,
+) -> astra_services::ExternalRequestDescriptor {
+    astra_services::ExternalRequestDescriptor {
+        method: method.as_str().to_string(),
+        path: uri.path().to_string(),
+        route: Some(route.to_string()),
+        request_id: headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned),
+        body_digest: None,
+    }
+}
 pub(crate) mod tool_plan_gate;
 pub(crate) mod tool_route_boundary;
 pub(crate) mod tool_route_runtime;

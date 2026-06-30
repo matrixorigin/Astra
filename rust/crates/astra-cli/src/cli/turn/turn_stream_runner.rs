@@ -102,6 +102,7 @@ fn build_turn_stream_params<'a>(
         message,
         semantic_query_override,
         session_id,
+        model_id: crate::cli::slash::slash_config::active_model_id_for_request(),
         model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
         provider: None,
         explain: state.explain,

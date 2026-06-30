@@ -3133,6 +3133,41 @@ pub(crate) async fn run_tui_session(
                                         frame_requester.schedule_frame();
                                         continue;
                                     }
+                                    if let Some(rest) = name.strip_prefix("__external_login__\n") {
+                                        let mut parts = rest.splitn(3, '\n');
+                                        let provider_id = parts.next().unwrap_or("").to_string();
+                                        let username = parts.next().unwrap_or("").to_string();
+                                        let password = parts.next().unwrap_or("").to_string();
+                                        match crate::cli::auth_flow::do_external_login(api, profile, &provider_id, None, &username, &password).await {
+                                            Ok(token) => {
+                                                chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username} via {provider_id}")));
+                                                crate::post_auth_cloud_resync(profile, &mut state).await;
+                                                if let Some(model) = sync_default_model_after_auth(
+                                                    api,
+                                                    &token,
+                                                    &mut state,
+                                                    &mut bottom_pane,
+                                                )
+                                                .await
+                                                {
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::response(
+                                                            format!("Default model: {model}"),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                chat_widget.commit_system(history_cell::system::SystemCell::error(format!("External login failed: {e}")));
+                                            }
+                                        }
+                                        pending_deferred_slash_flush = false;
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
                                     if let Some(rest) = name.strip_prefix("__register__\n") {
                                         let mut parts = rest.splitn(3, '\n');
                                         let username = parts.next().unwrap_or("").to_string();
@@ -3237,6 +3272,9 @@ pub(crate) async fn run_tui_session(
                                             .and_then(crate::cli::slash::slash_router::entry_thinking_capability);
                                         let provider =
                                             entry.and_then(crate::cli::slash::slash_router::entry_provider);
+                                        let model_id = entry
+                                            .and_then(crate::cli::slash::slash_router::entry_model_id)
+                                            .map(ToOwned::to_owned);
                                         let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
                                             &base_model,
                                             provider,
@@ -3246,6 +3284,9 @@ pub(crate) async fn run_tui_session(
                                             state.model = Some(base_model.clone());
                                             crate::cli::slash::slash_config::set_active_model_for_display(
                                                 Some(base_model.clone()),
+                                            );
+                                            crate::cli::slash::slash_config::set_active_model_id_for_request(
+                                                model_id,
                                             );
                                             bottom_pane.footer.model = Some(base_model.clone());
                                             chat_widget.commit_system(
@@ -3308,6 +3349,9 @@ pub(crate) async fn run_tui_session(
                                         );
                                         let provider =
                                             entry.and_then(crate::cli::slash::slash_router::entry_provider);
+                                        let model_id = entry
+                                            .and_then(crate::cli::slash::slash_router::entry_model_id)
+                                            .map(ToOwned::to_owned);
                                         let thinking_cap = entry
                                             .and_then(crate::cli::slash::slash_router::entry_thinking_capability);
                                         let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
@@ -3339,6 +3383,9 @@ pub(crate) async fn run_tui_session(
                                         state.model = Some(composed.clone());
                                         crate::cli::slash::slash_config::set_active_model_for_display(
                                             Some(composed.clone()),
+                                        );
+                                        crate::cli::slash::slash_config::set_active_model_id_for_request(
+                                            model_id,
                                         );
                                         bottom_pane.footer.model = Some(composed.clone());
                                         chat_widget.commit_system(

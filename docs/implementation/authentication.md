@@ -9,11 +9,6 @@ Two-layer separation:
 
 The platform does NOT implement RBAC. It does NOT query `mo_catalog.mo_user_grant`. Authorization is ownership-based: you can only operate on resources you created.
 
-## Runtime Modes
-
-- `ASTRA_AUTH_MODE=local_jwt` (default): astra issues and validates local JWTs via `/auth/login` and `/auth/refresh`.
-- `ASTRA_AUTH_MODE=trusted_moi`: astra trusts externally issued Moi JWTs (`Authorization: Bearer ...`) and disables local auth endpoints (`/auth/register`, `/auth/login`, `/auth/refresh`, `/auth/logout` return 403).
-
 ## Authentication: JWT
 
 ```
@@ -24,6 +19,12 @@ Client → Authorization: Bearer <access_token> → API validates → extracts u
 - Access token: 1 hour TTL
 - Refresh token: 7 day TTL
 - Stateless validation (no DB lookup per request)
+
+## External Authentication
+
+External users enter through configured `auth.external_providers`. The provider endpoint validates
+the external credential and returns an Astra-compatible session descriptor. Astra then issues its
+own access and refresh tokens, so subsequent requests use the same session mechanism as local users.
 
 ## Authorization: Resource Ownership
 

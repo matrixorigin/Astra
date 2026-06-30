@@ -62,6 +62,10 @@ fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+fn model_list_entry_id(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("model_id").and_then(|v| v.as_str())
+}
+
 fn model_list_entry_thinking_capability(entry: &serde_json::Value) -> Option<&str> {
     entry.get("thinking_capability").and_then(|v| v.as_str())
 }
@@ -74,9 +78,10 @@ fn find_model_list_entry<'a>(
     models: &'a [serde_json::Value],
     name: &str,
 ) -> Option<&'a serde_json::Value> {
-    models
-        .iter()
-        .find(|m| model_list_entry_name(m).is_some_and(|n| n.eq_ignore_ascii_case(name)))
+    models.iter().find(|m| {
+        model_list_entry_id(m).is_some_and(|id| id == name)
+            || model_list_entry_name(m).is_some_and(|n| n.eq_ignore_ascii_case(name))
+    })
 }
 
 /// Slash-command fallback path used by the TUI for state-bearing
@@ -223,6 +228,11 @@ pub(crate) async fn handle_slash_command(
                     };
 
                     state.model = Some(model_with_suffix.clone());
+                    slash_config::set_active_model_id_for_request(
+                        selected_model
+                            .and_then(model_list_entry_id)
+                            .map(ToOwned::to_owned),
+                    );
                     state.cached_pricing = slash_stats::extract_pricing_for_model(&models, &chosen)
                         .unwrap_or_else(|| slash_stats::fallback_pricing(&chosen));
                     state.context_budget = prompts::ContextBudget::from_runtime_config(
@@ -241,18 +251,40 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/model" => {
+            let mut selected_model_id: Option<String> = None;
+            let mut selected_model_name: Option<String> = None;
             if let Some(tok) = token {
                 match api.get_models_text(tok).await {
                     Ok(body) => {
-                        let value: serde_json::Value =
-                            serde_json::from_str(&body).unwrap_or_default();
-                        let models = value
+                        let value: serde_json::Value = match serde_json::from_str(&body) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                eprintln!(
+                                    "{}",
+                                    format!("  Failed to parse model list response: {err}")
+                                        .yellow()
+                                );
+                                return Ok(false);
+                            }
+                        };
+                        let Some(models) = value
                             .as_array()
-                            .cloned()
-                            .or_else(|| value.get("models").and_then(|v| v.as_array()).cloned())
-                            .unwrap_or_default();
+                            .or_else(|| value.get("models").and_then(|v| v.as_array()))
+                        else {
+                            eprintln!(
+                                "{}",
+                                "  Model list response did not include a models array.".yellow()
+                            );
+                            return Ok(false);
+                        };
+                        let models = models.clone();
+                        if models.is_empty() {
+                            eprintln!("{}", "  No models returned by the server.".yellow());
+                            return Ok(false);
+                        }
 
-                        if let Some(entry) = find_model_list_entry(&models, arg) {
+                        let matched_entry = find_model_list_entry(&models, arg);
+                        if let Some(entry) = matched_entry {
                             if !model_list_entry_is_active(entry) {
                                 eprintln!(
                                     "{}",
@@ -265,6 +297,9 @@ pub(crate) async fn handle_slash_command(
                                 );
                                 return Ok(false);
                             }
+                            selected_model_id = model_list_entry_id(entry).map(ToOwned::to_owned);
+                            selected_model_name =
+                                model_list_entry_name(entry).map(ToOwned::to_owned);
                         }
 
                         let available: Vec<String> = models
@@ -279,7 +314,8 @@ pub(crate) async fn handle_slash_command(
                             })
                             .collect();
 
-                        let model_exists = available.iter().any(|m| m.eq_ignore_ascii_case(arg));
+                        let model_exists = matched_entry.is_some()
+                            || available.iter().any(|m| m.eq_ignore_ascii_case(arg));
 
                         if !model_exists && !available.is_empty() {
                             let suggestions = cli_output::suggest_models(arg, &available);
@@ -303,19 +339,31 @@ pub(crate) async fn handle_slash_command(
                             return Ok(false);
                         }
                     }
-                    Err(_) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "{}",
+                            format!("  Failed to list models: {}", map_thin_err(err)).yellow()
+                        );
+                        return Ok(false);
+                    }
                 }
             }
 
-            state.model = Some(arg.to_string());
-            slash_config::set_active_model_for_display(Some(arg.to_string()));
-            let base_model = astra_turn_core::thinking_config::resolve_model_thinking(arg).0;
+            let selected_model = selected_model_name.unwrap_or_else(|| arg.to_string());
+            state.model = Some(selected_model.clone());
+            slash_config::set_active_model_id_for_request(selected_model_id);
+            slash_config::set_active_model_for_display(Some(selected_model.clone()));
+            let base_model =
+                astra_turn_core::thinking_config::resolve_model_thinking(&selected_model).0;
             state.cached_pricing = slash_stats::fallback_pricing(base_model);
             state.context_budget = prompts::ContextBudget::from_runtime_config(
                 &state.runtime_config,
                 Some(base_model),
             );
-            eprintln!("{}", format!("  \u{2713}  Set model to {}", arg).green());
+            eprintln!(
+                "{}",
+                format!("  \u{2713}  Set model to {}", selected_model).green()
+            );
             if let Some(ref j) = state.journal {
                 crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
                     j,
@@ -323,7 +371,7 @@ pub(crate) async fn handle_slash_command(
                     &session_journal::JournalEvent::config_change(
                         state.session_id.as_deref(),
                         "model",
-                        arg,
+                        &selected_model,
                     ),
                     "slash_router:model",
                 );
@@ -630,6 +678,21 @@ pub(crate) fn entry_thinking_capability(entry: &serde_json::Value) -> Option<&st
     model_list_entry_thinking_capability(entry)
 }
 
+/// Public accessor for a model entry's provider-issued `model_id`.
+pub(crate) fn entry_model_id(entry: &serde_json::Value) -> Option<&str> {
+    model_list_entry_id(entry)
+}
+
+/// Public accessor for a model entry's display name.
+pub(crate) fn entry_model_name(entry: &serde_json::Value) -> Option<&str> {
+    model_list_entry_name(entry)
+}
+
+/// Public accessor for a model entry's active state.
+pub(crate) fn entry_model_is_active(entry: &serde_json::Value) -> bool {
+    model_list_entry_is_active(entry)
+}
+
 /// Public accessor for a model entry's `provider` field.
 pub(crate) fn entry_provider(entry: &serde_json::Value) -> Option<&str> {
     model_list_entry_provider(entry)
@@ -637,7 +700,10 @@ pub(crate) fn entry_provider(entry: &serde_json::Value) -> Option<&str> {
 
 #[cfg(test)]
 mod model_list_json_tests {
-    use super::{model_list_entry_is_active, model_list_entry_thinking_capability};
+    use super::{
+        entry_model_id, entry_model_is_active, entry_model_name, find_model_entry_by_name,
+        model_list_entry_is_active, model_list_entry_thinking_capability,
+    };
 
     #[test]
     fn respects_is_active_false() {
@@ -673,6 +739,19 @@ mod model_list_json_tests {
     fn reads_thinking_capability_both() {
         let v = serde_json::json!({"name": "claude", "thinking_capability": "both"});
         assert_eq!(model_list_entry_thinking_capability(&v), Some("both"));
+    }
+
+    #[test]
+    fn finds_model_entry_by_provider_model_id() {
+        let models = vec![serde_json::json!({
+            "model_id": "provider-model-id",
+            "name": "Display Model",
+            "is_active": true
+        })];
+        let entry = find_model_entry_by_name(&models, "provider-model-id").expect("model entry");
+        assert_eq!(entry_model_id(entry), Some("provider-model-id"));
+        assert_eq!(entry_model_name(entry), Some("Display Model"));
+        assert!(entry_model_is_active(entry));
     }
 
     #[test]

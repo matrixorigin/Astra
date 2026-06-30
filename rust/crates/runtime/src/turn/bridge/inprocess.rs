@@ -78,6 +78,67 @@ fn selected_model_name_from_payload(payload: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderModelGatewayInvocation {
+    model: String,
+    endpoint_url: String,
+    authorization: String,
+}
+
+fn provider_model_gateway_invocation_from_payload(
+    payload: &Value,
+) -> Result<Option<ProviderModelGatewayInvocation>, String> {
+    let Some(model_gateway) = payload
+        .get("capability_descriptors")
+        .and_then(Value::as_object)
+        .and_then(|descriptors| descriptors.get("model_gateway"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(None);
+    };
+    let selected_model = payload
+        .get("selected_model")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "selected_model is required with capability_descriptors.model_gateway".to_string()
+        })?;
+    if selected_model.get("id").and_then(Value::as_str).is_none() {
+        return Err(
+            "provider-issued selected_model.id is required with capability_descriptors".to_string(),
+        );
+    }
+    let model = selected_model
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "selected_model.model is required with capability_descriptors.model_gateway".to_string()
+        })?
+        .to_string();
+    let endpoint_url = model_gateway
+        .get("endpoint_url")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "capability_descriptors.model_gateway.endpoint_url is required".to_string())?
+        .to_string();
+    let authorization = payload
+        .get("runtime_auth")
+        .and_then(Value::as_object)
+        .and_then(|runtime_auth| runtime_auth.get("authorization"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "runtime_auth.authorization is required with capability_descriptors.model_gateway"
+                .to_string()
+        })?
+        .to_string();
+    Ok(Some(ProviderModelGatewayInvocation {
+        model,
+        endpoint_url,
+        authorization,
+    }))
+}
+
 fn rewrite_bridge_runtime_manifest_model_resolution(
     trace: &mut Value,
     requested_model: Option<&str>,
@@ -1381,6 +1442,8 @@ impl InProcessChatTurnBridge {
             .get("round_index")
             .and_then(Value::as_i64)
             .unwrap_or(0) as u32;
+        let provider_model_gateway_invocation =
+            provider_model_gateway_invocation_from_payload(&payload);
 
         let _agent_id = payload
             .get("agent_id")
@@ -1547,6 +1610,18 @@ impl InProcessChatTurnBridge {
                     .as_ref()
                     .map(|blocks| !blocks.is_empty())
                     .unwrap_or(false);
+            let provider_model_gateway_invocation = match provider_model_gateway_invocation {
+                Ok(invocation) => invocation,
+                Err(error) => {
+                    yield render_sse_map(&build_stream_error_event(
+                        &error,
+                        "EXTERNAL_RUNTIME_CONTEXT_INVALID",
+                        false,
+                    ));
+                    mark_disconnect_capture_finalized(&disconnect_capture_state);
+                    return;
+                }
+            };
 
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_chain for rate-limit-triggered fallback.
@@ -1566,12 +1641,29 @@ impl InProcessChatTurnBridge {
                     "missing selected_model.model; refusing implicit model fallback"
                 );
             }
+            let mut llm_header_overrides: Option<HashMap<String, String>> = None;
+            let mut completions_url_override: Option<String> = None;
             let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, mut cache_capability, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     None::<String>,
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
+                    "openai".to_string(),
+                    None,
+                    None,
+                    Vec::<String>::new(),
+                )
+            } else if let Some(invocation) = provider_model_gateway_invocation {
+                let mut headers = HashMap::new();
+                headers.insert("authorization".to_string(), invocation.authorization);
+                llm_header_overrides = Some(headers);
+                completions_url_override = Some(invocation.endpoint_url);
+                (
+                    invocation.model,
+                    None::<String>,
+                    "provider-runtime".to_string(),
+                    "http://127.0.0.1".to_string(),
                     "openai".to_string(),
                     None,
                     None,
@@ -3016,6 +3108,9 @@ impl InProcessChatTurnBridge {
                             cc.clone(),
                             &thinking_config,
                             request_body_overrides.as_ref(),
+                            llm_header_overrides.as_ref(),
+                            completions_url_override.as_deref(),
+                            None,
                         )
                         .await
                         {
@@ -3195,6 +3290,9 @@ impl InProcessChatTurnBridge {
                                 cc.clone(),
                                 &thinking_config,
                                 request_body_overrides.as_ref(),
+                                llm_header_overrides.as_ref(),
+                                completions_url_override.as_deref(),
+                                None,
                             )
                             .await
                             {
@@ -4745,6 +4843,44 @@ mod tests {
             })),
             None
         );
+    }
+
+    #[test]
+    fn provider_model_gateway_invocation_from_payload_reads_external_runtime_context() {
+        let invocation = provider_model_gateway_invocation_from_payload(&json!({
+            "selected_model": {"id": "model-qwen", "model": "qwen3.5-flash"},
+            "runtime_auth": {"authorization": "Bearer runtime-grant"},
+            "capability_descriptors": {
+                "model_gateway": {
+                    "endpoint_url": "http://catalog.local/api/v1/models/openai/chat/completions"
+                }
+            }
+        }))
+        .expect("valid provider runtime context")
+        .expect("provider model gateway invocation");
+
+        assert_eq!(invocation.model, "qwen3.5-flash");
+        assert_eq!(
+            invocation.endpoint_url,
+            "http://catalog.local/api/v1/models/openai/chat/completions"
+        );
+        assert_eq!(invocation.authorization, "Bearer runtime-grant");
+    }
+
+    #[test]
+    fn provider_model_gateway_invocation_requires_provider_model_id() {
+        let error = provider_model_gateway_invocation_from_payload(&json!({
+            "selected_model": {"model": "qwen3.5-flash"},
+            "runtime_auth": {"authorization": "Bearer runtime-grant"},
+            "capability_descriptors": {
+                "model_gateway": {
+                    "endpoint_url": "http://catalog.local/api/v1/models/openai/chat/completions"
+                }
+            }
+        }))
+        .expect_err("provider model id is required");
+
+        assert!(error.contains("selected_model.id"), "{error}");
     }
 
     #[test]

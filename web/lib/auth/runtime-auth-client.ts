@@ -1,4 +1,6 @@
 import {
+  PATH_AUTH_EXTERNAL_LOGIN,
+  PATH_AUTH_EXTERNAL_PROVIDERS,
   PATH_AUTH_LOGIN,
   PATH_AUTH_LOGOUT,
   PATH_AUTH_ME,
@@ -6,11 +8,13 @@ import {
   PATH_AUTH_REGISTER,
   type AuthResult,
   type UserInfo,
-} from '@astra/sdk';
-import { WebRuntimeClient } from '@/lib/runtime-client';
+} from "@astra/sdk";
+import { WebRuntimeClient } from "@/lib/runtime-client";
 
 export type AuthTokens = AuthResult;
-export type AuthUser = Omit<UserInfo, 'display_name'> & { display_name: string | null };
+export type AuthUser = Omit<UserInfo, "display_name"> & {
+  display_name: string | null;
+};
 
 export type AuthRegisterResponse = AuthTokens & AuthUser;
 
@@ -18,16 +22,26 @@ export type AuthLogoutResponse = {
   message?: string;
 };
 
+export type ExternalAuthProvider = {
+  id: string;
+  display_name: string;
+  credential_type: string;
+};
+
+export type ExternalAuthProvidersResponse = {
+  providers: ExternalAuthProvider[];
+};
+
 export type RuntimeAuthResult<T> =
   | { ok: true; data: T }
   | { ok: false; status: number; error: string };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function stringField(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() ? value : undefined;
+  return typeof value === "string" && value.trim() ? value : undefined;
 }
 
 function hasAuthTokens(value: unknown): value is AuthTokens {
@@ -36,9 +50,9 @@ function hasAuthTokens(value: unknown): value is AuthTokens {
   }
 
   return (
-    typeof value.access_token === 'string' &&
+    typeof value.access_token === "string" &&
     value.access_token.length > 0 &&
-    typeof value.refresh_token === 'string' &&
+    typeof value.refresh_token === "string" &&
     value.refresh_token.length > 0
   );
 }
@@ -49,17 +63,17 @@ function isAuthRegisterResponse(value: unknown): value is AuthRegisterResponse {
   }
 
   const record = value;
-  const userId = record['user_id'];
-  const username = record['username'];
-  const email = record['email'];
-  const displayName = record['display_name'];
+  const userId = record["user_id"];
+  const username = record["username"];
+  const email = record["email"];
+  const displayName = record["display_name"];
 
   return (
     hasAuthTokens(record) &&
-    typeof userId === 'string' &&
-    typeof username === 'string' &&
-    typeof email === 'string' &&
-    (typeof displayName === 'string' || displayName === null)
+    typeof userId === "string" &&
+    typeof username === "string" &&
+    typeof email === "string" &&
+    (typeof displayName === "string" || displayName === null)
   );
 }
 
@@ -69,10 +83,10 @@ function isAuthUser(value: unknown): value is AuthUser {
   }
 
   return (
-    typeof value.user_id === 'string' &&
-    typeof value.username === 'string' &&
-    typeof value.email === 'string' &&
-    (typeof value.display_name === 'string' || value.display_name === null)
+    typeof value.user_id === "string" &&
+    typeof value.username === "string" &&
+    typeof value.email === "string" &&
+    (typeof value.display_name === "string" || value.display_name === null)
   );
 }
 
@@ -80,13 +94,32 @@ function isLogoutResponse(value: unknown): value is AuthLogoutResponse {
   return isRecord(value);
 }
 
+function isExternalAuthProvider(value: unknown): value is ExternalAuthProvider {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.display_name === "string" &&
+    typeof value.credential_type === "string"
+  );
+}
+
+function isExternalAuthProvidersResponse(
+  value: unknown,
+): value is ExternalAuthProvidersResponse {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.providers) &&
+    value.providers.every(isExternalAuthProvider)
+  );
+}
+
 function runtimeClientForAuth(
   apiUrl: string,
   tokens?: { accessToken?: string; refreshToken?: string },
 ) {
   return new WebRuntimeClient({
-    mode: 'live',
-    source: 'cookie',
+    mode: "live",
+    source: "cookie",
     apiUrl,
     accessToken: tokens?.accessToken,
     refreshToken: tokens?.refreshToken,
@@ -104,8 +137,8 @@ async function runtimeErrorFromResponse(
   defaultMessage: string,
 ): Promise<string> {
   try {
-    const contentType = response.headers.get('content-type') ?? '';
-    if (contentType.includes('application/json')) {
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
       const body = (await response.json()) as {
         detail?: unknown;
         error?: unknown;
@@ -120,7 +153,10 @@ async function runtimeErrorFromResponse(
     }
 
     const text = await response.text();
-    return text.trim() || `${defaultMessage}: ${response.status} ${response.statusText}`.trim();
+    return (
+      text.trim() ||
+      `${defaultMessage}: ${response.status} ${response.statusText}`.trim()
+    );
   } catch {
     return `${defaultMessage}: ${response.status} ${response.statusText}`.trim();
   }
@@ -171,8 +207,8 @@ async function postRuntimeAuth<T>(
   try {
     const client = runtimeClientForAuth(apiUrl);
     const response = await client.fetchResponse(path, {
-      method: 'POST',
-      auth: 'none',
+      method: "POST",
+      auth: "none",
       json: body,
       operation: defaultError,
     });
@@ -181,7 +217,32 @@ async function postRuntimeAuth<T>(
     return {
       ok: false,
       status: 502,
-      error: error instanceof Error ? error.message : 'Cannot reach Astra runtime.',
+      error:
+        error instanceof Error ? error.message : "Cannot reach Astra runtime.",
+    };
+  }
+}
+
+async function getRuntimeAuth<T>(
+  apiUrl: string,
+  path: string,
+  defaultError: string,
+  guard: (value: unknown) => value is T,
+): Promise<RuntimeAuthResult<T>> {
+  try {
+    const client = runtimeClientForAuth(apiUrl);
+    const response = await client.fetchResponse(path, {
+      method: "GET",
+      auth: "none",
+      operation: defaultError,
+    });
+    return decodeRuntimeResponse(response, defaultError, guard);
+  } catch (error) {
+    return {
+      ok: false,
+      status: 502,
+      error:
+        error instanceof Error ? error.message : "Cannot reach Astra runtime.",
     };
   }
 }
@@ -190,7 +251,54 @@ export function runtimeLogin(
   apiUrl: string,
   input: { username: string; password: string },
 ): Promise<RuntimeAuthResult<AuthTokens>> {
-  return postRuntimeAuth(apiUrl, PATH_AUTH_LOGIN, input, 'Login failed', hasAuthTokens);
+  return postRuntimeAuth(
+    apiUrl,
+    PATH_AUTH_LOGIN,
+    input,
+    "Login failed",
+    hasAuthTokens,
+  );
+}
+
+export function runtimeExternalProviders(
+  apiUrl: string,
+): Promise<RuntimeAuthResult<ExternalAuthProvidersResponse>> {
+  return getRuntimeAuth(
+    apiUrl,
+    PATH_AUTH_EXTERNAL_PROVIDERS,
+    "Fetch external auth providers failed",
+    isExternalAuthProvidersResponse,
+  );
+}
+
+export function runtimeExternalLogin(
+  apiUrl: string,
+  input: {
+    provider_id: string;
+    username: string;
+    password: string;
+    scope_id?: string;
+  },
+): Promise<RuntimeAuthResult<AuthTokens>> {
+  return postRuntimeAuth(
+    apiUrl,
+    PATH_AUTH_EXTERNAL_LOGIN,
+    input,
+    "External login failed",
+    hasAuthTokens,
+  ).then((result) => {
+    if (!result.ok) {
+      return result;
+    }
+
+    return {
+      ok: true,
+      data: {
+        access_token: result.data.access_token,
+        refresh_token: result.data.refresh_token,
+      },
+    };
+  });
 }
 
 export function runtimeRegister(
@@ -206,7 +314,7 @@ export function runtimeRegister(
     apiUrl,
     PATH_AUTH_REGISTER,
     input,
-    'Registration failed',
+    "Registration failed",
     isAuthRegisterResponse,
   );
 }
@@ -219,7 +327,7 @@ export function runtimeRefresh(
     apiUrl,
     PATH_AUTH_REFRESH,
     { refresh_token: refreshToken },
-    'Token refresh failed',
+    "Token refresh failed",
     hasAuthTokens,
   );
 }
@@ -232,7 +340,7 @@ export function runtimeLogout(
     apiUrl,
     PATH_AUTH_LOGOUT,
     { refresh_token: refreshToken },
-    'Logout failed',
+    "Logout failed",
     isLogoutResponse,
   );
 }
@@ -244,15 +352,20 @@ export async function runtimeMe(
   try {
     const client = runtimeClientForAuth(apiUrl, { accessToken });
     const response = await client.fetchResponse(PATH_AUTH_ME, {
-      auth: 'required',
-      operation: 'Fetch current user',
+      auth: "required",
+      operation: "Fetch current user",
     });
-    return decodeRuntimeResponse(response, 'Fetch current user failed', isAuthUser);
+    return decodeRuntimeResponse(
+      response,
+      "Fetch current user failed",
+      isAuthUser,
+    );
   } catch (error) {
     return {
       ok: false,
       status: 502,
-      error: error instanceof Error ? error.message : 'Cannot reach Astra runtime.',
+      error:
+        error instanceof Error ? error.message : "Cannot reach Astra runtime.",
     };
   }
 }

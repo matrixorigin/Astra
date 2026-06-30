@@ -54,6 +54,7 @@ impl ChatStreamRequest {
         Self::with_selected_model(
             message,
             SelectedModel {
+                id: None,
                 model: model.into(),
                 gateway: None,
             },
@@ -83,6 +84,8 @@ impl ChatStreamRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SelectedModel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<String>,
@@ -195,17 +198,15 @@ impl ToolResultRequest {
         }
     }
 
-    /// Parse a dispatch result JSON string back into output, error status, and
-    /// structured tool-result fields.
-    pub fn parse_output_error_and_fields(
-        result_json: &str,
-    ) -> (String, bool, Option<Map<String, Value>>) {
-        let v: serde_json::Value = match serde_json::from_str(result_json) {
-            Ok(value) => value,
-            Err(error) => {
-                return (format!("invalid tool result JSON: {error}"), true, None);
-            }
-        };
+    /// Parse a dispatch result JSON string back into `(output, is_error)`.
+    ///
+    /// The JSON is the serialized `ToolResultRequest` produced by
+    /// `edge_callback_handlers` / `deliver_result`.  Both the tool-executor
+    /// fallback path and the turn-bridge polling path need to extract the
+    /// same two fields — this avoids duplicated parsing logic.
+    pub fn parse_output_and_error(result_json: &str) -> (String, bool) {
+        let v: serde_json::Value = serde_json::from_str(result_json)
+            .unwrap_or_else(|_| serde_json::json!({"output": result_json}));
         let output = v
             .get("output")
             .and_then(|v| v.as_str())
@@ -214,18 +215,9 @@ impl ToolResultRequest {
         let is_error = v
             .get("status")
             .and_then(|v| v.as_str())
-            .map(|s| {
-                !matches!(
-                    s.trim().to_ascii_lowercase().as_str(),
-                    "completed" | "skipped"
-                )
-            })
+            .map(|s| s == "error")
             .unwrap_or(false);
-        let fields = v
-            .get("tool_result_fields")
-            .and_then(Value::as_object)
-            .cloned();
-        (output, is_error, fields)
+        (output, is_error)
     }
 }
 
@@ -716,6 +708,7 @@ mod tests {
             session_id: Some("s-1".into()),
             agent_id: None,
             selected_model: SelectedModel {
+                id: None,
                 model: "m".into(),
                 gateway: None,
             },
@@ -1236,70 +1229,38 @@ mod tests {
         }
     }
 
-    // ── ToolResultRequest serialization / parse_output_error_and_fields ──────
+    // ── ToolResultRequest serialization / parse_output_and_error ──────
 
     #[test]
-    fn tool_result_parse_output_error_and_fields_success() {
-        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"completed","output":"hello","duration_ms":42}"#;
-        let (output, is_error, fields) = ToolResultRequest::parse_output_error_and_fields(json);
+    fn tool_result_parse_output_and_error_success() {
+        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"success","output":"hello","duration_ms":42}"#;
+        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
         assert_eq!(output, "hello");
         assert!(!is_error);
-        assert!(fields.is_none());
     }
 
     #[test]
-    fn tool_result_parse_output_error_and_fields_error_status() {
-        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"failed","output":"fail"}"#;
-        let (output, is_error, fields) = ToolResultRequest::parse_output_error_and_fields(json);
+    fn tool_result_parse_output_and_error_error_status() {
+        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"error","output":"fail"}"#;
+        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
         assert_eq!(output, "fail");
         assert!(is_error);
-        assert!(fields.is_none());
     }
 
     #[test]
-    fn tool_result_parse_output_error_and_fields_preserves_metadata() {
-        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"failed","output":"fail","tool_result_fields":{"exit_code":7,"result_class":"execution_error"}}"#;
-        let (output, is_error, fields) = ToolResultRequest::parse_output_error_and_fields(json);
-        assert_eq!(output, "fail");
-        assert!(is_error);
-        let fields = fields.expect("fields");
-        assert_eq!(fields.get("exit_code").and_then(Value::as_i64), Some(7));
-        assert_eq!(
-            fields.get("result_class").and_then(Value::as_str),
-            Some("execution_error")
-        );
+    fn tool_result_parse_output_and_error_non_json_fallback() {
+        // When input is not JSON, fallback uses the whole string as output
+        let (output, is_error) = ToolResultRequest::parse_output_and_error("plain text result");
+        assert_eq!(output, "plain text result");
+        assert!(!is_error);
     }
 
     #[test]
-    fn tool_result_parse_output_error_and_fields_unknown_status_fails_closed() {
-        for status in ["ok", "success", "error", "mystery"] {
-            let json = format!(
-                r#"{{"request_id":"r1","edge_agent_id":"agt","status":"{status}","output":"body"}}"#
-            );
-            let (output, is_error, fields) =
-                ToolResultRequest::parse_output_error_and_fields(&json);
-            assert_eq!(output, "body");
-            assert!(is_error, "status {status:?} must fail closed");
-            assert!(fields.is_none());
-        }
-    }
-
-    #[test]
-    fn tool_result_parse_output_error_and_fields_invalid_json_is_error() {
-        let (output, is_error, fields) =
-            ToolResultRequest::parse_output_error_and_fields("plain text result");
-        assert!(output.contains("invalid tool result JSON"));
-        assert!(is_error);
-        assert!(fields.is_none());
-    }
-
-    #[test]
-    fn tool_result_parse_output_error_and_fields_missing_output() {
-        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"completed"}"#;
-        let (output, is_error, fields) = ToolResultRequest::parse_output_error_and_fields(json);
+    fn tool_result_parse_output_and_error_missing_output() {
+        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"success"}"#;
+        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
         assert_eq!(output, "");
         assert!(!is_error);
-        assert!(fields.is_none());
     }
 
     #[test]
@@ -1307,7 +1268,7 @@ mod tests {
         let req = ToolResultRequest::new_with_hash(
             "req-1".into(),
             Some("agent-1".into()),
-            "completed".into(),
+            "success".into(),
             "done".into(),
             100,
         );
@@ -1326,7 +1287,7 @@ mod tests {
         let req = ToolResultRequest::new_with_hash_and_fields(
             "req-1".into(),
             Some("agent-1".into()),
-            "completed".into(),
+            "success".into(),
             "done".into(),
             100,
             Some(fields),
@@ -1346,7 +1307,7 @@ mod tests {
         let req = ToolResultRequest {
             request_id: "r1".into(),
             edge_agent_id: Some("ea-1".into()),
-            status: "completed".into(),
+            status: "success".into(),
             output: Some("ok".into()),
             duration_ms: Some(10),
             result_hash: Some("abc123".into()),
@@ -1361,7 +1322,7 @@ mod tests {
     /// must not crash deserialization — the field is optional.
     #[test]
     fn tool_result_deser_missing_edge_agent_id_yields_none() {
-        let json = r#"{"request_id":"r1","status":"completed","output":"ok","duration_ms":10}"#;
+        let json = r#"{"request_id":"r1","status":"success","output":"ok","duration_ms":10}"#;
         let req: ToolResultRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.request_id, "r1");
         assert_eq!(req.edge_agent_id, None);
@@ -1370,7 +1331,7 @@ mod tests {
     /// edge_agent_id=None in validation must be rejected by the server.
     #[test]
     fn tool_result_deser_null_edge_agent_id() {
-        let json = r#"{"request_id":"r1","edge_agent_id":null,"status":"completed","output":"ok"}"#;
+        let json = r#"{"request_id":"r1","edge_agent_id":null,"status":"success","output":"ok"}"#;
         let req: ToolResultRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.edge_agent_id, None);
     }

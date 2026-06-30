@@ -3,28 +3,14 @@ use super::*;
 pub(super) fn build_auth_service(
     settings: &AppSettings,
     shared_pool: &SharedPool,
+    shared_encryptor: &Arc<FernetTokenEncryptor>,
 ) -> Result<Arc<dyn AuthService>, Box<dyn std::error::Error>> {
-    let auth_mode = std::env::var("ASTRA_AUTH_MODE")
-        .unwrap_or_else(|_| "local_jwt".to_string())
-        .trim()
-        .to_ascii_lowercase();
-    let auth_service: Arc<dyn AuthService> = match auth_mode.as_str() {
-        "" | "local_jwt" | "local" | "database" => Arc::new(
-            DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
-                .with_pool(shared_pool.clone()),
-        ),
-        "trusted_moi" => Arc::new(
-            astra_services::auth::TrustedMoiAuthService::from_env()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
-        ),
-        other => {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unsupported ASTRA_AUTH_MODE={other}; expected local_jwt or trusted_moi"),
-            )));
-        }
-    };
-    Ok(auth_service)
+    Ok(Arc::new(
+        DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
+            .with_pool(shared_pool.clone())
+            .with_encryptor(shared_encryptor.as_ref().clone())
+            .with_external_providers(settings.external_auth_providers.clone()),
+    ))
 }
 
 pub(super) fn build_core_state(

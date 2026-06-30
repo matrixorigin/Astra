@@ -2359,7 +2359,7 @@ fn extract_think_tags(text: &str) -> Option<(String, String)> {
     }
 }
 
-fn apply_llm_header_overrides(
+pub(crate) fn apply_llm_header_overrides(
     mut req: reqwest::RequestBuilder,
     header_overrides: Option<&HashMap<String, String>>,
 ) -> reqwest::RequestBuilder {

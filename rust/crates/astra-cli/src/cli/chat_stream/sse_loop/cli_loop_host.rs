@@ -132,6 +132,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub token: String,
     pub auth_profile: Option<&'a str>,
+    pub model_id: Option<String>,
     pub model: Option<&'a str>,
     pub explain: ExplainMode,
     pub render_md: bool,
@@ -490,6 +491,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .clone()
             .or_else(|| self.model.map(str::to_owned));
         let effective_model = effective_model_owned.as_deref();
+        let effective_model_id = if state.skills.model_override.is_some() {
+            None
+        } else {
+            self.model_id.as_deref()
+        };
         let runtime_volatile_texts = state
             .take_volatile_pending()
             .into_iter()
@@ -567,6 +573,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             api: self.api,
             token: self.token.as_str(),
             auth_profile: self.auth_profile,
+            model_id: effective_model_id,
             model: effective_model,
             explain: self.explain,
             render_md: self.render_md,

@@ -362,6 +362,7 @@ async fn main() {
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
     slash_config::set_active_model_for_display(resolved_model.clone());
+    slash_config::set_active_model_id_for_request(None);
 
     // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {
@@ -655,6 +656,115 @@ mod tests {
             .unwrap();
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn slash_model_with_provider_model_id_preserves_request_id_and_display_model() {
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "models": [{
+                        "model_id": "provider-model-id",
+                        "name": "Display Model",
+                        "is_active": true
+                    }]
+                }))
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let mut state = SessionState::default();
+        cli::slash::slash_config::set_active_model_id_for_request(None);
+        let exit = handle_slash_command(
+            "/model provider-model-id",
+            &api,
+            None,
+            &mut state,
+            Some("fake-token"),
+        )
+        .await
+        .unwrap();
+
+        assert!(!exit);
+        assert_eq!(state.model.as_deref(), Some("Display Model"));
+        assert_eq!(
+            cli::slash::slash_config::active_model_id_for_request().as_deref(),
+            Some("provider-model-id")
+        );
+        cli::slash::slash_config::set_active_model_id_for_request(None);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn slash_model_with_token_does_not_update_state_when_model_list_fails() {
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    axum::Json(serde_json::json!({"detail": "provider catalog down"})),
+                )
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let mut state = SessionState {
+            model: Some("old-model".to_string()),
+            ..Default::default()
+        };
+        cli::slash::slash_config::set_active_model_id_for_request(Some("old-id".to_string()));
+        let exit = handle_slash_command(
+            "/model provider-model-id",
+            &api,
+            None,
+            &mut state,
+            Some("fake-token"),
+        )
+        .await
+        .unwrap();
+
+        assert!(!exit);
+        assert_eq!(state.model.as_deref(), Some("old-model"));
+        assert_eq!(
+            cli::slash::slash_config::active_model_id_for_request().as_deref(),
+            Some("old-id")
+        );
+        cli::slash::slash_config::set_active_model_id_for_request(None);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn slash_model_with_token_does_not_update_state_when_model_list_is_empty() {
+        let app = Router::new().route(
+            "/models",
+            get(|| async { axum::Json(serde_json::json!({"models": []})) }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let mut state = SessionState {
+            model: Some("old-model".to_string()),
+            ..Default::default()
+        };
+        cli::slash::slash_config::set_active_model_id_for_request(Some("old-id".to_string()));
+        let exit = handle_slash_command(
+            "/model provider-model-id",
+            &api,
+            None,
+            &mut state,
+            Some("fake-token"),
+        )
+        .await
+        .unwrap();
+
+        assert!(!exit);
+        assert_eq!(state.model.as_deref(), Some("old-model"));
+        assert_eq!(
+            cli::slash::slash_config::active_model_id_for_request().as_deref(),
+            Some("old-id")
+        );
+        cli::slash::slash_config::set_active_model_id_for_request(None);
     }
 
     #[tokio::test]

@@ -606,7 +606,7 @@ mod tests {
             sample_schema("skill"),
         ];
         let cfg = ToolSurfaceConfig {
-            always_load_tools: vec!["github".into()],
+            pinned_tools: vec!["github".into()],
         };
 
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
@@ -640,7 +640,7 @@ mod tests {
             sample_schema("web_fetch"),
         ];
         let cfg = ToolSurfaceConfig {
-            always_load_tools: vec!["web_fetch".into()],
+            pinned_tools: vec!["web_fetch".into()],
         };
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
@@ -662,7 +662,7 @@ mod tests {
             sample_schema("tool_search"),
         ];
         let cfg = ToolSurfaceConfig {
-            always_load_tools: vec!["not_a_real_tool".into()],
+            pinned_tools: vec!["not_a_real_tool".into()],
         };
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 

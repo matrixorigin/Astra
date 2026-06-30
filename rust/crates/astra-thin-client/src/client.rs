@@ -335,6 +335,27 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    pub async fn get_auth_external_providers_text(&self) -> Result<String, ThinClientError> {
+        let url = self.url(paths::AUTH_EXTERNAL_PROVIDERS)?;
+        let resp = self.http.get(url).send().await?;
+        Self::text_or_api(resp).await
+    }
+
+    pub async fn post_auth_external_login_json(
+        &self,
+        body: &Value,
+    ) -> Result<String, ThinClientError> {
+        let url = self.url(paths::AUTH_EXTERNAL_LOGIN)?;
+        let resp = self
+            .http
+            .post(url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(body)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
+
     pub async fn get_auth_me_text(&self, token: &str) -> Result<String, ThinClientError> {
         let url = self.url(paths::AUTH_ME)?;
         let resp = self

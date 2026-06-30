@@ -53,11 +53,19 @@ impl From<astra_services::AgentBindingRecord> for AgentBindingResponse {
 
 pub(super) async fn create_agent_binding_handler(
     State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     request: Result<Json<astra_services::AgentBindingCreateRequestData>, JsonRejection>,
 ) -> Result<Json<AgentBindingCreateResponse>, (StatusCode, Json<ErrorResponse>)> {
     let Json(request) = request.map_err(agent_binding_json_rejection_to_error)?;
-    let _user = state.auth_service.current_user(&headers).await?;
+    let _principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(&method, &uri, &headers, "/agent-bindings"),
+        )
+        .await?;
     let record = state.agent_binding_service.create_binding(request).await?;
     Ok(Json((&record).into()))
 }

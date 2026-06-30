@@ -74,6 +74,16 @@ pub struct AuthRefreshRequest {
 }
 
 #[cfg(feature = "server")]
+#[derive(Deserialize)]
+pub struct AuthExternalLoginRequest {
+    pub provider_id: String,
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub scope_id: Option<String>,
+}
+
+#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct ChatRouteRequest {
     #[serde(default)]
@@ -89,10 +99,14 @@ pub struct ChatRequest {
     pub parts: Vec<serde_json::Value>,
     #[serde(default)]
     pub attachments: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub runtime_system_prompt: Option<String>,
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
     #[serde(default)]
     pub selected_model: Option<astra_services::runs::SelectedModelRequest>,
+    #[serde(default)]
+    pub capability_descriptors: Option<astra_services::runs::RuntimeCapabilityDescriptorsRequest>,
     #[serde(default)]
     pub agent_binding: Option<astra_services::runs::AgentBindingRuntimeRequest>,
     #[serde(default)]
@@ -101,6 +115,8 @@ pub struct ChatRequest {
     pub runtime_profile: Option<astra_services::runs::RuntimeProfileRequest>,
     #[serde(default)]
     pub llm_token_service: Option<astra_services::LlmTokenServiceRequest>,
+    #[serde(default)]
+    pub skill_search: Option<astra_core::SkillSearchSettings>,
     #[serde(default)]
     pub allow_skills: Option<Vec<String>>,
     #[serde(default)]
@@ -113,6 +129,8 @@ pub struct ChatRequest {
     pub executor_binding: Option<astra_services::runs::ExecutorBindingRequest>,
     #[serde(default)]
     pub runtime_mcp_bindings: Vec<astra_services::runs::RuntimeMcpBindingRequest>,
+    #[serde(default)]
+    pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub edge_executor_id: Option<String>,
@@ -311,6 +329,20 @@ pub struct AuthLogoutResponse {
 }
 
 #[cfg(feature = "server")]
+#[derive(Serialize, PartialEq, Eq)]
+pub struct AuthExternalProviderResponse {
+    pub id: String,
+    pub display_name: String,
+    pub credential_type: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize, PartialEq, Eq)]
+pub struct AuthExternalProvidersResponse {
+    pub providers: Vec<AuthExternalProviderResponse>,
+}
+
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq)]
 pub struct SessionResponse {
     pub session_id: String,
@@ -397,6 +429,82 @@ pub struct HealthResponse {
     pub database: String,
     pub persist_ok: u64,
     pub persist_fail: u64,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize, PartialEq, Eq)]
+pub struct LearningHealthResponse {
+    pub status: String,
+    pub service: String,
+    pub version: String,
+    pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_count: Option<u64>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize, PartialEq, Eq)]
+pub struct LearningSignalsResponse {
+    pub signal_types: Vec<&'static str>,
+    pub descriptions: LearningSignalDescriptions,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize, PartialEq, Eq)]
+pub struct LearningSignalDescriptions {
+    pub wrong_skill: &'static str,
+    pub slow_execution: &'static str,
+    pub high_cost: &'static str,
+    pub low_satisfaction: &'static str,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize, PartialEq)]
+pub struct LearningStatsResponse {
+    pub total_learnings: i32,
+    pub high_confidence: i32,
+    pub low_confidence: i32,
+    pub avg_confidence: f64,
+    pub by_signal_type: serde_json::Map<String, serde_json::Value>,
+    pub weights: serde_json::Map<String, serde_json::Value>,
+    pub weights_per_signal: serde_json::Map<String, serde_json::Value>,
+    pub decay: serde_json::Map<String, serde_json::Value>,
+    pub total_gates: i32,
+    pub passed_gates: i32,
+    pub failed_gates: i32,
+    pub pass_rate: f64,
+    pub avg_improvement_pct: f64,
+    pub per_skill: serde_json::Map<String, serde_json::Value>,
+    pub last_learning_time: Option<String>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+pub struct LearningTriggerRequest {
+    #[serde(default = "default_days")]
+    pub days: i32,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default = "default_signal_types")]
+    pub signal_types: Vec<String>,
+    #[serde(default)]
+    pub weights: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize, PartialEq)]
+pub struct LearningTriggerResponse {
+    pub status: &'static str,
+    pub learned: i32,
+    pub signals_by_type: Option<serde_json::Value>,
+    pub gate_verdict: Option<String>,
+    pub improvement_pct: Option<serde_json::Value>,
+    pub test_count: Option<i32>,
+    pub error: Option<&'static str>,
+    pub message: Option<serde_json::Value>,
+    pub model_version: &'static str,
 }
 
 #[cfg(feature = "server")]
@@ -538,6 +646,8 @@ pub enum WsClientMessage {
         #[serde(default)]
         agent_id: Option<String>,
         selected_model: astra_services::runs::SelectedModelRequest,
+        #[serde(default)]
+        skill_search: Option<astra_core::SkillSearchSettings>,
         #[serde(default)]
         context: Option<serde_json::Map<String, serde_json::Value>>,
         #[serde(default)]
@@ -727,6 +837,10 @@ pub fn merge_plan_subtask_context(
 
 #[cfg(feature = "server")]
 #[doc(hidden)]
+pub fn default_days() -> i32 {
+    7
+}
+
 #[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_admin_scope() -> String {
@@ -777,6 +891,10 @@ pub fn default_admin_audit_limit() -> u32 {
 
 #[cfg(feature = "server")]
 #[doc(hidden)]
+pub fn default_signal_types() -> Vec<String> {
+    vec!["wrong_skill".to_string()]
+}
+
 #[cfg(feature = "server")]
 pub fn sse_error_code_for_status(status: u16) -> &'static str {
     match status {
@@ -1012,6 +1130,17 @@ impl From<AuthTokenRecord> for AuthTokenResponse {
 }
 
 #[cfg(feature = "server")]
+impl From<astra_services::ExternalProviderPublicRecord> for AuthExternalProviderResponse {
+    fn from(value: astra_services::ExternalProviderPublicRecord) -> Self {
+        Self {
+            id: value.id,
+            display_name: value.display_name,
+            credential_type: value.credential_type,
+        }
+    }
+}
+
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
     let context = merge_plan_subtask_context(
@@ -1023,6 +1152,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         message: request.message,
         parts: request.parts,
         attachments: request.attachments,
+        runtime_system_prompt: request.runtime_system_prompt,
         session_id: request.session_id,
         full_llm_capture: false,
         agent_id: request.agent_id,
@@ -1031,16 +1161,21 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
             .as_ref()
             .map(|selected| selected.model.clone()),
         selected_model: request.selected_model,
+        capability_descriptors: request.capability_descriptors,
+        provider_runtime_authorized: false,
         agent_binding: request.agent_binding,
         runtime_auth: request.runtime_auth,
+        runtime_skill_binding: None,
         runtime_profile: request.runtime_profile,
         llm_token_service: request.llm_token_service.map(Into::into),
+        skill_search: request.skill_search,
         allow_skills: request.allow_skills,
         allow_skill_sources: request.allow_skill_sources,
         allow_tools: request.allow_tools,
         workspace_binding: request.workspace_binding,
         executor_binding: request.executor_binding,
         runtime_mcp_bindings: request.runtime_mcp_bindings,
+        mcp_binding_ids: request.mcp_binding_ids,
         context,
         edge_executor_id: request.edge_executor_id,
         capabilities: request.capabilities,

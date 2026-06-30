@@ -5593,6 +5593,7 @@ async fn apply_restored_session(
         }
     }
     crate::cli::slash::slash_config::set_active_model_for_display(state.model.clone());
+    crate::cli::slash::slash_config::set_active_model_id_for_request(None);
 
     if prepared_history.history.len() > state.history.len() || state.history.is_empty() {
         state.history = prepared_history.history;

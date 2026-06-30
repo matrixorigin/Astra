@@ -57,11 +57,10 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_chat_turn_out_of_order_tool_results` | `journey_extended.rs` | Start one `POST /chat/turn` round that emits two `tool_request`s; send the second callback result before the first and assert the initial SSE handoff still ends with `has_tool_calls=true` |
 | `e2e_matrix_same_session_concurrent_turns_isolated` | `journey_extended.rs` | Launch two concurrent `POST /chat/turn` requests against the same session; assert both SSE responses complete and persisted `llm_response` rows keep distinct `event_id` / `causal_chain_id` values |
 | `e2e_matrix_same_session_waiting_turn_overlap_isolated` | `journey_extended.rs` | Start one same-session tool-backed `POST /chat/turn`, finish a second same-session plain turn while the first is still in handoff, then assert the two SSE streams do not leak each other’s content |
-| `e2e_matrix_auth_session_negative_paths` | `journey_extended.rs` | `GET /sessions` without auth (401); mode-aware auth negatives: `local_jwt` checks duplicate register + bad login + successful login, `trusted_moi` checks local auth endpoints disabled |
+| `e2e_matrix_auth_session_negative_paths` | `journey_extended.rs` | `GET /sessions` without auth (401); duplicate register + bad login + successful login after negative calls |
 | `e2e_matrix_memory_proxy_user_isolation` | `journey_extended.rs` | Unauthenticated `POST /memory/store` (401); spoofed `user_id`/`session_id` in body → forwarder receives JWT `user_id` for both fields |
-| `e2e_matrix_models_admin_crud` | `journey_extended.rs` | Mode-aware: `local_jwt` runs SQL `astra_admin` role grant + `POST/PUT/DELETE /models` with DB checks; `trusted_moi` asserts current admin path rejects the call (admin auth still local-JWT based) |
+| `e2e_matrix_models_admin_crud` | `journey_extended.rs` | SQL `astra_admin` role grant + `POST/PUT/DELETE /models` with DB checks |
 | `e2e_matrix_audit_cross_session_analytics_http` | `journey_audit_cross_session.rs` | Seed `agent_sessions` / `agent_events` / `ctx_decision_audits`; `GET /audit/stats`, `GET /audit/mutations`, `GET /audit/promotions` JSON assertions |
-| `e2e_matrix_trusted_moi_user_system_integration` | `journey_trusted_moi.rs` | Startup in `trusted_moi`; external JWT `/auth/me`; local auth endpoints disabled (`/auth/register|login|refresh`=403); `POST /sessions` + DB owner and memory proxy identity isolation bound to upstream user ID |
 | `e2e_matrix_team_crud_and_db` | `journey_team_crud_matrix.rs` | Team CRUD + upsert via second `POST /teams`, empty `GET .../executions`, SQL `team_definitions` |
 | `e2e_matrix_team_snapshots_and_db` | `journey_team_snapshots_matrix.rs` | `POST/GET .../snapshots`, `DELETE /teams/snapshots/{id}`, SQL `team_snapshots` |
 | `e2e_matrix_team_http_negative_paths` | `journey_team_http_negatives_matrix.rs` | Auth 401, GET/DELETE 404, validation 400 (empty members, duplicate roles, bad budget, adversarial size) |
@@ -76,12 +75,12 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_delegate_http_boundaries` | `journey_delegate_http_matrix.rs` | `POST /chat` → `run_id`; `GET /chat/runs/{id}/delegations`; `POST .../delegate` validation `400` |
 | `e2e_matrix_admin_tokens_smoke` | `journey_admin_smoke_matrix.rs` | `GET /admin/tokens`: `403` → grant `astra_admin` → `200` JSON array |
 
-Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, `bootstrap_trusted_moi`, `grant_astra_admin_role`, `revoke_astra_admin_role`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
+Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, `grant_astra_admin_role`, `revoke_astra_admin_role`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
 
 ## Database isolation
 
 - **Shared database**: All tests use the same MatrixOne database from `AppSettings` (typically `astra_runtime`). There is **no separate schema per test**.
-- **Row isolation**: Each `bootstrap()` registers a **new user** (`prod_matrix_{uuid}`), and `bootstrap_trusted_moi()` creates a **new external user principal** (`moi-user-{uuid}`); both create a **new** `session_id` and use an `edge_agent_id` / `suffix` unique to that run. API state and SQL assertions are scoped by those IDs.
+- **Row isolation**: Each `bootstrap()` registers a **new user** (`prod_matrix_{uuid}`), creates a **new** `session_id`, and uses an `edge_agent_id` / `suffix` unique to that run. API state and SQL assertions are scoped by those IDs.
 - **Parallel runs**: Tests are safe to run in parallel by default (`cargo` / `make test-online` without `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1`). The full journey uses a **suffix-scoped marketplace skill name** (`e2e_matrix_mkt_{suffix}`) so concurrent runs do not fight over the same global marketplace stats key.
 - **Opt-in serial**: If you hit flakiness (shared Redis keys, connection limits, etc.), run with `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1` (see `Makefile` `test-ignored-integration`) to force `--test-threads=1` for `system_matrix_http_e2e` only.
 

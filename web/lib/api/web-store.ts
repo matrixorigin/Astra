@@ -443,10 +443,6 @@ function backendSessionIdForChat(chat: ChatRecord) {
   return chat.backendSessionId ?? chat.id;
 }
 
-function persistedBackendSessionIdForChat(chat: ChatRecord) {
-  return chat.backendSessionId ?? (chat.id.startsWith("web-") ? null : chat.id);
-}
-
 function publicActiveRun(
   activeRun?: ChatActiveRunRecord,
 ): ChatDetail["activeRun"] {
@@ -1900,15 +1896,14 @@ async function listAllBackendSessions(
   ownerUserId: string,
 ): Promise<RuntimeSessionResponse[]> {
   const sessions: RuntimeSessionResponse[] = [];
-  let cursor: RuntimeSessionListCursor | null = null;
-  const seenCursors = new Set<string>();
+  let cursor: RuntimeSessionListCursor | null | undefined;
 
   for (;;) {
     let parsed: RuntimeSessionListResponse;
     try {
       parsed = await client.sdk.listRuntimeSessions({
         limit: SESSION_SYNC_PAGE_SIZE,
-        ...(cursor ? { cursor } : {}),
+        cursor,
       });
     } catch (error) {
       throw runtimeOperationError(
@@ -1920,20 +1915,10 @@ async function listAllBackendSessions(
     const page = Array.isArray(parsed.sessions) ? parsed.sessions : [];
     sessions.push(...page);
 
-    const nextCursor = parsed.next_cursor ?? null;
-
-    if (page.length === 0 || nextCursor === null) {
+    cursor = parsed.next_cursor;
+    if (page.length === 0 || !cursor) {
       break;
     }
-
-    const cursorKey = `${nextCursor.updated_at}\u0000${nextCursor.session_id}`;
-    if (seenCursors.has(cursorKey)) {
-      throw new Error(
-        `Cannot sync persisted sessions for user ${ownerUserId}: repeated session list cursor`,
-      );
-    }
-    seenCursors.add(cursorKey);
-    cursor = nextCursor;
   }
 
   return sessions;
@@ -2202,10 +2187,7 @@ async function updateBackendSessionModel(
   chat: ChatRecord,
   model: string,
 ): Promise<void> {
-  const sessionId = persistedBackendSessionIdForChat(chat);
-  if (!sessionId) {
-    return;
-  }
+  const sessionId = backendSessionIdForChat(chat);
   const client = await requireRuntimeClient({
     auth: "required",
     operation: `update persisted session ${sessionId} model`,
@@ -2357,14 +2339,14 @@ async function callBackendAgent(params: {
       auth: "optional",
       operation: "start web chat turn",
     });
-    const model = await requireKnownBackendModelName(client, params.model);
+    const selectedModel = await resolveBackendModelName(client, params.model);
     const activeSkills = normalizedActiveSkills(params.activeSkills);
 
     const run = await client.sdk.createRun(
       {
         message: params.text,
         sessionId: params.sessionId,
-        selectedModel: { model },
+        selectedModel,
         allowSkills: activeSkills.length ? activeSkills : undefined,
         context: {
           source: "web_v1",
@@ -2550,57 +2532,59 @@ function parseRunSseText(text: string): StreamResult {
   };
 }
 
-export async function requireKnownBackendModelName(
+export async function resolveBackendModelName(
   runtime: RuntimeConfig | WebRuntimeClient,
   model: string,
-): Promise<string> {
+): Promise<{ id?: string; model: string }> {
   const requestedModel = model.trim();
   if (!requestedModel) {
     throw new Error("model is required");
   }
 
-  const client =
-    runtime instanceof WebRuntimeClient ? runtime : new WebRuntimeClient(runtime);
-  const accessToken = client.config.accessToken;
-  if (!accessToken) {
-    throw new RuntimeClientError({
-      operation: "resolve runtime model",
-      path: "/models",
-      status: 401,
-      detail: "Runtime authentication is missing.",
-    });
-  }
-
-  const cached = modelCache.get(accessToken);
-  let modelsPromise: Promise<Array<{ model_id?: string | null; name?: string | null }>>;
-  if (cached) {
-    modelsPromise = cached;
-  } else {
-    modelsPromise = client.sdk.listModels();
-    modelCache.set(accessToken, modelsPromise);
-  }
-
-  let models: Array<{ model_id?: string | null; name?: string | null }>;
   try {
-    models = await modelsPromise;
-  } catch (error) {
-    modelCache.invalidate(accessToken);
-    throw runtimeOperationError("resolve runtime model", error);
-  }
+    const client =
+      runtime instanceof WebRuntimeClient
+        ? runtime
+        : new WebRuntimeClient(runtime);
+    const accessToken = client.config.accessToken;
+    if (!accessToken) {
+      return { model: requestedModel };
+    }
 
-  const knownNames = new Set(
-    models
-      .map((item) => item.name?.trim() || item.model_id?.trim())
-      .filter((name): name is string => Boolean(name)),
-  );
-  if (!knownNames.has(requestedModel)) {
-    throw new RuntimeClientError({
-      operation: "resolve runtime model",
-      path: "/models",
-      status: 400,
-      detail: `Unknown model "${requestedModel}". Select a model returned by /api/models.`,
+    const cached = modelCache.get(accessToken);
+    let modelsPromise: Promise<
+      Array<{ model_id?: string | null; name?: string | null }>
+    >;
+    if (cached) {
+      modelsPromise = cached;
+    } else {
+      modelsPromise = client.sdk.listModels();
+      modelCache.set(accessToken, modelsPromise);
+    }
+
+    const models = await modelsPromise.catch((err) => {
+      modelCache.invalidate(accessToken);
+      throw err;
     });
+    const matched = models.find(
+      (item) =>
+        item.model_id === requestedModel || item.name === requestedModel,
+    );
+    return matched
+      ? {
+          id:
+            typeof matched.model_id === "string" ? matched.model_id : undefined,
+          model:
+            typeof matched.name === "string"
+              ? matched.name
+              : typeof matched.model_id === "string"
+                ? matched.model_id
+                : requestedModel,
+        }
+      : { model: requestedModel };
+  } catch (error) {
+    throw new Error(
+      `resolve backend model failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
-
-  return requestedModel;
 }

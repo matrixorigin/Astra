@@ -641,13 +641,14 @@ The wire contract should be strict:
 - `runtime_auth.authorization` is required when `selected_model.gateway` is present, because model gateway resolve/invocation uses registered model gateway endpoints.
 - `runtime_auth.authorization` is not required for native/default chat that has no `agent_binding` and no `selected_model.gateway`.
 - If `agent_binding` is present, that field is the explicit opt-in to Agent Binding registry semantics. `runtime_profile` may be omitted; when present, it must be `agent_binding_registry`.
-- If `runtime_mcp_bindings` is non-empty, `runtime_profile` must be `request_scoped_runtime_mcp`.
+- If `runtime_mcp_bindings` is non-empty, `runtime_profile` must be `request_scoped_runtime_mcp` after the migration flag is enabled.
 - A request must not set both `agent_binding` and `runtime_mcp_bindings`.
+- A request must not set both `agent_binding` and `mcp_binding_ids`.
 - Agent Binding mode must not carry capability server definitions in the chat request.
 - Plain chat with `selected_model.gateway` omits `agent_binding` but still carries `selected_model` and `runtime_auth`.
 - Native/default chat omits `agent_binding`, omits `selected_model.gateway`, and carries `selected_model.model`.
 
-Request-scoped MCP does not rely on implicit detection: the caller must provide `runtime_profile=request_scoped_runtime_mcp` together with `runtime_mcp_bindings`. Agent Binding does not rely on implicit request-scoped detection either: the presence of `agent_binding` is the explicit registry selector.
+During the compatibility window, existing `runtime_mcp_bindings` clients may omit `runtime_profile` only behind an explicit server config flag such as `runtime.allow_implicit_request_scoped_mcp=true`. That path must emit deprecation diagnostics. Agent Binding does not rely on implicit request-scoped detection: the presence of `agent_binding` is the explicit runtime selector.
 
 ## API Design
 
@@ -921,6 +922,7 @@ Rejected combinations:
 
 ```text
 agent_binding + runtime_mcp_bindings
+agent_binding + mcp_binding_ids
 missing selected_model
 selected_model without selected_model.model
 selected_model.gateway as an empty string

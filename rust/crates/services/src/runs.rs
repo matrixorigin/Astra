@@ -17,18 +17,6 @@ use uuid::Uuid;
 
 pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
 pub const SSE_HEARTBEAT_INTERVAL_SECS: u64 = 15;
-const RUN_RECORD_SELECT_COLS: &str = "\
-    run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth, \
-    delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, owner_pod_id, \
-    owner_lease_expires_at, run_generation, last_event_idx, checkpoint_version, checkpoint_json, \
-    error_code, error_message, retry_count, total_prompt_tokens, total_completion_tokens, \
-    total_tool_calls, agent_binding_id, agent_binding_name, agent_binding_schema_version, \
-    selected_model_json, selected_model_name, selected_model_gateway, capability_server_refs_json, \
-    runtime_profile, created_at, updated_at";
-const RUN_PROJECTION_SELECT_COLS: &str = "\
-    run_id, user_id, session_id, status, waiting_for, error_message, projection_event_idx, \
-    latest_event_type, latest_checkpoint_id, latest_checkpoint_kind, latest_checkpoint_version, \
-    total_prompt_tokens, total_completion_tokens, total_tool_calls, projection_hash, updated_at";
 
 pub fn is_run_lifecycle_unconfigured_error(status: StatusCode, error: &ErrorResponse) -> bool {
     status == StatusCode::NOT_IMPLEMENTED
@@ -285,12 +273,11 @@ pub enum FallbackPolicyRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WorkspaceBindingRequest {
     pub kind: WorkspaceBindingRequestKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "cwd", skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<WorkspaceSourceRequest>,
@@ -383,9 +370,35 @@ impl std::fmt::Debug for RuntimeMcpBindingRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectedModelRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCapabilityDescriptorRequest {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub descriptor_type: String,
+    pub transport: String,
+    pub endpoint_url: String,
+    pub protocol: String,
+    #[serde(default)]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCapabilityDescriptorsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_gateway: Option<RuntimeCapabilityDescriptorRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<RuntimeCapabilityDescriptorRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<RuntimeCapabilityDescriptorRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,6 +429,24 @@ impl std::fmt::Debug for RuntimeAuthRequest {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeSkillBindingRequest {
+    pub id: String,
+    pub url: String,
+    pub authorization: String,
+}
+
+impl std::fmt::Debug for RuntimeSkillBindingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_url = runtime_mcp_debug_url(&self.url);
+        f.debug_struct("RuntimeSkillBindingRequest")
+            .field("id", &self.id)
+            .field("url", &redacted_url)
+            .field("authorization_present", &!self.authorization.is_empty())
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeProfileRequest {
@@ -428,21 +459,27 @@ pub struct ChatRequestData {
     pub message: String,
     pub parts: Vec<serde_json::Value>,
     pub attachments: Vec<serde_json::Value>,
+    pub runtime_system_prompt: Option<String>,
     pub session_id: Option<String>,
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
     pub model: Option<String>,
     pub selected_model: Option<SelectedModelRequest>,
+    pub capability_descriptors: Option<RuntimeCapabilityDescriptorsRequest>,
+    pub provider_runtime_authorized: bool,
     pub agent_binding: Option<AgentBindingRuntimeRequest>,
     pub runtime_auth: Option<RuntimeAuthRequest>,
+    pub runtime_skill_binding: Option<RuntimeSkillBindingRequest>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
     pub llm_token_service: Option<LlmTokenServiceConfig>,
+    pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub allow_skills: Option<Vec<String>>,
     pub allow_skill_sources: Option<Vec<String>>,
     pub allow_tools: Option<Vec<String>>,
     pub workspace_binding: Option<WorkspaceBindingRequest>,
     pub executor_binding: Option<ExecutorBindingRequest>,
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
+    pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub edge_executor_id: Option<String>,
     pub capabilities: Vec<String>,
@@ -481,20 +518,29 @@ impl std::fmt::Debug for ChatRequestData {
             .field("message", &self.message)
             .field("parts", &self.parts)
             .field("attachments", &self.attachments)
+            .field("runtime_system_prompt", &self.runtime_system_prompt)
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
             .field("model", &self.model)
             .field("selected_model", &self.selected_model)
+            .field("capability_descriptors", &self.capability_descriptors)
+            .field(
+                "provider_runtime_authorized",
+                &self.provider_runtime_authorized,
+            )
             .field("agent_binding", &self.agent_binding)
             .field("runtime_auth", &self.runtime_auth)
+            .field("runtime_skill_binding", &self.runtime_skill_binding)
             .field("runtime_profile", &self.runtime_profile)
             .field("llm_token_service", &self.llm_token_service)
+            .field("skill_search", &self.skill_search)
             .field("allow_skills", &self.allow_skills)
             .field("allow_skill_sources", &self.allow_skill_sources)
             .field("allow_tools", &self.allow_tools)
             .field("workspace_binding", &self.workspace_binding)
             .field("executor_binding", &self.executor_binding)
             .field("runtime_mcp_bindings", &self.runtime_mcp_bindings)
+            .field("deprecated_mcp_binding_ids", &self.mcp_binding_ids)
             .field("context", &self.context)
             .field("edge_executor_id", &self.edge_executor_id)
             .field("capabilities", &self.capabilities)
@@ -747,6 +793,19 @@ pub struct DurableRunDisplayProjectionRecord {
     pub projection_hash: String,
     pub updated_at: String,
 }
+
+const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
+     ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
+     owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx, checkpoint_version, \
+     checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
+     total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
+     agent_binding_schema_version, selected_model_json, selected_model_name, \
+     selected_model_gateway, capability_server_refs_json, runtime_profile, created_at, updated_at";
+
+const RUN_DISPLAY_PROJECTION_COLUMNS: &str = "run_id, user_id, session_id, status, waiting_for, \
+     error_message, projection_event_idx, latest_event_type, latest_checkpoint_id, \
+     latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens, \
+     total_completion_tokens, total_tool_calls, projection_hash, updated_at";
 
 /// Abstraction for durable run persistence.
 ///
@@ -1744,7 +1803,7 @@ impl DatabaseRunStateStore {
     }
 
     async fn load_run_metadata(&self, run_id: &str) -> DbStoreResult<Option<DurableRunRecord>> {
-        let sql = format!("SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs WHERE run_id = ?");
+        let sql = format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE run_id = ?");
         let row = sqlx::query(&sql)
             .bind(run_id)
             .fetch_optional(self.pool.get())
@@ -1758,7 +1817,7 @@ impl DatabaseRunStateStore {
         run_id: &str,
     ) -> DbStoreResult<Option<DurableRunDisplayProjectionRecord>> {
         let sql = format!(
-            "SELECT {RUN_PROJECTION_SELECT_COLS} FROM run_display_projections WHERE run_id = ?"
+            "SELECT {RUN_DISPLAY_PROJECTION_COLUMNS} FROM run_display_projections WHERE run_id = ?"
         );
         let row = sqlx::query(&sql)
             .bind(run_id)
@@ -2592,7 +2651,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|source| db_error("count_user_runs", user_id, source).to_string())?;
         let total = total_row.try_get::<i64, _>("total").unwrap_or(0);
         let sql = format!(
-            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs \
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
              WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?"
         );
         let rows = sqlx::query(&sql)
@@ -2616,7 +2675,7 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let sql = format!(
-            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs \
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
              WHERE status IN (?, ?) ORDER BY updated_at ASC"
         );
         let rows = sqlx::query(&sql)
@@ -2633,7 +2692,7 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let sql = format!(
-            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
              WHERE status IN (?, ?)
                AND (
                    owner_pod_id IS NULL
@@ -2641,7 +2700,7 @@ impl RunStateStore for DatabaseRunStateStore {
                    OR owner_lease_expires_at IS NULL
                    OR owner_lease_expires_at < NOW(6)
                )
-             ORDER BY updated_at ASC"
+             ORDER BY updated_at ASC",
         );
         let rows = sqlx::query(&sql)
             .bind(STATUS_RUNNING)
@@ -2664,11 +2723,11 @@ impl RunStateStore for DatabaseRunStateStore {
         session_id: &str,
     ) -> Result<Option<DurableRunRecord>, String> {
         let sql = format!(
-            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs \
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
              WHERE user_id = ? AND session_id = ? \
                AND (status IN (?, ?, ?) OR (status = ? AND waiting_for IS NOT NULL)) \
              ORDER BY updated_at DESC \
-             LIMIT 1"
+             LIMIT 1",
         );
         let row = sqlx::query(&sql)
             .bind(user_id)
@@ -2689,7 +2748,7 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String> {
         let sql = format!(
-            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs \
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
              WHERE delegation_id = ? ORDER BY depth ASC, created_at ASC"
         );
         let rows = sqlx::query(&sql)
@@ -2719,8 +2778,7 @@ impl RunStateStore for DatabaseRunStateStore {
 impl DatabaseRunStateStore {
     async fn find_runs_by_status(&self, status: &str) -> Result<Vec<DurableRunRecord>, String> {
         let sql = format!(
-            "SELECT {RUN_RECORD_SELECT_COLS} FROM agent_runs \
-             WHERE status = ? ORDER BY updated_at ASC"
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE status = ? ORDER BY updated_at ASC"
         );
         let rows = sqlx::query(&sql)
             .bind(status)
@@ -3026,8 +3084,6 @@ fn copy_execution_boundary_fields(
         "transport",
         "fallback_policy",
         "route",
-        "status",
-        "skipped",
         "success",
         "duration_ms",
         "error_kind",
@@ -3776,33 +3832,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_preserves_skipped_terminal_status_for_clients() {
-        let out = transform_run_event_for_client(make_event(
-            "tool_result",
-            json!({
-                "tool_call_id": "c-skip",
-                "name": "read_file",
-                "output": "Duplicate read_file call skipped.",
-                "status": "skipped",
-                "skipped": true,
-                "success": true,
-                "duration_ms": 0,
-                "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
-                "executor": {"kind": "edge_agent", "executor_id": "edge-1", "transport": "edge_ws"},
-                "transport": "edge_ws"
-            }),
-        ));
-        assert_eq!(out["type"], "tool_call_end");
-        assert_eq!(out["call_id"], "c-skip");
-        assert_eq!(out["tool"], "read_file");
-        assert_eq!(out["status"], "skipped");
-        assert_eq!(out["skipped"], true);
-        assert_eq!(out["success"], true);
-        assert_eq!(out["result"], "Duplicate read_file call skipped.");
-        assert_eq!(out["executor"]["kind"], "edge_agent");
-    }
-
-    #[test]
     fn run_started_and_finished() {
         let started = transform_run_event_for_client(make_event(
             "run_started",
@@ -4172,20 +4201,26 @@ mod tests {
             message: "hi".to_string(),
             parts: Vec::new(),
             attachments: Vec::new(),
+            runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
             agent_id: None,
             model: None,
             selected_model: None,
+            capability_descriptors: None,
+            provider_runtime_authorized: false,
             agent_binding: None,
             runtime_auth: None,
+            runtime_skill_binding: None,
             runtime_profile: None,
             llm_token_service: None,
+            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
+            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -4227,25 +4262,32 @@ mod tests {
             message: "hi".to_string(),
             parts: Vec::new(),
             attachments: Vec::new(),
+            runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
             agent_id: None,
             model: None,
             selected_model: Some(SelectedModelRequest {
+                id: None,
                 model: "gpt-4".to_string(),
                 gateway: Some("primary-gateway".to_string()),
             }),
+            capability_descriptors: None,
+            provider_runtime_authorized: false,
             agent_binding: None,
             runtime_auth: Some(RuntimeAuthRequest {
                 authorization: "Bearer secret-runtime-token".to_string(),
             }),
+            runtime_skill_binding: None,
             runtime_profile: None,
             llm_token_service: None,
+            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
+            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -4306,20 +4348,26 @@ mod tests {
                     message: "hi".to_string(),
                     parts: Vec::new(),
                     attachments: Vec::new(),
+                    runtime_system_prompt: None,
                     session_id: None,
                     agent_id: None,
                     model: None,
                     selected_model: None,
+                    capability_descriptors: None,
+                    provider_runtime_authorized: false,
                     agent_binding: None,
                     runtime_auth: None,
+                    runtime_skill_binding: None,
                     runtime_profile: None,
                     llm_token_service: None,
+                    skill_search: None,
                     allow_skills: None,
                     allow_skill_sources: None,
                     allow_tools: None,
                     workspace_binding: None,
                     executor_binding: None,
                     runtime_mcp_bindings: Vec::new(),
+                    mcp_binding_ids: None,
                     context: None,
                     edge_executor_id: None,
                     capabilities: Vec::new(),

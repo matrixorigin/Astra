@@ -250,7 +250,7 @@ impl SessionService for Phase1HttpSession {
         _session_id: String,
         _user_id: String,
         _limit: u32,
-        _cursor: Option<astra_services::SessionActivityCursor>,
+        _cursor: Option<astra_services::auth::SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
         unsupported_phase1_http_method("sessions.get_session_activity")
     }

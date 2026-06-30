@@ -18,12 +18,26 @@ use std::sync::{OnceLock, RwLock};
 use crate::cli::theme;
 
 static ACTIVE_MODEL_FOR_DISPLAY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+static ACTIVE_MODEL_ID_FOR_REQUEST: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 
 pub(crate) fn set_active_model_for_display(model: Option<String>) {
     let lock = ACTIVE_MODEL_FOR_DISPLAY.get_or_init(|| RwLock::new(None));
     if let Ok(mut guard) = lock.write() {
         *guard = model;
     }
+}
+
+pub(crate) fn set_active_model_id_for_request(model_id: Option<String>) {
+    let lock = ACTIVE_MODEL_ID_FOR_REQUEST.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = model_id;
+    }
+}
+
+pub(crate) fn active_model_id_for_request() -> Option<String> {
+    ACTIVE_MODEL_ID_FOR_REQUEST
+        .get()
+        .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
 }
 
 /// Resolve the active model for "effective budget" display. Returns

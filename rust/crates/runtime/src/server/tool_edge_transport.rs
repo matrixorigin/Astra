@@ -268,8 +268,21 @@ async fn try_edge_dispatch(
         }
         return EdgeTransportAttempt::TransportDisconnected;
     };
-    let (output, is_error, tool_result_fields) =
-        astra_thin_client::ToolResultRequest::parse_output_error_and_fields(&result_json);
+    let parsed_result =
+        serde_json::from_str::<astra_thin_client::ToolResultRequest>(&result_json).ok();
+    let tool_result_fields = parsed_result
+        .as_ref()
+        .and_then(|request| request.tool_result_fields.clone());
+    let (output, is_error) = parsed_result
+        .map(|request| {
+            (
+                request.output.unwrap_or_default(),
+                request.status.as_str() == "error",
+            )
+        })
+        .unwrap_or_else(|| {
+            astra_thin_client::ToolResultRequest::parse_output_and_error(&result_json)
+        });
     EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
         output,
         is_error,
