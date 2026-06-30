@@ -426,6 +426,37 @@ mod tests {
     }
 
     #[test]
+    fn drops_persisted_runtime_scaffolding_directives() {
+        let messages = vec![
+            json!({"role": "user", "content": "continue"}),
+            json!({"role": "assistant", "content": "working"}),
+            json!({"role": "user", "content": "⚠️ VERIFICATION REQUIRED: Before you finish, run any missing checks"}),
+            json!({"role": "user", "content": "🔄 ERROR BUDGET EXHAUSTED: You've hit Unknown errors 3 turns in a row"}),
+            json!({"role": "assistant", "content": "Tools used: bash, grep, read_file"}),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+
+        let got = sanitize_prompt_facing_messages(messages);
+        let joined = got
+            .iter()
+            .filter_map(|msg| msg["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "continue"}),
+                json!({"role": "assistant", "content": "working"}),
+                json!({"role": "assistant", "content": "done"}),
+            ]
+        );
+        assert!(!joined.contains("VERIFICATION REQUIRED"));
+        assert!(!joined.contains("ERROR BUDGET"));
+        assert!(!joined.contains("Tools used:"));
+    }
+
+    #[test]
     fn anthropic_style_tool_blocks_are_compacted_without_provider_frames() {
         let messages = vec![
             json!({"role": "user", "content": "inspect"}),

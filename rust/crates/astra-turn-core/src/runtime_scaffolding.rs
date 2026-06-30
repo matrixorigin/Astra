@@ -9,6 +9,9 @@ pub enum RuntimeScaffoldingKind {
     CrossSessionProjectContext,
     PreviousRoundSummary,
     SequentialToolCallsWarning,
+    VerificationRequired,
+    ErrorBudgetDirective,
+    GenericRuntimeScaffolding,
 }
 
 pub const SYSTEM_REMINDER_WRAPPER_PREFIX: &str = "<system-reminder>";
@@ -20,6 +23,8 @@ pub const ALREADY_FETCHED_PREFIX: &str = "## Already Fetched";
 pub const CROSS_SESSION_PROJECT_CONTEXT_PREFIX: &str = "## Cross-Session Project Context";
 pub const PREVIOUS_ROUND_PREFIX: &str = "✓ Previous round:";
 pub const SEQUENTIAL_TOOL_CALLS_PREFIX: &str = "## ⚠ Sequential Tool Calls Detected";
+pub const VERIFICATION_REQUIRED_PREFIX: &str = "⚠️ VERIFICATION REQUIRED";
+pub const ERROR_BUDGET_PREFIX: &str = "🔄 ERROR BUDGET";
 
 pub fn detect_runtime_scaffolding(content: &str) -> Option<RuntimeScaffoldingKind> {
     let trimmed = content.trim_start();
@@ -41,38 +46,21 @@ pub fn detect_runtime_scaffolding(content: &str) -> Option<RuntimeScaffoldingKin
         Some(RuntimeScaffoldingKind::PreviousRoundSummary)
     } else if trimmed.starts_with(SEQUENTIAL_TOOL_CALLS_PREFIX) {
         Some(RuntimeScaffoldingKind::SequentialToolCallsWarning)
+    } else if trimmed.starts_with(VERIFICATION_REQUIRED_PREFIX) {
+        Some(RuntimeScaffoldingKind::VerificationRequired)
+    } else if trimmed.starts_with(ERROR_BUDGET_PREFIX) {
+        Some(RuntimeScaffoldingKind::ErrorBudgetDirective)
+    } else if astra_turn_types::scaffolding_body_prefixes_for_filtering()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        Some(RuntimeScaffoldingKind::GenericRuntimeScaffolding)
     } else {
         None
     }
 }
 
 pub fn is_continuation_scaffolding_for_role(role: &str, content: &str) -> bool {
-    matches!(
-        (role, detect_runtime_scaffolding(content)),
-        (
-            "user",
-            Some(
-                RuntimeScaffoldingKind::SystemReminderWrapper
-                    | RuntimeScaffoldingKind::AttentionManifest
-                    | RuntimeScaffoldingKind::WorkingSetManifest
-                    | RuntimeScaffoldingKind::SessionAnchor
-                    | RuntimeScaffoldingKind::ObsoleteActiveTaskAttachment
-                    | RuntimeScaffoldingKind::PreviousRoundSummary
-                    | RuntimeScaffoldingKind::SequentialToolCallsWarning,
-            ),
-        ) | (
-            "system",
-            Some(
-                RuntimeScaffoldingKind::AttentionManifest
-                    | RuntimeScaffoldingKind::WorkingSetManifest
-                    | RuntimeScaffoldingKind::SessionAnchor
-                    | RuntimeScaffoldingKind::ObsoleteActiveTaskAttachment
-                    | RuntimeScaffoldingKind::AlreadyFetchedInventory
-                    | RuntimeScaffoldingKind::CrossSessionProjectContext
-                    | RuntimeScaffoldingKind::PreviousRoundSummary,
-            ),
-        )
-    )
+    matches!(role, "user" | "assistant" | "system") && detect_runtime_scaffolding(content).is_some()
 }
 
 pub fn is_trailing_user_runtime_scaffolding(content: &str) -> bool {
@@ -112,6 +100,50 @@ mod tests {
             Some(RuntimeScaffoldingKind::AlreadyFetchedInventory)
         );
         assert_eq!(detect_runtime_scaffolding("plain user message"), None);
+    }
+
+    #[test]
+    fn detects_stop_hook_and_error_budget_directives() {
+        assert_eq!(
+            detect_runtime_scaffolding(
+                "⚠️ VERIFICATION REQUIRED: Before you finish, run missing checks"
+            ),
+            Some(RuntimeScaffoldingKind::VerificationRequired)
+        );
+        assert_eq!(
+            detect_runtime_scaffolding("🔄 ERROR BUDGET EXHAUSTED: You've hit Unknown errors"),
+            Some(RuntimeScaffoldingKind::ErrorBudgetDirective)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_turn_types_scaffolding_prefixes() {
+        assert_eq!(
+            detect_runtime_scaffolding("Tools used: bash, grep, read_file"),
+            Some(RuntimeScaffoldingKind::GenericRuntimeScaffolding)
+        );
+        assert_eq!(
+            detect_runtime_scaffolding("[compact session=sess-1 turn=4]\nsummary"),
+            Some(RuntimeScaffoldingKind::GenericRuntimeScaffolding)
+        );
+    }
+
+    #[test]
+    fn continuation_scaffolding_is_filtered_for_prompt_facing_roles() {
+        for role in ["user", "assistant", "system"] {
+            assert!(is_continuation_scaffolding_for_role(
+                role,
+                "⚠️ VERIFICATION REQUIRED: Before you finish"
+            ));
+            assert!(is_continuation_scaffolding_for_role(
+                role,
+                "Tools used: bash"
+            ));
+        }
+        assert!(!is_continuation_scaffolding_for_role(
+            "tool",
+            "Tools used: bash"
+        ));
     }
 
     #[test]
