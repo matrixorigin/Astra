@@ -9,7 +9,7 @@ x-env-files: &astra-env-files
 
 services:
   matrixone-init:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:4.0.0-rc3}
     user: root
     entrypoint:
       - sh
@@ -31,7 +31,7 @@ services:
     restart: "no"
 
   matrixone:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:4.0.0-rc3}
     hostname: matrixone
     user: "${UID:-1000}:${GID:-1000}"
     depends_on:

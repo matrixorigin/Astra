@@ -1,6 +1,6 @@
 //! `ToolCallRecord` rows for headless early-exit paths.
 
-use astra_services::session_journal::ToolCallRecord;
+use astra_services::session_journal::{NOOP_OR_CACHED_RESULT_CLASS, ToolCallRecord};
 
 #[must_use]
 pub fn journal_record_duplicate_within_turn(
@@ -19,6 +19,7 @@ pub fn journal_record_duplicate_within_turn(
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
         ..Default::default()
     }
 }
@@ -84,6 +85,7 @@ pub fn journal_record_cross_turn_cache_hit(
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
         ..Default::default()
     }
 }
@@ -142,6 +144,7 @@ pub fn journal_record_tool_not_admitted(
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
         ..Default::default()
     }
 }
@@ -190,6 +193,7 @@ pub fn journal_record_suppressed_tool_retry(
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
         ..Default::default()
     }
 }
@@ -259,12 +263,16 @@ mod tests {
         let r = journal_record_duplicate_within_turn("bash".into(), Some("x".into()));
         assert!(r.ok);
         assert_eq!(r.error.as_deref(), Some("duplicate_within_turn"));
+        assert_eq!(r.result_class.as_deref(), Some(NOOP_OR_CACHED_RESULT_CLASS));
+        assert!(r.is_structured_noop_or_cached_result());
     }
 
     #[test]
     fn cache_hit_record_has_output_bytes() {
         let r = journal_record_cross_turn_cache_hit("read_file".into(), 12, None, None);
         assert_eq!(r.output_bytes, Some(12));
+        assert_eq!(r.result_class.as_deref(), Some(NOOP_OR_CACHED_RESULT_CLASS));
+        assert!(r.is_structured_noop_or_cached_result());
     }
 
     #[test]
@@ -440,6 +448,8 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.ms, 7);
         assert_eq!(r.error.as_deref(), Some("unknown_tool: nope"));
+        assert_eq!(r.result_class, None);
+        assert!(!r.is_structured_noop_or_cached_result());
     }
 
     #[test]
@@ -460,6 +470,8 @@ mod tests {
                 .is_some_and(|preview| preview.starts_with("Deferred:"))
         );
         assert!(r.is_synthetic_placeholder());
+        assert_eq!(r.result_class.as_deref(), Some(NOOP_OR_CACHED_RESULT_CLASS));
+        assert!(r.is_structured_noop_or_cached_result());
     }
 
     #[test]
@@ -488,6 +500,8 @@ mod tests {
         assert!(r.ok);
         assert_eq!(r.error.as_deref(), Some("nonprogress_retry_deferred"));
         assert!(r.is_synthetic_placeholder());
+        assert_eq!(r.result_class.as_deref(), Some(NOOP_OR_CACHED_RESULT_CLASS));
+        assert!(r.is_structured_noop_or_cached_result());
         assert!(
             !r.was_blocked_by_policy(),
             "retry deferral must not look like a hard policy block"

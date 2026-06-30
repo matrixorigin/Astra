@@ -11,14 +11,13 @@
 #   docker-compose -f docker-compose.prod.yml up -d
 #   docker-compose -f docker-compose.prod.yml up -d --scale api=3
 
-version: '3.8'
+version: "3.8"
 
 services:
-
   # ─── Database ─────────────────────────────────────────────
 
   matrixone:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:4.0.0-rc3}
     hostname: matrixone
     command: ["/mo-service", "-launch", "/etc/quickstart/launch.toml"]
     ports:
@@ -39,10 +38,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '4'
+          cpus: "4"
           memory: 8G
         reservations:
-          cpus: '2'
+          cpus: "2"
           memory: 4G
     logging:
       driver: "json-file"
@@ -116,10 +115,10 @@ services:
       replicas: 3
       resources:
         limits:
-          cpus: '2'
+          cpus: "2"
           memory: 4G
         reservations:
-          cpus: '1'
+          cpus: "1"
           memory: 2G
 
     logging:

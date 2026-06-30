@@ -92,12 +92,12 @@ docker compose up -d
 
 ## Services
 
-| Service | Host port | Description |
-| --- | --- | --- |
-| `api` | `17001` | `astra-server` HTTP API |
-| `memoria` | `8100` | Memoria memory service |
-| `matrixone` | `26001` | MatrixOne MySQL-compatible endpoint |
-| `matrixone` debug | `26060` | MatrixOne debug/health endpoint |
+| Service           | Host port | Description                         |
+| ----------------- | --------- | ----------------------------------- |
+| `api`             | `17001`   | `astra-server` HTTP API             |
+| `memoria`         | `8100`    | Memoria memory service              |
+| `matrixone`       | `26001`   | MatrixOne MySQL-compatible endpoint |
+| `matrixone` debug | `26060`   | MatrixOne debug/health endpoint     |
 
 `ASTRA_API_PORT` in `.env` controls the host-facing published port. The API container itself listens on `17001`.
 
@@ -107,7 +107,7 @@ By default the stack pulls:
 
 - `matrixorigin/astra:latest`
 - `matrixorigin/memoria:latest`
-- `matrixorigin/matrixone:latest`
+- `matrixorigin/matrixone:4.0.0-rc3`
 
 Override image tags in `.env`, for example:
 

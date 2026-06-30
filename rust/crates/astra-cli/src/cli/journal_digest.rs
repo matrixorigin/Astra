@@ -99,6 +99,12 @@ pub struct Aggregates {
     pub total_tokens_out: u64,
     pub total_duration_ms: u64,
     pub total_tool_calls: u64,
+    /// Tool records that produced fresh observations, excluding cache hits,
+    /// duplicate suppressions, synthetic placeholders, and failures.
+    pub total_fresh_tool_calls: u64,
+    /// Tool records that did not execute fresh work because the runtime reused
+    /// or pointed back to an already-known result.
+    pub total_noop_or_cached_tool_calls: u64,
     pub tool_calls_failed: u64,
     /// Tool calls blocked by a safety guard (shell_obfuscation, dangerous command, etc.).
     /// Subset of `tool_calls_failed`. Non-zero means the agent hit safety walls.
@@ -144,6 +150,10 @@ pub struct TurnRow {
     pub selected_skills: Vec<String>,
     pub tool_calls_ok: u32,
     pub tool_calls_fail: u32,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub tool_calls_fresh: u32,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub tool_calls_noop_or_cached: u32,
     /// Number of short-circuited skill re-entries in this turn (reentry_count ≥ 1).
     /// Surfaces "model called `skill(X)` again after already loading X" waste.
     #[serde(skip_serializing_if = "is_zero_u32")]
@@ -271,20 +281,38 @@ fn preview(s: Option<&String>, max: usize) -> String {
     out
 }
 
-fn tool_call_counts(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> (u32, u32) {
+#[derive(Debug, Default, Clone, Copy)]
+struct ToolCallStats {
+    ok: u32,
+    fail: u32,
+    fresh: u32,
+    noop_or_cached: u32,
+}
+
+impl ToolCallStats {
+    fn total(self) -> u32 {
+        self.ok + self.fail
+    }
+}
+
+fn tool_call_stats(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> ToolCallStats {
     let Some(calls) = calls else {
-        return (0, 0);
+        return ToolCallStats::default();
     };
-    let mut ok = 0u32;
-    let mut fail = 0u32;
+    let mut stats = ToolCallStats::default();
     for c in calls {
         if is_effective_failure(c) {
-            fail += 1;
+            stats.fail += 1;
         } else {
-            ok += 1;
+            stats.ok += 1;
+            if c.is_structured_noop_or_cached_result() {
+                stats.noop_or_cached += 1;
+            } else {
+                stats.fresh += 1;
+            }
         }
     }
-    (ok, fail)
+    stats
 }
 
 /// Treat a tool call as a failure when either:
@@ -513,6 +541,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     let mut total_tokens_out: u64 = 0;
     let mut total_duration_ms: u64 = 0;
     let mut total_tool_calls: u64 = 0;
+    let mut total_fresh_tool_calls: u64 = 0;
+    let mut total_noop_or_cached_tool_calls: u64 = 0;
     let mut tool_calls_failed: u64 = 0;
     let mut safety_guard_blocks: u64 = 0;
     let mut turn_error_count = 0usize;
@@ -542,16 +572,22 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     Vec::new()
                 };
                 let pending_attempt_run_id = attempt_run_id(&pending_rounds);
-                let (ok_c, fail_c) = tool_call_counts(ev.tool_calls.as_ref());
+                let stats = tool_call_stats(ev.tool_calls.as_ref());
                 let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
                 // Fallback: if tool_calls Vec is absent, use tool_count scalar.
-                let effective_total = if ok_c + fail_c > 0 {
-                    u64::from(ok_c + fail_c)
+                let effective_total = if stats.total() > 0 {
+                    u64::from(stats.total())
                 } else {
                     u64::from(ev.tool_count.unwrap_or(0))
                 };
                 total_tool_calls += effective_total;
-                tool_calls_failed += u64::from(fail_c);
+                total_fresh_tool_calls += if stats.total() > 0 {
+                    u64::from(stats.fresh)
+                } else {
+                    u64::from(ev.tool_count.unwrap_or(0))
+                };
+                total_noop_or_cached_tool_calls += u64::from(stats.noop_or_cached);
+                tool_calls_failed += u64::from(stats.fail);
                 // Count safety guard blocks regardless of focus level.
                 //
                 // Include `ok=true but result body encodes failure`
@@ -644,13 +680,19 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                         Vec::new()
                     },
                     // When tool_calls Vec is absent, treat tool_count as all-ok
-                    // (fail_c is necessarily 0 in this branch).
-                    tool_calls_ok: if ok_c + fail_c > 0 {
-                        ok_c
+                    // and fresh because no per-call semantics are available.
+                    tool_calls_ok: if stats.total() > 0 {
+                        stats.ok
                     } else {
                         ev.tool_count.unwrap_or(0)
                     },
-                    tool_calls_fail: fail_c,
+                    tool_calls_fail: stats.fail,
+                    tool_calls_fresh: if stats.total() > 0 {
+                        stats.fresh
+                    } else {
+                        ev.tool_count.unwrap_or(0)
+                    },
+                    tool_calls_noop_or_cached: stats.noop_or_cached,
                     skill_reentry_calls: reentry_c,
                     skill_locked_out_calls: locked_out_c,
                     user_input_preview,
@@ -804,6 +846,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             total_tokens_out,
             total_duration_ms,
             total_tool_calls,
+            total_fresh_tool_calls,
+            total_noop_or_cached_tool_calls,
             tool_calls_failed,
             safety_guard_blocks,
             avg_tokens_in,
@@ -868,11 +912,13 @@ pub fn print_text(d: &JournalDigest) {
         a.error_event_count
     );
     println!(
-        "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} tool_failures={}",
+        "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} fresh={} noop_or_cached={} tool_failures={}",
         a.total_tokens_in.to_string().magenta(),
         a.total_tokens_out.to_string().magenta(),
         a.total_duration_ms,
         a.total_tool_calls,
+        a.total_fresh_tool_calls,
+        a.total_noop_or_cached_tool_calls,
         a.tool_calls_failed
     );
     println!("\n  {}", "Averages (per turn)".bold().magenta());
@@ -1727,6 +1773,17 @@ mod tests {
         .expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.aggregates.total_tool_calls, 2);
+        assert_eq!(
+            d.aggregates.total_fresh_tool_calls, 1,
+            "only the real bash call should count as fresh evidence"
+        );
+        assert_eq!(
+            d.aggregates.total_noop_or_cached_tool_calls, 1,
+            "cache hits should be visible as no-op/cache calls"
+        );
+        assert_eq!(d.turns[0].tool_calls_fresh, 1);
+        assert_eq!(d.turns[0].tool_calls_noop_or_cached, 1);
         assert_eq!(
             d.aggregates.tool_calls_failed, 0,
             "cross-turn cache hits must not count as failures"

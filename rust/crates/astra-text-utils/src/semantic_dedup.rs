@@ -38,23 +38,7 @@ pub const DEFAULT_SIMILARITY_THRESHOLD: f64 = 0.75;
 pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
     match tool_name {
         // File-based tools: key on normalized path + output-critical params
-        "read_file" => {
-            let path = arg_str(args, "path")?;
-            let start = arg_u64(args, "start_line")
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-            let end = arg_u64(args, "end_line")
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-            let outline = arg_bool(args, "outline").unwrap_or(false);
-            Some(format!(
-                "read_file:{}:{}:{}:outline={}",
-                normalize_path(path),
-                start,
-                end,
-                outline,
-            ))
-        }
+        "read_file" => read_file_semantic_key(args),
         "glob" => {
             let pattern = arg_str(args, "pattern").unwrap_or("*");
             let path = arg_str(args, "path").unwrap_or(".");
@@ -186,6 +170,42 @@ fn arg_bool(args: &Value, key: &str) -> Option<bool> {
 
 fn normalize_path(path: &str) -> String {
     path.trim().trim_end_matches('/').to_string()
+}
+
+fn read_file_semantic_key(args: &Value) -> Option<String> {
+    let path = arg_str(args, "path")?;
+    let (start, end) = read_file_effective_line_bounds(args);
+    let outline = arg_bool(args, "outline").unwrap_or(false);
+    Some(format!(
+        "read_file:{}:start={}:end={}:outline={}",
+        normalize_path(path),
+        start.map(|v| v.to_string()).unwrap_or_default(),
+        end.map(|v| v.to_string()).unwrap_or_default(),
+        outline,
+    ))
+}
+
+fn read_file_effective_line_bounds(args: &Value) -> (Option<u64>, Option<u64>) {
+    let mut start = arg_u64(args, "start_line");
+    let mut end = arg_u64(args, "end_line");
+
+    // Mirror astra_tools::fs_ops::convert_read_file_args for the LLM-facing
+    // contract. The schema exposes offset+limit; start_line/end_line are
+    // internal compatibility fields. Dedup must key on the effective range or
+    // offset reads of different sections collapse into the same cache entry.
+    if let Some(offset) = arg_u64(args, "offset") {
+        start = Some(offset);
+        if let Some(limit) = arg_u64(args, "limit") {
+            end = Some(offset.saturating_add(limit.saturating_sub(1)));
+        }
+    }
+
+    (start, end)
+}
+
+fn read_file_path_from_semantic_key(key: &str) -> Option<&str> {
+    key.strip_prefix("read_file:")
+        .and_then(|rest| rest.split_once(":start=").map(|(path, _)| path))
 }
 
 fn normalize_repo(repo: &str) -> String {
@@ -750,7 +770,7 @@ impl SemanticDedup {
         for (key, (_turn, tool, _generation)) in &self.param_cache {
             match tool.as_str() {
                 "read_file" => {
-                    if let Some(path) = key.strip_prefix("read_file:") {
+                    if let Some(path) = read_file_path_from_semantic_key(key) {
                         files.push(path);
                     }
                 }
@@ -883,15 +903,31 @@ mod tests {
     fn read_file_different_line_ranges_differ() {
         let k1 = semantic_call_key(
             "read_file",
-            &json!({"path": "foo.rs", "start_line": 1, "end_line": 120}),
+            &json!({"path": "foo.rs", "offset": 1, "limit": 120}),
         );
         let k2 = semantic_call_key(
             "read_file",
-            &json!({"path": "foo.rs", "start_line": 200, "end_line": 350}),
+            &json!({"path": "foo.rs", "offset": 200, "limit": 151}),
         );
         assert_ne!(
             k1, k2,
-            "different line ranges must produce distinct keys — otherwise agent can't read different regions of the same file"
+            "different offset/limit ranges must produce distinct keys — otherwise agent can't read different regions of the same file"
+        );
+    }
+
+    #[test]
+    fn read_file_offset_limit_matches_internal_line_range_key() {
+        let visible = semantic_call_key(
+            "read_file",
+            &json!({"path": "foo.rs", "offset": 20, "limit": 30}),
+        );
+        let internal = semantic_call_key(
+            "read_file",
+            &json!({"path": "foo.rs", "start_line": 20, "end_line": 49}),
+        );
+        assert_eq!(
+            visible, internal,
+            "LLM-facing offset/limit and internal start/end args must dedup identically"
         );
     }
 
@@ -1337,7 +1373,7 @@ mod tests {
     #[test]
     fn tracker_detects_token_cosine_only_with_same_semantic_key() {
         let mut tracker = SemanticDedup::new(0.7);
-        let args = json!({"path": "src/main.rs", "start_line": 1, "end_line": 80});
+        let args = json!({"path": "src/main.rs", "offset": 1, "limit": 80});
         let sem_key = semantic_call_key("read_file", &args).expect("read_file key");
         let output1 =
             "fn parse_user() {}\nfn parse_team() {}\nfn parse_token() {}\nfn parse_config() {}";
@@ -1364,8 +1400,8 @@ mod tests {
     #[test]
     fn read_file_different_ranges_do_not_trigger_output_similarity_hint() {
         let mut tracker = SemanticDedup::new(0.7);
-        let range1 = json!({"path": "src/lib.rs", "start_line": 1, "end_line": 500});
-        let range2 = json!({"path": "src/lib.rs", "start_line": 501, "end_line": 1000});
+        let range1 = json!({"path": "src/lib.rs", "offset": 1, "limit": 500});
+        let range2 = json!({"path": "src/lib.rs", "offset": 501, "limit": 500});
         let output1 = "pub fn handler_a() {}\npub fn handler_b() {}\npub fn handler_c() {}\npub fn handler_d() {}\n";
         let output2 = "pub fn handler_e() {}\npub fn handler_f() {}\npub fn handler_g() {}\npub fn handler_h() {}\n";
         assert!(
@@ -1388,14 +1424,14 @@ mod tests {
         let mut tracker = SemanticDedup::new(0.75);
         tracker.check_and_record(
             "read_file",
-            &json!({"path": "src/lib.rs", "start_line": 1, "end_line": 500}),
+            &json!({"path": "src/lib.rs", "offset": 1, "limit": 500}),
             "first range content that is long enough to be a useful cached output",
             1,
         );
 
         let block = tracker.pre_check_block(
             "read_file",
-            &json!({"path": "src/lib.rs", "start_line": 501, "end_line": 1000}),
+            &json!({"path": "src/lib.rs", "offset": 501, "limit": 500}),
             2,
         );
         assert!(

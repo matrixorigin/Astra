@@ -945,6 +945,7 @@ pub struct ToolCallRecord {
 /// optimizations — **not** tool failures — and are filtered out of
 /// evaluation/analytics by [`ToolCallRecord::is_synthetic_placeholder`].
 pub const SURGICAL_REMOVAL_TOOL_NAME: &str = "(surgically_removed)";
+pub const NOOP_OR_CACHED_RESULT_CLASS: &str = "noop_or_cached";
 
 impl ToolCallRecord {
     /// Synthetic placeholders are audit-only records emitted when skill routing
@@ -989,6 +990,9 @@ impl ToolCallRecord {
     /// "successful execution with fresh evidence" from cache hits, duplicate
     /// suppressions, and unchanged-result stubs.
     pub fn is_noop_or_cached_result(&self) -> bool {
+        if self.is_structured_noop_or_cached_result() {
+            return true;
+        }
         self.error
             .as_deref()
             .is_some_and(is_noop_or_cached_result_text)
@@ -1000,6 +1004,20 @@ impl ToolCallRecord {
                 .result_full
                 .as_deref()
                 .is_some_and(is_noop_or_cached_result_text)
+    }
+
+    /// Structured no-op/cache classification for current journal records.
+    /// Prefer this for new analytics. `is_noop_or_cached_result` keeps the
+    /// legacy text fallback for old local journals.
+    pub fn is_structured_noop_or_cached_result(&self) -> bool {
+        self.result_class.as_deref() == Some(NOOP_OR_CACHED_RESULT_CLASS)
+            || matches!(
+                self.error.as_deref(),
+                Some("cached_cross_turn" | "duplicate_within_turn")
+            )
+            || self.surgically_removed == Some(true)
+            || self.skill_reentry_count.is_some()
+            || self.skill_locked_out == Some(true)
     }
 }
 
@@ -7041,11 +7059,29 @@ mod tests {
                 ToolCallRecord {
                     name: "read_file".to_string(),
                     ok: true,
+                    result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
+                    ..Default::default()
+                }
+                .is_structured_noop_or_cached_result()
+            );
+            assert!(
+                ToolCallRecord {
+                    name: "read_file".to_string(),
+                    ok: true,
                     error: Some("cached_cross_turn".into()),
                     result_preview: Some("[cached_cross_turn: reused 200 bytes]".into()),
                     ..Default::default()
                 }
                 .is_noop_or_cached_result()
+            );
+            assert!(
+                !(ToolCallRecord {
+                    name: "nope".to_string(),
+                    ok: false,
+                    error: Some("unknown_tool: nope".to_string()),
+                    ..Default::default()
+                }
+                .is_structured_noop_or_cached_result())
             );
             assert!(
                 base_tool_record(

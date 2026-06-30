@@ -71,6 +71,7 @@ aws ecr get-login-password --region us-east-1 | \
 ### 2. Database (RDS or Self-Managed)
 
 **Option A: Self-managed MatrixOne on EC2**
+
 ```bash
 # Launch EC2 instance
 aws ec2 run-instances \
@@ -82,10 +83,11 @@ aws ec2 run-instances \
 
 # Install MatrixOne
 ssh ec2-user@<instance-ip>
-docker run -d -p 6001:6001 matrixorigin/matrixone:latest
+docker run -d -p 6001:6001 matrixorigin/matrixone:4.0.0-rc3
 ```
 
 **Option B: RDS MySQL (compatible)**
+
 ```bash
 # Create RDS instance
 aws rds create-db-instance \
@@ -151,12 +153,13 @@ Store in ECS task definition or use Secrets Manager:
 
 ```json
 {
-  "environment": [
-    {"name": "MATRIXONE_HOST", "value": "db.internal"}
-  ],
+  "environment": [{ "name": "MATRIXONE_HOST", "value": "db.internal" }],
   "secrets": [
-    {"name": "ASTRA_TOKEN_ENCRYPTION_KEY", "valueFrom": "arn:aws:secretsmanager:..."},
-    {"name": "ASTRA_JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:..."}
+    {
+      "name": "ASTRA_TOKEN_ENCRYPTION_KEY",
+      "valueFrom": "arn:aws:secretsmanager:..."
+    },
+    { "name": "ASTRA_JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:..." }
   ]
 }
 ```

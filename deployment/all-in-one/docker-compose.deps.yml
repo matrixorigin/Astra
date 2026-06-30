@@ -7,11 +7,15 @@
 #   make dev-deps
 
 services:
-
   matrixone-init:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:4.0.0-rc3}
     user: root
-    entrypoint: ["sh", "-c", "chown -R ${UID:-1000}:${GID:-1000} /mo-data && mkdir -p /mo-logs && chown -R ${UID:-1000}:${GID:-1000} /mo-logs"]
+    entrypoint:
+      [
+        "sh",
+        "-c",
+        "chown -R ${UID:-1000}:${GID:-1000} /mo-data && mkdir -p /mo-logs && chown -R ${UID:-1000}:${GID:-1000} /mo-logs",
+      ]
     volumes:
       - matrixone-data:/mo-data
       - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
@@ -19,7 +23,7 @@ services:
       - mo-net
 
   matrixone:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:4.0.0-rc3}
     hostname: matrixone
     user: "${UID:-1000}:${GID:-1000}"
     depends_on:

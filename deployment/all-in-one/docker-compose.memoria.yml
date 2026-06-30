@@ -4,11 +4,10 @@
 #   docker-compose -f docker-compose.memoria.yml up -d
 
 services:
-
   # ─── Infrastructure ─────────────────────────────────────────
 
   matrixone:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:4.0.0-rc3}
     hostname: matrixone
     entrypoint: /entrypoint.sh
     command: []

@@ -28,7 +28,7 @@ matrixone:
   enabled: true
   image:
     repository: matrixorigin/matrixone
-    tag: latest
+    tag: 4.0.0-rc3
   port: 6001
   storage:
     size: 100Gi
