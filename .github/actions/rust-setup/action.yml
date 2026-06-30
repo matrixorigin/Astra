@@ -10,6 +10,14 @@ inputs:
     description: "Whether to save cache (true/false)"
     required: false
     default: "false"
+  use-sccache:
+    description: "Enable sccache with the GitHub Actions cache backend"
+    required: false
+    default: "true"
+  use-mold:
+    description: "Use mold as the Linux linker"
+    required: false
+    default: "true"
 
 runs:
   using: "composite"
@@ -30,6 +38,33 @@ runs:
     - uses: dtolnay/rust-toolchain@stable
 
     - uses: taiki-e/install-action@nextest
+
+    - name: Install mold linker
+      if: ${{ inputs.use-mold == 'true' && runner.os == 'Linux' }}
+      shell: bash
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends mold
+        if [[ -n "${RUSTFLAGS:-}" ]]; then
+          echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold ${RUSTFLAGS}" >> "$GITHUB_ENV"
+        else
+          echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+        fi
+
+    - name: Install sccache
+      if: ${{ inputs.use-sccache == 'true' }}
+      uses: mozilla-actions/sccache-action@v0.0.10
+
+    - name: Configure sccache
+      if: ${{ inputs.use-sccache == 'true' }}
+      shell: bash
+      run: |
+        {
+          echo "SCCACHE_GHA_ENABLED=true"
+          echo "SCCACHE_CACHE_SIZE=5G"
+          echo "RUSTC_WRAPPER=sccache"
+        } >> "$GITHUB_ENV"
 
     - uses: Swatinem/rust-cache@v2
       with:

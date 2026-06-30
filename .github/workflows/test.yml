@@ -34,6 +34,9 @@ jobs:
         run: |
           cargo nextest run --manifest-path rust/Cargo.toml --workspace --no-run
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime --features bridge-e2e-hooks --no-run
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
   # ── Stage 2: parallel offline test shards (all need: build) ────────
   #
