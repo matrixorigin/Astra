@@ -1127,6 +1127,11 @@ mod tests {
         let labels = session_delete_labels();
         let schema_session_tables = session_lifecycle_schema_tables_with_session_id();
         let intentionally_retained_session_tables = BTreeSet::from([
+            // Auth session identifiers model login/provider sessions, not
+            // agent-run lifecycle rows. Deleting an agent session must not revoke
+            // unrelated user authentication state.
+            "auth_external_sessions".to_string(),
+            "auth_refresh_tokens".to_string(),
             // This is an operational repair queue. Unresolved cleanup debts must
             // survive session deletion until the retry worker settles the external resource.
             "workspace_cleanup_debts".to_string(),

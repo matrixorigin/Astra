@@ -221,6 +221,27 @@ fn deferred_tools_body(block: &str) -> Option<&str> {
     Some(body)
 }
 
+fn filter_block_to_names(block: &str, allowed_names: &HashSet<String>) -> Option<String> {
+    if allowed_names.is_empty() {
+        return None;
+    }
+    let (prefix, body, suffix) = split_deferred_tools_block(block)?;
+    let allowed_keys: HashSet<String> = allowed_names
+        .iter()
+        .map(|name| xml_escape_text(name).into_owned())
+        .collect();
+    let retained_lines: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| allowed_keys.contains(*line))
+        .collect();
+    if retained_lines.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}\n{}\n{suffix}", retained_lines.join("\n")))
+}
+
 fn split_deferred_tools_block(block: &str) -> Option<(&str, &str, &str)> {
     const OPEN: &str = "<deferred-tools>";
     const CLOSE: &str = "</deferred-tools>";

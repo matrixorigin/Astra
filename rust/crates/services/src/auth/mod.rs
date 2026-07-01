@@ -1914,7 +1914,7 @@ mod tests {
     fn refresh_token_row_decode_preserves_database_values() {
         let (user_id, expires_at, session_id) =
             decode_refresh_token_row(&FakeRefreshTokenRow::complete())
-            .expect("complete refresh token row should decode");
+                .expect("complete refresh token row should decode");
 
         assert_eq!(user_id, "user-1");
         assert_eq!(expires_at, "2026-06-26T10:00:00");

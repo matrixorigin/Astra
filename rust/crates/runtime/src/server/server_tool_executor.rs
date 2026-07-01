@@ -693,6 +693,12 @@ impl ServerToolExecutor {
         self.tool_has_runtime_binding(name)
     }
 
+    pub(crate) fn runtime_bound_tool_names(&self, names: HashSet<String>) -> HashSet<String> {
+        astra_turn_core::tool::deferred_activation::runtime_bound_tool_names(names, |name| {
+            self.tool_has_runtime_binding(name)
+        })
+    }
+
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
         if name.starts_with("mcp__") {
             return self.mcp_tool_has_runtime_binding(name);

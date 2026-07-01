@@ -12674,6 +12674,8 @@ mod tests {
 
         assert!(capabilities.agent_binding.is_none());
         assert!(capabilities.request_scoped_skill_resolver.is_some());
+        let edge_context =
+            AgenticRunLifecycleService::extract_edge_context(&request).expect("edge context");
 
         let state = svc.build_initial_state_inner(
             "external-user",
@@ -12684,6 +12686,7 @@ mod tests {
             None,
             None,
             request_constraints,
+            &edge_context,
             None,
             capabilities.request_scoped_skill_resolver.clone(),
             capabilities.agent_binding.as_ref(),

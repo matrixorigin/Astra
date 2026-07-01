@@ -697,7 +697,6 @@ mod tests {
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
-            "test-user".to_string(),
             "test-session".to_string(),
         );
 

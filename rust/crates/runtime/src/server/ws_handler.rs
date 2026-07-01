@@ -39,6 +39,7 @@
 #[cfg(test)]
 use super::chat_handlers::is_session_service_unconfigured_error;
 use super::chat_handlers::resolve_or_create_chat_session;
+use super::external_runtime_context::inject_effective_runtime_context;
 use super::header_utils::collect_forward_headers;
 use super::*;
 use crate::server::run::handlers::transform_stream_run_events_for_client_with_pending;
@@ -283,7 +284,10 @@ pub(super) enum WsServerMessage {
 
 /// Per-connection state for an authenticated WebSocket session.
 struct WsConnection {
-    user: AuthUserRecord,
+    /// Full authenticated principal for this connection. This preserves
+    /// external-session origin so WS chat can use the same provider
+    /// runtime-context injection path as HTTP `/chat` and `/chat/stream`.
+    principal: AuthPrincipal,
     /// Normalized bearer header captured during WS auth and replayed on bridge fallback.
     authorization: String,
     /// Inbound handshake headers eligible for remote skill forwarding.
@@ -483,19 +487,19 @@ async fn authenticate_with_token(
         HeaderValue::from_str(&bearer).unwrap_or_else(|_| HeaderValue::from_static("")),
     );
 
-    match state.auth_service.current_user(&headers).await {
-        Ok(user) => {
+    match state.auth_service.current_principal(&headers).await {
+        Ok(principal) => {
             forward_headers.insert("authorization".to_string(), bearer.clone());
             send_msg(
                 socket,
                 &WsServerMessage::AuthOk {
-                    user_id: user.user_id.clone(),
-                    username: user.username.clone(),
+                    user_id: principal.user.user_id.clone(),
+                    username: principal.user.username.clone(),
                 },
             )
             .await;
             Ok(WsConnection {
-                user,
+                principal,
                 authorization: bearer,
                 forward_headers,
                 session_id: None,
@@ -709,7 +713,7 @@ async fn handle_chat_message(
     request.forward_headers = ws_forward_headers(conn);
     let resolved = match resolve_or_create_chat_session(
         state,
-        &conn.user,
+        &conn.principal.user,
         request.session_id.take(),
         request.agent_id.clone(),
         request_session_id_is_trusted,
@@ -735,12 +739,17 @@ async fn handle_chat_message(
     };
     request.session_id = resolved.session_id;
     request.full_llm_capture = resolved.full_llm_capture;
+    if let Err((status, err)) = inject_ws_effective_runtime_context(state, conn, &mut request).await
+    {
+        send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
+        return;
+    }
 
     // Try RunLifecycleService first (server-side agentic loop)
     match state
         .execution
         .run_lifecycle_service
-        .create_run(conn.user.user_id.clone(), request)
+        .create_run(conn.principal.user.user_id.clone(), request)
         .await
     {
         Ok(run) => {
@@ -773,6 +782,14 @@ async fn handle_chat_message(
     }
 }
 
+async fn inject_ws_effective_runtime_context(
+    state: &AppState,
+    conn: &WsConnection,
+    request: &mut astra_services::runs::ChatRequestData,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    inject_effective_runtime_context(state, &conn.principal, request).await
+}
+
 /// Cancel an active run by run_id.
 async fn handle_cancel_run(
     socket: &mut WebSocket,
@@ -783,7 +800,7 @@ async fn handle_cancel_run(
     match state
         .execution
         .run_lifecycle_service
-        .cancel_run(run_id.to_string(), conn.user.user_id.clone())
+        .cancel_run(run_id.to_string(), conn.principal.user.user_id.clone())
         .await
     {
         Ok(record) => {
@@ -805,7 +822,7 @@ async fn handle_pause_run(
     match state
         .execution
         .run_lifecycle_service
-        .pause_run(run_id.to_string(), conn.user.user_id.clone())
+        .pause_run(run_id.to_string(), conn.principal.user.user_id.clone())
         .await
     {
         Ok(record) => {
@@ -835,7 +852,7 @@ async fn handle_resume_run(
     match state
         .execution
         .run_lifecycle_service
-        .resume_run(run_id.to_string(), conn.user.user_id.clone())
+        .resume_run(run_id.to_string(), conn.principal.user.user_id.clone())
         .await
     {
         Ok(record) => {
@@ -913,7 +930,7 @@ async fn handle_tool_approval(
 ) {
     use astra_turn_core::edge_ledger::approval_callback_key;
 
-    let key = approval_callback_key(&conn.user.user_id, request_id);
+    let key = approval_callback_key(&conn.principal.user.user_id, request_id);
     let value = serde_json::json!({
         "approved": approved,
         "reason": reason,
@@ -933,7 +950,7 @@ async fn handle_user_prompt_response(
 ) {
     use astra_turn_core::edge_ledger::user_prompt_callback_key;
 
-    let key = user_prompt_callback_key(&conn.user.user_id, request_id);
+    let key = user_prompt_callback_key(&conn.principal.user.user_id, request_id);
     let value = if cancelled {
         serde_json::json!({ "cancelled": true })
     } else {
@@ -1060,13 +1077,13 @@ fn build_ws_bridge_headers(
     let secret_hv = HeaderValue::from_str(&state.chat_turn_bridge_secret)
         .map_err(|_| "Invalid bridge secret for headers")?;
     bridge_headers.insert(HeaderName::from_static("x-mo-bridge-secret"), secret_hv);
-    let user_id_hv =
-        HeaderValue::from_str(&conn.user.user_id).map_err(|_| "Invalid user_id for headers")?;
+    let user_id_hv = HeaderValue::from_str(&conn.principal.user.user_id)
+        .map_err(|_| "Invalid user_id for headers")?;
     bridge_headers.insert(HeaderName::from_static("x-mo-user-id"), user_id_hv);
     let authorization_hv =
         HeaderValue::from_str(&conn.authorization).map_err(|_| "Invalid authorization header")?;
     bridge_headers.insert(HeaderName::from_static("authorization"), authorization_hv);
-    let username_b64 = URL_SAFE.encode(conn.user.username.as_bytes());
+    let username_b64 = URL_SAFE.encode(conn.principal.user.username.as_bytes());
     bridge_headers.insert(
         HeaderName::from_static("x-mo-username-b64"),
         HeaderValue::from_str(&username_b64)
@@ -1241,7 +1258,7 @@ async fn best_effort_cancel_run(state: &AppState, conn: &WsConnection, run_id: &
     let _ = state
         .execution
         .run_lifecycle_service
-        .cancel_run(run_id.to_string(), conn.user.user_id.clone())
+        .cancel_run(run_id.to_string(), conn.principal.user.user_id.clone())
         .await;
 }
 
@@ -1534,7 +1551,11 @@ async fn stream_run_over_websocket(
                 let events = match state
                     .execution
                     .run_lifecycle_service
-                    .stream_run(run_id.to_string(), conn.user.user_id.clone(), last_index)
+                    .stream_run(
+                        run_id.to_string(),
+                        conn.principal.user.user_id.clone(),
+                        last_index,
+                    )
                     .await
                 {
                     Ok(events) => {
@@ -1643,7 +1664,7 @@ async fn stream_run_over_websocket(
                 let status = match state
                     .execution
                     .run_lifecycle_service
-                    .get_run_status(run_id.to_string(), conn.user.user_id.clone())
+                    .get_run_status(run_id.to_string(), conn.principal.user.user_id.clone())
                     .await
                 {
                     Ok(status) => {
@@ -2025,15 +2046,25 @@ async fn send_msg(socket: &mut WebSocket, msg: &WsServerMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::auth::external::{
+        ExternalRuntimeAuthResponse, ExternalRuntimeCapabilityDescriptor,
+        ExternalRuntimeCapabilityDescriptors, ExternalRuntimeScopeResponse,
+        ExternalSelectedModelResponse,
+    };
     use async_trait::async_trait;
     use axum::{Json, http::StatusCode};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::Mutex;
 
     use crate::{
         AppState, ErrorResponse, HealthChecker, ServiceInfo, SessionActivityRecord,
         SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord,
         SessionService, SessionUpdateRequestData,
+    };
+    use astra_services::{
+        AuthExternalSessionContext, AuthPrincipal, AuthPrincipalOrigin, AuthRefreshRequestData,
+        AuthRegisterRequestData, AuthService, AuthTokenRecord, ExternalRuntimeContextRequestData,
+        ExternalRuntimeContextResponse,
     };
 
     #[derive(Clone)]
@@ -2153,6 +2184,125 @@ mod tests {
             username: "alice".into(),
             email: "alice@example.com".into(),
             display_name: Some("Alice".into()),
+        }
+    }
+
+    fn external_test_principal() -> AuthPrincipal {
+        AuthPrincipal {
+            user: AuthUserRecord {
+                user_id: "external:moi:user-1".to_string(),
+                username: "user-1".to_string(),
+                email: String::new(),
+                display_name: None,
+            },
+            session_id: Some("external-session-1".to_string()),
+            origin: AuthPrincipalOrigin::External(AuthExternalSessionContext {
+                provider_id: "moi".to_string(),
+                external_subject: "user-1".to_string(),
+                external_session_id: "external-session-1".to_string(),
+                provider_scope_id: "workspace-1".to_string(),
+                provider_scope_display_name: Some("Workspace 1".to_string()),
+            }),
+        }
+    }
+
+    fn external_test_conn() -> WsConnection {
+        let principal = external_test_principal();
+        WsConnection {
+            principal,
+            authorization: "Bearer external-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: None,
+            pending_session_id: None,
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        }
+    }
+
+    #[derive(Default)]
+    struct WsRuntimeContextAuthService {
+        requested_model_ids: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl AuthService for WsRuntimeContextAuthService {
+        async fn register(
+            &self,
+            _request: AuthRegisterRequestData,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn login(
+            &self,
+            _request: astra_services::AuthLoginRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn refresh(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn logout(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn current_user(
+            &self,
+            _headers: &HeaderMap,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn external_runtime_context(
+            &self,
+            _principal: &AuthPrincipal,
+            request: ExternalRuntimeContextRequestData,
+        ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
+            self.requested_model_ids
+                .lock()
+                .expect("requested ids")
+                .push(request.requested_model_id.clone());
+            Ok(ExternalRuntimeContextResponse {
+                selected_model: ExternalSelectedModelResponse {
+                    id: request.requested_model_id,
+                    model: "qwen3.7-max".to_string(),
+                },
+                runtime_auth: ExternalRuntimeAuthResponse {
+                    auth_type: "moi_runtime_grant".to_string(),
+                    authorization: "Bearer runtime-grant".to_string(),
+                    expires_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+                capability_descriptors: ExternalRuntimeCapabilityDescriptors {
+                    model_gateway: Some(ExternalRuntimeCapabilityDescriptor {
+                        id: "moi-model-gateway".to_string(),
+                        descriptor_type: "model_gateway".to_string(),
+                        transport: "streamable_http".to_string(),
+                        endpoint_url: "http://127.0.0.1/model".to_string(),
+                        protocol: "model_gateway".to_string(),
+                        metadata: serde_json::Map::new(),
+                    }),
+                    mcp: None,
+                    skills: None,
+                },
+                runtime_scope: ExternalRuntimeScopeResponse {
+                    allowed_model_id: "model-qwen".to_string(),
+                    allowed_tools: Vec::new(),
+                    allowed_skills: Vec::new(),
+                    allowed_knowledge_bases: Vec::new(),
+                },
+                runtime_system_prompt: None,
+                task_id: "task-1".to_string(),
+                manifest_id: "manifest-1".to_string(),
+                provider_scope_id: "workspace-1".to_string(),
+            })
         }
     }
 
@@ -2429,12 +2579,113 @@ mod tests {
         assert!(request.interactive_client);
     }
 
+    #[tokio::test]
+    async fn ws_external_user_session_injects_provider_runtime_context() {
+        let auth = Arc::new(WsRuntimeContextAuthService::default());
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_auth_service(auth.clone());
+        let conn = external_test_conn();
+        let mut request = build_ws_chat_request(
+            "hello",
+            None,
+            None,
+            astra_services::runs::SelectedModelRequest {
+                id: Some("model-qwen".into()),
+                model: "client-display-name".into(),
+                gateway: None,
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+
+        inject_ws_effective_runtime_context(&state, &conn, &mut request)
+            .await
+            .expect("external websocket chat should inject provider runtime context");
+
+        assert_eq!(
+            auth.requested_model_ids
+                .lock()
+                .expect("requested ids")
+                .as_slice(),
+            ["model-qwen"]
+        );
+        assert_eq!(request.model.as_deref(), Some("qwen3.7-max"));
+        assert_eq!(
+            request
+                .selected_model
+                .as_ref()
+                .and_then(|selected| selected.id.as_deref()),
+            Some("model-qwen")
+        );
+        assert_eq!(
+            request
+                .runtime_auth
+                .as_ref()
+                .map(|runtime_auth| runtime_auth.authorization.as_str()),
+            Some("Bearer runtime-grant")
+        );
+        assert!(request.provider_runtime_authorized);
+        assert!(request.capability_descriptors.is_some());
+    }
+
+    #[tokio::test]
+    async fn ws_external_user_session_requires_provider_model_id() {
+        let auth = Arc::new(WsRuntimeContextAuthService::default());
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_auth_service(auth.clone());
+        let conn = external_test_conn();
+        let mut request = build_ws_chat_request(
+            "hello",
+            None,
+            None,
+            astra_services::runs::SelectedModelRequest {
+                id: None,
+                model: "qwen3.7-max".into(),
+                gateway: None,
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let (status, error) = inject_ws_effective_runtime_context(&state, &conn, &mut request)
+            .await
+            .expect_err("external websocket chat must require selected_model.id");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("external_requested_model_required")
+        );
+        assert!(
+            auth.requested_model_ids
+                .lock()
+                .expect("requested ids")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn ws_bridge_headers_forward_authorization() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
             .with_chat_turn_bridge_secret("bridge-secret");
         let conn = WsConnection {
-            user: test_user(),
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer good-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: None,
@@ -2453,7 +2704,7 @@ mod tests {
     #[test]
     fn ws_forward_headers_preserve_handshake_headers() {
         let conn = WsConnection {
-            user: test_user(),
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer good-token".into(),
             forward_headers: std::collections::HashMap::from([
                 ("x-workspace-id".to_string(), "ws-001".to_string()),
@@ -2518,12 +2769,7 @@ mod tests {
     #[test]
     fn chat_request_session_id_prefers_requested_value_without_mutating_connection() {
         let conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("bound-session".into()),
@@ -2545,12 +2791,7 @@ mod tests {
     #[test]
     fn chat_request_session_id_falls_back_to_bound_connection_session() {
         let conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("bound-session".into()),
@@ -2567,12 +2808,7 @@ mod tests {
     #[test]
     fn chat_request_session_id_prefers_pending_handshake_session_before_bound_session() {
         let conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("bound-session".into()),
@@ -2589,12 +2825,7 @@ mod tests {
     #[test]
     fn chat_request_session_id_is_trusted_only_for_bound_session() {
         let trusted_conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("bound-session".into()),
@@ -2603,12 +2834,7 @@ mod tests {
             bridge_prepared_run_id: None,
         };
         let pending_conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("bound-session".into()),
@@ -2900,12 +3126,7 @@ mod tests {
     #[test]
     fn bridge_success_preamble_messages_emit_session_info_before_run_started() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: None,
@@ -2949,12 +3170,7 @@ mod tests {
     #[test]
     fn bridge_forward_error_messages_preserve_trusted_run_identity() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: None,
@@ -3040,12 +3256,7 @@ mod tests {
     #[test]
     fn bridge_forward_error_messages_without_run_id_only_emit_error() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: None,
@@ -3123,12 +3334,7 @@ mod tests {
     #[test]
     fn process_bridge_stream_event_suppresses_initial_tail_session_info() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-1".into()),
@@ -3165,12 +3371,7 @@ mod tests {
     #[test]
     fn process_bridge_stream_event_synthesizes_run_started_for_tail_session_info() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: None,
@@ -3227,12 +3428,7 @@ mod tests {
     #[test]
     fn process_bridge_stream_event_emits_run_started_before_tail_session_info() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: None,
@@ -3290,12 +3486,7 @@ mod tests {
     #[test]
     fn process_bridge_stream_event_preserves_turn_complete_assistant_text() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-42".into()),
@@ -3336,12 +3527,7 @@ mod tests {
     #[test]
     fn session_info_stream_event_updates_connection_state() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: None,
@@ -3368,12 +3554,7 @@ mod tests {
     #[test]
     fn session_info_stream_event_upgrades_prepared_bridge_run_id() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-1".into()),
@@ -3400,12 +3581,7 @@ mod tests {
     #[test]
     fn session_info_stream_event_without_prepared_run_id_synthesizes_run_started() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: None,
@@ -3441,12 +3617,7 @@ mod tests {
     #[test]
     fn session_info_stream_event_does_not_override_real_active_run_id() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-1".into()),
@@ -3473,12 +3644,7 @@ mod tests {
     #[test]
     fn repeated_session_info_without_prepared_run_id_does_not_resynthesize_run_started() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-42".into()),
@@ -3504,12 +3670,7 @@ mod tests {
     #[test]
     fn run_started_stream_event_upgrades_prepared_bridge_run_id_without_synthetic_start() {
         let mut conn = WsConnection {
-            user: AuthUserRecord {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                email: "alice@example.com".into(),
-                display_name: Some("Alice".into()),
-            },
+            principal: AuthPrincipal::internal(test_user()),
             authorization: "Bearer test-token".into(),
             forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-1".into()),

@@ -1926,9 +1926,8 @@ impl DatabaseRunStateStore {
         user_id: &str,
         run_id: &str,
     ) -> DbStoreResult<Option<DurableRunRecord>> {
-        let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ?"
-        );
+        let sql =
+            format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ?");
         let row = sqlx::query(&sql)
             .bind(user_id)
             .bind(run_id)

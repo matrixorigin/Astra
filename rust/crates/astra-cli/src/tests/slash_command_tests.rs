@@ -31,6 +31,7 @@ async fn slash_clear_creates_new_session() {
     assert!(state.history.is_empty());
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn slash_model_with_arg_sets_model() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();

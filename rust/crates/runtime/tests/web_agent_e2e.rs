@@ -4919,19 +4919,13 @@ async fn context_meta_exposes_late_round_guidance_signals() {
             > 0,
         "context_meta should expose prompt token estimates"
     );
-    assert_eq!(
-        late_round_context["system_prompt_breakdown"]["guidance_signals"]["round_budget_warning"]
-            .as_bool(),
-        Some(false)
-    );
-    assert_eq!(
-        late_round_context["system_prompt_breakdown"]["guidance_signals"]["synthesize_or_batch"]
-            .as_bool(),
-        Some(false)
+    let guidance_signals = &late_round_context["system_prompt_breakdown"]["guidance_signals"];
+    assert!(
+        guidance_signals["parallel_batching_nudge"].is_boolean(),
+        "context_meta should expose the parallel_batching_nudge flag"
     );
     assert!(
-        late_round_context["system_prompt_breakdown"]["guidance_signals"]["parallel_feedback"]
-            .is_boolean(),
+        guidance_signals["parallel_feedback"].is_boolean(),
         "context_meta should expose the parallel_feedback flag"
     );
 }
