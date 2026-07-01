@@ -1684,6 +1684,7 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-block-parse-e2e-key",
             "base_url": base_url
         }),
@@ -1817,6 +1818,7 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-block-parse-fail-e2e-key",
             "base_url": base_url
         }),
@@ -1980,6 +1982,7 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-disconnect-e2e-key",
             "base_url": base_url
         }),
@@ -2121,6 +2124,7 @@ pub async fn run_server_loop_transport_recovery_session_artifact_latest_and_down
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-transport-recovery-e2e-key",
             "base_url": base_url
         }),
@@ -2252,6 +2256,7 @@ pub async fn run_server_loop_transport_failure_session_artifact_latest_and_downl
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-transport-failure-e2e-key",
             "base_url": base_url
         }),
@@ -2410,6 +2415,7 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-idle-recovery-e2e-key",
             "base_url": base_url
         }),
@@ -2543,6 +2549,7 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-idle-failure-e2e-key",
             "base_url": base_url
         }),
@@ -2691,6 +2698,7 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-rate-limit-e2e-key",
             "base_url": base_url
         }),
@@ -2835,6 +2843,7 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-rate-limit-retry-e2e-key",
             "base_url": base_url
         }),
@@ -3138,6 +3147,7 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "transport-e2e-key",
             "base_url": base_url
         }),
@@ -3261,6 +3271,7 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "disconnect-e2e-key",
             "base_url": base_url
         }),
@@ -3418,6 +3429,7 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "idle-e2e-key",
             "base_url": base_url
         }),
@@ -3546,6 +3558,7 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "rate-limit-e2e-key",
             "base_url": base_url
         }),
@@ -3678,6 +3691,7 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "rate-limit-retry-e2e-key",
             "base_url": base_url
         }),
@@ -3798,6 +3812,7 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "tool-call-block-recovery-e2e-key",
             "base_url": base_url
         }),

@@ -929,7 +929,7 @@ impl DatabaseContextManifestStore {
         summary_hint: Option<&str>,
     ) -> Result<String, ContextManifestError> {
         let row = sqlx::query(
-            "SELECT status, content_json, metadata
+            "SELECT status, content_json, CAST(metadata AS CHAR) AS metadata
              FROM session_artifacts
              WHERE user_id = ? AND session_id = ? AND artifact_id = ?
              LIMIT 1",

@@ -39,7 +39,7 @@ pub struct EventRecord {
     pub agent_version: Option<String>,
     pub parent_event_id: Option<String>,
     pub parent_event_ids: Vec<String>,
-    pub causal_chain_id: String,
+    pub causal_chain_id: Option<String>,
     pub metadata: serde_json::Value,
     pub created_at: String,
 }
@@ -250,7 +250,7 @@ fn decode_event_record_from_row(
         agent_version: event_row_optional_string(row, "agent_version")?,
         parent_event_id: event_row_optional_string(row, "parent_event_id")?,
         parent_event_ids: Vec::new(),
-        causal_chain_id: event_row_string(row, "causal_chain_id")?,
+        causal_chain_id: event_row_optional_string(row, "causal_chain_id")?,
         metadata: parse_event_metadata_json(&metadata_json)?,
         created_at: event_row_string(row, "created_at")?,
     })
@@ -911,7 +911,7 @@ pub struct EventResponse {
     pub parent_event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parent_event_ids: Vec<String>,
-    pub causal_chain_id: String,
+    pub causal_chain_id: Option<String>,
     pub metadata: serde_json::Value,
     pub created_at: String,
 }
@@ -1101,7 +1101,6 @@ mod tests {
                 "session_id" => "session-1",
                 "event_type" => "tool_call",
                 "content" => r#"{"cmd":"pwd"}"#,
-                "causal_chain_id" => "chain-1",
                 "metadata_json" => self.metadata_json,
                 "created_at" => "2026-06-26T12:00:00",
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -1115,6 +1114,7 @@ mod tests {
                 "agent_id" => Some("agent-1".to_string()),
                 "agent_version" => Some("1.2.3".to_string()),
                 "parent_event_id" => None,
+                "causal_chain_id" => Some("chain-1".to_string()),
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
         }
@@ -1155,7 +1155,7 @@ mod tests {
         assert_eq!(record.agent_version.as_deref(), Some("1.2.3"));
         assert_eq!(record.parent_event_id, None);
         assert_eq!(record.parent_event_ids, Vec::<String>::new());
-        assert_eq!(record.causal_chain_id, "chain-1");
+        assert_eq!(record.causal_chain_id.as_deref(), Some("chain-1"));
         assert_eq!(record.metadata, serde_json::json!({"tool_name":"bash"}));
         assert_eq!(record.created_at, "2026-06-26T12:00:00");
     }
@@ -1261,7 +1261,7 @@ mod tests {
             agent_version: None,
             parent_event_id: None,
             parent_event_ids: vec!["p1".to_string(), "p2".to_string()],
-            causal_chain_id: "cc1".to_string(),
+            causal_chain_id: Some("cc1".to_string()),
             metadata: serde_json::json!({"tool_name": "bash"}),
             created_at: "2025-01-01".to_string(),
         };
@@ -1288,7 +1288,7 @@ mod tests {
                 agent_version: None,
                 parent_event_id: None,
                 parent_event_ids: Vec::new(),
-                causal_chain_id: "cc".to_string(),
+                causal_chain_id: Some("cc".to_string()),
                 metadata: serde_json::json!(null),
                 created_at: "now".to_string(),
             }],

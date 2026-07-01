@@ -807,6 +807,7 @@ pub async fn run_saas_models_list_and_key_encryption() {
         json!({
             "name": model_name,
             "provider": "mock",
+            "context_window": 200000,
             "api_key": plain_key,
             "input_modalities": ["text"],
             "output_modalities": ["text"]

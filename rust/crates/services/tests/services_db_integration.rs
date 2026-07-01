@@ -1763,43 +1763,52 @@ async fn concurrent_push_session_state_preserves_single_owner_metadata() {
         .collect();
     assert_eq!(
         successes.len(),
-        1,
-        "exactly one owner may create session restore metadata; outcomes: {outcomes:?}"
-    );
-    assert!(
-        outcomes.iter().any(|result| result.is_err()),
-        "losing owner must fail instead of updating the winner's metadata"
+        2,
+        "owner-bound sessions allow different users to persist the same logical session_id independently; outcomes: {outcomes:?}"
     );
 
-    let row = sqlx::query(
+    let rows = sqlx::query(
         "SELECT user_id, CAST(metadata AS CHAR) AS metadata_json \
-         FROM agent_sessions WHERE session_id = ? AND user_id IN (?, ?) LIMIT 1",
+         FROM agent_sessions WHERE session_id = ? AND user_id IN (?, ?) ORDER BY user_id",
     )
     .bind(&session_id)
     .bind(&user_a)
     .bind(&user_b)
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
-    .expect("load winner session state");
-    let stored_user = row.try_get::<String, _>("user_id").unwrap();
-    let metadata = row
-        .try_get::<Option<String>, _>("metadata_json")
-        .unwrap()
-        .unwrap_or_default();
-    assert_eq!(stored_user, successes[0].0);
-    assert!(
-        metadata.contains(&successes[0].1),
-        "winner branch must be retained in metadata: {metadata}"
+    .expect("load owner session states");
+    assert_eq!(
+        rows.len(),
+        2,
+        "both owners should get isolated session restore metadata rows"
     );
-    let loser_branch = if successes[0].1 == "owner-a-branch" {
-        "owner-b-branch"
-    } else {
-        "owner-a-branch"
-    };
-    assert!(
-        !metadata.contains(loser_branch),
-        "loser metadata must not overwrite the winner: {metadata}"
-    );
+    for row in rows {
+        let stored_user = row.try_get::<String, _>("user_id").unwrap();
+        let metadata = row
+            .try_get::<Option<String>, _>("metadata_json")
+            .unwrap()
+            .unwrap_or_default();
+        let expected_branch = if stored_user == user_a {
+            "owner-a-branch"
+        } else if stored_user == user_b {
+            "owner-b-branch"
+        } else {
+            panic!("unexpected owner row: {stored_user}");
+        };
+        assert!(
+            metadata.contains(expected_branch),
+            "owner branch must be retained in that owner's metadata: {metadata}"
+        );
+        let forbidden_branch = if expected_branch == "owner-a-branch" {
+            "owner-b-branch"
+        } else {
+            "owner-a-branch"
+        };
+        assert!(
+            !metadata.contains(forbidden_branch),
+            "owner metadata must not contain another owner's branch: {metadata}"
+        );
+    }
 
     cleanup_restore_fixture_for_owners(&pool, &[session_id], &[&user_a, &user_b]).await;
     flusher.shutdown.cancel();
@@ -2469,13 +2478,23 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     ] {
         sqlx::query(
             "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-             causal_chain_id, token_input, token_output, token_total, meta_tool_name, llm_model_used, created_at) \
-             VALUES (?, ?, ?, ?, '{}', '', ?, ?, ?, ?, ?, ?)",
+             causal_chain_id, token_usage, token_input, token_output, token_total, meta_tool_name, llm_model_used, created_at) \
+             VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?, ?, ?, ?, ?, ?)",
         )
         .bind(eid)
         .bind(&s1)
         .bind(&user_id)
         .bind(typ)
+        .bind(
+            serde_json::json!({
+                "input_tokens": tin,
+                "cached_input_tokens": 0,
+                "cache_creation_tokens": 0,
+                "output_tokens": tout,
+                "total_tokens": ttot,
+            })
+            .to_string(),
+        )
         .bind(tin)
         .bind(tout)
         .bind(ttot)
@@ -2489,12 +2508,22 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
 
     sqlx::query(
         "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-         causal_chain_id, token_input, token_output, token_total, meta_tool_name, llm_model_used, created_at) \
-         VALUES (?, ?, ?, 'user_query', '{}', '', 5, 5, 10, NULL, 'm1', ?)",
+         causal_chain_id, token_usage, token_input, token_output, token_total, meta_tool_name, llm_model_used, created_at) \
+         VALUES (?, ?, ?, 'user_query', '{}', '', CAST(? AS JSON), 5, 5, 10, NULL, 'm1', ?)",
     )
     .bind(&e_turn_b1)
     .bind(&s2)
     .bind(&user_id)
+    .bind(
+        serde_json::json!({
+            "input_tokens": 5,
+            "cached_input_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": 5,
+            "total_tokens": 10,
+        })
+        .to_string(),
+    )
     .bind("2026-06-15 10:10:00.000000")
     .execute(&pool)
     .await
@@ -3215,12 +3244,13 @@ async fn durable_task_resume_loads_verification_history_from_db() {
         "INSERT INTO task_contracts \
          (contract_id, task_id, session_id, user_id, goal, scope_json, subtasks_json, criteria_json, \
           version, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'it-goal', CAST('{}' AS JSON), ?, CAST('[]' AS JSON), 1, 'active', NOW(), NOW())",
+         VALUES (?, ?, ?, ?, 'it-goal', CAST(? AS JSON), ?, CAST('[]' AS JSON), 1, 'active', NOW(), NOW())",
     )
     .bind(&contract_id)
     .bind(&task_id)
     .bind(&session_id)
     .bind(&user_id)
+    .bind(serde_json::json!({"in_scope": [], "out_of_scope": [], "assumptions": []}).to_string())
     .bind(&subtasks_json)
     .execute(&pool)
     .await
@@ -3229,12 +3259,13 @@ async fn durable_task_resume_loads_verification_history_from_db() {
         "INSERT INTO task_contracts \
          (contract_id, task_id, session_id, user_id, goal, scope_json, subtasks_json, criteria_json, \
           version, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'stale-goal', CAST('{}' AS JSON), ?, CAST('[]' AS JSON), 88, 'abandoned', NOW(), NOW())",
+         VALUES (?, ?, ?, ?, 'stale-goal', CAST(? AS JSON), ?, CAST('[]' AS JSON), 88, 'abandoned', NOW(), NOW())",
     )
     .bind(&stale_contract_id)
     .bind(&task_id)
     .bind(&session_id)
     .bind(&user_id)
+    .bind(serde_json::json!({"in_scope": [], "out_of_scope": [], "assumptions": []}).to_string())
     .bind(&subtasks_json)
     .execute(&pool)
     .await
@@ -3243,12 +3274,13 @@ async fn durable_task_resume_loads_verification_history_from_db() {
         "INSERT INTO task_contracts \
          (contract_id, task_id, session_id, user_id, goal, scope_json, subtasks_json, criteria_json, \
           version, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'foreign-goal', CAST('{}' AS JSON), ?, CAST('[]' AS JSON), 99, 'active', NOW(), NOW())",
+         VALUES (?, ?, ?, ?, 'foreign-goal', CAST(? AS JSON), ?, CAST('[]' AS JSON), 99, 'active', NOW(), NOW())",
     )
     .bind(&foreign_contract_id)
     .bind(&task_id)
     .bind(&resume_session_id)
     .bind(&foreign_user_id)
+    .bind(serde_json::json!({"in_scope": [], "out_of_scope": [], "assumptions": []}).to_string())
     .bind(&subtasks_json)
     .execute(&pool)
     .await
@@ -5811,7 +5843,7 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             &owner_llm_event_id,
             1000_i32,
             100_i64,
-            serde_json::json!({"selected_events": [0.95]}),
+            serde_json::json!({"selected_events": 0.95}),
             "2026-06-01 10:01:30.000000",
         ),
         (
@@ -5821,7 +5853,7 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             &other_llm_event_id,
             9000_i32,
             900_i64,
-            serde_json::json!({"selected_events": [0.05]}),
+            serde_json::json!({"selected_events": 0.05}),
             "2026-06-01 10:03:30.000000",
         ),
     ] {

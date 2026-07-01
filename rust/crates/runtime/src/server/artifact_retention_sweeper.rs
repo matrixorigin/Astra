@@ -54,6 +54,10 @@ pub async fn run_artifact_retention_gc_once(
     limit: u32,
 ) -> Result<ArtifactRetentionSweepOutcome, sqlx::Error> {
     let effective_limit = limit.max(1);
+    // MatrixOne v4.0.0-rc4 can return zero rows for `status = 'active'` or
+    // `status IN (...)` when the predicate column leads a secondary index that
+    // also carries an owner-bound composite primary key. Keep null-safe
+    // equality until matrixorigin/matrixone#25341 is fixed.
     let rows = sqlx::query(
         "SELECT artifact_id, user_id, session_id, retention_policy,
                 referenced_by_manifest_count, referenced_by_state_items_count,
@@ -61,7 +65,7 @@ pub async fn run_artifact_retention_gc_once(
          FROM session_artifacts FORCE INDEX (idx_artifacts_retention)
          WHERE retention_until IS NOT NULL
            AND retention_until <= DATE_ADD(NOW(6), INTERVAL 7 DAY)
-           AND status IN ('active', 'expiring')
+           AND (status <=> 'active' OR status <=> 'expiring')
            AND retention_policy <> 'permanent'
          ORDER BY retention_until ASC
          LIMIT ?",
@@ -188,7 +192,7 @@ async fn apply_artifact_retention_policy(
                  retention_until = DATE_ADD(NOW(6), INTERVAL 365 DAY),
                  updated_at = NOW(6)
              WHERE user_id = ? AND session_id = ? AND artifact_id = ?
-               AND status IN ('active', 'expiring')",
+               AND (status <=> 'active' OR status <=> 'expiring')",
         )
         .bind(&artifact.user_id)
         .bind(&artifact.session_id)
@@ -219,7 +223,7 @@ async fn apply_artifact_retention_policy(
                  retention_until = DATE_ADD(NOW(6), INTERVAL 365 DAY),
                  updated_at = NOW(6)
              WHERE user_id = ? AND session_id = ? AND artifact_id = ?
-               AND status IN ('active', 'expiring')",
+               AND (status <=> 'active' OR status <=> 'expiring')",
         )
         .bind(cold_ref)
         .bind(&artifact.user_id)
@@ -239,7 +243,7 @@ async fn apply_artifact_retention_policy(
         "UPDATE session_artifacts
          SET status = 'expired', updated_at = NOW(6)
          WHERE user_id = ? AND session_id = ? AND artifact_id = ?
-           AND status IN ('active', 'expiring')
+           AND (status <=> 'active' OR status <=> 'expiring')
            AND retention_until IS NOT NULL
            AND retention_until <= NOW(6)",
     )
@@ -257,7 +261,7 @@ async fn apply_artifact_retention_policy(
         "UPDATE session_artifacts
          SET status = 'expiring', updated_at = NOW(6)
          WHERE user_id = ? AND session_id = ? AND artifact_id = ?
-           AND status IN ('active', 'expiring')
+           AND (status <=> 'active' OR status <=> 'expiring')
            AND retention_until IS NOT NULL
            AND retention_until > NOW(6)",
     )
@@ -487,7 +491,7 @@ mod tests {
                     .next()
             })
             .expect("artifact retention query body");
-        assert!(body.contains("status IN ('active', 'expiring')"));
+        assert!(body.contains("status <=> 'active' OR status <=> 'expiring'"));
         assert!(
             !body.contains("CAST(status AS CHAR)"),
             "retention sweeper must not cast status in WHERE because that blocks index filtering"

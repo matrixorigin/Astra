@@ -676,8 +676,13 @@ async fn deleted_and_cancelled_are_distinct_transitions() {
         .await;
     assert!(delete.contains("\"status\":\"deleted\""), "{delete}");
     let after_delete = mgr.get(&json!({"task_id": "task-2"})).await;
+    let after_delete_json: serde_json::Value =
+        serde_json::from_str(&after_delete).expect("task get should return valid JSON");
     assert!(
-        after_delete.contains("\"status\":\"deleted\""),
+        after_delete_json
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("deleted"),
         "deleted task should retain an audit tombstone: {after_delete}"
     );
 

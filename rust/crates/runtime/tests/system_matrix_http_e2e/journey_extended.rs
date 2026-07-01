@@ -1214,6 +1214,7 @@ pub async fn run_models_admin_crud_with_db() {
         json!({
             "name": model_name,
             "provider": "mock",
+            "context_window": 200000,
             "api_key": "e2e-key-not-used",
             "input_modalities": ["text"],
             "output_modalities": ["text"],

@@ -602,7 +602,7 @@ pub(crate) const AGENT_TASK_DETAIL_SELECT_COLUMNS: &str = "task_id, user_id, ses
      outcome, project_type, goal_pattern, agent_id, \
      CAST(created_at AS CHAR) AS created_at, \
      CAST(updated_at AS CHAR) AS updated_at, \
-     completed_at";
+     CAST(completed_at AS CHAR) AS completed_at";
 
 pub(crate) const AGENT_TASK_LIST_SELECT_COLUMNS: &str = "task_id, user_id, session_id, parent_task_id, title, \
      NULL AS description, status, progress_pct, items_done, items_total, \
@@ -611,7 +611,7 @@ pub(crate) const AGENT_TASK_LIST_SELECT_COLUMNS: &str = "task_id, user_id, sessi
      outcome, project_type, goal_pattern, agent_id, NULL AS claimability, \
      CAST(created_at AS CHAR) AS created_at, \
      CAST(updated_at AS CHAR) AS updated_at, \
-     completed_at";
+     CAST(completed_at AS CHAR) AS completed_at";
 
 fn decode_task_status_guard_row(
     row: &impl TaskStatusGuardDbRow,

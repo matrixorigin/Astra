@@ -79,6 +79,26 @@ fn audit_row_optional_string(
         .map_err(|error| audit_decode_error(context, column, error))
 }
 
+fn audit_row_datetime_string(
+    row: &impl SessionAuditRow,
+    context: &str,
+    column: &str,
+) -> AuditResult<String> {
+    row.datetime_string_column(column)
+        .or_else(|_| row.string_column(column))
+        .map_err(|error| audit_decode_error(context, column, error))
+}
+
+fn audit_row_optional_datetime_string(
+    row: &impl SessionAuditRow,
+    context: &str,
+    column: &str,
+) -> AuditResult<Option<String>> {
+    row.optional_datetime_string_column(column)
+        .or_else(|_| row.optional_string_column(column))
+        .map_err(|error| audit_decode_error(context, column, error))
+}
+
 fn audit_row_i64(row: &impl SessionAuditRow, context: &str, column: &str) -> AuditResult<i64> {
     row.i64_column(column)
         .map_err(|error| audit_decode_error(context, column, error))
@@ -748,8 +768,8 @@ fn audit_session_list_item_from_row(
     row: &impl SessionAuditRow,
 ) -> AuditResult<AuditSessionListItem> {
     let context = "audit_session_list_row";
-    let first_ts = audit_row_optional_string(row, context, "first_ts")?;
-    let last_ts = audit_row_optional_string(row, context, "last_ts")?;
+    let first_ts = audit_row_optional_datetime_string(row, context, "first_ts")?;
+    let last_ts = audit_row_optional_datetime_string(row, context, "last_ts")?;
     let duration_secs = compute_duration_secs(first_ts.as_deref(), last_ts.as_deref());
     Ok(AuditSessionListItem {
         session_id: audit_row_string(row, context, "session_id")?,
@@ -762,8 +782,8 @@ fn audit_session_list_item_from_row(
         model: audit_row_optional_string(row, context, "model")?
             .filter(|model| !model.trim().is_empty()),
         duration_secs,
-        created_at: audit_row_string(row, context, "created_at")?,
-        ended_at: audit_row_optional_string(row, context, "ended_at")?,
+        created_at: audit_row_datetime_string(row, context, "created_at")?,
+        ended_at: audit_row_optional_datetime_string(row, context, "ended_at")?,
     })
 }
 
@@ -853,7 +873,7 @@ mod agent_events_content_cap {
     pub const ERROR_LIST_ENTRY: u32 = 8192;
 }
 
-const TURN_LIST_TOTAL_SQL: &str = "SELECT COALESCE(MAX(turn_seq), 0) AS cnt FROM agent_events \
+const TURN_LIST_TOTAL_SQL: &str = "SELECT COALESCE(MAX(turn_seq), COUNT(CASE WHEN event_type = 'user_query' THEN 1 END), 0) AS cnt FROM agent_events \
      WHERE session_id = ? AND user_id = ?";
 
 // ── Response types ───────────────────────────────────────────────────────────
@@ -1775,7 +1795,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let sess_row = query(
-            "SELECT status, created_at, ended_at \
+            "SELECT status, CAST(created_at AS CHAR) AS created_at, CAST(ended_at AS CHAR) AS ended_at \
              FROM agent_sessions WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
@@ -1810,8 +1830,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
                  THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS tokens_in, \
                COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
                  THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS tokens_out, \
-               MIN(created_at) AS first_at, \
-               MAX(created_at) AS last_at, \
+               CAST(MIN(created_at) AS CHAR) AS first_at, \
+               CAST(MAX(created_at) AS CHAR) AS last_at, \
                (SELECT GROUP_CONCAT(m ORDER BY m SEPARATOR '{sep}') \
                   FROM (SELECT DISTINCT llm_model_used AS m FROM agent_events e3 \
                         WHERE e3.session_id = ? AND e3.user_id = ? \
@@ -3119,10 +3139,9 @@ mod tests {
     }
 
     #[test]
-    fn turn_list_total_query_uses_turn_seq_high_watermark_not_count() {
+    fn turn_list_total_query_uses_turn_seq_high_watermark_with_legacy_count_fallback() {
         assert!(TURN_LIST_TOTAL_SQL.contains("MAX(turn_seq)"));
-        assert!(!TURN_LIST_TOTAL_SQL.contains("COUNT"));
-        assert!(!TURN_LIST_TOTAL_SQL.contains("event_type = 'user_query'"));
+        assert!(TURN_LIST_TOTAL_SQL.contains("COUNT(CASE WHEN event_type = 'user_query'"));
     }
 
     #[test]

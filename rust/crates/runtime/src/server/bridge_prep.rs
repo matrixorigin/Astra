@@ -1242,7 +1242,10 @@ mod tests {
             serde_json::from_slice(&prepared.body).expect("prepared payload should be json");
 
         assert!(payload.get("messages").is_none());
-        assert_eq!(prepared.trusted_session_id.as_deref(), Some("bound-session"));
+        assert_eq!(
+            prepared.trusted_session_id.as_deref(),
+            Some("bound-session")
+        );
         assert_eq!(session_service.create_calls(), 0);
         assert_eq!(session_service.get_calls(), 0);
     }

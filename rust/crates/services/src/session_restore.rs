@@ -30,6 +30,7 @@ use crate::{
 const STEP_CHECKPOINT_NUMBER_OFFSET: u32 = 1_000_000_000;
 const MAX_CLOUD_RESTORE_CHECKPOINTS: u32 = 200;
 pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_index";
+const SESSION_STATE_SYNC_METADATA_MARKER: &str = "_session_state_sync";
 const CLOUD_CHECKPOINTS_SELECT_SQL: &str = "\
     SELECT number, turn, title, summary, total_tokens, contract_state_json \
     FROM ( \
@@ -46,13 +47,7 @@ const CLOUD_CHECKPOINT_COUNT_SQL: &str = "\
     WHERE user_id = ? AND session_id = ? AND state_json IS NULL";
 const PUSH_SESSION_STATE_UPSERT_SQL: &str = "INSERT INTO agent_sessions \
              (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
-             SELECT ?, ?, 'active', ?, NOW(6), NOW(6), NOW(6) \
-             FROM DUAL \
-             WHERE NOT EXISTS ( \
-                 SELECT 1 FROM agent_sessions \
-                 WHERE session_id = ? AND user_id <> ? \
-                 LIMIT 1 \
-             ) \
+             VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6)) \
              ON DUPLICATE KEY UPDATE \
              metadata = IF(user_id = VALUES(user_id), VALUES(metadata), metadata), \
              updated_at = IF(user_id = VALUES(user_id), NOW(6), updated_at), \
@@ -808,20 +803,44 @@ impl HybridRestoreService {
 
         let session_query_started_at = std::time::Instant::now();
         let row = sqlx::query(
-            "SELECT session_id, user_id, title, status, event_count, CAST(metadata AS CHAR) AS metadata_json, \
-             (SELECT COALESCE(MAX(ae.turn_seq), 0) FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id) AS turn_count, \
-             (SELECT COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
-                 THEN COALESCE(token_input, 0) ELSE 0 END), 0) \
-               FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id) AS total_tokens_in, \
-             (SELECT COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
-                THEN COALESCE(token_output, 0) ELSE 0 END), 0) \
-               FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id AND ae.user_id = agent_sessions.user_id) AS total_tokens_out, \
-             (SELECT COUNT(*) FROM session_checkpoints sc WHERE sc.user_id = agent_sessions.user_id AND sc.session_id = agent_sessions.session_id AND state_json IS NULL) AS checkpoint_count, \
-             (SELECT e.llm_model_used FROM agent_events e WHERE e.session_id = agent_sessions.session_id \
-               AND e.user_id = agent_sessions.user_id \
-               AND e.llm_model_used IS NOT NULL AND e.llm_model_used != '' ORDER BY e.created_at DESC LIMIT 1) AS latest_model, \
-             created_at, updated_at \
-              FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+            "SELECT s.session_id, s.user_id, s.title, s.status, s.event_count, CAST(s.metadata AS CHAR) AS metadata_json, \
+             COALESCE(event_summary.turn_count, 0) AS turn_count, \
+             COALESCE(event_summary.total_tokens_in, 0) AS total_tokens_in, \
+             COALESCE(event_summary.total_tokens_out, 0) AS total_tokens_out, \
+             COALESCE(checkpoint_summary.checkpoint_count, 0) AS checkpoint_count, \
+             latest_model.llm_model_used AS latest_model, \
+             s.created_at, s.updated_at \
+              FROM agent_sessions s \
+              LEFT JOIN ( \
+                SELECT user_id, session_id, \
+                       COALESCE(MAX(turn_seq), 0) AS turn_count, \
+                       COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+                         THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS total_tokens_in, \
+                       COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+                         THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS total_tokens_out \
+                FROM agent_events \
+                GROUP BY user_id, session_id \
+              ) event_summary \
+                ON event_summary.user_id = s.user_id AND event_summary.session_id = s.session_id \
+              LEFT JOIN ( \
+                SELECT user_id, session_id, COUNT(*) AS checkpoint_count \
+                FROM session_checkpoints \
+                WHERE state_json IS NULL \
+                GROUP BY user_id, session_id \
+              ) checkpoint_summary \
+                ON checkpoint_summary.user_id = s.user_id AND checkpoint_summary.session_id = s.session_id \
+              LEFT JOIN ( \
+                SELECT user_id, session_id, llm_model_used \
+                FROM ( \
+                  SELECT user_id, session_id, llm_model_used, \
+                         ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY created_at DESC, event_id DESC) AS rn \
+                  FROM agent_events \
+                  WHERE llm_model_used IS NOT NULL AND llm_model_used != '' \
+                ) ranked_models \
+                WHERE rn = 1 \
+              ) latest_model \
+                ON latest_model.user_id = s.user_id AND latest_model.session_id = s.session_id \
+              WHERE s.session_id = ? AND s.user_id = ?",
         )
         .bind(session_id)
         .bind(user_id)
@@ -1724,9 +1743,26 @@ impl SessionRestoreService for HybridRestoreService {
 
         let rows = sqlx::query(
             "SELECT s.session_id, s.title, s.status, CAST(s.metadata AS CHAR) AS metadata_json, \
-         (SELECT COALESCE(MAX(turn_seq), 0) FROM agent_events WHERE session_id = s.session_id AND user_id = s.user_id) AS turn_count, \
-         (SELECT e.llm_model_used FROM agent_events e WHERE e.session_id = s.session_id AND e.user_id = s.user_id AND e.llm_model_used IS NOT NULL AND e.llm_model_used != '' ORDER BY e.created_at DESC LIMIT 1) AS latest_model \
+         COALESCE(event_summary.turn_count, 0) AS turn_count, \
+         latest_model.llm_model_used AS latest_model \
          FROM agent_sessions s \
+         LEFT JOIN ( \
+           SELECT user_id, session_id, COALESCE(MAX(turn_seq), 0) AS turn_count \
+           FROM agent_events \
+           GROUP BY user_id, session_id \
+         ) event_summary \
+           ON event_summary.user_id = s.user_id AND event_summary.session_id = s.session_id \
+         LEFT JOIN ( \
+           SELECT user_id, session_id, llm_model_used \
+           FROM ( \
+             SELECT user_id, session_id, llm_model_used, \
+                    ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY created_at DESC, event_id DESC) AS rn \
+             FROM agent_events \
+             WHERE llm_model_used IS NOT NULL AND llm_model_used != '' \
+           ) ranked_models \
+           WHERE rn = 1 \
+         ) latest_model \
+           ON latest_model.user_id = s.user_id AND latest_model.session_id = s.session_id \
          WHERE s.user_id = ? AND s.status IN ('active', 'paused') \
          ORDER BY s.updated_at DESC LIMIT 20",
         )
@@ -1884,6 +1920,31 @@ impl SessionRestoreService for HybridRestoreService {
 // ─── MatrixOneSyncService push methods ─────────────────────────────────────
 
 impl crate::state_sync::MatrixOneSyncService {
+    async fn reject_foreign_real_session_for_session_state(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<(), String> {
+        let rows = sqlx::query(
+            "SELECT CAST(metadata AS CHAR) AS metadata_json \
+             FROM agent_sessions WHERE session_id = ? AND user_id <> ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("load foreign session metadata: {e}"))?;
+
+        for row in rows {
+            let metadata_json =
+                mysql_optional_string(&row, "push_session_state_foreign_owner", "metadata_json")?;
+            if !session_state_sync_metadata_marker_present(metadata_json.as_deref())? {
+                return Err("push_session_state: session_id belongs to another owner".to_string());
+            }
+        }
+        Ok(())
+    }
+
     /// Push a checkpoint to MatrixOne for cross-device availability.
     pub async fn push_checkpoint(
         &self,
@@ -2192,6 +2253,11 @@ impl crate::state_sync::MatrixOneSyncService {
             .transpose()?
             .flatten();
 
+        if existing_metadata_row.is_none() {
+            self.reject_foreign_real_session_for_session_state(session_id, user_id)
+                .await?;
+        }
+
         let metadata_json = merge_session_state_metadata(
             existing_metadata_json.as_deref(),
             executing_plan_json,
@@ -2207,8 +2273,6 @@ impl crate::state_sync::MatrixOneSyncService {
             .bind(session_id)
             .bind(user_id)
             .bind(&metadata_json)
-            .bind(session_id)
-            .bind(user_id)
             .execute(&self.pool)
             .await
             .and_then(|result| {
@@ -2462,6 +2526,10 @@ fn merge_session_state_metadata(
     model: Option<&str>,
 ) -> Result<String, String> {
     let mut metadata = session_metadata_object_for_merge(existing_metadata_json)?;
+    metadata.insert(
+        SESSION_STATE_SYNC_METADATA_MARKER.to_string(),
+        serde_json::Value::Bool(true),
+    );
 
     if let Some(plan) = executing_plan_json {
         metadata.insert(
@@ -2518,6 +2586,16 @@ fn merge_session_state_metadata(
     }
 
     Ok(serde_json::Value::Object(metadata).to_string())
+}
+
+fn session_state_sync_metadata_marker_present(
+    existing_metadata_json: Option<&str>,
+) -> Result<bool, String> {
+    let metadata = session_metadata_object_for_merge(existing_metadata_json)?;
+    Ok(metadata
+        .get(SESSION_STATE_SYNC_METADATA_MARKER)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false))
 }
 
 fn session_metadata_object_for_merge(
@@ -2786,8 +2864,16 @@ mod tests {
     fn push_session_state_upsert_is_atomically_owner_guarded() {
         let sql = PUSH_SESSION_STATE_UPSERT_SQL;
         assert!(
-            sql.contains("WHERE session_id = ? AND user_id <> ?"),
-            "insert path must reject an existing session_id owned by another user"
+            sql.contains("VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6))"),
+            "insert path must target the owner-bound (user_id, session_id) primary key directly"
+        );
+        assert!(
+            !sql.contains("user_id <>"),
+            "owner-bound sessions must allow different users to persist the same logical session_id independently"
+        );
+        assert!(
+            !sql.contains("WHERE NOT EXISTS"),
+            "insert path must not retain the old global-session-id guard"
         );
         assert!(
             !sql.contains(concat!("ELSE ", "NULL")),
@@ -3837,6 +3923,20 @@ mod tests {
         assert_eq!(
             parsed.get("model").and_then(|v| v.as_str()),
             Some("gpt-5.4")
+        );
+        assert_eq!(
+            parsed
+                .get(SESSION_STATE_SYNC_METADATA_MARKER)
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            session_state_sync_metadata_marker_present(Some(&merged)).unwrap(),
+            "merged session-state metadata must be recognized as sync-created"
+        );
+        assert!(
+            !session_state_sync_metadata_marker_present(Some(r#"{"owner":true}"#)).unwrap(),
+            "foreign real session metadata must not pass the sync-created marker check"
         );
     }
 

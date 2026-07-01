@@ -752,6 +752,7 @@ pub async fn bootstrap() -> BootstrapResult {
         json!({
             "name": mock_model,
             "provider": "mock",
+            "context_window": 200000,
             "api_key": "unused",
             "base_url": "http://127.0.0.1:1",
             "context_window": 200000

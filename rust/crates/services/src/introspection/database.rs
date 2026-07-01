@@ -340,6 +340,24 @@ fn parse_json_object_strict(context: &str, column: &str, raw: &str) -> ServiceRe
     Ok(value)
 }
 
+fn parse_token_budget_value(context: &str, raw: &str) -> ServiceResult<Value> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| introspection_decode_error(context, "token_budget", error))?;
+    if value.is_object() {
+        return Ok(value);
+    }
+    if let Some(total) = value.as_i64()
+        && total >= 0
+    {
+        return Ok(serde_json::json!({ "total": total }));
+    }
+    Err(introspection_decode_error(
+        context,
+        "token_budget",
+        "expected JSON object or non-negative integer",
+    ))
+}
+
 fn retrieval_quality_scores_from_row(
     row: &impl IntrospectionRow,
 ) -> ServiceResult<HashMap<String, f64>> {
@@ -374,7 +392,7 @@ fn context_snapshot_core_from_row(
             "total_tokens",
         )?,
         assembly_ms: introspection_row_optional_non_negative_i64(row, context, "assembly_time_ms")?,
-        budget: parse_json_object_strict(context, "token_budget", &budget_raw)?,
+        budget: parse_token_budget_value(context, &budget_raw)?,
         relevance_scores: parse_relevance_scores_strict(context, &relevance_raw)?,
         llm_response_id: introspection_row_optional_string(row, context, "llm_response_id")?,
     })
@@ -2513,6 +2531,10 @@ mod tests {
             context_snapshot_core_from_row(&FakeContextSnapshotRow::empty_on("context_capture_id")),
             "expected non-empty string",
         );
+
+        let row = context_snapshot_core_from_row(&FakeContextSnapshotRow::with_token_budget("42"))
+            .expect("legacy integer token budget decodes");
+        assert_eq!(row.budget["total"], 42);
 
         for raw_budget in ["{not-json", "[]"] {
             assert_introspection_internal_error_mentions(

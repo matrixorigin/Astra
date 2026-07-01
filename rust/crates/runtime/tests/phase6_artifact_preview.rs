@@ -402,7 +402,7 @@ async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
         "SELECT
           (SELECT COUNT(*) FROM session_tool_outputs FORCE INDEX (idx_tool_outputs_user_run_created) WHERE user_id = ? AND run_id = ?) AS output_count,
           (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_session_artifacts_owner_kind_order) WHERE user_id = ? AND session_id = ? AND artifact_kind = 'pg_dump') AS dump_count,
-          (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_artifacts_retention) WHERE retention_until IS NOT NULL AND retention_until <= DATE_ADD(NOW(6), INTERVAL 7 DAY) AND status IN ('active', 'expiring')) AS retention_count",
+          (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_artifacts_retention) WHERE retention_until IS NOT NULL AND retention_until <= DATE_ADD(NOW(6), INTERVAL 7 DAY) AND (status <=> 'active' OR status <=> 'expiring')) AS retention_count",
     )
     .bind(&user_id)
     .bind(&run_id)
