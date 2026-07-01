@@ -24,7 +24,7 @@ use astra_runtime::{
     turn::chat_turn_api_error::{
         CHAT_TURN_POST_MAX_RETRIES, chat_turn_http_error_with_compact_body,
     },
-    turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn_with_context_window,
+    turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn_with_input_budget,
     turn::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
         EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES,
@@ -363,6 +363,19 @@ fn tool_surface_should_inject(
     (false, "")
 }
 
+fn chat_turn_budget_pressure(
+    messages: &[Value],
+    registry: &ToolRegistry,
+    effective_input_budget_tokens: u64,
+) -> f64 {
+    let schema_tokens = registry.total_always_load_token_cost();
+    budget_pressure_for_chat_turn_with_input_budget(
+        messages,
+        schema_tokens as usize,
+        effective_input_budget_tokens,
+    )
+}
+
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let timing = ctx.timing_phases;
     let mut mark = Instant::now();
@@ -454,14 +467,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Recalling memory…");
 
-    let budget_pressure = {
-        let schema_tokens = ctx.registry.total_always_load_token_cost();
-        budget_pressure_for_chat_turn_with_context_window(
-            ctx.messages,
-            schema_tokens as usize,
-            ctx.context_window_tokens,
-        )
-    };
+    let budget_pressure = chat_turn_budget_pressure(
+        ctx.messages,
+        ctx.registry,
+        ctx.effective_input_budget_tokens,
+    );
 
     let semantic_query_str = ctx.semantic_query_override.unwrap_or(ctx.message);
     let mut boost_terms =
@@ -1496,8 +1506,9 @@ pub(crate) async fn fetch_chat_turn_sse(
 mod tests {
     use super::{
         PrepareChatTurnRequest, PrepareTurnTelemetry, build_retained_history_turns,
-        inject_bridge_turn_identity, inject_runtime_turn_overrides, msg_content,
-        prepare_chat_turn_payload, retained_history_messages, should_skip_memory_boost,
+        chat_turn_budget_pressure, inject_bridge_turn_identity, inject_runtime_turn_overrides,
+        msg_content, prepare_chat_turn_payload, retained_history_messages,
+        should_skip_memory_boost,
     };
     use astra_runtime::turn::agentic_loop::host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
@@ -1513,6 +1524,17 @@ mod tests {
             "function": {
                 "name": name,
                 "description": format!("{name} tool"),
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })
+    }
+
+    fn schema_with_description(name: &str, description: &str) -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
                 "parameters": { "type": "object", "properties": {} }
             }
         })
@@ -1553,6 +1575,41 @@ mod tests {
         assert_eq!(payload["turn_chain_id"], json!("root-chain"));
         assert_eq!(payload["user_query_event_id"], json!("root-query"));
     }
+
+    #[test]
+    fn chat_turn_budget_pressure_uses_effective_input_budget_for_large_context_models() {
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn_with_context_window,
+        };
+
+        let mut registry = ToolRegistry::new(Vec::new());
+        let large_description = "x".repeat(360_000);
+        registry.inject_schema_always_load(
+            schema_with_description("large_always_load", &large_description),
+            true,
+        );
+        let messages: Vec<Value> = Vec::new();
+        let schema_tokens = registry.total_always_load_token_cost() as usize;
+
+        let effective_budget_pressure = chat_turn_budget_pressure(&messages, &registry, 100_000);
+        let raw_context_window_pressure =
+            budget_pressure_for_chat_turn_with_context_window(&messages, schema_tokens, 800_000);
+
+        assert!(
+            effective_budget_pressure >= 0.6,
+            "100K effective input budget should see {schema_tokens} schema tokens as compact pressure, got {effective_budget_pressure}"
+        );
+        assert!(
+            raw_context_window_pressure < 0.3,
+            "raw 800K context-window pressure would hide the same schema load, got {raw_context_window_pressure}"
+        );
+        assert!(
+            effective_budget_pressure > raw_context_window_pressure,
+            "turn preparation must be governed by effective input budget, not raw context window"
+        );
+    }
+
     #[test]
     fn msg_content_extracts_string_and_array_formats() {
         // String content (OpenAI format)
