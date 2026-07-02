@@ -463,33 +463,7 @@ impl SessionService for DatabaseSessionService {
 
         let limit = validate_session_list_limit(filter.limit);
 
-        let total = if filter.cursor.is_none() {
-            let mut count_query = QueryBuilder::<MySql>::new(
-                "SELECT COUNT(session_id) AS total FROM agent_sessions WHERE user_id = ",
-            );
-            count_query.push_bind(&filter.user_id);
-            if let Some(agent_id) = &filter.agent_id {
-                count_query.push(" AND agent_id = ");
-                count_query.push_bind(agent_id);
-            }
-            if let Some(status) = &filter.status {
-                count_query.push(" AND status = ");
-                count_query.push_bind(status);
-            }
-
-            let total_row = count_query
-                .build()
-                .fetch_one(&pool)
-                .await
-                .map_err(internal_error)?;
-            Some(
-                total_row
-                    .try_get::<i64, _>("total")
-                    .map_err(internal_error)?,
-            )
-        } else {
-            None
-        };
+        let total = None;
 
         let mut list_query = QueryBuilder::<MySql>::new(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
@@ -896,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn session_list_cursor_path_omits_count_contract() {
+    fn session_list_omits_count_contract() {
         let source = include_str!("session.rs");
         let database_impl = source
             .split("impl SessionService for DatabaseSessionService")
@@ -908,12 +882,12 @@ mod tests {
             .and_then(|rest| rest.split("async fn get_session").next())
             .expect("list_sessions body should be present");
         assert!(
-            body.contains("let total = if filter.cursor.is_none()"),
-            "non-cursor path may count, but cursor path must skip COUNT(*)"
+            body.contains("let total = None;"),
+            "session list should return total=None instead of running a count"
         );
         assert!(
-            body.contains("} else {\n            None\n        };"),
-            "cursor path must return total=None instead of running a count"
+            !body.contains("COUNT(session_id)") && !body.contains("COUNT(*)"),
+            "session list must not run COUNT(*) on the hot path"
         );
     }
 
