@@ -29,8 +29,7 @@
 //! Created by [`ensure_schema()`]:
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS agent_message_queue (
-//!     id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-//!     message_id    VARCHAR(36) NOT NULL,
+//!     message_id    VARCHAR(36) PRIMARY KEY,
 //!     from_run_id   VARCHAR(128) NOT NULL,
 //!     from_agent_id VARCHAR(128) NOT NULL,
 //!     to_run_id     VARCHAR(128),          -- NULL for broadcast
@@ -45,8 +44,17 @@
 //!     claimed_at_ms BIGINT,               -- when the message was claimed
 //!     attempt_count INT DEFAULT 0,        -- number of delivery attempts
 //!     created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-//!     INDEX idx_amq_direct    (to_run_id, to_agent_id, status, id),
-//!     INDEX idx_amq_broadcast (delegation_id, is_broadcast, status, id)
+//!     INDEX idx_amq_direct    (to_run_id, to_agent_id, status, created_at, message_id),
+//!     INDEX idx_amq_broadcast (delegation_id, is_broadcast, status, created_at, message_id)
+//! );
+//!
+//! CREATE TABLE IF NOT EXISTS agent_message_broadcast_delivery (
+//!     message_id    VARCHAR(36) NOT NULL,
+//!     consumer_id   VARCHAR(256) NOT NULL,
+//!     delegation_id VARCHAR(128) NOT NULL,
+//!     delivered_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+//!     PRIMARY KEY (message_id, consumer_id),
+//!     INDEX idx_ambd_consumer (consumer_id, delegation_id, delivered_at)
 //! );
 //! ```
 
@@ -55,7 +63,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::mysql::MySqlRow;
 use sqlx::{MySql, Pool, Row, query};
 use tokio::sync::{RwLock, mpsc, watch};
 
@@ -91,12 +98,13 @@ pub struct TransportMetrics {
 
 // ─── Schema ─────────────────────────────────────────────────────────────────
 
-/// Create the `agent_message_queue` table if it doesn't exist.
+/// Create the message transport tables if they don't exist.
 pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
+    recreate_legacy_agent_message_queue_if_needed(pool).await?;
+
     query(
         "CREATE TABLE IF NOT EXISTS agent_message_queue (
-            id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-            message_id    VARCHAR(36) NOT NULL,
+            message_id    VARCHAR(36) PRIMARY KEY,
             from_run_id   VARCHAR(128) NOT NULL,
             from_agent_id VARCHAR(128) NOT NULL,
             to_run_id     VARCHAR(128),
@@ -111,12 +119,55 @@ pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
             claimed_at_ms BIGINT,
             attempt_count INT NOT NULL DEFAULT 0,
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_amq_direct    (to_run_id, to_agent_id, status, id),
-            INDEX idx_amq_broadcast (delegation_id, is_broadcast, status, id)
+            INDEX idx_amq_direct    (to_run_id, to_agent_id, status, created_at, message_id),
+            INDEX idx_amq_broadcast (delegation_id, is_broadcast, status, created_at, message_id)
         )",
     )
     .execute(pool)
     .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_message_broadcast_delivery (
+            message_id    VARCHAR(36) NOT NULL,
+            consumer_id   VARCHAR(256) NOT NULL,
+            delegation_id VARCHAR(128) NOT NULL,
+            delivered_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (message_id, consumer_id),
+            INDEX idx_ambd_consumer (consumer_id, delegation_id, delivered_at)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn recreate_legacy_agent_message_queue_if_needed(
+    pool: &Pool<MySql>,
+) -> Result<(), sqlx::Error> {
+    let row = query(
+        "SELECT COUNT(*) AS cnt
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'agent_message_queue'
+           AND COLUMN_NAME = 'id'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let legacy_id_columns: i64 = row.try_get("cnt")?;
+    if legacy_id_columns == 0 {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        target: "astra_runtime::messaging::db_transport",
+        "recreating legacy agent_message_queue schema with global AUTO_INCREMENT id; drain pending messages before rollout if queue preservation matters"
+    );
+    query("DROP TABLE IF EXISTS agent_message_broadcast_delivery")
+        .execute(pool)
+        .await?;
+    query("DROP TABLE IF EXISTS agent_message_queue")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -220,6 +271,7 @@ impl DatabaseTransport {
         .bind(now_ms)
         .execute(&self.pool)
         .await?;
+        cleanup_broadcast_delivery_orphans(&self.pool).await?;
         Ok(result.rows_affected())
     }
 
@@ -234,6 +286,7 @@ impl DatabaseTransport {
         .bind(cutoff_ms)
         .execute(&self.pool)
         .await?;
+        cleanup_broadcast_delivery_orphans(&self.pool).await?;
         Ok(result.rows_affected())
     }
 
@@ -558,7 +611,6 @@ async fn poll_loop(
     metrics: Arc<TransportMetrics>,
     consumer_id: String,
 ) {
-    let mut last_broadcast_id: i64 = 0;
     let mut consecutive_errors: u32 = 0;
     let mut current_backoff = INITIAL_BACKOFF;
 
@@ -580,7 +632,7 @@ async fn poll_loop(
             "UPDATE agent_message_queue
              SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = attempt_count + 1
              WHERE to_run_id = ? AND to_agent_id = ? AND status = 'pending'
-             ORDER BY id ASC LIMIT ?",
+             ORDER BY created_at ASC, message_id ASC LIMIT ?",
         )
         .bind(&consumer_id)
         .bind(now_ms)
@@ -594,10 +646,10 @@ async fn poll_loop(
             Ok(result) if result.rows_affected() > 0 => {
                 // Fetch the messages we just claimed.
                 let fetch_result = query(
-                    "SELECT id, CAST(id AS CHAR) AS row_id_text, message_id, payload_json FROM agent_message_queue
+                    "SELECT message_id, payload_json FROM agent_message_queue
                      WHERE to_run_id = ? AND to_agent_id = ? AND status = 'claimed' AND claimed_by = ?
                        AND claimed_at_ms = ?
-                     ORDER BY id ASC LIMIT ?",
+                     ORDER BY created_at ASC, message_id ASC LIMIT ?",
                 )
                 .bind(&addr.run_id)
                 .bind(&addr.agent_id)
@@ -610,30 +662,12 @@ async fn poll_loop(
                 if let Ok(rows) = fetch_result {
                     for row in rows {
                         let message_id: Option<String> = row.try_get("message_id").ok();
-                        let row_id = match extract_queue_row_id(&row) {
-                            Ok(id) => Some(id),
-                            Err(e) => {
-                                had_error = true;
-                                metrics
-                                    .poll_errors
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                    "  ⚠ messaging: failed to extract direct row id for {}@{} (message_id: {}): {:?}",
-                                    addr.agent_id,
-                                    addr.run_id,
-                                    message_id.as_deref().unwrap_or("<unavailable>"),
-                                    e
-                                );
-                                None
-                            }
-                        };
-                        if row_id.is_none() {
+                        if message_id.is_none() {
                             metrics
                                 .messages_dropped
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             match mark_direct_failed_by_identity(
                                 &pool,
-                                None,
                                 message_id.as_deref(),
                                 &consumer_id,
                             )
@@ -646,8 +680,7 @@ async fn poll_loop(
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                        "  ⚠ messaging: failed to dead-letter direct row without id (message_id: {}) for {}@{}: {:?}",
-                                        message_id.as_deref().unwrap_or("<unavailable>"),
+                                        "  ⚠ messaging: failed to dead-letter direct row without message_id for {}@{}: {:?}",
                                         addr.agent_id,
                                         addr.run_id,
                                         e
@@ -664,7 +697,6 @@ async fn poll_loop(
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 match mark_direct_failed_by_identity(
                                     &pool,
-                                    row_id,
                                     message_id.as_deref(),
                                     &consumer_id,
                                 )
@@ -677,8 +709,7 @@ async fn poll_loop(
                                             .poll_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                            "  ⚠ messaging: failed to dead-letter undecodable direct row (row_id: {:?}, message_id: {}) for {}@{}: {:?}",
-                                            row_id,
+                                            "  ⚠ messaging: failed to dead-letter undecodable direct row (message_id: {}) for {}@{}: {:?}",
                                             message_id.as_deref().unwrap_or("<unavailable>"),
                                             addr.agent_id,
                                             addr.run_id,
@@ -713,16 +744,17 @@ async fn poll_loop(
                                     }
                                     return;
                                 }
-                                let row_id = row_id.expect("checked above");
-                                if let Err(e) = mark_direct_acked(&pool, row_id, &consumer_id).await
+                                let message_id = message_id.as_deref().expect("checked above");
+                                if let Err(e) =
+                                    mark_direct_acked(&pool, message_id, &consumer_id).await
                                 {
                                     had_error = true;
                                     metrics
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                        "  ⚠ messaging: failed to ack delivered direct row {} for {}@{}: {:?}",
-                                        row_id, addr.agent_id, addr.run_id, e
+                                        "  ⚠ messaging: failed to ack delivered direct message {} for {}@{}: {:?}",
+                                        message_id, addr.agent_id, addr.run_id, e
                                     );
                                 }
                             }
@@ -732,7 +764,6 @@ async fn poll_loop(
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 match mark_direct_failed_by_identity(
                                     &pool,
-                                    row_id,
                                     message_id.as_deref(),
                                     &consumer_id,
                                 )
@@ -745,8 +776,7 @@ async fn poll_loop(
                                             .poll_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                            "  ⚠ messaging: failed to dead-letter direct row (row_id: {:?}, message_id: {}) for {}@{}: {:?}",
-                                            row_id,
+                                            "  ⚠ messaging: failed to dead-letter direct row (message_id: {}) for {}@{}: {:?}",
                                             message_id.as_deref().unwrap_or("<unavailable>"),
                                             addr.agent_id,
                                             addr.run_id,
@@ -786,15 +816,21 @@ async fn poll_loop(
         }
 
         // 2. Poll broadcast messages (if in a delegation group).
-        //    Broadcasts use cursor-based reading (all agents see every broadcast).
+        //    Broadcast delivery is tracked per consumer so correctness does not
+        //    depend on a global append id or wall-clock-monotonic cursor.
         if let Some(ref did) = delegation_id {
             let broadcast_result = query(
-                "SELECT id, CAST(id AS CHAR) AS row_id_text, message_id, payload_json FROM agent_message_queue
-                 WHERE delegation_id = ? AND is_broadcast = TRUE AND id > ? AND status IN ('pending', 'claimed')
-                 ORDER BY id ASC LIMIT ?",
+                "SELECT q.message_id, q.payload_json
+                 FROM agent_message_queue q
+                 LEFT JOIN agent_message_broadcast_delivery d
+                   ON d.message_id = q.message_id AND d.consumer_id = ?
+                 WHERE q.delegation_id = ? AND q.is_broadcast = TRUE
+                   AND q.status IN ('pending', 'claimed')
+                   AND d.message_id IS NULL
+                 ORDER BY q.created_at ASC, q.message_id ASC LIMIT ?",
             )
+            .bind(&consumer_id)
             .bind(did)
-            .bind(last_broadcast_id)
             .bind(POLL_BATCH_SIZE)
             .fetch_all(&pool)
             .await;
@@ -802,71 +838,35 @@ async fn poll_loop(
             if let Ok(rows) = broadcast_result {
                 for row in rows {
                     let message_id: Option<String> = row.try_get("message_id").ok();
-                    let row_id = match extract_queue_row_id(&row) {
-                        Ok(id) => Some(id),
-                        Err(e) => {
-                            had_error = true;
-                            metrics
-                                .poll_errors
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                "  ⚠ messaging: failed to extract broadcast row id for delegation {} (message_id: {}): {:?}",
-                                did,
-                                message_id.as_deref().unwrap_or("<unavailable>"),
-                                e
-                            );
-                            None
-                        }
-                    };
-                    if row_id.is_none() {
+                    if message_id.is_none() {
+                        had_error = true;
                         metrics
-                            .messages_dropped
+                            .poll_errors
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        match mark_broadcast_failed_by_identity(
-                            &pool,
-                            None,
-                            message_id.as_deref(),
-                            did,
-                        )
-                        .await
-                        {
-                            Ok(()) => continue,
-                            Err(e) => {
-                                had_error = true;
-                                metrics
-                                    .poll_errors
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                    "  ⚠ messaging: failed to dead-letter broadcast row without id (message_id: {}) for delegation {}: {:?}",
-                                    message_id.as_deref().unwrap_or("<unavailable>"),
-                                    did,
-                                    e
-                                );
-                                break;
-                            }
-                        }
+                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                            "  ⚠ messaging: broadcast row missing message_id for delegation {}",
+                            did
+                        );
+                        continue;
                     }
-                    let row_id = row_id.expect("checked above");
+                    let message_id = message_id.expect("checked above");
                     let json: String = match row.try_get("payload_json") {
                         Ok(j) => j,
                         Err(_) => {
                             metrics
                                 .messages_dropped
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            match mark_broadcast_failed(&pool, row_id).await {
-                                Ok(()) => {
-                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
-                                }
+                            match mark_broadcast_failed_by_identity(&pool, &message_id, did).await {
+                                Ok(()) => {}
                                 Err(e) => {
                                     had_error = true;
                                     metrics
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                        "  ⚠ messaging: failed to dead-letter undecodable broadcast row {} for delegation {}: {:?}",
-                                        row_id, did, e
+                                        "  ⚠ messaging: failed to dead-letter undecodable broadcast message {} for delegation {}: {:?}",
+                                        message_id, did, e
                                     );
-                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
                                 }
                             }
                             continue;
@@ -875,32 +875,54 @@ async fn poll_loop(
 
                     match serde_json::from_str::<AgentMessage>(&json) {
                         Ok(msg) if !msg.is_expired() => {
-                            metrics
-                                .messages_received
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if tx.send(Arc::new(msg)).is_err() {
-                                return;
-                            }
-                            advance_broadcast_cursor(&mut last_broadcast_id, row_id);
-                        }
-                        Ok(_) | Err(_) => {
-                            metrics
-                                .messages_dropped
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            match mark_broadcast_failed(&pool, row_id).await {
-                                Ok(()) => {
-                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
-                                }
+                            match reserve_broadcast_delivery(&pool, &message_id, &consumer_id, did)
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => continue,
                                 Err(e) => {
                                     had_error = true;
                                     metrics
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                        "  ⚠ messaging: failed to dead-letter broadcast row {} for delegation {}: {:?}",
-                                        row_id, did, e
+                                        "  ⚠ messaging: failed to reserve broadcast delivery {} for {} in delegation {}: {:?}",
+                                        message_id, consumer_id, did, e
                                     );
-                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
+                                    continue;
+                                }
+                            }
+                            metrics
+                                .messages_received
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if tx.send(Arc::new(msg)).is_err() {
+                                if let Err(e) =
+                                    release_broadcast_delivery(&pool, &message_id, &consumer_id)
+                                        .await
+                                {
+                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                        "  ⚠ messaging: failed to release reserved broadcast delivery {} for {} after closed channel: {:?}",
+                                        message_id, consumer_id, e
+                                    );
+                                }
+                                return;
+                            }
+                        }
+                        Ok(_) | Err(_) => {
+                            metrics
+                                .messages_dropped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match mark_broadcast_failed_by_identity(&pool, &message_id, did).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    had_error = true;
+                                    metrics
+                                        .poll_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                        "  ⚠ messaging: failed to dead-letter broadcast message {} for delegation {}: {:?}",
+                                        message_id, did, e
+                                    );
                                 }
                             }
                         }
@@ -947,19 +969,42 @@ async fn poll_loop(
     }
 }
 
-async fn mark_broadcast_failed(pool: &Pool<MySql>, row_id: i64) -> Result<(), sqlx::Error> {
-    query(
-        "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
-         WHERE id = ? AND is_broadcast = TRUE AND status IN ('pending', 'claimed')",
+async fn reserve_broadcast_delivery(
+    pool: &Pool<MySql>,
+    message_id: &str,
+    consumer_id: &str,
+    delegation_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = query(
+        "INSERT IGNORE INTO agent_message_broadcast_delivery
+         (message_id, consumer_id, delegation_id)
+         VALUES (?, ?, ?)",
     )
-    .bind(row_id)
+    .bind(message_id)
+    .bind(consumer_id)
+    .bind(delegation_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+async fn release_broadcast_delivery(
+    pool: &Pool<MySql>,
+    message_id: &str,
+    consumer_id: &str,
+) -> Result<(), sqlx::Error> {
+    query(
+        "DELETE FROM agent_message_broadcast_delivery
+         WHERE message_id = ? AND consumer_id = ?",
+    )
+    .bind(message_id)
+    .bind(consumer_id)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-async fn mark_broadcast_failed_by_message_id(
+async fn mark_broadcast_failed_by_identity(
     pool: &Pool<MySql>,
     message_id: &str,
     delegation_id: &str,
@@ -976,46 +1021,17 @@ async fn mark_broadcast_failed_by_message_id(
     Ok(())
 }
 
-async fn mark_broadcast_failed_by_identity(
-    pool: &Pool<MySql>,
-    row_id: Option<i64>,
-    message_id: Option<&str>,
-    delegation_id: &str,
-) -> Result<(), sqlx::Error> {
-    match (row_id, message_id) {
-        (Some(row_id), _) => mark_broadcast_failed(pool, row_id).await,
-        (None, Some(message_id)) => {
-            mark_broadcast_failed_by_message_id(pool, message_id, delegation_id).await
-        }
-        (None, None) => Err(sqlx::Error::Protocol(
-            "missing row_id and message_id for broadcast failure path".into(),
-        )),
-    }
-}
-
-async fn mark_direct_failed(pool: &Pool<MySql>, row_id: i64) -> Result<(), sqlx::Error> {
-    query(
-        "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
-         WHERE id = ? AND is_broadcast = FALSE AND status IN ('pending', 'claimed')",
-    )
-    .bind(row_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 async fn mark_direct_acked(
     pool: &Pool<MySql>,
-    row_id: i64,
+    message_id: &str,
     consumer_id: &str,
 ) -> Result<(), sqlx::Error> {
     query(
         "UPDATE agent_message_queue
          SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL
-         WHERE id = ? AND is_broadcast = FALSE AND status = 'claimed' AND claimed_by = ?",
+         WHERE message_id = ? AND is_broadcast = FALSE AND status = 'claimed' AND claimed_by = ?",
     )
-    .bind(row_id)
+    .bind(message_id)
     .bind(consumer_id)
     .execute(pool)
     .await?;
@@ -1041,19 +1057,27 @@ async fn mark_direct_failed_by_message_id(
 
 pub async fn mark_direct_failed_by_identity(
     pool: &Pool<MySql>,
-    row_id: Option<i64>,
     message_id: Option<&str>,
     consumer_id: &str,
 ) -> Result<(), sqlx::Error> {
-    match (row_id, message_id) {
-        (Some(row_id), _) => mark_direct_failed(pool, row_id).await,
-        (None, Some(message_id)) => {
-            mark_direct_failed_by_message_id(pool, message_id, consumer_id).await
-        }
-        (None, None) => Err(sqlx::Error::Protocol(
-            "missing row_id and message_id for direct failure path".into(),
+    match message_id {
+        Some(message_id) => mark_direct_failed_by_message_id(pool, message_id, consumer_id).await,
+        None => Err(sqlx::Error::Protocol(
+            "missing message_id for direct failure path".into(),
         )),
     }
+}
+
+async fn cleanup_broadcast_delivery_orphans(pool: &Pool<MySql>) -> Result<u64, sqlx::Error> {
+    let result = query(
+        "DELETE FROM agent_message_broadcast_delivery
+         WHERE message_id NOT IN (
+             SELECT message_id FROM agent_message_queue
+         )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 // ─── DatabaseMessageStream ──────────────────────────────────────────────────
@@ -1195,6 +1219,21 @@ impl CleanupScheduler {
                         tracing::warn!(target: "astra_runtime::messaging::db_transport", "  ⚠ messaging: age cleanup error: {e}");
                     }
                 }
+
+                // 3. Cleanup broadcast delivery rows whose queue message was pruned.
+                match cleanup_broadcast_delivery_orphans(&pool).await {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::info!(
+                                target: "astra_runtime::messaging::db_transport",
+                                "cleaned up {n} orphaned broadcast delivery rows"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "astra_runtime::messaging::db_transport", "  ⚠ messaging: broadcast delivery cleanup error: {e}");
+                    }
+                }
             }
         });
 
@@ -1246,29 +1285,6 @@ async fn reclaim_stale_in_pool(
         .map_err(|e| MailboxError::Transport(format!("reclaim commit: {e}")))?;
 
     Ok(reclaimed.rows_affected())
-}
-
-fn extract_queue_row_id(row: &MySqlRow) -> Result<i64, sqlx::Error> {
-    match row.try_get("id") {
-        Ok(id) => Ok(id),
-        Err(primary_err) => match row
-            .try_get::<Option<String>, _>("row_id_text")
-            .ok()
-            .flatten()
-            .and_then(|value| parse_row_id_text_fallback(&value))
-        {
-            Some(id) => Ok(id),
-            None => Err(primary_err),
-        },
-    }
-}
-
-fn parse_row_id_text_fallback(value: &str) -> Option<i64> {
-    value.parse::<i64>().ok()
-}
-
-fn advance_broadcast_cursor(last_broadcast_id: &mut i64, row_id: i64) {
-    *last_broadcast_id = (*last_broadcast_id).max(row_id);
 }
 
 async fn release_claimed_for_consumer_in_pool(
@@ -1334,22 +1350,6 @@ mod tests {
             // Task should be aborted — no lingering futures.
             tokio::time::sleep(Duration::from_millis(10)).await;
         });
-    }
-
-    #[test]
-    fn parse_row_id_text_fallback_numeric_and_reject() {
-        assert_eq!(super::parse_row_id_text_fallback("42"), Some(42));
-        assert_eq!(super::parse_row_id_text_fallback("not-a-row-id"), None);
-        assert_eq!(super::parse_row_id_text_fallback(""), None);
-    }
-
-    #[test]
-    fn broadcast_cursor_advances_monotonically() {
-        let mut cursor = 5;
-        super::advance_broadcast_cursor(&mut cursor, 3);
-        assert_eq!(cursor, 5);
-        super::advance_broadcast_cursor(&mut cursor, 9);
-        assert_eq!(cursor, 9);
     }
 
     #[test]

@@ -175,12 +175,6 @@ DEFAULT_AUTO_INCREMENT_METADATA = AutoIncrementMetadata(
 
 
 AUTO_INCREMENT_METADATA: dict[str, AutoIncrementMetadata] = {
-    "agent_message_queue": AutoIncrementMetadata(
-        write_profile="hot queue append; claim queries order pending rows by id",
-        owner_boundary="run/agent/delegation scoped, not user-owner-bound",
-        hotspot_risk="high",
-        guidance="prioritize replacement before high fan-out: use message_id/ULID or scoped sortable sequence instead of global AUTO_INCREMENT claim order",
-    ),
     "edge_pending_dispatch": AutoIncrementMetadata(
         write_profile="hot edge dispatch coordination when edge execution is active",
         owner_boundary="owner-bound by unique (user_id, request_id)",
@@ -326,10 +320,20 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "agent_message_queue": TableMetadata(
         semantic_owner="astra_messaging::db_transport",
         state_class="coordination queue fact",
-        primary_query="claim pending direct or broadcast messages by status, recipient/delegation, and id",
+        primary_query="claim pending direct messages by recipient/status/created_at/message_id; fetch undelivered broadcasts by delegation/status/created_at/message_id",
         retention_policy="TTL/cleanup governed queue; expired and terminal messages should be pruned in batches",
         rebuildability="not rebuildable for pending messages",
         merge_guidance="keep outside run/event tables; queue claim, visibility timeout, and retry semantics are distinct",
+        migration_owner="astra_messaging::db_transport",
+        product_owner="distributed agent messaging",
+    ),
+    "agent_message_broadcast_delivery": TableMetadata(
+        semantic_owner="astra_messaging::db_transport",
+        state_class="coordination delivery fact",
+        primary_query="per-consumer broadcast dedup lookup by message_id and consumer_id",
+        retention_policy="remove orphan delivery rows after parent queue messages are pruned",
+        rebuildability="rebuildable only by allowing broadcast redelivery to active consumers",
+        merge_guidance="keep separate from agent_message_queue; it replaces global queue cursor state with consumer-scoped delivery state",
         migration_owner="astra_messaging::db_transport",
         product_owner="distributed agent messaging",
     ),

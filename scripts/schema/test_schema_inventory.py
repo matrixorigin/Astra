@@ -35,6 +35,7 @@ class SchemaInventoryTest(unittest.TestCase):
     def test_inventory_includes_non_storage_schema_owners(self) -> None:
         expected = {
             "agent_message_queue": "messaging",
+            "agent_message_broadcast_delivery": "messaging",
             "resource_limits": "resource_governor",
             "resource_usage": "resource_governor",
             "llm_provider_admission_windows": "runtime_admission",
@@ -99,6 +100,7 @@ class SchemaInventoryTest(unittest.TestCase):
     def test_external_hot_coordination_tables_have_semantic_metadata(self) -> None:
         for table in [
             "agent_message_queue",
+            "agent_message_broadcast_delivery",
             "resource_limits",
             "resource_usage",
             "llm_provider_admission_windows",
@@ -117,13 +119,28 @@ class SchemaInventoryTest(unittest.TestCase):
     def test_global_inventory_has_no_foreign_key_tables(self) -> None:
         self.assertEqual([], self.summary["foreign_key_tables"])
 
-    def test_auto_increment_audit_is_not_legacy_three_table_claim(self) -> None:
+    def test_auto_increment_audit_baseline_excludes_message_queue(self) -> None:
         auto_increment = set(self.summary["auto_increment_tables"])
-        self.assertGreaterEqual(len(auto_increment), 9)
-        self.assertIn("agent_message_queue", auto_increment)
+        self.assertEqual(len(auto_increment), 8)
+        self.assertNotIn("agent_message_queue", auto_increment)
         self.assertIn("edge_pending_dispatch", auto_increment)
         self.assertIn("auth_user_roles", auto_increment)
         self.assertIn("mcp_servers", auto_increment)
+
+    def test_agent_message_queue_uses_message_identity(self) -> None:
+        row = self.tables["agent_message_queue"]
+        self.assertEqual(row["primary_key"], ["message_id"])
+        self.assertEqual(row["auto_increment_columns"], [])
+        self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
+        self.assertIn("created_at", row["primary_query"])
+        self.assertIn("message_id", row["primary_query"])
+
+    def test_broadcast_delivery_uses_consumer_scoped_identity(self) -> None:
+        row = self.tables["agent_message_broadcast_delivery"]
+        self.assertEqual(row["primary_key"], ["message_id", "consumer_id"])
+        self.assertEqual(row["auto_increment_columns"], [])
+        self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
+        self.assertIn("consumer-scoped delivery state", row["merge_guidance"])
 
     def test_every_auto_increment_table_has_risk_audit_metadata(self) -> None:
         self.assertEqual([], self.summary["unaudited_auto_increment_tables"])
@@ -142,15 +159,7 @@ class SchemaInventoryTest(unittest.TestCase):
                         f"{table}.{field} must be explicit for AUTO_INCREMENT audit",
                     )
 
-    def test_auto_increment_risk_classifies_hot_coordination_tables(self) -> None:
-        self.assertEqual(
-            self.tables["agent_message_queue"]["auto_increment_hotspot_risk"],
-            "high",
-        )
-        self.assertIn(
-            "claim queries order pending rows by id",
-            self.tables["agent_message_queue"]["auto_increment_write_profile"],
-        )
+    def test_auto_increment_risk_classifies_remaining_hot_coordination_tables(self) -> None:
         self.assertEqual(
             self.tables["edge_pending_dispatch"]["auto_increment_hotspot_risk"],
             "medium",

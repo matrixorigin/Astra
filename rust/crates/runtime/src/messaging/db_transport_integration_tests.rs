@@ -47,6 +47,10 @@ mod tests {
 
     /// Clean up test messages between tests.
     async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>) {
+        sqlx::query("DELETE FROM agent_message_broadcast_delivery WHERE consumer_id LIKE '%run-%' OR delegation_id LIKE 'del-%' OR message_id LIKE 'test-%'")
+            .execute(pool)
+            .await
+            .expect("cleanup messaging DB transport broadcast delivery fixture rows");
         sqlx::query("DELETE FROM agent_message_queue WHERE message_id LIKE 'test-%' OR from_run_id LIKE 'run-%'")
             .execute(pool)
             .await
@@ -391,14 +395,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_failure_identity_falls_back_to_message_id() {
+    async fn direct_failure_identity_uses_message_id() {
         skip_without_db!(pool);
 
         let transport =
             DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
 
-        let sender = addr("run-db-rowid-fallback-a", "alice");
-        let receiver = addr("run-db-rowid-fallback-b", "bob");
+        let sender = addr("run-db-message-id-failure-a", "alice");
+        let receiver = addr("run-db-message-id-failure-b", "bob");
 
         transport.register(sender.clone(), None).await.unwrap();
         transport.register(receiver.clone(), None).await.unwrap();
@@ -409,7 +413,7 @@ mod tests {
                 address: receiver.clone(),
             },
             MessagePayload::Text {
-                content: "fallback".into(),
+                content: "message-id-failure".into(),
                 summary: None,
             },
         ));
@@ -429,7 +433,7 @@ mod tests {
         .await
         .unwrap();
 
-        mark_direct_failed_by_identity(&pool, None, Some(&message_id), &claimed_by)
+        mark_direct_failed_by_identity(&pool, Some(&message_id), &claimed_by)
             .await
             .unwrap();
 
