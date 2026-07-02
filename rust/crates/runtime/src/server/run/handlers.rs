@@ -435,20 +435,18 @@ pub(crate) async fn list_runs_handler(
     Query(query): Query<RunListQuery>,
 ) -> Result<Json<RunListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    if query.offset != 0 {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "run list offset pagination is no longer supported; use after_updated_at and after_run_id",
+        ));
+    }
     let cursor = query.cursor()?;
-    let runs = if cursor.is_some() {
-        state
-            .execution
-            .run_lifecycle_service
-            .list_runs_cursor(user.user_id, query.limit, cursor)
-            .await?
-    } else {
-        state
-            .execution
-            .run_lifecycle_service
-            .list_runs(user.user_id, query.limit, query.offset)
-            .await?
-    };
+    let runs = state
+        .execution
+        .run_lifecycle_service
+        .list_runs_cursor(user.user_id, query.limit, cursor)
+        .await?;
     Ok(Json(RunListResponse::from(runs)))
 }
 
@@ -695,6 +693,29 @@ mod tests {
         assert_eq!(
             transformed[0],
             json!({"type": "tool_call_end", "call_id": "call-1", "result": "ok", "index": 9})
+        );
+    }
+
+    #[test]
+    fn list_runs_handler_uses_cursor_pagination_only() {
+        let source = include_str!("handlers.rs");
+        let body = source
+            .split("pub(crate) async fn list_runs_handler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub(crate) async fn pause_run_handler").next())
+            .expect("list_runs_handler body should be present");
+
+        assert!(
+            body.contains("query.offset != 0"),
+            "HTTP run list must reject legacy offset pagination"
+        );
+        assert!(
+            body.contains(".list_runs_cursor("),
+            "HTTP run list should use seek pagination for the first page and cursor pages"
+        );
+        assert!(
+            !body.contains(".list_runs("),
+            "HTTP run list must not call the legacy COUNT/OFFSET path"
         );
     }
 

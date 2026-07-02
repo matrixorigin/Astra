@@ -1221,17 +1221,10 @@ export type RunListCursor = {
   runId: string;
 };
 
-export type RunListParams =
-  | {
-      limit?: number;
-      offset?: number;
-      cursor?: null;
-    }
-  | {
-      limit?: number;
-      cursor: RunListCursor;
-      offset?: never;
-    };
+export type RunListParams = {
+  limit?: number;
+  cursor?: RunListCursor | null;
+};
 
 export type RunListResponse = {
   runs: RunStatus[];

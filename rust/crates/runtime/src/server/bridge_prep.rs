@@ -947,7 +947,7 @@ mod tests {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
-                total: Some(0),
+                total: 0,
                 limit: 1,
                 next_cursor: None,
             })
@@ -1046,7 +1046,7 @@ mod tests {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
-                total: Some(0),
+                total: 0,
                 limit: 1,
                 next_cursor: None,
             })

@@ -497,7 +497,7 @@ describe("AstraClient — Runs", () => {
           fallback_policy: "disabled",
         },
       ],
-      total: 1,
+      total: null,
       limit: 50,
       offset: 0,
       next_cursor: null,
@@ -509,7 +509,7 @@ describe("AstraClient — Runs", () => {
     expect(r.runs[0].executor?.kind).toBe("server_local");
     expect(r.runs[0].transport).toBe("server_local");
     expect(r.runs[0].fallbackPolicy).toBe("disabled");
-    expect(r.total).toBe(1);
+    expect(r.total).toBeNull();
     expect(r.nextCursor).toBeNull();
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/runs");
@@ -547,22 +547,6 @@ describe("AstraClient — Runs", () => {
     expect(url).toContain("after_updated_at=2026-06-29T08%3A30%3A00.000000");
     expect(url).toContain("after_run_id=run-1");
     expect(url).not.toContain("offset=");
-  });
-
-  test("listRuns rejects cursor mixed with offset before fetch", async () => {
-    globalThis.fetch = mockFetch(200, {});
-
-    await expect(
-      createClient().listRuns({
-        limit: 2,
-        offset: 10,
-        cursor: {
-          updatedAt: "2026-06-29T08:30:00.000000",
-          runId: "run-1",
-        },
-      } as never),
-    ).rejects.toThrow("listRuns cursor cannot be combined with offset");
-    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
   test("delegateRun posts delegation body", async () => {

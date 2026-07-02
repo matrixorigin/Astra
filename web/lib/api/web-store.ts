@@ -1852,14 +1852,14 @@ async function listAllBackendRuns(
   ownerUserId: string,
 ): Promise<RunStatus[]> {
   const runs: RunStatus[] = [];
-  let offset = 0;
+  let cursor: RunListResponse["nextCursor"] | null | undefined;
 
   for (;;) {
     let parsed: RunListResponse;
     try {
       parsed = await client.sdk.listRuns({
         limit: RUN_SYNC_PAGE_SIZE,
-        offset,
+        ...(cursor ? { cursor } : {}),
       });
     } catch (error) {
       throw runtimeOperationError(
@@ -1875,20 +1875,11 @@ async function listAllBackendRuns(
       typeof parsed.limit === "number" && parsed.limit > 0
         ? parsed.limit
         : RUN_SYNC_PAGE_SIZE;
-    const total =
-      typeof parsed.total === "number" && Number.isFinite(parsed.total)
-        ? parsed.total
-        : null;
+    cursor = parsed.nextCursor;
 
-    if (
-      page.length === 0 ||
-      page.length < responseLimit ||
-      (total !== null && offset + page.length >= total)
-    ) {
+    if (page.length === 0 || page.length < responseLimit || !cursor) {
       break;
     }
-
-    offset += page.length;
   }
 
   return runs;
@@ -1918,7 +1909,7 @@ async function listAllBackendSessions(
     const page = Array.isArray(parsed.sessions) ? parsed.sessions : [];
     sessions.push(...page);
 
-    cursor = parsed.next_cursor;
+    cursor = parsed.next_cursor ?? undefined;
     if (page.length === 0 || !cursor) {
       break;
     }

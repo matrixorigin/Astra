@@ -924,7 +924,7 @@ mod session_resolution_tests {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
-                total: Some(0),
+                total: 0,
                 limit: 20,
                 next_cursor: None,
             })
@@ -1232,7 +1232,7 @@ mod chat_stream_bridge_fallback_tests {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
-                total: Some(0),
+                total: 0,
                 limit: 20,
                 next_cursor: None,
             })
@@ -1324,7 +1324,7 @@ mod chat_stream_bridge_fallback_tests {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
-                total: Some(0),
+                total: 0,
                 limit: 20,
                 next_cursor: None,
             })

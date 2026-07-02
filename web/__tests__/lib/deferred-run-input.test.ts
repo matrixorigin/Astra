@@ -382,7 +382,7 @@ describe('queueDeferredRunInput', () => {
     });
 
     expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200 });
-    expect(listRuns).toHaveBeenCalledWith({ limit: 200, offset: 0 });
+    expect(listRuns).toHaveBeenCalledWith({ limit: 200 });
     expect(submitRunInput).toHaveBeenCalledWith('run-recovered', {
       idempotencyKey: expect.any(String),
       input: {
@@ -450,7 +450,7 @@ describe('queueDeferredRunInput', () => {
     const result = await getChatHydrated('user-a', 'chat-open');
 
     expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200 });
-    expect(listRuns).toHaveBeenCalledWith({ limit: 200, offset: 0 });
+    expect(listRuns).toHaveBeenCalledWith({ limit: 200 });
     expect(getSessionTranscript).toHaveBeenCalledWith('chat-open', {
       limit: 200,
     });

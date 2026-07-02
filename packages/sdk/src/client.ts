@@ -804,9 +804,6 @@ export class AstraClient {
 
   /** `GET /runs` — list durable runs for the current user. */
   async listRuns(opts: RunListParams = {}): Promise<RunListResponse> {
-    if (opts.cursor && "offset" in opts && opts.offset !== undefined) {
-      throw new TypeError("listRuns cursor cannot be combined with offset");
-    }
     const q = buildQueryString({
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
       ...(opts.cursor
@@ -814,9 +811,7 @@ export class AstraClient {
             after_updated_at: opts.cursor.updatedAt,
             after_run_id: opts.cursor.runId,
           }
-        : opts.offset !== undefined
-          ? { offset: opts.offset }
-          : {}),
+        : {}),
     });
     const raw = await this.fetch<RunListWire>(`${PATH_RUNS}${q}`);
     return normalizeRunList(raw);

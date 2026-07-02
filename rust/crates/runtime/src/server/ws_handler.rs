@@ -2380,7 +2380,7 @@ mod tests {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: Vec::new(),
-                total: Some(0),
+                total: 0,
                 limit: 20,
                 next_cursor: None,
             })
