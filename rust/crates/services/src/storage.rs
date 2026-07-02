@@ -5075,6 +5075,7 @@ pub async fn cleanup_expired_data(
     const SESSION_SYNC_LOG_BATCH_LIMIT: u32 = 1000;
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
     const PROMPT_REQUEST_BATCH_LIMIT: u32 = 1000;
+    const PROMPT_REQUEST_MAX_BATCHES_PER_RUN: u32 = 10;
     const PROMPT_REQUEST_DELETE_CHUNK_SIZE: usize = 250;
     const AGENT_EVENT_BATCH_LIMIT: u32 = 1000;
     const AGENT_EVENT_DELETE_CHUNK_SIZE: usize = 250;
@@ -5174,89 +5175,100 @@ pub async fn cleanup_expired_data(
 
     // 6. Old prompt observability rows. Select parent request records first so
     // child prompt_deltas and parent prompt_request_records are pruned together.
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| format!("cleanup prompt_request_records begin transaction: {e}"))?;
-    let expired_prompt_rows = sqlx::query(
-        "SELECT p.user_id, p.session_id, p.request_id
-         FROM prompt_request_records p
-         LEFT JOIN agent_sessions s
-           ON s.user_id = p.user_id AND s.session_id = p.session_id
-         LEFT JOIN agent_runs r
-           ON r.user_id = p.user_id AND r.run_id = p.run_id
-         WHERE p.created_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
-           AND (s.session_id IS NULL OR s.status IN ('ended', 'closed', 'cancelled', 'deleting'))
-           AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
-         ORDER BY p.created_at ASC, p.user_id ASC, p.request_id ASC
-         LIMIT ?",
-    )
-    .bind(policy.prompt_request_days)
-    .bind(PROMPT_REQUEST_BATCH_LIMIT)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| format!("cleanup prompt_request_records select expired ids: {e}"))?;
-    let expired_prompt_request_ids: Vec<(String, String, String)> = expired_prompt_rows
-        .iter()
-        .map(decode_expired_prompt_request_ref)
-        .collect::<Result<Vec<_>, _>>()?;
     let mut prompt_delta_deleted = 0_u64;
     let mut prompt_request_deleted = 0_u64;
-    for chunk in expired_prompt_request_ids.chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE) {
-        let mut builder = QueryBuilder::<MySql>::new(
-            "DELETE FROM prompt_deltas WHERE (user_id, session_id, request_id) IN (",
-        );
-        for (index, (user_id, session_id, request_id)) in chunk.iter().enumerate() {
-            if index > 0 {
-                builder.push(", ");
-            }
-            builder
-                .push("(")
-                .push_bind(user_id)
-                .push(", ")
-                .push_bind(session_id)
-                .push(", ")
-                .push_bind(request_id)
-                .push(")");
-        }
-        builder.push(")");
-        let deleted = builder
-            .build()
-            .execute(&mut *tx)
+    for _ in 0..PROMPT_REQUEST_MAX_BATCHES_PER_RUN {
+        let mut tx = pool
+            .begin()
             .await
-            .map(|r| r.rows_affected())
-            .map_err(|e| format!("cleanup prompt_deltas: {e}"))?;
-        prompt_delta_deleted = prompt_delta_deleted.saturating_add(deleted);
-    }
-    for chunk in expired_prompt_request_ids.chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE) {
-        let mut builder = QueryBuilder::<MySql>::new(
-            "DELETE FROM prompt_request_records WHERE (user_id, session_id, request_id) IN (",
-        );
-        for (index, (user_id, session_id, request_id)) in chunk.iter().enumerate() {
-            if index > 0 {
-                builder.push(", ");
-            }
-            builder
-                .push("(")
-                .push_bind(user_id)
-                .push(", ")
-                .push_bind(session_id)
-                .push(", ")
-                .push_bind(request_id)
-                .push(")");
-        }
-        builder.push(")");
-        let deleted = builder
-            .build()
-            .execute(&mut *tx)
-            .await
-            .map(|r| r.rows_affected())
-            .map_err(|e| format!("cleanup prompt_request_records delete expired ids: {e}"))?;
-        prompt_request_deleted = prompt_request_deleted.saturating_add(deleted);
-    }
-    tx.commit()
+            .map_err(|e| format!("cleanup prompt_request_records begin transaction: {e}"))?;
+        let expired_prompt_rows = sqlx::query(
+            "SELECT p.user_id, p.session_id, p.request_id
+             FROM prompt_request_records p
+             LEFT JOIN agent_sessions s
+               ON s.user_id = p.user_id AND s.session_id = p.session_id
+             LEFT JOIN agent_runs r
+               ON r.user_id = p.user_id AND r.run_id = p.run_id
+             WHERE p.created_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
+               AND (s.session_id IS NULL OR s.status IN ('ended', 'closed', 'cancelled', 'deleting'))
+               AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
+             ORDER BY p.created_at ASC, p.user_id ASC, p.request_id ASC
+             LIMIT ?",
+        )
+        .bind(policy.prompt_request_days)
+        .bind(PROMPT_REQUEST_BATCH_LIMIT)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(|e| format!("cleanup prompt_request_records commit transaction: {e}"))?;
+        .map_err(|e| format!("cleanup prompt_request_records select expired ids: {e}"))?;
+        let expired_prompt_request_ids: Vec<(String, String, String)> = expired_prompt_rows
+            .iter()
+            .map(decode_expired_prompt_request_ref)
+            .collect::<Result<Vec<_>, _>>()?;
+        if expired_prompt_request_ids.is_empty() {
+            tx.commit()
+                .await
+                .map_err(|e| format!("cleanup prompt_request_records commit empty batch: {e}"))?;
+            break;
+        }
+        for chunk in expired_prompt_request_ids.chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE) {
+            let mut builder = QueryBuilder::<MySql>::new(
+                "DELETE FROM prompt_deltas WHERE (user_id, session_id, request_id) IN (",
+            );
+            for (index, (user_id, session_id, request_id)) in chunk.iter().enumerate() {
+                if index > 0 {
+                    builder.push(", ");
+                }
+                builder
+                    .push("(")
+                    .push_bind(user_id)
+                    .push(", ")
+                    .push_bind(session_id)
+                    .push(", ")
+                    .push_bind(request_id)
+                    .push(")");
+            }
+            builder.push(")");
+            let deleted = builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map(|r| r.rows_affected())
+                .map_err(|e| format!("cleanup prompt_deltas: {e}"))?;
+            prompt_delta_deleted = prompt_delta_deleted.saturating_add(deleted);
+        }
+        for chunk in expired_prompt_request_ids.chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE) {
+            let mut builder = QueryBuilder::<MySql>::new(
+                "DELETE FROM prompt_request_records WHERE (user_id, session_id, request_id) IN (",
+            );
+            for (index, (user_id, session_id, request_id)) in chunk.iter().enumerate() {
+                if index > 0 {
+                    builder.push(", ");
+                }
+                builder
+                    .push("(")
+                    .push_bind(user_id)
+                    .push(", ")
+                    .push_bind(session_id)
+                    .push(", ")
+                    .push_bind(request_id)
+                    .push(")");
+            }
+            builder.push(")");
+            let deleted = builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map(|r| r.rows_affected())
+                .map_err(|e| format!("cleanup prompt_request_records delete expired ids: {e}"))?;
+            prompt_request_deleted = prompt_request_deleted.saturating_add(deleted);
+        }
+        tx.commit()
+            .await
+            .map_err(|e| format!("cleanup prompt_request_records commit transaction: {e}"))?;
+        if expired_prompt_request_ids.len() < PROMPT_REQUEST_BATCH_LIMIT as usize {
+            break;
+        }
+    }
     results.push(CleanupResult {
         table: "prompt_deltas",
         rows_deleted: prompt_delta_deleted,
@@ -6214,6 +6226,7 @@ mod tests {
             "SESSION_SYNC_LOG_BATCH_LIMIT",
             "AUTH_AUDIT_LOG_BATCH_LIMIT",
             "PROMPT_REQUEST_BATCH_LIMIT",
+            "PROMPT_REQUEST_MAX_BATCHES_PER_RUN",
             "AGENT_EVENT_BATCH_LIMIT",
         ] {
             assert!(
@@ -6252,6 +6265,13 @@ mod tests {
             body.contains("PROMPT_REQUEST_DELETE_CHUNK_SIZE")
                 && body.contains(".chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE)"),
             "prompt cleanup must chunk tuple deletes"
+        );
+        assert!(
+            body.contains("for _ in 0..PROMPT_REQUEST_MAX_BATCHES_PER_RUN")
+                && body.contains(
+                    "expired_prompt_request_ids.len() < PROMPT_REQUEST_BATCH_LIMIT as usize"
+                ),
+            "prompt cleanup must drain multiple bounded batches and stop when the selected batch is partial"
         );
         assert!(
             body.contains("FROM prompt_request_records p")

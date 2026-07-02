@@ -157,6 +157,11 @@ async fn prompt_retention_pressure_probe() {
         );
     }
     let cleanup_ms = cleanup_started.elapsed().as_millis();
+    let max_rows_per_cleanup = 10_000_i64;
+    let expected_cleanup_calls: u64 = ((delete_rows + max_rows_per_cleanup - 1)
+        / max_rows_per_cleanup)
+        .try_into()
+        .expect("expected cleanup calls fit u64");
 
     assert_eq!(
         prompt_session_count(&pool, &user_id, &ended_session).await,
@@ -175,6 +180,10 @@ async fn prompt_retention_pressure_probe() {
         reported_prompt_deltas >= delete_rows as u64,
         "cleanup result should account for at least the pressure child rows"
     );
+    assert_eq!(
+        cleanup_calls, expected_cleanup_calls,
+        "prompt cleanup should drain up to 10 bounded batches per cleanup invocation"
+    );
 
     eprintln!(
         "CLEANUP_PRESSURE_RESULT {}",
@@ -184,6 +193,7 @@ async fn prompt_retention_pressure_probe() {
             "rows_deleted": delete_rows,
             "guarded_rows": keep_rows,
             "batch_limit": 1000,
+            "max_batches_per_cleanup": 10,
             "cleanup_calls": cleanup_calls,
             "reported_prompt_requests": reported_prompt_requests,
             "reported_prompt_deltas": reported_prompt_deltas,
