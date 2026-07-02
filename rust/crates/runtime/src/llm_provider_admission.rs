@@ -20,7 +20,6 @@ const ENV_RETENTION_WINDOWS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_RETENTION_WIND
 const ENV_CLEANUP_INTERVAL_MS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_CLEANUP_INTERVAL_MS";
 const ENV_SCOPE: &str = "ASTRA_LLM_PROVIDER_ADMISSION_SCOPE";
 const ENV_FAIL_OPEN: &str = "ASTRA_LLM_PROVIDER_ADMISSION_FAIL_OPEN";
-const ENV_BURST: &str = "ASTRA_LLM_PROVIDER_ADMISSION_BURST";
 
 const DEFAULT_WINDOW_MS: u64 = 60_000;
 const DEFAULT_RETENTION_WINDOWS: u64 = 120;
@@ -174,7 +173,7 @@ impl ProviderAdmissionConfig {
                 .map(parse_scope)
                 .unwrap_or(ProviderAdmissionScope::Provider),
             fail_open: read_bool(ENV_FAIL_OPEN).unwrap_or(false),
-            burst: read_positive_u64(ENV_BURST).unwrap_or(DEFAULT_RPM_BURST),
+            burst: DEFAULT_RPM_BURST,
         }
     }
 
