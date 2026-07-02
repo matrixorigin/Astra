@@ -1479,6 +1479,9 @@ impl RunStateStore for InMemoryRunStateStore {
             if run.user_id != user_id {
                 return Ok(false);
             }
+            if durable_run_status_is_terminal(&run.status) {
+                return Ok(false);
+            }
             let (checkpoint_kind, checkpoint_version, idempotency_key) =
                 checkpoint_metadata(run_id, checkpoint_json)?;
             run.checkpoint_json = Some(checkpoint_json.to_string());
@@ -6111,6 +6114,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_checkpoint_rejects_terminal_run_without_mutation() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("terminal-checkpoint"))
+            .await
+            .unwrap();
+        store
+            .update_run_status_with_event_if_current(
+                "u1",
+                "terminal-checkpoint",
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some("boom"),
+                make_event("run_error", json!({"error": "boom"})),
+            )
+            .await
+            .unwrap();
+
+        let saved = store
+            .save_checkpoint(
+                "u1",
+                "terminal-checkpoint",
+                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"terminal"}"#,
+            )
+            .await
+            .unwrap();
+
+        assert!(!saved);
+        let loaded = store
+            .load_run("u1", "terminal-checkpoint")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_FAILED);
+        assert!(loaded.checkpoint_json.is_none());
+        assert!(loaded.checkpoint_version.is_none());
+        assert!(
+            store
+                .load_latest_checkpoint("u1", "terminal-checkpoint", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn status_with_events_transition_commits_event_batch() {
         let store = InMemoryRunStateStore::new();
         store
@@ -6242,6 +6292,16 @@ mod tests {
         record.ancestor_path = Some(run_id.clone());
         store.insert_run(record).await.expect("insert run");
 
+        let saved_checkpoint = store
+            .save_checkpoint(
+                &user_id,
+                &run_id,
+                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"db-it"}"#,
+            )
+            .await
+            .expect("save checkpoint before terminal transition");
+        assert!(saved_checkpoint);
+
         let events = vec![
             make_event("run_error", json!({"error": "boom"})),
             make_event("run_finished", json!({"status": "failed"})),
@@ -6278,14 +6338,6 @@ mod tests {
             .update_run_usage(&user_id, &run_id, 10, 4, 2)
             .await
             .expect("update usage");
-        store
-            .save_checkpoint(
-                &user_id,
-                &run_id,
-                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"db-it"}"#,
-            )
-            .await
-            .expect("save checkpoint");
 
         let loaded = store
             .load_run(&user_id, &run_id)
@@ -6339,6 +6391,15 @@ mod tests {
             .insert_run(durable_run_record("projection-repair"))
             .await
             .unwrap();
+        let saved_checkpoint = store
+            .save_checkpoint(
+                "u1",
+                "projection-repair",
+                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"repair"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(saved_checkpoint);
 
         let events = vec![
             make_event("run_error", json!({"error": "boom"})),
@@ -6358,14 +6419,6 @@ mod tests {
             .unwrap();
         store
             .update_run_usage("u1", "projection-repair", 10, 4, 2)
-            .await
-            .unwrap();
-        store
-            .save_checkpoint(
-                "u1",
-                "projection-repair",
-                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"repair"}"#,
-            )
             .await
             .unwrap();
 
