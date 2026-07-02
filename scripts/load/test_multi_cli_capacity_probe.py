@@ -54,6 +54,7 @@ class CapacityProbeTests(unittest.TestCase):
                     'astra_turn_observer_dispatches_total{mode="async",outcome="scheduled"} 3',
                     'astra_post_loop_memory_cleanup_dispatches_total{mode="async",outcome="dropped_full"} 4',
                     'astra_session_memory_post_loop_drains_total{outcome="leftover"} 5',
+                    'astra_run_control_poll_attempts_total{operation="status",outcome="ok"} 8',
                     "astra_event_ingestion_events_dropped_before_acceptance_total 6",
                     'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="critical"} 0',
                     'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="telemetry"} 7',
@@ -79,6 +80,10 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(
             metrics['astra_session_memory_post_loop_drains_total{outcome="leftover"}'],
             5.0,
+        )
+        self.assertEqual(
+            metrics['astra_run_control_poll_attempts_total{operation="status",outcome="ok"}'],
+            8.0,
         )
         self.assertEqual(
             metrics["astra_event_ingestion_events_dropped_before_acceptance_total"],
@@ -211,6 +216,7 @@ class CapacityProbeTests(unittest.TestCase):
             summary["event_ingestion"]["dropped_before_acceptance_critical_total"],
             None,
         )
+        self.assertEqual(summary["run_control"]["attempts_last_total"], None)
 
     def test_summarize_metrics_file_reports_event_ingestion_totals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -246,6 +252,67 @@ class CapacityProbeTests(unittest.TestCase):
                 "dropped_permanent_total": 1.0,
                 "errors_total": 2.0,
             },
+        )
+
+    def test_summarize_metrics_file_reports_run_control_poll_deltas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "unix_ms": 1_000,
+                                "http_status": 200,
+                                "metrics": {
+                                    'astra_run_control_poll_attempts_total{operation="status",outcome="ok"}': 10.0,
+                                    'astra_run_control_poll_attempts_total{operation="user_input_poll",outcome="ok"}': 3.0,
+                                    'astra_run_control_poll_errors_total{operation="status",class="store"}': 1.0,
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "unix_ms": 3_000,
+                                "http_status": 200,
+                                "metrics": {
+                                    'astra_run_control_poll_attempts_total{operation="status",outcome="ok"}': 16.0,
+                                    'astra_run_control_poll_attempts_total{operation="user_input_poll",outcome="ok"}': 5.0,
+                                    'astra_run_control_poll_errors_total{operation="status",class="store"}': 2.0,
+                                    'astra_run_control_poll_errors_total{operation="user_input_poll",class="missing"}': 4.0,
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = probe.summarize_metrics_file(path)
+
+        run_control = summary["run_control"]
+        self.assertEqual(run_control["attempts_last_total"], 21.0)
+        self.assertEqual(run_control["attempts_delta_total"], 8.0)
+        self.assertEqual(run_control["attempts_per_sec"], 4.0)
+        self.assertEqual(
+            run_control["attempts_by_operation_outcome"]["status:ok"],
+            {"last": 16.0, "delta": 6.0},
+        )
+        self.assertEqual(
+            run_control["attempts_by_operation_outcome"]["user_input_poll:ok"],
+            {"last": 5.0, "delta": 2.0},
+        )
+        self.assertEqual(run_control["errors_last_total"], 6.0)
+        self.assertEqual(run_control["errors_delta_total"], 5.0)
+        self.assertEqual(run_control["errors_per_sec"], 2.5)
+        self.assertEqual(
+            run_control["errors_by_operation_class"]["status:store"],
+            {"last": 2.0, "delta": 1.0},
+        )
+        self.assertEqual(
+            run_control["errors_by_operation_class"]["user_input_poll:missing"],
+            {"last": 4.0, "delta": 4.0},
         )
 
     def test_error_helpers_read_run_lifecycle_machine_code(self) -> None:

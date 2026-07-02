@@ -599,6 +599,11 @@ EVENT_INGESTION_METRIC_KEYS = {
     "errors_total": "astra_event_ingestion_errors_total",
 }
 
+RUN_CONTROL_ATTEMPTS_METRIC = "astra_run_control_poll_attempts_total"
+RUN_CONTROL_ERRORS_METRIC = "astra_run_control_poll_errors_total"
+METRIC_KEY_RE = re.compile(r"^(?P<name>[^{]+)(?:\{(?P<labels>.*)\})?$")
+METRIC_LABEL_RE = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:\\.|[^"])*)"')
+
 
 def parse_prometheus_metrics(text: str, prefixes: tuple[str, ...] = DEFAULT_METRIC_PREFIXES) -> dict[str, float]:
     metrics: dict[str, float] = {}
@@ -618,6 +623,18 @@ def parse_prometheus_metrics(text: str, prefixes: tuple[str, ...] = DEFAULT_METR
             continue
         metrics[f"{name}{labels}"] = value
     return metrics
+
+
+def split_metric_key(key: str) -> tuple[str, dict[str, str]]:
+    match = METRIC_KEY_RE.match(key)
+    if not match:
+        return key, {}
+    labels_text = match.group("labels") or ""
+    labels = {
+        item.group("key"): item.group("value").replace(r"\"", '"').replace(r"\\", "\\")
+        for item in METRIC_LABEL_RE.finditer(labels_text)
+    }
+    return match.group("name"), labels
 
 
 def render_template(value: Any, mapping: dict[str, str]) -> Any:
@@ -1068,6 +1085,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
             "last_metric_count": 0,
             "last_metric_names": [],
             "event_ingestion": summarize_event_ingestion_metrics({}),
+            "run_control": summarize_run_control_metrics({}, {}, None),
         }
     sample_count = 0
     samples_with_metrics = 0
@@ -1075,6 +1093,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
     statuses: list[str] = []
     first_unix_ms = None
     last_unix_ms = None
+    first_metrics: dict[str, float] = {}
     last_metrics: dict[str, float] = {}
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -1097,7 +1116,14 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
             metrics = sample.get("metrics")
             if isinstance(metrics, dict) and metrics:
                 samples_with_metrics += 1
+                if not first_metrics:
+                    first_metrics = metrics
                 last_metrics = metrics
+    elapsed_ms = (
+        last_unix_ms - first_unix_ms
+        if isinstance(first_unix_ms, int) and isinstance(last_unix_ms, int)
+        else None
+    )
     return {
         "sample_count": sample_count,
         "samples_with_metrics": samples_with_metrics,
@@ -1108,11 +1134,96 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
         "last_metric_count": len(last_metrics),
         "last_metric_names": sorted(last_metrics)[:50],
         "event_ingestion": summarize_event_ingestion_metrics(last_metrics),
+        "run_control": summarize_run_control_metrics(first_metrics, last_metrics, elapsed_ms),
     }
 
 
 def summarize_event_ingestion_metrics(metrics: dict[str, float]) -> dict[str, float | None]:
     return {name: metrics.get(key) for name, key in EVENT_INGESTION_METRIC_KEYS.items()}
+
+
+def counter_delta(first: float | None, last: float | None) -> float | None:
+    if last is None:
+        return None
+    if first is None:
+        return last
+    if last < first:
+        return last
+    return last - first
+
+
+def summarize_counter_family(
+    first_metrics: dict[str, float],
+    last_metrics: dict[str, float],
+    metric_name: str,
+    label_fields: tuple[str, str],
+) -> tuple[float | None, float | None, dict[str, dict[str, float | None]]]:
+    keys = sorted(
+        key
+        for key in set(first_metrics) | set(last_metrics)
+        if split_metric_key(key)[0] == metric_name
+    )
+    last_total = 0.0
+    delta_total = 0.0
+    saw_last = False
+    saw_delta = False
+    by_label: dict[str, dict[str, float | None]] = {}
+    for key in keys:
+        _, labels = split_metric_key(key)
+        label_key = ":".join(labels.get(field, "none") for field in label_fields)
+        first = first_metrics.get(key)
+        last = last_metrics.get(key)
+        delta = counter_delta(first, last)
+        if last is not None:
+            saw_last = True
+            last_total += last
+        if delta is not None:
+            saw_delta = True
+            delta_total += delta
+        by_label[label_key] = {
+            "last": last,
+            "delta": delta,
+        }
+    return (
+        last_total if saw_last else None,
+        delta_total if saw_delta else None,
+        by_label,
+    )
+
+
+def rate_per_sec(delta: float | None, elapsed_ms: int | None) -> float | None:
+    if delta is None or not elapsed_ms or elapsed_ms <= 0:
+        return None
+    return round(delta / (elapsed_ms / 1000.0), 3)
+
+
+def summarize_run_control_metrics(
+    first_metrics: dict[str, float],
+    last_metrics: dict[str, float],
+    elapsed_ms: int | None,
+) -> dict[str, Any]:
+    attempt_last, attempt_delta, attempts = summarize_counter_family(
+        first_metrics,
+        last_metrics,
+        RUN_CONTROL_ATTEMPTS_METRIC,
+        ("operation", "outcome"),
+    )
+    error_last, error_delta, errors = summarize_counter_family(
+        first_metrics,
+        last_metrics,
+        RUN_CONTROL_ERRORS_METRIC,
+        ("operation", "class"),
+    )
+    return {
+        "attempts_last_total": attempt_last,
+        "attempts_delta_total": attempt_delta,
+        "attempts_per_sec": rate_per_sec(attempt_delta, elapsed_ms),
+        "attempts_by_operation_outcome": attempts,
+        "errors_last_total": error_last,
+        "errors_delta_total": error_delta,
+        "errors_per_sec": rate_per_sec(error_delta, elapsed_ms),
+        "errors_by_operation_class": errors,
+    }
 
 
 def percentile_summary(values: list[float]) -> dict[str, float | None]:
