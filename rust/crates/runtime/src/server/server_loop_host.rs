@@ -72,23 +72,27 @@ use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 const MAX_PENDING_PROGRESS_AGENTS: usize = 128;
 const MAX_PENDING_PROGRESS_PER_AGENT: usize = 8;
 const MAX_STREAMED_TURN_EVENT_BUFFER: usize = 2_048;
+const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
 const TURN_INTENT_JUDGE_POLICY_ENV: &str = "ASTRA_TURN_INTENT_JUDGE_POLICY";
+const FACTUAL_RETRY_JUDGE_POLICY_ENV: &str = "ASTRA_FACTUAL_RETRY_JUDGE_POLICY";
+const PRE_TURN_COMPACTION_LLM_POLICY_ENV: &str = "ASTRA_PRE_TURN_COMPACTION_LLM_POLICY";
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
 const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnIntentJudgePolicy {
+enum AuxiliaryLlmPolicy {
     CapacityAware,
     Always,
     Disabled,
 }
 
-impl TurnIntentJudgePolicy {
-    fn from_env() -> Self {
-        std::env::var(TURN_INTENT_JUDGE_POLICY_ENV)
+impl AuxiliaryLlmPolicy {
+    fn from_env(policy_env: &'static str) -> Self {
+        std::env::var(policy_env)
+            .or_else(|_| std::env::var(AUX_LLM_POLICY_ENV))
             .ok()
             .as_deref()
-            .map(parse_turn_intent_judge_policy)
+            .map(parse_auxiliary_llm_policy)
             .unwrap_or(Self::CapacityAware)
     }
 
@@ -101,21 +105,21 @@ impl TurnIntentJudgePolicy {
     }
 }
 
-fn parse_turn_intent_judge_policy(raw: &str) -> TurnIntentJudgePolicy {
+fn parse_auxiliary_llm_policy(raw: &str) -> AuxiliaryLlmPolicy {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "always" | "on" | "true" | "1" => TurnIntentJudgePolicy::Always,
-        "disabled" | "disable" | "off" | "false" | "0" => TurnIntentJudgePolicy::Disabled,
-        "capacity_aware" | "capacity-aware" | "auto" | "" => TurnIntentJudgePolicy::CapacityAware,
-        _ => TurnIntentJudgePolicy::CapacityAware,
+        "always" | "on" | "true" | "1" => AuxiliaryLlmPolicy::Always,
+        "disabled" | "disable" | "off" | "false" | "0" => AuxiliaryLlmPolicy::Disabled,
+        "capacity_aware" | "capacity-aware" | "auto" | "" => AuxiliaryLlmPolicy::CapacityAware,
+        _ => AuxiliaryLlmPolicy::CapacityAware,
     }
 }
 
-fn should_skip_builtin_turn_intent_judge_for_capacity() -> Option<&'static str> {
-    let policy = TurnIntentJudgePolicy::from_env();
+fn should_skip_auxiliary_llm_for_capacity(policy_env: &'static str) -> Option<&'static str> {
+    let policy = AuxiliaryLlmPolicy::from_env(policy_env);
     match policy {
-        TurnIntentJudgePolicy::Disabled => Some("disabled"),
-        TurnIntentJudgePolicy::Always => None,
-        TurnIntentJudgePolicy::CapacityAware => {
+        AuxiliaryLlmPolicy::Disabled => Some("disabled"),
+        AuxiliaryLlmPolicy::Always => None,
+        AuxiliaryLlmPolicy::CapacityAware => {
             if crate::llm_provider_admission::ProviderAdmissionConfig::from_env().is_enabled() {
                 Some("provider_admission_enabled")
             } else {
@@ -123,6 +127,10 @@ fn should_skip_builtin_turn_intent_judge_for_capacity() -> Option<&'static str> 
             }
         }
     }
+}
+
+fn auxiliary_llm_policy_label(policy_env: &'static str) -> &'static str {
+    AuxiliaryLlmPolicy::from_env(policy_env).as_label()
 }
 
 fn llm_main_attempt_metrics_slot() -> &'static RwLock<Option<Arc<MetricsRegistry>>> {
@@ -3356,10 +3364,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .await;
         }
 
-        if let Some(reason) = should_skip_builtin_turn_intent_judge_for_capacity() {
+        if let Some(reason) = should_skip_auxiliary_llm_for_capacity(TURN_INTENT_JUDGE_POLICY_ENV) {
             tracing::debug!(
                 target: "astra::turn_intent",
-                policy = TurnIntentJudgePolicy::from_env().as_label(),
+                policy = auxiliary_llm_policy_label(TURN_INTENT_JUDGE_POLICY_ENV),
                 reason,
                 "turn intent judge skipped by capacity policy"
             );
@@ -3382,6 +3390,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         ctx: FactualRetryFallbackJudgeContext<'_>,
     ) -> Option<FactualRetryFallbackDecision> {
+        if let Some(reason) = should_skip_auxiliary_llm_for_capacity(FACTUAL_RETRY_JUDGE_POLICY_ENV)
+        {
+            tracing::debug!(
+                target: "astra::factual_retry_judge",
+                policy = auxiliary_llm_policy_label(FACTUAL_RETRY_JUDGE_POLICY_ENV),
+                reason,
+                "factual retry fallback judge skipped by capacity policy"
+            );
+            return None;
+        }
+
         let client = self.summary_client()?;
         let messages = factual_retry_fallback_judge_messages(FactualRetryFallbackJudgeInput {
             original_query: ctx.original_query,
@@ -4286,6 +4305,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         {
             return;
         }
+        if let Some(reason) =
+            should_skip_auxiliary_llm_for_capacity(PRE_TURN_COMPACTION_LLM_POLICY_ENV)
+        {
+            tracing::debug!(
+                target: "astra::pre_turn_compaction",
+                policy = auxiliary_llm_policy_label(PRE_TURN_COMPACTION_LLM_POLICY_ENV),
+                reason,
+                "pre-turn LLM compaction skipped by capacity policy"
+            );
+            return;
+        }
         let Some(params) = self.resolved_llm_params.clone() else {
             return;
         };
@@ -4992,6 +5022,37 @@ mod tests {
     use astra_turn_core::cloud_summary::SummaryLlmClient;
     use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key};
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+    use std::ffi::OsString;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn mock_matrixone() -> MatrixOneSettings {
         MatrixOneSettings::mock()
@@ -8367,9 +8428,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn factual_retry_fallback_judge_uses_llm_response_selection() {
         use axum::{Router, extract::State, routing::post};
         use tokio::net::TcpListener;
+
+        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+        let _policy = EnvVarGuard::set(FACTUAL_RETRY_JUDGE_POLICY_ENV, "always");
 
         #[derive(Default)]
         struct RequestCapture {
@@ -8448,9 +8513,90 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn factual_retry_fallback_judge_skips_gateway_when_provider_admission_is_enabled() {
+        use axum::{Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use tokio::net::TcpListener;
+
+        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+        let _policy = EnvVarGuard::remove(FACTUAL_RETRY_JUDGE_POLICY_ENV);
+        let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
+        let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_handler = request_count.clone();
+        let app = Router::new().route(
+            "/gateway/chat/completions",
+            post(move || {
+                let request_count = request_count_for_handler.clone();
+                async move {
+                    request_count.fetch_add(1, AtomicOrdering::SeqCst);
+                    axum::Json(json!({
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "{\"decision\":\"restore_fallback\",\"confidence\":0.94,\"reason\":\"candidate A answers the UI question\"}"
+                                },
+                                "finish_reason": "stop"
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-judge".to_string(),
+            "session-judge".to_string(),
+        )
+        .build();
+        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
+            model_name: "gpt-4o-mini".to_string(),
+            api_key: String::new(),
+            base_url: format!("http://{addr}/gateway"),
+            provider: "openai".to_string(),
+            max_output_tokens: 128,
+        });
+
+        let decision = host
+            .judge_factual_retry_fallback(FactualRetryFallbackJudgeContext {
+                original_query: "what do 59% and 117k mean?",
+                fallback_text: "59% is context usage; 117k is token count.",
+                retry_text: "I completed the requested work.",
+            })
+            .await;
+
+        assert_eq!(decision, None);
+        assert_eq!(
+            request_count.load(AtomicOrdering::SeqCst),
+            0,
+            "capacity-aware default must not spend provider RPM on factual retry judge"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn maybe_pre_turn_compact_uses_inline_summary_prefix() {
         use axum::{Router, extract::State, routing::post};
         use tokio::net::TcpListener;
+
+        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+        let _policy = EnvVarGuard::set(PRE_TURN_COMPACTION_LLM_POLICY_ENV, "always");
 
         #[derive(Default)]
         struct RequestCapture {
@@ -8577,6 +8723,93 @@ mod tests {
                     .is_some_and(|s| s.contains("You are a conversation summarizer"))
             }),
             "inline path must not fall back to COMPACT_SYSTEM_PROMPT"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn maybe_pre_turn_compact_skips_gateway_when_provider_admission_is_enabled() {
+        use axum::{Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use tokio::net::TcpListener;
+
+        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+        let _policy = EnvVarGuard::remove(PRE_TURN_COMPACTION_LLM_POLICY_ENV);
+        let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
+        let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_handler = request_count.clone();
+        let app = Router::new().route(
+            "/gateway/chat/completions",
+            post(move || {
+                let request_count = request_count_for_handler.clone();
+                async move {
+                    request_count.fetch_add(1, AtomicOrdering::SeqCst);
+                    axum::Json(json!({
+                        "choices": [
+                            {
+                                "message": { "content": "inline summary" },
+                                "finish_reason": "stop"
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-inline".to_string(),
+            "session-inline".to_string(),
+        )
+        .build();
+        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
+            model_name: "gpt-4o-mini".to_string(),
+            api_key: String::new(),
+            base_url: format!("http://{addr}/gateway"),
+            provider: "openai".to_string(),
+            max_output_tokens: 128,
+        });
+
+        let mut state = create_test_state();
+        state.max_turn_input_tokens = 100;
+        state.message = "Fix the regression".to_string();
+        for i in 0..6 {
+            state
+                .messages
+                .push(json!({"role": "user", "content": format!("question {i}")}));
+            state
+                .messages
+                .push(json!({"role": "assistant", "content": format!("answer {i}")}));
+        }
+
+        <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
+            &mut host,
+            &mut state,
+            0.95,
+            true,
+        )
+        .await;
+
+        assert_eq!(state.compact_tier_applied, CompactionTier::Normal);
+        assert_eq!(
+            request_count.load(AtomicOrdering::SeqCst),
+            0,
+            "capacity-aware default must not spend provider RPM on pre-turn LLM compaction"
         );
 
         server.abort();
@@ -9647,38 +9880,7 @@ mod tests {
             LlmTokenServiceConfig, TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError,
         };
         use async_trait::async_trait;
-        use std::ffi::OsString;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-        struct EnvVarGuard {
-            key: &'static str,
-            previous: Option<OsString>,
-        }
-
-        impl EnvVarGuard {
-            fn set(key: &'static str, value: &str) -> Self {
-                let previous = std::env::var_os(key);
-                unsafe { std::env::set_var(key, value) };
-                Self { key, previous }
-            }
-
-            fn remove(key: &'static str) -> Self {
-                let previous = std::env::var_os(key);
-                unsafe { std::env::remove_var(key) };
-                Self { key, previous }
-            }
-        }
-
-        impl Drop for EnvVarGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match self.previous.take() {
-                        Some(value) => std::env::set_var(self.key, value),
-                        None => std::env::remove_var(self.key),
-                    }
-                }
-            }
-        }
 
         struct ScriptedJudge {
             calls: std::sync::Mutex<Vec<TurnIntentJudgeContext>>,
@@ -9731,22 +9933,34 @@ mod tests {
         }
 
         #[test]
-        fn turn_intent_capacity_policy_parser_is_stable() {
+        fn auxiliary_llm_capacity_policy_parser_is_stable() {
             assert_eq!(
-                parse_turn_intent_judge_policy("always"),
-                TurnIntentJudgePolicy::Always
+                parse_auxiliary_llm_policy("always"),
+                AuxiliaryLlmPolicy::Always
             );
             assert_eq!(
-                parse_turn_intent_judge_policy("off"),
-                TurnIntentJudgePolicy::Disabled
+                parse_auxiliary_llm_policy("off"),
+                AuxiliaryLlmPolicy::Disabled
             );
             assert_eq!(
-                parse_turn_intent_judge_policy("capacity-aware"),
-                TurnIntentJudgePolicy::CapacityAware
+                parse_auxiliary_llm_policy("capacity-aware"),
+                AuxiliaryLlmPolicy::CapacityAware
             );
             assert_eq!(
-                parse_turn_intent_judge_policy("surprise"),
-                TurnIntentJudgePolicy::CapacityAware
+                parse_auxiliary_llm_policy("surprise"),
+                AuxiliaryLlmPolicy::CapacityAware
+            );
+        }
+
+        #[test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        fn auxiliary_llm_policy_uses_specific_override_before_global() {
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
+            let _specific_policy = EnvVarGuard::set(FACTUAL_RETRY_JUDGE_POLICY_ENV, "always");
+
+            assert_eq!(
+                AuxiliaryLlmPolicy::from_env(FACTUAL_RETRY_JUDGE_POLICY_ENV),
+                AuxiliaryLlmPolicy::Always
             );
         }
 
@@ -9814,11 +10028,12 @@ mod tests {
         }
 
         #[tokio::test]
-        #[serial_test::serial(turn_intent_capacity_policy_env)]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
         async fn judge_turn_intent_uses_gateway_llm_when_no_judge_is_injected() {
             use axum::{Router, extract::State, routing::post};
             use tokio::net::TcpListener;
 
+            let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
             let _policy = EnvVarGuard::set(TURN_INTENT_JUDGE_POLICY_ENV, "always");
 
             #[derive(Default)]
@@ -9942,11 +10157,12 @@ mod tests {
         }
 
         #[tokio::test]
-        #[serial_test::serial(turn_intent_capacity_policy_env)]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
         async fn builtin_turn_intent_judge_skips_gateway_when_provider_admission_is_enabled() {
             use axum::{Router, routing::post};
             use tokio::net::TcpListener;
 
+            let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
             let _policy = EnvVarGuard::remove(TURN_INTENT_JUDGE_POLICY_ENV);
             let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
             let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
