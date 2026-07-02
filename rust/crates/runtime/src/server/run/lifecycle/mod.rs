@@ -1977,6 +1977,21 @@ impl AgenticRunLifecycleService {
         Some(Arc::new(store))
     }
 
+    fn install_restored_csl_history_for_current_turn(
+        loop_state: &mut AgenticLoopState,
+        mut restored_messages: Vec<Value>,
+    ) -> usize {
+        let turn_start_message_count = restored_messages.len();
+        if restored_messages.is_empty() {
+            return turn_start_message_count;
+        }
+        if !loop_state.messages.is_empty() {
+            restored_messages.push(loop_state.messages.remove(0));
+        }
+        loop_state.messages = restored_messages;
+        turn_start_message_count
+    }
+
     async fn restore_csl_history(
         &self,
         user_id: &str,
@@ -1998,11 +2013,11 @@ impl AgenticRunLifecycleService {
         };
         mgr.set_trace_id(run_id.to_string());
 
-        let mut restored_messages = Vec::new();
+        let mut restored_messages = None;
 
         match mgr.load().await {
             Ok(Some(mat)) => {
-                restored_messages = mat.messages;
+                restored_messages = Some(mat.messages);
                 restore_session_state_compact(mat.session_state, loop_state);
             }
             Ok(None) => {
@@ -2048,14 +2063,14 @@ impl AgenticRunLifecycleService {
             }
         }
 
-        if !restored_messages.is_empty() {
-            if !loop_state.messages.is_empty() {
-                restored_messages.push(loop_state.messages.remove(0));
-            }
-            loop_state.messages = restored_messages;
+        if let Some(restored_messages) = restored_messages {
+            let turn_start_message_count =
+                Self::install_restored_csl_history_for_current_turn(loop_state, restored_messages);
+            mgr.mark_turn_start(turn_start_message_count);
+        } else {
+            mgr.mark_turn_start(loop_state.messages.len());
         }
 
-        mgr.mark_turn_start(loop_state.messages.len());
         Some(mgr)
     }
 
@@ -7858,6 +7873,45 @@ mod tests {
             blocks: vec![],
             blocked_by: vec![],
         }
+    }
+
+    #[test]
+    fn restored_csl_turn_start_excludes_current_user_message() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![json!({"role": "user", "content": "current question"})];
+
+        let turn_start = AgenticRunLifecycleService::install_restored_csl_history_for_current_turn(
+            &mut state,
+            vec![
+                json!({"role": "user", "content": "old question"}),
+                json!({"role": "assistant", "content": "old answer"}),
+            ],
+        );
+
+        assert_eq!(turn_start, 2);
+        assert_eq!(state.messages.len(), 3);
+        assert_eq!(state.messages[0]["content"], "old question");
+        assert_eq!(state.messages[2]["content"], "current question");
+        let appended: Vec<&str> = state.messages[turn_start..]
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect();
+        assert_eq!(appended, vec!["current question"]);
+    }
+
+    #[test]
+    fn empty_restored_csl_turn_still_treats_current_user_as_new() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![json!({"role": "user", "content": "current question"})];
+
+        let turn_start = AgenticRunLifecycleService::install_restored_csl_history_for_current_turn(
+            &mut state,
+            Vec::new(),
+        );
+
+        assert_eq!(turn_start, 0);
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0]["content"], "current question");
     }
 
     fn test_agent_progress_event(
