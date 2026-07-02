@@ -69,12 +69,15 @@ static WS_CONNECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// Heartbeat interval for keep-alive pings.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Poll cadence for background lifecycle runs streamed over WebSocket.
-/// 500ms keeps per-run DB QPS at 2 (vs 10 at 100ms) while still
-/// delivering <1s event visibility for streamed run lifecycle.
-const RUN_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Fast poll cadence for background lifecycle runs streamed over WebSocket.
+/// Active streams keep sub-second event visibility; idle streams back off below.
+const RUN_STREAM_FAST_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const RUN_STREAM_IDLE_STEP_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const RUN_STREAM_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const RUN_STREAM_IDLE_STEP_AFTER_EMPTY_POLLS: u32 = 2;
+const RUN_STREAM_IDLE_MAX_AFTER_EMPTY_POLLS: u32 = 5;
 /// Safety valve for retryable lifecycle poll failures to avoid indefinite hung streams.
-/// At 500ms poll cadence, 60 consecutive errors ≈ 30s wall time.
+/// Wall time depends on the current adaptive poll cadence.
 const MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS: u32 = 60;
 
 fn ws_connection_limit_reached_with(current: usize) -> bool {
@@ -1350,6 +1353,62 @@ fn retryable_poll_failure_limit_reached(consecutive_failures: &mut u32) -> bool 
     *consecutive_failures >= MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunStreamPollCadence {
+    empty_successful_polls: u32,
+    current_interval: Duration,
+}
+
+impl RunStreamPollCadence {
+    fn new() -> Self {
+        Self {
+            empty_successful_polls: 0,
+            current_interval: RUN_STREAM_FAST_POLL_INTERVAL,
+        }
+    }
+
+    fn interval(self) -> Duration {
+        self.current_interval
+    }
+
+    fn record_successful_poll(&mut self, saw_activity: bool) -> Option<Duration> {
+        if saw_activity {
+            self.empty_successful_polls = 0;
+        } else {
+            self.empty_successful_polls = self.empty_successful_polls.saturating_add(1);
+        }
+
+        let target = run_stream_poll_interval_for_empty_successes(self.empty_successful_polls);
+        if target == self.current_interval {
+            return None;
+        }
+        self.current_interval = target;
+        Some(target)
+    }
+}
+
+fn run_stream_poll_interval_for_empty_successes(empty_successful_polls: u32) -> Duration {
+    if empty_successful_polls >= RUN_STREAM_IDLE_MAX_AFTER_EMPTY_POLLS {
+        RUN_STREAM_IDLE_POLL_INTERVAL
+    } else if empty_successful_polls >= RUN_STREAM_IDLE_STEP_AFTER_EMPTY_POLLS {
+        RUN_STREAM_IDLE_STEP_POLL_INTERVAL
+    } else {
+        RUN_STREAM_FAST_POLL_INTERVAL
+    }
+}
+
+fn run_stream_poll_timer(interval: Duration) -> tokio::time::Interval {
+    let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    poll
+}
+
+fn run_stream_initial_poll_timer() -> tokio::time::Interval {
+    let mut poll = tokio::time::interval(RUN_STREAM_FAST_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    poll
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WsSendFailure {
     Failed(String),
@@ -1429,8 +1488,8 @@ async fn stream_run_over_websocket(
     conn: &mut WsConnection,
     run_id: &str,
 ) {
-    let mut poll = tokio::time::interval(RUN_STREAM_POLL_INTERVAL);
-    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut poll_cadence = RunStreamPollCadence::new();
+    let mut poll = run_stream_initial_poll_timer();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_index = 0u32;
@@ -1534,13 +1593,16 @@ async fn stream_run_over_websocket(
                 }
             }
             _ = poll.tick() => {
+                let mut saw_poll_activity = false;
+
                 // ── Phase E: Forward pending approval requests to client ──
-                for req in state
+                let approval_requests = state
                     .execution
                     .run_lifecycle_service
                     .drain_approval_requests(run_id)
-                    .await
-                {
+                    .await;
+                saw_poll_activity |= !approval_requests.is_empty();
+                for req in approval_requests {
                     send_msg(
                         socket,
                         &WsServerMessage::ToolApprovalRequest {
@@ -1558,12 +1620,13 @@ async fn stream_run_over_websocket(
                     .await;
                 }
 
-                for req in state
+                let user_prompt_requests = state
                     .execution
                     .run_lifecycle_service
                     .drain_user_prompt_requests(run_id)
-                    .await
-                {
+                    .await;
+                saw_poll_activity |= !user_prompt_requests.is_empty();
+                for req in user_prompt_requests {
                     let Ok(prompt) = serde_json::from_value::<AskUserPrompt>(
                         req.get("prompt").cloned().unwrap_or(Value::Null),
                     ) else {
@@ -1599,12 +1662,13 @@ async fn stream_run_over_websocket(
                 }
 
                 // ── Phase F.3: Forward pending progress events to client ──
-                for evt in state
+                let progress_events = state
                     .execution
                     .run_lifecycle_service
                     .drain_progress_events(run_id)
-                    .await
-                {
+                    .await;
+                saw_poll_activity |= !progress_events.is_empty();
+                for evt in progress_events {
                     match evt.get("kind").and_then(|v| v.as_str()) {
                         Some("started") => {
                             send_msg(
@@ -1698,6 +1762,7 @@ async fn stream_run_over_websocket(
                     Ok(events) => {
                         stream_poll_error = None;
                         consecutive_stream_retryable_errors = 0;
+                        saw_poll_activity |= !events.is_empty();
                         events
                     }
                     Err((status, err)) => {
@@ -1886,6 +1951,12 @@ async fn stream_run_over_websocket(
                     )
                     .await;
                     return;
+                }
+
+                if let Some(next_interval) =
+                    poll_cadence.record_successful_poll(saw_poll_activity)
+                {
+                    poll = run_stream_poll_timer(next_interval);
                 }
             }
         }
@@ -4263,6 +4334,46 @@ mod tests {
     #[test]
     fn heartbeat_interval_constant() {
         assert_eq!(HEARTBEAT_INTERVAL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn run_stream_poll_cadence_backs_off_after_successful_empty_polls() {
+        let mut cadence = RunStreamPollCadence::new();
+        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
+
+        assert_eq!(cadence.record_successful_poll(false), None);
+        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
+
+        assert_eq!(
+            cadence.record_successful_poll(false),
+            Some(RUN_STREAM_IDLE_STEP_POLL_INTERVAL)
+        );
+        assert_eq!(cadence.interval(), RUN_STREAM_IDLE_STEP_POLL_INTERVAL);
+
+        assert_eq!(cadence.record_successful_poll(false), None);
+        assert_eq!(cadence.record_successful_poll(false), None);
+        assert_eq!(
+            cadence.record_successful_poll(false),
+            Some(RUN_STREAM_IDLE_POLL_INTERVAL)
+        );
+        assert_eq!(cadence.interval(), RUN_STREAM_IDLE_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn run_stream_poll_cadence_resets_to_fast_after_activity() {
+        let mut cadence = RunStreamPollCadence::new();
+        for _ in 0..RUN_STREAM_IDLE_MAX_AFTER_EMPTY_POLLS {
+            let _ = cadence.record_successful_poll(false);
+        }
+        assert_eq!(cadence.interval(), RUN_STREAM_IDLE_POLL_INTERVAL);
+
+        assert_eq!(
+            cadence.record_successful_poll(true),
+            Some(RUN_STREAM_FAST_POLL_INTERVAL)
+        );
+        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
+        assert_eq!(cadence.record_successful_poll(false), None);
+        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
     }
 
     // ─── SSE parsing edge cases ─────────────────────────────────────────
