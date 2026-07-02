@@ -244,6 +244,10 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(ref pool) = state.shared_pool {
         bg_handles.push(spawn_data_cleanup(pool.clone(), bg_cancel.clone()));
+        bg_handles.push(spawn_edge_dispatch_cleanup(
+            state.execution.edge_dispatch_service.clone(),
+            bg_cancel.clone(),
+        ));
         bg_handles.push(astra_services::session_reaper::spawn_session_reaper(
             pool.clone(),
             bg_cancel.clone(),
@@ -398,22 +402,208 @@ fn spawn_data_cleanup(
     })
 }
 
+const EDGE_DISPATCH_CLEANUP_INTERVAL_SECS_ENV: &str = "ASTRA_EDGE_DISPATCH_CLEANUP_INTERVAL_SECS";
+const EDGE_DISPATCH_STALE_SECS_ENV: &str = "ASTRA_EDGE_DISPATCH_STALE_SECS";
+
+fn cleanup_duration_from_env(key: &str, default_secs: u64, min_secs: u64) -> std::time::Duration {
+    cleanup_duration_from_raw(std::env::var(key).ok().as_deref(), default_secs, min_secs)
+}
+
+fn cleanup_duration_from_raw(
+    raw: Option<&str>,
+    default_secs: u64,
+    min_secs: u64,
+) -> std::time::Duration {
+    let secs = raw
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs >= min_secs)
+        .unwrap_or(default_secs);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Spawn a background task that expires orphaned edge dispatch rows.
+///
+/// Normal tool waits call `fail_dispatch` on timeout/cancel. This sweeper covers
+/// the unhappy path where the waiting pod crashes after inserting a dispatch
+/// but before it can mark the request terminal.
+fn spawn_edge_dispatch_cleanup(
+    dispatch: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let cleanup_interval =
+        cleanup_duration_from_env(EDGE_DISPATCH_CLEANUP_INTERVAL_SECS_ENV, 15 * 60, 60);
+    let stale_after = cleanup_duration_from_env(EDGE_DISPATCH_STALE_SECS_ENV, 60 * 60, 5 * 60);
+
+    spawn_edge_dispatch_cleanup_with_config(dispatch, cancel, cleanup_interval, stale_after)
+}
+
+fn spawn_edge_dispatch_cleanup_with_config(
+    dispatch: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
+    cancel: tokio_util::sync::CancellationToken,
+    cleanup_interval: std::time::Duration,
+    stale_after: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+        interval.tick().await; // skip immediate first tick
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!(
+                        target: "astra_runtime::cleanup",
+                        "edge dispatch cleanup received cancellation; exiting"
+                    );
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
+
+            match dispatch.cleanup_stale(stale_after).await {
+                Ok(rows) if rows > 0 => {
+                    tracing::info!(
+                        target: "astra_runtime::cleanup",
+                        rows,
+                        stale_after_secs = stale_after.as_secs(),
+                        "edge dispatch cleanup expired or deleted stale rows"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_runtime::cleanup",
+                        error = %error,
+                        "edge dispatch cleanup failed"
+                    );
+                }
+            }
+        }
+    })
+}
+
 pub use astra_server_types::edge_connection_pool;
 
 #[cfg(test)]
 mod tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     };
 
     use astra_core::{ErrorResponse, error_response};
     use astra_services::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
         RunListRecord, RunStatusRecord,
+        multi_agent::{EdgeDispatchRow, EdgeDispatchService},
     };
     use async_trait::async_trait;
     use axum::{Json, http::StatusCode};
+
+    #[test]
+    fn cleanup_duration_from_raw_enforces_minimum_and_default() {
+        assert_eq!(
+            super::cleanup_duration_from_raw(Some("900"), 60, 30),
+            std::time::Duration::from_secs(900)
+        );
+        assert_eq!(
+            super::cleanup_duration_from_raw(Some("10"), 60, 30),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            super::cleanup_duration_from_raw(Some("nope"), 60, 30),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            super::cleanup_duration_from_raw(None, 60, 30),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingEdgeDispatchService {
+        cleanup_calls: AtomicUsize,
+        stale_after_secs: AtomicU64,
+    }
+
+    #[async_trait]
+    impl EdgeDispatchService for RecordingEdgeDispatchService {
+        async fn insert_dispatch(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _request_id: &str,
+            _payload_json: &str,
+        ) -> Result<i64, String> {
+            unreachable!("insert_dispatch is not used in cleanup tests")
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<EdgeDispatchRow>, String> {
+            unreachable!("poll_pending is not used in cleanup tests")
+        }
+
+        async fn deliver_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _edge_agent_id: &str,
+            _result_json: &str,
+        ) -> Result<bool, String> {
+            unreachable!("deliver_result is not used in cleanup tests")
+        }
+
+        async fn fail_dispatch(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _reason: &str,
+        ) -> Result<bool, String> {
+            unreachable!("fail_dispatch is not used in cleanup tests")
+        }
+
+        async fn wait_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<String>, String> {
+            unreachable!("wait_result is not used in cleanup tests")
+        }
+
+        async fn cleanup_stale(&self, older_than: std::time::Duration) -> Result<u64, String> {
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            self.stale_after_secs
+                .store(older_than.as_secs(), Ordering::SeqCst);
+            Ok(1)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn edge_dispatch_cleanup_sweeper_uses_configured_stale_after() {
+        let service = Arc::new(RecordingEdgeDispatchService::default());
+        let dispatch: Arc<dyn EdgeDispatchService> = service.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = super::spawn_edge_dispatch_cleanup_with_config(
+            dispatch,
+            cancel.clone(),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        );
+
+        tokio::task::yield_now().await;
+        assert_eq!(service.cleanup_calls.load(Ordering::SeqCst), 0);
+
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(service.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.stale_after_secs.load(Ordering::SeqCst), 30);
+
+        cancel.cancel();
+        handle.await.expect("cleanup task should stop cleanly");
+    }
 
     #[derive(Default)]
     struct RecordingRunLifecycleService {

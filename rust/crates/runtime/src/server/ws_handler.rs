@@ -160,6 +160,8 @@ pub(super) enum WsClientMessage {
     #[serde(rename = "user_prompt")]
     UserPrompt {
         request_id: String,
+        session_id: String,
+        run_id: String,
         #[serde(default)]
         answers: Option<AskUserAnswers>,
         #[serde(default)]
@@ -235,6 +237,8 @@ pub(super) enum WsServerMessage {
     #[serde(rename = "user_prompt_request")]
     UserPromptRequest {
         request_id: String,
+        session_id: String,
+        run_id: String,
         prompt: AskUserPrompt,
     },
 
@@ -595,6 +599,8 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                             }
                             Ok(WsClientMessage::UserPrompt {
                                 request_id,
+                                session_id,
+                                run_id,
                                 answers,
                                 cancelled,
                             }) => {
@@ -602,6 +608,8 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     state,
                                     &conn,
                                     &request_id,
+                                    &session_id,
+                                    &run_id,
                                     answers,
                                     cancelled,
                                 )
@@ -881,6 +889,8 @@ pub(crate) enum WsLedgerOutcome {
     IdempotentReplay,
     /// Key was present with a DIFFERENT value; the original decision is preserved.
     ConflictIgnored,
+    /// Key was absent but the shared ledger was already at capacity.
+    CapacityExceeded,
 }
 
 /// Insert `value` under `key` in the ledger with at-most-once idempotency semantics.
@@ -889,12 +899,27 @@ pub(crate) enum WsLedgerOutcome {
 /// - Key present + same JSON value → no-op, return `IdempotentReplay`.
 /// - Key present + different JSON value → do NOT overwrite; emit a warning;
 ///   return `ConflictIgnored`.
+/// - Key absent + ledger full → do NOT insert; emit a warning; return
+///   `CapacityExceeded`.
 pub(crate) fn ws_ledger_dedup_insert(
     ledger: &mut std::collections::HashMap<String, serde_json::Value>,
     key: String,
     value: serde_json::Value,
 ) -> WsLedgerOutcome {
     use std::collections::hash_map::Entry;
+    if !ledger.contains_key(&key)
+        && ledger.len() >= astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES
+    {
+        tracing::warn!(
+            target: "astra_runtime::ws_callback",
+            key = %key,
+            entries = ledger.len(),
+            limit = astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES,
+            "WS ledger dedup: refusing new callback because edge callback ledger is full"
+        );
+        return WsLedgerOutcome::CapacityExceeded;
+    }
+
     match ledger.entry(key.clone()) {
         Entry::Vacant(e) => {
             e.insert(value);
@@ -945,12 +970,61 @@ async fn handle_user_prompt_response(
     state: &AppState,
     conn: &WsConnection,
     request_id: &str,
+    session_id: &str,
+    run_id: &str,
     answers: Option<AskUserAnswers>,
     cancelled: bool,
 ) {
+    use astra_services::session_journal::{JournalEvent, JournalWriter, validate_session_id};
     use astra_turn_core::edge_ledger::user_prompt_callback_key;
 
     let key = user_prompt_callback_key(&conn.principal.user.user_id, request_id);
+    if let Err(error) = validate_session_id(session_id) {
+        tracing::warn!(
+            target: "astra_runtime::ws_callback",
+            user_id = %conn.principal.user.user_id,
+            request_id = %request_id,
+            session_id = %session_id,
+            error = %error,
+            "refusing durable ask_user response journal write for invalid session_id"
+        );
+    } else {
+        let status = if cancelled { "cancelled" } else { "submitted" };
+        let answers_json = answers.as_ref().and_then(|answers| {
+            serde_json::to_value(answers)
+                .map_err(|error| {
+                    tracing::warn!(
+                        target: "astra_runtime::ws_callback",
+                        user_id = %conn.principal.user.user_id,
+                        request_id = %request_id,
+                        session_id = %session_id,
+                        error = %error,
+                        "failed to serialize ask_user answers for journal"
+                    );
+                })
+                .ok()
+        });
+        if let Err(error) = JournalWriter::new(session_id).and_then(|writer| {
+            writer.append(&JournalEvent::ask_user_response(
+                Some(session_id),
+                None,
+                request_id,
+                Some(run_id),
+                status,
+                answers_json,
+            ))
+        }) {
+            tracing::warn!(
+                target: "astra_runtime::ws_callback",
+                user_id = %conn.principal.user.user_id,
+                request_id = %request_id,
+                session_id = %session_id,
+                run_id = %run_id,
+                error = %error,
+                "failed to persist ask_user response journal event"
+            );
+        }
+    }
     let value = if cancelled {
         serde_json::json!({ "cancelled": true })
     } else {
@@ -1337,6 +1411,8 @@ async fn stream_run_over_websocket(
                             }
                             Ok(WsClientMessage::UserPrompt {
                                 request_id,
+                                session_id,
+                                run_id,
                                 answers,
                                 cancelled,
                             }) => {
@@ -1344,6 +1420,8 @@ async fn stream_run_over_websocket(
                                     state,
                                     conn,
                                     &request_id,
+                                    &session_id,
+                                    &run_id,
                                     answers,
                                     cancelled,
                                 )
@@ -1452,6 +1530,16 @@ async fn stream_run_over_websocket(
                         &WsServerMessage::UserPromptRequest {
                             request_id: req
                                 .get("request_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            session_id: req
+                                .get("session_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            run_id: req
+                                .get("run_id")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default()
                                 .to_string(),
@@ -4235,15 +4323,19 @@ mod tests {
 
     #[test]
     fn parse_user_prompt_response() {
-        let json = r#"{"type":"user_prompt","request_id":"req-3","answers":{"answers":[{"question":"Continue?","answers":["custom"],"multi_select":false}]}}"#;
+        let json = r#"{"type":"user_prompt","request_id":"req-3","session_id":"sess-1","run_id":"run-1","answers":{"answers":[{"question":"Continue?","answers":["custom"],"multi_select":false}]}}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::UserPrompt {
                 request_id,
+                session_id,
+                run_id,
                 answers,
                 cancelled,
             } => {
                 assert_eq!(request_id, "req-3");
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(run_id, "run-1");
                 assert!(!cancelled);
                 assert_eq!(
                     answers.unwrap().answers[0].answers,
@@ -4418,6 +4510,8 @@ mod tests {
     fn serialize_user_prompt_request() {
         let msg = WsServerMessage::UserPromptRequest {
             request_id: "req-2".into(),
+            session_id: "sess-1".into(),
+            run_id: "run-1".into(),
             prompt: AskUserPrompt {
                 context: Some("Need confirmation".into()),
                 questions: vec![astra_tools::AskUserQuestion {
@@ -4443,6 +4537,8 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"user_prompt_request""#));
+        assert!(json.contains(r#""session_id":"sess-1""#));
+        assert!(json.contains(r#""run_id":"run-1""#));
         assert!(json.contains(r#""question":"Continue?""#));
         assert!(json.contains(r#""header":"Confirm""#));
         assert!(json.contains(r#""context":"Need confirmation""#));
@@ -4482,6 +4578,8 @@ mod tests {
             },
             WsServerMessage::UserPromptRequest {
                 request_id: "req-2".into(),
+                session_id: "sess-1".into(),
+                run_id: "run-1".into(),
                 prompt: AskUserPrompt {
                     context: None,
                     questions: vec![astra_tools::AskUserQuestion {
@@ -4533,7 +4631,7 @@ mod tests {
             r#"{"type":"message","content":"hello","selected_model":{"model":"gpt-5.4"}}"#,
             r#"{"type":"cancel_run","run_id":"r1"}"#,
             r#"{"type":"tool_approval","request_id":"req-1","approved":true}"#,
-            r#"{"type":"user_prompt","request_id":"req-2","answers":{"answers":[{"question":"Continue?","answers":["yes"],"multi_select":false}]}}"#,
+            r#"{"type":"user_prompt","request_id":"req-2","session_id":"sess-1","run_id":"run-1","answers":{"answers":[{"question":"Continue?","answers":["yes"],"multi_select":false}]}}"#,
             r#"{"type":"ping"}"#,
         ];
         for json in &inputs {
@@ -4563,8 +4661,17 @@ mod tests {
 
     #[test]
     fn user_prompt_requires_request_id() {
-        let json = r#"{"type":"user_prompt","answers":{"answers":[]}}"#;
+        let json = r#"{"type":"user_prompt","session_id":"sess-1","run_id":"run-1","answers":{"answers":[]}}"#;
         assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
+    }
+
+    #[test]
+    fn user_prompt_requires_session_id_and_run_id() {
+        let missing_session = r#"{"type":"user_prompt","request_id":"req-2","run_id":"run-1","answers":{"answers":[]}}"#;
+        assert!(serde_json::from_str::<WsClientMessage>(missing_session).is_err());
+
+        let missing_run = r#"{"type":"user_prompt","request_id":"req-2","session_id":"sess-1","answers":{"answers":[]}}"#;
+        assert!(serde_json::from_str::<WsClientMessage>(missing_run).is_err());
     }
 
     // ── ws_ledger_dedup_insert unit tests ──────────────────────────────────
@@ -4609,6 +4716,48 @@ mod tests {
         assert_eq!(
             ledger["user:req-1"], original,
             "conflicting update must not overwrite the first decision"
+        );
+    }
+
+    #[test]
+    fn ws_ledger_dedup_insert_rejects_new_key_when_full() {
+        let mut ledger = std::collections::HashMap::new();
+        for i in 0..astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES {
+            ledger.insert(format!("user:req-{i}"), serde_json::json!({"i": i}));
+        }
+
+        let outcome = ws_ledger_dedup_insert(
+            &mut ledger,
+            "user:req-new".to_string(),
+            serde_json::json!({"approved": true}),
+        );
+
+        assert_eq!(outcome, WsLedgerOutcome::CapacityExceeded);
+        assert!(
+            !ledger.contains_key("user:req-new"),
+            "full ledger must not accept new WS callback keys"
+        );
+        assert_eq!(
+            ledger.len(),
+            astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn ws_ledger_dedup_insert_allows_existing_key_when_full() {
+        let mut ledger = std::collections::HashMap::new();
+        for i in 0..astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES {
+            ledger.insert(format!("user:req-{i}"), serde_json::json!({"i": i}));
+        }
+        let value = serde_json::json!({"i": 0});
+
+        let outcome = ws_ledger_dedup_insert(&mut ledger, "user:req-0".to_string(), value.clone());
+
+        assert_eq!(outcome, WsLedgerOutcome::IdempotentReplay);
+        assert_eq!(ledger["user:req-0"], value);
+        assert_eq!(
+            ledger.len(),
+            astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES
         );
     }
 

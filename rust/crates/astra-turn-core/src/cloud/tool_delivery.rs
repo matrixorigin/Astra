@@ -966,7 +966,26 @@ pub async fn deliver_tool_calls_concurrent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::TurnAuxiliaryEventRecord;
     use astra_thin_client::ApprovalDecision;
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct RecordingAuxiliaryEventWriter {
+        events: Arc<StdMutex<Vec<TurnAuxiliaryEventRecord>>>,
+    }
+
+    #[async_trait]
+    impl crate::contracts::TurnAuxiliaryEventWriter for RecordingAuxiliaryEventWriter {
+        async fn persist_events(
+            &self,
+            events: Vec<TurnAuxiliaryEventRecord>,
+        ) -> Result<(), String> {
+            self.events.lock().unwrap().extend(events);
+            Ok(())
+        }
+    }
 
     fn read_tool(id: &str) -> Value {
         json!({
@@ -1333,6 +1352,65 @@ mod tests {
         let guard = ledger.lock().await;
         assert!(guard.contains_key(&tool_callback_key("user-a", "shared-approval")));
         assert!(!guard.contains_key(&approval_callback_key("user-b", "shared-approval")));
+    }
+
+    #[tokio::test]
+    async fn approval_wait_replays_journal_decision_when_ledger_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-journal-replay").unwrap();
+        writer
+            .append(&JournalEvent::approval_decision(
+                Some("sess-journal-replay"),
+                Some(7),
+                "w-journal",
+                Some("write_file"),
+                Some("standard"),
+                "allow",
+                None,
+            ))
+            .unwrap();
+
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let recorded_events = Arc::new(StdMutex::new(Vec::new()));
+        let audit = ApprovalAuditContext {
+            user_id: "user-a".to_string(),
+            session_id: "sess-journal-replay".to_string(),
+            turn: 7,
+            agent_id: None,
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: "chain-journal-replay".to_string(),
+            auxiliary_event_writer: Arc::new(RecordingAuxiliaryEventWriter {
+                events: Arc::clone(&recorded_events),
+            }),
+        };
+
+        wait_approval_ledger_for_tool(
+            &ledger,
+            "user-a",
+            &write_tool("w-journal"),
+            Duration::from_millis(60),
+            Some(&audit),
+        )
+        .await
+        .expect("journal approval decision should allow the tool");
+
+        assert!(
+            ledger.lock().await.is_empty(),
+            "journal replay should not require or leave an in-memory ledger entry"
+        );
+        let events = recorded_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "approval_decision");
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()["outcome_source"].as_str(),
+            Some("journal")
+        );
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()["decision"].as_str(),
+            Some("allow")
+        );
     }
 
     #[tokio::test]

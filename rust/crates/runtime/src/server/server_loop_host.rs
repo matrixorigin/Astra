@@ -900,6 +900,7 @@ pub struct ServerAgenticLoopHost {
 
     // ── Tool execution ──
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    approval_audit_context: Option<astra_turn_core::cloud_tool_delivery::ApprovalAuditContext>,
     user_id: String,
     session_id: String,
     workspace_binding: WorkspaceBinding,
@@ -1351,6 +1352,7 @@ impl ServerAgenticLoopHostBuilder {
             static_tool_catalog_admissible: self.static_tool_catalog_admissible,
             always_load_tool_names,
             edge_callback_ledger: self.edge_callback_ledger,
+            approval_audit_context: None,
             user_id: self.user_id,
             session_id: self.session_id,
             workspace_binding: schema_workspace.clone(),
@@ -1877,6 +1879,13 @@ impl ServerAgenticLoopHost {
 
     pub fn set_execution_metadata(&mut self, metadata: Value) {
         self.execution_metadata = Some(metadata);
+    }
+
+    pub fn set_approval_audit_context(
+        &mut self,
+        context: astra_turn_core::cloud_tool_delivery::ApprovalAuditContext,
+    ) {
+        self.approval_audit_context = Some(context);
     }
 
     pub fn set_agent_live_event_sink(&mut self, agent_id: String, sink: SharedAgentLiveEventSink) {
@@ -2426,7 +2435,7 @@ impl ServerAgenticLoopHost {
                         &self.user_id,
                         tc,
                         ledger_wait,
-                        None,
+                        self.approval_audit_context.as_ref(),
                     )
                     .await
                     {

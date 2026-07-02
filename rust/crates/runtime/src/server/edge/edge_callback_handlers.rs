@@ -157,23 +157,22 @@ pub(crate) async fn post_tool_result_handler(
     validate_tool_result_request(&body)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     let key = tool_callback_key(&user.user_id, &body.request_id);
-    let mut lock = state.edge_callback_ledger.lock().await;
-    insert_ledger_entry(
-        &mut lock,
-        key.clone(),
-        serde_json::json!({
-            "kind": "tool_result",
-            "user_id": user.user_id,
-            "edge_id": edge_id,
-            "body": serde_json::to_value(&body).map_err(|e| {
-                error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to serialize tool_result body for ledger: {e}"),
-                )
-            })?,
-        }),
-    )
-    .map_err(|err| ledger_insert_error_response(&key, err))?;
+    let ledger_value = serde_json::json!({
+        "kind": "tool_result",
+        "user_id": user.user_id,
+        "edge_id": edge_id,
+        "body": serde_json::to_value(&body).map_err(|e| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("failed to serialize tool_result body for ledger: {e}"),
+            )
+        })?,
+    });
+    {
+        let mut lock = state.edge_callback_ledger.lock().await;
+        insert_ledger_entry(&mut lock, key.clone(), ledger_value)
+            .map_err(|err| ledger_insert_error_response(&key, err))?;
+    }
 
     // Cross-pod: also call deliver_result so other pods' turn bridges
     // waiting on wait_result() can see this result.
@@ -226,7 +225,6 @@ pub(crate) async fn post_approval_respond_handler(
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
     let key = approval_callback_key(&user.user_id, &body.request_id);
-    let mut lock = state.edge_callback_ledger.lock().await;
     if let Some(session_id) = body.session_id.as_deref() {
         validate_session_id(session_id)
             .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
@@ -290,23 +288,27 @@ pub(crate) async fn post_approval_respond_handler(
                 })?;
         }
     }
-    let ledger_enqueued = insert_approval_ledger_entry(
-        &mut lock,
-        key.clone(),
-        serde_json::json!({
-            "kind": "approval_respond",
-            "user_id": user.user_id,
-            "edge_id": edge_id,
-            "body": serde_json::to_value(&body).map_err(|e| {
-                error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to serialize approval_respond body for ledger: {e}"),
-                )
-            })?,
-        }),
-        body.session_id.is_some(),
-    )
-    .map_err(|err| ledger_insert_error_response(&key, err))?;
+    let ledger_value = serde_json::json!({
+        "kind": "approval_respond",
+        "user_id": user.user_id,
+        "edge_id": edge_id,
+        "body": serde_json::to_value(&body).map_err(|e| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("failed to serialize approval_respond body for ledger: {e}"),
+            )
+        })?,
+    });
+    let ledger_enqueued = {
+        let mut lock = state.edge_callback_ledger.lock().await;
+        insert_approval_ledger_entry(
+            &mut lock,
+            key.clone(),
+            ledger_value,
+            body.session_id.is_some(),
+        )
+        .map_err(|err| ledger_insert_error_response(&key, err))?
+    };
     tracing::info!(
         target: "astra_runtime::edge_callback",
         request_id = %trace.request_id,
@@ -483,6 +485,12 @@ mod edge_callback_insert_tests {
     use serde_json::json;
     use std::collections::HashMap;
 
+    fn source_index(source: &str, needle: &str) -> usize {
+        source
+            .find(needle)
+            .unwrap_or_else(|| panic!("source must contain `{needle}`"))
+    }
+
     #[test]
     fn edge_register_request_accepts_runtime_environment_advertisement() {
         let request: EdgeRegisterRequest = serde_json::from_value(json!({
@@ -514,6 +522,49 @@ mod edge_callback_insert_tests {
         assert_eq!(
             request.capabilities.as_ref().unwrap()["binding"]["runtime"]["provider"],
             "host_process"
+        );
+    }
+
+    #[test]
+    fn tool_result_handler_releases_ledger_lock_before_cross_pod_delivery() {
+        let source = include_str!("edge_callback_handlers.rs");
+        let lock_idx = source_index(
+            source,
+            "let mut lock = state.edge_callback_ledger.lock().await;",
+        );
+        let insert_done_idx = source_index(
+            source,
+            ".map_err(|err| ledger_insert_error_response(&key, err))?;\n    }\n\n    // Cross-pod",
+        );
+        let deliver_idx = source_index(source, ".deliver_result(");
+
+        assert!(
+            lock_idx < insert_done_idx,
+            "tool result handler should only lock around the ledger insert"
+        );
+        assert!(
+            insert_done_idx < deliver_idx,
+            "cross-pod delivery must happen after the ledger lock scope closes"
+        );
+    }
+
+    #[test]
+    fn approval_handler_does_not_hold_ledger_lock_while_writing_journal() {
+        let source = include_str!("edge_callback_handlers.rs");
+        let journal_lookup_idx = source_index(source, "find_latest_approval_required");
+        let journal_append_idx = source_index(source, ".append(&JournalEvent::approval_decision(");
+        let ledger_lock_idx = source_index(
+            source,
+            "let ledger_enqueued = {\n        let mut lock = state.edge_callback_ledger.lock().await;",
+        );
+
+        assert!(
+            journal_lookup_idx < ledger_lock_idx,
+            "approval journal lookup must run before acquiring the ledger lock"
+        );
+        assert!(
+            journal_append_idx < ledger_lock_idx,
+            "approval journal append must run before acquiring the ledger lock"
         );
     }
 

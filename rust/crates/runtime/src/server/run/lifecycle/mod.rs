@@ -899,8 +899,8 @@ pub(crate) use persistence::{
     PostLoopPersistContext, TranscriptPersistItem, build_run_turn_complete_event_with_interruption,
     format_task_board_resume_hint, persist_server_loop_core_events,
     persist_server_loop_trace_events, persist_session_transcript_items,
-    restore_session_state_compact, restore_step_checkpoint_runtime_state, server_trace_context,
-    trace_context_from_subrun_context,
+    restore_session_state_compact, restore_step_checkpoint_runtime_state,
+    server_loop_causal_chain_id, server_trace_context, trace_context_from_subrun_context,
 };
 use run_state::*;
 
@@ -2322,7 +2322,19 @@ impl AgenticRunLifecycleService {
         self.runs.write().await.remove(run_id);
         astra_core::log_persist!(
             self.run_engine
-                .persist_status(user_id, run_id, STATUS_FAILED, None, Some(message))
+                .persist_status_if_current(
+                    user_id,
+                    run_id,
+                    &[
+                        STATUS_RUNNING,
+                        STATUS_PAUSED,
+                        STATUS_WAITING,
+                        STATUS_INPUT_QUEUED,
+                    ],
+                    STATUS_FAILED,
+                    None,
+                    Some(message),
+                )
                 .await,
             "run_lifecycle",
             run_id,
@@ -3183,6 +3195,31 @@ impl AgenticRunLifecycleService {
             builder = builder.with_test_llm_rounds(rounds);
         }
         builder.build()
+    }
+
+    fn configure_host_approval_audit_context(
+        &self,
+        host: &mut server_loop_host::ServerAgenticLoopHost,
+        user_id: &str,
+        session_id: &str,
+        turn: u32,
+        agent_id: Option<String>,
+    ) {
+        let Some(writer) = self.auxiliary_event_writer.clone() else {
+            return;
+        };
+        host.set_approval_audit_context(
+            astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+                turn,
+                agent_id,
+                parent_event_id: None,
+                parent_event_ids: Vec::new(),
+                causal_chain_id: server_loop_causal_chain_id("server-loop-tools"),
+                auxiliary_event_writer: writer,
+            },
+        );
     }
 
     async fn task_board_resume_hint_for_session(
@@ -4779,6 +4816,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         loop_state.session_turn =
             infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await;
+        self.configure_host_approval_audit_context(
+            &mut host,
+            &user_id,
+            &session_id,
+            loop_state.session_turn,
+            request.agent_id.clone(),
+        );
         let fresh_session_current_date = loop_state
             .pipeline_session
             .as_ref()
@@ -4979,6 +5023,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let user_prompt_gate =
                     astra_turn_core::ws_user_prompt_gate::WebSocketUserPromptGate::new(
                         user_id.clone(),
+                        session_id.clone(),
+                        run_id.clone(),
+                        Some(loop_state.session_turn),
                         self.edge_callback_ledger.clone(),
                         user_prompt_tx,
                     );
@@ -5099,40 +5146,65 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             reason = %reason,
                             "run rejected: daily token budget exhausted"
                         );
-                        if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                            if run.status.try_transition(&RunStatus::Failed).is_ok() {
-                                run.status = RunStatus::Failed;
+                        let budget_reject_committed = match run_engine
+                            .persist_status_if_current(
+                                &bg_user_id,
+                                &bg_run_id,
+                                &[
+                                    STATUS_RUNNING,
+                                    STATUS_PAUSED,
+                                    STATUS_WAITING,
+                                    STATUS_INPUT_QUEUED,
+                                ],
+                                astra_core::STATUS_FAILED,
+                                None,
+                                Some(&reason),
+                            )
+                            .await
+                        {
+                            Ok(true) => true,
+                            Ok(false) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::run_lifecycle",
+                                    run_id = %bg_run_id,
+                                    "skipping budget rejection failure events after stale status CAS"
+                                );
+                                false
                             }
-                            // Push terminal events so SSE clients see the failure.
-                            run.events.push(json!({
-                                "event_type": "run_error",
-                                "data": {"error": reason.clone()}
-                            }));
-                            run.events.push(json!({
-                                "event_type": "run_finished",
-                                "data": {"total_prompt_tokens": 0, "total_completion_tokens": 0}
-                            }));
-                            run.live_tx = None;
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::run_lifecycle",
+                                    run_id = %bg_run_id,
+                                    error = %error,
+                                    "failed to persist budget rejection status"
+                                );
+                                false
+                            }
+                        };
+                        if budget_reject_committed {
+                            if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                                if run.status.try_transition(&RunStatus::Failed).is_ok() {
+                                    run.status = RunStatus::Failed;
+                                }
+                                // Push terminal events so SSE clients see the failure.
+                                run.events.push(json!({
+                                    "event_type": "run_error",
+                                    "data": {"error": reason.clone()}
+                                }));
+                                run.events.push(json!({
+                                    "event_type": "run_finished",
+                                    "data": {"total_prompt_tokens": 0, "total_completion_tokens": 0}
+                                }));
+                                run.live_tx = None;
+                            }
                         }
                         // Clean up channels for this run.
                         bg_approval_channels.lock().await.remove(&bg_run_id);
                         bg_user_prompt_channels.lock().await.remove(&bg_run_id);
                         bg_progress_channels.lock().await.remove(&bg_run_id);
-                        astra_core::log_persist!(
-                            run_engine
-                                .persist_status(
-                                    &bg_user_id,
-                                    &bg_run_id,
-                                    astra_core::STATUS_FAILED,
-                                    None,
-                                    Some(&reason),
-                                )
-                                .await,
-                            "run_lifecycle",
-                            &bg_run_id,
-                            "budget_reject"
-                        );
-                        if let Some(record) = bg_cloud_workspace_record.as_ref() {
+                        if budget_reject_committed
+                            && let Some(record) = bg_cloud_workspace_record.as_ref()
+                        {
                             Self::cleanup_cloud_workspace_with_debt(
                             bg_workspace_record_store.clone(),
                             &bg_user_id,
@@ -5146,7 +5218,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         )
                         .await;
                         }
-                        Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                        if budget_reject_committed {
+                            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                        }
                         return;
                     }
                 }
@@ -5161,12 +5235,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 bg_approval_channels.lock().await.remove(&bg_run_id);
                 bg_user_prompt_channels.lock().await.remove(&bg_run_id);
                 bg_progress_channels.lock().await.remove(&bg_run_id);
-                let terminal_events = terminal_events_for_persistence(&events);
+                let terminal_events = enforce_durable_run_event_batch_budget(
+                    terminal_events_for_persistence(&events),
+                );
 
                 // Publish terminal run state before best-effort post-run side effects
                 // so background observers do not stay stuck in "running" because a
                 // hook, event write, or learning save is slow.
-                let mut persisted_status = final_status.clone();
+                let mut persisted_status = final_status;
                 let mut persist_status_update = true;
                 let mut persist_terminal_events = true;
 
@@ -5188,7 +5264,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 .get_or_insert_with(|| "user_resume".to_string());
                             run.live_tx = None;
                         } else if run.status.try_transition(&final_status).is_ok() {
-                            run.status = final_status.clone();
+                            run.status = final_status;
                         }
                         if !run.status.is_resumable() {
                             run.live_tx = None;
@@ -5222,21 +5298,50 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     Self::schedule_run_eviction(&runs, bg_run_id.clone());
                 }
 
+                let mut durable_status_committed = !persist_status_update;
+                let mut terminal_events_committed = false;
                 if persist_status_update {
-                    astra_core::log_persist!(
-                        run_engine
-                            .persist_status(
-                                &bg_user_id,
-                                &bg_run_id,
-                                persisted_status.as_str(),
-                                None,
-                                error_msg.as_deref()
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "status"
-                    );
+                    let events_for_transition: &[Value] = if persist_terminal_events {
+                        terminal_events.as_slice()
+                    } else {
+                        &[]
+                    };
+                    match run_engine
+                        .transition_status_with_events_if_current(
+                            &bg_user_id,
+                            &bg_run_id,
+                            &[STATUS_RUNNING, STATUS_WAITING, STATUS_INPUT_QUEUED],
+                            persisted_status.as_str(),
+                            None,
+                            error_msg.as_deref(),
+                            events_for_transition,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            durable_status_committed = true;
+                            terminal_events_committed =
+                                persist_terminal_events && !terminal_events.is_empty();
+                        }
+                        Ok(false) => {
+                            persist_terminal_events = false;
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                status = persisted_status.as_str(),
+                                "skipping terminal transition after stale terminal status CAS"
+                            );
+                        }
+                        Err(error) => {
+                            persist_terminal_events = false;
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                error = %error,
+                                "failed to persist terminal status/events transition"
+                            );
+                        }
+                    }
                 }
                 astra_core::log_persist!(
                     run_engine
@@ -5259,7 +5364,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         gov.record_tokens(&bg_user_id, total).await;
                     }
                 }
-                if persist_terminal_events && !terminal_events.is_empty() {
+                if durable_status_committed
+                    && persist_terminal_events
+                    && !terminal_events.is_empty()
+                    && !terminal_events_committed
+                {
                     astra_core::log_persist!(
                         run_engine
                             .append_events_batch(&bg_user_id, &bg_run_id, &terminal_events)
@@ -5526,6 +5635,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             execution_bindings.as_ref(),
             plan_resume_hint,
             task_board_resume_hint,
+        );
+        self.configure_host_approval_audit_context(
+            &mut host,
+            &user_id,
+            &session_id,
+            state.session_turn,
+            request.agent_id.clone(),
         );
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
@@ -5897,14 +6013,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &bg_run_id,
                     streaming_final_events.clone(),
                 );
-                let streaming_events_for_durable = merge_agent_lifecycle_before_terminal_events(
-                    &final_events,
-                    &archived_lifecycle_events,
+                let streaming_events_for_durable = enforce_durable_run_event_batch_budget(
+                    merge_agent_lifecycle_before_terminal_events(
+                        &final_events,
+                        &archived_lifecycle_events,
+                    ),
                 );
                 persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
                 let mut terminal_state_events = streaming_final_events;
 
-                let mut persisted_status = final_status.clone();
+                let mut persisted_status = final_status;
                 let mut persist_status_update = true;
                 let mut persist_streaming_events = true;
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
@@ -5925,7 +6043,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 .get_or_insert_with(|| "user_resume".to_string());
                             run.live_tx = None;
                         } else if run.status.try_transition(&final_status).is_ok() {
-                            run.status = final_status.clone();
+                            run.status = final_status;
                         }
                         if !run.status.is_resumable() {
                             run.live_tx = None;
@@ -5969,21 +6087,50 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
+                let mut durable_status_committed = !persist_status_update;
+                let mut streaming_events_committed = false;
                 if persist_status_update {
-                    astra_core::log_persist!(
-                        run_engine
-                            .persist_status(
-                                &bg_user_id,
-                                &bg_run_id,
-                                persisted_status.as_str(),
-                                None,
-                                error_msg.as_deref()
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "status"
-                    );
+                    let events_for_transition: &[Value] = if persist_streaming_events {
+                        streaming_events_for_durable.as_slice()
+                    } else {
+                        &[]
+                    };
+                    match run_engine
+                        .transition_status_with_events_if_current(
+                            &bg_user_id,
+                            &bg_run_id,
+                            &[STATUS_RUNNING, STATUS_WAITING, STATUS_INPUT_QUEUED],
+                            persisted_status.as_str(),
+                            None,
+                            error_msg.as_deref(),
+                            events_for_transition,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            durable_status_committed = true;
+                            streaming_events_committed = persist_streaming_events
+                                && !streaming_events_for_durable.is_empty();
+                        }
+                        Ok(false) => {
+                            persist_streaming_events = false;
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                status = persisted_status.as_str(),
+                                "skipping streaming terminal transition after stale terminal status CAS"
+                            );
+                        }
+                        Err(error) => {
+                            persist_streaming_events = false;
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                error = %error,
+                                "failed to persist streaming terminal status/events transition"
+                            );
+                        }
+                    }
                 }
 
                 // Persist usage unconditionally — cancelled runs still consumed tokens
@@ -6004,7 +6151,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
 
                 // Persist terminal events to durable store in a single batch.
-                if persist_streaming_events && !streaming_events_for_durable.is_empty() {
+                if durable_status_committed
+                    && persist_streaming_events
+                    && !streaming_events_for_durable.is_empty()
+                    && !streaming_events_committed
+                {
                     astra_core::log_persist!(
                         run_engine
                             .append_events_batch(
@@ -6198,6 +6349,29 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 recent_events,
             })
         }
+    }
+
+    async fn repair_run_projection(
+        &self,
+        run_id: String,
+        user_id: String,
+        recent_limit: u32,
+    ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let rebuilt = self
+            .run_engine
+            .rebuild_run_projection(&user_id, &run_id)
+            .await
+            .map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to rebuild run projection: {error}"),
+                )
+            })?;
+        if rebuilt.is_none() {
+            return Err(error_response(StatusCode::NOT_FOUND, "Run not found"));
+        }
+        self.get_run_projection(run_id, user_id, recent_limit).await
     }
 
     async fn stream_run(
@@ -6481,14 +6655,38 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let cancel_event = json!({"event_type": "run_finished", "data": {"cancelled": true}});
-        self.run_engine
-            .persist_status(&user_id, &run_id, STATUS_CANCELLED, None, None)
-            .await
-            .map_err(|error| Self::durable_persist_error("cancel status", error))?;
-        let append_result = self
+        let status_updated = self
             .run_engine
-            .append_event(&user_id, &run_id, cancel_event.clone())
-            .await;
+            .transition_status_with_event_if_current(
+                &user_id,
+                &run_id,
+                &[
+                    STATUS_RUNNING,
+                    STATUS_PAUSED,
+                    STATUS_WAITING,
+                    STATUS_INPUT_QUEUED,
+                ],
+                STATUS_CANCELLED,
+                None,
+                None,
+                cancel_event.clone(),
+            )
+            .await
+            .map_err(|error| Self::durable_persist_error("cancel transition", error))?;
+        if !status_updated {
+            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            let current_status = Self::run_status_from_durable(&current.status)?;
+            if matches!(
+                current_status,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            ) {
+                return Ok(CancelRunRecord {
+                    run_id,
+                    status: current.status,
+                });
+            }
+            return Err(Self::run_state_conflict("cancel", &current.status));
+        }
 
         {
             let mut runs = self.runs.write().await;
@@ -6505,7 +6703,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         if let Some(de) = &self.delegation_engine {
             de.cancel_children_of(&user_id, &run_id).await;
         }
-        append_result.map_err(|error| Self::durable_persist_error("cancel event", error))?;
         Self::schedule_run_eviction(&self.runs, run_id.clone());
 
         Ok(CancelRunRecord {
@@ -6591,30 +6788,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let pause_event = json!({"event_type": "run_paused", "data": {}});
         // Always write to DB first — the source of truth for cross-pod control.
-        if let Err(error) = self
+        let status_updated = self
             .run_engine
-            .persist_status(&user_id, &run_id, STATUS_PAUSED, Some("user_resume"), None)
+            .transition_status_with_event_if_current(
+                &user_id,
+                &run_id,
+                &[STATUS_RUNNING],
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+                pause_event.clone(),
+            )
             .await
-        {
-            return Err(Self::durable_persist_error("pause status", error));
-        }
-        if let Err(error) = self
-            .run_engine
-            .append_event(&user_id, &run_id, pause_event.clone())
-            .await
-        {
-            // Rollback DB status. Ignore rollback failures — durable state
-            // still says PAUSED, but the event was never written, so the run
-            // is in a safe state (no partial event). On pod restart, the
-            // LR/checkpoint logic handles reconciliation.
-            let _ = self
-                .run_engine
-                .persist_status(&user_id, &run_id, STATUS_RUNNING, None, None)
-                .await;
-            return Err(Self::durable_persist_error("pause event", error));
+            .map_err(|error| Self::durable_persist_error("pause transition", error))?;
+        if !status_updated {
+            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            return Err(Self::run_state_conflict("pause", &current.status));
         }
 
-        // Only update in-memory state after both DB writes succeeded.
         {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(&run_id) {
@@ -6645,10 +6836,33 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         if has_buffered_terminal_completion(&durable.events) {
-            self.run_engine
-                .persist_status(&user_id, &run_id, STATUS_COMPLETED, None, None)
+            let status_updated = self
+                .run_engine
+                .persist_status_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_PAUSED],
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                )
                 .await
                 .map_err(|error| Self::durable_persist_error("resume completed status", error))?;
+            if !status_updated {
+                let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+                let current_status = Self::run_status_from_durable(&current.status)?;
+                if matches!(
+                    current_status,
+                    RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+                ) {
+                    return Ok(RunMutationRecord {
+                        run_id,
+                        status: current.status,
+                        previous_status: durable.status,
+                    });
+                }
+                return Err(Self::run_state_conflict("resume", &current.status));
+            }
             {
                 let mut runs = self.runs.write().await;
                 if let Some(run) = runs.get_mut(&run_id) {
@@ -6668,26 +6882,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let resume_event = json!({"event_type": "run_resumed", "data": {}});
         // Always write to DB first — the source of truth for cross-pod control.
-        if let Err(error) = self
+        let status_updated = self
             .run_engine
-            .persist_status(&user_id, &run_id, STATUS_RUNNING, None, None)
+            .transition_status_with_event_if_current(
+                &user_id,
+                &run_id,
+                &[STATUS_PAUSED],
+                STATUS_RUNNING,
+                None,
+                None,
+                resume_event.clone(),
+            )
             .await
-        {
-            return Err(Self::durable_persist_error("resume status", error));
-        }
-        if let Err(error) = self
-            .run_engine
-            .append_event(&user_id, &run_id, resume_event.clone())
-            .await
-        {
-            let _ = self
-                .run_engine
-                .persist_status(&user_id, &run_id, STATUS_PAUSED, Some("user_resume"), None)
-                .await;
-            return Err(Self::durable_persist_error("resume event", error));
+            .map_err(|error| Self::durable_persist_error("resume transition", error))?;
+        if !status_updated {
+            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            return Err(Self::run_state_conflict("resume", &current.status));
         }
 
-        // Only update in-memory state after both DB writes succeeded.
         {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(&run_id) {
@@ -9068,10 +9280,19 @@ mod tests {
         append_calls: usize,
     }
 
+    struct FaultInjectedStatusMutation {
+        user_id: String,
+        run_id: String,
+        status: String,
+        waiting_for: Option<String>,
+        error_message: Option<String>,
+    }
+
     struct FaultInjectedRunStateStore {
         inner: InMemoryRunStateStore,
         fail_status_calls: HashSet<usize>,
         fail_append_calls: HashSet<usize>,
+        mutate_before_status_call: HashMap<usize, FaultInjectedStatusMutation>,
         counters: StdMutex<FaultInjectedRunStoreCounters>,
     }
 
@@ -9081,8 +9302,31 @@ mod tests {
                 inner: InMemoryRunStateStore::new(),
                 fail_status_calls: fail_status_calls.iter().copied().collect(),
                 fail_append_calls: fail_append_calls.iter().copied().collect(),
+                mutate_before_status_call: HashMap::new(),
                 counters: StdMutex::new(FaultInjectedRunStoreCounters::default()),
             }
+        }
+
+        fn with_status_mutation_before_call(
+            mut self,
+            call: usize,
+            user_id: &str,
+            run_id: &str,
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+        ) -> Self {
+            self.mutate_before_status_call.insert(
+                call,
+                FaultInjectedStatusMutation {
+                    user_id: user_id.to_string(),
+                    run_id: run_id.to_string(),
+                    status: status.to_string(),
+                    waiting_for: waiting_for.map(ToString::to_string),
+                    error_message: error_message.map(ToString::to_string),
+                },
+            );
+            self
         }
 
         fn next_status_call(&self) -> usize {
@@ -9095,6 +9339,21 @@ mod tests {
             let mut counters = self.counters.lock().expect("append counter lock");
             counters.append_calls += 1;
             counters.append_calls
+        }
+
+        async fn apply_status_mutation_before_call(&self, call: usize) -> Result<(), String> {
+            if let Some(mutation) = self.mutate_before_status_call.get(&call) {
+                self.inner
+                    .update_run_status(
+                        &mutation.user_id,
+                        &mutation.run_id,
+                        &mutation.status,
+                        mutation.waiting_for.as_deref(),
+                        mutation.error_message.as_deref(),
+                    )
+                    .await?;
+            }
+            Ok(())
         }
     }
 
@@ -9121,6 +9380,7 @@ mod tests {
             error_message: Option<&str>,
         ) -> Result<bool, String> {
             let call = self.next_status_call();
+            self.apply_status_mutation_before_call(call).await?;
             if self.fail_status_calls.contains(&call) {
                 return Err(format!("injected update_run_status failure on call {call}"));
             }
@@ -9139,6 +9399,7 @@ mod tests {
             error_message: Option<&str>,
         ) -> Result<bool, String> {
             let call = self.next_status_call();
+            self.apply_status_mutation_before_call(call).await?;
             if self.fail_status_calls.contains(&call) {
                 return Err(format!(
                     "injected update_run_status_if_current failure on call {call}"
@@ -9152,6 +9413,78 @@ mod tests {
                     status,
                     waiting_for,
                     error_message,
+                )
+                .await
+        }
+
+        async fn update_run_status_with_event_if_current(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            expected_statuses: &[&str],
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+            event: serde_json::Value,
+        ) -> Result<bool, String> {
+            let call = self.next_status_call();
+            self.apply_status_mutation_before_call(call).await?;
+            if self.fail_status_calls.contains(&call) {
+                return Err(format!(
+                    "injected update_run_status_with_event_if_current failure on call {call}"
+                ));
+            }
+            let append_call = self.next_append_call();
+            if self.fail_append_calls.contains(&append_call) {
+                return Err(format!(
+                    "injected transition append_event failure on call {append_call}"
+                ));
+            }
+            self.inner
+                .update_run_status_with_event_if_current(
+                    user_id,
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                    event,
+                )
+                .await
+        }
+
+        async fn update_run_status_with_events_if_current(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            expected_statuses: &[&str],
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+            events: &[serde_json::Value],
+        ) -> Result<bool, String> {
+            let call = self.next_status_call();
+            self.apply_status_mutation_before_call(call).await?;
+            if self.fail_status_calls.contains(&call) {
+                return Err(format!(
+                    "injected update_run_status_with_events_if_current failure on call {call}"
+                ));
+            }
+            let append_call = self.next_append_call();
+            if self.fail_append_calls.contains(&append_call) {
+                return Err(format!(
+                    "injected transition append_events failure on call {append_call}"
+                ));
+            }
+            self.inner
+                .update_run_status_with_events_if_current(
+                    user_id,
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                    events,
                 )
                 .await
         }
@@ -9203,6 +9536,14 @@ mod tests {
             run_id: &str,
         ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
             self.inner.load_run_projection(user_id, run_id).await
+        }
+
+        async fn rebuild_run_projection(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+            self.inner.rebuild_run_projection(user_id, run_id).await
         }
 
         async fn append_events_batch(
@@ -11481,18 +11822,19 @@ mod tests {
         assert_eq!(replay.len(), 2);
         assert_eq!(replay[0]["event_type"], "text_done");
         assert_eq!(replay[1]["event_type"], "run_finished");
-        assert!(live_delta_event_for_persistence(&events[1]));
+        assert!(!live_delta_event_for_persistence(&events[0]));
+        assert!(!live_delta_event_for_persistence(&events[1]));
         assert!(live_delta_event_for_persistence(&events[2]));
         assert!(live_delta_event_for_persistence(&events[3]));
         assert!(live_delta_event_for_persistence(&events[4]));
-        assert!(live_delta_event_for_persistence(&events[5]));
+        assert!(!live_delta_event_for_persistence(&events[5]));
         assert!(live_delta_event_for_persistence(&events[6]));
         assert!(live_delta_event_for_persistence(&events[7]));
         assert!(live_delta_event_for_persistence(&events[8]));
     }
 
     #[test]
-    fn streaming_durable_persistence_keeps_live_events_before_terminal() {
+    fn streaming_durable_persistence_keeps_semantic_events_before_terminal() {
         let events = vec![
             json!({"type": "reasoning_delta", "content": "thinking"}),
             json!({"type": "tool_call", "tool_call": {"id": "call-1"}}),
@@ -11507,12 +11849,11 @@ mod tests {
             .cloned()
             .collect();
 
-        assert_eq!(persisted.len(), 5);
-        assert_eq!(persisted[0]["type"], "reasoning_delta");
-        assert_eq!(persisted[1]["type"], "tool_call");
-        assert_eq!(persisted[2]["type"], "tool_call_end");
-        assert_eq!(persisted[3]["event_type"], "text_done");
-        assert_eq!(persisted[4]["event_type"], "run_finished");
+        assert_eq!(persisted.len(), 4);
+        assert_eq!(persisted[0]["type"], "tool_call");
+        assert_eq!(persisted[1]["type"], "tool_call_end");
+        assert_eq!(persisted[2]["event_type"], "text_done");
+        assert_eq!(persisted[3]["event_type"], "run_finished");
     }
 
     #[test]
@@ -11533,10 +11874,7 @@ mod tests {
         };
 
         for idx in 0..(MAX_ACTIVE_RUN_LIVE_EVENTS + 5) {
-            push_active_run_live_event(
-                &mut run,
-                json!({"type": "text_delta", "content": idx.to_string()}),
-            );
+            push_active_run_live_event(&mut run, json!({"type": "agent_progress", "seq": idx}));
         }
 
         let live_events: Vec<_> = run
@@ -11546,7 +11884,25 @@ mod tests {
             .collect();
         assert_eq!(live_events.len(), MAX_ACTIVE_RUN_LIVE_EVENTS);
         assert_eq!(run.events[0]["event_type"], "run_started");
-        assert_eq!(live_events[0]["content"], "5");
+        assert_eq!(live_events[0]["seq"], 5);
+    }
+
+    #[test]
+    fn transport_delta_chunks_are_live_only_not_durable() {
+        let events = vec![
+            json!({"type": "text_delta", "content": "hi"}),
+            json!({"type": "reasoning_delta", "content": "thinking"}),
+            json!({"type": "thinking_delta", "content": "thinking"}),
+            json!({"type": "agent_live_event", "event_kind": "output_delta", "content": "child"}),
+            json!({"type": "agent_live_event", "event_kind": "thinking_delta", "content": "child-thinking"}),
+        ];
+
+        for event in events {
+            assert!(
+                !streaming_event_for_persistence(&event),
+                "transport delta should remain live-only: {event}"
+            );
+        }
     }
 
     #[test]
@@ -11648,12 +12004,11 @@ mod tests {
         ];
 
         let persisted = terminal_events_for_persistence(&events);
-        assert_eq!(persisted.len(), 5);
-        assert_eq!(persisted[0]["type"], "reasoning_delta");
-        assert_eq!(persisted[1]["type"], "reasoning_done");
-        assert_eq!(persisted[2]["event_type"], "text_done");
-        assert_eq!(persisted[3]["event_type"], "run_error");
-        assert_eq!(persisted[4]["event_type"], "run_finished");
+        assert_eq!(persisted.len(), 4);
+        assert_eq!(persisted[0]["type"], "reasoning_done");
+        assert_eq!(persisted[1]["event_type"], "text_done");
+        assert_eq!(persisted[2]["event_type"], "run_error");
+        assert_eq!(persisted[3]["event_type"], "run_finished");
     }
 
     #[tokio::test]
@@ -13003,6 +13358,16 @@ mod tests {
             "event_type": "run_finished",
             "data": {"interrupted": true}
         })]));
+        assert!(!has_buffered_terminal_completion(&[
+            json!({
+                "event_type": "run_finished",
+                "data": {"total_prompt_tokens": 1, "total_completion_tokens": 1}
+            }),
+            json!({
+                "event_type": "run_finished",
+                "data": {"cancelled": true}
+            }),
+        ]));
     }
 
     #[test]
@@ -13125,6 +13490,43 @@ mod tests {
         assert_eq!(result.previous_status, "paused");
         let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
         assert_eq!(status.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn resume_run_does_not_promote_cancelled_or_interrupted_finish_to_completed() {
+        for (suffix, data) in [
+            ("cancelled", json!({"cancelled": true})),
+            ("interrupted", json!({"interrupted": true})),
+        ] {
+            let svc = test_service_with_engine();
+            let run = ok(svc
+                .create_run("user-1".into(), test_request(&format!("task-{suffix}")))
+                .await);
+            ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+            svc.run_engine
+                .append_event(
+                    "user-1",
+                    &run.run_id,
+                    json!({
+                        "event_type": "run_finished",
+                        "data": data
+                    }),
+                )
+                .await
+                .unwrap();
+
+            let result = ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
+            assert_eq!(result.status, STATUS_RUNNING, "{suffix}");
+            assert_eq!(result.previous_status, STATUS_PAUSED, "{suffix}");
+            let durable = svc
+                .run_engine
+                .load_run("user-1", &run.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.status, STATUS_RUNNING, "{suffix}");
+            assert_eq!(durable.events.last().unwrap()["event_type"], "run_resumed");
+        }
     }
 
     #[tokio::test]
@@ -13358,6 +13760,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_run_stale_read_does_not_overwrite_completed() {
+        let store: Arc<dyn RunStateStore> = Arc::new(
+            FaultInjectedRunStateStore::new(&[], &[]).with_status_mutation_before_call(
+                1,
+                "user-1",
+                "run-race",
+                STATUS_COMPLETED,
+                None,
+                None,
+            ),
+        );
+        let svc = test_service_with_store(store);
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-race", "user-1", "sess-1")
+            .await
+            .unwrap();
+
+        let result = ok(svc.cancel_run("run-race".into(), "user-1".into()).await);
+        assert_eq!(result.status, STATUS_COMPLETED);
+
+        let durable = engine
+            .load_run("user-1", "run-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_COMPLETED);
+        assert!(
+            durable
+                .events
+                .iter()
+                .all(|event| event["event_type"] != "run_finished"),
+            "stale cancel must not append a cancel terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_run_stale_read_does_not_overwrite_completed() {
+        let store: Arc<dyn RunStateStore> = Arc::new(
+            FaultInjectedRunStateStore::new(&[], &[]).with_status_mutation_before_call(
+                1,
+                "user-1",
+                "run-pause-race",
+                STATUS_COMPLETED,
+                None,
+                None,
+            ),
+        );
+        let svc = test_service_with_store(store);
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-pause-race", "user-1", "sess-1")
+            .await
+            .unwrap();
+
+        let e = err(svc
+            .pause_run("run-pause-race".into(), "user-1".into())
+            .await);
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        assert!(e.1.0.detail.contains("completed"));
+
+        let durable = engine
+            .load_run("user-1", "run-pause-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_COMPLETED);
+        assert!(
+            durable
+                .events
+                .iter()
+                .all(|event| event["event_type"] != "run_paused"),
+            "stale pause must not append a pause event"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_run_stale_read_does_not_overwrite_cancelled() {
+        let store: Arc<dyn RunStateStore> = Arc::new(
+            FaultInjectedRunStateStore::new(&[], &[]).with_status_mutation_before_call(
+                2,
+                "user-1",
+                "run-resume-race",
+                STATUS_CANCELLED,
+                None,
+                None,
+            ),
+        );
+        let svc = test_service_with_store(store);
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-resume-race", "user-1", "sess-1")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "user-1",
+                "run-resume-race",
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let e = err(svc
+            .resume_run("run-resume-race".into(), "user-1".into())
+            .await);
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        assert!(e.1.0.detail.contains("cancelled"));
+
+        let durable = engine
+            .load_run("user-1", "run-resume-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_CANCELLED);
+        assert!(
+            durable
+                .events
+                .iter()
+                .all(|event| event["event_type"] != "run_resumed"),
+            "stale resume must not append a resume event"
+        );
+    }
+
+    #[tokio::test]
     async fn pause_run_running_succeeds_via_db() {
         let svc = test_service_with_engine();
         let engine = &svc.run_engine;
@@ -13386,14 +13915,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_run_append_failure_rollback_succeeds_keeps_running() {
+    async fn cancel_run_transition_failure_does_not_commit_status_or_event() {
+        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]));
+        let svc = test_service_with_store(store);
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+
+        let e = err(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(e.1.0.detail.contains("cancel transition"));
+
+        let durable = svc
+            .run_engine
+            .load_run("user-1", &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_RUNNING);
+        assert!(durable.waiting_for.is_none());
+        assert_eq!(durable.events.len(), 1);
+        assert_eq!(durable.events[0]["event_type"], "run_started");
+
+        let runs = svc.runs.read().await;
+        let live = runs.get(&run.run_id).expect("live run state");
+        assert_eq!(live.status, RunStatus::Running);
+        assert!(live.waiting_for.is_none());
+        assert!(!live.cancel_flag.load(Ordering::SeqCst));
+        assert_eq!(live.events.len(), 1);
+        assert_eq!(live.events[0]["event_type"], "run_started");
+    }
+
+    #[tokio::test]
+    async fn pause_run_transition_failure_does_not_commit_status_or_event() {
         let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]));
         let svc = test_service_with_store(store);
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
 
         let e = err(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
         assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(e.1.0.detail.contains("pause event"));
+        assert!(e.1.0.detail.contains("pause transition"));
 
         let durable = svc
             .run_engine
@@ -13416,7 +13975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_run_append_failure_rollback_succeeds_keeps_paused() {
+    async fn resume_run_transition_failure_does_not_commit_status_or_event() {
         let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[2]));
         let svc = test_service_with_store(store);
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
@@ -13424,7 +13983,7 @@ mod tests {
 
         let e = err(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
         assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(e.1.0.detail.contains("resume event"));
+        assert!(e.1.0.detail.contains("resume transition"));
 
         let durable = svc
             .run_engine
@@ -14036,52 +14595,6 @@ mod tests {
             count.load(Ordering::Acquire),
             0,
             "task completed — counter must be 0"
-        );
-    }
-
-    /// P1-A: RunStatus::try_transition enforces valid state machine transitions.
-    #[test]
-    fn run_status_try_transition_valid_and_invalid() {
-        use super::RunStatus::*;
-
-        // Valid transitions
-        assert!(Running.try_transition(&InputQueued).is_ok());
-        assert!(Running.try_transition(&Paused).is_ok());
-        assert!(Running.try_transition(&Completed).is_ok());
-        assert!(Running.try_transition(&Failed).is_ok());
-        assert!(Running.try_transition(&Cancelled).is_ok());
-        assert!(InputQueued.try_transition(&Running).is_ok());
-        assert!(InputQueued.try_transition(&Paused).is_ok());
-        assert!(InputQueued.try_transition(&Waiting).is_ok());
-        assert!(InputQueued.try_transition(&Completed).is_ok());
-        assert!(InputQueued.try_transition(&Failed).is_ok());
-        assert!(InputQueued.try_transition(&Cancelled).is_ok());
-        assert!(Paused.try_transition(&Running).is_ok());
-        assert!(Paused.try_transition(&Cancelled).is_ok());
-        assert!(Paused.try_transition(&Failed).is_ok());
-        assert!(Waiting.try_transition(&InputQueued).is_ok());
-
-        // Terminal states cannot transition
-        let err = Completed.try_transition(&Running);
-        assert!(err.is_err(), "Completed → Running must be rejected");
-        assert!(
-            err.unwrap_err().contains("Completed"),
-            "error must name the source state"
-        );
-
-        let err = Failed.try_transition(&Running);
-        assert!(err.is_err(), "Failed → Running must be rejected");
-
-        let err = Cancelled.try_transition(&Completed);
-        assert!(err.is_err(), "Cancelled → Completed must be rejected");
-
-        // Running cannot go back to Running
-        let err = Running.try_transition(&Running);
-        assert!(err.is_err(), "Running → Running must be rejected");
-
-        assert!(
-            InputQueued.try_transition(&InputQueued).is_ok(),
-            "InputQueued → InputQueued must stay queueable for repeated user input"
         );
     }
 

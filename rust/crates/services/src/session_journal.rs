@@ -1324,6 +1324,10 @@ pub enum JournalEventType {
     ApprovalDecision,
     /// An approval prompt timed out before a decision arrived.
     ApprovalTimeout,
+    /// An ask_user prompt was emitted and is waiting for a response.
+    AskUserPrompted,
+    /// An ask_user response was received.
+    AskUserResponse,
     /// Permission evaluation / approval / persistence audit event.
     PermissionAudit,
     /// A rollback-capable execution boundary started tracking side effects.
@@ -1996,6 +2000,59 @@ pub fn find_latest_approval_required(
             turn: event.turn,
             tool_name: approval_metadata_str(metadata, "tool_name"),
             approval_kind: approval_metadata_str(metadata, "approval_kind"),
+        }));
+    }
+    Ok(None)
+}
+
+fn ask_user_metadata_str(metadata: &serde_json::Value, field: &str) -> Option<String> {
+    metadata
+        .get("ask_user")
+        .and_then(|ask_user| ask_user.get(field))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskUserJournalResponse {
+    pub request_id: String,
+    pub run_id: Option<String>,
+    pub status: String,
+    pub answers: Option<serde_json::Value>,
+}
+
+pub fn find_latest_ask_user_response(
+    session_id: &str,
+    request_id: &str,
+) -> std::io::Result<Option<AskUserJournalResponse>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let events = read_journal(session_id)?;
+    for event in events.into_iter().rev() {
+        if event.event_type != JournalEventType::AskUserResponse {
+            continue;
+        }
+        let Some(metadata) = event.metadata.as_ref() else {
+            continue;
+        };
+        let Some(found_request_id) = ask_user_metadata_str(metadata, "request_id") else {
+            continue;
+        };
+        if found_request_id != request_id {
+            continue;
+        }
+        let Some(status) = ask_user_metadata_str(metadata, "status") else {
+            continue;
+        };
+        let answers = metadata
+            .get("ask_user")
+            .and_then(|ask_user| ask_user.get("answers"))
+            .cloned();
+        return Ok(Some(AskUserJournalResponse {
+            request_id: found_request_id,
+            run_id: ask_user_metadata_str(metadata, "run_id"),
+            status,
+            answers,
         }));
     }
     Ok(None)
@@ -3121,6 +3178,51 @@ impl JournalEvent {
                 "request_id": request_id,
                 "tool_name": tool_name,
                 "approval_kind": approval_kind,
+            }
+        }));
+        evt
+    }
+
+    pub fn ask_user_prompted(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        request_id: &str,
+        run_id: Option<&str>,
+        prompt: serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::AskUserPrompted, session_id);
+        evt.turn = turn;
+        evt.user_input = Some(truncate(&format!("ask_user_prompted {request_id}"), 200));
+        evt.metadata = Some(serde_json::json!({
+            "ask_user": {
+                "request_id": request_id,
+                "run_id": run_id.filter(|s| !s.is_empty()),
+                "prompt": prompt,
+            }
+        }));
+        evt
+    }
+
+    pub fn ask_user_response(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        request_id: &str,
+        run_id: Option<&str>,
+        status: &str,
+        answers: Option<serde_json::Value>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::AskUserResponse, session_id);
+        evt.turn = turn;
+        evt.user_input = Some(truncate(
+            &format!("ask_user_response {request_id} {status}"),
+            200,
+        ));
+        evt.metadata = Some(serde_json::json!({
+            "ask_user": {
+                "request_id": request_id,
+                "run_id": run_id.filter(|s| !s.is_empty()),
+                "status": status,
+                "answers": answers,
             }
         }));
         evt
@@ -4436,6 +4538,50 @@ mod approval_tests {
         assert_eq!(found.turn, Some(11));
         assert_eq!(found.tool_name.as_deref(), Some("bash"));
         assert_eq!(found.approval_kind.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn find_latest_ask_user_response_reads_latest_matching_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-ask-user").unwrap();
+
+        writer
+            .append(&JournalEvent::ask_user_prompted(
+                Some("sess-ask-user"),
+                Some(5),
+                "ask-1",
+                Some("run-1"),
+                serde_json::json!({"questions": []}),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::ask_user_response(
+                Some("sess-ask-user"),
+                Some(5),
+                "ask-1",
+                Some("run-1"),
+                "submitted",
+                Some(serde_json::json!({
+                    "answers": [{
+                        "question": "Continue?",
+                        "answers": ["yes"],
+                        "multi_select": false
+                    }]
+                })),
+            ))
+            .unwrap();
+
+        let found = find_latest_ask_user_response("sess-ask-user", "ask-1")
+            .unwrap()
+            .expect("ask_user response");
+        assert_eq!(found.request_id, "ask-1");
+        assert_eq!(found.run_id.as_deref(), Some("run-1"));
+        assert_eq!(found.status, "submitted");
+        assert_eq!(
+            found.answers.unwrap()["answers"][0]["answers"][0].as_str(),
+            Some("yes")
+        );
     }
 
     #[test]

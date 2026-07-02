@@ -162,6 +162,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(crate::server::run::handlers::get_run_projection_handler),
         )
         .route(
+            "/chat/runs/{run_id}/projection/repair",
+            post(crate::server::run::handlers::repair_run_projection_handler),
+        )
+        .route(
             "/chat/runs/{run_id}/stream",
             get(crate::server::run::handlers::stream_run_handler),
         )

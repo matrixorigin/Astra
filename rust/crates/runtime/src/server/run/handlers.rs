@@ -217,6 +217,12 @@ pub(crate) struct RunProjectionResponse {
 }
 
 #[derive(serde::Serialize)]
+pub(crate) struct RunProjectionRepairResponse {
+    pub repaired: bool,
+    pub projection: RunProjectionResponse,
+}
+
+#[derive(serde::Serialize)]
 pub(crate) struct PromptRequestObservabilityResponse {
     pub request_id: String,
     pub request_hash: String,
@@ -281,21 +287,51 @@ pub(crate) async fn get_run_projection_handler(
 ) -> Result<Json<RunProjectionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id.clone();
-    let mut projection = state
+    let projection = state
         .execution
         .run_lifecycle_service
         .get_run_projection(run_id.clone(), user_id.clone(), query.recent_limit)
         .await?;
+    Ok(Json(
+        build_run_projection_response(&state, &user_id, &run_id, projection).await?,
+    ))
+}
+
+pub(crate) async fn repair_run_projection_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<RunProjectionQuery>,
+) -> Result<Json<RunProjectionRepairResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
+    let projection = state
+        .execution
+        .run_lifecycle_service
+        .repair_run_projection(run_id.clone(), user_id.clone(), query.recent_limit)
+        .await?;
+    Ok(Json(RunProjectionRepairResponse {
+        repaired: true,
+        projection: build_run_projection_response(&state, &user_id, &run_id, projection).await?,
+    }))
+}
+
+async fn build_run_projection_response(
+    state: &AppState,
+    user_id: &str,
+    run_id: &str,
+    mut projection: astra_services::runs::RunProjectionRecord,
+) -> Result<RunProjectionResponse, (StatusCode, Json<ErrorResponse>)> {
     projection.recent_events =
-        transform_stream_run_events_for_client(&run_id, projection.recent_events);
+        transform_stream_run_events_for_client(run_id, projection.recent_events);
     let projection_lag_events =
         (projection.run_event_high_watermark - projection.projection_event_idx).max(0);
     let (observability_available, prompt_request_count, latest_prompt_request) =
-        load_run_prompt_observability(&state, &user_id, &run_id).await?;
+        load_run_prompt_observability(state, user_id, run_id).await?;
     let has_durable_projection = projection.run_event_high_watermark
         == projection.projection_event_idx
         || projection.projection_event_idx >= 0;
-    Ok(Json(RunProjectionResponse::new(
+    Ok(RunProjectionResponse::new(
         projection,
         RunProjectionObservabilityResponse {
             has_durable_projection,
@@ -304,7 +340,7 @@ pub(crate) async fn get_run_projection_handler(
             prompt_request_count,
             latest_prompt_request,
         },
-    )))
+    ))
 }
 
 async fn load_run_prompt_observability(
@@ -1149,6 +1185,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repair_run_projection_http_rebuilds_and_returns_projection() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run("run-projection-repair-http", "u1", "session-projection")
+            .await
+            .expect("start durable run");
+        engine
+            .transition_status_with_events_if_current(
+                "u1",
+                "run-projection-repair-http",
+                &[astra_core::STATUS_RUNNING],
+                astra_core::STATUS_FAILED,
+                None,
+                Some("boom"),
+                &[
+                    json!({"event_type": "run_error", "data": {"error": "boom"}}),
+                    json!({"event_type": "run_finished", "data": {"status": "failed"}}),
+                ],
+            )
+            .await
+            .expect("persist terminal transition");
+
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/runs/run-projection-repair-http/projection/repair?recent_limit=2")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("repair response should be valid json");
+        assert_eq!(json.get("repaired"), Some(&json!(true)));
+        assert_eq!(json.pointer("/projection/status"), Some(&json!("failed")));
+        assert_eq!(
+            json.pointer("/projection/latest_event_type"),
+            Some(&json!("run_finished"))
+        );
+        assert_eq!(
+            json.pointer("/projection/observability/projection_lag_events"),
+            Some(&json!(0))
+        );
+        let recent_events = json
+            .pointer("/projection/recent_events")
+            .and_then(serde_json::Value::as_array)
+            .expect("recent events should be present");
+        assert_eq!(recent_events.len(), 2);
+    }
+
+    #[tokio::test]
     async fn get_run_projection_http_hides_foreign_run() {
         use crate::server::run::engine::RunEngine;
         use crate::server::run::lifecycle::AgenticRunLifecycleService;
@@ -1180,6 +1294,48 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/chat/runs/run-foreign/projection")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn repair_run_projection_http_hides_foreign_run() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run("run-foreign-repair", "u2", "session-foreign")
+            .await
+            .expect("start durable run");
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/runs/run-foreign-repair/projection/repair")
                     .header("authorization", "Bearer good-token")
                     .body(Body::empty())
                     .expect("request should build"),

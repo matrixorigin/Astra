@@ -350,8 +350,18 @@ impl RunEngine {
             .await?;
         if updated {
             let summary = error_message.or(waiting_for);
-            self.project_delegation_run_if_needed(user_id, run_id, status, summary)
-                .await?;
+            if let Err(error) = self
+                .project_delegation_run_if_needed(user_id, run_id, status, summary)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    status,
+                    error = %error,
+                    "run transition committed but delegation projection refresh failed"
+                );
+            }
         }
         Ok(updated)
     }
@@ -381,8 +391,105 @@ impl RunEngine {
             .await?;
         if updated {
             let summary = error_message.or(waiting_for);
-            self.project_delegation_run_if_needed(user_id, run_id, status, summary)
-                .await?;
+            if let Err(error) = self
+                .project_delegation_run_if_needed(user_id, run_id, status, summary)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    status,
+                    error = %error,
+                    "run transition committed but delegation projection refresh failed"
+                );
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Atomically persist a status transition and its durable audit event.
+    ///
+    /// Use this for user/control-plane transitions where status without the
+    /// corresponding event would be an inconsistent durable fact.
+    pub async fn transition_status_with_event_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        event: serde_json::Value,
+    ) -> Result<bool, String> {
+        let updated = self
+            .store
+            .update_run_status_with_event_if_current(
+                user_id,
+                run_id,
+                expected_statuses,
+                status,
+                waiting_for,
+                error_message,
+                event,
+            )
+            .await?;
+        if updated {
+            let summary = error_message.or(waiting_for);
+            if let Err(error) = self
+                .project_delegation_run_if_needed(user_id, run_id, status, summary)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    status,
+                    error = %error,
+                    "run transition committed but delegation projection refresh failed"
+                );
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Atomically persist a status transition and a durable audit event batch.
+    ///
+    /// Empty `events` is valid and behaves as a CAS status transition.
+    pub async fn transition_status_with_events_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        let updated = self
+            .store
+            .update_run_status_with_events_if_current(
+                user_id,
+                run_id,
+                expected_statuses,
+                status,
+                waiting_for,
+                error_message,
+                events,
+            )
+            .await?;
+        if updated {
+            let summary = error_message.or(waiting_for);
+            if let Err(error) = self
+                .project_delegation_run_if_needed(user_id, run_id, status, summary)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    status,
+                    error = %error,
+                    "run transition committed but delegation projection refresh failed"
+                );
+            }
         }
         Ok(updated)
     }
@@ -468,6 +575,15 @@ impl RunEngine {
         run_id: &str,
     ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
         self.store.load_run_projection(user_id, run_id).await
+    }
+
+    /// Rebuild the durable display projection from authoritative run facts.
+    pub async fn rebuild_run_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+        self.store.rebuild_run_projection(user_id, run_id).await
     }
 
     /// Append an event to the durable event log.
@@ -978,6 +1094,32 @@ mod tests {
             Err("store unavailable".into())
         }
 
+        async fn update_run_status_with_event_if_current(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+            _expected_statuses: &[&str],
+            _status: &str,
+            _waiting_for: Option<&str>,
+            _error_message: Option<&str>,
+            _event: serde_json::Value,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn update_run_status_with_events_if_current(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+            _expected_statuses: &[&str],
+            _status: &str,
+            _waiting_for: Option<&str>,
+            _error_message: Option<&str>,
+            _events: &[serde_json::Value],
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
         async fn update_run_usage(
             &self,
             _user_id: &str,
@@ -1008,6 +1150,14 @@ mod tests {
         }
 
         async fn load_run_projection(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn rebuild_run_projection(
             &self,
             _user_id: &str,
             _run_id: &str,

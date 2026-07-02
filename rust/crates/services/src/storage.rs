@@ -3124,22 +3124,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    query(
-        "CREATE TABLE IF NOT EXISTS model_gateways (
-            id VARCHAR(128) PRIMARY KEY,
-            resolve_url LONGTEXT NOT NULL,
-            model_protocol VARCHAR(64) NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            metadata_json LONGTEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            disabled_at DATETIME(6) NULL,
-            INDEX idx_model_gateways_status_created (status, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
     // via `astra admin config set/get/unset` (first key: `reasoning_model_name`).
     query(
@@ -3389,28 +3373,6 @@ pub async fn ensure_core_schema(
         &["user_id", "request_id"],
         "ALTER TABLE edge_pending_dispatch ADD UNIQUE KEY uq_edge_dispatch_owner_request (user_id, request_id)",
     )
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS agent_bindings (
-            id VARCHAR(64) PRIMARY KEY,
-            binding_name VARCHAR(255) NOT NULL,
-            idempotency_key VARCHAR(255) NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            agent_md LONGTEXT NOT NULL,
-            capability_servers_json LONGTEXT NOT NULL,
-            runtime_policy_json LONGTEXT NOT NULL,
-            metadata_json LONGTEXT NULL,
-            binding_schema_version VARCHAR(32) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            disabled_at DATETIME(6) NULL,
-            UNIQUE KEY uq_agent_bindings_name (binding_name),
-            UNIQUE KEY uq_agent_bindings_idempotency_key (idempotency_key),
-            INDEX idx_agent_bindings_status_created (status, created_at)
-        )",
-    )
-    .execute(&pool)
     .await?;
 
     query(
@@ -5565,6 +5527,39 @@ mod tests {
         assert!(
             !ddl_source.contains("context_window INT NOT NULL DEFAULT"),
             "model registry must not silently replace missing context_window with 200K"
+        );
+    }
+
+    #[test]
+    fn core_schema_has_no_duplicate_create_table_declarations() {
+        let source = include_str!("storage.rs");
+        let ddl_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production storage DDL source");
+
+        let marker = "CREATE TABLE IF NOT EXISTS ";
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for rest in ddl_source.split(marker).skip(1) {
+            let table = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect::<String>();
+            assert!(
+                !table.is_empty(),
+                "CREATE TABLE declaration must include a parseable table name"
+            );
+            *counts.entry(table).or_default() += 1;
+        }
+
+        let duplicates: Vec<_> = counts
+            .iter()
+            .filter_map(|(table, count)| (*count > 1).then_some(format!("{table}:{count}")))
+            .collect();
+        assert!(
+            duplicates.is_empty(),
+            "duplicate CREATE TABLE declarations are not allowed: {}",
+            duplicates.join(", ")
         );
     }
 
