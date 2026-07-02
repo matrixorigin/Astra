@@ -123,10 +123,11 @@ class SchemaInventoryTest(unittest.TestCase):
 
     def test_auto_increment_audit_baseline_excludes_message_queue(self) -> None:
         auto_increment = set(self.summary["auto_increment_tables"])
-        self.assertEqual(len(auto_increment), 6)
+        self.assertEqual(len(auto_increment), 5)
         self.assertNotIn("agent_message_queue", auto_increment)
         self.assertNotIn("edge_pending_dispatch", auto_increment)
         self.assertNotIn("context_manifest_items", auto_increment)
+        self.assertNotIn("session_state_item_events", auto_increment)
         self.assertIn("auth_user_roles", auto_increment)
         self.assertIn("mcp_servers", auto_increment)
 
@@ -159,6 +160,13 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
         self.assertIn("manifest-local item", row["primary_query"])
 
+    def test_session_state_item_events_uses_owner_event_identity(self) -> None:
+        row = self.tables["session_state_item_events"]
+        self.assertEqual(row["primary_key"], ["user_id", "event_id"])
+        self.assertEqual(row["auto_increment_columns"], [])
+        self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
+        self.assertIn("state item audit", row["primary_query"])
+
     def test_every_auto_increment_table_has_risk_audit_metadata(self) -> None:
         self.assertEqual([], self.summary["unaudited_auto_increment_tables"])
         for table in self.summary["auto_increment_tables"]:
@@ -176,18 +184,16 @@ class SchemaInventoryTest(unittest.TestCase):
                         f"{table}.{field} must be explicit for AUTO_INCREMENT audit",
                     )
 
-    def test_auto_increment_risk_classifies_remaining_warm_coordination_tables(self) -> None:
-        self.assertEqual(
-            self.tables["session_state_item_events"]["auto_increment_hotspot_risk"],
-            "medium",
-        )
-        self.assertIn(
-            "owner/session/item",
-            self.tables["session_state_item_events"]["auto_increment_owner_boundary"],
-        )
-
-    def test_auto_increment_risk_keeps_auth_admin_tables_low_priority(self) -> None:
-        for table in ["auth_user_roles", "auth_external_identities", "mcp_servers"]:
+    def test_auto_increment_risk_keeps_remaining_admin_tables_low_priority(self) -> None:
+        remaining = {
+            "auth_external_identities",
+            "auth_user_roles",
+            "mcp_bindings",
+            "mcp_servers",
+            "mcp_tools",
+        }
+        self.assertEqual(set(self.summary["auto_increment_tables"]), remaining)
+        for table in remaining:
             with self.subTest(table=table):
                 self.assertEqual(
                     self.tables[table]["auto_increment_hotspot_risk"],

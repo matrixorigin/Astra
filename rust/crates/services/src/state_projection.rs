@@ -734,10 +734,11 @@ impl DatabaseStateProjectionStore {
         })?;
         sqlx::query(
             "INSERT INTO session_state_item_events
-             (item_id, user_id, session_id, category, item_key, mutation, next_hash,
+             (event_id, item_id, user_id, session_id, category, item_key, mutation, next_hash,
               payload_json, provenance_event_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
+        .bind(new_state_item_event_id())
         .bind(&item_id)
         .bind(&item.user_id)
         .bind(&item.session_id)
@@ -973,10 +974,11 @@ impl DatabaseStateProjectionStore {
 
         sqlx::query(
             "INSERT INTO session_state_item_events
-             (item_id, user_id, session_id, category, item_key, mutation, next_hash,
+             (event_id, item_id, user_id, session_id, category, item_key, mutation, next_hash,
               payload_json, created_at)
-             VALUES (?, ?, ?, 'delegation_state', ?, 'insert', ?, ?, NOW(6))",
+             VALUES (?, ?, ?, ?, 'delegation_state', ?, 'insert', ?, ?, NOW(6))",
         )
+        .bind(new_state_item_event_id())
         .bind(&item_id)
         .bind(&record.user_id)
         .bind(&record.session_id)
@@ -1068,10 +1070,11 @@ impl DatabaseStateProjectionStore {
             })?;
             sqlx::query(
                 "INSERT INTO session_state_item_events
-                 (item_id, user_id, session_id, category, item_key, mutation, next_hash,
+                 (event_id, item_id, user_id, session_id, category, item_key, mutation, next_hash,
                   payload_json, created_at)
-                 VALUES (?, ?, ?, 'delegation_state', ?, 'bubble_up', ?, ?, NOW(6))",
+                 VALUES (?, ?, ?, ?, 'delegation_state', ?, 'bubble_up', ?, ?, NOW(6))",
             )
+            .bind(new_state_item_event_id())
             .bind(&item_id)
             .bind(user_id)
             .bind(&target.session_id)
@@ -1252,10 +1255,11 @@ impl DatabaseStateProjectionStore {
         })?;
         sqlx::query(
             "INSERT INTO session_state_item_events
-             (item_id, user_id, session_id, category, item_key, mutation, next_hash,
+             (event_id, item_id, user_id, session_id, category, item_key, mutation, next_hash,
               payload_json, provenance_event_id, created_at)
-             VALUES (?, ?, ?, 'active_skill', ?, 'activate', ?, ?, ?, NOW(6))",
+             VALUES (?, ?, ?, ?, 'active_skill', ?, 'activate', ?, ?, ?, NOW(6))",
         )
+        .bind(new_state_item_event_id())
         .bind(&item_id)
         .bind(user_id)
         .bind(session_id)
@@ -1723,6 +1727,10 @@ fn content_hash(content: &str) -> String {
     format!("sha256:{digest:x}")
 }
 
+fn new_state_item_event_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
 fn artifact_ids_from_state_payload(payload: &serde_json::Value) -> Vec<String> {
     fn visit(value: &serde_json::Value, out: &mut Vec<String>) {
         match value {
@@ -1771,6 +1779,36 @@ pub fn validate_state_mutation(mutation: &str) -> Result<(), StateProjectionErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_item_event_writes_bind_application_event_id() {
+        let source = include_str!("state_projection.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production state_projection source");
+        let insert_count = production
+            .matches("INSERT INTO session_state_item_events")
+            .count();
+        assert_eq!(
+            insert_count, 4,
+            "new state item event insert paths must bind event_id explicitly"
+        );
+        assert_eq!(
+            production
+                .matches("(event_id, item_id, user_id, session_id")
+                .count(),
+            insert_count,
+            "every state item event insert must include event_id as the first column"
+        );
+        assert_eq!(
+            production
+                .matches(".bind(new_state_item_event_id())")
+                .count(),
+            insert_count,
+            "every state item event insert must use an application-generated event id"
+        );
+    }
 
     #[derive(Clone)]
     struct FakeStateProjectionRow {

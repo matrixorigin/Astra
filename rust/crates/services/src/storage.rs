@@ -2377,7 +2377,7 @@ pub async fn ensure_core_schema(
     }
     query(
         "CREATE TABLE IF NOT EXISTS session_state_item_events (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            event_id VARCHAR(64) NOT NULL,
             item_id VARCHAR(128) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
@@ -2394,12 +2394,22 @@ pub async fn ensure_core_schema(
             trace_id VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_state_item_event_mutation CHECK (mutation IN ('insert', 'update', 'replace', 'archive', 'delete', 'bubble_up', 'apply_suggestion', 'activate')),
-            INDEX idx_state_events_item_created (item_id, created_at, id),
-            INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, id),
-            INDEX idx_state_events_category_created (category, created_at)
+            PRIMARY KEY (user_id, event_id),
+            INDEX idx_state_events_item_created (item_id, created_at, event_id),
+            INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, event_id),
+            INDEX idx_state_events_category_created (category, created_at, event_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "session_state_item_events",
+        &["user_id", "event_id"],
+        &["id"],
+        &[],
+    )
     .await?;
     drop_index_if_present(
         &pool,
@@ -2408,13 +2418,39 @@ pub async fn ensure_core_schema(
         "idx_state_events_session_created",
     )
     .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "session_state_item_events",
+        &["user_id", "event_id"],
+        "ALTER TABLE session_state_item_events ADD PRIMARY KEY (user_id, event_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "session_state_item_events",
+        "idx_state_events_item_created",
+        &["item_id", "created_at", "event_id"],
+        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_item_created (item_id, created_at, event_id)",
+    )
+    .await?;
     ensure_index_shape(
         &pool,
         &settings.database,
         "session_state_item_events",
         "idx_state_events_owner_session_created",
-        &["user_id", "session_id", "created_at", "id"],
-        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, id)",
+        &["user_id", "session_id", "created_at", "event_id"],
+        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, event_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "session_state_item_events",
+        "idx_state_events_category_created",
+        &["category", "created_at", "event_id"],
+        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_category_created (category, created_at, event_id)",
     )
     .await?;
 
@@ -5508,6 +5544,51 @@ mod tests {
         assert!(
             source.contains("&[\"uq_manifest_item_order\"]"),
             "legacy unique-key-plus-surrogate schemas must fail startup instead of preserving the old shape"
+        );
+    }
+
+    #[test]
+    fn session_state_item_events_identity_is_owner_event_bound() {
+        let source = include_str!("storage.rs");
+        let ddl = source
+            .split("CREATE TABLE IF NOT EXISTS session_state_item_events")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("session_state_item_events DDL");
+
+        assert!(
+            ddl.contains("event_id VARCHAR(64) NOT NULL"),
+            "session_state_item_events must use an application-generated event identity"
+        );
+        assert!(
+            ddl.contains("PRIMARY KEY (user_id, event_id)"),
+            "session_state_item_events must keep event identity owner-bound"
+        );
+        assert!(
+            ddl.contains("idx_state_events_item_created (item_id, created_at, event_id)"),
+            "item audit queries must keep a deterministic event_id tie-breaker"
+        );
+        assert!(
+            ddl.contains(
+                "idx_state_events_owner_session_created (user_id, session_id, created_at, event_id)"
+            ),
+            "owner/session audit queries must keep a deterministic event_id tie-breaker"
+        );
+        assert!(
+            !ddl.contains("id BIGINT AUTO_INCREMENT"),
+            "session_state_item_events must not reintroduce a global AUTO_INCREMENT surrogate"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE session_state_item_events ADD PRIMARY KEY (user_id, event_id)"
+            ),
+            "schema bootstrap must verify the owner/event primary key"
+        );
+        assert!(
+            source.contains(
+                "\"session_state_item_events\",\n        &[\"user_id\", \"event_id\"],\n        &[\"id\"]"
+            ),
+            "legacy id schemas must fail startup instead of preserving the old hot surrogate"
         );
     }
 

@@ -175,12 +175,6 @@ DEFAULT_AUTO_INCREMENT_METADATA = AutoIncrementMetadata(
 
 
 AUTO_INCREMENT_METADATA: dict[str, AutoIncrementMetadata] = {
-    "session_state_item_events": AutoIncrementMetadata(
-        write_profile="warm-to-hot state projection append",
-        owner_boundary="owner/session/item scoped columns, but primary key is global id",
-        hotspot_risk="medium",
-        guidance="consider item-scoped event sequence or ULID if projection event volume grows; id is mainly a tie-breaker in created_at indexes",
-    ),
     "auth_user_roles": AutoIncrementMetadata(
         write_profile="low-frequency admin/auth role grant",
         owner_boundary="user/role unique key",
@@ -374,6 +368,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from context_manifests; item-level ordering, source refs, token budgets, and raw refs are independently queried",
         migration_owner="astra_services::storage / context_manifest",
         product_owner="LLM context assembly traceability",
+    ),
+    "session_state_item_events": TableMetadata(
+        semantic_owner="astra_services::state_projection",
+        state_class="durable state projection audit event",
+        primary_query="state item audit by item_id/created_at/event_id and owner session audit by user_id/session_id/created_at/event_id",
+        retention_policy="retain with session_state_items while compaction invariants, projection debugging, and user/session audit need mutation history",
+        rebuildability="not fully rebuildable after source mutation context is gone",
+        merge_guidance="keep separate from session_state_items; the item table is current projection state, while this table records mutation history",
+        migration_owner="astra_services::storage / state_projection",
+        product_owner="session state projection, compaction invariants, active skill/delegation audit",
     ),
 }
 
