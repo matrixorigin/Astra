@@ -84,15 +84,11 @@ If `reasoning_model_name` is not set, the server falls back to the cheapest acti
 - `ASTRA_LLM_PROVIDER_ADMISSION_SCOPE` — `provider` or `provider_model`; default `provider`
 - `ASTRA_RUN_ADMISSION_TIMEOUT_SECS` — per-run wait time before the pod-local run semaphore returns `run_admission_timeout`; default `30`
 - `ASTRA_AUX_LLM_POLICY` — global policy for optional auxiliary LLM calls; `capacity_aware` by default skips optional auxiliary calls when provider admission is enabled, `always` preserves them, `disabled` turns them off
-- `ASTRA_TURN_INTENT_JUDGE_POLICY`, `ASTRA_FACTUAL_RETRY_JUDGE_POLICY`, `ASTRA_PRE_TURN_COMPACTION_LLM_POLICY` — per-purpose overrides for auxiliary LLM policy
-- `ASTRA_TURN_OBSERVER_MODE` — server-loop Memoria observer dispatch mode; `async` by default keeps terminal run finalization from waiting on observer HTTP calls, `inline` restores synchronous completion, `disabled` skips the optional observer
-- `ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY` — max in-flight async server-loop observer calls per process; default `4`, and `0` drops async observer requests without sending them
-- `ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE` — post-loop session-memory final flush and session-end governance dispatch mode; `async` by default keeps optional Memoria work from holding run admission slots, `inline` restores synchronous cleanup, `disabled` skips external cleanup while still resetting local process state
-- `ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY` — max in-flight async post-loop memory cleanup tasks per process; default `4`, and `0` drops external cleanup work after local reset
-- `ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS` — max time an individual post-loop cleanup worker waits for session-memory extraction workers before continuing; default `1000`
 - `ASTRA_CAPTURE_TRACES`
 
 Diagnostic DB history is controlled through `runtime.toml` trace categories, not separate environment variables. Production defaults keep high-volume diagnostic tables off; `trace.profile = "dev"` enables them. For custom profiles, enable `context_assembly` for context manifests, `prompt_assembly` for prompt request deltas, and `harness_snapshots` for durable harness snapshot history.
+
+Server-loop Memoria observer and post-loop memory cleanup are fixed internal async best-effort side effects with bounded in-process concurrency. They are intentionally not environment-configurable; they must not hold run admission slots or become deployment-specific tuning surfaces.
 
 ### Observability
 
