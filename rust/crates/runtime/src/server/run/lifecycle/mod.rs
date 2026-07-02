@@ -273,6 +273,40 @@ fn run_admission_capacity_response(error: RunAdmissionError) -> (StatusCode, Jso
     )
 }
 
+fn pre_spawn_failure_error_code(message: &str) -> &'static str {
+    if message.contains("capacity timeout") {
+        "run_admission_timeout"
+    } else if message.contains("capacity admission closed") {
+        "run_admission_closed"
+    } else {
+        "pre_spawn_failure"
+    }
+}
+
+fn pre_spawn_failure_terminal_events(message: &str) -> [Value; 2] {
+    let error_code = pre_spawn_failure_error_code(message);
+    [
+        json!({
+            "event_type": "run_error",
+            "data": {
+                "error": message,
+                "error_code": error_code,
+                "error_kind": "server_error",
+            },
+        }),
+        json!({
+            "event_type": "run_finished",
+            "data": {
+                "total_prompt_tokens": 0,
+                "total_completion_tokens": 0,
+                "error": message,
+                "error_code": error_code,
+                "error_kind": "server_error",
+            },
+        }),
+    ]
+}
+
 fn per_user_run_quota_response(
     limit: astra_services::resource_governor::ResourceLimitKind,
     reason: String,
@@ -2835,10 +2869,10 @@ impl AgenticRunLifecycleService {
     }
 
     async fn fail_started_run_before_spawn(&self, user_id: &str, run_id: &str, message: &str) {
-        self.runs.write().await.remove(run_id);
+        let terminal_events = pre_spawn_failure_terminal_events(message);
         astra_core::log_persist!(
             self.run_engine
-                .persist_status_if_current(
+                .transition_status_with_events_if_current(
                     user_id,
                     run_id,
                     &[
@@ -2850,12 +2884,14 @@ impl AgenticRunLifecycleService {
                     STATUS_FAILED,
                     None,
                     Some(message),
+                    &terminal_events,
                 )
                 .await,
             "run_lifecycle",
             run_id,
-            "pre_spawn_failure"
+            "pre_spawn_failure_transition"
         );
+        self.runs.write().await.remove(run_id);
     }
 
     fn finalize_run_events(
@@ -16191,6 +16227,90 @@ mod tests {
         .await
         .expect("timeout waiting for durable run status to finalize");
         assert_ne!(durable.status, "running");
+    }
+
+    #[tokio::test]
+    async fn fail_started_run_before_spawn_persists_terminal_events() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-pre-spawn", "user-1", "session-1")
+            .await
+            .unwrap();
+
+        svc.fail_started_run_before_spawn(
+            "user-1",
+            "run-pre-spawn",
+            "server capacity timeout before agentic loop start",
+        )
+        .await;
+
+        let durable = engine
+            .load_run("user-1", "run-pre-spawn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_FAILED);
+        assert_eq!(durable.error_code.as_deref(), Some("run_admission_timeout"));
+        assert!(
+            durable.events.iter().any(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("run_error")
+                    && event
+                        .get("data")
+                        .and_then(Value::as_object)
+                        .and_then(|data| data.get("error_code"))
+                        .and_then(Value::as_str)
+                        == Some("run_admission_timeout")
+            }),
+            "durable run_error must explain the pre-spawn failure"
+        );
+        assert!(
+            durable.events.iter().any(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("run_finished")
+                    && event
+                        .get("data")
+                        .and_then(Value::as_object)
+                        .and_then(|data| data.get("error_kind"))
+                        .and_then(Value::as_str)
+                        == Some("server_error")
+            }),
+            "durable run_finished must preserve the pre-spawn terminal code"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_started_run_before_spawn_transition_failure_does_not_commit_partial_terminal() {
+        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]));
+        let svc = test_service_with_store(store);
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-pre-spawn-fail", "user-1", "session-1")
+            .await
+            .unwrap();
+
+        svc.fail_started_run_before_spawn(
+            "user-1",
+            "run-pre-spawn-fail",
+            "server capacity timeout before agentic loop start",
+        )
+        .await;
+
+        let durable = engine
+            .load_run("user-1", "run-pre-spawn-fail")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_RUNNING);
+        assert!(durable.error_code.is_none());
+        assert!(
+            durable.events.iter().all(|event| {
+                !matches!(
+                    event.get("event_type").and_then(Value::as_str),
+                    Some("run_error" | "run_finished")
+                )
+            }),
+            "failed pre-spawn transition must not leave partial terminal events"
+        );
     }
 
     #[tokio::test]
