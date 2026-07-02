@@ -696,12 +696,18 @@ mod tests {
             vec![
                 json!({
                     "event_type": "run_error",
-                    "data": {"error": "boom"},
+                    "data": {"error": "boom", "error_code": "network", "error_kind": "network"},
                     "index": 10
                 }),
                 json!({
                     "event_type": "run_finished",
-                    "data": {"prompt_tokens": 7, "completion_tokens": 3, "tool_call_count": 2},
+                    "data": {
+                        "prompt_tokens": 7,
+                        "completion_tokens": 3,
+                        "tool_call_count": 2,
+                        "error_code": "network",
+                        "error_kind": "network"
+                    },
                     "index": 11
                 }),
                 json!({
@@ -714,7 +720,18 @@ mod tests {
 
         assert_eq!(
             transformed[0],
-            json!({"type": "run_error", "message": "boom", "error": "boom", "code": "RUN_ERROR", "run_id": "run-123", "index": 10})
+            json!({
+                "type": "run_error",
+                "message": "boom",
+                "error": "boom",
+                "code": "LLM_TRANSPORT_ERROR",
+                "error_code": "network",
+                "error_kind": "network",
+                "retryable": true,
+                "retry_after_ms": 3000,
+                "run_id": "run-123",
+                "index": 10
+            })
         );
         assert_eq!(
             transformed[1],
@@ -722,7 +739,15 @@ mod tests {
         );
         assert_eq!(
             transformed[2],
-            json!({"type": "run_finished", "run_id": "run-123", "status": "failed", "error": "boom", "index": 11})
+            json!({
+                "type": "run_finished",
+                "run_id": "run-123",
+                "status": "failed",
+                "error": "boom",
+                "error_code": "network",
+                "error_kind": "network",
+                "index": 11
+            })
         );
         assert_eq!(
             transformed[3],

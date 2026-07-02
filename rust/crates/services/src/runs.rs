@@ -1361,6 +1361,8 @@ impl RunStateStore for InMemoryRunStateStore {
             return Ok(false);
         }
         let latest_event_type = extract_event_type(&event);
+        let terminal_error_code =
+            terminal_error_code_from_events(status, std::slice::from_ref(&event));
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
@@ -1371,6 +1373,9 @@ impl RunStateStore for InMemoryRunStateStore {
                     run.waiting_for = waiting_for.map(ToString::to_string);
                     if let Some(msg) = error_message {
                         run.error_message = Some(msg.to_string());
+                    }
+                    if let Some(code) = terminal_error_code.as_ref() {
+                        run.error_code = Some(code.clone());
                     }
                     run.events.push(event);
                     run.last_event_idx = run.events.len() as i64 - 1;
@@ -1404,6 +1409,7 @@ impl RunStateStore for InMemoryRunStateStore {
             return Ok(false);
         }
         let latest_event_type = events.last().map(extract_event_type);
+        let terminal_error_code = terminal_error_code_from_events(status, events);
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
@@ -1414,6 +1420,9 @@ impl RunStateStore for InMemoryRunStateStore {
                     run.waiting_for = waiting_for.map(ToString::to_string);
                     if let Some(msg) = error_message {
                         run.error_message = Some(msg.to_string());
+                    }
+                    if let Some(code) = terminal_error_code.as_ref() {
+                        run.error_code = Some(code.clone());
                     }
                     if !events.is_empty() {
                         run.events.extend(events.iter().cloned());
@@ -2744,6 +2753,8 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
+        let terminal_error_code =
+            terminal_error_code_from_events(status, std::slice::from_ref(&event));
 
         let mut tx = self.pool.get().begin().await.map_err(|source| {
             db_error("transition_run_status_with_event_begin", run_id, source).to_string()
@@ -2828,6 +2839,10 @@ impl RunStateStore for DatabaseRunStateStore {
         if let Some(error_message) = error_message {
             update.push(", error_message = ");
             update.push_bind(error_message);
+        }
+        if let Some(error_code) = terminal_error_code.as_deref() {
+            update.push(", error_code = ");
+            update.push_bind(error_code);
         }
         update.push(", last_event_idx = ");
         update.push_bind(event_idx);
@@ -2926,6 +2941,7 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
+        let terminal_error_code = terminal_error_code_from_events(status, events);
 
         let mut tx = self.pool.get().begin().await.map_err(|source| {
             db_error("transition_run_status_with_events_begin", run_id, source).to_string()
@@ -3013,6 +3029,10 @@ impl RunStateStore for DatabaseRunStateStore {
         if let Some(error_message) = error_message {
             update.push(", error_message = ");
             update.push_bind(error_message);
+        }
+        if let Some(error_code) = terminal_error_code.as_deref() {
+            update.push(", error_code = ");
+            update.push_bind(error_code);
         }
         update.push(", last_event_idx = ");
         update.push_bind(next_last_event_idx);
@@ -4087,6 +4107,38 @@ fn run_error_client_surface(error_kind: &str) -> Option<(&'static str, bool, Opt
     }
 }
 
+fn data_string(data: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    data.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn run_error_code_from_data(data: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    data_string(data, "error_code").or_else(|| data_string(data, "error_kind"))
+}
+
+fn run_error_code_from_event(event: &serde_json::Value) -> Option<String> {
+    let event_type = event
+        .get("event_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if event_type != "run_error" && event_type != "run_finished" {
+        return None;
+    }
+    event
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .or_else(|| event.as_object())
+        .and_then(run_error_code_from_data)
+}
+
+fn terminal_error_code_from_events(status: &str, events: &[serde_json::Value]) -> Option<String> {
+    if status != STATUS_FAILED {
+        return None;
+    }
+    events.iter().rev().find_map(run_error_code_from_event)
+}
+
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
     // Already-client-ready shape (`{"type": ..., ...}`): allowlist the
     // `type` value. Drop anything not explicitly safe for external
@@ -4234,6 +4286,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     "run_id",
                     "status",
                     "error",
+                    "error_code",
                     "error_kind",
                     "interrupted",
                     "interruption_kind",
@@ -4255,6 +4308,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 .and_then(serde_json::Value::as_str)
                 .and_then(run_error_client_surface);
             let code = surface.map_or("RUN_ERROR", |(code, _, _)| code);
+            let error_code = run_error_code_from_data(&data);
             let mut out = serde_json::Map::from_iter([
                 (
                     "type".to_string(),
@@ -4267,6 +4321,12 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     serde_json::Value::String(code.to_string()),
                 ),
             ]);
+            if let Some(error_code) = error_code {
+                out.insert(
+                    "error_code".to_string(),
+                    serde_json::Value::String(error_code),
+                );
+            }
             if let Some((_, retryable, retry_after_ms)) = surface {
                 out.insert("retryable".to_string(), serde_json::Value::Bool(retryable));
                 if let Some(retry_after_ms) = retry_after_ms {
@@ -5359,12 +5419,13 @@ mod tests {
 
         let finished = transform_run_event_for_client(make_event(
             "run_finished",
-            json!({"run_id": "run-1", "status": "failed", "error": "boom"}),
+            json!({"run_id": "run-1", "status": "failed", "error": "boom", "error_code": "network"}),
         ));
         assert_eq!(finished["type"], "run_finished");
         assert_eq!(finished["run_id"], "run-1");
         assert_eq!(finished["status"], "failed");
         assert_eq!(finished["error"], "boom");
+        assert_eq!(finished["error_code"], "network");
 
         let waiting = transform_run_event_for_client(make_event(
             "run_waiting",
@@ -5392,6 +5453,7 @@ mod tests {
         assert_eq!(out["type"], "run_error");
         assert_eq!(out["message"], "slow down");
         assert_eq!(out["error_kind"], "rate_limit");
+        assert_eq!(out["error_code"], "rate_limit");
         assert_eq!(out["code"], "LLM_RATE_LIMIT");
         assert_eq!(out["retryable"], true);
         assert_eq!(out["retry_after_ms"], 5_000);
@@ -5401,6 +5463,7 @@ mod tests {
             json!({"error": "provider 500", "error_kind": "server_error"}),
         ));
         assert_eq!(out["code"], "SERVER_ERROR");
+        assert_eq!(out["error_code"], "server_error");
         assert_eq!(out["retryable"], true);
         assert_eq!(out["retry_after_ms"], 2_000);
     }
@@ -6170,8 +6233,14 @@ mod tests {
             .unwrap();
 
         let events = vec![
-            make_event("run_error", json!({"error": "boom"})),
-            make_event("run_finished", json!({"status": "failed"})),
+            make_event(
+                "run_error",
+                json!({"error": "boom", "error_code": "network", "error_kind": "network"}),
+            ),
+            make_event(
+                "run_finished",
+                json!({"status": "failed", "error_code": "network"}),
+            ),
         ];
         let updated = store
             .update_run_status_with_events_if_current(
@@ -6193,6 +6262,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.status, STATUS_FAILED);
+        assert_eq!(loaded.error_code.as_deref(), Some("network"));
         assert_eq!(loaded.error_message.as_deref(), Some("boom"));
         assert_eq!(loaded.last_event_idx, 1);
         assert_eq!(loaded.events.len(), 2);

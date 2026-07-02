@@ -468,13 +468,16 @@ async def stream_sse_request(
                 if event_type == "session_info":
                     session_id = string_or_none(event.get("session_id")) or session_id
                     run_id = string_or_none(event.get("run_id")) or run_id
-                elif event_type == "error":
-                    error_code = string_or_none(event.get("error_code")) or string_or_none(event.get("code"))
-                    error_message = string_or_none(event.get("message"))
+                elif event_type in ("error", "run_error"):
+                    error_code = error_code_from_event(event) or error_code
+                    error_message = error_message_from_event(event) or error_message
                     retryable = bool(event.get("retryable")) if "retryable" in event else None
-                    outcome = "sse_error"
+                    if event_type == "error":
+                        outcome = "sse_error"
                 elif event_type == "run_finished":
                     terminal_status = string_or_none(event.get("status"))
+                    error_code = error_code or error_code_from_event(event)
+                    error_message = error_message or error_message_from_event(event)
                     if terminal_status in ("completed", "succeeded", "success", "ok"):
                         outcome = "completed"
                     else:
@@ -1077,6 +1080,14 @@ def counts_by(values: list[str]) -> dict[str, int]:
 
 def string_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def error_code_from_event(event: dict[str, Any]) -> str | None:
+    return string_or_none(event.get("error_code")) or string_or_none(event.get("code"))
+
+
+def error_message_from_event(event: dict[str, Any]) -> str | None:
+    return string_or_none(event.get("message")) or string_or_none(event.get("error"))
 
 
 def round_or_none(value: float | None) -> float | None:

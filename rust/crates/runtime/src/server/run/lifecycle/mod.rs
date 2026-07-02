@@ -2631,13 +2631,22 @@ impl AgenticRunLifecycleService {
                 }
                 Err(err) => {
                     let msg = err.to_string();
+                    let error_code = err.kind.as_str();
                     events.push(json!({
                         "event_type": "run_error",
-                        "data": {"error": &msg, "error_kind": err.kind.as_str()}
+                        "data": {
+                            "error": &msg,
+                            "error_code": error_code,
+                            "error_kind": error_code,
+                        }
                     }));
+                    let mut finished = usage;
+                    finished["error"] = Value::String(msg.clone());
+                    finished["error_code"] = Value::String(error_code.to_string());
+                    finished["error_kind"] = Value::String(error_code.to_string());
                     events.push(json!({
                         "event_type": "run_finished",
-                        "data": usage,
+                        "data": finished,
                     }));
                     (RunStatus::Failed, Some(msg))
                 }
@@ -12407,6 +12416,44 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["event_type"], "run_error");
         assert_eq!(events[1]["event_type"], "run_finished");
+    }
+
+    #[test]
+    fn finalize_run_events_preserves_classified_error_code() {
+        let svc = test_service();
+        let request = test_request("network");
+        let state = svc.build_initial_state(
+            "test-user",
+            &request,
+            "session-1",
+            "run-1",
+            None,
+            None,
+            None,
+        );
+
+        let classified = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Network,
+            "LLM request failed: connection reset",
+        );
+        let (events, status, error) =
+            AgenticRunLifecycleService::finalize_run_events(Err(classified), vec![], &state);
+
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(
+            error.as_deref(),
+            Some("[network] LLM request failed: connection reset")
+        );
+        assert_eq!(events[0]["event_type"], "run_error");
+        assert_eq!(events[0]["data"]["error_code"], "network");
+        assert_eq!(events[0]["data"]["error_kind"], "network");
+        assert_eq!(events[1]["event_type"], "run_finished");
+        assert_eq!(events[1]["data"]["error_code"], "network");
+        assert_eq!(events[1]["data"]["error_kind"], "network");
+        assert_eq!(
+            events[1]["data"]["error"],
+            "[network] LLM request failed: connection reset"
+        );
     }
 
     #[test]

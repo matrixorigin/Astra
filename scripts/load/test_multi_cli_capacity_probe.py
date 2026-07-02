@@ -133,6 +133,20 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(summary["last_metric_count"], 1)
         self.assertEqual(summary["last_metric_names"], ["astra_capacity_run_slots_total"])
 
+    def test_error_helpers_read_run_lifecycle_machine_code(self) -> None:
+        event = {
+            "type": "run_error",
+            "error": "[network] LLM request failed",
+            "error_code": "network",
+            "code": "LLM_TRANSPORT_ERROR",
+        }
+        self.assertEqual(probe.error_code_from_event(event), "network")
+        self.assertEqual(probe.error_message_from_event(event), "[network] LLM request failed")
+
+        legacy_event = {"type": "error", "message": "boom", "code": "INTERNAL_ERROR"}
+        self.assertEqual(probe.error_code_from_event(legacy_event), "INTERNAL_ERROR")
+        self.assertEqual(probe.error_message_from_event(legacy_event), "boom")
+
     def test_summarize_results_reports_terminal_failure_reasons(self) -> None:
         args = argparse.Namespace(
             profile="100-cli",

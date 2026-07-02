@@ -1346,3 +1346,87 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
         .execute(_pool.get())
         .await;
 }
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn terminal_transition_persists_error_code_with_event_batch() {
+    let (pool, store) = setup().await;
+    let user_id = format!("tc-user-{}", uuid::Uuid::new_v4());
+    let session_id = format!("tc-session-{}", uuid::Uuid::new_v4());
+    let run_id = format!("tc-run-{}", uuid::Uuid::new_v4());
+
+    store
+        .insert_run(durable_run_record(
+            run_id.clone(),
+            user_id.clone(),
+            session_id,
+        ))
+        .await
+        .expect("insert run");
+
+    let events = vec![
+        make_event(
+            "run_error",
+            json!({
+                "error": "[network] LLM request failed",
+                "error_code": "network",
+                "error_kind": "network"
+            }),
+        ),
+        make_event(
+            "run_finished",
+            json!({
+                "status": "failed",
+                "error_code": "network",
+                "error_kind": "network"
+            }),
+        ),
+    ];
+
+    let updated = store
+        .update_run_status_with_events_if_current(
+            &user_id,
+            &run_id,
+            &["running"],
+            "failed",
+            None,
+            Some("[network] LLM request failed"),
+            &events,
+        )
+        .await
+        .expect("terminal transition");
+    assert!(updated);
+
+    let loaded = store
+        .load_run(&user_id, &run_id)
+        .await
+        .expect("load run")
+        .expect("run exists");
+    assert_eq!(loaded.status, "failed");
+    assert_eq!(loaded.error_code.as_deref(), Some("network"));
+    assert_eq!(
+        loaded.error_message.as_deref(),
+        Some("[network] LLM request failed")
+    );
+    assert_eq!(loaded.events.len(), 2);
+    assert_eq!(loaded.events[0]["event_type"], "run_error");
+    assert_eq!(loaded.events[1]["event_type"], "run_finished");
+
+    let db_error_code: Option<String> =
+        sqlx::query_scalar("SELECT error_code FROM agent_runs WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id)
+            .bind(&run_id)
+            .fetch_one(pool.get())
+            .await
+            .expect("select error_code");
+    assert_eq!(db_error_code.as_deref(), Some("network"));
+
+    let _ = sqlx::query("DELETE FROM agent_run_events WHERE run_id = ?")
+        .bind(&run_id)
+        .execute(pool.get())
+        .await;
+    let _ = sqlx::query("DELETE FROM agent_runs WHERE run_id = ?")
+        .bind(&run_id)
+        .execute(pool.get())
+        .await;
+}
