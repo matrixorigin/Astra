@@ -147,6 +147,19 @@ class TableMetadata:
 
 
 @dataclass(frozen=True)
+class ConsolidationReview:
+    candidate: str
+    decision: str
+    current_read_paths: list[str]
+    current_write_paths: list[str]
+    user_api_impact: str
+    migration_backfill: str
+    rollback: str
+    test_evidence: list[str]
+    rationale: str
+
+
+@dataclass(frozen=True)
 class AutoIncrementMetadata:
     write_profile: str
     owner_boundary: str
@@ -1181,6 +1194,162 @@ TABLE_METADATA: dict[str, TableMetadata] = {
 }
 
 
+P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
+    ConsolidationReview(
+        candidate="session_sync_log",
+        decision="keep_with_bounded_retention",
+        current_read_paths=[
+            "rust/crates/services/src/state_sync.rs::get_sync_status",
+            "rust/crates/services/tests/services_db_integration.rs::session_sync_log_*",
+        ],
+        current_write_paths=[
+            "rust/crates/services/src/state_sync.rs::SyncAuditWriter::enqueue",
+            "rust/crates/services/src/storage.rs::cleanup_expired_data",
+        ],
+        user_api_impact=(
+            "sync status and operational diagnostics currently read this product audit table; "
+            "removing it would make sync_status less explainable even if tracing exists"
+        ),
+        migration_backfill=(
+            "no merge/backfill now; keep pruning by sync_log_days in bounded batches"
+        ),
+        rollback=(
+            "if a future replacement lands, rollback is recreating the table and re-enabling "
+            "SyncAuditWriter writes; historical rows are not exactly reconstructable"
+        ),
+        test_evidence=[
+            "scripts/schema/test_schema_inventory.py::test_session_sync_log_is_product_audit_not_dead_table",
+            "rust/crates/services/tests/services_db_integration.rs::session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone",
+        ],
+        rationale=(
+            "best-effort but product-readable audit is not the same lifecycle as external tracing"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="data_versioning_checkpoints",
+        decision="keep",
+        current_read_paths=[
+            "rust/crates/services/src/data_versioning.rs::get_checkpoint",
+            "rust/crates/services/src/data_versioning.rs::list_checkpoints",
+        ],
+        current_write_paths=[
+            "rust/crates/services/src/data_versioning.rs::create_checkpoint",
+        ],
+        user_api_impact=(
+            "data versioning rollback/list workflows depend on named checkpoint identity and created_at audit"
+        ),
+        migration_backfill=(
+            "no deletion; if the feature is retired, first remove service/API callers and DB integration tests"
+        ),
+        rollback=(
+            "checkpoint rows are not reconstructable after deletion unless an external version store "
+            "preserved equivalent identity/name/timestamp data"
+        ),
+        test_evidence=[
+            "rust/crates/services/tests/data_versioning_db_it.rs",
+            "scripts/schema/test_schema_inventory.py::test_p1_5_consolidation_reviews_are_evidence_backed",
+        ],
+        rationale=(
+            "small table size is not evidence of redundancy; it is the durable root for rollback/list identity"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="preview_template_registry + raw_ref_scheme_registry",
+        decision="keep_separate",
+        current_read_paths=[
+            "rust/crates/services/src/runs.rs::preview_template_registry",
+            "rust/crates/services/src/context_manifest.rs::raw_ref_scheme_registry",
+        ],
+        current_write_paths=[
+            "rust/crates/services/src/storage.rs::seed raw_ref_scheme_registry",
+            "rust/crates/services/src/storage.rs::seed preview_template_registry",
+        ],
+        user_api_impact=(
+            "preview templates affect artifact/tool-output rendering; raw-ref schemes affect dereference "
+            "authority and access checks"
+        ),
+        migration_backfill=(
+            "no merge; a unified table would need a typed registry model and separate indexes for resolver "
+            "authority versus rendering templates"
+        ),
+        rollback=(
+            "keep current bootstrap seeds as rollback source; merged rows would need lossless split back "
+            "into scheme metadata and template metadata"
+        ),
+        test_evidence=[
+            "rust/crates/services/tests/schema_assertions.rs::preview_template_registry",
+            "rust/crates/services/tests/schema_assertions.rs::raw_ref_scheme_registry",
+            "rust/crates/runtime/tests/phase6_artifact_preview.rs",
+        ],
+        rationale=(
+            "same bootstrap area does not imply same lifecycle; resolver/access semantics differ from rendering"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="harness_skill_drafts + harness_skill_rules",
+        decision="keep_separate",
+        current_read_paths=[
+            "rust/crates/services/src/harness.rs::list_skill_drafts",
+            "rust/crates/services/src/harness.rs::harness_skill_rules SELECT paths",
+        ],
+        current_write_paths=[
+            "rust/crates/services/src/harness.rs::create skill drafts",
+            "rust/crates/services/src/harness.rs::create/update skill rules",
+        ],
+        user_api_impact=(
+            "Skillify draft review/publish workflow and evidence-backed rule review have distinct "
+            "cardinality and decision surfaces"
+        ),
+        migration_backfill=(
+            "no merge; a combined table would need item_type-specific constraints and would weaken "
+            "rule fanout/query indexes"
+        ),
+        rollback=(
+            "current split tables are rollback-safe; merging would require lossless split by draft/rule "
+            "identity and citation references"
+        ),
+        test_evidence=[
+            "rust/crates/services/tests/harness_skillify_db_it.rs",
+            "rust/crates/services/tests/services_db_integration.rs::harness_skill_rules",
+        ],
+        rationale=(
+            "rules are evidence-backed child assertions, not just optional columns on a draft"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="team_execution_history + team_snapshots",
+        decision="keep_separate",
+        current_read_paths=[
+            "rust/crates/services/src/team_persistence.rs::list_executions_page",
+            "rust/crates/services/src/team_persistence.rs::list_snapshots_page",
+        ],
+        current_write_paths=[
+            "rust/crates/services/src/team_persistence.rs::record_execution_start",
+            "rust/crates/services/src/team_persistence.rs::save_snapshot",
+        ],
+        user_api_impact=(
+            "/teams/{name}/executions and /teams/{name}/snapshots expose different resources: "
+            "execution result audit versus point-in-time team definition snapshots"
+        ),
+        migration_backfill=(
+            "no merge; both APIs now have seek pagination and different cursor keys"
+        ),
+        rollback=(
+            "current split tables avoid backfill risk; merging would require reversible event_type mapping "
+            "and separate cursor compatibility"
+        ),
+        test_evidence=[
+            "rust/crates/services/tests/team_persistence_integration.rs",
+            "rust/crates/runtime/tests/system_matrix_http_e2e/journey_team_snapshots_matrix.rs",
+            "rust/crates/runtime/src/server/team_handlers.rs::team handler cursor tests",
+        ],
+        rationale=(
+            "execution history is append-like run audit; snapshots are named reproducibility artifacts"
+        ),
+    ),
+)
+
+
 def repository_root() -> Path:
     return REPO_ROOT
 
@@ -1389,6 +1558,9 @@ def build_inventory(root: Path | None = None) -> dict[str, object]:
 
     return {
         "schema_sources": [asdict(source) for source in SCHEMA_SOURCES],
+        "p1_5_consolidation_reviews": [
+            asdict(review) for review in P1_5_CONSOLIDATION_REVIEWS
+        ],
         "summary": {
             "source_count": len(SCHEMA_SOURCES),
             "table_declaration_count": len(tables),

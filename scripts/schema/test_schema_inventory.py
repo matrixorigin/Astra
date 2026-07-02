@@ -18,6 +18,10 @@ class SchemaInventoryTest(unittest.TestCase):
         cls.tables = {
             table["table"]: table for table in cls.inventory["tables"]
         }
+        cls.p1_5_reviews = {
+            review["candidate"]: review
+            for review in cls.inventory["p1_5_consolidation_reviews"]
+        }
         cls.summary = cls.inventory["summary"]
 
     def test_core_storage_table_count_is_current_baseline(self) -> None:
@@ -694,6 +698,98 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("sync_status", row["merge_guidance"])
         self.assertIn("sync_log_days default 30", row["retention_policy"])
         self.assertIn("not exactly rebuildable", row["rebuildability"])
+
+    def test_p1_5_consolidation_reviews_are_evidence_backed(self) -> None:
+        expected = {
+            "session_sync_log",
+            "data_versioning_checkpoints",
+            "preview_template_registry + raw_ref_scheme_registry",
+            "harness_skill_drafts + harness_skill_rules",
+            "team_execution_history + team_snapshots",
+        }
+        self.assertEqual(set(self.p1_5_reviews), expected)
+
+        for candidate, review in self.p1_5_reviews.items():
+            with self.subTest(candidate=candidate):
+                self.assertIn(
+                    review["decision"],
+                    {"keep", "keep_separate", "keep_with_bounded_retention"},
+                )
+                self.assertGreaterEqual(len(review["current_read_paths"]), 1)
+                self.assertGreaterEqual(len(review["current_write_paths"]), 1)
+                self.assertGreaterEqual(len(review["test_evidence"]), 1)
+                for field in [
+                    "user_api_impact",
+                    "migration_backfill",
+                    "rollback",
+                    "rationale",
+                ]:
+                    self.assertNotEqual(review[field], "")
+                    self.assertNotIn("TBD", review[field])
+
+        self.assertIn("sync status", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
+        self.assertIn(
+            "rollback/list",
+            self.p1_5_reviews["data_versioning_checkpoints"]["user_api_impact"],
+        )
+        self.assertIn(
+            "access checks",
+            self.p1_5_reviews[
+                "preview_template_registry + raw_ref_scheme_registry"
+            ]["user_api_impact"],
+        )
+        self.assertIn(
+            "distinct cardinality",
+            self.p1_5_reviews[
+                "harness_skill_drafts + harness_skill_rules"
+            ]["user_api_impact"],
+        )
+        self.assertIn(
+            "different resources",
+            self.p1_5_reviews[
+                "team_execution_history + team_snapshots"
+            ]["user_api_impact"],
+        )
+
+    def test_p1_5_consolidation_source_evidence_still_exists(self) -> None:
+        expectations = {
+            "rust/crates/services/src/state_sync.rs": [
+                "session_sync_log",
+                "SyncAuditWriter",
+                "sync_status",
+            ],
+            "rust/crates/services/src/data_versioning.rs": [
+                "data_versioning_checkpoints",
+                "create_checkpoint",
+                "list_checkpoints",
+            ],
+            "rust/crates/services/src/storage.rs": [
+                "preview_template_registry",
+                "raw_ref_scheme_registry",
+                "INSERT IGNORE INTO raw_ref_scheme_registry",
+                "INSERT IGNORE INTO preview_template_registry",
+            ],
+            "rust/crates/services/src/harness.rs": [
+                "harness_skill_drafts",
+                "harness_skill_rules",
+                "INSERT INTO harness_skill_drafts",
+                "INSERT INTO harness_skill_rules",
+            ],
+            "rust/crates/services/src/team_persistence.rs": [
+                "team_execution_history",
+                "team_snapshots",
+                "record_execution_start",
+                "list_executions_page",
+                "save_snapshot",
+                "list_snapshots_page",
+            ],
+        }
+
+        for relative_path, needles in expectations.items():
+            text = (schema_inventory.REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            for needle in needles:
+                with self.subTest(path=relative_path, needle=needle):
+                    self.assertIn(needle, text)
 
     def test_agent_message_queue_retention_is_bounded(self) -> None:
         queue = self.tables["agent_message_queue"]
