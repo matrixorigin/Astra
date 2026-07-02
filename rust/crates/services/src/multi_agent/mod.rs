@@ -16,7 +16,7 @@ pub mod task_lease;
 // but the module boundaries are now clear.
 pub use edge_dispatch::{
     DatabaseEdgeDispatchService, EdgeDispatchRow, EdgeDispatchService,
-    UnconfiguredEdgeDispatchService,
+    UnconfiguredEdgeDispatchService, refresh_edge_dispatch_backlog_metrics,
 };
 pub use edge_registry::{
     DatabaseEdgeRegistryService, EdgeAgentRecord, EdgeRegistryService,

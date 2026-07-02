@@ -89,10 +89,38 @@ pub struct LatencySnapshot {
 /// All fields are atomic — safe to share across tasks without external locking.
 #[derive(Debug)]
 pub struct MultiAgentMetrics {
-    /// Current depth of the edge dispatch queue.
+    /// Approximate current depth of the edge dispatch queue from hot-path
+    /// insert/terminal transitions. DB scrape gauges below are authoritative
+    /// across pod restarts and cross-pod writers.
     pub dispatch_queue_depth: AtomicU64,
-    /// Dispatch processing latency.
-    pub dispatch_latency: LatencyTracker,
+    /// Current DB-backed pending row count, refreshed during `/metrics`.
+    pub dispatch_pending_rows: AtomicU64,
+    /// Current DB-backed dispatched/in-flight row count, refreshed during `/metrics`.
+    pub dispatch_dispatched_rows: AtomicU64,
+    /// Oldest pending row age in milliseconds, refreshed during `/metrics`.
+    pub dispatch_oldest_pending_age_ms: AtomicU64,
+    /// Oldest dispatched row age in milliseconds, refreshed during `/metrics`.
+    pub dispatch_oldest_dispatched_age_ms: AtomicU64,
+    /// Total dispatch rows claimed by edge WS pollers.
+    pub dispatch_claimed_total: AtomicU64,
+    /// Total result deliveries that updated a pending/dispatched row.
+    pub dispatch_deliver_hits_total: AtomicU64,
+    /// Total result deliveries that missed owner/request/agent/status.
+    pub dispatch_deliver_misses_total: AtomicU64,
+    /// Total dispatches explicitly failed by runtime.
+    pub dispatch_failed_total: AtomicU64,
+    /// Total stale pending/dispatched rows expired by cleanup.
+    pub dispatch_cleanup_expired_total: AtomicU64,
+    /// Total terminal rows deleted by cleanup.
+    pub dispatch_cleanup_deleted_total: AtomicU64,
+    /// Total wait_result calls that reached timeout without a terminal result.
+    pub dispatch_wait_result_timeouts_total: AtomicU64,
+    /// Total backlog scrape failures while rendering `/metrics`.
+    pub dispatch_backlog_scrape_errors_total: AtomicU64,
+    /// Time from dispatch creation to edge WS claim.
+    pub dispatch_claim_wait_latency: LatencyTracker,
+    /// DB update latency for deliver_result.
+    pub dispatch_deliver_update_latency: LatencyTracker,
     /// Total edge registry registration retry attempts.
     pub registry_retry_total: AtomicU64,
     /// Task lease claim latency.
@@ -111,7 +139,20 @@ impl MultiAgentMetrics {
     pub fn new() -> Self {
         Self {
             dispatch_queue_depth: AtomicU64::new(0),
-            dispatch_latency: LatencyTracker::new(),
+            dispatch_pending_rows: AtomicU64::new(0),
+            dispatch_dispatched_rows: AtomicU64::new(0),
+            dispatch_oldest_pending_age_ms: AtomicU64::new(0),
+            dispatch_oldest_dispatched_age_ms: AtomicU64::new(0),
+            dispatch_claimed_total: AtomicU64::new(0),
+            dispatch_deliver_hits_total: AtomicU64::new(0),
+            dispatch_deliver_misses_total: AtomicU64::new(0),
+            dispatch_failed_total: AtomicU64::new(0),
+            dispatch_cleanup_expired_total: AtomicU64::new(0),
+            dispatch_cleanup_deleted_total: AtomicU64::new(0),
+            dispatch_wait_result_timeouts_total: AtomicU64::new(0),
+            dispatch_backlog_scrape_errors_total: AtomicU64::new(0),
+            dispatch_claim_wait_latency: LatencyTracker::new(),
+            dispatch_deliver_update_latency: LatencyTracker::new(),
             registry_retry_total: AtomicU64::new(0),
             lease_claim_latency: LatencyTracker::new(),
             lease_renewal_success_total: AtomicU64::new(0),
@@ -125,55 +166,93 @@ impl MultiAgentMetrics {
     /// Idempotent — safe to call before every scrape.
     pub fn register_with(&self, target: &dyn MetricTarget) {
         target.register_gauge(
-            "edge_dispatch_queue_depth",
-            "Current depth of the edge dispatch queue",
+            "astra_edge_dispatch_queue_depth",
+            "Approximate current edge dispatch queue depth from hot-path updates",
+        );
+        target.register_gauge(
+            "astra_edge_dispatch_pending_rows",
+            "Current DB-backed edge dispatch rows with status pending",
+        );
+        target.register_gauge(
+            "astra_edge_dispatch_dispatched_rows",
+            "Current DB-backed edge dispatch rows with status dispatched",
+        );
+        target.register_gauge(
+            "astra_edge_dispatch_oldest_pending_age_ms",
+            "Age in milliseconds of the oldest pending edge dispatch row",
+        );
+        target.register_gauge(
+            "astra_edge_dispatch_oldest_dispatched_age_ms",
+            "Age in milliseconds of the oldest dispatched edge dispatch row",
         );
         target.register_counter(
-            "dispatch_latency_us_total",
-            "Total microseconds spent in edge dispatch processing",
-        );
-        target.register_gauge(
-            "dispatch_latency_count",
-            "Number of edge dispatch operations completed",
-        );
-        target.register_gauge(
-            "dispatch_latency_min_us",
-            "Minimum edge dispatch latency in microseconds",
-        );
-        target.register_gauge(
-            "dispatch_latency_max_us",
-            "Maximum edge dispatch latency in microseconds",
-        );
-        target.register_gauge(
-            "dispatch_latency_avg_us",
-            "Average edge dispatch latency in microseconds",
+            "astra_edge_dispatch_claimed_total",
+            "Total edge dispatch rows claimed by edge WebSocket pollers",
         );
         target.register_counter(
-            "registry_retry_total",
+            "astra_edge_dispatch_deliver_hits_total",
+            "Total edge dispatch result deliveries that updated a row",
+        );
+        target.register_counter(
+            "astra_edge_dispatch_deliver_misses_total",
+            "Total edge dispatch result deliveries that did not match an updatable row",
+        );
+        target.register_counter(
+            "astra_edge_dispatch_failed_total",
+            "Total edge dispatches moved to failed by runtime",
+        );
+        target.register_counter(
+            "astra_edge_dispatch_cleanup_expired_total",
+            "Total stale pending or dispatched edge dispatch rows expired by cleanup",
+        );
+        target.register_counter(
+            "astra_edge_dispatch_cleanup_deleted_total",
+            "Total completed or failed edge dispatch rows deleted by cleanup",
+        );
+        target.register_counter(
+            "astra_edge_dispatch_wait_result_timeouts_total",
+            "Total edge dispatch wait_result calls that timed out without a terminal result",
+        );
+        target.register_counter(
+            "astra_edge_dispatch_backlog_scrape_errors_total",
+            "Total failures refreshing edge dispatch backlog gauges during metrics scrape",
+        );
+        register_latency_metrics(
+            target,
+            "astra_edge_dispatch_claim_wait",
+            "edge dispatch creation-to-claim latency",
+        );
+        register_latency_metrics(
+            target,
+            "astra_edge_dispatch_deliver_update",
+            "edge dispatch deliver_result DB update latency",
+        );
+        target.register_counter(
+            "astra_edge_registry_retry_total",
             "Total edge registry registration retry attempts",
         );
         target.register_counter(
-            "lease_claim_duration_us_total",
+            "astra_task_lease_claim_duration_us_total",
             "Total microseconds spent claiming task leases",
         );
         target.register_gauge(
-            "lease_claim_count",
+            "astra_task_lease_claim_count",
             "Number of task lease claim operations completed",
         );
         target.register_counter(
-            "lease_renewal_success_total",
+            "astra_task_lease_renewal_success_total",
             "Total successful task lease renewal attempts",
         );
         target.register_counter(
-            "lease_renewal_failure_total",
+            "astra_task_lease_renewal_failure_total",
             "Total failed task lease renewal attempts",
         );
         target.register_gauge(
-            "active_lease_renewals",
+            "astra_task_lease_active_renewals",
             "Number of active task lease renewal loops",
         );
         target.register_counter(
-            "event_overflow_total",
+            "astra_multi_agent_event_overflow_total",
             "Total event ingestion overflow/skipped events",
         );
     }
@@ -183,41 +262,95 @@ impl MultiAgentMetrics {
     /// `astra-turn-core` from here (avoids cyclic deps).
     pub fn scrape_to(&self, target: &dyn MetricTarget) {
         target.set_gauge(
-            "edge_dispatch_queue_depth",
+            "astra_edge_dispatch_queue_depth",
             self.dispatch_queue_depth.load(Ordering::Relaxed) as f64,
         );
-
-        let dl = self.dispatch_latency.snapshot();
-        target.set_counter("dispatch_latency_us_total", dl.sum_us);
-        target.set_gauge("dispatch_latency_count", dl.count as f64);
-        target.set_gauge("dispatch_latency_min_us", dl.min_us as f64);
-        target.set_gauge("dispatch_latency_max_us", dl.max_us as f64);
-        target.set_gauge("dispatch_latency_avg_us", dl.avg_us as f64);
+        target.set_gauge(
+            "astra_edge_dispatch_pending_rows",
+            self.dispatch_pending_rows.load(Ordering::Relaxed) as f64,
+        );
+        target.set_gauge(
+            "astra_edge_dispatch_dispatched_rows",
+            self.dispatch_dispatched_rows.load(Ordering::Relaxed) as f64,
+        );
+        target.set_gauge(
+            "astra_edge_dispatch_oldest_pending_age_ms",
+            self.dispatch_oldest_pending_age_ms.load(Ordering::Relaxed) as f64,
+        );
+        target.set_gauge(
+            "astra_edge_dispatch_oldest_dispatched_age_ms",
+            self.dispatch_oldest_dispatched_age_ms
+                .load(Ordering::Relaxed) as f64,
+        );
+        target.set_counter(
+            "astra_edge_dispatch_claimed_total",
+            self.dispatch_claimed_total.load(Ordering::Relaxed),
+        );
+        target.set_counter(
+            "astra_edge_dispatch_deliver_hits_total",
+            self.dispatch_deliver_hits_total.load(Ordering::Relaxed),
+        );
+        target.set_counter(
+            "astra_edge_dispatch_deliver_misses_total",
+            self.dispatch_deliver_misses_total.load(Ordering::Relaxed),
+        );
+        target.set_counter(
+            "astra_edge_dispatch_failed_total",
+            self.dispatch_failed_total.load(Ordering::Relaxed),
+        );
+        target.set_counter(
+            "astra_edge_dispatch_cleanup_expired_total",
+            self.dispatch_cleanup_expired_total.load(Ordering::Relaxed),
+        );
+        target.set_counter(
+            "astra_edge_dispatch_cleanup_deleted_total",
+            self.dispatch_cleanup_deleted_total.load(Ordering::Relaxed),
+        );
+        target.set_counter(
+            "astra_edge_dispatch_wait_result_timeouts_total",
+            self.dispatch_wait_result_timeouts_total
+                .load(Ordering::Relaxed),
+        );
+        target.set_counter(
+            "astra_edge_dispatch_backlog_scrape_errors_total",
+            self.dispatch_backlog_scrape_errors_total
+                .load(Ordering::Relaxed),
+        );
+        scrape_latency_metrics(
+            target,
+            "astra_edge_dispatch_claim_wait",
+            self.dispatch_claim_wait_latency.snapshot(),
+        );
+        scrape_latency_metrics(
+            target,
+            "astra_edge_dispatch_deliver_update",
+            self.dispatch_deliver_update_latency.snapshot(),
+        );
 
         target.set_counter(
-            "registry_retry_total",
+            "astra_edge_registry_retry_total",
             self.registry_retry_total.load(Ordering::Relaxed),
         );
 
         let lc = self.lease_claim_latency.snapshot();
-        target.set_counter("lease_claim_duration_us_total", lc.sum_us);
-        target.set_gauge("lease_claim_count", lc.count as f64);
+        target.set_counter("astra_task_lease_claim_duration_us_total", lc.sum_us);
+        target.set_gauge("astra_task_lease_claim_count", lc.count as f64);
 
         target.set_counter(
-            "lease_renewal_success_total",
+            "astra_task_lease_renewal_success_total",
             self.lease_renewal_success_total.load(Ordering::Relaxed),
         );
         target.set_counter(
-            "lease_renewal_failure_total",
+            "astra_task_lease_renewal_failure_total",
             self.lease_renewal_failure_total.load(Ordering::Relaxed),
         );
         target.set_gauge(
-            "active_lease_renewals",
+            "astra_task_lease_active_renewals",
             self.active_lease_renewals.load(Ordering::Relaxed) as f64,
         );
 
         target.set_counter(
-            "event_overflow_total",
+            "astra_multi_agent_event_overflow_total",
             self.event_overflow_total.load(Ordering::Relaxed),
         );
     }
@@ -236,6 +369,37 @@ pub trait MetricTarget: Send + Sync {
     fn register_gauge(&self, name: &str, help: &str);
     fn set_gauge(&self, name: &str, value: f64);
     fn set_counter(&self, name: &str, value: u64);
+}
+
+fn register_latency_metrics(target: &dyn MetricTarget, prefix: &str, description: &str) {
+    target.register_counter(
+        &format!("{prefix}_us_total"),
+        &format!("Total microseconds spent in {description}"),
+    );
+    target.register_gauge(
+        &format!("{prefix}_count"),
+        &format!("Number of {description} samples"),
+    );
+    target.register_gauge(
+        &format!("{prefix}_min_us"),
+        &format!("Minimum {description} in microseconds"),
+    );
+    target.register_gauge(
+        &format!("{prefix}_max_us"),
+        &format!("Maximum {description} in microseconds"),
+    );
+    target.register_gauge(
+        &format!("{prefix}_avg_us"),
+        &format!("Average {description} in microseconds"),
+    );
+}
+
+fn scrape_latency_metrics(target: &dyn MetricTarget, prefix: &str, snapshot: LatencySnapshot) {
+    target.set_counter(&format!("{prefix}_us_total"), snapshot.sum_us);
+    target.set_gauge(&format!("{prefix}_count"), snapshot.count as f64);
+    target.set_gauge(&format!("{prefix}_min_us"), snapshot.min_us as f64);
+    target.set_gauge(&format!("{prefix}_max_us"), snapshot.max_us as f64);
+    target.set_gauge(&format!("{prefix}_avg_us"), snapshot.avg_us as f64);
 }
 
 // ─── Convenience ────────────────────────────────────────────────────────────
@@ -338,17 +502,23 @@ mod tests {
             .map(|(_k, v)| v.split(':').next().unwrap())
             .collect();
 
-        // Every metric defined in register_with must appear.
-        assert!(names.contains(&"edge_dispatch_queue_depth"));
-        assert!(names.contains(&"dispatch_latency_us_total"));
-        assert!(names.contains(&"dispatch_latency_count"));
-        assert!(names.contains(&"dispatch_latency_min_us"));
-        assert!(names.contains(&"dispatch_latency_max_us"));
-        assert!(names.contains(&"dispatch_latency_avg_us"));
-        assert!(names.contains(&"registry_retry_total"));
-        assert!(names.contains(&"lease_claim_duration_us_total"));
-        assert!(names.contains(&"lease_claim_count"));
-        assert!(names.contains(&"event_overflow_total"));
+        // Every important metric family defined in register_with must appear.
+        assert!(names.contains(&"astra_edge_dispatch_queue_depth"));
+        assert!(names.contains(&"astra_edge_dispatch_pending_rows"));
+        assert!(names.contains(&"astra_edge_dispatch_dispatched_rows"));
+        assert!(names.contains(&"astra_edge_dispatch_oldest_pending_age_ms"));
+        assert!(names.contains(&"astra_edge_dispatch_claimed_total"));
+        assert!(names.contains(&"astra_edge_dispatch_deliver_hits_total"));
+        assert!(names.contains(&"astra_edge_dispatch_deliver_misses_total"));
+        assert!(names.contains(&"astra_edge_dispatch_cleanup_expired_total"));
+        assert!(names.contains(&"astra_edge_dispatch_cleanup_deleted_total"));
+        assert!(names.contains(&"astra_edge_dispatch_backlog_scrape_errors_total"));
+        assert!(names.contains(&"astra_edge_dispatch_claim_wait_us_total"));
+        assert!(names.contains(&"astra_edge_dispatch_deliver_update_us_total"));
+        assert!(names.contains(&"astra_edge_registry_retry_total"));
+        assert!(names.contains(&"astra_task_lease_claim_duration_us_total"));
+        assert!(names.contains(&"astra_task_lease_claim_count"));
+        assert!(names.contains(&"astra_multi_agent_event_overflow_total"));
 
         // Gauge vs counter kind must match.
         let kind_of = |name: &str| -> &str {
@@ -357,11 +527,21 @@ mod tests {
                 .map(|(k, _)| k.as_str())
                 .unwrap()
         };
-        assert_eq!(kind_of("edge_dispatch_queue_depth"), "gauge");
-        assert_eq!(kind_of("dispatch_latency_us_total"), "counter");
-        assert_eq!(kind_of("registry_retry_total"), "counter");
-        assert_eq!(kind_of("event_overflow_total"), "counter");
-        assert_eq!(kind_of("lease_claim_duration_us_total"), "counter");
+        assert_eq!(kind_of("astra_edge_dispatch_queue_depth"), "gauge");
+        assert_eq!(
+            kind_of("astra_edge_dispatch_claim_wait_us_total"),
+            "counter"
+        );
+        assert_eq!(
+            kind_of("astra_edge_dispatch_deliver_update_us_total"),
+            "counter"
+        );
+        assert_eq!(kind_of("astra_edge_registry_retry_total"), "counter");
+        assert_eq!(kind_of("astra_multi_agent_event_overflow_total"), "counter");
+        assert_eq!(
+            kind_of("astra_task_lease_claim_duration_us_total"),
+            "counter"
+        );
     }
 
     #[test]
@@ -388,34 +568,56 @@ mod tests {
         m.scrape_to(&spy);
 
         // Counters must be stored as u64 (not f64 reinterpreted).
-        assert_eq!(spy.counter("registry_retry_total"), Some(42));
-        assert_eq!(spy.counter("event_overflow_total"), Some(7));
+        assert_eq!(spy.counter("astra_edge_registry_retry_total"), Some(42));
+        assert_eq!(
+            spy.counter("astra_multi_agent_event_overflow_total"),
+            Some(7)
+        );
     }
 
     #[test]
     fn scrape_to_pushes_gauges_as_f64() {
         let m = MultiAgentMetrics::new();
         m.dispatch_queue_depth.store(5, Ordering::Relaxed);
+        m.dispatch_pending_rows.store(3, Ordering::Relaxed);
+        m.dispatch_dispatched_rows.store(2, Ordering::Relaxed);
+        m.dispatch_oldest_pending_age_ms
+            .store(1_500, Ordering::Relaxed);
 
         let spy = SpyTarget::new();
         m.scrape_to(&spy);
 
-        assert_eq!(spy.gauge("edge_dispatch_queue_depth"), Some(5.0));
+        assert_eq!(spy.gauge("astra_edge_dispatch_queue_depth"), Some(5.0));
+        assert_eq!(spy.gauge("astra_edge_dispatch_pending_rows"), Some(3.0));
+        assert_eq!(spy.gauge("astra_edge_dispatch_dispatched_rows"), Some(2.0));
+        assert_eq!(
+            spy.gauge("astra_edge_dispatch_oldest_pending_age_ms"),
+            Some(1500.0)
+        );
     }
 
     #[test]
     fn scrape_to_latency_counter_is_sum_not_avg() {
         let m = MultiAgentMetrics::new();
-        m.dispatch_latency.record(Duration::from_micros(100));
-        m.dispatch_latency.record(Duration::from_micros(200));
+        m.dispatch_claim_wait_latency
+            .record(Duration::from_micros(100));
+        m.dispatch_claim_wait_latency
+            .record(Duration::from_micros(200));
+        m.dispatch_deliver_update_latency
+            .record(Duration::from_micros(50));
 
         let spy = SpyTarget::new();
         m.scrape_to(&spy);
 
-        // dispatch_latency_us_total = sum_us = 300
-        assert_eq!(spy.counter("dispatch_latency_us_total"), Some(300));
-        // dispatch_latency_count = 2
-        assert_eq!(spy.gauge("dispatch_latency_count"), Some(2.0));
+        assert_eq!(
+            spy.counter("astra_edge_dispatch_claim_wait_us_total"),
+            Some(300)
+        );
+        assert_eq!(spy.gauge("astra_edge_dispatch_claim_wait_count"), Some(2.0));
+        assert_eq!(
+            spy.counter("astra_edge_dispatch_deliver_update_us_total"),
+            Some(50)
+        );
     }
 
     #[test]
@@ -427,7 +629,10 @@ mod tests {
         m.scrape_to(&spy);
 
         // 5ms = 5000us
-        assert_eq!(spy.counter("lease_claim_duration_us_total"), Some(5_000));
+        assert_eq!(
+            spy.counter("astra_task_lease_claim_duration_us_total"),
+            Some(5_000)
+        );
     }
 
     #[test]
@@ -436,11 +641,23 @@ mod tests {
         let spy = SpyTarget::new();
         m.scrape_to(&spy);
 
-        assert_eq!(spy.counter("dispatch_latency_us_total"), Some(0));
-        assert_eq!(spy.gauge("dispatch_latency_count"), Some(0.0));
-        assert_eq!(spy.gauge("dispatch_latency_min_us"), Some(0.0));
-        assert_eq!(spy.gauge("dispatch_latency_max_us"), Some(0.0));
-        assert_eq!(spy.gauge("dispatch_latency_avg_us"), Some(0.0));
+        assert_eq!(
+            spy.counter("astra_edge_dispatch_claim_wait_us_total"),
+            Some(0)
+        );
+        assert_eq!(spy.gauge("astra_edge_dispatch_claim_wait_count"), Some(0.0));
+        assert_eq!(
+            spy.gauge("astra_edge_dispatch_claim_wait_min_us"),
+            Some(0.0)
+        );
+        assert_eq!(
+            spy.gauge("astra_edge_dispatch_claim_wait_max_us"),
+            Some(0.0)
+        );
+        assert_eq!(
+            spy.gauge("astra_edge_dispatch_claim_wait_avg_us"),
+            Some(0.0)
+        );
     }
 
     // ── LatencyTracker ────────────────────────────────────────────────
@@ -479,9 +696,14 @@ mod tests {
         assert_eq!(m.registry_retry_total.load(Ordering::Relaxed), 0);
         assert_eq!(m.event_overflow_total.load(Ordering::Relaxed), 0);
 
-        let dl = m.dispatch_latency.snapshot();
-        assert_eq!(dl.count, 0);
-        assert_eq!(dl.sum_us, 0);
+        let claim_wait = m.dispatch_claim_wait_latency.snapshot();
+        assert_eq!(claim_wait.count, 0);
+        assert_eq!(claim_wait.sum_us, 0);
+        assert_eq!(
+            m.dispatch_backlog_scrape_errors_total
+                .load(Ordering::Relaxed),
+            0
+        );
 
         let lc = m.lease_claim_latency.snapshot();
         assert_eq!(lc.count, 0);

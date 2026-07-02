@@ -60,6 +60,23 @@ pub(super) async fn health_handler(State(state): State<AppState>) -> Json<Health
 /// scrapes the latest multi-agent metrics snapshot into the registry so all
 /// metrics are exposed through a single endpoint.
 pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    if let Some(shared_pool) = state.shared_pool.as_ref()
+        && let Err(error) = astra_services::multi_agent::refresh_edge_dispatch_backlog_metrics(
+            shared_pool,
+            &state.multi_agent_metrics,
+        )
+        .await
+    {
+        state
+            .multi_agent_metrics
+            .dispatch_backlog_scrape_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            target: "astra_runtime::metrics",
+            error = %error,
+            "failed to refresh edge dispatch backlog metrics"
+        );
+    }
     let bridge = MetricsRegistryBridge(state.metrics_registry().clone());
     state.multi_agent_metrics.register_with(&bridge);
     state.multi_agent_metrics.scrape_to(&bridge);
@@ -117,6 +134,14 @@ mod tests {
             text.contains(
                 "astra_llm_provider_rate_limit_errors_total{model=\"metrics-model\",status=\"429\"} 1"
             ),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_edge_dispatch_pending_rows gauge"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_edge_dispatch_deliver_misses_total counter"),
             "{text}"
         );
     }

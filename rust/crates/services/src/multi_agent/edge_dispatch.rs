@@ -24,6 +24,7 @@ pub struct EdgeDispatchRow {
     pub payload_json: String,
     pub result_json: Option<String>,
     pub status: String,
+    pub pending_wait_us: u64,
 }
 
 async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'static str) {
@@ -133,7 +134,107 @@ fn decode_claimed_dispatch_row(row: &impl EdgeDispatchDbRow) -> Result<EdgeDispa
             .optional_string_column("result_json")
             .map_err(|e| edge_dispatch_decode_error("poll row", "result_json", e))?,
         status: "dispatched".to_string(),
+        pending_wait_us: non_negative_i64_column(row, "pending_wait_us", "poll row")? as u64,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EdgeDispatchBacklogRow {
+    pending_rows: u64,
+    dispatched_rows: u64,
+    oldest_pending_age_ms: u64,
+    oldest_dispatched_age_ms: u64,
+}
+
+impl EdgeDispatchBacklogRow {
+    fn empty() -> Self {
+        Self {
+            pending_rows: 0,
+            dispatched_rows: 0,
+            oldest_pending_age_ms: 0,
+            oldest_dispatched_age_ms: 0,
+        }
+    }
+}
+
+const EDGE_DISPATCH_BACKLOG_SQL: &str = "SELECT \
+    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_rows, \
+    COALESCE(SUM(CASE WHEN status = 'dispatched' THEN 1 ELSE 0 END), 0) AS dispatched_rows, \
+    COALESCE(TIMESTAMPDIFF(MICROSECOND, MIN(CASE WHEN status = 'pending' THEN created_at ELSE NULL END), NOW(6)), 0) AS oldest_pending_age_us, \
+    COALESCE(TIMESTAMPDIFF(MICROSECOND, MIN(CASE WHEN status = 'dispatched' THEN created_at ELSE NULL END), NOW(6)), 0) AS oldest_dispatched_age_us \
+    FROM edge_pending_dispatch \
+    WHERE status IN ('pending', 'dispatched')";
+
+fn non_negative_i64_column(
+    row: &impl EdgeDispatchDbRow,
+    column: &'static str,
+    context: &str,
+) -> Result<i64, String> {
+    let value = row
+        .i64_column(column)
+        .map_err(|e| edge_dispatch_decode_error(context, column, e))?;
+    if value < 0 {
+        return Err(format!(
+            "edge_dispatch {context} decode `{column}`: negative value {value}"
+        ));
+    }
+    Ok(value)
+}
+
+fn micros_to_millis(us: u64) -> u64 {
+    us.saturating_add(999) / 1000
+}
+
+fn decode_backlog_row(row: &impl EdgeDispatchDbRow) -> Result<EdgeDispatchBacklogRow, String> {
+    Ok(EdgeDispatchBacklogRow {
+        pending_rows: non_negative_i64_column(row, "pending_rows", "backlog row")? as u64,
+        dispatched_rows: non_negative_i64_column(row, "dispatched_rows", "backlog row")? as u64,
+        oldest_pending_age_ms: micros_to_millis(non_negative_i64_column(
+            row,
+            "oldest_pending_age_us",
+            "backlog row",
+        )? as u64),
+        oldest_dispatched_age_ms: micros_to_millis(non_negative_i64_column(
+            row,
+            "oldest_dispatched_age_us",
+            "backlog row",
+        )? as u64),
+    })
+}
+
+fn apply_backlog_metrics(metrics: &SharedMultiAgentMetrics, backlog: EdgeDispatchBacklogRow) {
+    metrics
+        .dispatch_pending_rows
+        .store(backlog.pending_rows, Ordering::Relaxed);
+    metrics
+        .dispatch_dispatched_rows
+        .store(backlog.dispatched_rows, Ordering::Relaxed);
+    metrics
+        .dispatch_oldest_pending_age_ms
+        .store(backlog.oldest_pending_age_ms, Ordering::Relaxed);
+    metrics
+        .dispatch_oldest_dispatched_age_ms
+        .store(backlog.oldest_dispatched_age_ms, Ordering::Relaxed);
+}
+
+/// Refresh DB-authoritative edge dispatch backlog gauges.
+///
+/// Hot-path counters are process-local approximations. This scrape-time query
+/// gives operators the cross-pod truth for queue depth and oldest pending age.
+pub async fn refresh_edge_dispatch_backlog_metrics(
+    shared: &astra_core::SharedPool,
+    metrics: &SharedMultiAgentMetrics,
+) -> Result<(), String> {
+    let row = sqlx::query(EDGE_DISPATCH_BACKLOG_SQL)
+        .fetch_optional(shared.get())
+        .await
+        .map_err(|e| format!("edge_dispatch backlog metrics SELECT: {e}"))?;
+    let backlog = match row {
+        Some(row) => decode_backlog_row(&row)?,
+        None => EdgeDispatchBacklogRow::empty(),
+    };
+    apply_backlog_metrics(metrics, backlog);
+    Ok(())
 }
 
 fn decode_terminal_result_json(row: &impl EdgeDispatchDbRow) -> Result<String, String> {
@@ -221,7 +322,8 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             "SELECT dispatch_id, user_id, edge_agent_id, request_id, \
              CAST(payload_json AS CHAR) AS payload_json, \
              CAST(result_json AS CHAR) AS result_json, \
-             status \
+             status, \
+             COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
              FROM edge_pending_dispatch \
              WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
              ORDER BY dispatch_id ASC LIMIT 50 \
@@ -289,6 +391,15 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .await
             .map_err(|e| format!("edge_dispatch poll commit: {e}"))?;
 
+        if let Some(ref m) = self.metrics {
+            m.dispatch_claimed_total
+                .fetch_add(claimed_rows.len() as u64, Ordering::Relaxed);
+            for row in &claimed_rows {
+                m.dispatch_claim_wait_latency
+                    .record(std::time::Duration::from_micros(row.pending_wait_us));
+            }
+        }
+
         Ok(claimed_rows)
     }
 
@@ -314,9 +425,16 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         .await
         .map_err(|e| format!("edge_dispatch deliver_result: {e}"))?;
         let affected = n.rows_affected() > 0;
-        if affected && let Some(ref m) = self.metrics {
-            saturating_decrement(&m.dispatch_queue_depth);
-            m.dispatch_latency.record(start.elapsed());
+        if let Some(ref m) = self.metrics {
+            m.dispatch_deliver_update_latency.record(start.elapsed());
+            if affected {
+                saturating_decrement(&m.dispatch_queue_depth);
+                m.dispatch_deliver_hits_total
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                m.dispatch_deliver_misses_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(affected)
     }
@@ -350,6 +468,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let affected = n.rows_affected() > 0;
         if affected && let Some(ref m) = self.metrics {
             saturating_decrement(&m.dispatch_queue_depth);
+            m.dispatch_failed_total.fetch_add(1, Ordering::Relaxed);
         }
         Ok(affected)
     }
@@ -395,6 +514,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                     "edge_dispatch: wait_result timed out after {} iterations",
                     iterations
                 );
+                if let Some(ref m) = self.metrics {
+                    m.dispatch_wait_result_timeouts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(None); // timeout
             }
             // Exponential backoff with jitter: 100ms → 200ms → 400ms → 800ms (capped).
@@ -433,6 +556,8 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             for _ in 0..expired {
                 saturating_decrement(&m.dispatch_queue_depth);
             }
+            m.dispatch_cleanup_expired_total
+                .fetch_add(expired, Ordering::Relaxed);
         }
 
         let deleted = sqlx::query(
@@ -444,6 +569,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("edge_dispatch cleanup: {e}"))?;
+        if let Some(ref m) = self.metrics {
+            m.dispatch_cleanup_deleted_total
+                .fetch_add(deleted.rows_affected(), Ordering::Relaxed);
+        }
         Ok(expired + deleted.rows_affected())
     }
 }
@@ -577,6 +706,11 @@ mod tests {
             }
             match column {
                 "dispatch_id" => Ok(42),
+                "pending_wait_us" => Ok(1_234),
+                "pending_rows" => Ok(3),
+                "dispatched_rows" => Ok(2),
+                "oldest_pending_age_us" => Ok(1_500),
+                "oldest_dispatched_age_us" => Ok(2_001),
                 _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
         }
@@ -620,6 +754,7 @@ mod tests {
             Some(r#"{"status":"completed"}"#)
         );
         assert_eq!(row.status, "dispatched");
+        assert_eq!(row.pending_wait_us, 1_234);
     }
 
     #[test]
@@ -640,6 +775,7 @@ mod tests {
             "request_id",
             "payload_json",
             "result_json",
+            "pending_wait_us",
         ] {
             let error =
                 decode_claimed_dispatch_row(&FakeEdgeDispatchRow::fail_on(column)).unwrap_err();
@@ -648,6 +784,74 @@ mod tests {
                 "decode error should identify poll row column `{column}`: {error}"
             );
         }
+    }
+
+    #[test]
+    fn backlog_row_decode_preserves_counts_and_rounds_age_up_to_ms() {
+        let row = decode_backlog_row(&FakeEdgeDispatchRow::complete()).unwrap();
+
+        assert_eq!(
+            row,
+            EdgeDispatchBacklogRow {
+                pending_rows: 3,
+                dispatched_rows: 2,
+                oldest_pending_age_ms: 2,
+                oldest_dispatched_age_ms: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn backlog_row_decode_fails_loudly_on_any_column_error() {
+        for column in [
+            "pending_rows",
+            "dispatched_rows",
+            "oldest_pending_age_us",
+            "oldest_dispatched_age_us",
+        ] {
+            let error = decode_backlog_row(&FakeEdgeDispatchRow::fail_on(column)).unwrap_err();
+            assert!(
+                error.contains("edge_dispatch backlog row decode") && error.contains(column),
+                "backlog decode error should identify `{column}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_backlog_metrics_updates_cross_pod_backlog_gauges() {
+        let metrics = crate::multi_agent::metrics::shared_metrics();
+
+        apply_backlog_metrics(
+            &metrics,
+            EdgeDispatchBacklogRow {
+                pending_rows: 7,
+                dispatched_rows: 5,
+                oldest_pending_age_ms: 11_000,
+                oldest_dispatched_age_ms: 13_000,
+            },
+        );
+
+        assert_eq!(metrics.dispatch_pending_rows.load(Ordering::Relaxed), 7);
+        assert_eq!(metrics.dispatch_dispatched_rows.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            metrics
+                .dispatch_oldest_pending_age_ms
+                .load(Ordering::Relaxed),
+            11_000
+        );
+        assert_eq!(
+            metrics
+                .dispatch_oldest_dispatched_age_ms
+                .load(Ordering::Relaxed),
+            13_000
+        );
+    }
+
+    #[test]
+    fn backlog_metrics_sql_is_bounded_to_nonterminal_dispatch_rows() {
+        assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("status IN ('pending', 'dispatched')"));
+        assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("oldest_pending_age_us"));
+        assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("oldest_dispatched_age_us"));
     }
 
     #[test]

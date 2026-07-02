@@ -215,9 +215,78 @@
         ]
       },
       {
-        "title": "Nonstream Fallback",
+        "title": "Edge Dispatch Backlog",
         "type": "graph",
         "gridPos": {"h": 8, "w": 12, "x": 0, "y": 61},
+        "targets": [
+          {
+            "expr": "astra_edge_dispatch_pending_rows",
+            "legendFormat": "pending rows"
+          },
+          {
+            "expr": "astra_edge_dispatch_dispatched_rows",
+            "legendFormat": "dispatched rows"
+          },
+          {
+            "expr": "astra_edge_dispatch_oldest_pending_age_ms",
+            "legendFormat": "oldest pending ms"
+          },
+          {
+            "expr": "astra_edge_dispatch_oldest_dispatched_age_ms",
+            "legendFormat": "oldest dispatched ms"
+          }
+        ]
+      },
+      {
+        "title": "Edge Dispatch Outcomes",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 61},
+        "targets": [
+          {
+            "expr": "rate(astra_edge_dispatch_claimed_total[5m])",
+            "legendFormat": "claimed"
+          },
+          {
+            "expr": "rate(astra_edge_dispatch_deliver_hits_total[5m])",
+            "legendFormat": "deliver hits"
+          },
+          {
+            "expr": "rate(astra_edge_dispatch_deliver_misses_total[5m])",
+            "legendFormat": "deliver misses"
+          },
+          {
+            "expr": "rate(astra_edge_dispatch_cleanup_expired_total[5m])",
+            "legendFormat": "cleanup expired"
+          },
+          {
+            "expr": "rate(astra_edge_dispatch_cleanup_deleted_total[5m])",
+            "legendFormat": "cleanup deleted"
+          },
+          {
+            "expr": "rate(astra_edge_dispatch_wait_result_timeouts_total[5m])",
+            "legendFormat": "wait_result timeout"
+          }
+        ]
+      },
+      {
+        "title": "Edge Dispatch Mean Latency",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 69},
+        "targets": [
+          {
+            "expr": "rate(astra_edge_dispatch_claim_wait_us_total[5m]) / clamp_min(rate(astra_edge_dispatch_claim_wait_count[5m]), 1) / 1000",
+            "legendFormat": "claim wait ms"
+          },
+          {
+            "expr": "rate(astra_edge_dispatch_deliver_update_us_total[5m]) / clamp_min(rate(astra_edge_dispatch_deliver_update_count[5m]), 1) / 1000",
+            "legendFormat": "deliver update ms"
+          }
+        ]
+      },
+      {
+        "title": "Nonstream Fallback",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 69},
         "targets": [
           {
             "expr": "rate(astra_llm_nonstream_fallback_attempts_total[5m])",

@@ -37,6 +37,10 @@ DEFAULT_METRIC_PREFIXES = (
     "astra_llm_nonstream_fallback_",
     "astra_durable_run_event_",
     "astra_run_control_",
+    "astra_edge_dispatch_",
+    "astra_edge_registry_",
+    "astra_task_lease_",
+    "astra_multi_agent_",
 )
 
 
