@@ -5622,10 +5622,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await;
 
             if request.interactive_client {
+                use astra_turn_core::ws_approval_gate::WebSocketApprovalGate;
+
                 // ── Phase E: Wire WebSocket approval and ask_user gates ───
                 let (approval_tx, approval_rx) = mpsc::channel::<Value>(64);
-                let approval_gate = astra_turn_core::ws_approval_gate::WebSocketApprovalGate::new(
+                let approval_gate = WebSocketApprovalGate::new_with_journal_context(
                     user_id.clone(),
+                    session_id.clone(),
+                    run_id.clone(),
+                    Some(loop_state.session_turn),
                     self.edge_callback_ledger.clone(),
                     approval_tx,
                 );
