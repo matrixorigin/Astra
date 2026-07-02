@@ -44,7 +44,8 @@ use astra_services::{
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 
 use astra_core::{
-    STATUS_CANCELLED, STATUS_INPUT_QUEUED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING,
+    STATUS_CANCELLED, STATUS_FAILED, STATUS_INPUT_QUEUED, STATUS_PAUSED, STATUS_RUNNING,
+    STATUS_WAITING,
 };
 
 const METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL: &str = "astra_run_control_poll_attempts_total";
@@ -753,76 +754,147 @@ impl RunEngine {
         let running = self.store.find_recoverable_running_runs().await?;
 
         let mut recovered_running = Vec::with_capacity(running.len());
-        for mut run in running {
-            if has_graceful_resume_checkpoint(self, &run).await {
-                if let Err(e) = self
-                    .store
-                    .update_run_status(
-                        &run.user_id,
-                        &run.run_id,
-                        STATUS_WAITING,
-                        Some("restart_resume"),
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "astra_runtime::run_engine",
-                        run_id = %run.run_id,
-                        error = %e,
-                        "failed to mark graceful run waiting during recovery"
-                    );
-                }
-                if let Err(e) = self
-                    .store
-                    .append_event(
-                        &run.user_id,
-                        &run.run_id,
-                        serde_json::json!({
-                            "event_type": "run_resumed_after_restart",
-                            "data": {"checkpoint_version": "checkpoint_v1"}
-                        }),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "astra_runtime::run_engine",
-                        run_id = %run.run_id,
-                        error = %e,
-                        "failed to append graceful restart event"
-                    );
-                }
-                run.status = STATUS_WAITING.to_string();
-                run.waiting_for = Some("restart_resume".to_string());
-            } else {
-                if let Err(e) = self
-                    .store
-                    .update_run_status(
-                        &run.user_id,
-                        &run.run_id,
-                        astra_core::STATUS_FAILED,
-                        None,
-                        Some("recovered from crash"),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "astra_runtime::run_engine",
-                        run_id = %run.run_id,
-                        error = %e,
-                        "failed to mark crashed run as failed during recovery"
-                    );
-                }
-                run.status = astra_core::STATUS_FAILED.to_string();
-                run.error_message = Some("recovered from crash".to_string());
+        for run in running {
+            if let Some(recovered) = self.recover_active_run(run).await {
+                recovered_running.push(recovered);
             }
-            recovered_running.push(run);
         }
 
         // Return all: waiting (to resume) + recovered running runs.
         let mut all = waiting;
         all.extend(recovered_running);
         Ok(all)
+    }
+
+    async fn recover_active_run(&self, mut run: DurableRunRecord) -> Option<DurableRunRecord> {
+        let expected_status = run.status.clone();
+        if has_graceful_resume_checkpoint(self, &run).await {
+            let event = serde_json::json!({
+                "event_type": "run_resumed_after_restart",
+                "data": {"checkpoint_version": "checkpoint_v1"}
+            });
+            match self
+                .store
+                .update_run_status_with_event_if_current(
+                    &run.user_id,
+                    &run.run_id,
+                    &[expected_status.as_str()],
+                    STATUS_WAITING,
+                    Some("restart_resume"),
+                    None,
+                    event,
+                )
+                .await
+            {
+                Ok(true) => {
+                    run.status = STATUS_WAITING.to_string();
+                    run.waiting_for = Some("restart_resume".to_string());
+                    run.last_event_idx += 1;
+                    run.events.push(serde_json::json!({
+                        "event_type": "run_resumed_after_restart",
+                        "data": {"checkpoint_version": "checkpoint_v1"}
+                    }));
+                    Some(run)
+                }
+                Ok(false) => self.recovery_conflict_current_run(&run).await,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "astra_runtime::run_engine",
+                        run_id = %run.run_id,
+                        error = %e,
+                        "failed to atomically mark graceful run waiting during recovery"
+                    );
+                    None
+                }
+            }
+        } else {
+            let event = serde_json::json!({
+                "event_type": "run_error",
+                "data": {
+                    "error": "recovered from crash",
+                    "error_code": "crash_recovery",
+                    "error_kind": "crash_recovery"
+                }
+            });
+            match self
+                .store
+                .update_run_status_with_event_if_current(
+                    &run.user_id,
+                    &run.run_id,
+                    &[expected_status.as_str()],
+                    STATUS_FAILED,
+                    None,
+                    Some("recovered from crash"),
+                    event,
+                )
+                .await
+            {
+                Ok(true) => {
+                    run.status = STATUS_FAILED.to_string();
+                    run.waiting_for = None;
+                    run.error_message = Some("recovered from crash".to_string());
+                    run.error_code = Some("crash_recovery".to_string());
+                    run.last_event_idx += 1;
+                    run.events.push(serde_json::json!({
+                        "event_type": "run_error",
+                        "data": {
+                            "error": "recovered from crash",
+                            "error_code": "crash_recovery",
+                            "error_kind": "crash_recovery"
+                        }
+                    }));
+                    Some(run)
+                }
+                Ok(false) => self.recovery_conflict_current_run(&run).await,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "astra_runtime::run_engine",
+                        run_id = %run.run_id,
+                        error = %e,
+                        "failed to atomically mark crashed run as failed during recovery"
+                    );
+                    None
+                }
+            }
+        }
+    }
+
+    async fn recovery_conflict_current_run(
+        &self,
+        stale_run: &DurableRunRecord,
+    ) -> Option<DurableRunRecord> {
+        let current = match self.load_run(&stale_run.user_id, &stale_run.run_id).await {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_engine",
+                    run_id = %stale_run.run_id,
+                    error = %error,
+                    "recovery transition CAS missed and current run reload failed"
+                );
+                return None;
+            }
+        };
+        let Some(current) = current else {
+            tracing::warn!(
+                target: "astra_runtime::run_engine",
+                run_id = %stale_run.run_id,
+                "recovery transition CAS missed and current run is gone"
+            );
+            return None;
+        };
+        if current.status == STATUS_WAITING || current.status == STATUS_FAILED {
+            Some(current)
+        } else {
+            tracing::warn!(
+                target: "astra_runtime::run_engine",
+                run_id = %stale_run.run_id,
+                stale_status = %stale_run.status,
+                current_status = %current.status,
+                "recovery transition skipped because durable status changed"
+            );
+            None
+        }
     }
 
     /// List runs for a user (delegates to store).
@@ -2339,6 +2411,16 @@ mod tests {
             Some("recovered from crash"),
             "error message must indicate crash recovery"
         );
+        assert_eq!(crashed.error_code.as_deref(), Some("crash_recovery"));
+        assert_eq!(
+            crashed.events.last().unwrap()["event_type"],
+            "run_error",
+            "crash recovery failure must be auditable from durable events"
+        );
+        assert_eq!(
+            crashed.events.last().unwrap()["data"]["error_code"],
+            "crash_recovery"
+        );
 
         // The waiting run must remain waiting
         let waiting = engine
@@ -2349,6 +2431,52 @@ mod tests {
         assert_eq!(
             waiting.status, "waiting",
             "waiting run must remain waiting for resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_active_runs_cas_miss_does_not_overwrite_completed() {
+        let engine = test_engine();
+        engine
+            .start_run("run-race", "user-1", "sess-race")
+            .await
+            .unwrap();
+        let stale_running = engine
+            .load_run("user-1", "run-race")
+            .await
+            .unwrap()
+            .unwrap();
+        engine
+            .persist_status(
+                "user-1",
+                "run-race",
+                astra_core::STATUS_COMPLETED,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_run(stale_running).await;
+
+        assert!(
+            recovered.is_none(),
+            "a CAS-missed completed run must not be reported as recovered"
+        );
+        let durable = engine
+            .load_run("user-1", "run-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, astra_core::STATUS_COMPLETED);
+        assert!(durable.error_message.is_none());
+        assert!(durable.error_code.is_none());
+        assert!(
+            durable
+                .events
+                .iter()
+                .all(|event| event["event_type"] != "run_error"),
+            "stale recovery must not append a crash-recovery run_error"
         );
     }
 
@@ -2385,6 +2513,12 @@ mod tests {
         assert_eq!(
             durable.error_message.as_deref(),
             Some("recovered from crash")
+        );
+        assert_eq!(durable.error_code.as_deref(), Some("crash_recovery"));
+        assert_eq!(
+            durable.events.last().unwrap()["event_type"],
+            "run_error",
+            "input-queued recovery failure must be auditable from durable events"
         );
     }
 }
