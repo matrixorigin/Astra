@@ -198,6 +198,45 @@ fn terminal_transition_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS.saturating_mul(attempt as u64))
 }
 
+fn json_contains_expected_fields(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    match (actual, expected) {
+        (serde_json::Value::Object(actual), serde_json::Value::Object(expected)) => {
+            expected.iter().all(|(key, expected_value)| {
+                key == "index"
+                    || actual.get(key).is_some_and(|actual_value| {
+                        json_contains_expected_fields(actual_value, expected_value)
+                    })
+            })
+        }
+        (serde_json::Value::Array(actual), serde_json::Value::Array(expected)) => {
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual_value, expected_value)| {
+                        json_contains_expected_fields(actual_value, expected_value)
+                    })
+        }
+        _ => actual == expected,
+    }
+}
+
+fn durable_run_contains_event_batch(
+    run: &DurableRunRecord,
+    expected_events: &[serde_json::Value],
+) -> bool {
+    expected_events.is_empty()
+        || run
+            .events
+            .windows(expected_events.len())
+            .any(|actual_events| {
+                actual_events
+                    .iter()
+                    .zip(expected_events)
+                    .all(|(actual, expected)| json_contains_expected_fields(actual, expected))
+            })
+}
+
 fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
     let mut data = serde_json::Map::new();
     if let Some(mode_label) = effective_mode_label(context) {
@@ -658,7 +697,9 @@ impl RunEngine {
     /// If the store commits but the connection drops before the caller observes
     /// success, a retry can return `Ok(false)` because the status is already
     /// terminal. In that case we reconcile by loading the durable row and only
-    /// treat it as committed when the stored status matches the target status.
+    /// treat it as committed when the stored status and terminal event batch are
+    /// both present. If the status committed but the expected events are missing,
+    /// repair the event batch before reporting success.
     pub async fn transition_terminal_status_with_events_if_current(
         &self,
         user_id: &str,
@@ -686,32 +727,17 @@ impl RunEngine {
             {
                 Ok(true) => return Ok(true),
                 Ok(false) if saw_store_error => {
-                    let current = self.store.load_run(user_id, run_id).await.map_err(|error| {
-                        if let Some(last_error) = last_error.as_ref() {
-                            format!(
-                                "{last_error}; failed to reconcile terminal transition after retry: {error}"
-                            )
-                        } else {
-                            error
-                        }
-                    })?;
-                    if current.as_ref().is_some_and(|run| run.status == status) {
-                        let summary = error_message.or(waiting_for);
-                        if let Err(error) = self
-                            .project_delegation_run_if_needed(user_id, run_id, status, summary)
-                            .await
-                        {
-                            tracing::warn!(
-                                user_id,
-                                run_id,
-                                status,
-                                error = %error,
-                                "terminal run transition reconciled but delegation projection refresh failed"
-                            );
-                        }
-                        return Ok(true);
-                    }
-                    return Ok(false);
+                    return self
+                        .reconcile_terminal_transition_after_store_error(
+                            user_id,
+                            run_id,
+                            status,
+                            waiting_for,
+                            error_message,
+                            events,
+                            last_error.as_deref(),
+                        )
+                        .await;
                 }
                 Ok(false) => return Ok(false),
                 Err(error) => {
@@ -734,6 +760,74 @@ impl RunEngine {
             }
         }
         Err(last_error.unwrap_or_else(|| "terminal transition retry exhausted".to_string()))
+    }
+
+    async fn reconcile_terminal_transition_after_store_error(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+        last_error: Option<&str>,
+    ) -> Result<bool, String> {
+        let Some(run) = self
+            .store
+            .load_run(user_id, run_id)
+            .await
+            .map_err(|error| {
+                if let Some(last_error) = last_error {
+                    format!(
+                        "{last_error}; failed to reconcile terminal transition after retry: {error}"
+                    )
+                } else {
+                    error
+                }
+            })?
+        else {
+            return Ok(false);
+        };
+        if run.status != status {
+            return Ok(false);
+        }
+        if !durable_run_contains_event_batch(&run, events) {
+            self.store
+                .append_events_batch(user_id, run_id, events)
+                .await
+                .map_err(|error| {
+                    if let Some(last_error) = last_error {
+                        format!(
+                            "{last_error}; terminal transition reached status {status} but event repair failed: {error}"
+                        )
+                    } else {
+                        format!(
+                            "terminal transition reached status {status} but event repair failed: {error}"
+                        )
+                    }
+                })?;
+            tracing::warn!(
+                user_id,
+                run_id,
+                status,
+                repaired_event_count = events.len(),
+                "terminal run transition reconciled status but had to repair missing events"
+            );
+        }
+        let summary = error_message.or(waiting_for);
+        if let Err(error) = self
+            .project_delegation_run_if_needed(user_id, run_id, status, summary)
+            .await
+        {
+            tracing::warn!(
+                user_id,
+                run_id,
+                status,
+                error = %error,
+                "terminal run transition reconciled but delegation projection refresh failed"
+            );
+        }
+        Ok(true)
     }
 
     async fn project_delegation_run_if_needed(
@@ -1458,6 +1552,7 @@ mod tests {
     enum BatchTransitionFailureMode {
         BeforeCommit,
         AfterCommit,
+        StatusOnlyAfterCommit,
         ConcurrentCancelAfterCommit,
     }
 
@@ -1616,6 +1711,19 @@ mod tests {
                             )
                             .await?;
                         return Err("transient EOF after commit".to_string());
+                    }
+                    BatchTransitionFailureMode::StatusOnlyAfterCommit => {
+                        self.inner
+                            .update_run_status_if_current(
+                                user_id,
+                                run_id,
+                                expected_statuses,
+                                status,
+                                waiting_for,
+                                error_message,
+                            )
+                            .await?;
+                        return Err("transient EOF after status-only commit".to_string());
                     }
                     BatchTransitionFailureMode::ConcurrentCancelAfterCommit => {
                         self.inner
@@ -2274,6 +2382,81 @@ mod tests {
             1,
             "commit-after-EOF reconcile must not append duplicate terminal events"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_repairs_missing_events_after_status_only_unknown_error() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            1,
+            BatchTransitionFailureMode::StatusOnlyAfterCommit,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-terminal-repair", "user-1", "sess-1")
+            .await
+            .unwrap();
+        let terminal_events = vec![
+            serde_json::json!({
+                "event_type": "run_error",
+                "data": {
+                    "error": "tool failed",
+                    "error_code": "tool_error",
+                    "error_kind": "tool_error"
+                }
+            }),
+            serde_json::json!({
+                "event_type": "run_finished",
+                "data": {
+                    "status": STATUS_FAILED,
+                    "error": "tool failed",
+                    "error_code": "tool_error",
+                    "error_kind": "tool_error"
+                }
+            }),
+        ];
+
+        let updated = engine
+            .transition_terminal_status_with_events_if_current(
+                "user-1",
+                "run-terminal-repair",
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some("tool failed"),
+                &terminal_events,
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        assert_eq!(store.attempts(), 2);
+        let run = engine
+            .load_run("user-1", "run-terminal-repair")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_FAILED);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(
+                    |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("run_error")
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(
+                    |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("run_finished")
+                )
+                .count(),
+            1
+        );
+        assert!(durable_run_contains_event_batch(&run, &terminal_events));
     }
 
     #[tokio::test]
