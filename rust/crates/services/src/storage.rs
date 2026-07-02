@@ -1289,7 +1289,7 @@ pub async fn ensure_core_schema(
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_agent_runs_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
             PRIMARY KEY (user_id, run_id),
-            INDEX idx_agent_runs_user_updated (user_id, updated_at),
+            INDEX idx_agent_runs_user_updated_run (user_id, updated_at, run_id),
             INDEX idx_agent_runs_user_session_status_updated (user_id, session_id, status, updated_at),
             INDEX idx_agent_runs_owner_root_depth (user_id, root_run_id, depth, created_at),
             INDEX idx_agent_runs_owner_parent_status_updated (user_id, parent_run_id, status, updated_at),
@@ -1315,10 +1315,16 @@ pub async fn ensure_core_schema(
         "idx_agent_runs_root_depth",
         "idx_agent_runs_parent",
         "idx_agent_runs_retry_of",
+        "idx_agent_runs_user_updated",
     ] {
         drop_index_if_present(&pool, &settings.database, "agent_runs", removed_index).await?;
     }
     for (index, expected_columns, ddl) in [
+        (
+            "idx_agent_runs_user_updated_run",
+            &["user_id", "updated_at", "run_id"][..],
+            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_user_updated_run (user_id, updated_at, run_id)",
+        ),
         (
             "idx_agent_runs_user_session_status_updated",
             &["user_id", "session_id", "status", "updated_at"][..],
@@ -5801,6 +5807,25 @@ mod tests {
                 "{table} schema bootstrap must verify owner-bound primary key shape"
             );
         }
+    }
+
+    #[test]
+    fn agent_runs_list_index_matches_seek_pagination_order() {
+        let source = include_str!("storage.rs");
+        assert!(
+            source.contains("INDEX idx_agent_runs_user_updated_run (user_id, updated_at, run_id)"),
+            "agent_runs run-list index must include the stable seek tie-breaker"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_user_updated_run (user_id, updated_at, run_id)"
+            ),
+            "agent_runs schema bootstrap must create the seek pagination index"
+        );
+        assert!(
+            source.contains("\"idx_agent_runs_user_updated\""),
+            "agent_runs schema bootstrap must remove the obsolete two-column run-list index"
+        );
     }
 
     #[test]

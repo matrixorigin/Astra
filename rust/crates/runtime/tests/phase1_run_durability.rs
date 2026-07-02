@@ -377,9 +377,10 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         Ok(RunListRecord {
             runs: Vec::new(),
-            total: 0,
+            total: Some(0),
             limit,
             offset,
+            next_cursor: None,
         })
     }
 

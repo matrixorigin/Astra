@@ -37,8 +37,9 @@ use astra_services::{
     DatabaseStateProjectionStore,
     runs::{
         CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
-        DurableRunRecord, DurableRunStatusKind, RequestedTurnInteractionMode, RunStateStore,
-        RuntimeProfileRequest, SelectedModelRequest, durable_run_status_kind,
+        DurableRunListPage, DurableRunRecord, DurableRunStatusKind, RequestedTurnInteractionMode,
+        RunListCursor, RunStateStore, RuntimeProfileRequest, SelectedModelRequest,
+        durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
@@ -905,6 +906,19 @@ impl RunEngine {
         offset: u32,
     ) -> Result<(Vec<DurableRunRecord>, i64), String> {
         self.store.list_user_runs(user_id, limit, offset).await
+    }
+
+    /// List runs for a user using seek pagination.
+    pub async fn list_user_runs_cursor(
+        &self,
+        user_id: &str,
+        limit: u32,
+        cursor: Option<RunListCursor>,
+        include_total: bool,
+    ) -> Result<DurableRunListPage, String> {
+        self.store
+            .list_user_runs_cursor(user_id, limit, cursor, include_total)
+            .await
     }
 
     /// Access the underlying store (for advanced queries).

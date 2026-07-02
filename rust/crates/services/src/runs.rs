@@ -16,6 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::db_row::RowExt as RunStateDbRow;
+use crate::pagination::MAX_API_LIST_LIMIT;
 
 pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
 pub const SSE_HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -114,6 +115,21 @@ pub trait RunLifecycleService: Send + Sync {
         limit: u32,
         offset: u32,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    async fn list_runs_cursor(
+        &self,
+        user_id: String,
+        limit: u32,
+        cursor: Option<RunListCursor>,
+    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+        if cursor.is_some() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "run list cursor not supported",
+            ));
+        }
+        self.list_runs(user_id, limit, 0).await
+    }
 
     /// Pause an active run. Default: NOT_IMPLEMENTED.
     async fn pause_run(
@@ -676,9 +692,72 @@ pub struct RunInputRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunListRecord {
     pub runs: Vec<RunStatusRecord>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
     pub offset: u32,
+    pub next_cursor: Option<RunListCursor>,
+}
+
+/// Cursor for stable run list pagination.
+///
+/// `updated_at` is the ordering key, paired with `run_id` as the deterministic
+/// tie-breaker for rows updated in the same database timestamp.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunListCursor {
+    pub updated_at: String,
+    pub run_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DurableRunListPage {
+    pub runs: Vec<DurableRunRecord>,
+    pub total: Option<i64>,
+    pub next_cursor: Option<RunListCursor>,
+}
+
+#[must_use]
+pub fn validate_run_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_API_LIST_LIMIT)
+}
+
+#[must_use]
+fn run_list_query_limit(limit: u32) -> i64 {
+    i64::from(validate_run_list_limit(limit)) + 1
+}
+
+pub fn run_list_cursor_db_updated_at(cursor: &RunListCursor) -> Result<String, String> {
+    let updated_at = cursor.updated_at.trim();
+    if updated_at.is_empty() {
+        return Err("invalid run list cursor: updated_at is required".to_string());
+    }
+    let mut db_updated_at = updated_at.replace('T', " ");
+    if let Some(stripped) = db_updated_at.strip_suffix('Z') {
+        db_updated_at = stripped.to_string();
+    }
+    if chrono::NaiveDateTime::parse_from_str(&db_updated_at, "%Y-%m-%d %H:%M:%S%.f").is_err() {
+        return Err(format!("invalid run list cursor timestamp: {updated_at}"));
+    }
+    Ok(db_updated_at)
+}
+
+pub fn run_list_cursor_run_id(cursor: &RunListCursor) -> Result<String, String> {
+    let run_id = cursor.run_id.trim();
+    if run_id.is_empty() {
+        return Err("invalid run list cursor: run_id is required".to_string());
+    }
+    Ok(run_id.to_string())
+}
+
+fn durable_run_list_next_cursor(run: &DurableRunRecord) -> RunListCursor {
+    RunListCursor {
+        updated_at: run.updated_at.clone(),
+        run_id: run.run_id.clone(),
+    }
+}
+
+fn durable_run_after_cursor(run: &DurableRunRecord, cursor: &RunListCursor) -> bool {
+    run.updated_at < cursor.updated_at
+        || (run.updated_at == cursor.updated_at && run.run_id < cursor.run_id)
 }
 
 // ─── Durable Run State Store ─────────────────────────────────────────────────
@@ -827,6 +906,11 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, selected_model_json, selected_model_name, \
      selected_model_gateway, capability_server_refs_json, runtime_profile, created_at, updated_at";
+const RUN_LIST_CURSOR_SELECT_SQL: &str =
+    "DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%f') AS cursor_updated_at";
+const RUN_LIST_CURSOR_FILTER_SQL: &str = " AND (updated_at < ";
+const RUN_LIST_CURSOR_TIE_SQL: &str = " OR (updated_at = ";
+const RUN_LIST_ORDER_SQL: &str = " ORDER BY updated_at DESC, run_id DESC";
 
 const RUN_DISPLAY_PROJECTION_COLUMNS: &str = "run_id, user_id, session_id, status, waiting_for, \
      error_message, projection_event_idx, latest_event_type, latest_checkpoint_id, \
@@ -977,6 +1061,26 @@ pub trait RunStateStore: Send + Sync {
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<DurableRunRecord>, i64), String>;
+
+    /// List runs with seek pagination. Cursor callers can skip the exact
+    /// `COUNT(*)`; offset callers can still request it through the legacy API.
+    async fn list_user_runs_cursor(
+        &self,
+        user_id: &str,
+        limit: u32,
+        cursor: Option<RunListCursor>,
+        include_total: bool,
+    ) -> Result<DurableRunListPage, String> {
+        if cursor.is_some() {
+            return Err("run list cursor pagination is not supported by this store".to_string());
+        }
+        let (runs, total) = self.list_user_runs(user_id, limit, 0).await?;
+        Ok(DurableRunListPage {
+            runs,
+            total: include_total.then_some(total),
+            next_cursor: None,
+        })
+    }
 
     /// Find runs in WAITING status (for resume engine).
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
@@ -1648,6 +1752,49 @@ impl RunStateStore for InMemoryRunStateStore {
             .take(limit as usize)
             .collect();
         Ok((page, total))
+    }
+
+    async fn list_user_runs_cursor(
+        &self,
+        user_id: &str,
+        limit: u32,
+        cursor: Option<RunListCursor>,
+        include_total: bool,
+    ) -> Result<DurableRunListPage, String> {
+        if let Some(cursor) = &cursor {
+            run_list_cursor_run_id(cursor)?;
+        }
+        let limit = validate_run_list_limit(limit);
+        let runs = self.runs.read().await;
+        let mut user_runs: Vec<_> = runs
+            .values()
+            .filter(|r| r.user_id == user_id)
+            .cloned()
+            .collect();
+        user_runs.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.run_id.cmp(&a.run_id))
+        });
+        let total = user_runs.len() as i64;
+        if let Some(cursor) = &cursor {
+            user_runs.retain(|run| durable_run_after_cursor(run, cursor));
+        }
+        let has_more = user_runs.len() > limit as usize;
+        if has_more {
+            user_runs.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            user_runs.last().map(durable_run_list_next_cursor)
+        } else {
+            None
+        };
+        Ok(DurableRunListPage {
+            runs: user_runs,
+            total: include_total.then_some(total),
+            next_cursor,
+        })
     }
 
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
@@ -3356,7 +3503,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|e| e.to_string())?;
         let sql = format!(
             "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
-             WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+             WHERE user_id = ?{RUN_LIST_ORDER_SQL} LIMIT ? OFFSET ?"
         );
         let rows = sqlx::query(&sql)
             .bind(user_id)
@@ -3371,6 +3518,81 @@ impl RunStateStore for DatabaseRunStateStore {
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|e| e.to_string())?;
         Ok((runs, total))
+    }
+
+    async fn list_user_runs_cursor(
+        &self,
+        user_id: &str,
+        limit: u32,
+        cursor: Option<RunListCursor>,
+        include_total: bool,
+    ) -> Result<DurableRunListPage, String> {
+        let limit = validate_run_list_limit(limit);
+        let total = if include_total {
+            let total_row =
+                sqlx::query("SELECT COUNT(*) AS total FROM agent_runs WHERE user_id = ?")
+                    .bind(user_id)
+                    .fetch_one(self.pool.get())
+                    .await
+                    .map_err(|source| db_error("count_user_runs", user_id, source).to_string())?;
+            Some(
+                run_row_non_negative_i64(&total_row, "count_user_runs", "agent_runs", "total")
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        let query_limit = run_list_query_limit(limit);
+        let rows = if let Some(cursor) = cursor {
+            let updated_at = run_list_cursor_db_updated_at(&cursor)?;
+            let run_id = run_list_cursor_run_id(&cursor)?;
+            let sql = format!(
+                "SELECT {AGENT_RUN_COLUMNS}, {RUN_LIST_CURSOR_SELECT_SQL} FROM agent_runs \
+                 WHERE user_id = ?{RUN_LIST_CURSOR_FILTER_SQL}?{RUN_LIST_CURSOR_TIE_SQL}? AND run_id < ?))\
+                 {RUN_LIST_ORDER_SQL} LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(user_id)
+                .bind(updated_at.clone())
+                .bind(updated_at)
+                .bind(run_id)
+                .bind(query_limit)
+                .fetch_all(self.pool.get())
+                .await
+        } else {
+            let sql = format!(
+                "SELECT {AGENT_RUN_COLUMNS}, {RUN_LIST_CURSOR_SELECT_SQL} FROM agent_runs \
+                 WHERE user_id = ?{RUN_LIST_ORDER_SQL} LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(user_id)
+                .bind(query_limit)
+                .fetch_all(self.pool.get())
+                .await
+        }
+        .map_err(|source| db_error("list_user_runs_cursor", user_id, source).to_string())?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cursor = run_list_cursor_from_row(&row).map_err(|e| e.to_string())?;
+            let run = run_record_from_row(row).map_err(|e| e.to_string())?;
+            entries.push((run, cursor));
+        }
+        let has_more = entries.len() > limit as usize;
+        if has_more {
+            entries.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            entries.last().map(|(_, cursor)| cursor.clone())
+        } else {
+            None
+        };
+        let runs = entries.into_iter().map(|(run, _)| run).collect();
+        Ok(DurableRunListPage {
+            runs,
+            total,
+            next_cursor,
+        })
     }
 
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
@@ -3744,6 +3966,30 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
 
 fn run_record_from_row(row: sqlx::mysql::MySqlRow) -> DbStoreResult<DurableRunRecord> {
     decode_run_record_from_row(&row)
+}
+
+fn run_list_cursor_from_row(row: &impl RunStateDbRow) -> DbStoreResult<RunListCursor> {
+    let operation = "list_user_runs_cursor";
+    let table = "agent_runs";
+    let updated_at = run_row_string(row, operation, table, "cursor_updated_at")?;
+    if updated_at.trim().is_empty() {
+        return Err(invalid_database_value_error(
+            operation,
+            table,
+            "cursor_updated_at",
+            "expected non-empty run list cursor timestamp",
+        ));
+    }
+    let run_id = run_row_string(row, operation, table, "run_id")?;
+    if run_id.trim().is_empty() {
+        return Err(invalid_database_value_error(
+            operation,
+            table,
+            "run_id",
+            "expected non-empty run list cursor run_id",
+        ));
+    }
+    Ok(RunListCursor { updated_at, run_id })
 }
 
 fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<DurableRunRecord> {
@@ -5266,6 +5512,88 @@ mod tests {
             .await
             .expect_err("approval-waiting paused run must still block the session");
         assert_eq!(error, "session already has an active run");
+    }
+
+    #[tokio::test]
+    async fn in_memory_list_user_runs_cursor_seek_paginates_without_count() {
+        let store = InMemoryRunStateStore::new();
+        for i in 0..5 {
+            let mut run = durable_run_record(&format!("run-{i}"));
+            run.status = STATUS_COMPLETED.into();
+            run.session_id = format!("session-{i}");
+            run.created_at = "2026-07-03T10:00:00.000000Z".into();
+            run.updated_at = "2026-07-03T10:00:00.000000Z".into();
+            store.insert_run(run).await.unwrap();
+        }
+
+        let first = store
+            .list_user_runs_cursor("u1", 2, None, false)
+            .await
+            .unwrap();
+        assert_eq!(first.total, None);
+        assert_eq!(
+            first
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-4", "run-3"]
+        );
+        assert_eq!(
+            first
+                .next_cursor
+                .as_ref()
+                .map(|cursor| cursor.run_id.as_str()),
+            Some("run-3")
+        );
+
+        let second = store
+            .list_user_runs_cursor("u1", 2, first.next_cursor, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-2", "run-1"]
+        );
+
+        let third = store
+            .list_user_runs_cursor("u1", 2, second.next_cursor, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            third
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-0"]
+        );
+        assert!(third.next_cursor.is_none());
+
+        let with_total = store
+            .list_user_runs_cursor("u1", 2, None, true)
+            .await
+            .unwrap();
+        assert_eq!(with_total.total, Some(5));
+    }
+
+    #[test]
+    fn run_list_sql_contract_uses_seek_cursor_not_offset() {
+        let order_sql = RUN_LIST_ORDER_SQL.to_ascii_uppercase();
+        let cursor_sql = format!(
+            "{}?{}? AND run_id < ?))",
+            RUN_LIST_CURSOR_FILTER_SQL, RUN_LIST_CURSOR_TIE_SQL
+        )
+        .to_ascii_uppercase();
+        assert!(!order_sql.contains(" OFFSET "));
+        assert!(!cursor_sql.contains(" OFFSET "));
+        assert!(order_sql.contains("UPDATED_AT DESC"));
+        assert!(order_sql.contains("RUN_ID DESC"));
+        assert!(cursor_sql.contains("RUN_ID < ?"));
     }
 
     #[test]

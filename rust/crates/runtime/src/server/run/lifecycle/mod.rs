@@ -39,9 +39,10 @@ use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
     AgentBindingRuntimeRequest, CancelRunRecord, CapabilityServerRefs, ChatRequestData,
     ChatRunRecord, ChatStreamRecord, DurableRunRecord, DurableRunStatusKind,
-    RequestedTurnInteractionMode, RunInputData, RunInputRecord, RunLifecycleService, RunListRecord,
-    RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord, RunStatusRecord,
-    RuntimeAuthRequest, RuntimeProfileRequest, SelectedModelRequest, durable_run_status_kind,
+    RequestedTurnInteractionMode, RunInputData, RunInputRecord, RunLifecycleService, RunListCursor,
+    RunListRecord, RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord,
+    RunStatusRecord, RuntimeAuthRequest, RuntimeProfileRequest, SelectedModelRequest,
+    durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
@@ -7453,9 +7454,41 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .collect();
         Ok(RunListRecord {
             runs: page,
-            total,
+            total: Some(total),
             limit,
             offset,
+            next_cursor: None,
+        })
+    }
+
+    async fn list_runs_cursor(
+        &self,
+        user_id: String,
+        limit: u32,
+        cursor: Option<RunListCursor>,
+    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+        let limit = astra_services::runs::validate_run_list_limit(limit);
+        let durable_page = self
+            .run_engine
+            .list_user_runs_cursor(&user_id, limit, cursor, false)
+            .await
+            .map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to list durable run state: {error}"),
+                )
+            })?;
+        let page = durable_page
+            .runs
+            .iter()
+            .map(Self::durable_status_record)
+            .collect();
+        Ok(RunListRecord {
+            runs: page,
+            total: durable_page.total,
+            limit,
+            offset: 0,
+            next_cursor: durable_page.next_cursor,
         })
     }
 
@@ -13799,7 +13832,7 @@ mod tests {
     async fn list_runs_empty_initially() {
         let svc = test_service();
         let result = ok(svc.list_runs("user-1".into(), 10, 0).await);
-        assert_eq!(result.total, 0);
+        assert_eq!(result.total, Some(0));
         assert!(result.runs.is_empty());
     }
 
@@ -13810,7 +13843,7 @@ mod tests {
         let u2_b = ok(svc.create_run("user-2".into(), test_request("b")).await);
         let u1_c = ok(svc.create_run("user-1".into(), test_request("c")).await);
         let for_u1 = ok(svc.list_runs("user-1".into(), 10, 0).await);
-        assert_eq!(for_u1.total, 2);
+        assert_eq!(for_u1.total, Some(2));
         let ids: std::collections::HashSet<_> =
             for_u1.runs.iter().map(|r| r.run_id.as_str()).collect();
         assert!(ids.contains(u1_a.run_id.as_str()));
@@ -13830,7 +13863,7 @@ mod tests {
         );
 
         let for_u2 = ok(svc.list_runs("user-2".into(), 10, 0).await);
-        assert_eq!(for_u2.total, 1);
+        assert_eq!(for_u2.total, Some(1));
         assert_eq!(for_u2.runs[0].run_id, u2_b.run_id);
     }
 
@@ -13844,11 +13877,40 @@ mod tests {
         }
         let page1 = ok(svc.list_runs("user-1".into(), 2, 0).await);
         assert_eq!(page1.runs.len(), 2);
-        assert_eq!(page1.total, 5);
+        assert_eq!(page1.total, Some(5));
         let page2 = ok(svc.list_runs("user-1".into(), 2, 2).await);
         assert_eq!(page2.runs.len(), 2);
         let page3 = ok(svc.list_runs("user-1".into(), 2, 4).await);
         assert_eq!(page3.runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_runs_cursor_pagination_omits_count_and_returns_next_cursor() {
+        let svc = test_service();
+        for i in 0..5 {
+            ok(svc
+                .create_run("user-cursor".into(), test_request(&format!("msg {i}")))
+                .await);
+        }
+
+        let page1 = ok(svc.list_runs_cursor("user-cursor".into(), 2, None).await);
+        assert_eq!(page1.total, None);
+        assert_eq!(page1.runs.len(), 2);
+        assert!(page1.next_cursor.is_some());
+
+        let page2 = ok(svc
+            .list_runs_cursor("user-cursor".into(), 2, page1.next_cursor)
+            .await);
+        assert_eq!(page2.total, None);
+        assert_eq!(page2.runs.len(), 2);
+        assert!(page2.next_cursor.is_some());
+
+        let page3 = ok(svc
+            .list_runs_cursor("user-cursor".into(), 2, page2.next_cursor)
+            .await);
+        assert_eq!(page3.total, None);
+        assert_eq!(page3.runs.len(), 1);
+        assert!(page3.next_cursor.is_none());
     }
 
     #[tokio::test]
@@ -16057,7 +16119,7 @@ mod tests {
 
         let runs = ok(svc.list_runs("user-1".into(), 10, 0).await);
         let run_ids: Vec<_> = runs.runs.iter().map(|run| run.run_id.as_str()).collect();
-        assert_eq!(runs.total, 2);
+        assert_eq!(runs.total, Some(2));
         assert!(run_ids.contains(&first.run_id.as_str()));
         assert!(run_ids.contains(&second.run_id.as_str()));
     }

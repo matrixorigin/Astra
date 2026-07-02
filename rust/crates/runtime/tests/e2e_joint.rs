@@ -424,9 +424,10 @@ impl RunLifecycleService for JointRunLifecycle {
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         Ok(RunListRecord {
             runs: Vec::new(),
-            total: 0,
+            total: Some(0),
             limit,
             offset,
+            next_cursor: None,
         })
     }
 

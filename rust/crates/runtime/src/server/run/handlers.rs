@@ -435,11 +435,20 @@ pub(crate) async fn list_runs_handler(
     Query(query): Query<RunListQuery>,
 ) -> Result<Json<RunListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let runs = state
-        .execution
-        .run_lifecycle_service
-        .list_runs(user.user_id, query.limit, query.offset)
-        .await?;
+    let cursor = query.cursor()?;
+    let runs = if cursor.is_some() {
+        state
+            .execution
+            .run_lifecycle_service
+            .list_runs_cursor(user.user_id, query.limit, cursor)
+            .await?
+    } else {
+        state
+            .execution
+            .run_lifecycle_service
+            .list_runs(user.user_id, query.limit, query.offset)
+            .await?
+    };
     Ok(Json(RunListResponse::from(runs)))
 }
 
