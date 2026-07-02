@@ -135,6 +135,15 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("sync_log_days default 30", row["retention_policy"])
         self.assertIn("not exactly rebuildable", row["rebuildability"])
 
+    def test_agent_message_queue_retention_is_bounded(self) -> None:
+        queue = self.tables["agent_message_queue"]
+        delivery = self.tables["agent_message_broadcast_delivery"]
+        self.assertIn("ordered bounded batches", queue["retention_policy"])
+        self.assertIn("orphan broadcast delivery", queue["retention_policy"])
+        self.assertIn("not rebuildable for pending messages", queue["rebuildability"])
+        self.assertIn("ordered bounded batches", delivery["retention_policy"])
+        self.assertIn("consumer-scoped delivery state", delivery["merge_guidance"])
+
     def test_external_hot_coordination_tables_have_semantic_metadata(self) -> None:
         for table in [
             "agent_message_queue",

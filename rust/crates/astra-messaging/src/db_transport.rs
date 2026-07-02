@@ -75,6 +75,12 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum number of messages to fetch per poll cycle.
 const POLL_BATCH_SIZE: i64 = 100;
 
+/// Maximum queue rows pruned by a single maintenance statement.
+const QUEUE_CLEANUP_BATCH_LIMIT: i64 = 1000;
+
+/// Maximum broadcast delivery rows pruned by a single maintenance statement.
+const BROADCAST_DELIVERY_CLEANUP_BATCH_LIMIT: i64 = 1000;
+
 /// Initial backoff on DB poll error (doubles each consecutive failure).
 const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 
@@ -83,6 +89,25 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
 /// After this many consecutive failures, log a critical warning.
 const CRITICAL_FAILURE_THRESHOLD: u32 = 30;
+
+const CLEANUP_EXPIRED_MESSAGES_SQL: &str = "DELETE FROM agent_message_queue
+             WHERE ttl_ms IS NOT NULL
+               AND timestamp_ms < (? - ttl_ms)
+             ORDER BY created_at ASC, message_id ASC
+             LIMIT ?";
+
+const CLEANUP_TERMINAL_MESSAGES_SQL: &str = "DELETE FROM agent_message_queue
+             WHERE timestamp_ms < ?
+               AND status IN ('acked', 'failed')
+             ORDER BY created_at ASC, message_id ASC
+             LIMIT ?";
+
+const CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL: &str = "DELETE FROM agent_message_broadcast_delivery
+         WHERE message_id NOT IN (
+             SELECT message_id FROM agent_message_queue
+         )
+         ORDER BY message_id ASC, consumer_id ASC
+         LIMIT ?";
 
 // ─── Metrics ────────────────────────────────────────────────────────────────
 
@@ -258,36 +283,22 @@ impl DatabaseTransport {
         }
     }
 
-    /// Delete expired messages from the queue.
+    /// Delete one bounded batch of expired messages from the queue.
     ///
-    /// Call periodically to prevent unbounded table growth.
+    /// Call periodically until it returns 0 to prevent unbounded table growth.
     pub async fn cleanup_expired(&self) -> Result<u64, sqlx::Error> {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let result = query(
-            "DELETE FROM agent_message_queue
-             WHERE ttl_ms IS NOT NULL
-               AND timestamp_ms < (? - ttl_ms)",
-        )
-        .bind(now_ms)
-        .execute(&self.pool)
-        .await?;
+        let deleted = cleanup_expired_in_pool(&self.pool, now_ms).await?;
         cleanup_broadcast_delivery_orphans(&self.pool).await?;
-        Ok(result.rows_affected())
+        Ok(deleted)
     }
 
-    /// Delete terminal messages older than the given duration.
+    /// Delete one bounded batch of terminal messages older than the given duration.
     pub async fn cleanup_older_than(&self, max_age: Duration) -> Result<u64, sqlx::Error> {
         let cutoff_ms = chrono::Utc::now().timestamp_millis() - max_age.as_millis() as i64;
-        let result = query(
-            "DELETE FROM agent_message_queue
-             WHERE timestamp_ms < ?
-               AND status IN ('acked', 'failed')",
-        )
-        .bind(cutoff_ms)
-        .execute(&self.pool)
-        .await?;
+        let deleted = cleanup_terminal_older_than_in_pool(&self.pool, cutoff_ms).await?;
         cleanup_broadcast_delivery_orphans(&self.pool).await?;
-        Ok(result.rows_affected())
+        Ok(deleted)
     }
 
     /// Number of currently registered agents (local process only).
@@ -1068,15 +1079,32 @@ pub async fn mark_direct_failed_by_identity(
     }
 }
 
+async fn cleanup_expired_in_pool(pool: &Pool<MySql>, now_ms: i64) -> Result<u64, sqlx::Error> {
+    let result = query(CLEANUP_EXPIRED_MESSAGES_SQL)
+        .bind(now_ms)
+        .bind(QUEUE_CLEANUP_BATCH_LIMIT)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+async fn cleanup_terminal_older_than_in_pool(
+    pool: &Pool<MySql>,
+    cutoff_ms: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = query(CLEANUP_TERMINAL_MESSAGES_SQL)
+        .bind(cutoff_ms)
+        .bind(QUEUE_CLEANUP_BATCH_LIMIT)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 async fn cleanup_broadcast_delivery_orphans(pool: &Pool<MySql>) -> Result<u64, sqlx::Error> {
-    let result = query(
-        "DELETE FROM agent_message_broadcast_delivery
-         WHERE message_id NOT IN (
-             SELECT message_id FROM agent_message_queue
-         )",
-    )
-    .execute(pool)
-    .await?;
+    let result = query(CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL)
+        .bind(BROADCAST_DELIVERY_CLEANUP_BATCH_LIMIT)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -1174,17 +1202,9 @@ impl CleanupScheduler {
 
                 // 1. Cleanup TTL-expired messages.
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                match query(
-                    "DELETE FROM agent_message_queue
-                     WHERE ttl_ms IS NOT NULL
-                       AND timestamp_ms < (? - ttl_ms)",
-                )
-                .bind(now_ms)
-                .execute(&pool)
-                .await
-                {
+                match cleanup_expired_in_pool(&pool, now_ms).await {
                     Ok(result) => {
-                        let n = result.rows_affected();
+                        let n = result;
                         if n > 0 {
                             tracing::info!(target: "astra_runtime::messaging::db_transport", "cleaned up {n} TTL-expired messages");
                         }
@@ -1196,17 +1216,9 @@ impl CleanupScheduler {
 
                 // 2. Cleanup old terminal messages (regardless of TTL).
                 let cutoff_ms = now_ms - age.as_millis() as i64;
-                match query(
-                    "DELETE FROM agent_message_queue
-                     WHERE timestamp_ms < ?
-                       AND status IN ('acked', 'failed')",
-                )
-                .bind(cutoff_ms)
-                .execute(&pool)
-                .await
-                {
+                match cleanup_terminal_older_than_in_pool(&pool, cutoff_ms).await {
                     Ok(result) => {
-                        let n = result.rows_affected();
+                        let n = result;
                         if n > 0 {
                             tracing::info!(
                                 target: "astra_runtime::messaging::db_transport",
@@ -1356,6 +1368,10 @@ mod tests {
     fn constants_are_reasonable() {
         // Poll interval
         assert_eq!(DEFAULT_POLL_INTERVAL, Duration::from_millis(100));
+        assert_eq!(POLL_BATCH_SIZE, 100);
+        assert!(QUEUE_CLEANUP_BATCH_LIMIT >= POLL_BATCH_SIZE);
+        assert!(QUEUE_CLEANUP_BATCH_LIMIT <= 10_000);
+        assert!(BROADCAST_DELIVERY_CLEANUP_BATCH_LIMIT <= 10_000);
         // Cleanup
         assert_eq!(DEFAULT_CLEANUP_INTERVAL, Duration::from_secs(300));
         assert_eq!(DEFAULT_MAX_AGE, Duration::from_secs(3600));
@@ -1365,6 +1381,71 @@ mod tests {
         assert!(INITIAL_BACKOFF >= Duration::from_millis(100));
         assert!(MAX_BACKOFF <= Duration::from_secs(30));
         assert!(MAX_BACKOFF > INITIAL_BACKOFF);
+    }
+
+    #[test]
+    fn queue_cleanup_sql_uses_ordered_bounded_batches() {
+        for (name, sql) in [
+            ("expired", CLEANUP_EXPIRED_MESSAGES_SQL),
+            ("terminal", CLEANUP_TERMINAL_MESSAGES_SQL),
+        ] {
+            assert!(
+                sql.contains("DELETE FROM agent_message_queue"),
+                "{name} cleanup must target the queue table"
+            );
+            assert!(
+                sql.contains("ORDER BY created_at ASC, message_id ASC"),
+                "{name} cleanup must prune deterministically"
+            );
+            assert!(
+                sql.trim_end().ends_with("LIMIT ?"),
+                "{name} cleanup must stay batch bounded"
+            );
+        }
+        assert!(
+            CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL
+                .contains("DELETE FROM agent_message_broadcast_delivery"),
+            "orphan cleanup must target broadcast delivery rows"
+        );
+        assert!(
+            CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL
+                .contains("ORDER BY message_id ASC, consumer_id ASC"),
+            "orphan delivery cleanup must prune deterministically"
+        );
+        assert!(
+            CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL
+                .trim_end()
+                .ends_with("LIMIT ?"),
+            "orphan delivery cleanup must stay batch bounded"
+        );
+    }
+
+    #[test]
+    fn cleanup_scheduler_reuses_bounded_cleanup_helpers() {
+        let source = include_str!("db_transport.rs");
+        let scheduler_body = source
+            .split("impl CleanupScheduler")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn reclaim_stale_in_pool").next())
+            .expect("cleanup scheduler body");
+        for helper in [
+            "cleanup_expired_in_pool(&pool, now_ms)",
+            "cleanup_terminal_older_than_in_pool(&pool, cutoff_ms)",
+            "cleanup_broadcast_delivery_orphans(&pool)",
+        ] {
+            assert!(
+                scheduler_body.contains(helper),
+                "cleanup scheduler must call bounded helper {helper}"
+            );
+        }
+        assert!(
+            !scheduler_body.contains("DELETE FROM agent_message_queue"),
+            "cleanup scheduler must not inline unbounded queue DELETE statements"
+        );
+        assert!(
+            !scheduler_body.contains("DELETE FROM agent_message_broadcast_delivery"),
+            "cleanup scheduler must not inline unbounded broadcast delivery DELETE statements"
+        );
     }
 
     #[test]
