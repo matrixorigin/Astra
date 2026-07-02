@@ -97,6 +97,44 @@ class SchemaInventoryTest(unittest.TestCase):
             self.tables["session_tool_outputs"]["state_class"],
         )
 
+    def test_high_growth_tables_have_retention_metadata(self) -> None:
+        high_growth_tables = [
+            "agent_events",
+            "agent_run_events",
+            "conversation_log",
+            "session_tool_outputs",
+            "prompt_request_records",
+            "prompt_deltas",
+            "session_sync_log",
+            "agent_message_queue",
+        ]
+        for table in high_growth_tables:
+            with self.subTest(table=table):
+                row = self.tables[table]
+                self.assertNotEqual(row["state_class"], "unclassified")
+                self.assertNotEqual(row["primary_query"], "unclassified")
+                self.assertNotEqual(row["retention_policy"], "unclassified")
+                self.assertNotEqual(row["rebuildability"], "unclassified")
+                self.assertNotEqual(row["merge_guidance"], "unclassified")
+
+    def test_prompt_delta_retention_is_parent_bound(self) -> None:
+        parent = self.tables["prompt_request_records"]
+        child = self.tables["prompt_deltas"]
+        self.assertIn("parent fact", parent["state_class"])
+        self.assertIn("user_id/request_id", parent["primary_query"])
+        self.assertIn("active sessions/runs", parent["retention_policy"])
+        self.assertIn("do not delete child deltas independently", parent["merge_guidance"])
+        self.assertIn("prompt_request_records", child["retention_policy"])
+        self.assertIn("independent TTL breaks", child["retention_policy"])
+        self.assertIn("position/delta_seq", child["primary_query"])
+
+    def test_session_sync_log_is_product_audit_not_dead_table(self) -> None:
+        row = self.tables["session_sync_log"]
+        self.assertIn("best-effort", row["state_class"])
+        self.assertIn("sync_status", row["merge_guidance"])
+        self.assertIn("sync_log_days default 30", row["retention_policy"])
+        self.assertIn("not exactly rebuildable", row["rebuildability"])
+
     def test_external_hot_coordination_tables_have_semantic_metadata(self) -> None:
         for table in [
             "agent_message_queue",
