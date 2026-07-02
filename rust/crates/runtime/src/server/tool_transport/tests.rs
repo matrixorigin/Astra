@@ -1,6 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -514,6 +515,173 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
         }
         std::future::pending::<()>().await;
         unreachable!("pending edge dispatch wait never completes")
+    }
+
+    async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
+        Ok(0)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SharedNoStickyDispatchRow {
+    user_id: String,
+    edge_agent_id: String,
+    request_id: String,
+    payload_json: String,
+    result_json: Option<String>,
+    status: String,
+}
+
+#[derive(Default)]
+struct SharedNoStickyEdgeDispatch {
+    rows: Mutex<HashMap<(String, String), SharedNoStickyDispatchRow>>,
+    inserted: tokio::sync::Notify,
+    terminal: tokio::sync::Notify,
+}
+
+impl SharedNoStickyEdgeDispatch {
+    async fn wait_for_insert(&self) {
+        loop {
+            if !self.rows.lock().expect("shared dispatch rows").is_empty() {
+                return;
+            }
+            self.inserted.notified().await;
+        }
+    }
+
+    fn status_for(&self, user_id: &str, request_id: &str) -> Option<String> {
+        self.rows
+            .lock()
+            .expect("shared dispatch rows")
+            .get(&(user_id.to_string(), request_id.to_string()))
+            .map(|row| row.status.clone())
+    }
+}
+
+#[async_trait]
+impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDispatch {
+    async fn insert_dispatch(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        request_id: &str,
+        payload_json: &str,
+    ) -> Result<(), String> {
+        let mut rows = self.rows.lock().expect("shared dispatch rows");
+        rows.entry((user_id.to_string(), request_id.to_string()))
+            .or_insert_with(|| SharedNoStickyDispatchRow {
+                user_id: user_id.to_string(),
+                edge_agent_id: edge_agent_id.to_string(),
+                request_id: request_id.to_string(),
+                payload_json: payload_json.to_string(),
+                result_json: None,
+                status: "pending".to_string(),
+            });
+        drop(rows);
+        self.inserted.notify_waiters();
+        Ok(())
+    }
+
+    async fn poll_pending(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+    ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+        let mut rows = self.rows.lock().expect("shared dispatch rows");
+        let mut claimed = Vec::new();
+        for row in rows.values_mut() {
+            if row.user_id == user_id
+                && row.edge_agent_id == edge_agent_id
+                && row.status == "pending"
+            {
+                row.status = "dispatched".to_string();
+                claimed.push(astra_services::multi_agent::EdgeDispatchRow {
+                    user_id: row.user_id.clone(),
+                    edge_agent_id: row.edge_agent_id.clone(),
+                    request_id: row.request_id.clone(),
+                    payload_json: row.payload_json.clone(),
+                    result_json: row.result_json.clone(),
+                    status: row.status.clone(),
+                    pending_wait_us: 0,
+                });
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn deliver_result(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        edge_agent_id: &str,
+        result_json: &str,
+    ) -> Result<bool, String> {
+        let mut rows = self.rows.lock().expect("shared dispatch rows");
+        let Some(row) = rows.get_mut(&(user_id.to_string(), request_id.to_string())) else {
+            return Ok(false);
+        };
+        if row.edge_agent_id != edge_agent_id
+            || !matches!(row.status.as_str(), "pending" | "dispatched")
+        {
+            return Ok(false);
+        }
+        row.status = "completed".to_string();
+        row.result_json = Some(result_json.to_string());
+        drop(rows);
+        self.terminal.notify_waiters();
+        Ok(true)
+    }
+
+    async fn fail_dispatch(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
+        let mut rows = self.rows.lock().expect("shared dispatch rows");
+        let Some(row) = rows.get_mut(&(user_id.to_string(), request_id.to_string())) else {
+            return Ok(false);
+        };
+        if !matches!(row.status.as_str(), "pending" | "dispatched") {
+            return Ok(false);
+        }
+        row.status = "failed".to_string();
+        row.result_json = Some(
+            serde_json::json!({
+                "request_id": request_id,
+                "status": "failed",
+                "output": format!("edge dispatch {reason}"),
+                "duration_ms": 0,
+            })
+            .to_string(),
+        );
+        drop(rows);
+        self.terminal.notify_waiters();
+        Ok(true)
+    }
+
+    async fn wait_result(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<String>, String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let rows = self.rows.lock().expect("shared dispatch rows");
+                let Some(row) = rows.get(&(user_id.to_string(), request_id.to_string())) else {
+                    return Ok(None);
+                };
+                if matches!(row.status.as_str(), "completed" | "failed") {
+                    return Ok(row.result_json.clone());
+                }
+            }
+            tokio::select! {
+                _ = self.terminal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+            }
+        }
     }
 
     async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
@@ -2379,6 +2547,117 @@ async fn edge_dispatch_result_reports_edge_ledger_transport() {
             .lock()
             .expect("inserted edge agent ids lock"),
         vec!["edge-selected".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
+    let dispatch = Arc::new(SharedNoStickyEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace(
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-selected",
+            "MacBook Pro",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+
+    let waiter = tokio::spawn(async move {
+        let local = CountingLocalTransport::new();
+        let result = service.execute(request, &local).await;
+        (result, local.calls())
+    });
+
+    let edge_ws_pod = dispatch.clone();
+    let claimed_request_id = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+        edge_ws_pod.wait_for_insert().await;
+        let rows = astra_services::multi_agent::EdgeDispatchService::poll_pending(
+            edge_ws_pod.as_ref(),
+            "user-1",
+            "edge-selected",
+        )
+        .await
+        .expect("edge WS pod should claim pending dispatch");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.user_id, "user-1");
+        assert_eq!(row.edge_agent_id, "edge-selected");
+        assert_eq!(row.status, "dispatched");
+        let message: astra_server_types::edge_ws_protocol::EdgeServerMessage =
+            serde_json::from_str(&row.payload_json).expect("dispatch payload should be WS message");
+        match message {
+            astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+                request_id,
+                tool,
+                args,
+                timeout_secs,
+            } => {
+                assert_eq!(request_id, row.request_id);
+                assert_eq!(tool, "bash");
+                assert_eq!(args, serde_json::json!({}));
+                assert!(timeout_secs > 0);
+            }
+            other => panic!("expected tool request payload, got {other:?}"),
+        }
+        row.request_id.clone()
+    })
+    .await
+    .expect("edge WS pod should poll pending dispatch before timeout");
+    assert_eq!(
+        dispatch
+            .status_for("user-1", &claimed_request_id)
+            .as_deref(),
+        Some("dispatched")
+    );
+
+    let tool_result = astra_thin_client::ToolResultRequest::new_with_hash(
+        claimed_request_id.clone(),
+        Some("edge-selected".to_string()),
+        "completed".to_string(),
+        "no-sticky-result".to_string(),
+        9,
+    );
+    let result_json =
+        serde_json::to_string(&tool_result).expect("tool result should serialize for callback pod");
+    let delivered = astra_services::multi_agent::EdgeDispatchService::deliver_result(
+        dispatch.as_ref(),
+        "user-1",
+        &claimed_request_id,
+        "edge-selected",
+        &result_json,
+    )
+    .await
+    .expect("callback pod should deliver result");
+    assert!(delivered);
+
+    let (result, local_calls) = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("waiter pod should observe delivered dispatch result")
+        .expect("waiter task should not panic");
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.output, "no-sticky-result");
+    assert_eq!(local_calls, 0);
+    let metadata = result.metadata.expect("edge ledger metadata");
+    assert_eq!(metadata["transport"], "edge_ledger");
+    assert_eq!(metadata["executor"]["transport"], "edge_ledger");
+    assert_eq!(metadata["executor"]["executor_id"], "edge-selected");
+    assert_eq!(
+        dispatch
+            .status_for("user-1", &claimed_request_id)
+            .as_deref(),
+        Some("completed")
     );
 }
 
