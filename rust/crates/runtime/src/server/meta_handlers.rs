@@ -80,6 +80,7 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoR
     let bridge = MetricsRegistryBridge(state.metrics_registry().clone());
     state.multi_agent_metrics.register_with(&bridge);
     state.multi_agent_metrics.scrape_to(&bridge);
+    crate::server::interaction_metrics::register_interaction_metrics(&state.metrics_registry());
     crate::capacity_model::scrape_capacity_metrics_from_env(&state.metrics_registry());
     crate::turn::bridge::llm_stream::rate_limit_cooldown()
         .scrape_metrics(&state.metrics_registry());
@@ -142,6 +143,14 @@ mod tests {
         );
         assert!(
             text.contains("# TYPE astra_edge_dispatch_deliver_misses_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_interaction_ask_user_wait_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_interaction_approval_ledger_insert_total counter"),
             "{text}"
         );
     }

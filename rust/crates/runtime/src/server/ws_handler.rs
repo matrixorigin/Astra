@@ -881,7 +881,7 @@ async fn handle_resume_run(
 }
 
 /// Outcome of a dedup-insert into the edge-callback ledger.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum WsLedgerOutcome {
     /// Key was absent; value has been inserted.
     Inserted,
@@ -891,6 +891,15 @@ pub(crate) enum WsLedgerOutcome {
     ConflictIgnored,
     /// Key was absent but the shared ledger was already at capacity.
     CapacityExceeded,
+}
+
+fn ws_ledger_outcome_label(outcome: WsLedgerOutcome) -> &'static str {
+    match outcome {
+        WsLedgerOutcome::Inserted => "inserted",
+        WsLedgerOutcome::IdempotentReplay => "idempotent_replay",
+        WsLedgerOutcome::ConflictIgnored => "conflict_ignored",
+        WsLedgerOutcome::CapacityExceeded => "capacity_exceeded",
+    }
 }
 
 /// Insert `value` under `key` in the ledger with at-most-once idempotency semantics.
@@ -960,9 +969,16 @@ async fn handle_tool_approval(
         "approved": approved,
         "reason": reason,
     });
-    let ledger = state.edge_callback_ledger.clone();
-    let mut guard = ledger.lock().await;
-    ws_ledger_dedup_insert(&mut guard, key, value);
+    let outcome = {
+        let ledger = state.edge_callback_ledger.clone();
+        let mut guard = ledger.lock().await;
+        ws_ledger_dedup_insert(&mut guard, key, value)
+    };
+    let registry = state.metrics_registry();
+    crate::server::interaction_metrics::record_approval_ledger_insert(
+        registry.as_ref(),
+        ws_ledger_outcome_label(outcome),
+    );
 }
 
 /// Store an ask_user response in the edge callback ledger.
@@ -979,6 +995,7 @@ async fn handle_user_prompt_response(
     use astra_turn_core::edge_ledger::user_prompt_callback_key;
 
     let key = user_prompt_callback_key(&conn.principal.user.user_id, request_id);
+    let registry = state.metrics_registry();
     if let Err(error) = validate_session_id(session_id) {
         tracing::warn!(
             target: "astra_runtime::ws_callback",
@@ -988,11 +1005,22 @@ async fn handle_user_prompt_response(
             error = %error,
             "refusing durable ask_user response journal write for invalid session_id"
         );
+        crate::server::interaction_metrics::record_ask_user_journal_write(
+            registry.as_ref(),
+            "response",
+            "invalid_session",
+        );
     } else {
         let status = if cancelled { "cancelled" } else { "submitted" };
-        let answers_json = answers.as_ref().and_then(|answers| {
-            serde_json::to_value(answers)
-                .map_err(|error| {
+        let mut write_outcome = if !cancelled && answers.is_none() {
+            "missing_answers"
+        } else {
+            "ok"
+        };
+        let answers_json = match answers.as_ref() {
+            Some(answers) => match serde_json::to_value(answers) {
+                Ok(value) => Some(value),
+                Err(error) => {
                     tracing::warn!(
                         target: "astra_runtime::ws_callback",
                         user_id = %conn.principal.user.user_id,
@@ -1001,10 +1029,13 @@ async fn handle_user_prompt_response(
                         error = %error,
                         "failed to serialize ask_user answers for journal"
                     );
-                })
-                .ok()
-        });
-        if let Err(error) = JournalWriter::new(session_id).and_then(|writer| {
+                    write_outcome = "serialize_error";
+                    None
+                }
+            },
+            None => None,
+        };
+        match JournalWriter::new(session_id).and_then(|writer| {
             writer.append(&JournalEvent::ask_user_response(
                 Some(session_id),
                 None,
@@ -1014,15 +1045,27 @@ async fn handle_user_prompt_response(
                 answers_json,
             ))
         }) {
-            tracing::warn!(
-                target: "astra_runtime::ws_callback",
-                user_id = %conn.principal.user.user_id,
-                request_id = %request_id,
-                session_id = %session_id,
-                run_id = %run_id,
-                error = %error,
-                "failed to persist ask_user response journal event"
-            );
+            Ok(()) => crate::server::interaction_metrics::record_ask_user_journal_write(
+                registry.as_ref(),
+                "response",
+                write_outcome,
+            ),
+            Err(error) => {
+                crate::server::interaction_metrics::record_ask_user_journal_write(
+                    registry.as_ref(),
+                    "response",
+                    "error",
+                );
+                tracing::warn!(
+                    target: "astra_runtime::ws_callback",
+                    user_id = %conn.principal.user.user_id,
+                    request_id = %request_id,
+                    session_id = %session_id,
+                    run_id = %run_id,
+                    error = %error,
+                    "failed to persist ask_user response journal event"
+                );
+            }
         }
     }
     let value = if cancelled {
@@ -1030,9 +1073,15 @@ async fn handle_user_prompt_response(
     } else {
         serde_json::json!({ "answers": answers })
     };
-    let ledger = state.edge_callback_ledger.clone();
-    let mut guard = ledger.lock().await;
-    ws_ledger_dedup_insert(&mut guard, key, value);
+    let outcome = {
+        let ledger = state.edge_callback_ledger.clone();
+        let mut guard = ledger.lock().await;
+        ws_ledger_dedup_insert(&mut guard, key, value)
+    };
+    crate::server::interaction_metrics::record_ask_user_ledger_insert(
+        registry.as_ref(),
+        ws_ledger_outcome_label(outcome),
+    );
 }
 
 #[cfg(test)]
@@ -4731,6 +4780,20 @@ mod tests {
             )
             .unwrap(),
             answers
+        );
+        drop(ledger);
+
+        let metrics = state.metrics_registry().render_prometheus();
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_journal_write_total{event=\"response\",outcome=\"ok\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics
+                .contains("astra_interaction_ask_user_ledger_insert_total{outcome=\"inserted\"} 1"),
+            "{metrics}"
         );
     }
 

@@ -284,6 +284,52 @@
         ]
       },
       {
+        "title": "Interaction Durable Journal",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 77},
+        "targets": [
+          {
+            "expr": "rate(astra_interaction_approval_journal_lookup_total[5m])",
+            "legendFormat": "approval lookup {{event}} {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_interaction_approval_journal_write_total[5m])",
+            "legendFormat": "approval write {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_interaction_ask_user_journal_lookup_total[5m])",
+            "legendFormat": "ask_user lookup {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_interaction_ask_user_journal_write_total[5m])",
+            "legendFormat": "ask_user write {{event}} {{outcome}}"
+          }
+        ]
+      },
+      {
+        "title": "Interaction Wait And Ledger",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 77},
+        "targets": [
+          {
+            "expr": "rate(astra_interaction_approval_ledger_insert_total[5m])",
+            "legendFormat": "approval ledger {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_interaction_ask_user_ledger_insert_total[5m])",
+            "legendFormat": "ask_user ledger {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_interaction_ask_user_wait_total[5m])",
+            "legendFormat": "ask_user wait {{source}} {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_interaction_ask_user_ledger_cleanup_total[5m])",
+            "legendFormat": "ask_user cleanup {{outcome}}"
+          }
+        ]
+      },
+      {
         "title": "Nonstream Fallback",
         "type": "graph",
         "gridPos": {"h": 8, "w": 12, "x": 12, "y": 69},

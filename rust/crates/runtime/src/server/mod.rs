@@ -35,6 +35,7 @@ mod external_runtime_context;
 pub mod harness;
 pub(crate) mod header_utils;
 mod http_helpers;
+mod interaction_metrics;
 mod llm_trusted_domains_handlers;
 mod mcp_handlers;
 mod meta_handlers;

@@ -39,6 +39,7 @@ DEFAULT_METRIC_PREFIXES = (
     "astra_run_control_",
     "astra_edge_dispatch_",
     "astra_edge_registry_",
+    "astra_interaction_",
     "astra_task_lease_",
     "astra_multi_agent_",
 )

@@ -6,9 +6,10 @@
 //! §5.5 edge callback ledger.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
+use crate::pipeline_metrics::MetricsRegistry;
 use astra_services::session_journal::{
     AskUserJournalResponse, JournalEvent, JournalWriter, find_latest_ask_user_response,
 };
@@ -24,6 +25,12 @@ use crate::edge_ledger::user_prompt_callback_key;
 const USER_PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 const USER_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const USER_PROMPT_JOURNAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const METRIC_ASK_USER_WAIT_TOTAL: &str = "astra_interaction_ask_user_wait_total";
+const METRIC_ASK_USER_JOURNAL_LOOKUP_TOTAL: &str =
+    "astra_interaction_ask_user_journal_lookup_total";
+const METRIC_ASK_USER_JOURNAL_WRITE_TOTAL: &str = "astra_interaction_ask_user_journal_write_total";
+const METRIC_ASK_USER_LEDGER_CLEANUP_TOTAL: &str =
+    "astra_interaction_ask_user_ledger_cleanup_total";
 
 /// An outbound ask_user request to be forwarded over WebSocket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +70,102 @@ impl WebSocketUserPromptGate {
             request_tx,
             timeout: USER_PROMPT_TIMEOUT,
         }
+    }
+}
+
+fn metrics_slot() -> &'static RwLock<Option<Arc<MetricsRegistry>>> {
+    static SLOT: OnceLock<RwLock<Option<Arc<MetricsRegistry>>>> = OnceLock::new();
+    SLOT.get_or_init(Default::default)
+}
+
+/// Attach the shared runtime metrics registry used by `/metrics`.
+pub fn set_ws_user_prompt_metrics_registry(registry: Arc<MetricsRegistry>) {
+    register_ws_user_prompt_metrics(&registry);
+    *metrics_slot()
+        .write()
+        .expect("ws user prompt metrics registry lock poisoned") = Some(registry);
+}
+
+fn ws_user_prompt_metrics_registry() -> Option<Arc<MetricsRegistry>> {
+    metrics_slot()
+        .read()
+        .expect("ws user prompt metrics registry lock poisoned")
+        .clone()
+}
+
+pub fn register_ws_user_prompt_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_ASK_USER_WAIT_TOTAL,
+        "ask_user waits by response source and low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_ASK_USER_JOURNAL_LOOKUP_TOTAL,
+        "ask_user durable response journal lookups by low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_ASK_USER_JOURNAL_WRITE_TOTAL,
+        "ask_user durable journal writes by event type and low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_ASK_USER_LEDGER_CLEANUP_TOTAL,
+        "ask_user ledger timeout cleanup attempts by low-cardinality outcome.",
+    );
+}
+
+fn record_wait_metric(source: &'static str, outcome: &'static str) {
+    let Some(registry) = ws_user_prompt_metrics_registry() else {
+        return;
+    };
+    register_ws_user_prompt_metrics(&registry);
+    registry.increment_counter(
+        METRIC_ASK_USER_WAIT_TOTAL,
+        &[("source", source), ("outcome", outcome)],
+        1,
+    );
+}
+
+fn record_journal_lookup_metric(outcome: &'static str) {
+    let Some(registry) = ws_user_prompt_metrics_registry() else {
+        return;
+    };
+    register_ws_user_prompt_metrics(&registry);
+    registry.increment_counter(
+        METRIC_ASK_USER_JOURNAL_LOOKUP_TOTAL,
+        &[("outcome", outcome)],
+        1,
+    );
+}
+
+fn record_journal_write_metric(event: &'static str, outcome: &'static str) {
+    let Some(registry) = ws_user_prompt_metrics_registry() else {
+        return;
+    };
+    register_ws_user_prompt_metrics(&registry);
+    registry.increment_counter(
+        METRIC_ASK_USER_JOURNAL_WRITE_TOTAL,
+        &[("event", event), ("outcome", outcome)],
+        1,
+    );
+}
+
+fn record_ledger_cleanup_metric(outcome: &'static str) {
+    let Some(registry) = ws_user_prompt_metrics_registry() else {
+        return;
+    };
+    register_ws_user_prompt_metrics(&registry);
+    registry.increment_counter(
+        METRIC_ASK_USER_LEDGER_CLEANUP_TOTAL,
+        &[("outcome", outcome)],
+        1,
+    );
+}
+
+fn decision_outcome_label(decision: &AskUserDecision) -> &'static str {
+    match decision {
+        AskUserDecision::Submitted(_) => "submitted",
+        AskUserDecision::Cancelled => "cancelled",
+        AskUserDecision::Timeout => "timeout",
+        AskUserDecision::Error(_) => "error",
     }
 }
 
@@ -111,7 +214,7 @@ fn append_ask_user_prompted_journal_event(
     turn: Option<u32>,
     request_id: &str,
     prompt: &AskUserPrompt,
-) {
+) -> bool {
     let prompt_json = serde_json::to_value(prompt).unwrap_or(Value::Null);
     match JournalWriter::new(session_id).and_then(|writer| {
         writer.append(&JournalEvent::ask_user_prompted(
@@ -122,7 +225,7 @@ fn append_ask_user_prompted_journal_event(
             prompt_json,
         ))
     }) {
-        Ok(()) => {}
+        Ok(()) => true,
         Err(error) => {
             tracing::warn!(
                 target: "astra_turn_core::ws_user_prompt_gate",
@@ -132,6 +235,7 @@ fn append_ask_user_prompted_journal_event(
                 error = %error,
                 "failed to persist ask_user prompted journal event"
             );
+            false
         }
     }
 }
@@ -148,6 +252,7 @@ async fn evict_late_user_prompt_response(
             request_id = %request_id,
             "user prompt response arrived after timeout; evicted from ledger"
         );
+        record_ledger_cleanup_metric("evicted");
         true
     } else {
         tracing::debug!(
@@ -155,6 +260,7 @@ async fn evict_late_user_prompt_response(
             request_id = %request_id,
             "no user prompt response observed before timeout; pending key cleared"
         );
+        record_ledger_cleanup_metric("empty");
         false
     }
 }
@@ -174,7 +280,9 @@ async fn wait_user_prompt_response(
             let mut guard = ledger.lock().await;
             guard.remove(&key)
         } {
-            return Some(decision_from_user_prompt_value(value));
+            let decision = decision_from_user_prompt_value(value);
+            record_wait_metric("ledger", decision_outcome_label(&decision));
+            return Some(decision);
         }
 
         if last_journal_lookup
@@ -184,10 +292,16 @@ async fn wait_user_prompt_response(
             last_journal_lookup = Some(std::time::Instant::now());
             match find_latest_ask_user_response(session_id, request_id) {
                 Ok(Some(response)) => {
-                    return Some(decision_from_journal_response(response));
+                    record_journal_lookup_metric("hit");
+                    let decision = decision_from_journal_response(response);
+                    record_wait_metric("journal", decision_outcome_label(&decision));
+                    return Some(decision);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    record_journal_lookup_metric("miss");
+                }
                 Err(error) => {
+                    record_journal_lookup_metric("error");
                     tracing::warn!(
                         target: "astra_turn_core::ws_user_prompt_gate",
                         session_id = %session_id,
@@ -200,6 +314,7 @@ async fn wait_user_prompt_response(
         }
 
         if started.elapsed() >= timeout {
+            record_wait_metric("timeout", "timeout");
             return None;
         }
         let remaining = timeout.saturating_sub(started.elapsed());
@@ -222,15 +337,17 @@ impl AskUserGate for WebSocketUserPromptGate {
         });
 
         if self.request_tx.send(request).await.is_err() {
+            record_wait_metric("channel", "send_error");
             return AskUserDecision::Error("WebSocket connection closed".into());
         }
-        append_ask_user_prompted_journal_event(
+        let prompt_write_ok = append_ask_user_prompted_journal_event(
             &self.session_id,
             &self.run_id,
             self.turn,
             request_id,
             prompt,
         );
+        record_journal_write_metric("prompted", if prompt_write_ok { "ok" } else { "error" });
 
         let key = user_prompt_callback_key(&self.user_id, request_id);
         let timeout = prompt
@@ -403,6 +520,8 @@ mod tests {
     async fn answered_via_journal_when_ledger_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let registry = Arc::new(crate::pipeline_metrics::MetricsRegistry::new());
+        set_ws_user_prompt_metrics_registry(registry.clone());
         let writer = JournalWriter::new("sess-user-prompt").unwrap();
         writer
             .append(&JournalEvent::ask_user_response(
@@ -444,6 +563,23 @@ mod tests {
 
         assert!(matches!(decision, AskUserDecision::Submitted(_)));
         assert!(ledger.lock().await.is_empty());
+        let metrics = registry.render_prometheus();
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_wait_total{outcome=\"submitted\",source=\"journal\"}"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("astra_interaction_ask_user_journal_lookup_total{outcome=\"hit\"}"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_journal_write_total{event=\"prompted\",outcome=\"ok\"}"
+            ),
+            "{metrics}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

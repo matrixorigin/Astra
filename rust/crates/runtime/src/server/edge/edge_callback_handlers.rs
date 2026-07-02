@@ -225,9 +225,15 @@ pub(crate) async fn post_approval_respond_handler(
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
     let key = approval_callback_key(&user.user_id, &body.request_id);
+    let registry = state.metrics_registry();
     if let Some(session_id) = body.session_id.as_deref() {
-        validate_session_id(session_id)
-            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        if let Err(error) = validate_session_id(session_id) {
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "invalid_session",
+            );
+            return Err(error_response(StatusCode::BAD_REQUEST, error));
+        }
         let decision = match &body.decision {
             astra_thin_client::ApprovalDecision::Allow => "allow",
             astra_thin_client::ApprovalDecision::Deny => "deny",
@@ -237,8 +243,29 @@ pub(crate) async fn post_approval_respond_handler(
             astra_thin_client::ApprovalKind::Standard => "standard",
             astra_thin_client::ApprovalKind::Explicit => "explicit",
         });
-        let approval_turn = find_latest_approval_required(session_id, &body.request_id)
-            .map_err(|e| {
+        let approval_turn = match find_latest_approval_required(session_id, &body.request_id) {
+            Ok(Some(request)) => {
+                crate::server::interaction_metrics::record_approval_journal_lookup(
+                    registry.as_ref(),
+                    "required",
+                    "hit",
+                );
+                request.turn
+            }
+            Ok(None) => {
+                crate::server::interaction_metrics::record_approval_journal_lookup(
+                    registry.as_ref(),
+                    "required",
+                    "miss",
+                );
+                None
+            }
+            Err(e) => {
+                crate::server::interaction_metrics::record_approval_journal_lookup(
+                    registry.as_ref(),
+                    "required",
+                    "error",
+                );
                 tracing::warn!(
                     target: "astra_runtime::edge_callback",
                     session_id = %session_id,
@@ -246,47 +273,88 @@ pub(crate) async fn post_approval_respond_handler(
                     error = %e,
                     "approval journal lookup failed, treating as no prior request"
                 );
-            })
-            .ok()
-            .flatten()
-            .and_then(|request| request.turn);
-        let already_recorded = find_latest_approval_decision(session_id, &body.request_id)
-            .map_err(|error| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("approval journal lookup failed: {error}"),
-                )
-            })?
-            .is_some_and(|existing| {
+                None
+            }
+        };
+        let already_recorded = match find_latest_approval_decision(session_id, &body.request_id) {
+            Ok(Some(existing)) => {
+                crate::server::interaction_metrics::record_approval_journal_lookup(
+                    registry.as_ref(),
+                    "decision",
+                    "hit",
+                );
                 existing.decision == decision
                     && existing.reason.as_deref() == body.reason.as_deref()
                     && existing.tool_name.as_deref() == body.tool_name.as_deref()
                     && existing.approval_kind.as_deref() == approval_kind
-            });
-        if !already_recorded {
-            let writer = JournalWriter::new(session_id).map_err(|error| {
-                error_response(
+            }
+            Ok(None) => {
+                crate::server::interaction_metrics::record_approval_journal_lookup(
+                    registry.as_ref(),
+                    "decision",
+                    "miss",
+                );
+                false
+            }
+            Err(error) => {
+                crate::server::interaction_metrics::record_approval_journal_lookup(
+                    registry.as_ref(),
+                    "decision",
+                    "error",
+                );
+                return Err(error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    format!("approval journal unavailable: {error}"),
-                )
-            })?;
-            writer
-                .append(&JournalEvent::approval_decision(
-                    Some(session_id),
-                    approval_turn,
-                    &body.request_id,
-                    body.tool_name.as_deref(),
-                    approval_kind,
-                    decision,
-                    body.reason.as_deref(),
-                ))
-                .map_err(|error| {
-                    error_response(
+                    format!("approval journal lookup failed: {error}"),
+                ));
+            }
+        };
+        if already_recorded {
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "idempotent",
+            );
+        } else {
+            let writer = match JournalWriter::new(session_id) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    crate::server::interaction_metrics::record_approval_journal_write(
+                        registry.as_ref(),
+                        "error",
+                    );
+                    return Err(error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
-                        format!("approval journal append failed: {error}"),
-                    )
-                })?;
+                        format!("approval journal unavailable: {error}"),
+                    ));
+                }
+            };
+            if let Err(error) = writer.append(&JournalEvent::approval_decision(
+                Some(session_id),
+                approval_turn,
+                &body.request_id,
+                body.tool_name.as_deref(),
+                approval_kind,
+                decision,
+                body.reason.as_deref(),
+            )) {
+                crate::server::interaction_metrics::record_approval_journal_write(
+                    registry.as_ref(),
+                    "error",
+                );
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("approval journal append failed: {error}"),
+                ));
+            }
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "ok",
+            );
         }
+    } else {
+        crate::server::interaction_metrics::record_approval_journal_write(
+            registry.as_ref(),
+            "skipped_no_session",
+        );
     }
     let ledger_value = serde_json::json!({
         "kind": "approval_respond",
@@ -299,16 +367,46 @@ pub(crate) async fn post_approval_respond_handler(
             )
         })?,
     });
-    let ledger_enqueued = {
+    let ledger_result = {
         let mut lock = state.edge_callback_ledger.lock().await;
-        insert_approval_ledger_entry(
+        let new_key = !lock.contains_key(&key);
+        let ledger_full = lock.len() >= LEDGER_MAX_ENTRIES;
+        match insert_approval_ledger_entry(
             &mut lock,
             key.clone(),
             ledger_value,
             body.session_id.is_some(),
-        )
-        .map_err(|err| ledger_insert_error_response(&key, err))?
+        ) {
+            Ok(enqueued) => {
+                let outcome = if enqueued {
+                    "inserted"
+                } else if new_key && ledger_full && body.session_id.is_some() {
+                    "durable_fallback"
+                } else {
+                    "idempotent_replay"
+                };
+                Ok((enqueued, outcome))
+            }
+            Err(err) => Err(err),
+        }
     };
+    let (ledger_enqueued, ledger_outcome) = match ledger_result {
+        Ok(result) => result,
+        Err(err) => {
+            crate::server::interaction_metrics::record_approval_ledger_insert(
+                registry.as_ref(),
+                match err {
+                    LedgerInsertError::CapacityExceeded => "capacity_exceeded",
+                    LedgerInsertError::DuplicateKey => "duplicate_key",
+                },
+            );
+            return Err(ledger_insert_error_response(&key, err));
+        }
+    };
+    crate::server::interaction_metrics::record_approval_ledger_insert(
+        registry.as_ref(),
+        ledger_outcome,
+    );
     tracing::info!(
         target: "astra_runtime::edge_callback",
         request_id = %trace.request_id,
@@ -625,7 +723,7 @@ mod edge_callback_insert_tests {
         let journal_append_idx = source_index(source, ".append(&JournalEvent::approval_decision(");
         let ledger_lock_idx = source_index(
             source,
-            "let ledger_enqueued = {\n        let mut lock = state.edge_callback_ledger.lock().await;",
+            "let ledger_result = {\n        let mut lock = state.edge_callback_ledger.lock().await;",
         );
 
         assert!(
@@ -831,6 +929,25 @@ mod edge_callback_insert_tests {
                 "req-approval-journal"
             )),
             "full local ledger should not be required after durable approval persistence"
+        );
+        drop(ledger);
+
+        let metrics = state.metrics_registry().render_prometheus();
+        assert!(
+            metrics.contains(
+                "astra_interaction_approval_journal_lookup_total{event=\"decision\",outcome=\"miss\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("astra_interaction_approval_journal_write_total{outcome=\"ok\"} 1"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "astra_interaction_approval_ledger_insert_total{outcome=\"durable_fallback\"} 1"
+            ),
+            "{metrics}"
         );
     }
 
