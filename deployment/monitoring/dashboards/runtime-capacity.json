@@ -174,7 +174,7 @@
         ]
       },
       {
-        "title": "Run Control Poll Errors",
+        "title": "Run Control And Recovery",
         "type": "graph",
         "gridPos": {"h": 8, "w": 12, "x": 12, "y": 45},
         "targets": [
@@ -185,6 +185,14 @@
           {
             "expr": "rate(astra_run_control_poll_errors_total[5m])",
             "legendFormat": "{{operation}} {{class}}"
+          },
+          {
+            "expr": "rate(astra_run_recovery_scans_total[5m])",
+            "legendFormat": "recovery scan {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_run_recovery_runs_total[5m])",
+            "legendFormat": "recovery {{action}} {{outcome}}"
           }
         ]
       },

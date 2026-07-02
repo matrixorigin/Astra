@@ -38,6 +38,7 @@ DEFAULT_METRIC_PREFIXES = (
     "astra_durable_run_event_",
     "astra_event_ingestion_",
     "astra_run_control_",
+    "astra_run_recovery_",
     "astra_ws_run_stream_",
     "astra_edge_dispatch_",
     "astra_edge_registry_",
@@ -602,6 +603,8 @@ EVENT_INGESTION_METRIC_KEYS = {
 
 RUN_CONTROL_ATTEMPTS_METRIC = "astra_run_control_poll_attempts_total"
 RUN_CONTROL_ERRORS_METRIC = "astra_run_control_poll_errors_total"
+RUN_RECOVERY_SCANS_METRIC = "astra_run_recovery_scans_total"
+RUN_RECOVERY_RUNS_METRIC = "astra_run_recovery_runs_total"
 WS_RUN_STREAM_ATTEMPTS_METRIC = "astra_ws_run_stream_poll_attempts_total"
 WS_RUN_STREAM_ERRORS_METRIC = "astra_ws_run_stream_poll_errors_total"
 EDGE_DISPATCH_GAUGE_KEYS = {
@@ -1126,6 +1129,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
             "last_metric_names": [],
             "event_ingestion": summarize_event_ingestion_metrics({}),
             "run_control": summarize_run_control_metrics({}, {}, None),
+            "run_recovery": summarize_run_recovery_metrics({}, {}, None),
             "ws_run_stream": summarize_ws_run_stream_metrics({}, {}, None),
             "edge_dispatch": summarize_edge_dispatch_metrics({}, {}, None),
             "control_plane": summarize_control_plane_metrics({}, None),
@@ -1168,6 +1172,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
         else None
     )
     run_control = summarize_run_control_metrics(first_metrics, last_metrics, elapsed_ms)
+    run_recovery = summarize_run_recovery_metrics(first_metrics, last_metrics, elapsed_ms)
     ws_run_stream = summarize_ws_run_stream_metrics(first_metrics, last_metrics, elapsed_ms)
     edge_dispatch = summarize_edge_dispatch_metrics(first_metrics, last_metrics, elapsed_ms)
     return {
@@ -1181,6 +1186,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
         "last_metric_names": sorted(last_metrics)[:50],
         "event_ingestion": summarize_event_ingestion_metrics(last_metrics),
         "run_control": run_control,
+        "run_recovery": run_recovery,
         "ws_run_stream": ws_run_stream,
         "edge_dispatch": edge_dispatch,
         "control_plane": summarize_control_plane_metrics(
@@ -1305,6 +1311,35 @@ def summarize_run_control_metrics(
         "errors_delta_total": error_delta,
         "errors_per_sec": rate_per_sec(error_delta, elapsed_ms),
         "errors_by_operation_class": errors,
+    }
+
+
+def summarize_run_recovery_metrics(
+    first_metrics: dict[str, float],
+    last_metrics: dict[str, float],
+    elapsed_ms: int | None,
+) -> dict[str, Any]:
+    scan_last, scan_delta, scans = summarize_counter_family(
+        first_metrics,
+        last_metrics,
+        RUN_RECOVERY_SCANS_METRIC,
+        ("outcome",),
+    )
+    run_last, run_delta, runs = summarize_counter_family(
+        first_metrics,
+        last_metrics,
+        RUN_RECOVERY_RUNS_METRIC,
+        ("action", "outcome"),
+    )
+    return {
+        "scans_last_total": scan_last,
+        "scans_delta_total": scan_delta,
+        "scans_per_sec": rate_per_sec(scan_delta, elapsed_ms),
+        "scans_by_outcome": scans,
+        "runs_last_total": run_last,
+        "runs_delta_total": run_delta,
+        "runs_per_sec": rate_per_sec(run_delta, elapsed_ms),
+        "runs_by_action_outcome": runs,
     }
 
 

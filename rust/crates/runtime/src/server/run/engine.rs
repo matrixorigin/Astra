@@ -51,6 +51,8 @@ use astra_core::{
 
 const METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL: &str = "astra_run_control_poll_attempts_total";
 const METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL: &str = "astra_run_control_poll_errors_total";
+const METRIC_RUN_RECOVERY_SCANS_TOTAL: &str = "astra_run_recovery_scans_total";
+const METRIC_RUN_RECOVERY_RUNS_TOTAL: &str = "astra_run_recovery_runs_total";
 const TERMINAL_TRANSITION_MAX_ATTEMPTS: usize = 3;
 const TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS: u64 = 25;
 const OWNER_LEASE_RENEWAL_STATUSES: &[&str] = &[
@@ -162,6 +164,17 @@ fn register_run_control_poll_metrics(registry: &MetricsRegistry) {
     );
 }
 
+fn register_run_recovery_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_RUN_RECOVERY_SCANS_TOTAL,
+        "Startup run recovery scans by low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_RUN_RECOVERY_RUNS_TOTAL,
+        "Startup run recovery actions by low-cardinality action and outcome.",
+    );
+}
+
 fn record_control_poll_attempt(
     registry: Option<&Arc<MetricsRegistry>>,
     operation: &'static str,
@@ -190,6 +203,30 @@ fn record_control_poll_error(
     registry.increment_counter(
         METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL,
         &[("operation", operation), ("class", class)],
+        1,
+    );
+}
+
+fn record_recovery_scan(registry: Option<&Arc<MetricsRegistry>>, outcome: &'static str) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_run_recovery_metrics(registry);
+    registry.increment_counter(METRIC_RUN_RECOVERY_SCANS_TOTAL, &[("outcome", outcome)], 1);
+}
+
+fn record_recovery_run(
+    registry: Option<&Arc<MetricsRegistry>>,
+    action: &'static str,
+    outcome: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_run_recovery_metrics(registry);
+    registry.increment_counter(
+        METRIC_RUN_RECOVERY_RUNS_TOTAL,
+        &[("action", action), ("outcome", outcome)],
         1,
     );
 }
@@ -323,6 +360,7 @@ impl RunEngine {
     /// Attach the shared metrics registry used by `/metrics`.
     pub fn with_metrics_registry(mut self, registry: Arc<MetricsRegistry>) -> Self {
         register_run_control_poll_metrics(&registry);
+        register_run_recovery_metrics(&registry);
         self.metrics_registry = Some(registry);
         self
     }
@@ -1029,10 +1067,20 @@ impl RunEngine {
     /// - other `running` runs: were in-flight when the process died; marked
     ///   `failed` with crash-recovery terminal events.
     pub async fn recover_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        let active = self.store.find_recoverable_active_runs().await?;
+        let active = match self.store.find_recoverable_active_runs().await {
+            Ok(active) => {
+                record_recovery_scan(self.metrics_registry.as_ref(), "ok");
+                active
+            }
+            Err(error) => {
+                record_recovery_scan(self.metrics_registry.as_ref(), "error");
+                return Err(error);
+            }
+        };
         let mut recovered = Vec::with_capacity(active.len());
         for run in active {
             if run.status == STATUS_WAITING {
+                record_recovery_run(self.metrics_registry.as_ref(), "preserve_waiting", "ok");
                 recovered.push(run);
                 continue;
             }
@@ -1064,6 +1112,11 @@ impl RunEngine {
                 .await
             {
                 Ok(true) => {
+                    record_recovery_run(
+                        self.metrics_registry.as_ref(),
+                        "resume_checkpoint",
+                        "committed",
+                    );
                     run.status = STATUS_WAITING.to_string();
                     run.waiting_for = Some("restart_resume".to_string());
                     run.last_event_idx += 1;
@@ -1075,6 +1128,11 @@ impl RunEngine {
                 }
                 Ok(false) => self.recovery_conflict_current_run(&run).await,
                 Err(e) => {
+                    record_recovery_run(
+                        self.metrics_registry.as_ref(),
+                        "resume_checkpoint",
+                        "error",
+                    );
                     tracing::warn!(
                         target: "astra_runtime::run_engine",
                         run_id = %run.run_id,
@@ -1100,6 +1158,11 @@ impl RunEngine {
                 .await
             {
                 Ok(true) => {
+                    record_recovery_run(
+                        self.metrics_registry.as_ref(),
+                        "fail_crashed",
+                        "committed",
+                    );
                     run.status = STATUS_FAILED.to_string();
                     run.waiting_for = None;
                     run.error_message = Some("recovered from crash".to_string());
@@ -1110,6 +1173,7 @@ impl RunEngine {
                 }
                 Ok(false) => self.recovery_conflict_current_run(&run).await,
                 Err(e) => {
+                    record_recovery_run(self.metrics_registry.as_ref(), "fail_crashed", "error");
                     tracing::warn!(
                         target: "astra_runtime::run_engine",
                         run_id = %run.run_id,
@@ -1129,6 +1193,7 @@ impl RunEngine {
         let current = match self.load_run(&stale_run.user_id, &stale_run.run_id).await {
             Ok(current) => current,
             Err(error) => {
+                record_recovery_run(self.metrics_registry.as_ref(), "conflict_reload", "error");
                 tracing::warn!(
                     target: "astra_runtime::run_engine",
                     run_id = %stale_run.run_id,
@@ -1139,6 +1204,7 @@ impl RunEngine {
             }
         };
         let Some(current) = current else {
+            record_recovery_run(self.metrics_registry.as_ref(), "conflict_reload", "missing");
             tracing::warn!(
                 target: "astra_runtime::run_engine",
                 run_id = %stale_run.run_id,
@@ -1147,8 +1213,18 @@ impl RunEngine {
             return None;
         };
         if current.status == STATUS_WAITING || current.status == STATUS_FAILED {
+            record_recovery_run(
+                self.metrics_registry.as_ref(),
+                "conflict_current",
+                "accepted",
+            );
             Some(current)
         } else {
+            record_recovery_run(
+                self.metrics_registry.as_ref(),
+                "conflict_current",
+                "skipped",
+            );
             tracing::warn!(
                 target: "astra_runtime::run_engine",
                 run_id = %stale_run.run_id,
@@ -2823,6 +2899,96 @@ mod tests {
                 && !rendered.contains("run-input")
                 && !rendered.contains("missing-run"),
             "metrics must stay low-cardinality: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_metrics_record_startup_actions_without_high_cardinality() {
+        let registry = Arc::new(MetricsRegistry::new());
+        let engine = test_engine().with_metrics_registry(registry.clone());
+        engine
+            .start_run("run-waiting-metric", "user-1", "sess-waiting")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "user-1",
+                "run-waiting-metric",
+                STATUS_WAITING,
+                Some("user_resume"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run("run-resume-metric", "user-1", "sess-resume")
+            .await
+            .unwrap();
+        engine
+            .persist_checkpoint(
+                "user-1",
+                "run-resume-metric",
+                r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"shutdown-run-resume-metric"}"#,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run("run-crash-metric", "user-1", "sess-crash")
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+        assert_eq!(recovered.len(), 3);
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains("astra_run_recovery_scans_total{outcome=\"ok\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_recovery_runs_total{action=\"preserve_waiting\",outcome=\"ok\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_recovery_runs_total{action=\"resume_checkpoint\",outcome=\"committed\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_recovery_runs_total{action=\"fail_crashed\",outcome=\"committed\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("user-1")
+                && !rendered.contains("run-waiting-metric")
+                && !rendered.contains("run-resume-metric")
+                && !rendered.contains("run-crash-metric"),
+            "recovery metrics must stay low-cardinality: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_metrics_record_scan_error() {
+        let registry = Arc::new(MetricsRegistry::new());
+        let engine =
+            RunEngine::new(Arc::new(FailingLoadRunStore)).with_metrics_registry(registry.clone());
+
+        let error = engine.recover_active_runs().await.unwrap_err();
+        assert_eq!(error, "store unavailable");
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains("astra_run_recovery_scans_total{outcome=\"error\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("user-1") && !rendered.contains("run-"),
+            "scan error metrics must stay low-cardinality: {rendered}"
         );
     }
 

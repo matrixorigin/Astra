@@ -55,6 +55,7 @@ class CapacityProbeTests(unittest.TestCase):
                     'astra_post_loop_memory_cleanup_dispatches_total{mode="async",outcome="dropped_full"} 4',
                     'astra_session_memory_post_loop_drains_total{outcome="leftover"} 5',
                     'astra_run_control_poll_attempts_total{operation="status",outcome="ok"} 8',
+                    'astra_run_recovery_runs_total{action="fail_crashed",outcome="committed"} 1',
                     'astra_ws_run_stream_poll_attempts_total{operation="stream_run",outcome="ok"} 9',
                     "astra_edge_dispatch_claimed_total 10",
                     "astra_event_ingestion_events_dropped_before_acceptance_total 6",
@@ -86,6 +87,12 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(
             metrics['astra_run_control_poll_attempts_total{operation="status",outcome="ok"}'],
             8.0,
+        )
+        self.assertEqual(
+            metrics[
+                'astra_run_recovery_runs_total{action="fail_crashed",outcome="committed"}'
+            ],
+            1.0,
         )
         self.assertEqual(
             metrics[
@@ -247,6 +254,7 @@ class CapacityProbeTests(unittest.TestCase):
             None,
         )
         self.assertEqual(summary["run_control"]["attempts_last_total"], None)
+        self.assertEqual(summary["run_recovery"]["scans_last_total"], None)
         self.assertEqual(summary["ws_run_stream"]["attempts_last_total"], None)
         self.assertEqual(
             summary["control_plane"]["poll_attempts_per_worker_per_sec"],
@@ -351,6 +359,66 @@ class CapacityProbeTests(unittest.TestCase):
         )
         self.assertEqual(
             run_control["errors_by_operation_class"]["user_input_poll:missing"],
+            {"last": 4.0, "delta": 4.0},
+        )
+
+    def test_summarize_metrics_file_reports_run_recovery_deltas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "unix_ms": 1_000,
+                                "http_status": 200,
+                                "metrics": {
+                                    'astra_run_recovery_scans_total{outcome="ok"}': 2.0,
+                                    'astra_run_recovery_runs_total{action="preserve_waiting",outcome="ok"}': 3.0,
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "unix_ms": 3_000,
+                                "http_status": 200,
+                                "metrics": {
+                                    'astra_run_recovery_scans_total{outcome="ok"}': 3.0,
+                                    'astra_run_recovery_scans_total{outcome="error"}': 1.0,
+                                    'astra_run_recovery_runs_total{action="preserve_waiting",outcome="ok"}': 5.0,
+                                    'astra_run_recovery_runs_total{action="fail_crashed",outcome="committed"}': 4.0,
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = probe.summarize_metrics_file(path)
+
+        run_recovery = summary["run_recovery"]
+        self.assertEqual(run_recovery["scans_last_total"], 4.0)
+        self.assertEqual(run_recovery["scans_delta_total"], 2.0)
+        self.assertEqual(run_recovery["scans_per_sec"], 1.0)
+        self.assertEqual(
+            run_recovery["scans_by_outcome"]["ok"],
+            {"last": 3.0, "delta": 1.0},
+        )
+        self.assertEqual(
+            run_recovery["scans_by_outcome"]["error"],
+            {"last": 1.0, "delta": 1.0},
+        )
+        self.assertEqual(run_recovery["runs_last_total"], 9.0)
+        self.assertEqual(run_recovery["runs_delta_total"], 6.0)
+        self.assertEqual(run_recovery["runs_per_sec"], 3.0)
+        self.assertEqual(
+            run_recovery["runs_by_action_outcome"]["preserve_waiting:ok"],
+            {"last": 5.0, "delta": 2.0},
+        )
+        self.assertEqual(
+            run_recovery["runs_by_action_outcome"]["fail_crashed:committed"],
             {"last": 4.0, "delta": 4.0},
         )
 
