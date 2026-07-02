@@ -113,6 +113,8 @@ const METRIC_RUN_ADMISSION_WAIT_MS_TOTAL: &str = "astra_run_admission_wait_ms_to
 const METRIC_DURABLE_RUN_EVENT_BATCHES_TOTAL: &str = "astra_durable_run_event_batches_total";
 const METRIC_DURABLE_RUN_EVENT_ROWS_TOTAL: &str = "astra_durable_run_event_rows_total";
 const METRIC_DURABLE_RUN_EVENT_BYTES_TOTAL: &str = "astra_durable_run_event_bytes_total";
+const METRIC_DURABLE_RUN_EVENT_ROW_BUDGET: &str = "astra_durable_run_event_row_budget";
+const METRIC_DURABLE_RUN_EVENT_BYTE_BUDGET: &str = "astra_durable_run_event_byte_budget";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunAdmissionError {
@@ -173,6 +175,31 @@ fn register_durable_run_event_metrics(
         METRIC_DURABLE_RUN_EVENT_BYTES_TOTAL,
         "Estimated durable run event bytes by terminal persistence path, outcome, and compaction state.",
     );
+    registry.register_gauge(
+        METRIC_DURABLE_RUN_EVENT_ROW_BUDGET,
+        "Configured maximum durable run event rows per terminal batch.",
+    );
+    registry.register_gauge(
+        METRIC_DURABLE_RUN_EVENT_BYTE_BUDGET,
+        "Configured maximum estimated durable run event bytes per terminal batch.",
+    );
+    refresh_durable_run_event_budget_metrics(registry);
+}
+
+fn refresh_durable_run_event_budget_metrics(
+    registry: &astra_turn_core::pipeline_metrics::MetricsRegistry,
+) {
+    let budget = DurableRunEventBatchBudget::from_env();
+    registry.set_gauge(
+        METRIC_DURABLE_RUN_EVENT_ROW_BUDGET,
+        &[],
+        budget.row_budget as f64,
+    );
+    registry.set_gauge(
+        METRIC_DURABLE_RUN_EVENT_BYTE_BUDGET,
+        &[],
+        budget.byte_budget as f64,
+    );
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -192,6 +219,7 @@ fn record_durable_run_event_batch_metrics(
         return;
     };
     register_durable_run_event_metrics(registry);
+    refresh_durable_run_event_budget_metrics(registry);
     let compacted = events
         .iter()
         .any(|event| durable_event_type(event) == Some("durable_events_compacted"));
@@ -9991,6 +10019,7 @@ mod tests {
         run_ordinal: usize,
         text_delta_count: usize,
         progress_event_count: usize,
+        budget: DurableRunEventBatchBudget,
     ) -> DurableEventPressureBatch {
         let mut raw_stream_events: Vec<Value> =
             Vec::with_capacity(text_delta_count + progress_event_count + 5);
@@ -10035,7 +10064,8 @@ mod tests {
             .iter()
             .map(durable_run_event_estimated_bytes)
             .sum::<usize>();
-        let budgeted_events = enforce_durable_run_event_batch_budget(durable_candidates);
+        let budgeted_events =
+            enforce_durable_run_event_batch_budget_with_budget(durable_candidates, budget);
         let budgeted_bytes = budgeted_events
             .iter()
             .map(durable_run_event_estimated_bytes)
@@ -10064,6 +10094,7 @@ mod tests {
         let run_id = format!("durable-pressure-{run_ordinal}-{}", Uuid::new_v4());
         let session_id = format!("sess-durable-pressure-{run_ordinal}-{}", Uuid::new_v4());
         let svc = db_backed_test_service(&pool, &format!("durable-pressure-pod-{run_ordinal}"));
+        let budget = DurableRunEventBatchBudget::from_env();
         cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
 
         let started = Instant::now();
@@ -10077,6 +10108,7 @@ mod tests {
                 run_ordinal,
                 text_delta_count,
                 progress_event_count,
+                budget,
             );
             if batch
                 .budgeted_events
@@ -10151,7 +10183,7 @@ mod tests {
                 .iter()
                 .filter(|event_type| event_type.as_str() == "durable_events_compacted")
                 .count();
-            if persisted_rows > MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 1 {
+            if persisted_rows > budget.row_budget + 1 {
                 return Err(format!(
                     "{run_id}: persisted {persisted_rows} rows above budget plus run_started"
                 ));
@@ -10176,7 +10208,7 @@ mod tests {
                         response.0, response.1.0.detail
                     )
                 })?;
-            if replay_events.len() > MAX_DURABLE_RUN_EVENT_BATCH_ROWS {
+            if replay_events.len() > budget.row_budget {
                 return Err(format!(
                     "{run_id}: replay returned {} rows above durable batch budget",
                     replay_events.len()
@@ -14255,6 +14287,7 @@ mod tests {
         let user_id = "user-1";
         let run_id = format!("budget-it-{}", Uuid::new_v4());
         let session_id = format!("sess-budget-it-{}", Uuid::new_v4());
+        let budget = DurableRunEventBatchBudget::default();
         cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
         svc.run_engine
             .start_run(&run_id, user_id, &session_id)
@@ -14273,8 +14306,7 @@ mod tests {
             "result": "ok"
         }));
         raw_stream_events.extend(
-            (0..(MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 25))
-                .map(|idx| json!({"type": "agent_progress", "seq": idx})),
+            (0..(budget.row_budget + 25)).map(|idx| json!({"type": "agent_progress", "seq": idx})),
         );
         raw_stream_events.push(json!({
             "event_type": "text_done",
@@ -14299,8 +14331,9 @@ mod tests {
             "transport chunks must stay live-only before DB persistence"
         );
 
-        let budgeted = enforce_durable_run_event_batch_budget(durable_candidates);
-        assert_eq!(budgeted.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
+        let budgeted =
+            enforce_durable_run_event_batch_budget_with_budget(durable_candidates, budget);
+        assert_eq!(budgeted.len(), budget.row_budget);
         assert!(
             budgeted
                 .iter()
@@ -14356,7 +14389,7 @@ mod tests {
         .expect("load persisted event rows");
         assert_eq!(
             rows.len(),
-            MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 1,
+            budget.row_budget + 1,
             "DB rows should be bounded to budgeted batch plus run_started"
         );
         let persisted_types = rows
@@ -14384,7 +14417,7 @@ mod tests {
         }
 
         let replay_events = ok(svc.stream_run(run_id.clone(), user_id.to_string(), 1).await);
-        assert!(replay_events.len() <= MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
+        assert!(replay_events.len() <= budget.row_budget);
         assert!(replay_events.iter().all(|event| {
             event.get("type").and_then(Value::as_str) != Some("text_delta")
                 && event.get("event_type").and_then(Value::as_str) != Some("text_delta")
@@ -14417,10 +14450,11 @@ mod tests {
             durable_event_pressure_env_usize("ASTRA_DURABLE_EVENT_PRESSURE_RUNS", 100, 1);
         let text_delta_count =
             durable_event_pressure_env_usize("ASTRA_DURABLE_EVENT_PRESSURE_TEXT_DELTAS", 10_000, 1);
+        let budget = DurableRunEventBatchBudget::from_env();
         let progress_event_count = durable_event_pressure_env_usize(
             "ASTRA_DURABLE_EVENT_PRESSURE_PROGRESS_ROWS",
-            MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 25,
-            MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 1,
+            budget.row_budget + 25,
+            budget.row_budget + 1,
         );
 
         let started = Instant::now();
@@ -14472,11 +14506,11 @@ mod tests {
             "transport deltas must never enter durable run events"
         );
         assert!(
-            total_persisted_rows <= run_count * (MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 1),
+            total_persisted_rows <= run_count * (budget.row_budget + 1),
             "persisted rows should be bounded by durable batch budget plus run_started"
         );
         assert!(
-            total_replay_rows <= run_count * MAX_DURABLE_RUN_EVENT_BATCH_ROWS,
+            total_replay_rows <= run_count * budget.row_budget,
             "cache-miss replay rows should be bounded by durable batch budget"
         );
 
@@ -14487,8 +14521,8 @@ mod tests {
                 "runs": run_count,
                 "text_deltas_per_run": text_delta_count,
                 "progress_rows_per_run": progress_event_count,
-                "row_budget": MAX_DURABLE_RUN_EVENT_BATCH_ROWS,
-                "byte_budget": MAX_DURABLE_RUN_EVENT_BATCH_BYTES,
+                "row_budget": budget.row_budget,
+                "byte_budget": budget.byte_budget,
                 "total_raw_events": total_raw_events,
                 "total_candidate_rows": total_candidate_rows,
                 "total_candidate_bytes": total_candidate_bytes,
@@ -16260,6 +16294,16 @@ mod tests {
         );
 
         let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains("# TYPE astra_durable_run_event_row_budget gauge")
+                && rendered.contains("astra_durable_run_event_row_budget "),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE astra_durable_run_event_byte_budget gauge")
+                && rendered.contains("astra_durable_run_event_byte_budget "),
+            "{rendered}"
+        );
         assert!(
             rendered.contains(
                 "astra_durable_run_event_batches_total{compacted=\"true\",outcome=\"planned\",path=\"streaming_terminal\"} 1"

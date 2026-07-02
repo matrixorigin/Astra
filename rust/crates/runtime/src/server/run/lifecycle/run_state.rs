@@ -24,7 +24,66 @@ use crate::server::run::engine::RunEngine;
 
 pub const MAX_DURABLE_RUN_EVENT_BATCH_ROWS: usize = MAX_ACTIVE_RUN_LIVE_EVENTS;
 pub const MAX_DURABLE_RUN_EVENT_BATCH_BYTES: usize = 2 * 1024 * 1024;
+pub const MIN_DURABLE_RUN_EVENT_BATCH_ROWS: usize = 16;
+pub const MIN_DURABLE_RUN_EVENT_BATCH_BYTES: usize = 64 * 1024;
 const DURABLE_RUN_EVENT_COMPACTION_SUMMARY_BYTES_RESERVE: usize = 1024;
+const DURABLE_RUN_EVENT_BATCH_MAX_ROWS_ENV: &str = "ASTRA_DURABLE_RUN_EVENT_BATCH_MAX_ROWS";
+const DURABLE_RUN_EVENT_BATCH_MAX_BYTES_ENV: &str = "ASTRA_DURABLE_RUN_EVENT_BATCH_MAX_BYTES";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableRunEventBatchBudget {
+    pub row_budget: usize,
+    pub byte_budget: usize,
+}
+
+impl Default for DurableRunEventBatchBudget {
+    fn default() -> Self {
+        Self {
+            row_budget: MAX_DURABLE_RUN_EVENT_BATCH_ROWS,
+            byte_budget: MAX_DURABLE_RUN_EVENT_BATCH_BYTES,
+        }
+    }
+}
+
+impl DurableRunEventBatchBudget {
+    pub fn new(row_budget: usize, byte_budget: usize) -> Self {
+        Self {
+            row_budget: row_budget.max(MIN_DURABLE_RUN_EVENT_BATCH_ROWS),
+            byte_budget: byte_budget.max(MIN_DURABLE_RUN_EVENT_BATCH_BYTES),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        let row_budget = std::env::var(DURABLE_RUN_EVENT_BATCH_MAX_ROWS_ENV).ok();
+        let byte_budget = std::env::var(DURABLE_RUN_EVENT_BATCH_MAX_BYTES_ENV).ok();
+        Self::from_env_values(row_budget.as_deref(), byte_budget.as_deref())
+    }
+
+    fn from_env_values(row_budget: Option<&str>, byte_budget: Option<&str>) -> Self {
+        Self::new(
+            parse_budget_env_value(
+                row_budget,
+                MAX_DURABLE_RUN_EVENT_BATCH_ROWS,
+                MIN_DURABLE_RUN_EVENT_BATCH_ROWS,
+            ),
+            parse_budget_env_value(
+                byte_budget,
+                MAX_DURABLE_RUN_EVENT_BATCH_BYTES,
+                MIN_DURABLE_RUN_EVENT_BATCH_BYTES,
+            ),
+        )
+    }
+}
+
+fn parse_budget_env_value(value: Option<&str>, default: usize, min: usize) -> usize {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return default;
+    };
+    value
+        .parse::<usize>()
+        .map(|parsed| parsed.max(min))
+        .unwrap_or(default)
+}
 
 /// Status of a single agentic run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,6 +440,17 @@ fn retain_budgeted_events(
 }
 
 pub fn enforce_durable_run_event_batch_budget(events: Vec<Value>) -> Vec<Value> {
+    enforce_durable_run_event_batch_budget_with_budget(
+        events,
+        DurableRunEventBatchBudget::from_env(),
+    )
+}
+
+pub fn enforce_durable_run_event_batch_budget_with_budget(
+    events: Vec<Value>,
+    budget: DurableRunEventBatchBudget,
+) -> Vec<Value> {
+    let budget = DurableRunEventBatchBudget::new(budget.row_budget, budget.byte_budget);
     if events.is_empty() {
         return events;
     }
@@ -390,9 +460,7 @@ pub fn enforce_durable_run_event_batch_budget(events: Vec<Value>) -> Vec<Value> 
         .map(durable_run_event_estimated_bytes)
         .collect();
     let original_bytes = event_bytes.iter().sum::<usize>();
-    if events.len() <= MAX_DURABLE_RUN_EVENT_BATCH_ROWS
-        && original_bytes <= MAX_DURABLE_RUN_EVENT_BATCH_BYTES
-    {
+    if events.len() <= budget.row_budget && original_bytes <= budget.byte_budget {
         return events;
     }
 
@@ -407,10 +475,12 @@ pub fn enforce_durable_run_event_batch_budget(events: Vec<Value>) -> Vec<Value> 
         .filter_map(|(bytes, critical)| critical.then_some(*bytes))
         .sum::<usize>();
 
-    let max_noncritical_rows = MAX_DURABLE_RUN_EVENT_BATCH_ROWS
+    let max_noncritical_rows = budget
+        .row_budget
         .saturating_sub(critical_count)
         .saturating_sub(1);
-    let max_noncritical_bytes = MAX_DURABLE_RUN_EVENT_BATCH_BYTES
+    let max_noncritical_bytes = budget
+        .byte_budget
         .saturating_sub(critical_bytes)
         .saturating_sub(DURABLE_RUN_EVENT_COMPACTION_SUMMARY_BYTES_RESERVE);
 
@@ -456,8 +526,8 @@ pub fn enforce_durable_run_event_batch_budget(events: Vec<Value>) -> Vec<Value> 
             "dropped_events": dropped_count,
             "original_bytes_estimate": original_bytes,
             "dropped_bytes_estimate": dropped_bytes,
-            "row_budget": MAX_DURABLE_RUN_EVENT_BATCH_ROWS,
-            "byte_budget": MAX_DURABLE_RUN_EVENT_BATCH_BYTES
+            "row_budget": budget.row_budget,
+            "byte_budget": budget.byte_budget
         }
     });
 
@@ -618,7 +688,10 @@ mod tests {
         events.push(json!({"event_type": "text_done", "data": {"full_text": "answer"}}));
         events.push(json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}));
 
-        let budgeted = enforce_durable_run_event_batch_budget(events);
+        let budgeted = enforce_durable_run_event_batch_budget_with_budget(
+            events,
+            DurableRunEventBatchBudget::default(),
+        );
 
         assert_eq!(budgeted.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
         assert_eq!(
@@ -649,7 +722,10 @@ mod tests {
         events.push(json!({"event_type": "text_done", "data": {"full_text": "answer"}}));
         events.push(json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}));
 
-        let budgeted = enforce_durable_run_event_batch_budget(events);
+        let budgeted = enforce_durable_run_event_batch_budget_with_budget(
+            events,
+            DurableRunEventBatchBudget::default(),
+        );
 
         assert_eq!(budgeted.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
         assert!(
@@ -691,7 +767,10 @@ mod tests {
             json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
         ];
 
-        let budgeted = enforce_durable_run_event_batch_budget(events);
+        let budgeted = enforce_durable_run_event_batch_budget_with_budget(
+            events,
+            DurableRunEventBatchBudget::default(),
+        );
 
         assert_eq!(budgeted.len(), 3);
         assert_eq!(
@@ -706,5 +785,57 @@ mod tests {
             .map(durable_run_event_estimated_bytes)
             .sum::<usize>();
         assert!(total_bytes < MAX_DURABLE_RUN_EVENT_BATCH_BYTES);
+    }
+
+    #[test]
+    fn durable_run_event_batch_budget_env_values_parse_and_clamp() {
+        assert_eq!(
+            DurableRunEventBatchBudget::from_env_values(Some("32"), Some("131072")),
+            DurableRunEventBatchBudget {
+                row_budget: 32,
+                byte_budget: 131_072
+            }
+        );
+        assert_eq!(
+            DurableRunEventBatchBudget::from_env_values(Some("0"), Some("1")),
+            DurableRunEventBatchBudget {
+                row_budget: MIN_DURABLE_RUN_EVENT_BATCH_ROWS,
+                byte_budget: MIN_DURABLE_RUN_EVENT_BATCH_BYTES
+            }
+        );
+        assert_eq!(
+            DurableRunEventBatchBudget::from_env_values(Some("not-a-number"), Some("")),
+            DurableRunEventBatchBudget::default()
+        );
+    }
+
+    #[test]
+    fn durable_run_event_batch_budget_accepts_custom_row_budget() {
+        let row_budget = 32;
+        let mut events: Vec<Value> = (0..(row_budget + 10))
+            .map(|idx| json!({"type": "agent_progress", "seq": idx}))
+            .collect();
+        events.push(json!({"event_type": "text_done", "data": {"full_text": "answer"}}));
+        events.push(json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}));
+
+        let budgeted = enforce_durable_run_event_batch_budget_with_budget(
+            events,
+            DurableRunEventBatchBudget::new(row_budget, MAX_DURABLE_RUN_EVENT_BATCH_BYTES),
+        );
+
+        assert_eq!(budgeted.len(), row_budget);
+        assert_eq!(
+            durable_event_type(&budgeted[0]),
+            Some("durable_events_compacted")
+        );
+        assert_eq!(budgeted[0]["data"]["row_budget"], json!(row_budget));
+        assert_eq!(
+            durable_event_type(&budgeted[budgeted.len() - 2]),
+            Some("text_done")
+        );
+        assert_eq!(
+            durable_event_type(&budgeted[budgeted.len() - 1]),
+            Some("run_finished")
+        );
     }
 }
