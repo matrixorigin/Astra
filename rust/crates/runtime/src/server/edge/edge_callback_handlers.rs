@@ -9,7 +9,9 @@ use axum::extract::Extension;
 
 use super::*;
 
-use astra_services::session_journal::{JournalEvent, JournalWriter, validate_session_id};
+use astra_services::session_journal::{
+    ApprovalDecisionAppendOutcome, append_approval_decision_for_run_if_absent, validate_session_id,
+};
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
 
@@ -287,73 +289,62 @@ pub(crate) async fn post_approval_respond_handler(
                     None
                 }
             };
-        let already_recorded =
-            match astra_services::session_journal::find_latest_approval_decision_for_run(
-                session_id,
-                &body.request_id,
-                run_id,
-            ) {
-                Ok(Some(existing)) => {
-                    crate::server::interaction_metrics::record_approval_journal_lookup(
-                        registry.as_ref(),
-                        "decision",
-                        "hit",
-                    );
-                    existing.decision == decision
-                        && existing.reason.as_deref() == body.reason.as_deref()
-                        && existing.run_id.as_deref() == Some(run_id)
-                        && existing.tool_name.as_deref() == body.tool_name.as_deref()
-                        && existing.approval_kind.as_deref() == approval_kind
-                }
-                Ok(None) => {
-                    crate::server::interaction_metrics::record_approval_journal_lookup(
-                        registry.as_ref(),
-                        "decision",
-                        "miss",
-                    );
-                    false
-                }
-                Err(error) => {
-                    crate::server::interaction_metrics::record_approval_journal_lookup(
-                        registry.as_ref(),
-                        "decision",
-                        "error",
-                    );
-                    return Err(error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("approval journal lookup failed: {error}"),
-                    ));
-                }
-            };
-        if already_recorded {
-            crate::server::interaction_metrics::record_approval_journal_write(
-                registry.as_ref(),
-                "idempotent",
-            );
-        } else {
-            let writer = match JournalWriter::new(session_id) {
-                Ok(writer) => writer,
-                Err(error) => {
-                    crate::server::interaction_metrics::record_approval_journal_write(
-                        registry.as_ref(),
-                        "error",
-                    );
-                    return Err(error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("approval journal unavailable: {error}"),
-                    ));
-                }
-            };
-            if let Err(error) = writer.append(&JournalEvent::approval_decision_for_run(
-                Some(session_id),
-                approval_turn,
-                &body.request_id,
-                Some(run_id),
-                body.tool_name.as_deref(),
-                approval_kind,
-                decision,
-                body.reason.as_deref(),
-            )) {
+        match append_approval_decision_for_run_if_absent(
+            session_id,
+            approval_turn,
+            &body.request_id,
+            run_id,
+            body.tool_name.as_deref(),
+            approval_kind,
+            decision,
+            body.reason.as_deref(),
+        ) {
+            Ok(ApprovalDecisionAppendOutcome::Appended) => {
+                crate::server::interaction_metrics::record_approval_journal_lookup(
+                    registry.as_ref(),
+                    "decision",
+                    "miss",
+                );
+                crate::server::interaction_metrics::record_approval_journal_write(
+                    registry.as_ref(),
+                    "ok",
+                );
+            }
+            Ok(ApprovalDecisionAppendOutcome::Idempotent) => {
+                crate::server::interaction_metrics::record_approval_journal_lookup(
+                    registry.as_ref(),
+                    "decision",
+                    "hit",
+                );
+                crate::server::interaction_metrics::record_approval_journal_write(
+                    registry.as_ref(),
+                    "idempotent",
+                );
+            }
+            Ok(ApprovalDecisionAppendOutcome::Conflict(existing)) => {
+                crate::server::interaction_metrics::record_approval_journal_lookup(
+                    registry.as_ref(),
+                    "decision",
+                    "hit",
+                );
+                crate::server::interaction_metrics::record_approval_journal_write(
+                    registry.as_ref(),
+                    "conflict",
+                );
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "approval decision already recorded for request {} run {} as {}",
+                        existing.request_id, run_id, existing.decision
+                    ),
+                ));
+            }
+            Err(error) => {
+                crate::server::interaction_metrics::record_approval_journal_lookup(
+                    registry.as_ref(),
+                    "decision",
+                    "error",
+                );
                 crate::server::interaction_metrics::record_approval_journal_write(
                     registry.as_ref(),
                     "error",
@@ -363,10 +354,6 @@ pub(crate) async fn post_approval_respond_handler(
                     format!("approval journal append failed: {error}"),
                 ));
             }
-            crate::server::interaction_metrics::record_approval_journal_write(
-                registry.as_ref(),
-                "ok",
-            );
         }
     } else {
         crate::server::interaction_metrics::record_approval_journal_write(
@@ -739,7 +726,7 @@ mod edge_callback_insert_tests {
         let source = include_str!("edge_callback_handlers.rs");
         let journal_lookup_idx = source_index(source, "find_latest_approval_required_for_run");
         let journal_append_idx =
-            source_index(source, ".append(&JournalEvent::approval_decision_for_run(");
+            source_index(source, "append_approval_decision_for_run_if_absent(");
         let ledger_lock_idx = source_index(
             source,
             "let ledger_result = {\n        let mut lock = state.edge_callback_ledger.lock().await;",

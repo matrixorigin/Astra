@@ -1960,6 +1960,113 @@ pub fn find_latest_approval_decision_for_run(
     find_latest_approval_decision_impl(session_id, request_id, Some(run_id))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalDecisionAppendOutcome {
+    Appended,
+    Idempotent,
+    Conflict(ApprovalJournalDecision),
+}
+
+fn approval_decision_from_event(
+    event: &JournalEvent,
+    request_id: &str,
+    run_id: Option<&str>,
+) -> Option<ApprovalJournalDecision> {
+    if event.event_type != JournalEventType::ApprovalDecision {
+        return None;
+    }
+    let metadata = event.metadata.as_ref()?;
+    let found_request_id = approval_metadata_str(metadata, "request_id")?;
+    if found_request_id != request_id {
+        return None;
+    }
+    let found_run_id = approval_metadata_str(metadata, "run_id");
+    if let Some(expected_run_id) = run_id
+        && found_run_id.as_deref() != Some(expected_run_id)
+    {
+        return None;
+    }
+    let decision = approval_metadata_str(metadata, "decision")?;
+    Some(ApprovalJournalDecision {
+        request_id: found_request_id,
+        run_id: found_run_id,
+        decision,
+        reason: approval_metadata_str(metadata, "reason"),
+        tool_name: approval_metadata_str(metadata, "tool_name"),
+        approval_kind: approval_metadata_str(metadata, "approval_kind"),
+    })
+}
+
+fn approval_decision_matches(
+    existing: &ApprovalJournalDecision,
+    decision: &str,
+    reason: Option<&str>,
+    tool_name: Option<&str>,
+    approval_kind: Option<&str>,
+) -> bool {
+    existing.decision == decision
+        && existing.reason.as_deref() == reason
+        && existing.tool_name.as_deref() == tool_name
+        && existing.approval_kind.as_deref() == approval_kind
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_approval_decision_for_run_if_absent(
+    session_id: &str,
+    turn: Option<u32>,
+    request_id: &str,
+    run_id: &str,
+    tool_name: Option<&str>,
+    approval_kind: Option<&str>,
+    decision: &str,
+    reason: Option<&str>,
+) -> std::io::Result<ApprovalDecisionAppendOutcome> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if run_id.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "run_id required",
+        ));
+    }
+
+    let path = journal_file_path(session_id);
+    let mut file = open_locked_journal_file(&path)?;
+    let mut content = String::new();
+    file.seek(SeekFrom::Start(0))?;
+    file.read_to_string(&mut content)?;
+    let events = parse_journal_text(&content).0;
+    for event in events.iter().rev() {
+        let Some(existing) = approval_decision_from_event(event, request_id, Some(run_id)) else {
+            continue;
+        };
+        return if approval_decision_matches(&existing, decision, reason, tool_name, approval_kind) {
+            Ok(ApprovalDecisionAppendOutcome::Idempotent)
+        } else {
+            Ok(ApprovalDecisionAppendOutcome::Conflict(existing))
+        };
+    }
+
+    let event = JournalEvent::approval_decision_for_run(
+        Some(session_id),
+        turn,
+        request_id,
+        Some(run_id),
+        tool_name,
+        approval_kind,
+        decision,
+        reason,
+    );
+    let events = prepend_session_start_if_needed(&path, std::slice::from_ref(&event))?;
+    let buf = serialize_journal_events(events.as_ref())?;
+    file.write_all(&buf)?;
+    file.sync_data()?;
+    update_cached_session_start_state_from_events(&path, events.as_ref());
+    Ok(ApprovalDecisionAppendOutcome::Appended)
+}
+
 fn find_latest_approval_decision_impl(
     session_id: &str,
     request_id: &str,
@@ -1968,36 +2075,10 @@ fn find_latest_approval_decision_impl(
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let events = read_journal(session_id)?;
-    for event in events.into_iter().rev() {
-        if event.event_type != JournalEventType::ApprovalDecision {
-            continue;
-        }
-        let Some(metadata) = event.metadata.as_ref() else {
-            continue;
+    for event in events.iter().rev() {
+        if let Some(decision) = approval_decision_from_event(event, request_id, run_id) {
+            return Ok(Some(decision));
         };
-        let Some(found_request_id) = approval_metadata_str(metadata, "request_id") else {
-            continue;
-        };
-        if found_request_id != request_id {
-            continue;
-        }
-        let found_run_id = approval_metadata_str(metadata, "run_id");
-        if let Some(expected_run_id) = run_id
-            && found_run_id.as_deref() != Some(expected_run_id)
-        {
-            continue;
-        }
-        let Some(decision) = approval_metadata_str(metadata, "decision") else {
-            continue;
-        };
-        return Ok(Some(ApprovalJournalDecision {
-            request_id: found_request_id,
-            run_id: found_run_id,
-            decision,
-            reason: approval_metadata_str(metadata, "reason"),
-            tool_name: approval_metadata_str(metadata, "tool_name"),
-            approval_kind: approval_metadata_str(metadata, "approval_kind"),
-        }));
     }
     Ok(None)
 }
@@ -4743,6 +4824,62 @@ mod approval_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn append_approval_decision_for_run_is_idempotent_and_conflict_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let first = append_approval_decision_for_run_if_absent(
+            "sess-approval-idempotent",
+            Some(3),
+            "req-idem",
+            "run-idem",
+            Some("write_file"),
+            Some("standard"),
+            "allow",
+            Some("approved"),
+        )
+        .unwrap();
+        assert_eq!(first, ApprovalDecisionAppendOutcome::Appended);
+
+        let duplicate = append_approval_decision_for_run_if_absent(
+            "sess-approval-idempotent",
+            Some(3),
+            "req-idem",
+            "run-idem",
+            Some("write_file"),
+            Some("standard"),
+            "allow",
+            Some("approved"),
+        )
+        .unwrap();
+        assert_eq!(duplicate, ApprovalDecisionAppendOutcome::Idempotent);
+
+        let conflict = append_approval_decision_for_run_if_absent(
+            "sess-approval-idempotent",
+            Some(3),
+            "req-idem",
+            "run-idem",
+            Some("write_file"),
+            Some("standard"),
+            "deny",
+            Some("late conflicting replay"),
+        )
+        .unwrap();
+        let ApprovalDecisionAppendOutcome::Conflict(existing) = conflict else {
+            panic!("expected conflict for distinct decision replay");
+        };
+        assert_eq!(existing.decision, "allow");
+        assert_eq!(existing.reason.as_deref(), Some("approved"));
+
+        let decisions = read_journal("sess-approval-idempotent")
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == JournalEventType::ApprovalDecision)
+            .count();
+        assert_eq!(decisions, 1, "idempotent/conflict paths must not append");
     }
 
     #[test]

@@ -1,20 +1,23 @@
 //! End-to-end: §5.5 HTTP handlers write into the same ledger the bridge consumes, keys match
 //! [`astra_turn_core::edge_ledger`], and `take_ledger_entry` removes rows.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
-    turn::cloud_tool_delivery::deliver_tool_calls_through_edge_ledger,
+    turn::cloud_tool_delivery::{
+        ApprovalAuditContext, deliver_tool_calls_through_edge_ledger, wait_approval_ledger_for_tool,
+    },
     turn::edge_ledger::{
         LEDGER_MAX_ENTRIES, approval_callback_key, take_ledger_entry, tool_callback_key,
     },
 };
 use astra_services::session_journal::{
-    JournalDirGuard, JournalEventType, find_latest_approval_decision, read_journal,
+    JournalDirGuard, JournalEventType, find_latest_approval_decision_for_run, read_journal,
 };
+use astra_turn_core::contracts::{TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter};
 use async_trait::async_trait;
 use axum::{
     Router, body,
@@ -100,6 +103,19 @@ impl AuthService for E2eAuth {
     }
 }
 
+#[derive(Clone, Default)]
+struct RecordingAuxiliaryEventWriter {
+    events: Arc<StdMutex<Vec<TurnAuxiliaryEventRecord>>>,
+}
+
+#[async_trait]
+impl TurnAuxiliaryEventWriter for RecordingAuxiliaryEventWriter {
+    async fn persist_events(&self, events: Vec<TurnAuxiliaryEventRecord>) -> Result<(), String> {
+        self.events.lock().unwrap().extend(events);
+        Ok(())
+    }
+}
+
 fn e2e_app() -> (
     Router,
     Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
@@ -135,6 +151,14 @@ async fn post_json(
     (status, json)
 }
 
+fn write_tool_call(id: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "type": "function",
+        "function": {"name": "write_file", "arguments": r#"{"path":"z.rs","content":"1"}"#}
+    })
+}
+
 #[tokio::test]
 async fn post_tools_result_populates_ledger_then_take_consumes() {
     let (app, ledger) = e2e_app();
@@ -167,7 +191,7 @@ async fn post_approval_respond_populates_ledger_then_take_consumes() {
     let (st, j) = post_json(
         app.clone(),
         "/approval/respond",
-        json!({"request_id": "ap-9", "decision": "allow"}),
+        json!({"request_id": "ap-9", "decision": "allow", "run_id": "run-ledger"}),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -200,6 +224,7 @@ async fn post_approval_respond_journals_when_ledger_is_full() {
             "decision": "deny",
             "reason": "policy",
             "session_id": "sess-approval",
+            "run_id": "run-approval",
             "tool_name": "write_file",
             "approval_kind": "standard"
         }),
@@ -211,13 +236,84 @@ async fn post_approval_respond_journals_when_ledger_is_full() {
     assert!(!ledger.lock().await.contains_key(&key));
     assert_eq!(ledger.lock().await.len(), LEDGER_MAX_ENTRIES);
 
-    let found = find_latest_approval_decision("sess-approval", "ap-overflow")
-        .unwrap()
-        .expect("journal decision");
+    let found =
+        find_latest_approval_decision_for_run("sess-approval", "ap-overflow", "run-approval")
+            .unwrap()
+            .expect("journal decision");
+    assert_eq!(found.run_id.as_deref(), Some("run-approval"));
     assert_eq!(found.decision, "deny");
     assert_eq!(found.reason.as_deref(), Some("policy"));
     assert_eq!(found.tool_name.as_deref(), Some("write_file"));
     assert_eq!(found.approval_kind.as_deref(), Some("standard"));
+}
+
+#[tokio::test]
+async fn approval_callback_on_other_appstate_replays_from_journal_without_sticky_ledger() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let (callback_app, callback_ledger) = e2e_app();
+    let (_waiter_app, waiter_ledger) = e2e_app();
+
+    let (st, j) = post_json(
+        callback_app,
+        "/approval/respond",
+        json!({
+            "request_id": "ap-no-sticky",
+            "decision": "allow",
+            "reason": "approved on callback pod",
+            "session_id": "sess-no-sticky",
+            "run_id": "run-no-sticky",
+            "tool_name": "write_file",
+            "approval_kind": "standard"
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "callback pod approval response: {j:?}");
+    assert_eq!(j["ok"], true);
+    assert!(
+        callback_ledger
+            .lock()
+            .await
+            .contains_key(&approval_callback_key("e2e-user", "ap-no-sticky")),
+        "callback pod may keep its same-pod fast-path ledger entry"
+    );
+    assert!(
+        waiter_ledger.lock().await.is_empty(),
+        "waiter pod intentionally has no same-pod ledger entry"
+    );
+
+    let aux_writer = RecordingAuxiliaryEventWriter::default();
+    let recorded_events = Arc::clone(&aux_writer.events);
+    let audit = ApprovalAuditContext {
+        user_id: "e2e-user".to_string(),
+        session_id: "sess-no-sticky".to_string(),
+        run_id: "run-no-sticky".to_string(),
+        turn: 3,
+        agent_id: None,
+        parent_event_id: None,
+        parent_event_ids: Vec::new(),
+        causal_chain_id: "chain-no-sticky".to_string(),
+        auxiliary_event_writer: Arc::new(aux_writer),
+    };
+
+    wait_approval_ledger_for_tool(
+        &waiter_ledger,
+        "e2e-user",
+        &write_tool_call("ap-no-sticky"),
+        Duration::from_millis(200),
+        Some(&audit),
+    )
+    .await
+    .expect("waiter pod should replay approval decision from journal without sticky ledger");
+
+    assert!(waiter_ledger.lock().await.is_empty());
+    let events = recorded_events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "approval_decision");
+    let metadata = events[0].metadata.as_ref().expect("approval metadata");
+    assert_eq!(metadata["outcome_source"].as_str(), Some("journal"));
+    assert_eq!(metadata["decision"].as_str(), Some("allow"));
+    assert_eq!(metadata["run_id"].as_str(), Some("run-no-sticky"));
 }
 
 #[test]
@@ -230,6 +326,7 @@ fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
         "decision": "allow",
         "reason": "duplicate allow",
         "session_id": "sess-concurrent-dup",
+        "run_id": "run-concurrent-dup",
         "tool_name": "write_file",
         "approval_kind": "standard"
     });
@@ -292,6 +389,13 @@ fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
                 .and_then(|approval| approval.get("request_id"))
                 .and_then(|request_id| request_id.as_str())
                 == Some("ap-concurrent-dup")
+                && event
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("approval"))
+                    .and_then(|approval| approval.get("run_id"))
+                    .and_then(|run_id| run_id.as_str())
+                    == Some("run-concurrent-dup")
         })
         .count();
     assert_eq!(
@@ -321,6 +425,7 @@ async fn distinct_payload_duplicate_approval_second_is_409_conflict() {
             "decision": "allow",
             "reason": "first",
             "session_id": "sess-conflict",
+            "run_id": "run-conflict",
             "tool_name": "write_file",
             "approval_kind": "standard"
         }),
@@ -337,6 +442,7 @@ async fn distinct_payload_duplicate_approval_second_is_409_conflict() {
             "decision": "deny",
             "reason": "second",
             "session_id": "sess-conflict",
+            "run_id": "run-conflict",
             "tool_name": "write_file",
             "approval_kind": "standard"
         }),
@@ -394,7 +500,7 @@ async fn http_handler_payload_matches_delivery_parser() {
     post_json(
         app.clone(),
         "/approval/respond",
-        json!({"request_id": "w-chain", "decision": "allow"}),
+        json!({"request_id": "w-chain", "decision": "allow", "run_id": "run-chain"}),
     )
     .await;
     let tc = json!({
@@ -444,7 +550,7 @@ async fn http_handler_payload_supports_batched_approval_delivery() {
         post_json(
             app.clone(),
             "/approval/respond",
-            json!({"request_id": request_id, "decision": "allow"}),
+            json!({"request_id": request_id, "decision": "allow", "run_id": "run-batch"}),
         )
         .await;
     }
