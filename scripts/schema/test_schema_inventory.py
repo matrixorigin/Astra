@@ -236,6 +236,108 @@ class SchemaInventoryTest(unittest.TestCase):
             self.tables["sweeper_leases"]["merge_guidance"],
         )
 
+    def test_auth_admin_model_config_tables_have_semantic_metadata(self) -> None:
+        config_security_tables = {
+            "admin_config",
+            "auth_users",
+            "auth_roles",
+            "auth_refresh_tokens",
+            "auth_external_sessions",
+            "auth_tokens",
+            "auth_audit_logs",
+            "infra_llm_models",
+            "model_gateways",
+            "runtime_llm_trusted_domains",
+        }
+        for table in config_security_tables:
+            with self.subTest(table=table):
+                row = self.tables[table]
+                for field in [
+                    "semantic_owner",
+                    "state_class",
+                    "primary_query",
+                    "retention_policy",
+                    "rebuildability",
+                    "merge_guidance",
+                    "migration_owner",
+                    "product_owner",
+                ]:
+                    self.assertNotEqual(
+                        row[field],
+                        "unclassified",
+                        f"{table}.{field} must be explicit metadata",
+                    )
+
+    def test_auth_admin_model_config_metadata_locks_boundary_decisions(self) -> None:
+        self.assertIn(
+            "fall back to code/default behavior",
+            self.tables["admin_config"]["retention_policy"],
+        )
+        self.assertIn(
+            "not the model registry itself",
+            self.tables["admin_config"]["merge_guidance"],
+        )
+        self.assertIn(
+            "deactivate via is_active",
+            self.tables["auth_users"]["retention_policy"],
+        )
+        self.assertIn(
+            "identity, grants, and sessions",
+            self.tables["auth_users"]["merge_guidance"],
+        )
+        self.assertIn(
+            "delete only after dependent auth_user_roles",
+            self.tables["auth_roles"]["retention_policy"],
+        )
+        self.assertIn(
+            "ordered bounded batches",
+            self.tables["auth_refresh_tokens"]["retention_policy"],
+        )
+        self.assertIn(
+            "high-churn secrets",
+            self.tables["auth_refresh_tokens"]["merge_guidance"],
+        )
+        self.assertIn(
+            "encrypted provider session handle",
+            self.tables["auth_external_sessions"]["rebuildability"],
+        )
+        self.assertIn(
+            "provider session",
+            self.tables["auth_external_sessions"]["merge_guidance"],
+        )
+        self.assertIn(
+            "encrypted_value or secret_ref",
+            self.tables["auth_tokens"]["rebuildability"],
+        )
+        self.assertIn(
+            "different trust boundaries",
+            self.tables["auth_tokens"]["merge_guidance"],
+        )
+        self.assertIn(
+            "product/security audit table",
+            self.tables["auth_audit_logs"]["merge_guidance"],
+        )
+        self.assertIn(
+            "active-model cache invalidation",
+            self.tables["infra_llm_models"]["retention_policy"],
+        )
+        self.assertIn(
+            "structured model registry",
+            self.tables["infra_llm_models"]["merge_guidance"],
+        )
+        self.assertIn(
+            "disable instead of deleting",
+            self.tables["model_gateways"]["retention_policy"],
+        )
+        self.assertIn(
+            "distinct from concrete model credentials",
+            self.tables["model_gateways"]["merge_guidance"],
+        )
+        self.assertIn(
+            "host/port trust policy",
+            self.tables["runtime_llm_trusted_domains"]["merge_guidance"],
+        )
+
     def test_high_growth_tables_have_retention_metadata(self) -> None:
         high_growth_tables = [
             "agent_events",
