@@ -645,6 +645,28 @@ def body_for_request(args: argparse.Namespace, template: Any, request_id: int, u
     return json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 
+def body_has_selected_model(body: Any) -> bool:
+    if not isinstance(body, dict):
+        return False
+    selected_model = body.get("selected_model")
+    if not isinstance(selected_model, dict):
+        return False
+    model = selected_model.get("model")
+    return isinstance(model, str) and bool(model.strip())
+
+
+def validate_stream_body_contract(args: argparse.Namespace, template: Any) -> None:
+    if args.model:
+        return
+    sample = json.loads(body_for_request(args, template, 0, 0).decode("utf-8"))
+    if body_has_selected_model(sample):
+        return
+    raise ProbeError(
+        "/chat/stream requires selected_model.model; pass --model or include "
+        "selected_model.model in --body-template"
+    )
+
+
 def load_tokens(path: str | None, explicit_token: str | None) -> list[str]:
     tokens: list[str] = []
     if explicit_token:
@@ -811,6 +833,8 @@ async def run_probe(args: argparse.Namespace) -> int:
     args.total = args.total or defaults["total"]
     args.output_dir = args.output_dir or default_output_dir(args.profile)
     template = load_body_template(args.body_template)
+    if not args.dry_run:
+        validate_stream_body_contract(args, template)
 
     if args.dry_run:
         print(
@@ -822,6 +846,7 @@ async def run_probe(args: argparse.Namespace) -> int:
                     "concurrency": args.concurrency,
                     "total": args.total,
                     "register_users": args.register_users,
+                    "require_metrics": args.require_metrics,
                     "output_dir": str(args.output_dir),
                     "body_example": json.loads(body_for_request(args, template, 0, 0).decode("utf-8")),
                 },
@@ -888,10 +913,22 @@ async def run_probe(args: argparse.Namespace) -> int:
     stop_metrics.set()
     await sampler
     elapsed_ms = (time.perf_counter() - started) * 1000.0
-    summary = summarize_results(results, args, started_unix_ms, int(time.time() * 1000), elapsed_ms)
+    metrics_summary = summarize_metrics_file(writer.metrics_path)
+    contract_violations: list[str] = []
+    if args.require_metrics and metrics_summary["samples_with_metrics"] == 0:
+        contract_violations.append("metrics_required_but_no_prefixed_metrics_sampled")
+    summary = summarize_results(
+        results,
+        args,
+        started_unix_ms,
+        int(time.time() * 1000),
+        elapsed_ms,
+        metrics_summary,
+        contract_violations,
+    )
     writer.write_summary(summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
-    return 0 if summary["failed"] == 0 else 2
+    return 0 if summary["failed"] == 0 and not contract_violations else 2
 
 
 def print_progress(results: list[StreamResult], total: int) -> None:
@@ -906,6 +943,8 @@ def summarize_results(
     started_unix_ms: int,
     ended_unix_ms: int,
     elapsed_ms: float,
+    metrics_summary: dict[str, Any],
+    contract_violations: list[str],
 ) -> dict[str, Any]:
     durations = [r.duration_ms for r in results]
     first_events = [r.first_event_ms for r in results if r.first_event_ms is not None]
@@ -931,7 +970,62 @@ def summarize_results(
         "duration_ms": percentile_summary(durations),
         "first_event_ms": percentile_summary(first_events),
         "header_latency_ms": percentile_summary(header_latencies),
+        "metrics": metrics_summary,
+        "contract_violations": contract_violations,
         "output_dir": str(args.output_dir),
+    }
+
+
+def summarize_metrics_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "sample_count": 0,
+            "samples_with_metrics": 0,
+            "http_status": {},
+            "errors": 0,
+            "first_unix_ms": None,
+            "last_unix_ms": None,
+            "last_metric_count": 0,
+            "last_metric_names": [],
+        }
+    sample_count = 0
+    samples_with_metrics = 0
+    errors = 0
+    statuses: list[str] = []
+    first_unix_ms = None
+    last_unix_ms = None
+    last_metrics: dict[str, float] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            sample_count += 1
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError:
+                errors += 1
+                continue
+            unix_ms = sample.get("unix_ms")
+            if isinstance(unix_ms, int):
+                first_unix_ms = unix_ms if first_unix_ms is None else min(first_unix_ms, unix_ms)
+                last_unix_ms = unix_ms if last_unix_ms is None else max(last_unix_ms, unix_ms)
+            statuses.append(str(sample.get("http_status", "none")))
+            if sample.get("error"):
+                errors += 1
+            metrics = sample.get("metrics")
+            if isinstance(metrics, dict) and metrics:
+                samples_with_metrics += 1
+                last_metrics = metrics
+    return {
+        "sample_count": sample_count,
+        "samples_with_metrics": samples_with_metrics,
+        "http_status": counts_by(statuses),
+        "errors": errors,
+        "first_unix_ms": first_unix_ms,
+        "last_unix_ms": last_unix_ms,
+        "last_metric_count": len(last_metrics),
+        "last_metric_names": sorted(last_metrics)[:50],
     }
 
 
@@ -1011,6 +1105,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--connect-timeout-secs", type=float, default=10.0)
     parser.add_argument("--request-timeout-secs", type=float, default=300.0)
     parser.add_argument("--metrics-interval-secs", type=float, default=5.0)
+    parser.add_argument(
+        "--require-metrics",
+        action="store_true",
+        help="fail if /metrics did not yield any metrics matching the capacity probe prefixes",
+    )
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--dry-run", action="store_true")

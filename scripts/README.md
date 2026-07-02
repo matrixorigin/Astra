@@ -44,6 +44,15 @@ only against a disposable environment; distinct user testing requires distinct
 real access tokens because the runtime derives ownership from auth, not from a
 request body field.
 
+`/chat/stream` requires an explicit `selected_model.model`. Pass `--model` for
+the standard probe body, or provide a `--body-template` that includes
+`selected_model.model`.
+
+```sh
+python3 scripts/load/multi_cli_capacity_probe.py --profile 100-cli --model qwen3.7-max --register-users --require-metrics
+python3 scripts/load/multi_cli_capacity_probe.py --profile 500-cli --model qwen3.7-max --token-file tokens.json --require-distinct-users --require-metrics
+```
+
 ### `scripts/load/cleanup_pressure_probe.py`
 Runs ignored live MatrixOne cleanup pressure probes for the current retention
 hot paths: `agent_message_queue`, `conversation_log`, and prompt retention.

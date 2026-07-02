@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -77,6 +78,7 @@ class CapacityProbeTests(unittest.TestCase):
         args = argparse.Namespace(
             message="msg {request_id}",
             profile="500-cli",
+            model=None,
         )
         template = {
             "message": "{message}",
@@ -85,6 +87,51 @@ class CapacityProbeTests(unittest.TestCase):
         rendered = json.loads(probe.body_for_request(args, template, 9, 4).decode("utf-8"))
         self.assertEqual(rendered["message"], "msg 9")
         self.assertEqual(rendered["context"], {"rid": "9", "user": "4"})
+
+    def test_stream_body_contract_requires_selected_model(self) -> None:
+        args = argparse.Namespace(
+            message="msg {request_id}",
+            profile="100-cli",
+            agent_id=None,
+            model=None,
+            session_id_template=None,
+        )
+        with self.assertRaises(probe.ProbeError):
+            probe.validate_stream_body_contract(args, None)
+
+        template = {
+            "message": "{message}",
+            "selected_model": {"model": "gpt-test"},
+        }
+        probe.validate_stream_body_contract(args, template)
+
+    def test_summarize_metrics_file_reports_empty_prefixed_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"unix_ms": 10, "http_status": 200, "metrics": {}}),
+                        json.dumps(
+                            {
+                                "unix_ms": 20,
+                                "http_status": 200,
+                                "metrics": {"astra_capacity_run_slots_total": 100.0},
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = probe.summarize_metrics_file(path)
+
+        self.assertEqual(summary["sample_count"], 2)
+        self.assertEqual(summary["samples_with_metrics"], 1)
+        self.assertEqual(summary["http_status"], {"200": 2})
+        self.assertEqual(summary["last_metric_count"], 1)
+        self.assertEqual(summary["last_metric_names"], ["astra_capacity_run_slots_total"])
 
     def test_percentile_summary_handles_empty(self) -> None:
         self.assertEqual(
