@@ -1109,6 +1109,27 @@ pub trait RunStateStore: Send + Sync {
         Ok(active)
     }
 
+    /// Return the interval at which the runtime should renew this store
+    /// owner's active run leases. Stores without shared lease state can return
+    /// `None`.
+    fn owner_lease_renewal_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Renew the current store owner's lease for a live run.
+    ///
+    /// Shared durable stores should only renew rows still owned by this store
+    /// instance and still in one of the expected active statuses. Returning
+    /// `Ok(false)` tells the runtime to stop heartbeating that run.
+    async fn renew_owner_lease(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+        _expected_statuses: &[&str],
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Find the newest run that blocks starting another run in the same session.
     async fn find_blocking_session_run(
         &self,
@@ -1993,6 +2014,13 @@ impl DatabaseRunStateStore {
         &self.owner_pod_id
     }
 
+    fn lease_expires_at(&self) -> chrono::NaiveDateTime {
+        let lease_expires_at = chrono::Utc::now()
+            + chrono::Duration::from_std(self.lease_ttl)
+                .unwrap_or_else(|_| chrono::Duration::seconds(45));
+        lease_expires_at.naive_utc()
+    }
+
     async fn load_tool_preview_contracts(
         &self,
         items: &[ToolOutputBatchItem],
@@ -2601,6 +2629,11 @@ impl DatabaseRunStateStore {
     }
 }
 
+fn run_owner_lease_renewal_interval(lease_ttl: Duration) -> Duration {
+    let interval_ms = (lease_ttl.as_millis().max(1) / 3).max(1).min(15_000);
+    Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX))
+}
+
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
     async fn insert_run(&self, mut record: DurableRunRecord) -> Result<(), String> {
@@ -2681,7 +2714,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(&record.status)
             .bind(&record.waiting_for)
             .bind(&self.owner_pod_id)
-            .bind(lease_expires_at.naive_utc())
+            .bind(lease_expires_at)
             .bind(record.run_generation as i64)
             .bind(record.last_event_idx)
             .bind(&record.checkpoint_version)
@@ -2733,7 +2766,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(&record.status)
             .bind(&record.waiting_for)
             .bind(&self.owner_pod_id)
-            .bind(lease_expires_at.naive_utc())
+            .bind(lease_expires_at)
             .bind(record.run_generation as i64)
             .bind(record.last_event_idx)
             .bind(&record.checkpoint_version)
@@ -3696,6 +3729,46 @@ impl RunStateStore for DatabaseRunStateStore {
             .map(run_record_from_row)
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|e| e.to_string())
+    }
+
+    fn owner_lease_renewal_interval(&self) -> Option<Duration> {
+        Some(run_owner_lease_renewal_interval(self.lease_ttl))
+    }
+
+    async fn renew_owner_lease(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+    ) -> Result<bool, String> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+
+        let mut query =
+            sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET owner_pod_id = ");
+        query.push_bind(&self.owner_pod_id);
+        query.push(", owner_lease_expires_at = ");
+        query.push_bind(self.lease_expires_at());
+        query.push(" WHERE user_id = ");
+        query.push_bind(user_id);
+        query.push(" AND run_id = ");
+        query.push_bind(run_id);
+        query.push(" AND owner_pod_id = ");
+        query.push_bind(&self.owner_pod_id);
+        query.push(" AND status IN (");
+        let mut separated = query.separated(", ");
+        for expected in expected_statuses {
+            separated.push_bind(*expected);
+        }
+        separated.push_unseparated(")");
+
+        let result = query
+            .build()
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| db_error("renew_owner_lease", run_id, source).to_string())?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn find_blocking_session_run(
@@ -5558,6 +5631,54 @@ mod tests {
         assert!(
             !body.contains("WHERE run_id = ?"),
             "lease acquisition must not retain the old ownerless predicate"
+        );
+    }
+
+    #[test]
+    fn owner_lease_renewal_interval_is_derived_from_ttl() {
+        assert_eq!(
+            run_owner_lease_renewal_interval(Duration::from_secs(45)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            run_owner_lease_renewal_interval(Duration::from_millis(30)),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            run_owner_lease_renewal_interval(Duration::from_secs(300)),
+            Duration::from_secs(15),
+            "very long leases should not make active-run heartbeat too sparse"
+        );
+    }
+
+    #[test]
+    fn renew_owner_lease_update_is_owner_and_status_bound() {
+        let source = include_str!("runs.rs");
+        let database_impl = source
+            .split("impl RunStateStore for DatabaseRunStateStore")
+            .nth(1)
+            .expect("database RunStateStore impl");
+        let body = database_impl
+            .split("async fn renew_owner_lease")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn find_blocking_session_run").next())
+            .expect("database renew_owner_lease body");
+
+        assert!(
+            body.contains("WHERE user_id = ") && body.contains("AND run_id = "),
+            "lease renewal must not update agent_runs by bare run_id"
+        );
+        assert!(
+            body.contains("AND owner_pod_id = "),
+            "lease renewal must only refresh the current store owner's rows"
+        );
+        assert!(
+            body.contains("AND status IN ("),
+            "lease renewal must stop once the run leaves active statuses"
+        );
+        assert!(
+            !body.contains("updated_at = NOW(6)"),
+            "lease heartbeat must not mutate user-visible run updated_at ordering"
         );
     }
 

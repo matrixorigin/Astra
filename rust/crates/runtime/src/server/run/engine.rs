@@ -53,6 +53,12 @@ const METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL: &str = "astra_run_control_poll_att
 const METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL: &str = "astra_run_control_poll_errors_total";
 const TERMINAL_TRANSITION_MAX_ATTEMPTS: usize = 3;
 const TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS: u64 = 25;
+const OWNER_LEASE_RENEWAL_STATUSES: &[&str] = &[
+    STATUS_RUNNING,
+    STATUS_WAITING,
+    STATUS_INPUT_QUEUED,
+    STATUS_PAUSED,
+];
 
 fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
     [
@@ -88,6 +94,20 @@ pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
     projection_store: Option<Arc<DatabaseStateProjectionStore>>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
+}
+
+pub(crate) struct RunOwnerLeaseHeartbeat {
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RunOwnerLeaseHeartbeat {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        self.join.abort();
+    }
 }
 
 /// Optional run-start interaction context persisted into the durable
@@ -266,6 +286,58 @@ impl RunEngine {
         register_run_control_poll_metrics(&registry);
         self.metrics_registry = Some(registry);
         self
+    }
+
+    /// Start renewing the store owner's active-run lease until the returned
+    /// guard is dropped. Stores without shared owner leases return `None`.
+    pub(crate) fn start_owner_lease_heartbeat(
+        &self,
+        user_id: String,
+        run_id: String,
+    ) -> Option<RunOwnerLeaseHeartbeat> {
+        let interval = self
+            .store
+            .owner_lease_renewal_interval()?
+            .max(Duration::from_millis(1));
+        let engine = self.clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = &mut stop_rx => break,
+                }
+
+                match engine
+                    .store
+                    .renew_owner_lease(&user_id, &run_id, OWNER_LEASE_RENEWAL_STATUSES)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(
+                            target: "astra_runtime::run_engine",
+                            run_id = %run_id,
+                            "stopping run owner lease heartbeat after renewal returned false"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "astra_runtime::run_engine",
+                            run_id = %run_id,
+                            error = %error,
+                            "failed to renew active run owner lease"
+                        );
+                    }
+                }
+            }
+        });
+
+        Some(RunOwnerLeaseHeartbeat {
+            stop_tx: Some(stop_tx),
+            join,
+        })
     }
 
     /// Create a durable run record in the store.
@@ -1342,6 +1414,46 @@ mod tests {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))
     }
 
+    #[tokio::test]
+    async fn owner_lease_heartbeat_is_disabled_when_store_has_no_interval() {
+        assert!(
+            test_engine()
+                .start_owner_lease_heartbeat("user-1".to_string(), "run-1".to_string())
+                .is_none(),
+            "stores without shared lease state should not spawn a heartbeat task"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_lease_heartbeat_renews_until_guard_drops() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::BeforeCommit)
+                .with_owner_lease_heartbeat(Duration::from_millis(5)),
+        );
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
+            .start_owner_lease_heartbeat("user-1".to_string(), "run-1".to_string())
+            .expect("heartbeat-enabled store should start a guard");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        while store.lease_renewals() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            store.lease_renewals() >= 2,
+            "heartbeat should renew the active run lease while the guard is alive"
+        );
+
+        drop(guard);
+        let renewals_after_drop = store.lease_renewals();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            store.lease_renewals(),
+            renewals_after_drop,
+            "dropping the heartbeat guard must stop renewal"
+        );
+    }
+
     #[derive(Clone, Copy)]
     enum BatchTransitionFailureMode {
         BeforeCommit,
@@ -1355,6 +1467,8 @@ mod tests {
         attempts: AtomicUsize,
         waiting_queries: AtomicUsize,
         recoverable_active_queries: AtomicUsize,
+        lease_renewal_interval: Option<Duration>,
+        lease_renewals: AtomicUsize,
         mode: BatchTransitionFailureMode,
     }
 
@@ -1366,8 +1480,15 @@ mod tests {
                 attempts: AtomicUsize::new(0),
                 waiting_queries: AtomicUsize::new(0),
                 recoverable_active_queries: AtomicUsize::new(0),
+                lease_renewal_interval: None,
+                lease_renewals: AtomicUsize::new(0),
                 mode,
             }
+        }
+
+        fn with_owner_lease_heartbeat(mut self, interval: Duration) -> Self {
+            self.lease_renewal_interval = Some(interval);
+            self
         }
 
         fn attempts(&self) -> usize {
@@ -1380,6 +1501,10 @@ mod tests {
 
         fn recoverable_active_queries(&self) -> usize {
             self.recoverable_active_queries.load(Ordering::SeqCst)
+        }
+
+        fn lease_renewals(&self) -> usize {
+            self.lease_renewals.load(Ordering::SeqCst)
         }
 
         fn should_fail_this_attempt(&self) -> bool {
@@ -1630,6 +1755,20 @@ mod tests {
             self.recoverable_active_queries
                 .fetch_add(1, Ordering::SeqCst);
             self.inner.find_recoverable_active_runs().await
+        }
+
+        fn owner_lease_renewal_interval(&self) -> Option<Duration> {
+            self.lease_renewal_interval
+        }
+
+        async fn renew_owner_lease(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+            _expected_statuses: &[&str],
+        ) -> Result<bool, String> {
+            self.lease_renewals.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
         }
 
         async fn find_blocking_session_run(

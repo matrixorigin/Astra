@@ -5747,6 +5747,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
                 let _guard = TaskCountGuard(bg_task_count_1);
+                let _owner_lease_heartbeat =
+                    run_engine.start_owner_lease_heartbeat(bg_user_id.clone(), bg_run_id.clone());
 
                 // Pre-flight: check daily token budget before starting the agentic loop.
                 if let Some(ref gov) = bg_resource_governor {
@@ -6600,6 +6602,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
                 let _guard = TaskCountGuard(bg_task_count_2);
+                let _owner_lease_heartbeat =
+                    run_engine.start_owner_lease_heartbeat(bg_user_id.clone(), bg_run_id.clone());
                 if let Some(ref gov) = bg_resource_governor {
                     use astra_services::resource_governor::LimitCheck;
                     if let LimitCheck::Denied { limit, reason } =
