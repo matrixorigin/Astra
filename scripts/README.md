@@ -1,6 +1,6 @@
 # Scripts Directory
 
-Current scripts are shell-based and organized by responsibility.
+Scripts are organized by responsibility and kept dependency-light.
 
 ## Layout
 
@@ -12,6 +12,8 @@ scripts/
 │   └── stop-api.sh
 ├── load/
 │   └── multi_cli_capacity_probe.py
+├── schema/
+│   └── schema_inventory.py
 ├── setup/
 │   └── demo-init.sh
 ├── ops/
@@ -39,6 +41,19 @@ Use `--auth-token` or `--token-file` for existing users. Use `--register-users`
 only against a disposable environment; distinct user testing requires distinct
 real access tokens because the runtime derives ownership from auth, not from a
 request body field.
+
+### `scripts/schema/schema_inventory.py`
+Builds a stdlib-only inventory of static production `CREATE TABLE IF NOT EXISTS`
+DDL across current schema owners, not just `storage.rs`. It reports owner,
+source line, column count, primary keys, index count, AUTO_INCREMENT columns,
+duplicate table names, and FK usage.
+
+Useful checks:
+
+```sh
+python3 scripts/schema/schema_inventory.py --fail-on-duplicates --fail-on-foreign-keys --output tmp/schema-inventory.json
+python3 scripts/schema/test_schema_inventory.py
+```
 
 ### Public CLI Installer
 The published `astra` CLI installer is owned by the public `matrixorigin/astra-suite` repository:
