@@ -12,7 +12,10 @@ use std::{
 use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
-use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
+use astra_core::{
+    ErrorKind, ErrorResponse, MatrixOneSettings, SharedPool,
+    classify_model_resolution_error_message, error_response, internal_error,
+};
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -448,8 +451,8 @@ struct ActiveLlmModelResolutionCache {
 }
 
 impl ActiveLlmModelResolutionCache {
-    fn get(
-        &mut self,
+    fn get_fresh(
+        &self,
         key: &ActiveLlmModelCacheKey,
         now: Instant,
     ) -> Option<ResolvedActiveLlmModel> {
@@ -458,8 +461,11 @@ impl ActiveLlmModelResolutionCache {
         {
             return Some(entry.model.clone());
         }
-        self.entries.remove(key);
         None
+    }
+
+    fn get_stale(&self, key: &ActiveLlmModelCacheKey) -> Option<ResolvedActiveLlmModel> {
+        self.entries.get(key).map(|entry| entry.model.clone())
     }
 
     fn insert(&mut self, key: ActiveLlmModelCacheKey, model: ResolvedActiveLlmModel, now: Instant) {
@@ -490,7 +496,16 @@ fn active_llm_model_resolution_cache_lookup(
     ACTIVE_LLM_MODEL_RESOLUTION_CACHE
         .lock()
         .expect("active LLM model resolution cache lock poisoned")
-        .get(key, Instant::now())
+        .get_fresh(key, Instant::now())
+}
+
+fn active_llm_model_resolution_cache_stale_lookup(
+    key: &ActiveLlmModelCacheKey,
+) -> Option<ResolvedActiveLlmModel> {
+    ACTIVE_LLM_MODEL_RESOLUTION_CACHE
+        .lock()
+        .expect("active LLM model resolution cache lock poisoned")
+        .get_stale(key)
 }
 
 fn active_llm_model_resolution_cache_store(
@@ -517,6 +532,10 @@ fn remove_active_llm_model_resolution_lock(key: &ActiveLlmModelCacheKey) {
         .lock()
         .expect("active LLM model resolution lock map poisoned")
         .remove(key);
+}
+
+fn active_llm_model_resolution_error_allows_stale_cache(error: &str) -> bool {
+    classify_model_resolution_error_message(error) == ErrorKind::DatabaseError
 }
 
 pub fn invalidate_active_llm_model_resolution_cache() {
@@ -895,6 +914,18 @@ pub async fn resolve_active_llm_model(
             Ok(resolved)
         }
         Err(err) => {
+            if active_llm_model_resolution_error_allows_stale_cache(&err)
+                && let Some(stale) = active_llm_model_resolution_cache_stale_lookup(&cache_key)
+            {
+                tracing::warn!(
+                    target: "astra_services::models",
+                    model = %name,
+                    error = %err,
+                    "active LLM model refresh failed; using stale cached model"
+                );
+                remove_active_llm_model_resolution_lock(&cache_key);
+                return Ok(stale);
+            }
             remove_active_llm_model_resolution_lock(&cache_key);
             Err(err)
         }
@@ -2805,24 +2836,46 @@ mod tests {
         let mut cache = ActiveLlmModelResolutionCache::default();
         let now = Instant::now();
 
-        assert!(cache.get(&key, now).is_none());
+        assert!(cache.get_fresh(&key, now).is_none());
+        assert!(cache.get_stale(&key).is_none());
         cache.insert(key.clone(), model.clone(), now);
 
-        assert_eq!(cache.get(&key, now).as_ref(), Some(&model));
+        assert_eq!(cache.get_fresh(&key, now).as_ref(), Some(&model));
         assert_eq!(
             cache
-                .get(&key, now + ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL)
+                .get_fresh(&key, now + ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL)
                 .as_ref(),
             Some(&model)
         );
         assert!(
             cache
-                .get(
+                .get_fresh(
                     &key,
                     now + ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL + Duration::from_millis(1),
                 )
                 .is_none()
         );
+        assert_eq!(
+            cache.get_stale(&key).as_ref(),
+            Some(&model),
+            "expired entries remain available for stale-if-DB-error fallback"
+        );
+    }
+
+    #[test]
+    fn active_llm_model_resolution_stale_fallback_only_allows_database_errors() {
+        assert!(active_llm_model_resolution_error_allows_stale_cache(
+            "DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF"
+        ));
+        assert!(active_llm_model_resolution_error_allows_stale_cache(
+            "DB query: pool timed out while waiting for an open connection"
+        ));
+        assert!(!active_llm_model_resolution_error_allows_stale_cache(
+            "Model `capacity-mock` is inactive"
+        ));
+        assert!(!active_llm_model_resolution_error_allows_stale_cache(
+            "Model `unknown-model` is not configured on this server"
+        ));
     }
 
     #[test]
