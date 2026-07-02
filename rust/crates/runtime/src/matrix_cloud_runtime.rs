@@ -148,7 +148,7 @@ impl MatrixCloudRuntime {
         let task_dirty = Arc::new(Mutex::new(HashSet::new()));
 
         let pool = shared_pool.get().clone();
-        let ingestion_config = IngestionConfig::from_env();
+        let ingestion_config = IngestionConfig::default();
         let (sender, ingestion_shutdown, ingestion_stats, ingestion_jh) =
             event_ingestion::EventIngestionWorker::spawn(pool.clone(), ingestion_config.clone());
         let audit_flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());

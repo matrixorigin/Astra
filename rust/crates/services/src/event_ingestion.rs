@@ -44,13 +44,6 @@ pub const DEFAULT_INGESTION_BATCH_SIZE: usize = 100;
 pub const DEFAULT_INGESTION_FLUSH_INTERVAL_SECS: u64 = 1;
 pub const DEFAULT_INGESTION_CHANNEL_CAPACITY: usize = 5_000;
 pub const DEFAULT_INGESTION_RETRIES: u32 = 3;
-pub const ASTRA_EVENT_INGESTION_BATCH_SIZE_ENV: &str = "ASTRA_EVENT_INGESTION_BATCH_SIZE";
-pub const ASTRA_EVENT_INGESTION_FLUSH_INTERVAL_SECS_ENV: &str =
-    "ASTRA_EVENT_INGESTION_FLUSH_INTERVAL_SECS";
-pub const ASTRA_EVENT_INGESTION_CHANNEL_CAPACITY_ENV: &str =
-    "ASTRA_EVENT_INGESTION_CHANNEL_CAPACITY";
-pub const ASTRA_EVENT_INGESTION_MAX_RETRIES_ENV: &str = "ASTRA_EVENT_INGESTION_MAX_RETRIES";
-pub const ASTRA_EVENT_INGESTION_REDACT_CONTENT_ENV: &str = "ASTRA_EVENT_INGESTION_REDACT_CONTENT";
 const MAX_SHUTDOWN_DRAIN_PENDING_YIELDS: usize = 64;
 const DISCONNECTED_PENDING_DEFERRAL_LIMIT: usize = 1;
 
@@ -85,27 +78,6 @@ impl Default for IngestionConfig {
 }
 
 impl IngestionConfig {
-    pub fn from_env() -> Self {
-        let default = Self::default();
-        Self {
-            batch_size: parse_env_usize(ASTRA_EVENT_INGESTION_BATCH_SIZE_ENV, default.batch_size),
-            flush_interval_secs: parse_env_u64(
-                ASTRA_EVENT_INGESTION_FLUSH_INTERVAL_SECS_ENV,
-                default.flush_interval_secs,
-            ),
-            channel_capacity: parse_env_usize(
-                ASTRA_EVENT_INGESTION_CHANNEL_CAPACITY_ENV,
-                default.channel_capacity,
-            ),
-            max_retries: parse_env_u32(ASTRA_EVENT_INGESTION_MAX_RETRIES_ENV, default.max_retries),
-            redact_content: parse_env_bool(
-                ASTRA_EVENT_INGESTION_REDACT_CONTENT_ENV,
-                default.redact_content,
-            ),
-        }
-        .normalized()
-    }
-
     fn normalized(mut self) -> Self {
         self.batch_size = self
             .batch_size
@@ -122,38 +94,6 @@ impl IngestionConfig {
             .max_retries
             .clamp(MIN_INGESTION_RETRIES, MAX_INGESTION_RETRIES);
         self
-    }
-}
-
-fn parse_env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
-fn parse_env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn parse_env_u32(name: &str, default: u32) -> u32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(default)
-}
-
-fn parse_env_bool(name: &str, default: bool) -> bool {
-    let Ok(value) = std::env::var(name) else {
-        return default;
-    };
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "y" | "on" | "enabled" => true,
-        "0" | "false" | "no" | "n" | "off" | "disabled" => false,
-        _ => default,
     }
 }
 
@@ -1476,36 +1416,6 @@ impl EventIngestionWorker {
 mod tests {
     use super::*;
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe { std::env::remove_var(key) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.previous.as_ref() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
     fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEvent {
         IngestionEvent {
             event_id: event_id.to_string(),
@@ -1586,57 +1496,6 @@ mod tests {
         assert_eq!(huge.flush_interval_secs, MAX_INGESTION_FLUSH_INTERVAL_SECS);
         assert_eq!(huge.channel_capacity, MAX_INGESTION_CHANNEL_CAPACITY);
         assert_eq!(huge.max_retries, MAX_INGESTION_RETRIES);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn ingestion_config_from_env_reads_overrides() {
-        let _batch = EnvVarGuard::set(ASTRA_EVENT_INGESTION_BATCH_SIZE_ENV, "37");
-        let _flush = EnvVarGuard::set(ASTRA_EVENT_INGESTION_FLUSH_INTERVAL_SECS_ENV, "9");
-        let _capacity = EnvVarGuard::set(ASTRA_EVENT_INGESTION_CHANNEL_CAPACITY_ENV, "4096");
-        let _retries = EnvVarGuard::set(ASTRA_EVENT_INGESTION_MAX_RETRIES_ENV, "5");
-        let _redact = EnvVarGuard::set(ASTRA_EVENT_INGESTION_REDACT_CONTENT_ENV, "off");
-
-        let config = IngestionConfig::from_env();
-
-        assert_eq!(config.batch_size, 37);
-        assert_eq!(config.flush_interval_secs, 9);
-        assert_eq!(config.channel_capacity, 4096);
-        assert_eq!(config.max_retries, 5);
-        assert!(!config.redact_content);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn ingestion_config_from_env_ignores_invalid_and_clamps_out_of_range() {
-        let _batch = EnvVarGuard::set(ASTRA_EVENT_INGESTION_BATCH_SIZE_ENV, "not-a-number");
-        let _flush = EnvVarGuard::set(ASTRA_EVENT_INGESTION_FLUSH_INTERVAL_SECS_ENV, "0");
-        let _capacity = EnvVarGuard::set(ASTRA_EVENT_INGESTION_CHANNEL_CAPACITY_ENV, "999999");
-        let _retries = EnvVarGuard::set(ASTRA_EVENT_INGESTION_MAX_RETRIES_ENV, "0");
-        let _redact = EnvVarGuard::set(ASTRA_EVENT_INGESTION_REDACT_CONTENT_ENV, "maybe");
-
-        let config = IngestionConfig::from_env();
-
-        assert_eq!(config.batch_size, DEFAULT_INGESTION_BATCH_SIZE);
-        assert_eq!(
-            config.flush_interval_secs,
-            MIN_INGESTION_FLUSH_INTERVAL_SECS
-        );
-        assert_eq!(config.channel_capacity, MAX_INGESTION_CHANNEL_CAPACITY);
-        assert_eq!(config.max_retries, MIN_INGESTION_RETRIES);
-        assert!(config.redact_content);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn ingestion_config_from_env_uses_defaults_when_unset() {
-        let _batch = EnvVarGuard::remove(ASTRA_EVENT_INGESTION_BATCH_SIZE_ENV);
-        let _flush = EnvVarGuard::remove(ASTRA_EVENT_INGESTION_FLUSH_INTERVAL_SECS_ENV);
-        let _capacity = EnvVarGuard::remove(ASTRA_EVENT_INGESTION_CHANNEL_CAPACITY_ENV);
-        let _retries = EnvVarGuard::remove(ASTRA_EVENT_INGESTION_MAX_RETRIES_ENV);
-        let _redact = EnvVarGuard::remove(ASTRA_EVENT_INGESTION_REDACT_CONTENT_ENV);
-
-        assert_eq!(IngestionConfig::from_env(), IngestionConfig::default());
     }
 
     #[test]
