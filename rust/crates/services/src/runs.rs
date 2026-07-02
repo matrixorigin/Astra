@@ -1097,6 +1097,18 @@ pub trait RunStateStore: Send + Sync {
         self.find_running_runs().await
     }
 
+    /// Find all active runs this store owner may recover after startup.
+    ///
+    /// This includes stable waiting runs plus running/input-queued runs that
+    /// need recovery classification. Shared durable stores must apply the same
+    /// owner-lease boundary to every returned status so a restarting pod cannot
+    /// resume or fail work still leased by another live pod.
+    async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        let mut active = self.find_waiting_runs().await?;
+        active.extend(self.find_recoverable_running_runs().await?);
+        Ok(active)
+    }
+
     /// Find the newest run that blocks starting another run in the same session.
     async fn find_blocking_session_run(
         &self,
@@ -3643,6 +3655,34 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|e| e.to_string())
     }
 
+    async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        let sql = format!(
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+             WHERE status IN (?, ?, ?)
+               AND (
+                   owner_pod_id IS NULL
+                   OR owner_pod_id = ?
+                   OR owner_lease_expires_at IS NULL
+                   OR owner_lease_expires_at < NOW(6)
+               )
+             ORDER BY updated_at ASC",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(STATUS_WAITING)
+            .bind(STATUS_RUNNING)
+            .bind(STATUS_INPUT_QUEUED)
+            .bind(&self.owner_pod_id)
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("find_recoverable_active_runs", "active", source).to_string()
+            })?;
+        rows.into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|e| e.to_string())
+    }
+
     async fn find_blocking_session_run(
         &self,
         user_id: &str,
@@ -5478,6 +5518,39 @@ mod tests {
         assert!(
             !body.contains("WHERE run_id = ?"),
             "lease acquisition must not retain the old ownerless predicate"
+        );
+    }
+
+    #[test]
+    fn recoverable_active_query_is_owner_lease_bound_for_waiting_runs() {
+        let source = include_str!("runs.rs");
+        let database_impl = source
+            .split("impl RunStateStore for DatabaseRunStateStore")
+            .nth(1)
+            .expect("database RunStateStore impl");
+        let body = database_impl
+            .split("async fn find_recoverable_active_runs")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn find_blocking_session_run").next())
+            .expect("database find_recoverable_active_runs body");
+
+        assert!(
+            body.contains("status IN (?, ?, ?)"),
+            "recoverable active query must cover waiting, running, and input-queued in one lease-scoped scan"
+        );
+        assert!(
+            body.contains(".bind(STATUS_WAITING)")
+                && body.contains(".bind(STATUS_RUNNING)")
+                && body.contains(".bind(STATUS_INPUT_QUEUED)"),
+            "waiting runs must be returned by the same recoverable active query as in-flight runs"
+        );
+        assert!(
+            body.contains("owner_pod_id = ?") && body.contains("owner_lease_expires_at < NOW(6)"),
+            "recoverable active query must respect the owner lease boundary"
+        );
+        assert!(
+            !body.contains("find_runs_by_status"),
+            "recoverable waiting runs must not fall back to the unscoped status query"
         );
     }
 

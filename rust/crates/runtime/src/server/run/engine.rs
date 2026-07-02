@@ -841,20 +841,18 @@ impl RunEngine {
     /// - other `running` runs: were in-flight when the process died; marked
     ///   `failed` with reason "recovered from crash".
     pub async fn recover_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        let waiting = self.store.find_waiting_runs().await?;
-        let running = self.store.find_recoverable_running_runs().await?;
-
-        let mut recovered_running = Vec::with_capacity(running.len());
-        for run in running {
-            if let Some(recovered) = self.recover_active_run(run).await {
-                recovered_running.push(recovered);
+        let active = self.store.find_recoverable_active_runs().await?;
+        let mut recovered = Vec::with_capacity(active.len());
+        for run in active {
+            if run.status == STATUS_WAITING {
+                recovered.push(run);
+                continue;
+            }
+            if let Some(recovered_run) = self.recover_active_run(run).await {
+                recovered.push(recovered_run);
             }
         }
-
-        // Return all: waiting (to resume) + recovered running runs.
-        let mut all = waiting;
-        all.extend(recovered_running);
-        Ok(all)
+        Ok(recovered)
     }
 
     async fn recover_active_run(&self, mut run: DurableRunRecord) -> Option<DurableRunRecord> {
@@ -1347,6 +1345,8 @@ mod tests {
         inner: InMemoryRunStateStore,
         fail_remaining: AtomicUsize,
         attempts: AtomicUsize,
+        waiting_queries: AtomicUsize,
+        recoverable_active_queries: AtomicUsize,
         mode: BatchTransitionFailureMode,
     }
 
@@ -1356,12 +1356,22 @@ mod tests {
                 inner: InMemoryRunStateStore::new(),
                 fail_remaining: AtomicUsize::new(failures),
                 attempts: AtomicUsize::new(0),
+                waiting_queries: AtomicUsize::new(0),
+                recoverable_active_queries: AtomicUsize::new(0),
                 mode,
             }
         }
 
         fn attempts(&self) -> usize {
             self.attempts.load(Ordering::SeqCst)
+        }
+
+        fn waiting_queries(&self) -> usize {
+            self.waiting_queries.load(Ordering::SeqCst)
+        }
+
+        fn recoverable_active_queries(&self) -> usize {
+            self.recoverable_active_queries.load(Ordering::SeqCst)
         }
 
         fn should_fail_this_attempt(&self) -> bool {
@@ -1596,6 +1606,7 @@ mod tests {
         }
 
         async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.waiting_queries.fetch_add(1, Ordering::SeqCst);
             self.inner.find_waiting_runs().await
         }
 
@@ -1605,6 +1616,12 @@ mod tests {
 
         async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
             self.inner.find_recoverable_running_runs().await
+        }
+
+        async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.recoverable_active_queries
+                .fetch_add(1, Ordering::SeqCst);
+            self.inner.find_recoverable_active_runs().await
         }
 
         async fn find_blocking_session_run(
@@ -2749,6 +2766,59 @@ mod tests {
         let active = engine.recover_active_runs().await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].run_id, "run-1");
+    }
+
+    #[tokio::test]
+    async fn recover_active_runs_uses_store_recoverable_active_query() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            0,
+            BatchTransitionFailureMode::BeforeCommit,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-waiting", "user-1", "sess-waiting")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "user-1",
+                "run-waiting",
+                STATUS_WAITING,
+                Some("user_resume"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run("run-crashed", "user-1", "sess-crashed")
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+
+        assert_eq!(
+            store.recoverable_active_queries(),
+            1,
+            "startup recovery must use the store's owner-scoped active recovery query"
+        );
+        assert_eq!(
+            store.waiting_queries(),
+            0,
+            "startup recovery must not separately query waiting runs outside the owner-scoped recovery path"
+        );
+        assert!(
+            recovered.iter().any(|run| run.run_id == "run-waiting"
+                && run.status == STATUS_WAITING
+                && run.waiting_for.as_deref() == Some("user_resume")),
+            "waiting runs returned by the owner-scoped recovery query must be preserved"
+        );
+        let crashed = engine
+            .load_run("user-1", "run-crashed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(crashed.status, STATUS_FAILED);
+        assert_eq!(crashed.error_code.as_deref(), Some("crash_recovery"));
     }
 
     #[tokio::test]
