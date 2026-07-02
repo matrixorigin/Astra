@@ -123,9 +123,13 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("parent fact", parent["state_class"])
         self.assertIn("user_id/request_id", parent["primary_query"])
         self.assertIn("active sessions/runs", parent["retention_policy"])
+        self.assertIn("ordered bounded batches", parent["retention_policy"])
+        self.assertIn("after child deltas", parent["retention_policy"])
         self.assertIn("do not delete child deltas independently", parent["merge_guidance"])
         self.assertIn("prompt_request_records", child["retention_policy"])
         self.assertIn("independent TTL breaks", child["retention_policy"])
+        self.assertIn("ordered bounded batches", child["retention_policy"])
+        self.assertIn("before prompt_request_records", child["retention_policy"])
         self.assertIn("position/delta_seq", child["primary_query"])
 
     def test_session_sync_log_is_product_audit_not_dead_table(self) -> None:

@@ -176,14 +176,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "prompt_deltas",
-        sql: "DELETE FROM prompt_deltas WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "prompt_request_records",
-        sql: "DELETE FROM prompt_request_records WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "session_state_revisions",
         sql: "DELETE FROM session_state_revisions WHERE session_id = ? AND user_id = ?",
     },
@@ -285,6 +277,20 @@ const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
         sql: "DELETE FROM conversation_log
              WHERE session_id = ? AND user_id = ?
              ORDER BY seq ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
+        label: "prompt_deltas",
+        sql: "DELETE FROM prompt_deltas
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY request_id ASC, delta_seq ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
+        label: "prompt_request_records",
+        sql: "DELETE FROM prompt_request_records
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY created_at ASC, request_id ASC
              LIMIT ?",
     },
 ];
@@ -1044,6 +1050,8 @@ mod tests {
                 "agent_events",
                 "agent_run_events",
                 "conversation_log",
+                "prompt_deltas",
+                "prompt_request_records",
                 "session_tool_output_batches",
                 "session_tool_outputs",
             ])
@@ -1072,6 +1080,34 @@ mod tests {
         }
         assert!(SESSION_DELETE_BATCH_LIMIT > 0);
         assert!(SESSION_DELETE_BATCH_LIMIT <= 10_000);
+    }
+
+    #[test]
+    fn prompt_session_hard_delete_keeps_child_before_parent_in_batched_path() {
+        let labels = SESSION_DELETE_DIRECT_BATCH_TABLES
+            .iter()
+            .map(|statement| statement.label)
+            .collect::<Vec<_>>();
+        let child = labels
+            .iter()
+            .position(|label| *label == "prompt_deltas")
+            .expect("prompt_deltas must use batched session hard delete");
+        let parent = labels
+            .iter()
+            .position(|label| *label == "prompt_request_records")
+            .expect("prompt_request_records must use batched session hard delete");
+
+        assert!(
+            child < parent,
+            "prompt_deltas must be pruned before prompt_request_records to preserve parent-bound cleanup"
+        );
+        assert!(
+            !SESSION_DELETE_DIRECT_TABLES
+                .iter()
+                .any(|statement| statement.label == "prompt_deltas"
+                    || statement.label == "prompt_request_records"),
+            "prompt high-growth tables must not regress to unbounded direct DELETE statements"
+        );
     }
 
     #[test]
