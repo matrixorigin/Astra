@@ -867,6 +867,7 @@ async def run_probe(args: argparse.Namespace) -> int:
                     "total": args.total,
                     "register_users": args.register_users,
                     "require_metrics": args.require_metrics,
+                    "require_error_codes_for_failures": args.require_error_codes_for_failures,
                     "output_dir": str(args.output_dir),
                     "body_example": json.loads(body_for_request(args, template, 0, 0).decode("utf-8")),
                 },
@@ -937,6 +938,11 @@ async def run_probe(args: argparse.Namespace) -> int:
     contract_violations: list[str] = []
     if args.require_metrics and metrics_summary["samples_with_metrics"] == 0:
         contract_violations.append("metrics_required_but_no_prefixed_metrics_sampled")
+    failures_missing_error_code = sum(
+        1 for result in results if result.outcome != "completed" and not result.error_code
+    )
+    if args.require_error_codes_for_failures and failures_missing_error_code > 0:
+        contract_violations.append(f"failures_missing_error_code:{failures_missing_error_code}")
     summary = summarize_results(
         results,
         args,
@@ -974,6 +980,9 @@ def summarize_results(
     terminal_statuses = counts_by([r.terminal_status or "none" for r in results])
     failure_reasons = counts_by([failure_reason(r) for r in results if r.outcome != "completed"])
     failed = sum(1 for r in results if r.outcome != "completed")
+    failures_missing_error_code = sum(
+        1 for r in results if r.outcome != "completed" and not r.error_code
+    )
     return {
         "profile": args.profile,
         "base_url": args.base_url,
@@ -986,6 +995,7 @@ def summarize_results(
         "throughput_rps": round(len(results) / (elapsed_ms / 1000.0), 3) if elapsed_ms > 0 else 0,
         "completed": outcomes.get("completed", 0),
         "failed": failed,
+        "failures_missing_error_code": failures_missing_error_code,
         "outcomes": outcomes,
         "http_status": counts_by([str(r.http_status or "none") for r in results]),
         "error_codes": error_codes,
@@ -1180,6 +1190,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-metrics",
         action="store_true",
         help="fail if /metrics did not yield any metrics matching the capacity probe prefixes",
+    )
+    parser.add_argument(
+        "--require-error-codes-for-failures",
+        action="store_true",
+        help="fail if any non-completed request lacks a machine-readable error_code",
     )
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--output-dir", type=Path)

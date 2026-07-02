@@ -204,7 +204,7 @@ class CapacityProbeTests(unittest.TestCase):
             base_url="http://127.0.0.1:17001",
             endpoint="/chat/stream",
             concurrency=2,
-            total=2,
+            total=3,
             output_dir=Path("tmp/probe-test"),
         )
         results = [
@@ -242,6 +242,23 @@ class CapacityProbeTests(unittest.TestCase):
                 retryable=None,
                 outcome="terminal_non_success",
             ),
+            probe.StreamResult(
+                request_id=2,
+                user_index=2,
+                token_index=2,
+                http_status=503,
+                header_latency_ms=2.0,
+                first_event_ms=None,
+                duration_ms=5.0,
+                event_count=0,
+                session_id=None,
+                run_id=None,
+                terminal_status=None,
+                error_code="run_admission_timeout",
+                error_message="server capacity timeout",
+                retryable=True,
+                outcome="http_error",
+            ),
         ]
 
         summary = probe.summarize_results(
@@ -254,8 +271,13 @@ class CapacityProbeTests(unittest.TestCase):
             contract_violations=[],
         )
 
-        self.assertEqual(summary["terminal_statuses"], {"completed": 1, "failed": 1})
-        self.assertEqual(summary["failure_reasons"], {"terminal_status:failed": 1})
+        self.assertEqual(summary["terminal_statuses"], {"completed": 1, "failed": 1, "none": 1})
+        self.assertEqual(
+            summary["failure_reasons"],
+            {"error_code:run_admission_timeout": 1, "terminal_status:failed": 1},
+        )
+        self.assertEqual(summary["error_codes"], {"none": 1, "run_admission_timeout": 1})
+        self.assertEqual(summary["failures_missing_error_code"], 1)
 
     def test_percentile_summary_handles_empty(self) -> None:
         self.assertEqual(
