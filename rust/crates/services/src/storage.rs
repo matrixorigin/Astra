@@ -4993,6 +4993,8 @@ pub struct RetentionPolicy {
     pub sync_log_days: u32,
     /// Max age in days for audit logs (default: 90)
     pub audit_log_days: u32,
+    /// Max age in days for prompt observability rows after their session/run is inactive (default: 90)
+    pub prompt_request_days: u32,
     /// Max age in days for agent events (default: 90)
     pub event_days: u32,
 }
@@ -5005,6 +5007,7 @@ impl Default for RetentionPolicy {
             task_lease_days: 7,
             sync_log_days: 30,
             audit_log_days: 90,
+            prompt_request_days: 90,
             event_days: 90,
         }
     }
@@ -5032,6 +5035,31 @@ fn decode_expired_agent_event_ref(
     Ok((user_id, event_id))
 }
 
+trait ExpiredPromptRequestRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
+}
+
+impl ExpiredPromptRequestRow for sqlx::mysql::MySqlRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+        self.try_get(column)
+    }
+}
+
+fn decode_expired_prompt_request_ref(
+    row: &impl ExpiredPromptRequestRow,
+) -> Result<(String, String, String), String> {
+    let user_id = row
+        .string_column("user_id")
+        .map_err(|e| format!("cleanup prompt_request_records decode user_id: {e}"))?;
+    let session_id = row
+        .string_column("session_id")
+        .map_err(|e| format!("cleanup prompt_request_records decode session_id: {e}"))?;
+    let request_id = row
+        .string_column("request_id")
+        .map_err(|e| format!("cleanup prompt_request_records decode request_id: {e}"))?;
+    Ok((user_id, session_id, request_id))
+}
+
 /// Purge expired data across all tables with TTL/expiry semantics.
 ///
 /// Returns a list of per-table cleanup results showing how many rows were deleted.
@@ -5046,6 +5074,8 @@ pub async fn cleanup_expired_data(
     const TASK_LEASE_BATCH_LIMIT: u32 = 1000;
     const SESSION_SYNC_LOG_BATCH_LIMIT: u32 = 1000;
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
+    const PROMPT_REQUEST_BATCH_LIMIT: u32 = 1000;
+    const PROMPT_REQUEST_DELETE_CHUNK_SIZE: usize = 250;
     const AGENT_EVENT_BATCH_LIMIT: u32 = 1000;
     const AGENT_EVENT_DELETE_CHUNK_SIZE: usize = 250;
     let mut results = Vec::new();
@@ -5142,7 +5172,101 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 6. Old agent events
+    // 6. Old prompt observability rows. Select parent request records first so
+    // child prompt_deltas and parent prompt_request_records are pruned together.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("cleanup prompt_request_records begin transaction: {e}"))?;
+    let expired_prompt_rows = sqlx::query(
+        "SELECT p.user_id, p.session_id, p.request_id
+         FROM prompt_request_records p
+         LEFT JOIN agent_sessions s
+           ON s.user_id = p.user_id AND s.session_id = p.session_id
+         LEFT JOIN agent_runs r
+           ON r.user_id = p.user_id AND r.run_id = p.run_id
+         WHERE p.created_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
+           AND (s.session_id IS NULL OR s.status IN ('ended', 'closed', 'cancelled', 'deleting'))
+           AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
+         ORDER BY p.created_at ASC, p.user_id ASC, p.request_id ASC
+         LIMIT ?",
+    )
+    .bind(policy.prompt_request_days)
+    .bind(PROMPT_REQUEST_BATCH_LIMIT)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| format!("cleanup prompt_request_records select expired ids: {e}"))?;
+    let expired_prompt_request_ids: Vec<(String, String, String)> = expired_prompt_rows
+        .iter()
+        .map(decode_expired_prompt_request_ref)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut prompt_delta_deleted = 0_u64;
+    let mut prompt_request_deleted = 0_u64;
+    for chunk in expired_prompt_request_ids.chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE) {
+        let mut builder = QueryBuilder::<MySql>::new(
+            "DELETE FROM prompt_deltas WHERE (user_id, session_id, request_id) IN (",
+        );
+        for (index, (user_id, session_id, request_id)) in chunk.iter().enumerate() {
+            if index > 0 {
+                builder.push(", ");
+            }
+            builder
+                .push("(")
+                .push_bind(user_id)
+                .push(", ")
+                .push_bind(session_id)
+                .push(", ")
+                .push_bind(request_id)
+                .push(")");
+        }
+        builder.push(")");
+        let deleted = builder
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| format!("cleanup prompt_deltas: {e}"))?;
+        prompt_delta_deleted = prompt_delta_deleted.saturating_add(deleted);
+    }
+    for chunk in expired_prompt_request_ids.chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE) {
+        let mut builder = QueryBuilder::<MySql>::new(
+            "DELETE FROM prompt_request_records WHERE (user_id, session_id, request_id) IN (",
+        );
+        for (index, (user_id, session_id, request_id)) in chunk.iter().enumerate() {
+            if index > 0 {
+                builder.push(", ");
+            }
+            builder
+                .push("(")
+                .push_bind(user_id)
+                .push(", ")
+                .push_bind(session_id)
+                .push(", ")
+                .push_bind(request_id)
+                .push(")");
+        }
+        builder.push(")");
+        let deleted = builder
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| format!("cleanup prompt_request_records delete expired ids: {e}"))?;
+        prompt_request_deleted = prompt_request_deleted.saturating_add(deleted);
+    }
+    tx.commit()
+        .await
+        .map_err(|e| format!("cleanup prompt_request_records commit transaction: {e}"))?;
+    results.push(CleanupResult {
+        table: "prompt_deltas",
+        rows_deleted: prompt_delta_deleted,
+    });
+    results.push(CleanupResult {
+        table: "prompt_request_records",
+        rows_deleted: prompt_request_deleted,
+    });
+
+    // 7. Old agent events
     let mut tx = pool
         .begin()
         .await
@@ -6089,6 +6213,7 @@ mod tests {
             "TASK_LEASE_BATCH_LIMIT",
             "SESSION_SYNC_LOG_BATCH_LIMIT",
             "AUTH_AUDIT_LOG_BATCH_LIMIT",
+            "PROMPT_REQUEST_BATCH_LIMIT",
             "AGENT_EVENT_BATCH_LIMIT",
         ] {
             assert!(
@@ -6101,6 +6226,7 @@ mod tests {
             "ORDER BY expires_at ASC, user_id ASC, task_id ASC",
             "ORDER BY created_at ASC, sync_id ASC",
             "ORDER BY created_at ASC, log_id ASC",
+            "ORDER BY p.created_at ASC, p.user_id ASC, p.request_id ASC",
             "ORDER BY created_at ASC, user_id ASC, event_id ASC",
         ] {
             assert!(
@@ -6108,6 +6234,51 @@ mod tests {
                 "cleanup_expired_data DELETE/SELECT batches must be deterministic; missing {ordering}"
             );
         }
+    }
+
+    #[test]
+    fn cleanup_expired_prompt_requests_are_parent_bound_and_active_guarded() {
+        let source = include_str!("storage.rs");
+        let body = source
+            .split("pub async fn cleanup_expired_data")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("cleanup_expired_data body");
+        assert!(
+            body.contains("policy.prompt_request_days"),
+            "prompt cleanup must be governed by explicit retention policy"
+        );
+        assert!(
+            body.contains("PROMPT_REQUEST_DELETE_CHUNK_SIZE")
+                && body.contains(".chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE)"),
+            "prompt cleanup must chunk tuple deletes"
+        );
+        assert!(
+            body.contains("FROM prompt_request_records p")
+                && body.contains("LEFT JOIN agent_sessions s")
+                && body.contains("LEFT JOIN agent_runs r"),
+            "prompt cleanup must select parent request rows with session/run guards"
+        );
+        assert!(
+            body.contains("s.status IN ('ended', 'closed', 'cancelled', 'deleting')")
+                && body.contains("r.status IN ('completed', 'failed', 'cancelled')"),
+            "prompt cleanup must avoid active sessions and non-terminal runs"
+        );
+        let child_delete = body
+            .find("DELETE FROM prompt_deltas WHERE (user_id, session_id, request_id) IN")
+            .expect("prompt cleanup must delete child delta rows");
+        let parent_delete = body
+            .find("DELETE FROM prompt_request_records WHERE (user_id, session_id, request_id) IN")
+            .expect("prompt cleanup must delete selected parent rows");
+        assert!(
+            child_delete < parent_delete,
+            "prompt cleanup must delete child deltas before parent request records"
+        );
+        assert!(
+            body.contains("table: \"prompt_deltas\"")
+                && body.contains("table: \"prompt_request_records\""),
+            "prompt cleanup should report child and parent row counts separately"
+        );
     }
 
     #[test]

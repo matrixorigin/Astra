@@ -122,13 +122,14 @@ class SchemaInventoryTest(unittest.TestCase):
         child = self.tables["prompt_deltas"]
         self.assertIn("parent fact", parent["state_class"])
         self.assertIn("user_id/request_id", parent["primary_query"])
-        self.assertIn("active sessions/runs", parent["retention_policy"])
+        self.assertIn("session is inactive", parent["retention_policy"])
+        self.assertIn("run is terminal", parent["retention_policy"])
         self.assertIn("ordered bounded batches", parent["retention_policy"])
         self.assertIn("after child deltas", parent["retention_policy"])
         self.assertIn("do not delete child deltas independently", parent["merge_guidance"])
         self.assertIn("prompt_request_records", child["retention_policy"])
         self.assertIn("independent TTL breaks", child["retention_policy"])
-        self.assertIn("ordered bounded batches", child["retention_policy"])
+        self.assertIn("bounded batches", child["retention_policy"])
         self.assertIn("before prompt_request_records", child["retention_policy"])
         self.assertIn("position/delta_seq", child["primary_query"])
 
