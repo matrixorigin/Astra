@@ -2949,13 +2949,23 @@ impl AgenticRunLifecycleService {
                 }
                 Ok(AgenticLoopOutcome::Cancelled) => unreachable!("handled by cancellation gate"),
                 Ok(AgenticLoopOutcome::Error(e)) => {
+                    let classified = astra_core::ClassifiedError::from(e.clone());
+                    let error_kind = classified.kind.as_str();
                     events.push(json!({
                         "event_type": "run_error",
-                        "data": {"error": e.clone()}
+                        "data": {
+                            "error": e.clone(),
+                            "error_code": error_kind,
+                            "error_kind": error_kind,
+                        }
                     }));
+                    let mut finished = usage.clone();
+                    finished["error"] = Value::String(e.clone());
+                    finished["error_code"] = Value::String(error_kind.to_string());
+                    finished["error_kind"] = Value::String(error_kind.to_string());
                     events.push(json!({
                         "event_type": "run_finished",
-                        "data": usage.clone(),
+                        "data": finished,
                     }));
                     (RunStatus::Failed, Some(e))
                 }
@@ -12973,7 +12983,51 @@ mod tests {
         assert_eq!(error.as_deref(), Some("boom"));
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["event_type"], "run_error");
+        assert_eq!(events[0]["data"]["error_code"], "unknown");
+        assert_eq!(events[0]["data"]["error_kind"], "unknown");
         assert_eq!(events[1]["event_type"], "run_finished");
+        assert_eq!(events[1]["data"]["error_code"], "unknown");
+        assert_eq!(events[1]["data"]["error_kind"], "unknown");
+    }
+
+    #[test]
+    fn finalize_run_events_classifies_string_error_outcomes() {
+        let svc = test_service();
+        let request = test_request("classify");
+        let state = svc.build_initial_state(
+            "test-user",
+            &request,
+            "session-1",
+            "run-1",
+            None,
+            None,
+            None,
+        );
+
+        for (message, expected_code) in [
+            (
+                "database operation failed: error communicating with database: unexpected EOF",
+                "database_error",
+            ),
+            (
+                "LLM request failed: error sending request for url (https://example.invalid)",
+                "network",
+            ),
+            ("[stream_transport] stream body closed", "stream_transport"),
+        ] {
+            let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+                Ok(AgenticLoopOutcome::Error(message.into())),
+                vec![],
+                &state,
+            );
+
+            assert_eq!(status, RunStatus::Failed);
+            assert_eq!(error.as_deref(), Some(message));
+            assert_eq!(events[0]["data"]["error_code"], expected_code);
+            assert_eq!(events[0]["data"]["error_kind"], expected_code);
+            assert_eq!(events[1]["data"]["error_code"], expected_code);
+            assert_eq!(events[1]["data"]["error_kind"], expected_code);
+        }
     }
 
     #[test]
