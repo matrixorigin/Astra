@@ -40,6 +40,7 @@ class CleanupPressureProbeTests(unittest.TestCase):
             csl_rows=4001,
             prompt_rows=5001,
             prompt_keep_rows=77,
+            prompt_fresh_rows=88,
         )
         commands = probe.build_commands(args)
         self.assertEqual([command.name for command in commands], [
@@ -51,6 +52,7 @@ class CleanupPressureProbeTests(unittest.TestCase):
         self.assertEqual(commands[1].env["ASTRA_CLEANUP_PRESSURE_CSL_ROWS"], "4001")
         self.assertEqual(commands[2].env["ASTRA_CLEANUP_PRESSURE_PROMPT_ROWS"], "5001")
         self.assertEqual(commands[2].env["ASTRA_CLEANUP_PRESSURE_PROMPT_KEEP_ROWS"], "77")
+        self.assertEqual(commands[2].env["ASTRA_CLEANUP_PRESSURE_PROMPT_FRESH_ROWS"], "88")
         for command in commands:
             self.assertIn("--nocapture", command.command)
             self.assertIn("test", command.database)

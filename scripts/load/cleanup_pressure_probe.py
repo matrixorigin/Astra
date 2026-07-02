@@ -24,12 +24,19 @@ from typing import Any
 RESULT_RE = re.compile(r"^CLEANUP_PRESSURE_RESULT\s+({.*})$", re.MULTILINE)
 
 PROFILE_DEFAULTS = {
-    "smoke": {"queue_rows": 2_005, "csl_rows": 2_005, "prompt_rows": 2_005, "prompt_keep_rows": 64},
+    "smoke": {
+        "queue_rows": 2_005,
+        "csl_rows": 2_005,
+        "prompt_rows": 2_005,
+        "prompt_keep_rows": 64,
+        "prompt_fresh_rows": 64,
+    },
     "pressure": {
         "queue_rows": 10_000,
         "csl_rows": 10_000,
         "prompt_rows": 10_000,
         "prompt_keep_rows": 256,
+        "prompt_fresh_rows": 256,
     },
 }
 
@@ -74,6 +81,7 @@ def build_commands(args: argparse.Namespace) -> list[ProbeCommand]:
     csl_rows = args.csl_rows or defaults["csl_rows"]
     prompt_rows = args.prompt_rows or defaults["prompt_rows"]
     prompt_keep_rows = args.prompt_keep_rows or defaults["prompt_keep_rows"]
+    prompt_fresh_rows = args.prompt_fresh_rows or defaults["prompt_fresh_rows"]
     base = safe_database_name(args.database_base)
 
     common_env = {
@@ -132,6 +140,7 @@ def build_commands(args: argparse.Namespace) -> list[ProbeCommand]:
                 "ASTRA_DATABASE": f"{base}_prompt",
                 "ASTRA_CLEANUP_PRESSURE_PROMPT_ROWS": str(prompt_rows),
                 "ASTRA_CLEANUP_PRESSURE_PROMPT_KEEP_ROWS": str(prompt_keep_rows),
+                "ASTRA_CLEANUP_PRESSURE_PROMPT_FRESH_ROWS": str(prompt_fresh_rows),
             },
             command=[
                 *manifest,
@@ -198,6 +207,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--csl-rows", type=int, help="conversation_log rows before truncate boundary")
     parser.add_argument("--prompt-rows", type=int, help="eligible prompt_request_records rows")
     parser.add_argument("--prompt-keep-rows", type=int, help="active-session prompt rows to guard")
+    parser.add_argument("--prompt-fresh-rows", type=int, help="fresh inactive prompt rows to retain")
     parser.add_argument(
         "--output-dir",
         type=Path,

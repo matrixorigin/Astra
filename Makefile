@@ -41,6 +41,7 @@ help:
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see rust/.config/nextest.toml)"
+	@echo "  make test-cleanup-pressure - Live MatrixOne cleanup pressure probes (explicit, not part of test-online)"
 	@echo "  make test-saas          - SaaS platform E2E (docs/testing/saas-test-plan.md §5; MatrixOne + optional SDK)"
 	@echo "  make test-saas-coverage - SaaS E2E + llvm line coverage report (needs: cargo install cargo-llvm-cov)"
 	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
@@ -130,6 +131,9 @@ STACK_REQUIRED_ENV := $(STACK_SECRET_ENV) MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBE
 #   make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci
 NEXTEST_OFFLINE_PROFILE ?= strict
 NEXTEST_ONLINE_PROFILE  ?= strict-online
+CLEANUP_PRESSURE_PROFILE ?= smoke
+CLEANUP_PRESSURE_DATABASE_BASE ?= astra_runtime_test_cleanup_pressure
+CLEANUP_PRESSURE_ARGS ?=
 
 NEXTEST_OFFLINE_FLAGS := --profile $(NEXTEST_OFFLINE_PROFILE)
 NEXTEST_ONLINE_FLAGS  := --profile $(NEXTEST_ONLINE_PROFILE)
@@ -946,6 +950,16 @@ test-online:
 	@echo ""
 	@echo "NOTE: live-LLM suite (real provider APIs, reads .models.yaml) auto-skips unless"
 	@echo "      ASTRA_LIVE_LLM=1 is set. Run it explicitly with: make test-live-llm"
+
+# Explicit cleanup pressure probes. This is intentionally not part of
+# test-online because pressure timings are operational evidence, not a normal
+# per-case correctness budget.
+.PHONY: test-cleanup-pressure
+test-cleanup-pressure:
+	@python3 scripts/load/cleanup_pressure_probe.py \
+		--profile "$(CLEANUP_PRESSURE_PROFILE)" \
+		--database-base "$(CLEANUP_PRESSURE_DATABASE_BASE)" \
+		$(CLEANUP_PRESSURE_ARGS)
 
 # SaaS platform E2E (docs/testing/saas-test-plan.md §5): resource governance, admin RBAC,
 # auth refresh, session reaper. Requires MatrixOne + .env secrets (same as test-online).

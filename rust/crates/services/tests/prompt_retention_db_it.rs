@@ -18,6 +18,7 @@ async fn prompt_retention_prunes_inactive_parent_and_child_rows_only() {
     let active_session = format!("prompt-retention-active-{}", Uuid::new_v4());
     let running_session = format!("prompt-retention-running-{}", Uuid::new_v4());
     let completed_session = format!("prompt-retention-completed-{}", Uuid::new_v4());
+    let fresh_session = format!("prompt-retention-fresh-{}", Uuid::new_v4());
     let running_run = format!("prompt-retention-run-{}", Uuid::new_v4());
     let completed_run = format!("prompt-retention-run-{}", Uuid::new_v4());
 
@@ -26,6 +27,7 @@ async fn prompt_retention_prunes_inactive_parent_and_child_rows_only() {
         (&active_session, "active"),
         (&running_session, "ended"),
         (&completed_session, "ended"),
+        (&fresh_session, "ended"),
     ] {
         insert_session(&pool, &user_id, session_id, status).await;
     }
@@ -39,13 +41,51 @@ async fn prompt_retention_prunes_inactive_parent_and_child_rows_only() {
     )
     .await;
 
-    let delete_no_run = insert_prompt_fixture(&pool, &user_id, &ended_session, None, 1).await;
-    let keep_active_session =
-        insert_prompt_fixture(&pool, &user_id, &active_session, None, 2).await;
-    let keep_running_run =
-        insert_prompt_fixture(&pool, &user_id, &running_session, Some(&running_run), 3).await;
-    let delete_completed_run =
-        insert_prompt_fixture(&pool, &user_id, &completed_session, Some(&completed_run), 4).await;
+    let delete_no_run = insert_prompt_fixture(
+        &pool,
+        &user_id,
+        &ended_session,
+        None,
+        1,
+        PromptFixtureAge::Expired,
+    )
+    .await;
+    let keep_active_session = insert_prompt_fixture(
+        &pool,
+        &user_id,
+        &active_session,
+        None,
+        2,
+        PromptFixtureAge::Expired,
+    )
+    .await;
+    let keep_running_run = insert_prompt_fixture(
+        &pool,
+        &user_id,
+        &running_session,
+        Some(&running_run),
+        3,
+        PromptFixtureAge::Expired,
+    )
+    .await;
+    let delete_completed_run = insert_prompt_fixture(
+        &pool,
+        &user_id,
+        &completed_session,
+        Some(&completed_run),
+        4,
+        PromptFixtureAge::Expired,
+    )
+    .await;
+    let keep_fresh_inactive = insert_prompt_fixture(
+        &pool,
+        &user_id,
+        &fresh_session,
+        None,
+        5,
+        PromptFixtureAge::Fresh,
+    )
+    .await;
 
     let policy = RetentionPolicy {
         prompt_request_days: 1,
@@ -74,6 +114,7 @@ async fn prompt_retention_prunes_inactive_parent_and_child_rows_only() {
     assert_prompt_absent(&pool, &user_id, &completed_session, &delete_completed_run).await;
     assert_prompt_present(&pool, &user_id, &active_session, &keep_active_session).await;
     assert_prompt_present(&pool, &user_id, &running_session, &keep_running_run).await;
+    assert_prompt_present(&pool, &user_id, &fresh_session, &keep_fresh_inactive).await;
 
     cleanup_user(&pool, &user_id).await;
 }
@@ -89,11 +130,14 @@ async fn prompt_retention_pressure_probe() {
     let user_id = format!("prp-user-{}", Uuid::new_v4().simple());
     let ended_session = format!("prp-end-{}", Uuid::new_v4().simple());
     let active_session = format!("prp-act-{}", Uuid::new_v4().simple());
+    let fresh_session = format!("prp-fresh-{}", Uuid::new_v4().simple());
     insert_session(&pool, &user_id, &ended_session, "ended").await;
     insert_session(&pool, &user_id, &active_session, "active").await;
+    insert_session(&pool, &user_id, &fresh_session, "ended").await;
 
     let delete_rows = cleanup_pressure_rows("ASTRA_CLEANUP_PRESSURE_PROMPT_ROWS", 5_000, 1_001);
     let keep_rows = cleanup_pressure_rows("ASTRA_CLEANUP_PRESSURE_PROMPT_KEEP_ROWS", 128, 1);
+    let fresh_rows = cleanup_pressure_rows("ASTRA_CLEANUP_PRESSURE_PROMPT_FRESH_ROWS", 128, 1);
 
     let insert_started = std::time::Instant::now();
     insert_prompt_fixtures_bulk(
@@ -104,6 +148,7 @@ async fn prompt_retention_pressure_probe() {
         0,
         delete_rows,
         "delete",
+        PromptFixtureAge::Expired,
     )
     .await;
     insert_prompt_fixtures_bulk(
@@ -114,6 +159,18 @@ async fn prompt_retention_pressure_probe() {
         delete_rows,
         keep_rows,
         "keep",
+        PromptFixtureAge::Expired,
+    )
+    .await;
+    insert_prompt_fixtures_bulk(
+        &pool,
+        &user_id,
+        &fresh_session,
+        None,
+        delete_rows + keep_rows,
+        fresh_rows,
+        "fresh",
+        PromptFixtureAge::Fresh,
     )
     .await;
     let insert_ms = insert_started.elapsed().as_millis();
@@ -124,6 +181,10 @@ async fn prompt_retention_pressure_probe() {
     assert_eq!(
         prompt_session_count(&pool, &user_id, &active_session).await,
         (keep_rows, keep_rows)
+    );
+    assert_eq!(
+        prompt_session_count(&pool, &user_id, &fresh_session).await,
+        (fresh_rows, fresh_rows)
     );
 
     let policy = RetentionPolicy {
@@ -172,6 +233,11 @@ async fn prompt_retention_pressure_probe() {
         (keep_rows, keep_rows),
         "active-session prompt rows must be guarded during pressure cleanup"
     );
+    assert_eq!(
+        prompt_session_count(&pool, &user_id, &fresh_session).await,
+        (fresh_rows, fresh_rows),
+        "fresh inactive prompt rows must not be pruned before the retention age"
+    );
     assert!(
         reported_prompt_requests >= delete_rows as u64,
         "cleanup result should account for at least the pressure parent rows"
@@ -189,9 +255,10 @@ async fn prompt_retention_pressure_probe() {
         "CLEANUP_PRESSURE_RESULT {}",
         serde_json::json!({
             "path": "prompt_request_records.retention",
-            "rows_inserted": delete_rows + keep_rows,
+            "rows_inserted": delete_rows + keep_rows + fresh_rows,
             "rows_deleted": delete_rows,
             "guarded_rows": keep_rows,
+            "fresh_rows": fresh_rows,
             "batch_limit": 1000,
             "max_batches_per_cleanup": 10,
             "cleanup_calls": cleanup_calls,
@@ -201,6 +268,7 @@ async fn prompt_retention_pressure_probe() {
             "cleanup_ms": cleanup_ms,
             "remaining_inactive_rows": prompt_session_count(&pool, &user_id, &ended_session).await.0,
             "remaining_guarded_rows": prompt_session_count(&pool, &user_id, &active_session).await.0,
+            "remaining_fresh_rows": prompt_session_count(&pool, &user_id, &fresh_session).await.0,
         })
     );
 
@@ -249,40 +317,46 @@ async fn insert_prompt_fixture(
     session_id: &str,
     run_id: Option<&str>,
     turn: i64,
+    age: PromptFixtureAge,
 ) -> String {
     let request_id = format!("promptreq-{}", Uuid::new_v4().simple());
-    sqlx::query(
+    let query = format!(
         "INSERT INTO prompt_request_records
          (request_id, session_id, user_id, run_id, turn, round, attempt, source,
           model, provider, max_output_tokens, message_count, tool_count,
           previous_request_id, request_hash, summary_json, created_at, created_at_unix_ms)
          VALUES (?, ?, ?, ?, ?, 0, 0, 'retention-test',
                  'test-model', 'test-provider', NULL, 1, 0,
-                 NULL, REPEAT('a', 64), '{}', DATE_SUB(NOW(6), INTERVAL 2 DAY),
-                 UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL 2 DAY)) * 1000)",
-    )
-    .bind(&request_id)
-    .bind(session_id)
-    .bind(user_id)
-    .bind(run_id)
-    .bind(turn)
-    .execute(pool)
-    .await
-    .expect("insert prompt request");
-    sqlx::query(
+                 NULL, REPEAT('a', 64), '{{}}', {},
+                 {})",
+        age.created_at_sql(),
+        age.created_at_unix_ms_sql()
+    );
+    sqlx::query(&query)
+        .bind(&request_id)
+        .bind(session_id)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(turn)
+        .execute(pool)
+        .await
+        .expect("insert prompt request");
+    let delta_query = format!(
         "INSERT INTO prompt_deltas
          (user_id, session_id, request_id, delta_seq, logical_key, chunk_kind, position,
           op, chunk_id, chunk_hash, previous_chunk_hash, created_at)
          VALUES (?, ?, ?, 0, 'message:0:user', 'message', 0,
-                 'append', ?, REPEAT('b', 64), NULL, DATE_SUB(NOW(6), INTERVAL 2 DAY))",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(&request_id)
-    .bind(format!("chunk-{request_id}"))
-    .execute(pool)
-    .await
-    .expect("insert prompt delta");
+                 'append', ?, REPEAT('b', 64), NULL, {})",
+        age.created_at_sql()
+    );
+    sqlx::query(&delta_query)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(&request_id)
+        .bind(format!("chunk-{request_id}"))
+        .execute(pool)
+        .await
+        .expect("insert prompt delta");
     request_id
 }
 
@@ -294,6 +368,7 @@ async fn insert_prompt_fixtures_bulk(
     start_turn: i64,
     count: i64,
     label: &str,
+    age: PromptFixtureAge,
 ) {
     let request_ids = (0..count)
         .map(|_| format!("promptreq-{label}-{}", Uuid::new_v4().simple()))
@@ -324,8 +399,8 @@ async fn insert_prompt_fixtures_bulk(
                 .push_bind(Option::<&str>::None)
                 .push_bind(format!("{turn:064x}"))
                 .push_bind("{}")
-                .push("DATE_SUB(NOW(6), INTERVAL 2 DAY)")
-                .push("UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL 2 DAY)) * 1000");
+                .push(age.created_at_sql())
+                .push(age.created_at_unix_ms_sql());
         });
         requests
             .build()
@@ -351,13 +426,35 @@ async fn insert_prompt_fixtures_bulk(
                 .push_bind(format!("chunk-{request_id}"))
                 .push_bind(format!("{:064x}", turn + 1_000_000))
                 .push_bind(Option::<&str>::None)
-                .push("DATE_SUB(NOW(6), INTERVAL 2 DAY)");
+                .push(age.created_at_sql());
         });
         deltas
             .build()
             .execute(pool)
             .await
             .expect("insert pressure prompt deltas");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PromptFixtureAge {
+    Expired,
+    Fresh,
+}
+
+impl PromptFixtureAge {
+    fn created_at_sql(self) -> &'static str {
+        match self {
+            Self::Expired => "DATE_SUB(NOW(6), INTERVAL 2 DAY)",
+            Self::Fresh => "NOW(6)",
+        }
+    }
+
+    fn created_at_unix_ms_sql(self) -> &'static str {
+        match self {
+            Self::Expired => "UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL 2 DAY)) * 1000",
+            Self::Fresh => "UNIX_TIMESTAMP(NOW(6)) * 1000",
+        }
     }
 }
 
