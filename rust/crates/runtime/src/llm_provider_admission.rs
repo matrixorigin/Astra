@@ -1,5 +1,6 @@
 use std::{
     env,
+    sync::atomic::{AtomicI64, Ordering},
     sync::{Arc, OnceLock, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,10 +15,14 @@ const ENV_CAPACITY_RPM: &str = "ASTRA_CAPACITY_PROVIDER_RPM";
 const ENV_TPM: &str = "ASTRA_LLM_PROVIDER_ADMISSION_TPM";
 const ENV_CAPACITY_TPM: &str = "ASTRA_CAPACITY_PROVIDER_TPM";
 const ENV_WINDOW_MS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_WINDOW_MS";
+const ENV_RETENTION_WINDOWS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_RETENTION_WINDOWS";
+const ENV_CLEANUP_INTERVAL_MS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_CLEANUP_INTERVAL_MS";
 const ENV_SCOPE: &str = "ASTRA_LLM_PROVIDER_ADMISSION_SCOPE";
 const ENV_FAIL_OPEN: &str = "ASTRA_LLM_PROVIDER_ADMISSION_FAIL_OPEN";
 
 const DEFAULT_WINDOW_MS: u64 = 60_000;
+const DEFAULT_RETENTION_WINDOWS: u64 = 120;
+const DEFAULT_CLEANUP_INTERVAL_MS: u64 = 300_000;
 const MAX_BUCKET_KEY_BYTES: usize = 240;
 
 const METRIC_PROVIDER_ADMISSION_ATTEMPTS_TOTAL: &str =
@@ -26,6 +31,10 @@ const METRIC_PROVIDER_ADMISSION_ERRORS_TOTAL: &str = "astra_llm_provider_admissi
 const METRIC_PROVIDER_ADMISSION_RETRY_AFTER_MS_TOTAL: &str =
     "astra_llm_provider_admission_retry_after_ms_total";
 const METRIC_PROVIDER_ADMISSION_TOKENS_TOTAL: &str = "astra_llm_provider_admission_tokens_total";
+const METRIC_PROVIDER_ADMISSION_CLEANUP_RUNS_TOTAL: &str =
+    "astra_llm_provider_admission_cleanup_runs_total";
+const METRIC_PROVIDER_ADMISSION_CLEANUP_ROWS_TOTAL: &str =
+    "astra_llm_provider_admission_cleanup_rows_total";
 
 const CREATE_WINDOWS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS llm_provider_admission_windows (
@@ -84,12 +93,19 @@ WHERE bucket_key = ?
   AND window_start_ms = ?
 "#;
 
+const CLEANUP_WINDOWS_SQL: &str = r#"
+DELETE FROM llm_provider_admission_windows
+WHERE window_start_ms < ?
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderAdmissionConfig {
     mode: ProviderAdmissionMode,
     rpm_limit: Option<u64>,
     tpm_limit: Option<u64>,
     window_ms: u64,
+    retention_windows: u64,
+    cleanup_interval_ms: u64,
     scope: ProviderAdmissionScope,
     fail_open: bool,
 }
@@ -106,6 +122,10 @@ impl ProviderAdmissionConfig {
             rpm_limit: read_positive_u64(ENV_RPM).or_else(|| read_positive_u64(ENV_CAPACITY_RPM)),
             tpm_limit: read_positive_u64(ENV_TPM).or_else(|| read_positive_u64(ENV_CAPACITY_TPM)),
             window_ms: read_positive_u64(ENV_WINDOW_MS).unwrap_or(DEFAULT_WINDOW_MS),
+            retention_windows: read_positive_u64(ENV_RETENTION_WINDOWS)
+                .unwrap_or(DEFAULT_RETENTION_WINDOWS),
+            cleanup_interval_ms: read_positive_u64(ENV_CLEANUP_INTERVAL_MS)
+                .unwrap_or(DEFAULT_CLEANUP_INTERVAL_MS),
             scope: env::var(ENV_SCOPE)
                 .ok()
                 .as_deref()
@@ -122,6 +142,8 @@ impl ProviderAdmissionConfig {
             rpm_limit: None,
             tpm_limit: None,
             window_ms: DEFAULT_WINDOW_MS,
+            retention_windows: DEFAULT_RETENTION_WINDOWS,
+            cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
         }
@@ -134,6 +156,8 @@ impl ProviderAdmissionConfig {
             rpm_limit,
             tpm_limit: None,
             window_ms: DEFAULT_WINDOW_MS,
+            retention_windows: DEFAULT_RETENTION_WINDOWS,
+            cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
         }
@@ -146,6 +170,8 @@ impl ProviderAdmissionConfig {
             rpm_limit,
             tpm_limit,
             window_ms: DEFAULT_WINDOW_MS,
+            retention_windows: DEFAULT_RETENTION_WINDOWS,
+            cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
         }
@@ -158,6 +184,8 @@ impl ProviderAdmissionConfig {
             rpm_limit: None,
             tpm_limit: None,
             window_ms: DEFAULT_WINDOW_MS,
+            retention_windows: DEFAULT_RETENTION_WINDOWS,
+            cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
         }
@@ -282,6 +310,14 @@ fn register_provider_admission_metrics(registry: &MetricsRegistry) {
         METRIC_PROVIDER_ADMISSION_TOKENS_TOTAL,
         "Estimated LLM provider admission tokens by mode, scope, and low-cardinality outcome.",
     );
+    registry.register_counter(
+        METRIC_PROVIDER_ADMISSION_CLEANUP_RUNS_TOTAL,
+        "LLM provider admission window cleanup runs by low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_PROVIDER_ADMISSION_CLEANUP_ROWS_TOTAL,
+        "LLM provider admission window cleanup deleted rows by low-cardinality outcome.",
+    );
 }
 
 fn record_attempt(config: &ProviderAdmissionConfig, outcome: &'static str) {
@@ -352,6 +388,23 @@ fn record_tokens(config: &ProviderAdmissionConfig, outcome: &'static str, estima
             ("outcome", outcome),
         ],
         estimated_tokens,
+    );
+}
+
+fn record_cleanup(outcome: &'static str, rows: u64) {
+    let Some(registry) = provider_admission_metrics_registry() else {
+        return;
+    };
+    register_provider_admission_metrics(&registry);
+    registry.increment_counter(
+        METRIC_PROVIDER_ADMISSION_CLEANUP_RUNS_TOTAL,
+        &[("outcome", outcome)],
+        1,
+    );
+    registry.increment_counter(
+        METRIC_PROVIDER_ADMISSION_CLEANUP_ROWS_TOTAL,
+        &[("outcome", outcome)],
+        rows,
     );
 }
 
@@ -521,6 +574,72 @@ fn handle_admission_error(
     }
 }
 
+fn cleanup_timestamp_slot() -> &'static AtomicI64 {
+    static SLOT: AtomicI64 = AtomicI64::new(0);
+    &SLOT
+}
+
+async fn cleanup_stale_windows_if_due(
+    shared_pool: &SharedPool,
+    config: &ProviderAdmissionConfig,
+    now_ms: i64,
+) {
+    if !should_run_cleanup(now_ms, config.cleanup_interval_ms) {
+        return;
+    }
+    match cleanup_stale_windows(shared_pool, config, now_ms).await {
+        Ok(rows) => record_cleanup("ok", rows),
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_runtime::llm_provider_admission",
+                error = %error.message,
+                "llm provider admission window cleanup failed"
+            );
+            record_cleanup("error", 0);
+        }
+    }
+}
+
+async fn cleanup_stale_windows(
+    shared_pool: &SharedPool,
+    config: &ProviderAdmissionConfig,
+    now_ms: i64,
+) -> Result<u64, ClassifiedError> {
+    let cutoff_ms = cleanup_cutoff_ms(now_ms, config.window_ms, config.retention_windows);
+    let result = sqlx::query(CLEANUP_WINDOWS_SQL)
+        .bind(cutoff_ms)
+        .execute(shared_pool.get())
+        .await
+        .map_err(database_error)?;
+    Ok(result.rows_affected())
+}
+
+fn should_run_cleanup(now_ms: i64, interval_ms: u64) -> bool {
+    let interval_ms = i64::try_from(interval_ms.max(1)).unwrap_or(i64::MAX);
+    let slot = cleanup_timestamp_slot();
+    let mut last = slot.load(Ordering::Relaxed);
+    loop {
+        if !cleanup_due(last, now_ms, interval_ms) {
+            return false;
+        }
+        match slot.compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => last = actual,
+        }
+    }
+}
+
+fn cleanup_due(last_cleanup_ms: i64, now_ms: i64, interval_ms: i64) -> bool {
+    now_ms.saturating_sub(last_cleanup_ms) >= interval_ms
+}
+
+fn cleanup_cutoff_ms(now_ms: i64, window_ms: u64, retention_windows: u64) -> i64 {
+    let window_start_ms = fixed_window_start_ms(now_ms, window_ms);
+    let window_ms = i64::try_from(window_ms.max(1)).unwrap_or(i64::MAX);
+    let retention_windows = i64::try_from(retention_windows.max(1)).unwrap_or(i64::MAX);
+    window_start_ms.saturating_sub(window_ms.saturating_mul(retention_windows))
+}
+
 async fn db_fixed_window_admit(
     shared_pool: &SharedPool,
     provider: &str,
@@ -529,6 +648,7 @@ async fn db_fixed_window_admit(
     estimated_tokens: u64,
 ) -> Result<FixedWindowAdmission, ClassifiedError> {
     let now_ms = now_epoch_ms();
+    cleanup_stale_windows_if_due(shared_pool, config, now_ms).await;
     let window_start_ms = fixed_window_start_ms(now_ms, config.window_ms);
     let bucket_key = bucket_key(config.scope, provider, model);
     let estimated_tokens_i64 = i64::try_from(estimated_tokens).unwrap_or(i64::MAX);
@@ -793,6 +913,22 @@ mod tests {
         assert!(CLAIM_WINDOW_SLOT_TPM_SQL.contains("token_count + ? <= ?"));
         assert!(CLAIM_WINDOW_SLOT_RPM_TPM_SQL.contains("request_count < ?"));
         assert!(CLAIM_WINDOW_SLOT_RPM_TPM_SQL.contains("token_count + ? <= ?"));
+        assert!(CLEANUP_WINDOWS_SQL.contains("DELETE FROM llm_provider_admission_windows"));
+        assert!(CLEANUP_WINDOWS_SQL.contains("window_start_ms < ?"));
+    }
+
+    #[test]
+    fn cleanup_cutoff_keeps_configured_number_of_complete_windows() {
+        assert_eq!(cleanup_cutoff_ms(123_456, 60_000, 2), 0);
+        assert_eq!(cleanup_cutoff_ms(180_000, 60_000, 2), 60_000);
+        assert_eq!(cleanup_cutoff_ms(180_001, 60_000, 2), 60_000);
+    }
+
+    #[test]
+    fn cleanup_throttle_runs_only_after_interval() {
+        assert!(!cleanup_due(1_000, 1_999, 1_000));
+        assert!(cleanup_due(1_000, 2_000, 1_000));
+        assert!(!cleanup_due(2_000, 1_000, 1_000));
     }
 
     #[test]
@@ -857,6 +993,27 @@ mod tests {
         assert!(rendered.contains(
             r#"astra_llm_provider_admission_tokens_total{mode="disabled",outcome="disabled",scope="provider"} 2048"#
         ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_metrics_use_low_cardinality_outcome_labels() {
+        let _guard = metrics_test_lock().lock_owned().await;
+        let registry = Arc::new(MetricsRegistry::new());
+        set_llm_provider_admission_metrics_registry(registry.clone());
+
+        record_cleanup("ok", 42);
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(r#"astra_llm_provider_admission_cleanup_runs_total{outcome="ok"} 1"#)
+        );
+        assert!(
+            rendered
+                .contains(r#"astra_llm_provider_admission_cleanup_rows_total{outcome="ok"} 42"#)
+        );
+        assert!(!rendered.contains("provider="));
+        assert!(!rendered.contains("model="));
+        assert!(!rendered.contains("user_id="));
     }
 
     #[tokio::test]
