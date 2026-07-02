@@ -174,26 +174,7 @@ DEFAULT_AUTO_INCREMENT_METADATA = AutoIncrementMetadata(
 )
 
 
-AUTO_INCREMENT_METADATA: dict[str, AutoIncrementMetadata] = {
-    "mcp_servers": AutoIncrementMetadata(
-        write_profile="low-frequency user-admin MCP registration",
-        owner_boundary="owner_user_id/name unique key",
-        hotspot_risk="low",
-        guidance="acceptable short-term; owner/name is the product identity",
-    ),
-    "mcp_bindings": AutoIncrementMetadata(
-        write_profile="low-frequency credential binding registration",
-        owner_boundary="owner_user_id/mcp_id/key_hash unique key",
-        hotspot_risk="low",
-        guidance="acceptable short-term; composite owner/server/key identity already exists",
-    ),
-    "mcp_tools": AutoIncrementMetadata(
-        write_profile="warm bulk replace during MCP tool discovery",
-        owner_boundary="binding_id/tool_name and binding_id/public_name unique keys",
-        hotspot_risk="low",
-        guidance="acceptable short-term; if discovery becomes high-volume, use binding-scoped tool identity rather than global id",
-    ),
-}
+AUTO_INCREMENT_METADATA: dict[str, AutoIncrementMetadata] = {}
 
 
 TABLE_METADATA: dict[str, TableMetadata] = {
@@ -386,6 +367,36 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from auth_external_sessions; identity link outlives individual provider sessions",
         migration_owner="astra_services::storage / auth",
         product_owner="external auth login and account linking",
+    ),
+    "mcp_servers": TableMetadata(
+        semantic_owner="astra_services::mcp_registry",
+        state_class="durable MCP server registry fact",
+        primary_query="owner server registration by owner_user_id/name and runtime join by owner_user_id/id",
+        retention_policy="retain while the owner keeps the MCP server active; inactive rows may be pruned after dependent bindings are removed",
+        rebuildability="rebuildable only from owner MCP registration configuration if that source still exists",
+        merge_guidance="keep separate from mcp_bindings; server endpoint lifecycle differs from credentials",
+        migration_owner="astra_services::storage / mcp_registry",
+        product_owner="MCP registry and runtime tool discovery",
+    ),
+    "mcp_bindings": TableMetadata(
+        semantic_owner="astra_services::mcp_registry",
+        state_class="durable MCP credential binding fact",
+        primary_query="owner binding lookup by owner_user_id/id and dedup by owner_user_id/mcp_id/key_hash",
+        retention_policy="retain while credential binding is active; delete/revoke must also remove discovered mcp_tools",
+        rebuildability="not rebuildable after encrypted credential payload is lost",
+        merge_guidance="keep separate from mcp_servers and mcp_tools; credentials have independent lifecycle and secrecy requirements",
+        migration_owner="astra_services::storage / mcp_registry",
+        product_owner="MCP credential binding and runtime execution",
+    ),
+    "mcp_tools": TableMetadata(
+        semantic_owner="astra_services::mcp_registry",
+        state_class="derived MCP discovery projection",
+        primary_query="binding tool hydration by owner_user_id/binding_id ordered by public_name",
+        retention_policy="replace atomically on discovery refresh; delete with parent binding",
+        rebuildability="rebuildable by rediscovering tools from the MCP server when credentials and endpoint remain valid",
+        merge_guidance="keep separate from bindings; tool schema fanout is a replaceable projection with different row cardinality",
+        migration_owner="astra_services::storage / mcp_registry",
+        product_owner="MCP runtime tool surface",
     ),
 }
 

@@ -121,16 +121,18 @@ class SchemaInventoryTest(unittest.TestCase):
     def test_global_inventory_has_no_foreign_key_tables(self) -> None:
         self.assertEqual([], self.summary["foreign_key_tables"])
 
-    def test_auto_increment_audit_baseline_excludes_message_queue(self) -> None:
+    def test_auto_increment_audit_baseline_is_empty(self) -> None:
         auto_increment = set(self.summary["auto_increment_tables"])
-        self.assertEqual(len(auto_increment), 3)
+        self.assertEqual(auto_increment, set())
         self.assertNotIn("agent_message_queue", auto_increment)
         self.assertNotIn("edge_pending_dispatch", auto_increment)
         self.assertNotIn("context_manifest_items", auto_increment)
         self.assertNotIn("session_state_item_events", auto_increment)
         self.assertNotIn("auth_user_roles", auto_increment)
         self.assertNotIn("auth_external_identities", auto_increment)
-        self.assertIn("mcp_servers", auto_increment)
+        self.assertNotIn("mcp_servers", auto_increment)
+        self.assertNotIn("mcp_bindings", auto_increment)
+        self.assertNotIn("mcp_tools", auto_increment)
 
     def test_agent_message_queue_uses_message_identity(self) -> None:
         row = self.tables["agent_message_queue"]
@@ -181,6 +183,22 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertEqual(identity_row["auto_increment_hotspot_risk"], "not_applicable")
         self.assertIn("external identity link", identity_row["state_class"])
 
+    def test_mcp_registry_uses_owner_bound_string_identity(self) -> None:
+        server_row = self.tables["mcp_servers"]
+        self.assertEqual(server_row["primary_key"], ["owner_user_id", "id"])
+        self.assertEqual(server_row["auto_increment_columns"], [])
+        self.assertIn("server endpoint lifecycle", server_row["merge_guidance"])
+
+        binding_row = self.tables["mcp_bindings"]
+        self.assertEqual(binding_row["primary_key"], ["owner_user_id", "id"])
+        self.assertEqual(binding_row["auto_increment_columns"], [])
+        self.assertIn("encrypted credential", binding_row["rebuildability"])
+
+        tool_row = self.tables["mcp_tools"]
+        self.assertEqual(tool_row["primary_key"], ["owner_user_id", "binding_id", "tool_name"])
+        self.assertEqual(tool_row["auto_increment_columns"], [])
+        self.assertIn("rediscovering tools", tool_row["rebuildability"])
+
     def test_every_auto_increment_table_has_risk_audit_metadata(self) -> None:
         self.assertEqual([], self.summary["unaudited_auto_increment_tables"])
         for table in self.summary["auto_increment_tables"]:
@@ -197,20 +215,6 @@ class SchemaInventoryTest(unittest.TestCase):
                         "not_applicable",
                         f"{table}.{field} must be explicit for AUTO_INCREMENT audit",
                     )
-
-    def test_auto_increment_risk_keeps_remaining_admin_tables_low_priority(self) -> None:
-        remaining = {
-            "mcp_bindings",
-            "mcp_servers",
-            "mcp_tools",
-        }
-        self.assertEqual(set(self.summary["auto_increment_tables"]), remaining)
-        for table in remaining:
-            with self.subTest(table=table):
-                self.assertEqual(
-                    self.tables[table]["auto_increment_hotspot_risk"],
-                    "low",
-                )
 
     def test_inventory_is_json_serializable(self) -> None:
         encoded = json.dumps(self.inventory, sort_keys=True)

@@ -504,7 +504,7 @@ pub struct ChatRequestData {
     pub workspace_binding: Option<WorkspaceBindingRequest>,
     pub executor_binding: Option<ExecutorBindingRequest>,
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
-    pub mcp_binding_ids: Option<Vec<i64>>,
+    pub mcp_binding_ids: Option<Vec<String>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub edge_executor_id: Option<String>,
     pub capabilities: Vec<String>,

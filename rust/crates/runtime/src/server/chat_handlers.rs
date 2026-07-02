@@ -653,7 +653,7 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: Some(vec![301]),
+            mcp_binding_ids: Some(vec!["mcp_bind_301".to_string()]),
             context: Some(context),
             edge_executor_id: None,
             capabilities: Vec::new(),

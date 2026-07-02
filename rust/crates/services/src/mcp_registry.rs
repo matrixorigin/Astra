@@ -72,8 +72,8 @@ pub struct McpRegisteredToolRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpRegisterRecord {
-    pub mcp_id: i64,
-    pub binding_id: i64,
+    pub mcp_id: String,
+    pub binding_id: String,
     pub server_name: String,
     pub tool_namespace: String,
     pub tools: Vec<McpRegisteredToolRecord>,
@@ -81,15 +81,15 @@ pub struct McpRegisterRecord {
 
 #[derive(Clone, PartialEq)]
 pub struct McpRegisteredBindingRecord {
-    pub mcp_id: i64,
-    pub binding_id: i64,
+    pub mcp_id: String,
+    pub binding_id: String,
     pub server_name: String,
 }
 
 #[derive(Clone, PartialEq)]
 pub struct McpRuntimeBindingRecord {
-    pub binding_id: i64,
-    pub mcp_id: i64,
+    pub binding_id: String,
+    pub mcp_id: String,
     pub server_name: String,
     pub server_description: Option<String>,
     pub transport: String,
@@ -119,7 +119,7 @@ pub fn mcp_schema_hash(parts: &serde_json::Value) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub fn mcp_binding_tool_namespace(binding_id: i64) -> String {
+pub fn mcp_binding_tool_namespace(binding_id: &str) -> String {
     format!("binding_{binding_id}")
 }
 
@@ -134,14 +134,14 @@ pub trait McpRegistryService: Send + Sync {
     async fn replace_binding_tools(
         &self,
         owner_user_id: String,
-        binding_id: i64,
+        binding_id: String,
         discovered_tools: Vec<McpDiscoveredToolData>,
     ) -> Result<McpRegisterRecord, (StatusCode, Json<ErrorResponse>)>;
 
     async fn load_runtime_bindings(
         &self,
         owner_user_id: String,
-        binding_ids: &[i64],
+        binding_ids: &[String],
     ) -> Result<Vec<McpRuntimeBindingRecord>, (StatusCode, Json<ErrorResponse>)>;
 }
 
@@ -165,7 +165,7 @@ impl McpRegistryService for UnconfiguredMcpRegistryService {
     async fn replace_binding_tools(
         &self,
         _owner_user_id: String,
-        _binding_id: i64,
+        _binding_id: String,
         _discovered_tools: Vec<McpDiscoveredToolData>,
     ) -> Result<McpRegisterRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
@@ -178,7 +178,7 @@ impl McpRegistryService for UnconfiguredMcpRegistryService {
     async fn load_runtime_bindings(
         &self,
         _owner_user_id: String,
-        _binding_ids: &[i64],
+        _binding_ids: &[String],
     ) -> Result<Vec<McpRuntimeBindingRecord>, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
@@ -302,7 +302,7 @@ fn validate_binding_request(
 
 fn validate_discovered_tools(
     owner_user_id: &str,
-    binding_id: i64,
+    binding_id: &str,
     discovered_tools: &[McpDiscoveredToolData],
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if owner_user_id.trim().is_empty() {
@@ -312,10 +312,10 @@ fn validate_discovered_tools(
             "mcp_owner_invalid",
         ));
     }
-    if binding_id <= 0 {
+    if binding_id.trim().is_empty() {
         return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
-            "binding_id must be positive",
+            "binding_id must not be empty",
             "mcp_binding_invalid",
         ));
     }
@@ -401,6 +401,24 @@ fn key_value_hash(key_value: &serde_json::Value) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn stable_mcp_id(prefix: &str, parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.len().to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("{prefix}_{}", &digest[..32])
+}
+
+fn mcp_server_id(owner_user_id: &str, server_name: &str) -> String {
+    stable_mcp_id("mcp_srv", &[owner_user_id, server_name])
+}
+
+fn mcp_binding_id(owner_user_id: &str, mcp_id: &str, key_hash: &str) -> String {
+    stable_mcp_id("mcp_bind", &[owner_user_id, mcp_id, key_hash])
+}
+
 fn mcp_decode_error(
     column: &'static str,
     message: impl Into<String>,
@@ -443,23 +461,23 @@ fn parse_json_column(
 }
 
 fn canonical_binding_ids(
-    binding_ids: &[i64],
-) -> Result<Vec<i64>, (StatusCode, Json<ErrorResponse>)> {
+    binding_ids: &[String],
+) -> Result<Vec<String>, (StatusCode, Json<ErrorResponse>)> {
     let mut unique_ids = Vec::new();
     let mut seen = HashSet::new();
     for id in binding_ids {
-        if *id <= 0 {
+        if id.trim().is_empty() {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
-                "binding_ids must contain positive integers",
+                "binding_ids must not contain empty values",
                 "mcp_binding_invalid",
             ));
         }
-        if seen.insert(*id) {
-            unique_ids.push(*id);
+        if seen.insert(id.as_str()) {
+            unique_ids.push(id.clone());
         }
     }
-    unique_ids.sort_unstable();
+    unique_ids.sort();
     Ok(unique_ids)
 }
 
@@ -478,6 +496,7 @@ impl McpRegistryService for DatabaseMcpRegistryService {
         let mut tx = pool.begin().await.map_err(internal_error)?;
 
         let server_name = request.server.name.trim();
+        let mcp_id = mcp_server_id(&owner_user_id, server_name);
         let existing_server =
             query("SELECT id FROM mcp_servers WHERE owner_user_id = ? AND name = ?")
                 .bind(&owner_user_id)
@@ -486,27 +505,26 @@ impl McpRegistryService for DatabaseMcpRegistryService {
                 .await
                 .map_err(internal_error)?;
 
-        let mcp_id = if let Some(row) = existing_server {
-            let mcp_id: i64 = row.try_get("id").map_err(internal_error)?;
+        if existing_server.is_some() {
             query(
                 "UPDATE mcp_servers SET description = ?, transport = ?, url = ?, \
-                 is_active = 1, updated_at = NOW(6) WHERE id = ? AND owner_user_id = ?",
+                 is_active = 1, updated_at = NOW(6) WHERE owner_user_id = ? AND id = ?",
             )
             .bind(request.server.description.as_deref())
             .bind(request.server.transport.trim())
             .bind(request.server.url.trim())
-            .bind(mcp_id)
             .bind(&owner_user_id)
+            .bind(&mcp_id)
             .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
-            mcp_id
         } else {
             query(
                 "INSERT INTO mcp_servers \
-                 (owner_user_id, name, description, transport, url, is_active, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
+                 (id, owner_user_id, name, description, transport, url, is_active, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
             )
+            .bind(&mcp_id)
             .bind(&owner_user_id)
             .bind(server_name)
             .bind(request.server.description.as_deref())
@@ -515,50 +533,38 @@ impl McpRegistryService for DatabaseMcpRegistryService {
             .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
+        }
 
-            let server_row = query(
-                "SELECT id FROM mcp_servers WHERE owner_user_id = ? AND name = ? AND is_active = 1",
-            )
-            .bind(&owner_user_id)
-            .bind(server_name)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(internal_error)?;
-            server_row.try_get("id").map_err(internal_error)?
-        };
+        let binding_id = mcp_binding_id(&owner_user_id, &mcp_id, &key_hash);
+        let existing_binding =
+            query("SELECT id FROM mcp_bindings WHERE owner_user_id = ? AND id = ?")
+                .bind(&owner_user_id)
+                .bind(&binding_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(internal_error)?;
 
-        let existing_binding = query(
-            "SELECT id FROM mcp_bindings WHERE owner_user_id = ? AND mcp_id = ? AND key_hash = ?",
-        )
-        .bind(&owner_user_id)
-        .bind(mcp_id)
-        .bind(&key_hash)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(internal_error)?;
-
-        let binding_id = if let Some(row) = existing_binding {
-            let binding_id: i64 = row.try_get("id").map_err(internal_error)?;
+        if existing_binding.is_some() {
             query(
                 "UPDATE mcp_bindings SET key_value_encrypted = ?, comment = ?, \
-                 is_active = 1, updated_at = NOW(6) WHERE id = ? AND owner_user_id = ?",
+                 is_active = 1, updated_at = NOW(6) WHERE owner_user_id = ? AND id = ?",
             )
             .bind(&encrypted_key_value)
             .bind(request.binding.comment.as_deref())
-            .bind(binding_id)
             .bind(&owner_user_id)
+            .bind(&binding_id)
             .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
-            binding_id
         } else {
             query(
                 "INSERT INTO mcp_bindings \
-                 (owner_user_id, mcp_id, key_hash, key_value_encrypted, comment, is_active, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
+                 (id, owner_user_id, mcp_id, key_hash, key_value_encrypted, comment, is_active, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
             )
+            .bind(&binding_id)
             .bind(&owner_user_id)
-            .bind(mcp_id)
+            .bind(&mcp_id)
             .bind(&key_hash)
             .bind(&encrypted_key_value)
             .bind(request.binding.comment.as_deref())
@@ -575,19 +581,7 @@ impl McpRegistryService for DatabaseMcpRegistryService {
                     internal_error(error)
                 }
             })?;
-
-            let row = query(
-                "SELECT id FROM mcp_bindings \
-                 WHERE owner_user_id = ? AND mcp_id = ? AND key_hash = ? AND is_active = 1",
-            )
-            .bind(&owner_user_id)
-            .bind(mcp_id)
-            .bind(&key_hash)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(internal_error)?;
-            row.try_get("id").map_err(internal_error)?
-        };
+        }
 
         tx.commit().await.map_err(internal_error)?;
 
@@ -601,20 +595,21 @@ impl McpRegistryService for DatabaseMcpRegistryService {
     async fn replace_binding_tools(
         &self,
         owner_user_id: String,
-        binding_id: i64,
+        binding_id: String,
         discovered_tools: Vec<McpDiscoveredToolData>,
     ) -> Result<McpRegisterRecord, (StatusCode, Json<ErrorResponse>)> {
-        validate_discovered_tools(&owner_user_id, binding_id, &discovered_tools)?;
+        validate_discovered_tools(&owner_user_id, &binding_id, &discovered_tools)?;
 
         let pool = self.get_pool().await.map_err(internal_error)?;
         let mut tx = pool.begin().await.map_err(internal_error)?;
         let binding_row = query(
             "SELECT b.mcp_id AS mcp_id, s.name AS server_name \
-             FROM mcp_bindings b JOIN mcp_servers s ON b.mcp_id = s.id \
+             FROM mcp_bindings b JOIN mcp_servers s \
+               ON b.owner_user_id = s.owner_user_id AND b.mcp_id = s.id \
              WHERE b.owner_user_id = ? AND b.id = ? AND b.is_active = 1 AND s.is_active = 1",
         )
         .bind(&owner_user_id)
-        .bind(binding_id)
+        .bind(&binding_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(internal_error)?;
@@ -625,11 +620,12 @@ impl McpRegistryService for DatabaseMcpRegistryService {
                 "mcp_binding_not_found",
             ));
         };
-        let mcp_id: i64 = binding_row.try_get("mcp_id").map_err(internal_error)?;
+        let mcp_id: String = binding_row.try_get("mcp_id").map_err(internal_error)?;
         let server_name: String = binding_row.try_get("server_name").map_err(internal_error)?;
 
-        query("DELETE FROM mcp_tools WHERE binding_id = ?")
-            .bind(binding_id)
+        query("DELETE FROM mcp_tools WHERE owner_user_id = ? AND binding_id = ?")
+            .bind(&owner_user_id)
+            .bind(&binding_id)
             .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
@@ -637,7 +633,7 @@ impl McpRegistryService for DatabaseMcpRegistryService {
         if !discovered_tools.is_empty() {
             let mut builder = QueryBuilder::<MySql>::new(
                 "INSERT INTO mcp_tools \
-                 (binding_id, tool_name, public_name, description, input_schema_json, \
+                 (owner_user_id, binding_id, tool_name, public_name, description, input_schema_json, \
                   output_schema_json, schema_hash, discovered_at) ",
             );
             builder.push_values(&discovered_tools, |mut row, tool| {
@@ -649,7 +645,8 @@ impl McpRegistryService for DatabaseMcpRegistryService {
                     .output_schema_json
                     .as_ref()
                     .map(serde_json::Value::to_string);
-                row.push_bind(binding_id)
+                row.push_bind(&owner_user_id)
+                    .push_bind(&binding_id)
                     .push_bind(&tool.tool_name)
                     .push_bind(&tool.public_name)
                     .push_bind(tool.description.as_deref())
@@ -675,9 +672,9 @@ impl McpRegistryService for DatabaseMcpRegistryService {
 
         Ok(McpRegisterRecord {
             mcp_id,
-            binding_id,
+            binding_id: binding_id.clone(),
             server_name,
-            tool_namespace: mcp_binding_tool_namespace(binding_id),
+            tool_namespace: mcp_binding_tool_namespace(&binding_id),
             tools: discovered_tools
                 .into_iter()
                 .map(|tool| McpRegisteredToolRecord {
@@ -691,7 +688,7 @@ impl McpRegistryService for DatabaseMcpRegistryService {
     async fn load_runtime_bindings(
         &self,
         owner_user_id: String,
-        binding_ids: &[i64],
+        binding_ids: &[String],
     ) -> Result<Vec<McpRuntimeBindingRecord>, (StatusCode, Json<ErrorResponse>)> {
         if binding_ids.is_empty() {
             return Ok(Vec::new());
@@ -704,7 +701,8 @@ impl McpRegistryService for DatabaseMcpRegistryService {
             "SELECT b.id AS binding_id, b.mcp_id AS mcp_id, b.key_value_encrypted AS key_value_encrypted, \
              s.name AS server_name, s.description AS server_description, \
              s.transport AS transport, s.url AS url \
-             FROM mcp_bindings b JOIN mcp_servers s ON b.mcp_id = s.id \
+             FROM mcp_bindings b JOIN mcp_servers s \
+               ON b.owner_user_id = s.owner_user_id AND b.mcp_id = s.id \
              WHERE b.owner_user_id = ",
         );
         builder.push_bind(&owner_user_id);
@@ -734,8 +732,8 @@ impl McpRegistryService for DatabaseMcpRegistryService {
         for row in rows {
             let encrypted = required_string(&row, "key_value_encrypted")?;
             records.push(McpRuntimeBindingRecord {
-                binding_id: row.try_get("binding_id").map_err(internal_error)?,
-                mcp_id: row.try_get("mcp_id").map_err(internal_error)?,
+                binding_id: required_string(&row, "binding_id")?,
+                mcp_id: required_string(&row, "mcp_id")?,
                 server_name: required_string(&row, "server_name")?,
                 server_description: optional_string(&row, "server_description")?,
                 transport: required_string(&row, "transport")?,
@@ -749,8 +747,10 @@ impl McpRegistryService for DatabaseMcpRegistryService {
             "SELECT binding_id, tool_name, public_name, description, \
              CAST(input_schema_json AS CHAR) AS input_schema_json, \
              CAST(output_schema_json AS CHAR) AS output_schema_json, schema_hash \
-             FROM mcp_tools WHERE binding_id IN (",
+             FROM mcp_tools WHERE owner_user_id = ",
         );
+        tool_builder.push_bind(&owner_user_id);
+        tool_builder.push(" AND binding_id IN (");
         {
             let mut separated = tool_builder.separated(", ");
             for id in &unique_ids {
@@ -765,7 +765,7 @@ impl McpRegistryService for DatabaseMcpRegistryService {
             .map_err(internal_error)?;
 
         for row in tool_rows {
-            let binding_id: i64 = row.try_get("binding_id").map_err(internal_error)?;
+            let binding_id = required_string(&row, "binding_id")?;
             if let Some(record) = records
                 .iter_mut()
                 .find(|record| record.binding_id == binding_id)
@@ -783,7 +783,7 @@ impl McpRegistryService for DatabaseMcpRegistryService {
             }
         }
 
-        records.sort_by_key(|record| record.binding_id);
+        records.sort_by(|left, right| left.binding_id.cmp(&right.binding_id));
         Ok(records)
     }
 }
@@ -802,8 +802,8 @@ mod tests {
     #[test]
     fn runtime_record_debug_redacts_key_value() {
         let record = McpRuntimeBindingRecord {
-            binding_id: 1,
-            mcp_id: 2,
+            binding_id: "mcp_bind_1".to_string(),
+            mcp_id: "mcp_srv_2".to_string(),
             server_name: "srv".to_string(),
             server_description: None,
             transport: "sse".to_string(),
@@ -860,7 +860,7 @@ mod tests {
         let tools = vec![
             McpDiscoveredToolData {
                 tool_name: "a".to_string(),
-                public_name: "mcp__binding_7__a".to_string(),
+                public_name: "mcp__binding_mcp_bind_7__a".to_string(),
                 description: None,
                 input_schema_json: Some(serde_json::json!({"type": "object"})),
                 output_schema_json: None,
@@ -868,7 +868,7 @@ mod tests {
             },
             McpDiscoveredToolData {
                 tool_name: "b".to_string(),
-                public_name: "mcp__binding_7__a".to_string(),
+                public_name: "mcp__binding_mcp_bind_7__a".to_string(),
                 description: None,
                 input_schema_json: Some(serde_json::json!({"type": "object"})),
                 output_schema_json: None,
@@ -876,7 +876,8 @@ mod tests {
             },
         ];
         validate_binding_request("u1", &request).unwrap();
-        let (status, Json(error)) = validate_discovered_tools("u1", 7, &tools).unwrap_err();
+        let (status, Json(error)) =
+            validate_discovered_tools("u1", "mcp_bind_7", &tools).unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
             error.error_code.as_deref(),
@@ -887,16 +888,27 @@ mod tests {
     #[test]
     fn canonical_binding_ids_dedupes_and_sorts() {
         assert_eq!(
-            canonical_binding_ids(&[301, 7, 301, 42]).unwrap(),
-            vec![7, 42, 301]
+            canonical_binding_ids(&[
+                "mcp_bind_301".to_string(),
+                "mcp_bind_7".to_string(),
+                "mcp_bind_301".to_string(),
+                "mcp_bind_42".to_string(),
+            ])
+            .unwrap(),
+            vec![
+                "mcp_bind_301".to_string(),
+                "mcp_bind_42".to_string(),
+                "mcp_bind_7".to_string()
+            ]
         );
     }
 
     #[test]
-    fn canonical_binding_ids_rejects_non_positive_ids() {
-        let (status, Json(error)) = canonical_binding_ids(&[1, 0]).unwrap_err();
+    fn canonical_binding_ids_rejects_empty_ids() {
+        let (status, Json(error)) =
+            canonical_binding_ids(&["mcp_bind_1".to_string(), " ".to_string()]).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error.error_code.as_deref(), Some("mcp_binding_invalid"));
-        assert_eq!(error.detail, "binding_ids must contain positive integers");
+        assert_eq!(error.detail, "binding_ids must not contain empty values");
     }
 }

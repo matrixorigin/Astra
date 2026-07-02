@@ -3523,7 +3523,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS mcp_servers (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            id VARCHAR(64) NOT NULL,
             owner_user_id VARCHAR(128) NOT NULL,
             name VARCHAR(128) NOT NULL,
             description TEXT NULL,
@@ -3532,35 +3532,114 @@ pub async fn ensure_core_schema(
             is_active SMALLINT NOT NULL DEFAULT 1,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (owner_user_id, id),
             UNIQUE KEY uq_mcp_servers_owner_name (owner_user_id, name),
             INDEX idx_mcp_servers_owner_active (owner_user_id, is_active, updated_at)
         )",
     )
     .execute(&pool)
     .await?;
+    fail_if_varchar_columns_shorter_than(&pool, &settings.database, "mcp_servers", &[("id", 64)])
+        .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "mcp_servers",
+        &["owner_user_id", "id"],
+        "ALTER TABLE mcp_servers ADD PRIMARY KEY (owner_user_id, id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_servers",
+        "uq_mcp_servers_owner_name",
+        &["owner_user_id", "name"],
+        "ALTER TABLE mcp_servers ADD UNIQUE INDEX uq_mcp_servers_owner_name (owner_user_id, name)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_servers",
+        "idx_mcp_servers_owner_active",
+        &["owner_user_id", "is_active", "updated_at"],
+        "ALTER TABLE mcp_servers ADD INDEX idx_mcp_servers_owner_active (owner_user_id, is_active, updated_at)",
+    )
+    .await?;
 
     query(
         "CREATE TABLE IF NOT EXISTS mcp_bindings (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            id VARCHAR(64) NOT NULL,
             owner_user_id VARCHAR(128) NOT NULL,
-            mcp_id BIGINT NOT NULL,
+            mcp_id VARCHAR(64) NOT NULL,
             key_hash VARCHAR(128) NOT NULL,
             key_value_encrypted TEXT NOT NULL,
             comment TEXT NULL,
             is_active SMALLINT NOT NULL DEFAULT 1,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (owner_user_id, id),
             UNIQUE KEY uq_mcp_bindings_owner_mcp_key (owner_user_id, mcp_id, key_hash),
             INDEX idx_mcp_bindings_owner_active (owner_user_id, is_active, updated_at),
-            INDEX idx_mcp_bindings_mcp_id (mcp_id)
+            INDEX idx_mcp_bindings_owner_mcp (owner_user_id, mcp_id)
         )",
     )
     .execute(&pool)
     .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        &[("id", 64), ("mcp_id", 64)],
+    )
+    .await?;
+    drop_index_if_present(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "idx_mcp_bindings_mcp_id",
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        &["owner_user_id", "id"],
+        "ALTER TABLE mcp_bindings ADD PRIMARY KEY (owner_user_id, id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "uq_mcp_bindings_owner_mcp_key",
+        &["owner_user_id", "mcp_id", "key_hash"],
+        "ALTER TABLE mcp_bindings ADD UNIQUE INDEX uq_mcp_bindings_owner_mcp_key (owner_user_id, mcp_id, key_hash)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "idx_mcp_bindings_owner_active",
+        &["owner_user_id", "is_active", "updated_at"],
+        "ALTER TABLE mcp_bindings ADD INDEX idx_mcp_bindings_owner_active (owner_user_id, is_active, updated_at)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "idx_mcp_bindings_owner_mcp",
+        &["owner_user_id", "mcp_id"],
+        "ALTER TABLE mcp_bindings ADD INDEX idx_mcp_bindings_owner_mcp (owner_user_id, mcp_id)",
+    )
+    .await?;
     query(
         "CREATE TABLE IF NOT EXISTS mcp_tools (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
-            binding_id BIGINT NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            binding_id VARCHAR(64) NOT NULL,
             tool_name VARCHAR(256) NOT NULL,
             public_name VARCHAR(384) NOT NULL,
             description TEXT NULL,
@@ -3568,12 +3647,61 @@ pub async fn ensure_core_schema(
             output_schema_json JSON NULL,
             schema_hash VARCHAR(128) NOT NULL,
             discovered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_mcp_tools_binding_tool (binding_id, tool_name),
-            UNIQUE KEY uq_mcp_tools_binding_public (binding_id, public_name),
-            INDEX idx_mcp_tools_binding (binding_id)
+            PRIMARY KEY (owner_user_id, binding_id, tool_name),
+            UNIQUE KEY uq_mcp_tools_owner_binding_public (owner_user_id, binding_id, public_name),
+            INDEX idx_mcp_tools_owner_binding (owner_user_id, binding_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        &["owner_user_id", "binding_id", "tool_name"],
+        &["id"],
+        &["uq_mcp_tools_binding_tool", "uq_mcp_tools_binding_public"],
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        &[("binding_id", 64)],
+    )
+    .await?;
+    drop_index_if_present(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        "idx_mcp_tools_binding",
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        &["owner_user_id", "binding_id", "tool_name"],
+        "ALTER TABLE mcp_tools ADD PRIMARY KEY (owner_user_id, binding_id, tool_name)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        "uq_mcp_tools_owner_binding_public",
+        &["owner_user_id", "binding_id", "public_name"],
+        "ALTER TABLE mcp_tools ADD UNIQUE INDEX uq_mcp_tools_owner_binding_public (owner_user_id, binding_id, public_name)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        "idx_mcp_tools_owner_binding",
+        &["owner_user_id", "binding_id"],
+        "ALTER TABLE mcp_tools ADD INDEX idx_mcp_tools_owner_binding (owner_user_id, binding_id)",
+    )
     .await?;
 
     query(
@@ -5700,6 +5828,60 @@ mod tests {
         assert!(
             source.contains("&[\"uq_auth_external_identity_provider_subject\"]"),
             "legacy auth_external_identities unique-key-plus-surrogate schemas must fail startup"
+        );
+    }
+
+    #[test]
+    fn mcp_registry_tables_use_owner_bound_string_identity() {
+        let source = include_str!("storage.rs");
+        let servers = source
+            .split("CREATE TABLE IF NOT EXISTS mcp_servers")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("mcp_servers DDL");
+        let bindings = source
+            .split("CREATE TABLE IF NOT EXISTS mcp_bindings")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("mcp_bindings DDL");
+        let tools = source
+            .split("CREATE TABLE IF NOT EXISTS mcp_tools")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("mcp_tools DDL");
+
+        assert!(servers.contains("id VARCHAR(64) NOT NULL"));
+        assert!(servers.contains("PRIMARY KEY (owner_user_id, id)"));
+        assert!(bindings.contains("id VARCHAR(64) NOT NULL"));
+        assert!(bindings.contains("mcp_id VARCHAR(64) NOT NULL"));
+        assert!(bindings.contains("PRIMARY KEY (owner_user_id, id)"));
+        assert!(tools.contains("owner_user_id VARCHAR(128) NOT NULL"));
+        assert!(tools.contains("binding_id VARCHAR(64) NOT NULL"));
+        assert!(tools.contains("PRIMARY KEY (owner_user_id, binding_id, tool_name)"));
+
+        for (table, ddl) in [
+            ("mcp_servers", servers),
+            ("mcp_bindings", bindings),
+            ("mcp_tools", tools),
+        ] {
+            assert!(
+                !ddl.contains("AUTO_INCREMENT"),
+                "{table} must not reintroduce a global AUTO_INCREMENT surrogate"
+            );
+        }
+        assert!(source.contains("ALTER TABLE mcp_servers ADD PRIMARY KEY (owner_user_id, id)"));
+        assert!(source.contains("ALTER TABLE mcp_bindings ADD PRIMARY KEY (owner_user_id, id)"));
+        assert!(source.contains(
+            "ALTER TABLE mcp_tools ADD PRIMARY KEY (owner_user_id, binding_id, tool_name)"
+        ));
+        assert!(
+            source.contains("[('id', 64), ('mcp_id', 64)]")
+                || source.contains("[(\"id\", 64), (\"mcp_id\", 64)]"),
+            "legacy numeric mcp_bindings ids must fail varchar width checks"
+        );
+        assert!(
+            source.contains("&[\"uq_mcp_tools_binding_tool\", \"uq_mcp_tools_binding_public\"]"),
+            "legacy tool unique-key-plus-surrogate schemas must fail startup"
         );
     }
 

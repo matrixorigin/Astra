@@ -11300,7 +11300,7 @@ mod tests {
     async fn validate_request_constraints_rejects_legacy_mcp_binding_ids() {
         let service = test_service();
         let mut request = test_request("hello");
-        request.mcp_binding_ids = Some(vec![301]);
+        request.mcp_binding_ids = Some(vec!["mcp_bind_301".to_string()]);
 
         let err = service
             .validate_request_constraints("u1", &request)

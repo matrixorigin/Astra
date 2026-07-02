@@ -360,13 +360,13 @@ fn input_schema_value(tool: &McpTool) -> Value {
 }
 
 pub(crate) async fn discover_binding_tools(
-    binding_id: i64,
+    binding_id: &str,
     request: &McpRegisterRequestData,
 ) -> Result<Vec<McpDiscoveredToolData>, (StatusCode, Json<ErrorResponse>)> {
-    if binding_id <= 0 {
+    if binding_id.trim().is_empty() {
         return Err(mcp_error(
             StatusCode::BAD_REQUEST,
-            "binding_id must be positive",
+            "binding_id must not be empty",
             "mcp_binding_invalid",
         ));
     }

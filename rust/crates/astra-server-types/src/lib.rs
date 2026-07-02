@@ -130,7 +130,7 @@ pub struct ChatRequest {
     #[serde(default)]
     pub runtime_mcp_bindings: Vec<astra_services::runs::RuntimeMcpBindingRequest>,
     #[serde(default)]
-    pub mcp_binding_ids: Option<Vec<i64>>,
+    pub mcp_binding_ids: Option<Vec<String>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub edge_executor_id: Option<String>,
