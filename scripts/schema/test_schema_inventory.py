@@ -52,6 +52,10 @@ class SchemaInventoryTest(unittest.TestCase):
         first_batch = {
             "agent_events",
             "agent_run_events",
+            "agent_sessions",
+            "agent_runs",
+            "run_checkpoints",
+            "run_display_projections",
             "conversation_log",
             "session_transcript_items",
             "transcript_pages",
@@ -96,11 +100,56 @@ class SchemaInventoryTest(unittest.TestCase):
             "large payload",
             self.tables["session_tool_outputs"]["state_class"],
         )
+        self.assertIn(
+            "owner lease recovery",
+            self.tables["agent_runs"]["primary_query"],
+        )
+        self.assertIn(
+            "not rebuildable from events",
+            self.tables["agent_runs"]["rebuildability"],
+        )
+        self.assertIn(
+            "do not merge into agent_runs",
+            self.tables["run_display_projections"]["merge_guidance"],
+        )
+        self.assertIn(
+            "rebuildable from agent_runs",
+            self.tables["run_display_projections"]["rebuildability"],
+        )
+        self.assertIn(
+            "do not merge into agent_runs",
+            self.tables["run_checkpoints"]["merge_guidance"],
+        )
+
+    def test_run_lifecycle_tables_lock_authority_boundaries(self) -> None:
+        sessions = self.tables["agent_sessions"]
+        runs = self.tables["agent_runs"]
+        checkpoints = self.tables["run_checkpoints"]
+        projections = self.tables["run_display_projections"]
+
+        self.assertIn("parent lifecycle row", sessions["retention_policy"])
+        self.assertIn("cleanup boundary", sessions["merge_guidance"])
+        self.assertIn("session lifecycle aggregate", sessions["state_class"])
+
+        self.assertIn("durable run lifecycle authority", runs["state_class"])
+        self.assertIn("pause/cancel", runs["retention_policy"])
+        self.assertIn("owner lease generation", runs["rebuildability"])
+        self.assertIn("events own replay", runs["merge_guidance"])
+        self.assertIn("projections own repairable display state", runs["merge_guidance"])
+
+        self.assertIn("no independent age-based TTL", checkpoints["retention_policy"])
+        self.assertIn("checkpoint_json", checkpoints["rebuildability"])
+        self.assertIn("typed, idempotent, multi-version", checkpoints["merge_guidance"])
+
+        self.assertIn("derived run display projection", projections["state_class"])
+        self.assertIn("clear and rebuild", projections["retention_policy"])
+        self.assertIn("repairable display state", projections["merge_guidance"])
 
     def test_high_growth_tables_have_retention_metadata(self) -> None:
         high_growth_tables = [
             "agent_events",
             "agent_run_events",
+            "run_checkpoints",
             "conversation_log",
             "session_tool_outputs",
             "prompt_request_records",
