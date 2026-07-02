@@ -330,6 +330,49 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(summary["error_codes"], {"none": 1, "run_admission_timeout": 1})
         self.assertEqual(summary["failures_missing_error_code"], 1)
 
+    def test_output_writer_keeps_jsonl_handles_open_until_closed(self) -> None:
+        async def run(path: Path) -> probe.OutputWriter:
+            writer = probe.OutputWriter(path)
+            await writer.write_request(
+                probe.StreamResult(
+                    request_id=0,
+                    user_index=0,
+                    token_index=0,
+                    http_status=200,
+                    header_latency_ms=1.0,
+                    first_event_ms=1.0,
+                    duration_ms=2.0,
+                    event_count=1,
+                    session_id="s",
+                    run_id="r",
+                    terminal_status="completed",
+                    error_code=None,
+                    error_message=None,
+                    retryable=None,
+                    outcome="completed",
+                )
+            )
+            await writer.write_metrics(
+                {"unix_ms": 1, "http_status": 200, "metrics": {"astra_capacity_run_slots_total": 50}},
+                "astra_capacity_run_slots_total 50\n",
+            )
+            return writer
+
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = asyncio.run(run(Path(tmp)))
+            self.assertFalse(writer._requests_file.closed)
+            self.assertFalse(writer._metrics_file.closed)
+            self.assertFalse(writer._metrics_raw_file.closed)
+            writer.close()
+            self.assertTrue(writer._requests_file.closed)
+            self.assertTrue(writer._metrics_file.closed)
+            self.assertTrue(writer._metrics_raw_file.closed)
+            self.assertEqual(len((Path(tmp) / "requests.jsonl").read_text(encoding="utf-8").splitlines()), 1)
+            self.assertIn(
+                "astra_capacity_run_slots_total",
+                (Path(tmp) / "metrics.jsonl").read_text(encoding="utf-8"),
+            )
+
     def test_percentile_summary_handles_empty(self) -> None:
         self.assertEqual(
             probe.percentile_summary([]),

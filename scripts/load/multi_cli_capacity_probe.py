@@ -121,28 +121,32 @@ class OutputWriter:
         self.metrics_raw_path = self.output_dir / "metrics-snapshots.prom"
         self.summary_path = self.output_dir / "summary.json"
         self._lock = asyncio.Lock()
+        self._requests_file = self.requests_path.open("a", encoding="utf-8", buffering=1)
+        self._metrics_file = self.metrics_path.open("a", encoding="utf-8", buffering=1)
+        self._metrics_raw_file = self.metrics_raw_path.open("a", encoding="utf-8", buffering=1)
 
     async def write_request(self, result: StreamResult) -> None:
         line = json.dumps(result.to_json(), sort_keys=True)
         async with self._lock:
-            with self.requests_path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            self._requests_file.write(line + "\n")
 
     async def write_metrics(self, sample: dict[str, Any], raw: str) -> None:
         line = json.dumps(sample, sort_keys=True)
         async with self._lock:
-            with self.metrics_path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-            with self.metrics_raw_path.open("a", encoding="utf-8") as f:
-                f.write(f"# sample_unix_ms {sample['unix_ms']}\n")
-                f.write(raw)
-                if raw and not raw.endswith("\n"):
-                    f.write("\n")
+            self._metrics_file.write(line + "\n")
+            self._metrics_raw_file.write(f"# sample_unix_ms {sample['unix_ms']}\n")
+            self._metrics_raw_file.write(raw)
+            if raw and not raw.endswith("\n"):
+                self._metrics_raw_file.write("\n")
 
     def write_summary(self, summary: dict[str, Any]) -> None:
         with self.summary_path.open("w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, sort_keys=True)
             f.write("\n")
+
+    def close(self) -> None:
+        for handle in (self._requests_file, self._metrics_file, self._metrics_raw_file):
+            handle.close()
 
 
 def parse_url(base_url: str, path: str | None = None) -> ParsedUrl:
@@ -878,83 +882,86 @@ async def run_probe(args: argparse.Namespace) -> int:
         return 0
 
     writer = OutputWriter(args.output_dir)
-    tokens = await bootstrap_tokens(args, args.concurrency if args.register_users else 0)
-    if not tokens:
-        raise ProbeError("no auth token available; pass --auth-token, --token-file, or --register-users")
-    if args.require_distinct_users and len(tokens) < args.concurrency:
-        raise ProbeError(
-            f"--require-distinct-users needs at least concurrency tokens; have {len(tokens)}, need {args.concurrency}"
-        )
-    if len(tokens) < args.concurrency:
-        print(
-            f"warning: {len(tokens)} token(s) for concurrency={args.concurrency}; tokens will be reused",
-            file=sys.stderr,
-        )
-
-    stream_url = merge_base_url(args.base_url, args.endpoint)
-    queue: asyncio.Queue[int] = asyncio.Queue()
-    for request_id in range(args.total):
-        queue.put_nowait(request_id)
-    results: list[StreamResult] = []
-    results_lock = asyncio.Lock()
-    stop_metrics = asyncio.Event()
-    sampler = asyncio.create_task(metrics_sampler(args, writer, stop_metrics))
-
-    async def worker(worker_id: int) -> None:
-        while True:
-            try:
-                request_id = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            user_index = worker_id if args.user_mode == "worker" else request_id
-            token_index = user_index % len(tokens)
-            token = tokens[token_index]
-            headers = {"authorization": f"Bearer {token}"}
-            body = body_for_request(args, template, request_id, user_index)
-            result = await stream_sse_request(
-                request_id=request_id,
-                user_index=user_index,
-                token_index=token_index,
-                url_text=stream_url,
-                headers=headers,
-                body=body,
-                connect_timeout_secs=args.connect_timeout_secs,
-                request_timeout_secs=args.request_timeout_secs,
+    try:
+        tokens = await bootstrap_tokens(args, args.concurrency if args.register_users else 0)
+        if not tokens:
+            raise ProbeError("no auth token available; pass --auth-token, --token-file, or --register-users")
+        if args.require_distinct_users and len(tokens) < args.concurrency:
+            raise ProbeError(
+                f"--require-distinct-users needs at least concurrency tokens; have {len(tokens)}, need {args.concurrency}"
             )
-            await writer.write_request(result)
-            async with results_lock:
-                results.append(result)
-                if len(results) % max(1, args.progress_every) == 0 or len(results) == args.total:
-                    print_progress(results, args.total)
-            queue.task_done()
+        if len(tokens) < args.concurrency:
+            print(
+                f"warning: {len(tokens)} token(s) for concurrency={args.concurrency}; tokens will be reused",
+                file=sys.stderr,
+            )
 
-    started_unix_ms = int(time.time() * 1000)
-    started = time.perf_counter()
-    await asyncio.gather(*(worker(i) for i in range(args.concurrency)))
-    stop_metrics.set()
-    await sampler
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-    metrics_summary = summarize_metrics_file(writer.metrics_path)
-    contract_violations: list[str] = []
-    if args.require_metrics and metrics_summary["samples_with_metrics"] == 0:
-        contract_violations.append("metrics_required_but_no_prefixed_metrics_sampled")
-    failures_missing_error_code = sum(
-        1 for result in results if result.outcome != "completed" and not result.error_code
-    )
-    if args.require_error_codes_for_failures and failures_missing_error_code > 0:
-        contract_violations.append(f"failures_missing_error_code:{failures_missing_error_code}")
-    summary = summarize_results(
-        results,
-        args,
-        started_unix_ms,
-        int(time.time() * 1000),
-        elapsed_ms,
-        metrics_summary,
-        contract_violations,
-    )
-    writer.write_summary(summary)
-    print(json.dumps(summary, indent=2, sort_keys=True))
-    return 0 if summary["failed"] == 0 and not contract_violations else 2
+        stream_url = merge_base_url(args.base_url, args.endpoint)
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for request_id in range(args.total):
+            queue.put_nowait(request_id)
+        results: list[StreamResult] = []
+        results_lock = asyncio.Lock()
+        stop_metrics = asyncio.Event()
+        sampler = asyncio.create_task(metrics_sampler(args, writer, stop_metrics))
+
+        async def worker(worker_id: int) -> None:
+            while True:
+                try:
+                    request_id = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                user_index = worker_id if args.user_mode == "worker" else request_id
+                token_index = user_index % len(tokens)
+                token = tokens[token_index]
+                headers = {"authorization": f"Bearer {token}"}
+                body = body_for_request(args, template, request_id, user_index)
+                result = await stream_sse_request(
+                    request_id=request_id,
+                    user_index=user_index,
+                    token_index=token_index,
+                    url_text=stream_url,
+                    headers=headers,
+                    body=body,
+                    connect_timeout_secs=args.connect_timeout_secs,
+                    request_timeout_secs=args.request_timeout_secs,
+                )
+                await writer.write_request(result)
+                async with results_lock:
+                    results.append(result)
+                    if len(results) % max(1, args.progress_every) == 0 or len(results) == args.total:
+                        print_progress(results, args.total)
+                queue.task_done()
+
+        started_unix_ms = int(time.time() * 1000)
+        started = time.perf_counter()
+        await asyncio.gather(*(worker(i) for i in range(args.concurrency)))
+        stop_metrics.set()
+        await sampler
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        metrics_summary = summarize_metrics_file(writer.metrics_path)
+        contract_violations: list[str] = []
+        if args.require_metrics and metrics_summary["samples_with_metrics"] == 0:
+            contract_violations.append("metrics_required_but_no_prefixed_metrics_sampled")
+        failures_missing_error_code = sum(
+            1 for result in results if result.outcome != "completed" and not result.error_code
+        )
+        if args.require_error_codes_for_failures and failures_missing_error_code > 0:
+            contract_violations.append(f"failures_missing_error_code:{failures_missing_error_code}")
+        summary = summarize_results(
+            results,
+            args,
+            started_unix_ms,
+            int(time.time() * 1000),
+            elapsed_ms,
+            metrics_summary,
+            contract_violations,
+        )
+        writer.write_summary(summary)
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0 if summary["failed"] == 0 and not contract_violations else 2
+    finally:
+        writer.close()
 
 
 def print_progress(results: list[StreamResult], total: int) -> None:
