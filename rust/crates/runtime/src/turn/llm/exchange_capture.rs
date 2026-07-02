@@ -51,6 +51,18 @@ fn resolve_full_llm_capture_enabled(
         .unwrap_or(default_enabled)
 }
 
+fn prompt_request_delta_persistence_enabled_for_trace(
+    trace: &astra_config::runtime_config::SessionTraceConfig,
+) -> bool {
+    trace.category_enabled(astra_config::runtime_config::TraceCategory::PromptAssembly)
+}
+
+fn prompt_request_delta_persistence_enabled() -> bool {
+    prompt_request_delta_persistence_enabled_for_trace(
+        &astra_config::runtime_config::RuntimeConfig::cached().trace,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_capture_request_json(
     messages: &[Value],
@@ -319,6 +331,9 @@ pub(crate) fn spawn_prompt_request_plan_persist_or_log(
     input: astra_services::PromptRequestPersistInput,
     plan: astra_services::PromptRequestPlan,
 ) {
+    if !prompt_request_delta_persistence_enabled() {
+        return;
+    }
     let Some(shared_pool) = shared_pool else {
         return;
     };
@@ -458,6 +473,7 @@ pub(crate) fn persist_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_config::runtime_config::{SessionTraceConfig, TraceCategory, TraceProfile};
     use astra_services::{StoredSessionArtifact, session_journal::JournalDirGuard};
     use async_trait::async_trait;
     use tempfile::tempdir;
@@ -530,6 +546,29 @@ mod tests {
         ) -> Result<Vec<StoredSessionArtifact>, astra_services::SessionArtifactStoreError> {
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn prompt_request_delta_db_persistence_follows_prompt_assembly_trace_category() {
+        let production = SessionTraceConfig::default();
+        assert!(
+            !prompt_request_delta_persistence_enabled_for_trace(&production),
+            "production/default trace profile must not write prompt delta diagnostics"
+        );
+
+        let dev = SessionTraceConfig::default().apply_profile(TraceProfile::Dev);
+        assert!(
+            prompt_request_delta_persistence_enabled_for_trace(&dev),
+            "dev trace profile enables all diagnostic persistence categories"
+        );
+
+        let custom = SessionTraceConfig {
+            profile: TraceProfile::Custom,
+            enabled_categories: vec![TraceCategory::PromptAssembly],
+            ..SessionTraceConfig::default()
+        }
+        .normalize();
+        assert!(prompt_request_delta_persistence_enabled_for_trace(&custom));
     }
 
     #[test]

@@ -406,6 +406,9 @@ async fn persist_context_manifest_for_llm_call(
     pre_llm_messages: &[serde_json::Value],
     turn_result: Option<&HostTurnResult>,
 ) {
+    if !context_manifest_db_persistence_enabled() {
+        return;
+    }
     if turn_result.is_none() && state.last_llm_context_manifest_trace.is_none() {
         return;
     }
@@ -483,6 +486,18 @@ async fn persist_context_manifest_for_llm_call(
             "failed to persist per-llm-call context manifest"
         );
     }
+}
+
+fn context_manifest_db_persistence_enabled_for_trace(
+    trace: &astra_config::runtime_config::SessionTraceConfig,
+) -> bool {
+    trace.category_enabled(astra_config::runtime_config::TraceCategory::ContextAssembly)
+}
+
+fn context_manifest_db_persistence_enabled() -> bool {
+    context_manifest_db_persistence_enabled_for_trace(
+        &astra_config::runtime_config::RuntimeConfig::cached().trace,
+    )
 }
 
 fn context_window_tokens_for_context_manifest(state: &AgenticLoopState) -> u32 {
@@ -3770,6 +3785,31 @@ mod tests {
         // The function signature enforces ordering: it takes a
         // turn_result: Option<&HostTurnResult>, which only exists after
         // execute_turn returns.
+    }
+
+    #[test]
+    fn context_manifest_db_persistence_follows_context_assembly_trace_category() {
+        use astra_config::runtime_config::{SessionTraceConfig, TraceCategory, TraceProfile};
+
+        let production = SessionTraceConfig::default();
+        assert!(
+            !context_manifest_db_persistence_enabled_for_trace(&production),
+            "production/default trace profile must not write context manifest diagnostics"
+        );
+
+        let dev = SessionTraceConfig::default().apply_profile(TraceProfile::Dev);
+        assert!(
+            context_manifest_db_persistence_enabled_for_trace(&dev),
+            "dev trace profile enables all diagnostic persistence categories"
+        );
+
+        let custom = SessionTraceConfig {
+            profile: TraceProfile::Custom,
+            enabled_categories: vec![TraceCategory::ContextAssembly],
+            ..SessionTraceConfig::default()
+        }
+        .normalize();
+        assert!(context_manifest_db_persistence_enabled_for_trace(&custom));
     }
 
     #[test]
