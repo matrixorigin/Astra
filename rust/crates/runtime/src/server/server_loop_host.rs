@@ -73,9 +73,6 @@ const MAX_PENDING_PROGRESS_AGENTS: usize = 128;
 const MAX_PENDING_PROGRESS_PER_AGENT: usize = 8;
 const MAX_STREAMED_TURN_EVENT_BUFFER: usize = 2_048;
 const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
-const TURN_INTENT_JUDGE_POLICY_ENV: &str = "ASTRA_TURN_INTENT_JUDGE_POLICY";
-const FACTUAL_RETRY_JUDGE_POLICY_ENV: &str = "ASTRA_FACTUAL_RETRY_JUDGE_POLICY";
-const PRE_TURN_COMPACTION_LLM_POLICY_ENV: &str = "ASTRA_PRE_TURN_COMPACTION_LLM_POLICY";
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
 const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
 
@@ -87,9 +84,8 @@ enum AuxiliaryLlmPolicy {
 }
 
 impl AuxiliaryLlmPolicy {
-    fn from_env(policy_env: &'static str) -> Self {
-        std::env::var(policy_env)
-            .or_else(|_| std::env::var(AUX_LLM_POLICY_ENV))
+    fn from_env() -> Self {
+        std::env::var(AUX_LLM_POLICY_ENV)
             .ok()
             .as_deref()
             .map(parse_auxiliary_llm_policy)
@@ -114,8 +110,8 @@ fn parse_auxiliary_llm_policy(raw: &str) -> AuxiliaryLlmPolicy {
     }
 }
 
-fn should_skip_auxiliary_llm_for_capacity(policy_env: &'static str) -> Option<&'static str> {
-    let policy = AuxiliaryLlmPolicy::from_env(policy_env);
+fn should_skip_auxiliary_llm_for_capacity() -> Option<&'static str> {
+    let policy = AuxiliaryLlmPolicy::from_env();
     match policy {
         AuxiliaryLlmPolicy::Disabled => Some("disabled"),
         AuxiliaryLlmPolicy::Always => None,
@@ -129,8 +125,8 @@ fn should_skip_auxiliary_llm_for_capacity(policy_env: &'static str) -> Option<&'
     }
 }
 
-fn auxiliary_llm_policy_label(policy_env: &'static str) -> &'static str {
-    AuxiliaryLlmPolicy::from_env(policy_env).as_label()
+fn auxiliary_llm_policy_label() -> &'static str {
+    AuxiliaryLlmPolicy::from_env().as_label()
 }
 
 fn llm_main_attempt_metrics_slot() -> &'static RwLock<Option<Arc<MetricsRegistry>>> {
@@ -3462,10 +3458,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .await;
         }
 
-        if let Some(reason) = should_skip_auxiliary_llm_for_capacity(TURN_INTENT_JUDGE_POLICY_ENV) {
+        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
             tracing::debug!(
                 target: "astra::turn_intent",
-                policy = auxiliary_llm_policy_label(TURN_INTENT_JUDGE_POLICY_ENV),
+                policy = auxiliary_llm_policy_label(),
                 reason,
                 "turn intent judge skipped by capacity policy"
             );
@@ -3488,11 +3484,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         ctx: FactualRetryFallbackJudgeContext<'_>,
     ) -> Option<FactualRetryFallbackDecision> {
-        if let Some(reason) = should_skip_auxiliary_llm_for_capacity(FACTUAL_RETRY_JUDGE_POLICY_ENV)
-        {
+        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
             tracing::debug!(
                 target: "astra::factual_retry_judge",
-                policy = auxiliary_llm_policy_label(FACTUAL_RETRY_JUDGE_POLICY_ENV),
+                policy = auxiliary_llm_policy_label(),
                 reason,
                 "factual retry fallback judge skipped by capacity policy"
             );
@@ -4404,12 +4399,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         {
             return;
         }
-        if let Some(reason) =
-            should_skip_auxiliary_llm_for_capacity(PRE_TURN_COMPACTION_LLM_POLICY_ENV)
-        {
+        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
             tracing::debug!(
                 target: "astra::pre_turn_compaction",
-                policy = auxiliary_llm_policy_label(PRE_TURN_COMPACTION_LLM_POLICY_ENV),
+                policy = auxiliary_llm_policy_label(),
                 reason,
                 "pre-turn LLM compaction skipped by capacity policy"
             );
@@ -8826,8 +8819,7 @@ mod tests {
         use axum::{Router, extract::State, routing::post};
         use tokio::net::TcpListener;
 
-        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
-        let _policy = EnvVarGuard::set(FACTUAL_RETRY_JUDGE_POLICY_ENV, "always");
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
         #[derive(Default)]
         struct RequestCapture {
@@ -8913,7 +8905,6 @@ mod tests {
         use tokio::net::TcpListener;
 
         let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
-        let _policy = EnvVarGuard::remove(FACTUAL_RETRY_JUDGE_POLICY_ENV);
         let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
         let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
 
@@ -8988,8 +8979,7 @@ mod tests {
         use axum::{Router, extract::State, routing::post};
         use tokio::net::TcpListener;
 
-        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
-        let _policy = EnvVarGuard::set(PRE_TURN_COMPACTION_LLM_POLICY_ENV, "always");
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
         #[derive(Default)]
         struct RequestCapture {
@@ -9129,7 +9119,6 @@ mod tests {
         use tokio::net::TcpListener;
 
         let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
-        let _policy = EnvVarGuard::remove(PRE_TURN_COMPACTION_LLM_POLICY_ENV);
         let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
         let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
 
@@ -10347,14 +10336,10 @@ mod tests {
 
         #[test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        fn auxiliary_llm_policy_uses_specific_override_before_global() {
+        fn auxiliary_llm_policy_uses_global_env() {
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
-            let _specific_policy = EnvVarGuard::set(FACTUAL_RETRY_JUDGE_POLICY_ENV, "always");
 
-            assert_eq!(
-                AuxiliaryLlmPolicy::from_env(FACTUAL_RETRY_JUDGE_POLICY_ENV),
-                AuxiliaryLlmPolicy::Always
-            );
+            assert_eq!(AuxiliaryLlmPolicy::from_env(), AuxiliaryLlmPolicy::Disabled);
         }
 
         #[tokio::test]
@@ -10426,8 +10411,7 @@ mod tests {
             use axum::{Router, extract::State, routing::post};
             use tokio::net::TcpListener;
 
-            let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
-            let _policy = EnvVarGuard::set(TURN_INTENT_JUDGE_POLICY_ENV, "always");
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
             #[derive(Default)]
             struct RequestCapture {
@@ -10556,7 +10540,6 @@ mod tests {
             use tokio::net::TcpListener;
 
             let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
-            let _policy = EnvVarGuard::remove(TURN_INTENT_JUDGE_POLICY_ENV);
             let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
             let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
             let request_count = Arc::new(AtomicUsize::new(0));
