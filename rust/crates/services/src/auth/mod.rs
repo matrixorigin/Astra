@@ -957,7 +957,7 @@ fn header_exact(
     Ok(Some(value.to_string()))
 }
 
-/// Map SQLx failures to HTTP errors; PoolTimedOut → 503 (retryable), others → 500.
+/// Map SQLx failures to stable auth DB errors; pool exhaustion is retryable.
 fn map_auth_sqlx(
     err: sqlx::Error,
     operation: &'static str,
@@ -982,12 +982,17 @@ fn map_auth_sqlx(
                 );
             }
         }
-        return error_response(
+        return error_response_coded(
             StatusCode::SERVICE_UNAVAILABLE,
             "pool timed out while waiting for an open connection",
+            "database_error",
         );
     }
-    internal_error(err)
+    error_response_coded(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        err.to_string(),
+        "database_error",
+    )
 }
 
 #[async_trait]
@@ -1861,6 +1866,29 @@ mod tests {
             }
             other => panic!("expected external_authorized_request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_auth_sqlx_pool_timeout_is_retryable_database_error() {
+        let (status, body) =
+            map_auth_sqlx(sqlx::Error::PoolTimedOut, "auth.test_pool_timeout", None);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.error_code.as_deref(), Some("database_error"));
+        assert!(body.0.detail.contains("pool timed out"));
+    }
+
+    #[test]
+    fn map_auth_sqlx_other_sqlx_error_is_database_error() {
+        let (status, body) = map_auth_sqlx(
+            sqlx::Error::Protocol("database connection closed".into()),
+            "auth.test_protocol",
+            None,
+        );
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0.error_code.as_deref(), Some("database_error"));
+        assert!(body.0.detail.contains("database connection closed"));
     }
 
     struct FakeRefreshTokenRow {
