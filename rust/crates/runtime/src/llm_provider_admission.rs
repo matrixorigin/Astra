@@ -7,7 +7,7 @@ use std::{
 
 use astra_core::{ClassifiedError, ErrorKind, SharedPool};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sqlx::Row;
 
 const ENV_MODE: &str = "ASTRA_LLM_PROVIDER_ADMISSION_MODE";
@@ -602,21 +602,11 @@ async fn admit_llm_provider_request_with_config(
                     record_attempt(&config, limit.rejected_outcome());
                     record_tokens(&config, limit.rejected_outcome(), estimated_tokens);
                     record_retry_after(&config, retry_after_ms);
-                    Err(ClassifiedError::new(
-                        ErrorKind::RateLimit,
-                        format!(
-                            "LLM provider admission {} limit reached for {} scope (rpm: {}, tpm: {}, window: {}ms). Retry after {}s.",
-                            limit.as_label(),
-                            config.scope_label(),
-                            config
-                                .rpm_limit
-                                .map_or("none".to_string(), |value| value.to_string()),
-                            config
-                                .tpm_limit
-                                .map_or("none".to_string(), |value| value.to_string()),
-                            config.window_ms,
-                            retry_after_ms.div_ceil(1000)
-                        ),
+                    Err(provider_admission_rejection_error(
+                        &config,
+                        limit,
+                        retry_after_ms,
+                        estimated_tokens,
                     ))
                 }
                 Err(error) => {
@@ -647,6 +637,45 @@ fn handle_admission_error(
         }
         Err(error)
     }
+}
+
+fn provider_admission_rejection_error(
+    config: &ProviderAdmissionConfig,
+    limit: ProviderAdmissionLimit,
+    retry_after_ms: u64,
+    estimated_tokens: u64,
+) -> ClassifiedError {
+    let rpm = config
+        .rpm_limit
+        .map_or("none".to_string(), |value| value.to_string());
+    let tpm = config
+        .tpm_limit
+        .map_or("none".to_string(), |value| value.to_string());
+    let details = json!({
+        "source": "llm_provider_admission",
+        "policy": "fail_fast",
+        "limit": limit.as_label(),
+        "scope": config.scope_label(),
+        "mode": config.mode_label(),
+        "retry_after_ms": retry_after_ms,
+        "estimated_tokens": estimated_tokens.max(1),
+        "rpm_limit": config.rpm_limit,
+        "tpm_limit": config.tpm_limit,
+        "window_ms": config.window_ms,
+    });
+    ClassifiedError::new(
+        ErrorKind::RateLimit,
+        format!(
+            "LLM provider admission {} limit reached for {} scope (rpm: {}, tpm: {}, window: {}ms). Retry after {}s.",
+            limit.as_label(),
+            config.scope_label(),
+            rpm,
+            tpm,
+            config.window_ms,
+            retry_after_ms.div_ceil(1000)
+        ),
+    )
+    .with_details_json(details.to_string())
 }
 
 fn cleanup_timestamp_slot() -> &'static AtomicI64 {
@@ -1051,6 +1080,27 @@ mod tests {
         assert_eq!(calibration_outcome(1_050, 1_000), "within_10pct");
         assert_eq!(calibration_outcome(1_250, 1_000), "overestimate");
         assert_eq!(calibration_outcome(750, 1_000), "underestimate");
+    }
+
+    #[test]
+    fn provider_admission_rejection_error_exposes_fail_fast_details() {
+        let config = ProviderAdmissionConfig::db_fixed_window_with_tpm(Some(60), Some(120_000));
+        let error =
+            provider_admission_rejection_error(&config, ProviderAdmissionLimit::Tpm, 42_000, 3_000);
+
+        assert_eq!(error.kind, ErrorKind::RateLimit);
+        assert!(error.message.contains("tpm limit"));
+        let details: Value =
+            serde_json::from_str(error.details_json.as_deref().expect("details json"))
+                .expect("valid json details");
+        assert_eq!(details["source"], "llm_provider_admission");
+        assert_eq!(details["policy"], "fail_fast");
+        assert_eq!(details["limit"], "tpm");
+        assert_eq!(details["scope"], "provider");
+        assert_eq!(details["retry_after_ms"], 42_000);
+        assert_eq!(details["estimated_tokens"], 3_000);
+        assert_eq!(details["rpm_limit"], 60);
+        assert_eq!(details["tpm_limit"], 120_000);
     }
 
     #[tokio::test]
