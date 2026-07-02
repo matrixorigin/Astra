@@ -64,6 +64,8 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoR
     state.multi_agent_metrics.register_with(&bridge);
     state.multi_agent_metrics.scrape_to(&bridge);
     crate::capacity_model::scrape_capacity_metrics_from_env(&state.metrics_registry());
+    crate::turn::bridge::llm_stream::rate_limit_cooldown()
+        .scrape_metrics(&state.metrics_registry());
     let body = state.metrics_registry().render_prometheus();
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
@@ -91,6 +93,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn metrics_handler_scrapes_capacity_metrics() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy));
+        let cooldown = crate::turn::bridge::llm_stream::rate_limit_cooldown();
+        cooldown.reset_for_tests();
+        cooldown.with("metrics-model", |rl| {
+            rl.record_429(None, false);
+        });
 
         let response = metrics_handler(State(state)).await.into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -103,6 +110,12 @@ mod tests {
         assert!(
             text.contains(
                 "astra_capacity_limit_mode{env_var=\"ASTRA_ENDPOINT_RPC_CONCURRENCY\",limit=\"registered_endpoint_rpc\",mode=\"reject\",scope=\"per_endpoint_per_pod\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "astra_llm_provider_rate_limit_errors_total{model=\"metrics-model\",status=\"429\"} 1"
             ),
             "{text}"
         );

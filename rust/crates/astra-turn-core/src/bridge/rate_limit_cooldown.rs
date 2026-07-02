@@ -12,6 +12,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::pipeline_metrics::MetricsRegistry;
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Default cooldown duration (30 seconds) when retry-after is unknown or too long.
@@ -62,6 +64,18 @@ fn default_retry_after_ms() -> u64 {
 
 const STATE_ACTIVE: u8 = 0;
 const STATE_COOLDOWN: u8 = 1;
+
+const METRIC_LLM_PROVIDER_RATE_LIMIT_ERRORS_TOTAL: &str =
+    "astra_llm_provider_rate_limit_errors_total";
+const METRIC_LLM_PROVIDER_RATE_LIMIT_CONSECUTIVE_ERRORS: &str =
+    "astra_llm_provider_rate_limit_consecutive_errors";
+const METRIC_LLM_PROVIDER_RATE_LIMIT_COOLDOWNS_TOTAL: &str =
+    "astra_llm_provider_rate_limit_cooldowns_total";
+const METRIC_LLM_PROVIDER_RATE_LIMIT_FALLBACKS_TOTAL: &str =
+    "astra_llm_provider_rate_limit_fallbacks_total";
+const METRIC_LLM_PROVIDER_RATE_LIMIT_STATE: &str = "astra_llm_provider_rate_limit_state";
+const METRIC_LLM_PROVIDER_RATE_LIMIT_COOLDOWN_REMAINING_MS: &str =
+    "astra_llm_provider_rate_limit_cooldown_remaining_ms";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -124,6 +138,13 @@ pub struct RateLimitMetrics {
     pub consecutive_errors: u64,
     pub cooldowns_triggered: u64,
     pub fallbacks_triggered: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerModelRateLimitMetrics {
+    pub model: String,
+    pub metrics: RateLimitMetrics,
+    pub cooldown_remaining_ms: u64,
 }
 
 // ── RateLimitCooldown ────────────────────────────────────────────────────────
@@ -478,12 +499,98 @@ impl PerModelCooldown {
         let mut map = self.map.lock().expect("per-model cooldown mutex");
         map.clear();
     }
+
+    pub fn metrics_snapshot(&self) -> Vec<PerModelRateLimitMetrics> {
+        let map = self.map.lock().expect("per-model cooldown mutex");
+        let mut snapshots: Vec<_> = map
+            .iter()
+            .map(|(model, cooldown)| PerModelRateLimitMetrics {
+                model: model.clone(),
+                metrics: cooldown.metrics(),
+                cooldown_remaining_ms: cooldown.cooldown_remaining_ms(),
+            })
+            .collect();
+        snapshots.sort_by(|a, b| a.model.cmp(&b.model));
+        snapshots
+    }
+
+    pub fn scrape_metrics(&self, registry: &MetricsRegistry) {
+        register_rate_limit_metrics(registry);
+        for snapshot in self.metrics_snapshot() {
+            let model = snapshot.model.as_str();
+            let metrics = snapshot.metrics;
+            registry.set_counter_absolute(
+                METRIC_LLM_PROVIDER_RATE_LIMIT_ERRORS_TOTAL,
+                &[("model", model), ("status", "429")],
+                metrics.total_429_errors,
+            );
+            registry.set_counter_absolute(
+                METRIC_LLM_PROVIDER_RATE_LIMIT_ERRORS_TOTAL,
+                &[("model", model), ("status", "529")],
+                metrics.total_529_errors,
+            );
+            registry.set_gauge(
+                METRIC_LLM_PROVIDER_RATE_LIMIT_CONSECUTIVE_ERRORS,
+                &[("model", model)],
+                metrics.consecutive_errors as f64,
+            );
+            registry.set_counter_absolute(
+                METRIC_LLM_PROVIDER_RATE_LIMIT_COOLDOWNS_TOTAL,
+                &[("model", model)],
+                metrics.cooldowns_triggered,
+            );
+            registry.set_counter_absolute(
+                METRIC_LLM_PROVIDER_RATE_LIMIT_FALLBACKS_TOTAL,
+                &[("model", model)],
+                metrics.fallbacks_triggered,
+            );
+            for state in ["active", "cooldown"] {
+                registry.set_gauge(
+                    METRIC_LLM_PROVIDER_RATE_LIMIT_STATE,
+                    &[("model", model), ("state", state)],
+                    if metrics.state == state { 1.0 } else { 0.0 },
+                );
+            }
+            registry.set_gauge(
+                METRIC_LLM_PROVIDER_RATE_LIMIT_COOLDOWN_REMAINING_MS,
+                &[("model", model)],
+                snapshot.cooldown_remaining_ms as f64,
+            );
+        }
+    }
 }
 
 impl Default for PerModelCooldown {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn register_rate_limit_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_LLM_PROVIDER_RATE_LIMIT_ERRORS_TOTAL,
+        "Provider rate-limit or overload errors by model and status.",
+    );
+    registry.register_gauge(
+        METRIC_LLM_PROVIDER_RATE_LIMIT_CONSECUTIVE_ERRORS,
+        "Current consecutive provider rate-limit/overload errors by model.",
+    );
+    registry.register_counter(
+        METRIC_LLM_PROVIDER_RATE_LIMIT_COOLDOWNS_TOTAL,
+        "Provider cooldown entries triggered by model.",
+    );
+    registry.register_counter(
+        METRIC_LLM_PROVIDER_RATE_LIMIT_FALLBACKS_TOTAL,
+        "Provider cooldown-triggered model fallback entries by model.",
+    );
+    registry.register_gauge(
+        METRIC_LLM_PROVIDER_RATE_LIMIT_STATE,
+        "Current provider rate-limit state by model; 1 for active state, 0 otherwise.",
+    );
+    registry.register_gauge(
+        METRIC_LLM_PROVIDER_RATE_LIMIT_COOLDOWN_REMAINING_MS,
+        "Remaining provider cooldown duration in milliseconds by model.",
+    );
 }
 
 // ── Fallback Chain Resolution ─────────────────────────────────────────────────
@@ -992,6 +1099,42 @@ mod tests {
         let pmc = PerModelCooldown::new();
         let action = pmc.with("new-model", |rl| rl.check_request(false));
         assert_eq!(action, RateLimitAction::Proceed);
+    }
+
+    #[test]
+    fn per_model_metrics_scrape_exports_provider_cooldown_state() {
+        let pmc = PerModelCooldown::new();
+        pmc.with("model-a", |rl| {
+            rl.record_429(None, false);
+            rl.record_429(None, false);
+            rl.record_429(None, false);
+        });
+        pmc.with("model-b", |rl| {
+            rl.record_529(None, true);
+            rl.record_529(None, true);
+            rl.record_529(None, true);
+        });
+
+        let registry = MetricsRegistry::new();
+        pmc.scrape_metrics(&registry);
+        let rendered = registry.render_prometheus();
+
+        assert!(
+            rendered.contains(
+                "astra_llm_provider_rate_limit_errors_total{model=\"model-a\",status=\"429\"} 3"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_llm_provider_rate_limit_state{model=\"model-a\",state=\"cooldown\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("astra_llm_provider_rate_limit_fallbacks_total{model=\"model-b\"} 1"),
+            "{rendered}"
+        );
     }
 
     #[test]
