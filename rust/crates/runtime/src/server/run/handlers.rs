@@ -534,6 +534,9 @@ mod tests {
         build_app,
     };
 
+    static HTTP_PROJECTION_REPAIR_DB: tokio::sync::OnceCell<astra_core::SharedPool> =
+        tokio::sync::OnceCell::const_new();
+
     #[derive(Clone)]
     struct StubHealthChecker;
 
@@ -603,6 +606,48 @@ mod tests {
 
     fn test_matrixone() -> astra_core::MatrixOneSettings {
         astra_core::MatrixOneSettings::mock()
+    }
+
+    async fn setup_http_projection_repair_db_it() -> astra_core::SharedPool {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+        );
+        HTTP_PROJECTION_REPAIR_DB
+            .get_or_init(|| async {
+                let settings = astra_core::MatrixOneSettings::from_env();
+                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                    .unwrap_or_else(|_| "mysql".to_string());
+                astra_services::ensure_core_schema(&settings, &catalog)
+                    .await
+                    .expect("ensure_core_schema");
+                astra_core::SharedPool::new(&settings)
+                    .await
+                    .expect("SharedPool::new")
+            })
+            .await
+            .clone()
+    }
+
+    async fn cleanup_run_projection_http_fixture(
+        pool: &astra_core::SharedPool,
+        user_id: &str,
+        run_id: &str,
+    ) {
+        for sql in [
+            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(user_id)
+                .bind(run_id)
+                .execute(pool.get())
+                .await
+                .expect("cleanup run projection repair fixture");
+        }
     }
 
     #[test]
@@ -1260,6 +1305,167 @@ mod tests {
             .and_then(serde_json::Value::as_array)
             .expect("recent events should be present");
         assert_eq!(recent_events.len(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn repair_run_projection_http_repairs_real_database_projection() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
+        use sqlx::Row;
+        use uuid::Uuid;
+
+        let shared_pool = setup_http_projection_repair_db_it().await;
+        let settings = shared_pool.settings().clone();
+        let user_id = "u1";
+        let run_id = format!("run-http-it-{}", Uuid::new_v4());
+        let session_id = format!("session-http-it-{}", Uuid::new_v4());
+        cleanup_run_projection_http_fixture(&shared_pool, user_id, &run_id).await;
+
+        let store: Arc<dyn RunStateStore> = Arc::new(
+            DatabaseRunStateStore::new(shared_pool.clone())
+                .with_owner_pod_id("projection-repair-http-it-pod"),
+        );
+        let engine = RunEngine::new(store);
+        engine
+            .start_run(&run_id, user_id, &session_id)
+            .await
+            .expect("start durable DB run");
+        let checkpoint_saved = engine
+            .persist_checkpoint(
+                user_id,
+                &run_id,
+                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"http-repair-it"}"#,
+            )
+            .await
+            .expect("save checkpoint before terminal transition");
+        assert!(checkpoint_saved);
+        let transitioned = engine
+            .transition_status_with_events_if_current(
+                user_id,
+                &run_id,
+                &[astra_core::STATUS_RUNNING],
+                astra_core::STATUS_FAILED,
+                None,
+                Some("boom"),
+                &[
+                    json!({"event_type": "run_error", "data": {"error": "boom"}}),
+                    json!({"event_type": "run_finished", "data": {"status": "failed"}}),
+                ],
+            )
+            .await
+            .expect("persist terminal transition");
+        assert!(transitioned);
+
+        sqlx::query(
+            "UPDATE run_display_projections
+             SET status = 'running',
+                 error_message = NULL,
+                 projection_event_idx = -1,
+                 latest_event_type = 'stale_event',
+                 latest_checkpoint_id = NULL,
+                 latest_checkpoint_kind = NULL,
+                 latest_checkpoint_version = NULL
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(&run_id)
+        .execute(shared_pool.get())
+        .await
+        .expect("corrupt projection");
+
+        let lifecycle = AgenticRunLifecycleService::new(
+            settings,
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_shared_pool(shared_pool.clone())
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/chat/runs/{run_id}/projection/repair?recent_limit=2"
+                    ))
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("repair response should be valid json");
+        assert_eq!(json.get("repaired"), Some(&json!(true)));
+        assert_eq!(json.pointer("/projection/status"), Some(&json!("failed")));
+        assert_eq!(
+            json.pointer("/projection/error_message"),
+            Some(&json!("boom"))
+        );
+        assert_eq!(
+            json.pointer("/projection/latest_event_type"),
+            Some(&json!("run_finished"))
+        );
+        assert_eq!(
+            json.pointer("/projection/latest_checkpoint/checkpoint_version"),
+            Some(&json!("checkpoint_v2"))
+        );
+        assert_eq!(
+            json.pointer("/projection/observability/projection_lag_events"),
+            Some(&json!(0))
+        );
+        let recent_events = json
+            .pointer("/projection/recent_events")
+            .and_then(serde_json::Value::as_array)
+            .expect("recent events should be present");
+        assert_eq!(recent_events.len(), 2);
+
+        let row = sqlx::query(
+            "SELECT status, error_message, projection_event_idx, latest_event_type,
+                    latest_checkpoint_version
+             FROM run_display_projections
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(&run_id)
+        .fetch_one(shared_pool.get())
+        .await
+        .expect("load repaired projection row");
+        let db_status: String = row.try_get("status").expect("status");
+        let db_error: Option<String> = row.try_get("error_message").expect("error_message");
+        let db_event_idx: i64 = row
+            .try_get("projection_event_idx")
+            .expect("projection_event_idx");
+        let db_latest_event: Option<String> =
+            row.try_get("latest_event_type").expect("latest_event_type");
+        let db_checkpoint_version: Option<String> = row
+            .try_get("latest_checkpoint_version")
+            .expect("latest_checkpoint_version");
+        assert_eq!(db_status, astra_core::STATUS_FAILED);
+        assert_eq!(db_error.as_deref(), Some("boom"));
+        // `RunEngine::start_run` persists `run_started` at index 0; the
+        // terminal batch then writes `run_error` and `run_finished`.
+        assert_eq!(db_event_idx, 2);
+        assert_eq!(db_latest_event.as_deref(), Some("run_finished"));
+        assert_eq!(db_checkpoint_version.as_deref(), Some("checkpoint_v2"));
+
+        cleanup_run_projection_http_fixture(&shared_pool, user_id, &run_id).await;
     }
 
     #[tokio::test]
