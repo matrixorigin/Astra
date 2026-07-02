@@ -1914,15 +1914,36 @@ async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timesta
     );
 
     let listed = store
-        .list_json_artifacts(&user_id, &session_id, Some("llm_capture"), 10)
+        .list_json_artifacts(&user_id, &session_id, Some("llm_capture"), 10, None)
         .await
         .expect("list session artifacts");
-    assert_eq!(listed.len(), 2);
+    assert_eq!(listed.artifacts.len(), 2);
     assert_eq!(
-        listed[0].artifact_id, newer_id,
+        listed.artifacts[0].artifact_id, newer_id,
         "artifact lists should use the same stable latest-first ordering"
     );
-    assert_eq!(listed[1].artifact_id, older_id);
+    assert_eq!(listed.artifacts[1].artifact_id, older_id);
+    assert!(listed.next_cursor.is_none());
+
+    let first_page = store
+        .list_json_artifacts(&user_id, &session_id, Some("llm_capture"), 1, None)
+        .await
+        .expect("list first artifact page");
+    assert_eq!(first_page.artifacts.len(), 1);
+    assert_eq!(first_page.artifacts[0].artifact_id, newer_id);
+    let second_page = store
+        .list_json_artifacts(
+            &user_id,
+            &session_id,
+            Some("llm_capture"),
+            1,
+            first_page.next_cursor.clone(),
+        )
+        .await
+        .expect("list second artifact page");
+    assert_eq!(second_page.artifacts.len(), 1);
+    assert_eq!(second_page.artifacts[0].artifact_id, older_id);
+    assert!(second_page.next_cursor.is_none());
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
 }
@@ -2038,9 +2059,10 @@ async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
     );
     assert_eq!(
         store
-            .list_json_artifacts(&owner_user_id, &session_id, Some("llm_capture"), 10)
+            .list_json_artifacts(&owner_user_id, &session_id, Some("llm_capture"), 10, None)
             .await
             .expect("owner list")
+            .artifacts
             .len(),
         1,
         "owner list sees exactly the session artifact"
@@ -2072,9 +2094,10 @@ async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
     );
     assert!(
         store
-            .list_json_artifacts(&other_user_id, &session_id, None, 10)
+            .list_json_artifacts(&other_user_id, &session_id, None, 10, None)
             .await
             .expect("non-owner list")
+            .artifacts
             .is_empty(),
         "non-owner list does not leak another user's artifacts"
     );

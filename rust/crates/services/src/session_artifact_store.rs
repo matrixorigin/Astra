@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::query;
+use sqlx::{QueryBuilder, query};
 use uuid::Uuid;
 
 /// Structured error type for [`SessionArtifactJsonStore`] operations. Replaces
@@ -215,6 +215,19 @@ pub struct StoredSessionArtifact {
     pub created_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionArtifactListCursor {
+    pub created_at: String,
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionArtifactListPage {
+    pub artifacts: Vec<StoredSessionArtifact>,
+    pub limit: usize,
+    pub next_cursor: Option<SessionArtifactListCursor>,
+}
+
 #[async_trait]
 pub trait SessionArtifactJsonStore: Send + Sync {
     async fn persist_json_artifact(
@@ -242,7 +255,8 @@ pub trait SessionArtifactJsonStore: Send + Sync {
         session_id: &str,
         artifact_kind: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<StoredSessionArtifact>, SessionArtifactStoreError>;
+        cursor: Option<SessionArtifactListCursor>,
+    ) -> Result<SessionArtifactListPage, SessionArtifactStoreError>;
 }
 
 #[derive(Clone, Debug)]
@@ -291,6 +305,84 @@ impl DatabaseSessionArtifactStore {
 fn validate_session_id(session_id: &str) -> Result<(), SessionArtifactStoreError> {
     crate::session_journal::validate_session_id(session_id)
         .map_err(SessionArtifactStoreError::InvalidSessionId)
+}
+
+fn validate_artifact_list_limit(limit: usize) -> usize {
+    limit.clamp(1, 100)
+}
+
+fn artifact_list_query_limit(limit: usize) -> i64 {
+    limit as i64 + 1
+}
+
+fn artifact_list_cursor_db_created_at(
+    cursor: &SessionArtifactListCursor,
+) -> Result<String, SessionArtifactStoreError> {
+    let created_at = cursor.created_at.trim();
+    if created_at.is_empty() {
+        return Err(SessionArtifactStoreError::InvalidDatabaseValue {
+            artifact_id: cursor.artifact_id.clone(),
+            column: "created_at",
+            value: cursor.created_at.clone(),
+            reason: "cursor timestamp must not be empty",
+        });
+    }
+    let db_created_at = created_at.replace('T', " ");
+    if db_created_at.len() != "YYYY-MM-DD HH:MM:SS.ffffff".len()
+        || db_created_at.as_bytes().get(10) != Some(&b' ')
+        || db_created_at.as_bytes().get(19) != Some(&b'.')
+        || chrono::NaiveDateTime::parse_from_str(&db_created_at, "%Y-%m-%d %H:%M:%S%.6f").is_err()
+    {
+        return Err(SessionArtifactStoreError::InvalidDatabaseValue {
+            artifact_id: cursor.artifact_id.clone(),
+            column: "created_at",
+            value: cursor.created_at.clone(),
+            reason: "cursor timestamp must use YYYY-MM-DDTHH:MM:SS.ffffff",
+        });
+    }
+    Ok(db_created_at)
+}
+
+fn artifact_list_cursor_artifact_id(
+    cursor: &SessionArtifactListCursor,
+) -> Result<String, SessionArtifactStoreError> {
+    let artifact_id = cursor.artifact_id.trim();
+    if artifact_id.is_empty() {
+        return Err(SessionArtifactStoreError::InvalidArtifactId(
+            cursor.artifact_id.clone(),
+        ));
+    }
+    Ok(artifact_id.to_string())
+}
+
+fn artifact_list_cursor_from_record(
+    artifact: &StoredSessionArtifact,
+) -> Result<SessionArtifactListCursor, SessionArtifactStoreError> {
+    let created_at = artifact.created_at.as_deref().ok_or_else(|| {
+        SessionArtifactStoreError::InvalidDatabaseValue {
+            artifact_id: artifact.artifact_id.clone(),
+            column: "created_at",
+            value: "NULL".to_string(),
+            reason: "list cursor requires created_at",
+        }
+    })?;
+    if created_at.trim().is_empty() {
+        return Err(SessionArtifactStoreError::InvalidDatabaseValue {
+            artifact_id: artifact.artifact_id.clone(),
+            column: "created_at",
+            value: created_at.to_string(),
+            reason: "list cursor requires non-empty created_at",
+        });
+    }
+    if artifact.artifact_id.trim().is_empty() {
+        return Err(SessionArtifactStoreError::InvalidArtifactId(
+            artifact.artifact_id.clone(),
+        ));
+    }
+    Ok(SessionArtifactListCursor {
+        created_at: created_at.to_string(),
+        artifact_id: artifact.artifact_id.clone(),
+    })
 }
 
 /// Convert a `u32` logical counter (`turn` / `round`) to an `i32` column
@@ -547,46 +639,66 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         session_id: &str,
         artifact_kind: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<StoredSessionArtifact>, SessionArtifactStoreError> {
+        cursor: Option<SessionArtifactListCursor>,
+    ) -> Result<SessionArtifactListPage, SessionArtifactStoreError> {
         validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
-        let capped_limit = limit.clamp(1, 100) as i64;
-        let rows = if let Some(kind) = artifact_kind {
-            query(
-                "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-                        content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
-                        CAST(retention_until AS CHAR) AS retention_until, status, \
-                        referenced_by_manifest_count, referenced_by_state_items_count, \
-                        referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
-                 FROM session_artifacts \
-                 WHERE user_id = ? AND session_id = ? AND artifact_kind = ? \
-                 ORDER BY created_at DESC, artifact_id DESC LIMIT ?",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .bind(kind)
-            .bind(capped_limit)
-            .fetch_all(&pool)
-            .await?
+        let capped_limit = validate_artifact_list_limit(limit);
+
+        let mut qb = QueryBuilder::<sqlx::MySql>::new(
+            "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
+                    content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
+                    CAST(retention_until AS CHAR) AS retention_until, status, \
+                    referenced_by_manifest_count, referenced_by_state_items_count, \
+                    referenced_by_citation_count, \
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
+             FROM session_artifacts \
+             WHERE user_id = ",
+        );
+        qb.push_bind(user_id);
+        qb.push(" AND session_id = ");
+        qb.push_bind(session_id);
+        if let Some(kind) = artifact_kind {
+            qb.push(" AND artifact_kind = ");
+            qb.push_bind(kind);
+        }
+        if let Some(cursor) = &cursor {
+            let created_at = artifact_list_cursor_db_created_at(cursor)?;
+            let artifact_id = artifact_list_cursor_artifact_id(cursor)?;
+            qb.push(" AND (created_at < ");
+            qb.push_bind(created_at.clone());
+            qb.push(" OR (created_at = ");
+            qb.push_bind(created_at);
+            qb.push(" AND artifact_id < ");
+            qb.push_bind(artifact_id);
+            qb.push("))");
+        }
+        qb.push(" ORDER BY created_at DESC, artifact_id DESC LIMIT ");
+        qb.push_bind(artifact_list_query_limit(capped_limit));
+
+        let rows = qb.build().fetch_all(&pool).await?;
+        let mut artifacts = rows
+            .iter()
+            .map(stored_artifact_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = artifacts.len() > capped_limit;
+        if has_more {
+            artifacts.truncate(capped_limit);
+        }
+        let next_cursor = if has_more {
+            artifacts
+                .last()
+                .map(artifact_list_cursor_from_record)
+                .transpose()?
         } else {
-            query(
-                "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-                        content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
-                        CAST(retention_until AS CHAR) AS retention_until, status, \
-                        referenced_by_manifest_count, referenced_by_state_items_count, \
-                        referenced_by_citation_count, CAST(created_at AS CHAR) AS created_at \
-                 FROM session_artifacts \
-                 WHERE user_id = ? AND session_id = ? \
-                 ORDER BY created_at DESC, artifact_id DESC LIMIT ?",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .bind(capped_limit)
-            .fetch_all(&pool)
-            .await?
+            None
         };
 
-        rows.iter().map(stored_artifact_from_row).collect()
+        Ok(SessionArtifactListPage {
+            artifacts,
+            limit: capped_limit,
+            next_cursor,
+        })
     }
 }
 
@@ -1067,5 +1179,41 @@ mod tests {
             .unwrap(),
             Some(i32::MAX)
         );
+    }
+
+    #[test]
+    fn artifact_list_cursor_validates_timestamp_and_id() {
+        let cursor = SessionArtifactListCursor {
+            created_at: "2026-10-01T12:34:56.123456".to_string(),
+            artifact_id: "artifact-1".to_string(),
+        };
+        assert_eq!(
+            artifact_list_cursor_db_created_at(&cursor).unwrap(),
+            "2026-10-01 12:34:56.123456"
+        );
+        assert_eq!(
+            artifact_list_cursor_artifact_id(&cursor).unwrap(),
+            "artifact-1"
+        );
+
+        let invalid_time = SessionArtifactListCursor {
+            created_at: "2026-10-01T12:34:56".to_string(),
+            artifact_id: "artifact-1".to_string(),
+        };
+        assert!(artifact_list_cursor_db_created_at(&invalid_time).is_err());
+
+        let missing_id = SessionArtifactListCursor {
+            created_at: "2026-10-01T12:34:56.123456".to_string(),
+            artifact_id: "  ".to_string(),
+        };
+        assert!(artifact_list_cursor_artifact_id(&missing_id).is_err());
+    }
+
+    #[test]
+    fn artifact_list_limit_is_bounded_and_fetches_one_extra_row() {
+        assert_eq!(validate_artifact_list_limit(0), 1);
+        assert_eq!(validate_artifact_list_limit(20), 20);
+        assert_eq!(validate_artifact_list_limit(usize::MAX), 100);
+        assert_eq!(artifact_list_query_limit(100), 101);
     }
 }

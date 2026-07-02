@@ -27,7 +27,8 @@ use astra_services::{
     AdminAuditRecord, AdminFeedbackStatsRecord, AdminInitRecord, AdminTokenRecord,
     AdminUserRoleRecord, AuthTokenRecord, AuthUserRecord, CancelRunRecord, ChatRequestData,
     ChatRunRecord, RunListCursor, RunListRecord, RunMutationRecord, RunStatusRecord,
-    SessionListRecord, SessionRecord, run_list_cursor_db_updated_at, run_list_cursor_run_id,
+    SessionArtifactListCursor, SessionListRecord, SessionRecord, run_list_cursor_db_updated_at,
+    run_list_cursor_run_id,
 };
 #[cfg(feature = "server")]
 use astra_tools::AskUserPrompt;
@@ -256,6 +257,50 @@ pub struct SessionArtifactListQuery {
     pub artifact_kind: Option<String>,
     #[serde(default = "default_session_artifact_limit")]
     pub limit: u32,
+    pub after_created_at: Option<String>,
+    pub after_artifact_id: Option<String>,
+}
+
+#[cfg(feature = "server")]
+impl SessionArtifactListQuery {
+    pub fn cursor(
+        &self,
+    ) -> Result<Option<SessionArtifactListCursor>, (StatusCode, Json<ErrorResponse>)> {
+        match (&self.after_created_at, &self.after_artifact_id) {
+            (None, None) => Ok(None),
+            (Some(created_at), Some(artifact_id)) => {
+                let db_created_at = created_at.trim().replace('T', " ");
+                if db_created_at.len() != "YYYY-MM-DD HH:MM:SS.ffffff".len()
+                    || db_created_at.as_bytes().get(10) != Some(&b' ')
+                    || db_created_at.as_bytes().get(19) != Some(&b'.')
+                    || chrono::NaiveDateTime::parse_from_str(
+                        &db_created_at,
+                        "%Y-%m-%d %H:%M:%S%.6f",
+                    )
+                    .is_err()
+                {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid session artifact list cursor timestamp: {created_at}"),
+                    ));
+                }
+                if artifact_id.trim().is_empty() {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid session artifact list cursor: artifact_id is required",
+                    ));
+                }
+                Ok(Some(SessionArtifactListCursor {
+                    created_at: created_at.clone(),
+                    artifact_id: artifact_id.clone(),
+                }))
+            }
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "session artifact list cursor requires both after_created_at and after_artifact_id",
+            )),
+        }
+    }
 }
 
 #[cfg(feature = "server")]
@@ -285,6 +330,7 @@ pub struct SessionArtifactListResponse {
     pub session_id: String,
     pub artifacts: Vec<SessionArtifactResponse>,
     pub limit: u32,
+    pub next_cursor: Option<SessionArtifactListCursor>,
 }
 
 #[cfg(feature = "server")]

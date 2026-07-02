@@ -5259,8 +5259,16 @@ mod tests {
             _session_id: &str,
             _artifact_kind: Option<&str>,
             _limit: usize,
-        ) -> Result<Vec<StoredSessionArtifact>, astra_services::SessionArtifactStoreError> {
-            Ok(Vec::new())
+            _cursor: Option<astra_services::SessionArtifactListCursor>,
+        ) -> Result<
+            astra_services::SessionArtifactListPage,
+            astra_services::SessionArtifactStoreError,
+        > {
+            Ok(astra_services::SessionArtifactListPage {
+                artifacts: Vec::new(),
+                limit: 0,
+                next_cursor: None,
+            })
         }
     }
 

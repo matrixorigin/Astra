@@ -938,9 +938,10 @@ async fn load_artifact_previews(
     session_id: &str,
 ) -> Result<Vec<ArtifactPreviewResponse>, (StatusCode, Json<ErrorResponse>)> {
     let artifacts = session_artifact_store(state)?
-        .list_json_artifacts(user_id, session_id, None, 8)
+        .list_json_artifacts(user_id, session_id, None, 8, None)
         .await
-        .map_err(internal_error)?;
+        .map_err(internal_error)?
+        .artifacts;
     Ok(artifacts
         .into_iter()
         .filter(|artifact| artifact.artifact_kind != WORKSPACE_METADATA_ARTIFACT_KIND)
@@ -1498,22 +1499,27 @@ pub(crate) async fn list_session_artifacts_handler(
         .get_session(session_id.clone(), user_id.clone())
         .await?;
     let artifact_store = session_artifact_store(&state)?;
-    let artifacts = artifact_store
+    let page = artifact_store
         .list_json_artifacts(
             &user_id,
             &session_id,
             query.artifact_kind.as_deref(),
             query.limit as usize,
+            query.cursor()?,
         )
         .await
         .map_err(internal_artifact_error)?;
+    let limit = page.limit as u32;
+    let next_cursor = page.next_cursor;
     Ok(Json(SessionArtifactListResponse {
         session_id,
-        artifacts: artifacts
+        artifacts: page
+            .artifacts
             .into_iter()
             .map(session_artifact_response)
             .collect(),
-        limit: query.limit,
+        limit,
+        next_cursor,
     }))
 }
 

@@ -964,8 +964,13 @@ mod tests {
             _session_id: &str,
             _artifact_kind: Option<&str>,
             _limit: usize,
-        ) -> Result<Vec<StoredSessionArtifact>, crate::SessionArtifactStoreError> {
-            Ok(Vec::new())
+            _cursor: Option<crate::SessionArtifactListCursor>,
+        ) -> Result<crate::SessionArtifactListPage, crate::SessionArtifactStoreError> {
+            Ok(crate::SessionArtifactListPage {
+                artifacts: Vec::new(),
+                limit: 0,
+                next_cursor: None,
+            })
         }
     }
 

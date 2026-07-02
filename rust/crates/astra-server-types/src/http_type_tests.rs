@@ -368,6 +368,39 @@ fn session_list_query_all_fields() {
 }
 
 #[test]
+fn session_artifact_list_query_cursor_requires_complete_seek_key() {
+    let q: SessionArtifactListQuery = serde_json::from_value(json!({
+        "artifact_kind": "llm_capture",
+        "limit": 10,
+        "after_created_at": "2026-10-01T12:34:56.123456",
+        "after_artifact_id": "artifact-5"
+    }))
+    .unwrap();
+    let cursor = q.cursor().unwrap().unwrap();
+    assert_eq!(cursor.created_at, "2026-10-01T12:34:56.123456");
+    assert_eq!(cursor.artifact_id, "artifact-5");
+
+    let missing_artifact_id: SessionArtifactListQuery = serde_json::from_value(json!({
+        "after_created_at": "2026-10-01T12:34:56.123456"
+    }))
+    .unwrap();
+    assert_eq!(
+        missing_artifact_id.cursor().unwrap_err().0,
+        StatusCode::BAD_REQUEST
+    );
+
+    let invalid_timestamp: SessionArtifactListQuery = serde_json::from_value(json!({
+        "after_created_at": "2026-10-01T12:34:56",
+        "after_artifact_id": "artifact-5"
+    }))
+    .unwrap();
+    assert_eq!(
+        invalid_timestamp.cursor().unwrap_err().0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[test]
 fn run_list_query_cursor_requires_complete_seek_key() {
     let q: RunListQuery = serde_json::from_value(json!({
         "limit": 20,
