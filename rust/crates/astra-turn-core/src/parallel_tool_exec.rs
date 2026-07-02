@@ -15,11 +15,15 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::tool::args::shape::{canonicalize_tool_call_name_in_place, tool_call_name};
+
+const METRIC_TOOL_EXECUTION_ATTEMPTS_TOTAL: &str = "astra_tool_execution_attempts_total";
+const METRIC_TOOL_EXECUTION_WAIT_MS_TOTAL: &str = "astra_tool_execution_wait_ms_total";
 
 /// Maximum number of read-only tools that can execute concurrently.
 /// Override with `ASTRA_MAX_CONCURRENT_TOOL_EXECUTIONS` env var.
@@ -67,6 +71,74 @@ pub fn shared_tool_semaphore() -> Arc<Semaphore> {
     static CELL: OnceLock<Arc<Semaphore>> = OnceLock::new();
     CELL.get_or_init(|| Arc::new(Semaphore::new(max_concurrent_tool_executions())))
         .clone()
+}
+
+pub fn set_tool_execution_metrics_registry(
+    registry: Arc<crate::pipeline_metrics::MetricsRegistry>,
+) {
+    register_tool_execution_metrics(&registry);
+    let slot = TOOL_EXECUTION_METRICS_REGISTRY.get_or_init(Default::default);
+    *slot
+        .write()
+        .expect("tool execution metrics registry lock poisoned") = Some(registry);
+}
+
+static TOOL_EXECUTION_METRICS_REGISTRY: OnceLock<
+    std::sync::RwLock<Option<Arc<crate::pipeline_metrics::MetricsRegistry>>>,
+> = OnceLock::new();
+
+fn register_tool_execution_metrics(registry: &crate::pipeline_metrics::MetricsRegistry) {
+    registry.register_counter(
+        METRIC_TOOL_EXECUTION_ATTEMPTS_TOTAL,
+        "Tool execution semaphore admission attempts by outcome.",
+    );
+    registry.register_counter(
+        METRIC_TOOL_EXECUTION_WAIT_MS_TOTAL,
+        "Total milliseconds spent waiting for tool execution semaphore admission by outcome.",
+    );
+}
+
+fn tool_metrics_registry() -> Option<Arc<crate::pipeline_metrics::MetricsRegistry>> {
+    TOOL_EXECUTION_METRICS_REGISTRY
+        .get_or_init(Default::default)
+        .read()
+        .expect("tool execution metrics registry lock poisoned")
+        .clone()
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn record_tool_admission(outcome: &'static str, wait: Duration) {
+    let Some(registry) = tool_metrics_registry() else {
+        return;
+    };
+    register_tool_execution_metrics(&registry);
+    registry.increment_counter(
+        METRIC_TOOL_EXECUTION_ATTEMPTS_TOTAL,
+        &[("outcome", outcome)],
+        1,
+    );
+    registry.increment_counter(
+        METRIC_TOOL_EXECUTION_WAIT_MS_TOTAL,
+        &[("outcome", outcome)],
+        duration_millis_u64(wait),
+    );
+}
+
+async fn acquire_tool_permit(semaphore: &Semaphore) -> Result<SemaphorePermit<'_>, ()> {
+    let start = Instant::now();
+    match semaphore.acquire().await {
+        Ok(permit) => {
+            record_tool_admission("acquired", start.elapsed());
+            Ok(permit)
+        }
+        Err(_closed) => {
+            record_tool_admission("closed", start.elapsed());
+            Err(())
+        }
+    }
 }
 
 // ───────────────────────────── Tool Classification ──────────────────────
@@ -226,9 +298,9 @@ pub async fn execute_parallel_round(
             let sem = semaphore.clone();
             let exec = executor.clone();
             join_set.spawn(async move {
-                let _permit = match sem.acquire().await {
+                let _permit = match acquire_tool_permit(&sem).await {
                     Ok(p) => p,
-                    Err(_) => {
+                    Err(()) => {
                         return ToolExecResult {
                             original_index: idx,
                             call_id: fallback_call_id,
@@ -417,6 +489,66 @@ mod tests {
                 )
             })
         })
+    }
+
+    fn metric_value(rendered: &str, prefix: &str) -> f64 {
+        rendered
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(prefix)
+                    .and_then(|value| value.trim().parse::<f64>().ok())
+            })
+            .unwrap_or_else(|| {
+                panic!("missing metric line starting with `{prefix}` in:\n{rendered}")
+            })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_admission_metrics_record_wait_time() {
+        let registry = Arc::new(crate::pipeline_metrics::MetricsRegistry::new());
+        set_tool_execution_metrics_registry(registry.clone());
+        let semaphore = Arc::new(Semaphore::new(1));
+        let held = semaphore.acquire().await.expect("initial permit");
+        let waiter_sem = semaphore.clone();
+
+        let waiter = tokio::spawn(async move {
+            let _permit = acquire_tool_permit(&waiter_sem)
+                .await
+                .expect("waiter should acquire after release");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        drop(held);
+        waiter.await.expect("waiter task");
+
+        let rendered = registry.render_prometheus();
+        let attempts = metric_value(
+            &rendered,
+            "astra_tool_execution_attempts_total{outcome=\"acquired\"}",
+        );
+        let wait_ms = metric_value(
+            &rendered,
+            "astra_tool_execution_wait_ms_total{outcome=\"acquired\"}",
+        );
+        assert!(attempts >= 1.0, "{rendered}");
+        assert!(wait_ms > 0.0, "{rendered}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_admission_closed_semaphore_is_counted() {
+        let registry = Arc::new(crate::pipeline_metrics::MetricsRegistry::new());
+        set_tool_execution_metrics_registry(registry.clone());
+        let semaphore = Semaphore::new(1);
+        semaphore.close();
+
+        let result = acquire_tool_permit(&semaphore).await;
+
+        assert!(result.is_err());
+        let rendered = registry.render_prometheus();
+        let closed = metric_value(
+            &rendered,
+            "astra_tool_execution_attempts_total{outcome=\"closed\"}",
+        );
+        assert!(closed >= 1.0, "{rendered}");
     }
 
     #[test]
