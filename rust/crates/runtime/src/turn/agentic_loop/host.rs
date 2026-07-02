@@ -1046,6 +1046,12 @@ impl StallTrackingState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredUserInputRecord {
+    pub event_index: usize,
+    pub content: String,
+}
+
 #[derive(Default)]
 pub struct DeferredInputState {
     /// Durable event cursor for deferred user-input polling.
@@ -1053,11 +1059,15 @@ pub struct DeferredInputState {
     /// Event indices already delivered to the model but not yet durably marked
     /// as released. Retried on later poll points without re-injecting content.
     pending_release_event_indices: Vec<usize>,
+    /// User messages that were appended to the prompt while this run was
+    /// already active. These must be persisted as transcript items after the
+    /// loop finishes, otherwise session history diverges from prompt history.
+    delivered_user_inputs: Vec<DeferredUserInputRecord>,
 }
 
 pub(crate) struct ObservedDeferredUserInputs {
     pub(crate) raw_inputs: Vec<Value>,
-    pub(crate) contents: Vec<String>,
+    pub(crate) contents: Vec<DeferredUserInputRecord>,
     pub(crate) released_event_indices: Vec<usize>,
     pub(crate) next_cursor: usize,
 }
@@ -1065,6 +1075,14 @@ pub(crate) struct ObservedDeferredUserInputs {
 impl DeferredInputState {
     pub fn deferred_user_input_cursor(&self) -> usize {
         self.deferred_user_input_cursor
+    }
+
+    pub fn delivered_user_inputs(&self) -> &[DeferredUserInputRecord] {
+        &self.delivered_user_inputs
+    }
+
+    pub(crate) fn record_delivered_user_inputs(&mut self, inputs: &[DeferredUserInputRecord]) {
+        self.delivered_user_inputs.extend_from_slice(inputs);
     }
 
     pub(crate) fn release_event_indices_to_ack(&self, observed: &[usize]) -> Vec<usize> {
@@ -1108,7 +1126,10 @@ impl DeferredInputState {
             let Some(content) = content_from_input(&event.input) else {
                 continue;
             };
-            contents.push(content);
+            contents.push(DeferredUserInputRecord {
+                event_index: event.event_index,
+                content,
+            });
         }
 
         ObservedDeferredUserInputs {

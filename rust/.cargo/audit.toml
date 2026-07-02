@@ -7,5 +7,9 @@
 # REVIEW_BY: 2026-10-18 — calendar re-check: run `cargo audit`, confirm whether rsa/sqlx resolved;
 # remove this ignore if a fixed dependency graph is available.
 
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml): pulled via plist → syntect → two-face.
+# quick-xml 0.39.3 is the version required by plist 1.9.0; there is no patched release in the
+# transitive dependency chain yet. Revisit when syntect/two-face upgrades plist.
+# REVIEW_BY: 2026-09-02
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]

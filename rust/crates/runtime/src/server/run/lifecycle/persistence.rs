@@ -831,7 +831,10 @@ async fn persist_server_loop_core_events_impl(
     state: &AgenticLoopState,
     model_name: Option<&str>,
 ) -> Result<(), String> {
-    if user_message.is_empty() && state.final_text.is_empty() {
+    if user_message.is_empty()
+        && state.final_text.is_empty()
+        && state.deferred_input.delivered_user_inputs().is_empty()
+    {
         return Ok(());
     }
 
@@ -877,6 +880,32 @@ async fn persist_server_loop_core_events_impl(
         None
     };
 
+    let deferred_user_message_events = state
+        .deferred_input
+        .delivered_user_inputs()
+        .iter()
+        .map(|input| {
+            let event_index = input.event_index.to_string();
+            let mut event = TraceEvent::new(
+                trace_event_id("deferred_user", &[run_id, &event_index]),
+                session_id,
+                user_id,
+                "user_message",
+                "turn",
+            )
+            .with_turn_context(&trace);
+            event.run_id = Some(run_id.to_string());
+            event.parent_run_id = parent_run_id.map(ToString::to_string);
+            event.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
+            event.parent_agent_id = parent_agent_id.map(ToString::to_string);
+            event.content = Some(input.content.clone());
+            event.parent_event_id = user_query_event
+                .as_ref()
+                .map(|event| event.event_id.clone());
+            event
+        })
+        .collect::<Vec<_>>();
+
     let llm_response_event = if !state.final_text.is_empty() {
         let usage = lifecycle_token_usage_json(
             state.total_prompt,
@@ -908,10 +937,11 @@ async fn persist_server_loop_core_events_impl(
         None
     };
 
-    let mut events = Vec::with_capacity(2);
+    let mut events = Vec::with_capacity(2 + deferred_user_message_events.len());
     if let Some(event) = user_query_event.clone() {
         events.push(event);
     }
+    events.extend(deferred_user_message_events.iter().cloned());
     if let Some(event) = llm_response_event.clone() {
         events.push(event);
     }
@@ -953,7 +983,8 @@ async fn persist_server_loop_core_events_impl(
             }),
         snapshot_link_plan: None,
     };
-    let transcript_items = transcript_items_from_core_plan(&plan, run_id);
+    let transcript_items =
+        transcript_items_from_core_plan(&plan, run_id, &deferred_user_message_events);
 
     match external_tx {
         Some(tx) => {
@@ -1005,13 +1036,22 @@ pub(crate) struct TranscriptPersistItem {
 fn transcript_items_from_core_plan(
     plan: &TurnCorePersistPlan,
     run_id: &str,
+    deferred_user_message_events: &[TraceEvent],
 ) -> Vec<TranscriptPersistItem> {
-    let mut items = Vec::with_capacity(2);
+    let mut items = Vec::with_capacity(2 + deferred_user_message_events.len());
     if let Some(event) = &plan.user_query_event {
         items.push(TranscriptPersistItem {
             run_id: run_id.to_string(),
             role: "user",
             content: event.content.clone(),
+            source_event_id: event.event_id.clone(),
+        });
+    }
+    for event in deferred_user_message_events {
+        items.push(TranscriptPersistItem {
+            run_id: run_id.to_string(),
+            role: "user",
+            content: event.content.clone().unwrap_or_default(),
             source_event_id: event.event_id.clone(),
         });
     }
@@ -1515,18 +1555,17 @@ pub(crate) async fn persist_session_transcript_items_inner_in_tx(
 
     for item in items {
         let existing = sqlx::query(
-            "SELECT COUNT(*) AS count
+            "SELECT 1 AS existing
              FROM session_transcript_items
-             WHERE session_id = ? AND user_id = ? AND run_id = ? AND role = ?",
+             WHERE session_id = ? AND user_id = ? AND source_event_id = ?
+             LIMIT 1",
         )
         .bind(session_id)
         .bind(user_id)
-        .bind(&item.run_id)
-        .bind(item.role)
-        .fetch_one(&mut **tx)
-        .await?
-        .try_get::<i64, _>("count")?;
-        if existing > 0 {
+        .bind(&item.source_event_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if existing.is_some() {
             continue;
         }
 
@@ -2335,6 +2374,172 @@ mod tests {
             .expect("cleanup transcript fixture agent_sessions");
     }
 
+    async fn cleanup_core_persist_fixture_for_owner(
+        db: &sqlx::Pool<sqlx::MySql>,
+        session_id: &str,
+        user_id: &str,
+    ) {
+        sqlx::query("DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .expect("cleanup core persist transcript_pages");
+        sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .expect("cleanup core persist session_transcript_items");
+        sqlx::query("DELETE FROM agent_event_edges WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .expect("cleanup core persist agent_event_edges");
+        sqlx::query("DELETE FROM agent_events WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .expect("cleanup core persist agent_events");
+        sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .expect("cleanup core persist agent_sessions");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn core_persistence_records_deferred_inputs_without_splitting_audit_turns() {
+        let pool = setup_pool().await;
+        let db = pool.get().clone();
+        let matrixone = MatrixOneSettings::from_env();
+        let session_id = Uuid::new_v4().to_string();
+        let user_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+
+        cleanup_core_persist_fixture_for_owner(&db, &session_id, &user_id).await;
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
+             VALUES (?, ?, 'core-persist-deferred-it', 'active', 0)",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(&db)
+        .await
+        .expect("insert owner session");
+
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.session_turn = 7;
+        state.final_text = "assistant final".to_string();
+        state.deferred_input.record_delivered_user_inputs(&[
+            crate::turn::agentic_loop::host::DeferredUserInputRecord {
+                event_index: 3,
+                content: "queued two".to_string(),
+            },
+            crate::turn::agentic_loop::host::DeferredUserInputRecord {
+                event_index: 4,
+                content: "queued three".to_string(),
+            },
+        ]);
+
+        persist_server_loop_core_events_impl(
+            &matrixone,
+            Some(&pool),
+            None,
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            None,
+            None,
+            None,
+            "initial one",
+            &state,
+            Some("test-model"),
+        )
+        .await
+        .expect("persist core events");
+
+        let event_rows = sqlx::query(
+            "SELECT event_id, event_type, content, parent_event_id
+             FROM agent_events
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY created_at ASC, event_id ASC",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_all(&db)
+        .await
+        .expect("agent events");
+        let user_query_rows = event_rows
+            .iter()
+            .filter(|row| row.try_get::<String, _>("event_type").unwrap() == "user_query")
+            .collect::<Vec<_>>();
+        let user_message_rows = event_rows
+            .iter()
+            .filter(|row| row.try_get::<String, _>("event_type").unwrap() == "user_message")
+            .collect::<Vec<_>>();
+        let response_rows = event_rows
+            .iter()
+            .filter(|row| row.try_get::<String, _>("event_type").unwrap() == "llm_response")
+            .collect::<Vec<_>>();
+        assert_eq!(user_query_rows.len(), 1, "run must have one audit turn");
+        assert_eq!(user_message_rows.len(), 2, "deferred inputs are messages");
+        assert_eq!(response_rows.len(), 1, "run must have one final response");
+        let root_event_id = user_query_rows[0].try_get::<String, _>("event_id").unwrap();
+        assert_eq!(
+            response_rows[0]
+                .try_get::<Option<String>, _>("parent_event_id")
+                .unwrap()
+                .as_deref(),
+            Some(root_event_id.as_str()),
+            "final response must remain attached to the audit turn root"
+        );
+        assert!(user_message_rows.iter().all(|row| {
+            row.try_get::<Option<String>, _>("parent_event_id")
+                .unwrap()
+                .as_deref()
+                == Some(root_event_id.as_str())
+        }));
+
+        let transcript_rows = sqlx::query(
+            "SELECT role, content
+             FROM session_transcript_items
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY item_seq ASC",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_all(&db)
+        .await
+        .expect("transcript rows");
+        let transcript_items = transcript_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<String, _>("role").unwrap(),
+                    row.try_get::<String, _>("content").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            transcript_items,
+            vec![
+                ("user".to_string(), "initial one".to_string()),
+                ("user".to_string(), "queued two".to_string()),
+                ("user".to_string(), "queued three".to_string()),
+                ("assistant".to_string(), "assistant final".to_string()),
+            ],
+            "transcript remains the ordered user-facing conversation"
+        );
+
+        cleanup_core_persist_fixture_for_owner(&db, &session_id, &user_id).await;
+    }
+
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn transcript_persistence_writes_owner_scoped_pages_and_rejects_wrong_owner() {
@@ -2389,6 +2594,12 @@ mod tests {
             },
             TranscriptPersistItem {
                 run_id: run_id.clone(),
+                role: "user",
+                content: "second input".to_string(),
+                source_event_id: Uuid::new_v4().to_string(),
+            },
+            TranscriptPersistItem {
+                run_id: run_id.clone(),
                 role: "assistant",
                 content: "world".to_string(),
                 source_event_id: Uuid::new_v4().to_string(),
@@ -2417,8 +2628,38 @@ mod tests {
         .expect("owner transcript page");
         assert_eq!(page.try_get::<String, _>("user_id").unwrap(), owner_user_id);
         assert_eq!(page.try_get::<i64, _>("start_item_seq").unwrap(), 1);
-        assert_eq!(page.try_get::<i64, _>("end_item_seq").unwrap(), 2);
-        assert_eq!(page.try_get::<i64, _>("item_count").unwrap(), 2);
+        assert_eq!(page.try_get::<i64, _>("end_item_seq").unwrap(), 3);
+        assert_eq!(page.try_get::<i64, _>("item_count").unwrap(), 3);
+
+        let owner_rows = sqlx::query(
+            "SELECT role, content
+             FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ?
+             ORDER BY item_seq ASC",
+        )
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .fetch_all(&db)
+        .await
+        .expect("owner transcript rows");
+        let owner_items = owner_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<String, _>("role").unwrap(),
+                    row.try_get::<String, _>("content").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owner_items,
+            vec![
+                ("user".to_string(), "hello".to_string()),
+                ("user".to_string(), "second input".to_string()),
+                ("assistant".to_string(), "world".to_string()),
+            ],
+            "transcript must preserve multiple user inputs in one run"
+        );
 
         let same_item_seq_rows = sqlx::query(
             "SELECT COUNT(*) AS c

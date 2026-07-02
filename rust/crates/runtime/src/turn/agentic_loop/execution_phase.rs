@@ -116,7 +116,7 @@ pub(crate) fn deferred_user_input_text(input: &serde_json::Value) -> Option<Stri
 
 fn render_deferred_user_input(content: &str) -> String {
     format!(
-        "A newer user message arrived during execution and now supersedes the previous plan.\n\nLatest user message:\n{content}\n\nRequired behavior:\n- Treat this as the newest user instruction.\n- Address it before making more tool calls.\n- Do not continue the previous plan blindly.\n- Only make another tool call if it is directly necessary to satisfy this newest user message."
+        "Newer user message(s) arrived during execution and now supersede the previous plan.\n\nNew user message(s):\n{content}\n\nRequired behavior:\n- Treat the last new user message as the newest user instruction.\n- Address it before making more tool calls.\n- Do not continue the previous plan blindly.\n- Only make another tool call if it is directly necessary to satisfy the newest user message."
     )
 }
 
@@ -163,13 +163,25 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     }
 
     if !observed.contents.is_empty() {
-        let combined = observed.contents.join("\n\n");
+        let combined = observed
+            .contents
+            .iter()
+            .map(|input| input.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         if !combined.is_empty() {
             state.messages.push(serde_json::json!({
                 "role": "user",
                 "content": combined.clone(),
             }));
-            state.message = combined.clone();
+            state.message = observed
+                .contents
+                .last()
+                .map(|input| input.content.clone())
+                .unwrap_or_default();
+            state
+                .deferred_input
+                .record_delivered_user_inputs(&observed.contents);
             state.push_volatile(
                 super::host::VolatileKind::DeferredUserInput,
                 render_deferred_user_input(&combined),
@@ -3386,7 +3398,8 @@ mod tests {
     use crate::observability::ObservabilityHub;
     use crate::turn::agentic_loop::host::tests::{MockHost, make_state, text_result};
     use crate::turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, VolatileKind, run_agentic_loop_with_host,
+        AgenticLoopHost, AgenticLoopState, DeferredUserInputRecord, VolatileKind,
+        run_agentic_loop_with_host,
     };
     use crate::turn::run_control::{RunInputProvider, RunQueuedInputPoll, RunStatusProvider};
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
@@ -5404,6 +5417,13 @@ mod tests {
         assert_eq!(*provider.released.lock().await, vec![1]);
         assert_eq!(state.message, "Switch to writing tests first.");
         assert_eq!(
+            state.deferred_input.delivered_user_inputs(),
+            &[DeferredUserInputRecord {
+                event_index: 1,
+                content: "Switch to writing tests first.".to_string(),
+            }]
+        );
+        assert_eq!(
             state
                 .messages
                 .last()
@@ -5415,6 +5435,66 @@ mod tests {
             entry.kind == VolatileKind::DeferredUserInput
                 && entry.content.contains("Switch to writing tests first.")
         }));
+    }
+
+    #[tokio::test]
+    async fn deferred_user_input_records_multiple_inputs_without_consecutive_user_messages() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-queued-many".into());
+        state.context_manifest_user_id = Some("user-deferred".into());
+        let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
+            next_cursor: 3,
+            inputs: vec![
+                crate::turn::run_control::QueuedRunInputEvent {
+                    event_index: 1,
+                    input: serde_json::json!({"content": "first queued input"}),
+                },
+                crate::turn::run_control::QueuedRunInputEvent {
+                    event_index: 2,
+                    input: serde_json::json!({"content": "second queued input"}),
+                },
+            ],
+            error: None,
+        }]));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 3);
+        assert_eq!(*provider.released.lock().await, vec![1, 2]);
+        assert_eq!(state.message, "second queued input");
+        assert_eq!(
+            state.deferred_input.delivered_user_inputs(),
+            &[
+                DeferredUserInputRecord {
+                    event_index: 1,
+                    content: "first queued input".to_string(),
+                },
+                DeferredUserInputRecord {
+                    event_index: 2,
+                    content: "second queued input".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .and_then(|message| message.get("content"))
+                .and_then(|content| content.as_str()),
+            Some("first queued input\n\nsecond queued input")
+        );
+        assert!(
+            !state.messages.windows(2).any(|window| {
+                window.iter().all(|message| {
+                    message.get("role").and_then(|role| role.as_str()) == Some("user")
+                })
+            }),
+            "deferred input injection must keep prompt history provider-safe"
+        );
     }
 
     #[tokio::test]

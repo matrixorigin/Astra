@@ -890,13 +890,16 @@ export async function sendMessage(
     chat.model = payload.options.model;
   }
 
+  const backendSessionId = await ensureChatBackendSession(ownerUserId, chat.id, {
+    model: payload.options?.model ?? chat.model,
+  });
   const agentResult = await callBackendAgent({
-    sessionId: chat.id,
+    sessionId: backendSessionId,
     text: payload.content,
     model: selectedWebModel(payload.options?.model ?? chat.model),
     activeSkills: payload.options?.activeSkills,
   });
-  assertBackendSessionMatchesChat(chat.id, agentResult.sessionId);
+  assertBackendSessionMatchesChat(backendSessionId, agentResult.sessionId);
   const assistantMessage = appendAssistantMessage(
     chat,
     agentResult.assistantText,

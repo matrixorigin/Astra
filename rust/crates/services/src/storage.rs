@@ -1705,7 +1705,8 @@ pub async fn ensure_core_schema(
             content_hash VARCHAR(128) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, item_seq),
-            INDEX idx_transcript_owner_run_event (user_id, run_id, source_event_idx)
+            INDEX idx_transcript_owner_run_event (user_id, run_id, source_event_idx),
+            INDEX idx_transcript_owner_session_source_event (user_id, session_id, source_event_id)
         )",
     )
     .execute(&pool)
@@ -1725,6 +1726,15 @@ pub async fn ensure_core_schema(
         "idx_transcript_owner_run_event",
         &["user_id", "run_id", "source_event_idx"],
         "ALTER TABLE session_transcript_items ADD INDEX idx_transcript_owner_run_event (user_id, run_id, source_event_idx)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "session_transcript_items",
+        "idx_transcript_owner_session_source_event",
+        &["user_id", "session_id", "source_event_id"],
+        "ALTER TABLE session_transcript_items ADD INDEX idx_transcript_owner_session_source_event (user_id, session_id, source_event_id)",
     )
     .await?;
     query(

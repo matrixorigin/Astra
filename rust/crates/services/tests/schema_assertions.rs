@@ -1290,6 +1290,17 @@ async fn phase2_web_hydration_schema_contract() {
         ["user_id", "run_id", "source_event_idx"],
         "transcript source event lookups must be owner-bound"
     );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_transcript_items",
+            "idx_transcript_owner_session_source_event"
+        )
+        .await,
+        ["user_id", "session_id", "source_event_id"],
+        "transcript source-event idempotency lookups must be owner/session-bound"
+    );
     let transcript_page_columns = column_names(&pool, &schema, "transcript_pages").await;
     assert!(
         transcript_page_columns
