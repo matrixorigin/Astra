@@ -634,6 +634,8 @@ struct SummaryClientTurnIntentJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
 }
 
+const RESOLVED_TURN_LLM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
+
 #[async_trait]
 impl astra_services::TurnIntentJudge for SummaryClientTurnIntentJudge {
     async fn judge(
@@ -1033,6 +1035,7 @@ pub struct ServerAgenticLoopHost {
     /// Summary-classifier calls need completion overrides and forwarded
     /// headers, which `LlmConnParams` intentionally does not carry.
     resolved_llm_config: Option<ResolvedTurnLlmConfig>,
+    resolved_llm_config_at: Option<Instant>,
 
     // ── Context ──
     edge_tools: Vec<Value>,
@@ -1519,6 +1522,7 @@ impl ServerAgenticLoopHostBuilder {
             resolved_context_window: None,
             resolved_llm_params: None,
             resolved_llm_config: None,
+            resolved_llm_config_at: None,
             edge_tools,
             capabilities: self.capabilities,
             edge_profile: self.edge_profile,
@@ -1681,6 +1685,12 @@ impl ServerAgenticLoopHost {
         let Some(config) = self.resolved_llm_config.as_ref() else {
             return false;
         };
+        let Some(inserted_at) = self.resolved_llm_config_at else {
+            return false;
+        };
+        if inserted_at.elapsed() > RESOLVED_TURN_LLM_CONFIG_CACHE_TTL {
+            return false;
+        }
         if self.llm_token_service.is_some()
             && config.header_overrides != state.hooks.forward_headers
         {
@@ -1697,6 +1707,7 @@ impl ServerAgenticLoopHost {
         self.resolved_context_window = None;
         self.resolved_llm_params = None;
         self.resolved_llm_config = None;
+        self.resolved_llm_config_at = None;
     }
 
     fn remember_resolved_llm_config(&mut self, llm_cfg: &ResolvedTurnLlmConfig) {
@@ -1710,6 +1721,7 @@ impl ServerAgenticLoopHost {
             max_output_tokens: 4096,
         });
         self.resolved_llm_config = Some(llm_cfg.clone());
+        self.resolved_llm_config_at = Some(Instant::now());
     }
 
     async fn turn_intent_summary_client(
@@ -8295,6 +8307,48 @@ mod tests {
                 .map(String::as_str),
             Some("Bearer second")
         );
+    }
+
+    #[tokio::test]
+    async fn host_model_resolution_refreshes_after_cache_ttl() {
+        let state = create_test_state();
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-model-cache".to_string(),
+            "session-model-cache".to_string(),
+        )
+        .with_model(Some("gpt-5-mini".to_string()))
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: "http://catalog-a/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(1000),
+        }))
+        .build();
+
+        let first = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("first resolution");
+        host.resolved_llm_config_at =
+            Some(Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL - Duration::from_secs(1));
+        host.llm_token_service = Some(LlmTokenServiceConfig {
+            url: "http://catalog-b/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(2000),
+        });
+        let second = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("second resolution");
+
+        assert_ne!(
+            second.completions_url_override,
+            first.completions_url_override
+        );
+        assert_eq!(
+            second.completions_url_override,
+            Some("http://catalog-b/api/v1/chat/completions".to_string())
+        );
+        assert_eq!(second.request_timeout, Some(Duration::from_millis(2000)));
     }
 
     #[test]
