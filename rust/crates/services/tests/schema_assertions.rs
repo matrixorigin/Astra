@@ -1290,6 +1290,17 @@ async fn phase2_web_hydration_schema_contract() {
         ["user_id", "run_id", "source_event_idx"],
         "transcript source event lookups must be owner-bound"
     );
+    assert!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_transcript_items",
+            "idx_transcript_user_session_seq"
+        )
+        .await
+        .is_empty(),
+        "session_transcript_items must drop MatrixOne-broken legacy index idx_transcript_user_session_seq"
+    );
     let transcript_page_columns = column_names(&pool, &schema, "transcript_pages").await;
     assert!(
         transcript_page_columns

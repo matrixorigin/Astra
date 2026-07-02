@@ -1710,6 +1710,16 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
+    // MatrixOne #25377: legacy secondary indexes that explicitly include the
+    // full transcript primary key can have empty hidden index tables and return
+    // wrong results for transcript sequence allocation.
+    drop_index_if_present(
+        &pool,
+        &settings.database,
+        "session_transcript_items",
+        "idx_transcript_user_session_seq",
+    )
+    .await?;
     ensure_primary_key_shape(
         &pool,
         &settings.database,
@@ -5311,6 +5321,34 @@ mod tests {
         assert!(
             !insert_body.contains("INSERT IGNORE INTO agent_event_edges"),
             "agent_event_edges must not hide ordering conflicts with INSERT IGNORE"
+        );
+    }
+
+    #[test]
+    fn transcript_items_schema_drops_legacy_matrixone_bad_index() {
+        let source = include_str!("storage.rs");
+        let create_ddl = source
+            .split("CREATE TABLE IF NOT EXISTS session_transcript_items")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("session_transcript_items DDL");
+        assert!(
+            !create_ddl.contains("idx_transcript_user_session_seq"),
+            "fresh transcript tables must not recreate the MatrixOne-broken legacy index"
+        );
+
+        let transcript_bootstrap = source
+            .split("CREATE TABLE IF NOT EXISTS session_transcript_items")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("CREATE TABLE IF NOT EXISTS transcript_pages")
+                    .next()
+            })
+            .expect("session_transcript_items bootstrap block");
+        assert!(
+            transcript_bootstrap.contains("drop_index_if_present(")
+                && transcript_bootstrap.contains("\"idx_transcript_user_session_seq\""),
+            "schema bootstrap must drop the MatrixOne-broken legacy transcript index"
         );
     }
 
