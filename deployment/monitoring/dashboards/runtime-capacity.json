@@ -377,6 +377,48 @@
             "legendFormat": "drain {{outcome}}"
           }
         ]
+      },
+      {
+        "title": "Event Ingestion Backpressure",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 93},
+        "targets": [
+          {
+            "expr": "rate(astra_event_ingestion_enqueue_overflows_total[5m])",
+            "legendFormat": "enqueue overflows"
+          },
+          {
+            "expr": "rate(astra_event_ingestion_events_dropped_before_acceptance_total[5m])",
+            "legendFormat": "dropped before acceptance"
+          },
+          {
+            "expr": "rate(astra_event_ingestion_events_dropped_before_acceptance_by_priority_total[5m])",
+            "legendFormat": "{{priority}} drops before acceptance"
+          }
+        ]
+      },
+      {
+        "title": "Event Ingestion Flush Health",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 93},
+        "targets": [
+          {
+            "expr": "rate(astra_event_ingestion_events_received_total[5m])",
+            "legendFormat": "received"
+          },
+          {
+            "expr": "rate(astra_event_ingestion_events_flushed_total[5m])",
+            "legendFormat": "flushed"
+          },
+          {
+            "expr": "rate(astra_event_ingestion_events_dropped_permanent_total[5m])",
+            "legendFormat": "permanent drops"
+          },
+          {
+            "expr": "rate(astra_event_ingestion_errors_total[5m])",
+            "legendFormat": "errors"
+          }
+        ]
       }
     ]
   }
