@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
@@ -26,6 +26,8 @@ use uuid::Uuid;
 use crate::turn::observation_dispatcher::{
     FileSink, MemorySink, ObservationDispatcher, ObservationEvent,
 };
+
+const DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Lazily-initialized process-wide alert dispatcher.
 ///
@@ -164,6 +166,11 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<(), astra_core::ClassifiedError> {
+    let poll_started = tokio::time::Instant::now();
+    if !state.deferred_input.should_poll_user_inputs(poll_started) {
+        return Ok(());
+    }
+
     let (run_control, user_id, run_id) = match (
         state.run_control.as_ref(),
         state.context_manifest_user_id.as_ref(),
@@ -182,6 +189,9 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
         )
         .await;
     if let Some(error) = &poll.error {
+        state
+            .deferred_input
+            .note_user_input_poll_finished(poll_started, DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL);
         tracing::warn!(run_id, error = %error, "deferred user input poll failed");
         return Ok(());
     }
@@ -191,6 +201,9 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     let release_event_indices = state
         .deferred_input
         .release_event_indices_to_ack(&observed.released_event_indices);
+    state
+        .deferred_input
+        .note_user_input_poll_finished(poll_started, DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL);
     if observed.raw_inputs.is_empty() && release_event_indices.is_empty() {
         return Ok(());
     }
@@ -3495,6 +3508,7 @@ mod tests {
 
     struct StubRunControlProvider {
         polls: Mutex<VecDeque<RunQueuedInputPoll>>,
+        poll_calls: Mutex<Vec<usize>>,
         released: Mutex<Vec<usize>>,
         release_failures: Mutex<usize>,
     }
@@ -3503,6 +3517,7 @@ mod tests {
         fn new(polls: Vec<RunQueuedInputPoll>) -> Self {
             Self {
                 polls: Mutex::new(VecDeque::from(polls)),
+                poll_calls: Mutex::new(Vec::new()),
                 released: Mutex::new(Vec::new()),
                 release_failures: Mutex::new(0),
             }
@@ -3511,9 +3526,14 @@ mod tests {
         fn with_release_failures(polls: Vec<RunQueuedInputPoll>, release_failures: usize) -> Self {
             Self {
                 polls: Mutex::new(VecDeque::from(polls)),
+                poll_calls: Mutex::new(Vec::new()),
                 released: Mutex::new(Vec::new()),
                 release_failures: Mutex::new(release_failures),
             }
+        }
+
+        async fn poll_call_count(&self) -> usize {
+            self.poll_calls.lock().await.len()
         }
     }
 
@@ -3659,6 +3679,7 @@ mod tests {
             _run_id: &str,
             after_event_index: usize,
         ) -> RunQueuedInputPoll {
+            self.poll_calls.lock().await.push(after_event_index);
             self.polls
                 .lock()
                 .await
@@ -5731,6 +5752,64 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn deferred_user_input_empty_poll_is_throttled() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-empty-throttle".into());
+        state.context_manifest_user_id = Some("user-deferred".into());
+        let provider = Arc::new(StubRunControlProvider::new(vec![
+            RunQueuedInputPoll {
+                next_cursor: 0,
+                inputs: Vec::new(),
+                error: None,
+            },
+            RunQueuedInputPoll {
+                next_cursor: 2,
+                inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                    event_index: 1,
+                    input: serde_json::json!({"content": "arrived after quiet poll"}),
+                }],
+                error: None,
+            },
+        ]));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(provider.poll_call_count().await, 1);
+
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.poll_call_count().await,
+            1,
+            "empty poll should suppress immediate follow-up DB poll"
+        );
+        assert!(state.messages.is_empty());
+
+        tokio::time::advance(DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL - Duration::from_millis(1))
+            .await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.poll_call_count().await,
+            1,
+            "poll should remain suppressed until the interval fully elapses"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(provider.poll_call_count().await, 2);
+        assert_eq!(state.message, "arrived after quiet poll");
+        assert_eq!(*provider.released.lock().await, vec![1]);
+    }
+
     #[tokio::test]
     async fn deferred_user_input_retries_release_without_reinjecting_after_ack_failure() {
         let mut state = make_state();
@@ -5765,6 +5844,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
+        assert_eq!(
+            provider.poll_call_count().await,
+            2,
+            "pending release acknowledgement must bypass empty-poll throttling"
+        );
         assert_eq!(*provider.released.lock().await, vec![1]);
         assert_eq!(
             state

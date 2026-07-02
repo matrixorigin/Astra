@@ -1056,6 +1056,9 @@ pub struct DeferredUserInputRecord {
 pub struct DeferredInputState {
     /// Durable event cursor for deferred user-input polling.
     deferred_user_input_cursor: usize,
+    /// Next time a best-effort empty/error deferred-input poll is allowed.
+    /// Pending release acknowledgements bypass this throttle.
+    next_deferred_user_input_poll_at: Option<tokio::time::Instant>,
     /// Event indices already delivered to the model but not yet durably marked
     /// as released. Retried on later poll points without re-injecting content.
     pending_release_event_indices: Vec<usize>,
@@ -1075,6 +1078,23 @@ pub(crate) struct ObservedDeferredUserInputs {
 impl DeferredInputState {
     pub fn deferred_user_input_cursor(&self) -> usize {
         self.deferred_user_input_cursor
+    }
+
+    pub(crate) fn should_poll_user_inputs(&self, now: tokio::time::Instant) -> bool {
+        if !self.pending_release_event_indices.is_empty() {
+            return true;
+        }
+        self.next_deferred_user_input_poll_at
+            .map(|next| now >= next)
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn note_user_input_poll_finished(
+        &mut self,
+        now: tokio::time::Instant,
+        interval: std::time::Duration,
+    ) {
+        self.next_deferred_user_input_poll_at = Some(now + interval);
     }
 
     pub fn delivered_user_inputs(&self) -> &[DeferredUserInputRecord] {
