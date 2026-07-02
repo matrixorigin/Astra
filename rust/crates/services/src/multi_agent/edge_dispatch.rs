@@ -501,6 +501,46 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    static EDGE_DISPATCH_DB: tokio::sync::OnceCell<astra_core::SharedPool> =
+        tokio::sync::OnceCell::const_new();
+
+    async fn setup_edge_dispatch_db_it() -> astra_core::SharedPool {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+        );
+        EDGE_DISPATCH_DB
+            .get_or_init(|| async {
+                let settings = astra_core::MatrixOneSettings::from_env();
+                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                    .unwrap_or_else(|_| "mysql".to_string());
+                crate::storage::ensure_core_schema(&settings, &catalog)
+                    .await
+                    .expect("ensure_core_schema");
+                astra_core::SharedPool::new(&settings)
+                    .await
+                    .expect("SharedPool::new")
+            })
+            .await
+            .clone()
+    }
+
+    async fn cleanup_edge_dispatch_fixture(
+        pool: &astra_core::SharedPool,
+        user_id: &str,
+        request_id: &str,
+    ) {
+        sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ? AND request_id = ?")
+            .bind(user_id)
+            .bind(request_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup edge dispatch fixture");
+    }
 
     struct FakeEdgeDispatchRow {
         failed_column: Option<&'static str>,
@@ -645,5 +685,161 @@ mod tests {
             error.contains("claimed 2 rows but updated 1"),
             "error should identify claim/update mismatch: {error}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn matrixone_dispatch_round_trip_survives_cross_pod_delivery() {
+        let pool = setup_edge_dispatch_db_it().await;
+        let pod_a = DatabaseEdgeDispatchService::from_shared(&pool);
+        let pod_b = DatabaseEdgeDispatchService::from_shared(&pool);
+        let pod_c = DatabaseEdgeDispatchService::from_shared(&pool);
+
+        let user_id = format!("edge-user-{}", Uuid::new_v4());
+        let other_user_id = format!("edge-other-{}", Uuid::new_v4());
+        let edge_agent_id = format!("edge-agent-{}", Uuid::new_v4());
+        let other_edge_agent_id = format!("edge-other-agent-{}", Uuid::new_v4());
+        let request_id = format!("edge-req-{}", Uuid::new_v4());
+        cleanup_edge_dispatch_fixture(&pool, &user_id, &request_id).await;
+        cleanup_edge_dispatch_fixture(&pool, &other_user_id, &request_id).await;
+
+        let payload = json!({
+            "request_id": request_id,
+            "tool": "bash",
+            "args": {"cmd": "printf ok"}
+        })
+        .to_string();
+        let dispatch_id = pod_a
+            .insert_dispatch(&user_id, &edge_agent_id, &request_id, &payload)
+            .await
+            .expect("insert pending dispatch");
+        let duplicate_dispatch_id = pod_a
+            .insert_dispatch(&user_id, &edge_agent_id, &request_id, &payload)
+            .await
+            .expect("duplicate insert should be idempotent");
+        assert_eq!(duplicate_dispatch_id, dispatch_id);
+
+        let wrong_agent_rows = pod_b
+            .poll_pending(&user_id, &other_edge_agent_id)
+            .await
+            .expect("wrong edge agent poll");
+        assert!(wrong_agent_rows.is_empty());
+
+        assert!(
+            !pod_c
+                .deliver_result(
+                    &other_user_id,
+                    &request_id,
+                    &edge_agent_id,
+                    r#"{"status":"completed","output":"wrong-user"}"#,
+                )
+                .await
+                .expect("wrong owner deliver should not error")
+        );
+        assert!(
+            !pod_c
+                .deliver_result(
+                    &user_id,
+                    &request_id,
+                    &other_edge_agent_id,
+                    r#"{"status":"completed","output":"wrong-agent"}"#,
+                )
+                .await
+                .expect("wrong agent deliver should not error")
+        );
+
+        let claimed = pod_b
+            .poll_pending(&user_id, &edge_agent_id)
+            .await
+            .expect("correct edge agent poll");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].dispatch_id, dispatch_id);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&claimed[0].payload_json)
+                .expect("claimed payload should be valid JSON"),
+            serde_json::from_str::<serde_json::Value>(&payload).expect("payload should be JSON")
+        );
+        assert_eq!(claimed[0].status, "dispatched");
+        assert!(
+            pod_b
+                .poll_pending(&user_id, &edge_agent_id)
+                .await
+                .expect("already claimed poll")
+                .is_empty(),
+            "claimed dispatch must not be re-claimed by another pod"
+        );
+
+        let wait_user_id = user_id.clone();
+        let wait_request_id = request_id.clone();
+        let wait = tokio::spawn(async move {
+            pod_a
+                .wait_result(
+                    &wait_user_id,
+                    &wait_request_id,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let result_json = json!({
+            "request_id": request_id,
+            "status": "completed",
+            "output": "ok",
+            "duration_ms": 12
+        })
+        .to_string();
+        assert!(
+            pod_c
+                .deliver_result(&user_id, &request_id, &edge_agent_id, &result_json)
+                .await
+                .expect("cross-pod deliver result")
+        );
+        let waited = wait
+            .await
+            .expect("wait task should join")
+            .expect("wait_result should not fail")
+            .expect("wait_result should observe completed result");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&waited)
+                .expect("waited result should be JSON"),
+            serde_json::from_str::<serde_json::Value>(&result_json).expect("result should be JSON")
+        );
+        assert!(
+            !pod_c
+                .deliver_result(
+                    &user_id,
+                    &request_id,
+                    &edge_agent_id,
+                    r#"{"status":"completed","output":"duplicate"}"#,
+                )
+                .await
+                .expect("duplicate terminal deliver should not error"),
+            "terminal result must not be overwritten"
+        );
+
+        let row = sqlx::query(
+            "SELECT status, CAST(result_json AS CHAR) AS result_json
+             FROM edge_pending_dispatch
+             WHERE user_id = ? AND request_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&request_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("load terminal dispatch row");
+        let status: String = row.try_get("status").expect("status");
+        let stored_result: Option<String> = row.try_get("result_json").expect("result_json");
+        assert_eq!(status, "completed");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                stored_result.as_deref().expect("stored result_json")
+            )
+            .expect("stored result_json should be JSON"),
+            serde_json::from_str::<serde_json::Value>(&result_json).expect("result should be JSON")
+        );
+
+        cleanup_edge_dispatch_fixture(&pool, &user_id, &request_id).await;
+        cleanup_edge_dispatch_fixture(&pool, &other_user_id, &request_id).await;
     }
 }
