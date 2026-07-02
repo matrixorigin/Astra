@@ -15,7 +15,8 @@ pub(super) async fn build_runtime_wiring(
         shared_pool.clone(),
     ));
     let run_engine = crate::server::run::engine::RunEngine::new(run_store)
-        .with_projection_store(Arc::clone(&state_projection_store));
+        .with_projection_store(Arc::clone(&state_projection_store))
+        .with_metrics_registry(state.metrics_registry());
     recover_active_runs(&run_engine).await;
 
     let profile_registry = Arc::new(default_agent_profile_registry());

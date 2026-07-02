@@ -41,10 +41,14 @@ use astra_services::{
         RuntimeProfileRequest, SelectedModelRequest, durable_run_status_kind,
     },
 };
+use astra_turn_core::pipeline_metrics::MetricsRegistry;
 
 use astra_core::{
     STATUS_CANCELLED, STATUS_INPUT_QUEUED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING,
 };
+
+const METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL: &str = "astra_run_control_poll_attempts_total";
+const METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL: &str = "astra_run_control_poll_errors_total";
 
 /// Durable run execution engine.
 ///
@@ -57,6 +61,7 @@ use astra_core::{
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
     projection_store: Option<Arc<DatabaseStateProjectionStore>>,
+    metrics_registry: Option<Arc<MetricsRegistry>>,
 }
 
 /// Optional run-start interaction context persisted into the durable
@@ -98,6 +103,49 @@ fn runtime_profile_label(profile: RuntimeProfileRequest) -> &'static str {
         RuntimeProfileRequest::RequestScopedRuntimeMcp => "request_scoped_runtime_mcp",
         RuntimeProfileRequest::AgentBindingRegistry => "agent_binding_registry",
     }
+}
+
+fn register_run_control_poll_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL,
+        "Run control-plane poll attempts by operation and low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL,
+        "Run control-plane poll errors by operation and low-cardinality class.",
+    );
+}
+
+fn record_control_poll_attempt(
+    registry: Option<&Arc<MetricsRegistry>>,
+    operation: &'static str,
+    outcome: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_run_control_poll_metrics(registry);
+    registry.increment_counter(
+        METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL,
+        &[("operation", operation), ("outcome", outcome)],
+        1,
+    );
+}
+
+fn record_control_poll_error(
+    registry: Option<&Arc<MetricsRegistry>>,
+    operation: &'static str,
+    class: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_run_control_poll_metrics(registry);
+    registry.increment_counter(
+        METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL,
+        &[("operation", operation), ("class", class)],
+        1,
+    );
 }
 
 fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
@@ -166,6 +214,7 @@ impl RunEngine {
         Self {
             store,
             projection_store: None,
+            metrics_registry: None,
         }
     }
 
@@ -179,6 +228,13 @@ impl RunEngine {
         projection_store: Arc<DatabaseStateProjectionStore>,
     ) -> Self {
         self.projection_store = Some(projection_store);
+        self
+    }
+
+    /// Attach the shared metrics registry used by `/metrics`.
+    pub fn with_metrics_registry(mut self, registry: Arc<MetricsRegistry>) -> Self {
+        register_run_control_poll_metrics(&registry);
+        self.metrics_registry = Some(registry);
         self
     }
 
@@ -627,7 +683,17 @@ impl RunEngine {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<RunControlStatus>, String> {
-        let record = self.store.load_run(user_id, run_id).await?;
+        let record = match self.store.load_run(user_id, run_id).await {
+            Ok(record) => {
+                record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "ok");
+                record
+            }
+            Err(error) => {
+                record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "error");
+                record_control_poll_error(self.metrics_registry.as_ref(), "status", "store");
+                return Err(error);
+            }
+        };
         Ok(match record {
             None => None,
             Some(r) => match durable_run_status_kind(&r.status) {
@@ -802,6 +868,16 @@ impl RunInputProvider for RunEngine {
         let run = match self.store.load_run(user_id, run_id).await {
             Ok(Some(run)) => run,
             Ok(None) => {
+                record_control_poll_attempt(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "missing",
+                );
+                record_control_poll_error(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "missing",
+                );
                 let error = format!("run not found while polling deferred input: {run_id}");
                 return RunQueuedInputPoll {
                     next_cursor: after_event_index,
@@ -814,6 +890,16 @@ impl RunInputProvider for RunEngine {
                     run_id,
                     error = %error,
                     "failed to poll queued user inputs from run store"
+                );
+                record_control_poll_attempt(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "error",
+                );
+                record_control_poll_error(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "store",
                 );
                 return RunQueuedInputPoll {
                     next_cursor: after_event_index,
@@ -883,8 +969,22 @@ impl RunInputProvider for RunEngine {
                     error = %update_error,
                     "failed to auto-heal stale input-queued status after released inputs"
                 );
+                record_control_poll_attempt(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "auto_heal_error",
+                );
+                record_control_poll_error(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "auto_heal",
+                );
                 error = Some(update_error);
             }
+        }
+
+        if error.is_none() {
+            record_control_poll_attempt(self.metrics_registry.as_ref(), "user_input_poll", "ok");
         }
 
         RunQueuedInputPoll {
@@ -1653,6 +1753,101 @@ mod tests {
                 .await
                 .unwrap(),
             Some(RunControlStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_control_poll_metrics_record_status_and_input_store_errors() {
+        let registry = Arc::new(MetricsRegistry::new());
+        let engine =
+            RunEngine::new(Arc::new(FailingLoadRunStore)).with_metrics_registry(registry.clone());
+
+        let status = engine.check_control_status("user-1", "run-input").await;
+        assert_eq!(status.unwrap_err(), "load failed");
+        let poll = engine.poll_user_inputs("user-1", "run-input", 7).await;
+        assert_eq!(poll.error.as_deref(), Some("load failed"));
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_attempts_total{operation=\"status\",outcome=\"error\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_errors_total{class=\"store\",operation=\"status\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_attempts_total{operation=\"user_input_poll\",outcome=\"error\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_errors_total{class=\"store\",operation=\"user_input_poll\"} 1"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_control_poll_metrics_record_missing_and_ok_without_high_cardinality() {
+        let registry = Arc::new(MetricsRegistry::new());
+        let engine = test_engine().with_metrics_registry(registry.clone());
+
+        let missing = engine.poll_user_inputs("user-1", "missing-run", 3).await;
+        assert_eq!(
+            missing.error.as_deref(),
+            Some("run not found while polling deferred input: missing-run")
+        );
+        engine
+            .start_run("run-input", "user-1", "sess-input")
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .check_control_status("user-1", "run-input")
+                .await
+                .unwrap(),
+            None
+        );
+        let ok = engine.poll_user_inputs("user-1", "run-input", 0).await;
+        assert_eq!(ok.error, None);
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_attempts_total{operation=\"user_input_poll\",outcome=\"missing\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_errors_total{class=\"missing\",operation=\"user_input_poll\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_attempts_total{operation=\"status\",outcome=\"ok\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_attempts_total{operation=\"user_input_poll\",outcome=\"ok\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("user-1")
+                && !rendered.contains("run-input")
+                && !rendered.contains("missing-run"),
+            "metrics must stay low-cardinality: {rendered}"
         );
     }
 
