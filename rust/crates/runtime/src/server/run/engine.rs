@@ -1085,32 +1085,39 @@ impl RunInputProvider for RunEngine {
             | DurableRunStatusKind::Failed => return Ok(()),
             _ => {}
         }
-        self.append_event(
-            user_id,
-            run_id,
-            serde_json::json!({
-                "event_type": "user_inputs_released",
-                "data": { "event_indices": event_indices },
-            }),
-        )
-        .await?;
-        let current =
-            self.store.load_run(user_id, run_id).await?.ok_or_else(|| {
+        let release_event = serde_json::json!({
+            "event_type": "user_inputs_released",
+            "data": { "event_indices": event_indices },
+        });
+        if run.status == STATUS_INPUT_QUEUED {
+            let updated = self
+                .transition_status_with_event_if_current(
+                    user_id,
+                    run_id,
+                    &[STATUS_INPUT_QUEUED],
+                    STATUS_RUNNING,
+                    None,
+                    None,
+                    release_event.clone(),
+                )
+                .await?;
+            if updated {
+                return Ok(());
+            }
+            let current = self.store.load_run(user_id, run_id).await?.ok_or_else(|| {
                 format!("run not found after acknowledging deferred input: {run_id}")
             })?;
-        if current.status != STATUS_INPUT_QUEUED {
-            return Ok(());
+            match durable_run_status_kind(&current.status) {
+                DurableRunStatusKind::Cancelled
+                | DurableRunStatusKind::Completed
+                | DurableRunStatusKind::Failed => return Ok(()),
+                _ => {}
+            }
+            if current.status == STATUS_INPUT_QUEUED {
+                return Ok(());
+            }
         }
-        self.persist_status_if_current(
-            user_id,
-            run_id,
-            &[STATUS_INPUT_QUEUED],
-            STATUS_RUNNING,
-            None,
-            None,
-        )
-        .await
-        .map(|_| ())
+        self.append_event(user_id, run_id, release_event).await
     }
 }
 
@@ -2004,6 +2011,16 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, STATUS_RUNNING);
         assert_eq!(run.waiting_for, None);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(
+                    |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("user_inputs_released")
+                )
+                .count(),
+            1
+        );
         let poll = engine.poll_user_inputs("user-1", "run-queued", 0).await;
         assert!(
             poll.inputs.is_empty(),
@@ -2051,6 +2068,13 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, STATUS_PAUSED);
         assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
+        assert!(
+            run.events.iter().any(|event| {
+                event.get("event_type").and_then(serde_json::Value::as_str)
+                    == Some("user_inputs_released")
+            }),
+            "paused release must still record that delivered inputs were consumed"
+        );
     }
 
     #[tokio::test]
