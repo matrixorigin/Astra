@@ -7,6 +7,7 @@ use std::{
 
 use astra_core::{ClassifiedError, ErrorKind, SharedPool};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
+use serde_json::{Map, Value};
 use sqlx::Row;
 
 const ENV_MODE: &str = "ASTRA_LLM_PROVIDER_ADMISSION_MODE";
@@ -35,6 +36,14 @@ const METRIC_PROVIDER_ADMISSION_CLEANUP_RUNS_TOTAL: &str =
     "astra_llm_provider_admission_cleanup_runs_total";
 const METRIC_PROVIDER_ADMISSION_CLEANUP_ROWS_TOTAL: &str =
     "astra_llm_provider_admission_cleanup_rows_total";
+const METRIC_PROVIDER_ADMISSION_CALIBRATION_SAMPLES_TOTAL: &str =
+    "astra_llm_provider_admission_calibration_samples_total";
+const METRIC_PROVIDER_ADMISSION_CALIBRATION_ESTIMATED_TOKENS_TOTAL: &str =
+    "astra_llm_provider_admission_calibration_estimated_tokens_total";
+const METRIC_PROVIDER_ADMISSION_CALIBRATION_ACTUAL_TOKENS_TOTAL: &str =
+    "astra_llm_provider_admission_calibration_actual_tokens_total";
+const METRIC_PROVIDER_ADMISSION_CALIBRATION_ABS_ERROR_TOKENS_TOTAL: &str =
+    "astra_llm_provider_admission_calibration_abs_error_tokens_total";
 
 const CREATE_WINDOWS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS llm_provider_admission_windows (
@@ -318,6 +327,22 @@ fn register_provider_admission_metrics(registry: &MetricsRegistry) {
         METRIC_PROVIDER_ADMISSION_CLEANUP_ROWS_TOTAL,
         "LLM provider admission window cleanup deleted rows by low-cardinality outcome.",
     );
+    registry.register_counter(
+        METRIC_PROVIDER_ADMISSION_CALIBRATION_SAMPLES_TOTAL,
+        "LLM provider admission estimate calibration samples by low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_PROVIDER_ADMISSION_CALIBRATION_ESTIMATED_TOKENS_TOTAL,
+        "Total estimated tokens for LLM provider admission calibration by low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_PROVIDER_ADMISSION_CALIBRATION_ACTUAL_TOKENS_TOTAL,
+        "Total provider-reported actual tokens for LLM provider admission calibration by low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_PROVIDER_ADMISSION_CALIBRATION_ABS_ERROR_TOKENS_TOTAL,
+        "Total absolute token-estimate error for LLM provider admission calibration by low-cardinality outcome.",
+    );
 }
 
 fn record_attempt(config: &ProviderAdmissionConfig, outcome: &'static str) {
@@ -406,6 +431,56 @@ fn record_cleanup(outcome: &'static str, rows: u64) {
         &[("outcome", outcome)],
         rows,
     );
+}
+
+pub(crate) fn record_llm_provider_admission_calibration(
+    estimated_tokens: u64,
+    usage: &Map<String, Value>,
+) {
+    let Some(registry) = provider_admission_metrics_registry() else {
+        return;
+    };
+    register_provider_admission_metrics(&registry);
+    let estimated_tokens = estimated_tokens.max(1);
+    let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(usage);
+    let actual_tokens = usage.total_tokens();
+    let outcome = calibration_outcome(estimated_tokens, actual_tokens);
+    let absolute_error = estimated_tokens.abs_diff(actual_tokens);
+    let labels = &[("outcome", outcome)];
+    registry.increment_counter(
+        METRIC_PROVIDER_ADMISSION_CALIBRATION_SAMPLES_TOTAL,
+        labels,
+        1,
+    );
+    registry.increment_counter(
+        METRIC_PROVIDER_ADMISSION_CALIBRATION_ESTIMATED_TOKENS_TOTAL,
+        labels,
+        estimated_tokens,
+    );
+    registry.increment_counter(
+        METRIC_PROVIDER_ADMISSION_CALIBRATION_ACTUAL_TOKENS_TOTAL,
+        labels,
+        actual_tokens,
+    );
+    registry.increment_counter(
+        METRIC_PROVIDER_ADMISSION_CALIBRATION_ABS_ERROR_TOKENS_TOTAL,
+        labels,
+        absolute_error,
+    );
+}
+
+fn calibration_outcome(estimated_tokens: u64, actual_tokens: u64) -> &'static str {
+    if actual_tokens == 0 {
+        return "missing_usage";
+    }
+    let absolute_error = estimated_tokens.abs_diff(actual_tokens);
+    if absolute_error.saturating_mul(10) <= actual_tokens {
+        "within_10pct"
+    } else if estimated_tokens > actual_tokens {
+        "overestimate"
+    } else {
+        "underestimate"
+    }
 }
 
 pub(crate) async fn ensure_llm_provider_admission_schema_if_configured(
@@ -970,6 +1045,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn calibration_outcome_classifies_missing_close_over_and_under() {
+        assert_eq!(calibration_outcome(1_000, 0), "missing_usage");
+        assert_eq!(calibration_outcome(1_050, 1_000), "within_10pct");
+        assert_eq!(calibration_outcome(1_250, 1_000), "overestimate");
+        assert_eq!(calibration_outcome(750, 1_000), "underestimate");
+    }
+
     #[tokio::test]
     async fn disabled_admission_records_disabled_and_allows_without_pool() {
         let _guard = metrics_test_lock().lock_owned().await;
@@ -1014,6 +1097,59 @@ mod tests {
         assert!(!rendered.contains("provider="));
         assert!(!rendered.contains("model="));
         assert!(!rendered.contains("user_id="));
+    }
+
+    #[tokio::test]
+    async fn calibration_metrics_record_actual_estimate_and_error() {
+        let _guard = metrics_test_lock().lock_owned().await;
+        let registry = Arc::new(MetricsRegistry::new());
+        set_llm_provider_admission_metrics_registry(registry.clone());
+        let usage = crate::turn::token_usage::TokenUsage {
+            input_tokens: 600,
+            cached_input_tokens: 50,
+            cache_creation_tokens: 25,
+            output_tokens: 325,
+        }
+        .to_json_map();
+
+        record_llm_provider_admission_calibration(1_250, &usage);
+
+        let rendered = registry.render_prometheus();
+        assert!(rendered.contains(
+            r#"astra_llm_provider_admission_calibration_samples_total{outcome="overestimate"} 1"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_provider_admission_calibration_estimated_tokens_total{outcome="overestimate"} 1250"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_provider_admission_calibration_actual_tokens_total{outcome="overestimate"} 1000"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_provider_admission_calibration_abs_error_tokens_total{outcome="overestimate"} 250"#
+        ));
+        assert!(!rendered.contains("provider="));
+        assert!(!rendered.contains("model="));
+        assert!(!rendered.contains("user_id="));
+    }
+
+    #[tokio::test]
+    async fn calibration_metrics_record_missing_usage() {
+        let _guard = metrics_test_lock().lock_owned().await;
+        let registry = Arc::new(MetricsRegistry::new());
+        set_llm_provider_admission_metrics_registry(registry.clone());
+
+        record_llm_provider_admission_calibration(2_000, &Map::new());
+
+        let rendered = registry.render_prometheus();
+        assert!(rendered.contains(
+            r#"astra_llm_provider_admission_calibration_samples_total{outcome="missing_usage"} 1"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_provider_admission_calibration_estimated_tokens_total{outcome="missing_usage"} 2000"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_provider_admission_calibration_abs_error_tokens_total{outcome="missing_usage"} 2000"#
+        ));
     }
 
     #[tokio::test]

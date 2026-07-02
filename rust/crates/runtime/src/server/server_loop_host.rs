@@ -3883,6 +3883,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
             {
                 let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&r.usage);
+                crate::llm_provider_admission::record_llm_provider_admission_calibration(
+                    admission_estimated_tokens as u64,
+                    &r.usage,
+                );
                 state.step_recorder.end_llm_round(
                     &llm_cfg.model_name,
                     u.input_tokens,
