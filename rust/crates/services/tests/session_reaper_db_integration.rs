@@ -51,6 +51,13 @@ async fn count_owner_rows(
 
 async fn cleanup_owner_session_rows(pool: &Pool<MySql>, user_id: &str, session_id: &str) {
     for table in [
+        "session_tool_outputs",
+        "session_tool_output_batches",
+        "agent_run_events",
+        "run_display_projections",
+        "run_checkpoints",
+        "agent_runs",
+        "conversation_log",
         "prompt_deltas",
         "prompt_request_records",
         "agent_event_edges",
@@ -227,6 +234,13 @@ async fn reaper_deletes_full_session_lifecycle_tables() {
     let session_id = format!("reaper-delete-{}", Uuid::new_v4());
     let user_id = format!("reaper-user-{}", Uuid::new_v4());
     let request_id = format!("promptreq-{}", Uuid::new_v4().simple());
+    let run_id = format!("run-{}", Uuid::new_v4().simple());
+    let run_event_row_id = format!("run-event-row-{}", Uuid::new_v4().simple());
+    let run_event_id = format!("run-event-{}", Uuid::new_v4().simple());
+    let batch_id = format!("batch-{}", Uuid::new_v4().simple());
+    let output_id = format!("output-{}", Uuid::new_v4().simple());
+    let event_id = format!("event-{}", Uuid::new_v4().simple());
+    let parent_event_id = format!("parent-event-{}", Uuid::new_v4().simple());
     let owner_journal = journal_file_path_for_user(&user_id, &session_id).expect("journal path");
     std::fs::create_dir_all(owner_journal.parent().expect("journal parent"))
         .expect("create journal parent");
@@ -284,6 +298,90 @@ async fn reaper_deletes_full_session_lifecycle_tables() {
     .await
     .expect("insert prompt delta");
 
+    sqlx::query(
+        "INSERT INTO agent_runs
+         (run_id, user_id, session_id, root_run_id, ancestor_path, status)
+         VALUES (?, ?, ?, ?, '/', 'completed')",
+    )
+    .bind(&run_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .execute(&pool)
+    .await
+    .expect("insert agent run");
+    sqlx::query(
+        "INSERT INTO agent_run_events
+         (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json)
+         VALUES (?, ?, 0, ?, ?, 'run.completed', ?, REPEAT('f', 64), '{}')",
+    )
+    .bind(&run_event_row_id)
+    .bind(&run_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&run_event_id)
+    .execute(&pool)
+    .await
+    .expect("insert agent run event");
+    sqlx::query(
+        "INSERT INTO session_tool_output_batches
+         (batch_id, session_id, run_id, user_id, output_count, payload_bytes)
+         VALUES (?, ?, ?, ?, 1, 2)",
+    )
+    .bind(&batch_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert tool output batch");
+    sqlx::query(
+        "INSERT INTO session_tool_outputs
+         (output_id, batch_id, session_id, run_id, user_id, output_idx, tool_name, output_json, payload_bytes)
+         VALUES (?, ?, ?, ?, ?, 0, 'test_tool', '{}', 2)",
+    )
+    .bind(&output_id)
+    .bind(&batch_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert tool output");
+    sqlx::query(
+        "INSERT INTO conversation_log
+         (user_id, session_id, seq, turn, entry_type, payload)
+         VALUES (?, ?, 1, 1, 0, ?)",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(r#"{"type":"snapshot","seq":1,"turn":1,"messages":[],"session_state":{}}"#)
+    .execute(&pool)
+    .await
+    .expect("insert conversation log");
+    sqlx::query(
+        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content)
+         VALUES (?, ?, ?, 'test.event', '{}')",
+    )
+    .bind(&event_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert agent event");
+    sqlx::query(
+        "INSERT INTO agent_event_edges
+         (user_id, session_id, child_event_id, parent_event_id, relation_kind, parent_order)
+         VALUES (?, ?, ?, ?, 'causal', 0)",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&event_id)
+    .bind(&parent_event_id)
+    .execute(&pool)
+    .await
+    .expect("insert agent event edge");
+
     let policy = SessionReaperPolicy {
         idle_after_secs: 86_400,
         end_after_idle_secs: 86_400,
@@ -313,6 +411,20 @@ async fn reaper_deletes_full_session_lifecycle_tables() {
         "reaper must delete prompt_request_records"
     );
     assert_eq!(prompt_deltas, 0, "reaper must delete prompt_deltas");
+    for table in [
+        "agent_events",
+        "agent_event_edges",
+        "agent_run_events",
+        "conversation_log",
+        "session_tool_output_batches",
+        "session_tool_outputs",
+    ] {
+        assert_eq!(
+            count_owner_rows(&pool, table, &user_id, &session_id).await,
+            0,
+            "reaper must delete {table}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
