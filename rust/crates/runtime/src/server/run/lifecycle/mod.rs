@@ -149,6 +149,16 @@ fn per_user_run_quota_response(
     )
 }
 
+fn classified_terminal_error_code(error: &astra_core::ClassifiedError) -> String {
+    if let Some(details_json) = error.details_json.as_deref()
+        && let Ok(Value::Object(details)) = serde_json::from_str::<Value>(details_json)
+        && details.get("source").and_then(Value::as_str) == Some("llm_provider_admission")
+    {
+        return "llm_provider_admission_rejected".to_string();
+    }
+    error.kind.as_str().to_string()
+}
+
 fn register_run_admission_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
     registry.register_counter(
         METRIC_RUN_ADMISSION_ATTEMPTS_TOTAL,
@@ -2631,19 +2641,20 @@ impl AgenticRunLifecycleService {
                 }
                 Err(err) => {
                     let msg = err.to_string();
-                    let error_code = err.kind.as_str();
+                    let error_kind = err.kind.as_str();
+                    let error_code = classified_terminal_error_code(&err);
                     events.push(json!({
                         "event_type": "run_error",
                         "data": {
                             "error": &msg,
-                            "error_code": error_code,
-                            "error_kind": error_code,
+                            "error_code": &error_code,
+                            "error_kind": error_kind,
                         }
                     }));
                     let mut finished = usage;
                     finished["error"] = Value::String(msg.clone());
-                    finished["error_code"] = Value::String(error_code.to_string());
-                    finished["error_kind"] = Value::String(error_code.to_string());
+                    finished["error_code"] = Value::String(error_code);
+                    finished["error_kind"] = Value::String(error_kind.to_string());
                     events.push(json!({
                         "event_type": "run_finished",
                         "data": finished,
@@ -12454,6 +12465,41 @@ mod tests {
             events[1]["data"]["error"],
             "[network] LLM request failed: connection reset"
         );
+    }
+
+    #[test]
+    fn finalize_run_events_distinguishes_provider_admission_rejection() {
+        let svc = test_service();
+        let request = test_request("admission");
+        let state = svc.build_initial_state(
+            "test-user",
+            &request,
+            "session-1",
+            "run-1",
+            None,
+            None,
+            None,
+        );
+
+        let classified = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::RateLimit,
+            "LLM provider admission rpm limit reached",
+        )
+        .with_details_json(json!({"source": "llm_provider_admission"}).to_string());
+        let (events, status, _error) =
+            AgenticRunLifecycleService::finalize_run_events(Err(classified), vec![], &state);
+
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(
+            events[0]["data"]["error_code"],
+            "llm_provider_admission_rejected"
+        );
+        assert_eq!(events[0]["data"]["error_kind"], "rate_limit");
+        assert_eq!(
+            events[1]["data"]["error_code"],
+            "llm_provider_admission_rejected"
+        );
+        assert_eq!(events[1]["data"]["error_kind"], "rate_limit");
     }
 
     #[test]
