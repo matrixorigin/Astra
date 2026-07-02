@@ -258,6 +258,12 @@ enum FixedWindowAdmission {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WindowCounts {
+    request_count: u64,
+    token_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderAdmissionLimit {
     Rpm,
@@ -756,6 +762,17 @@ async fn db_fixed_window_admit(
     let window_start_ms = fixed_window_start_ms(now_ms, config.window_ms);
     let bucket_key = bucket_key(config.scope, provider, model);
     let estimated_tokens_i64 = i64::try_from(estimated_tokens).unwrap_or(i64::MAX);
+    let previous_window_start_ms = previous_window_start_ms(window_start_ms, config.window_ms);
+    let previous_counts =
+        fetch_window_counts(shared_pool, &bucket_key, previous_window_start_ms).await?;
+    let previous_weight =
+        weighted_previous_window_counts(previous_counts, now_ms, window_start_ms, config.window_ms);
+    let rpm_remaining = config
+        .rpm_limit
+        .map(|limit| remaining_limit_after_previous_weight(limit, previous_weight.request_count));
+    let tpm_remaining = config
+        .tpm_limit
+        .map(|limit| remaining_limit_after_previous_weight(limit, previous_weight.token_count));
 
     sqlx::query(INSERT_WINDOW_SQL)
         .bind(&bucket_key)
@@ -770,9 +787,9 @@ async fn db_fixed_window_admit(
                 .bind(estimated_tokens_i64)
                 .bind(&bucket_key)
                 .bind(window_start_ms)
-                .bind(i64::try_from(rpm_limit).unwrap_or(i64::MAX))
+                .bind(rpm_remaining.unwrap_or_else(|| i64::try_from(rpm_limit).unwrap_or(i64::MAX)))
                 .bind(estimated_tokens_i64)
-                .bind(i64::try_from(tpm_limit).unwrap_or(i64::MAX))
+                .bind(tpm_remaining.unwrap_or_else(|| i64::try_from(tpm_limit).unwrap_or(i64::MAX)))
                 .execute(shared_pool.get())
                 .await
         }
@@ -781,7 +798,7 @@ async fn db_fixed_window_admit(
                 .bind(estimated_tokens_i64)
                 .bind(&bucket_key)
                 .bind(window_start_ms)
-                .bind(i64::try_from(rpm_limit).unwrap_or(i64::MAX))
+                .bind(rpm_remaining.unwrap_or_else(|| i64::try_from(rpm_limit).unwrap_or(i64::MAX)))
                 .execute(shared_pool.get())
                 .await
         }
@@ -791,7 +808,7 @@ async fn db_fixed_window_admit(
                 .bind(&bucket_key)
                 .bind(window_start_ms)
                 .bind(estimated_tokens_i64)
-                .bind(i64::try_from(tpm_limit).unwrap_or(i64::MAX))
+                .bind(tpm_remaining.unwrap_or_else(|| i64::try_from(tpm_limit).unwrap_or(i64::MAX)))
                 .execute(shared_pool.get())
                 .await
         }
@@ -811,6 +828,7 @@ async fn db_fixed_window_admit(
             shared_pool,
             &bucket_key,
             window_start_ms,
+            previous_weight,
             config,
             estimated_tokens,
         )
@@ -826,9 +844,29 @@ async fn detect_rejected_limit(
     shared_pool: &SharedPool,
     bucket_key: &str,
     window_start_ms: i64,
+    previous_weight: WindowCounts,
     config: &ProviderAdmissionConfig,
     estimated_tokens: u64,
 ) -> Result<ProviderAdmissionLimit, ClassifiedError> {
+    let current_counts = fetch_window_counts(shared_pool, bucket_key, window_start_ms).await?;
+    Ok(rejected_limit_from_counts(
+        current_counts
+            .request_count
+            .saturating_add(previous_weight.request_count),
+        current_counts
+            .token_count
+            .saturating_add(previous_weight.token_count),
+        estimated_tokens,
+        config.rpm_limit,
+        config.tpm_limit,
+    ))
+}
+
+async fn fetch_window_counts(
+    shared_pool: &SharedPool,
+    bucket_key: &str,
+    window_start_ms: i64,
+) -> Result<WindowCounts, ClassifiedError> {
     let row = sqlx::query(SELECT_WINDOW_COUNTS_SQL)
         .bind(bucket_key)
         .bind(window_start_ms)
@@ -836,17 +874,12 @@ async fn detect_rejected_limit(
         .await
         .map_err(database_error)?;
     let Some(row) = row else {
-        return Ok(ProviderAdmissionLimit::Capacity);
+        return Ok(WindowCounts::default());
     };
-    let request_count = row.try_get::<i64, _>("request_count").unwrap_or(0).max(0) as u64;
-    let token_count = row.try_get::<i64, _>("token_count").unwrap_or(0).max(0) as u64;
-    Ok(rejected_limit_from_counts(
-        request_count,
-        token_count,
-        estimated_tokens,
-        config.rpm_limit,
-        config.tpm_limit,
-    ))
+    Ok(WindowCounts {
+        request_count: row.try_get::<i64, _>("request_count").unwrap_or(0).max(0) as u64,
+        token_count: row.try_get::<i64, _>("token_count").unwrap_or(0).max(0) as u64,
+    })
 }
 
 fn rejected_limit_from_counts(
@@ -884,6 +917,46 @@ fn now_epoch_ms() -> i64 {
 fn fixed_window_start_ms(now_ms: i64, window_ms: u64) -> i64 {
     let window_ms = i64::try_from(window_ms.max(1)).unwrap_or(i64::MAX);
     now_ms - now_ms.rem_euclid(window_ms)
+}
+
+fn previous_window_start_ms(window_start_ms: i64, window_ms: u64) -> i64 {
+    let window_ms = i64::try_from(window_ms.max(1)).unwrap_or(i64::MAX);
+    window_start_ms.saturating_sub(window_ms)
+}
+
+fn weighted_previous_window_counts(
+    previous: WindowCounts,
+    now_ms: i64,
+    window_start_ms: i64,
+    window_ms: u64,
+) -> WindowCounts {
+    let window_ms = window_ms.max(1);
+    let elapsed_ms = u64::try_from(now_ms.saturating_sub(window_start_ms))
+        .unwrap_or(0)
+        .min(window_ms);
+    WindowCounts {
+        request_count: weighted_previous_value(previous.request_count, elapsed_ms, window_ms),
+        token_count: weighted_previous_value(previous.token_count, elapsed_ms, window_ms),
+    }
+}
+
+fn weighted_previous_value(value: u64, elapsed_ms: u64, window_ms: u64) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+    let window_ms = window_ms.max(1);
+    let remaining_ms = window_ms.saturating_sub(elapsed_ms.min(window_ms));
+    if remaining_ms == 0 {
+        return 0;
+    }
+    let numerator = u128::from(value).saturating_mul(u128::from(remaining_ms));
+    numerator
+        .div_ceil(u128::from(window_ms))
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn remaining_limit_after_previous_weight(limit: u64, previous_weight: u64) -> i64 {
+    i64::try_from(limit.saturating_sub(previous_weight)).unwrap_or(i64::MAX)
 }
 
 fn retry_after_ms(now_ms: i64, window_start_ms: i64, window_ms: u64) -> u64 {
@@ -984,8 +1057,43 @@ mod tests {
     fn fixed_window_math_is_stable_at_boundaries() {
         assert_eq!(fixed_window_start_ms(123_456, 60_000), 120_000);
         assert_eq!(fixed_window_start_ms(120_000, 60_000), 120_000);
+        assert_eq!(previous_window_start_ms(120_000, 60_000), 60_000);
         assert_eq!(retry_after_ms(123_456, 120_000, 60_000), 56_544);
         assert_eq!(retry_after_ms(180_000, 120_000, 60_000), 1);
+    }
+
+    #[test]
+    fn previous_window_weight_smooths_fixed_window_boundary() {
+        let previous = WindowCounts {
+            request_count: 20,
+            token_count: 60_000,
+        };
+        let window_start_ms = 180_000;
+
+        let at_boundary =
+            weighted_previous_window_counts(previous, 180_000, window_start_ms, 60_000);
+        assert_eq!(at_boundary.request_count, 20);
+        assert_eq!(at_boundary.token_count, 60_000);
+        assert_eq!(
+            remaining_limit_after_previous_weight(20, at_boundary.request_count),
+            0
+        );
+
+        let after_three_seconds =
+            weighted_previous_window_counts(previous, 183_000, window_start_ms, 60_000);
+        assert_eq!(after_three_seconds.request_count, 19);
+        assert_eq!(
+            remaining_limit_after_previous_weight(20, after_three_seconds.request_count),
+            1
+        );
+
+        let halfway = weighted_previous_window_counts(previous, 210_000, window_start_ms, 60_000);
+        assert_eq!(halfway.request_count, 10);
+        assert_eq!(halfway.token_count, 30_000);
+
+        let at_next_boundary =
+            weighted_previous_window_counts(previous, 240_000, window_start_ms, 60_000);
+        assert_eq!(at_next_boundary, WindowCounts::default());
     }
 
     #[test]
