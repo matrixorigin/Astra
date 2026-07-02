@@ -89,6 +89,9 @@ If `reasoning_model_name` is not set, the server falls back to the cheapest acti
 - `ASTRA_TURN_INTENT_JUDGE_POLICY`, `ASTRA_FACTUAL_RETRY_JUDGE_POLICY`, `ASTRA_PRE_TURN_COMPACTION_LLM_POLICY` — per-purpose overrides for auxiliary LLM policy
 - `ASTRA_TURN_OBSERVER_MODE` — server-loop Memoria observer dispatch mode; `async` by default keeps terminal run finalization from waiting on observer HTTP calls, `inline` restores synchronous completion, `disabled` skips the optional observer
 - `ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY` — max in-flight async server-loop observer calls per process; default `4`, and `0` drops async observer requests without sending them
+- `ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE` — post-loop session-memory final flush and session-end governance dispatch mode; `async` by default keeps optional Memoria work from holding run admission slots, `inline` restores synchronous cleanup, `disabled` skips external cleanup while still resetting local process state
+- `ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY` — max in-flight async post-loop memory cleanup tasks per process; default `4`, and `0` drops external cleanup work after local reset
+- `ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS` — max time an individual post-loop cleanup worker waits for session-memory extraction workers before continuing; default `1000`
 - `ASTRA_CAPTURE_TRACES`
 
 ### Observability

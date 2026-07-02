@@ -115,11 +115,119 @@ const METRIC_DURABLE_RUN_EVENT_ROWS_TOTAL: &str = "astra_durable_run_event_rows_
 const METRIC_DURABLE_RUN_EVENT_BYTES_TOTAL: &str = "astra_durable_run_event_bytes_total";
 const METRIC_DURABLE_RUN_EVENT_ROW_BUDGET: &str = "astra_durable_run_event_row_budget";
 const METRIC_DURABLE_RUN_EVENT_BYTE_BUDGET: &str = "astra_durable_run_event_byte_budget";
+const ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV: &str = "ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE";
+const ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV: &str =
+    "ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY";
+const ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV: &str =
+    "ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS";
+const DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY: usize = 4;
+const DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS: u64 = 1_000;
+static POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunAdmissionError {
     Timeout,
     Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostLoopMemoryCleanupMode {
+    Async,
+    Inline,
+    Disabled,
+}
+
+impl PostLoopMemoryCleanupMode {
+    fn from_env() -> Self {
+        match std::env::var(ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV) {
+            Ok(value) => Self::parse(&value).unwrap_or_else(|| {
+                tracing::warn!(
+                    env = ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV,
+                    value = %value,
+                    "invalid post-loop memory cleanup mode; defaulting to async"
+                );
+                Self::Async
+            }),
+            Err(_) => Self::Async,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "async" | "background" | "fire_and_forget" => Some(Self::Async),
+            "inline" | "sync" | "synchronous" => Some(Self::Inline),
+            "disabled" | "disable" | "off" | "none" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+}
+
+struct PostLoopMemoryCleanupPermit;
+
+impl Drop for PostLoopMemoryCleanupPermit {
+    fn drop(&mut self) {
+        POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn post_loop_memory_cleanup_concurrency_limit() -> usize {
+    match std::env::var(ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV) {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(limit) => limit,
+            Err(_) => {
+                tracing::warn!(
+                    env = ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV,
+                    value = %value,
+                    default = DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY,
+                    "invalid post-loop memory cleanup concurrency; using default"
+                );
+                DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY
+            }
+        },
+        Err(_) => DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY,
+    }
+}
+
+fn try_acquire_post_loop_memory_cleanup_permit(
+    limit: usize,
+) -> Option<PostLoopMemoryCleanupPermit> {
+    if limit == 0 {
+        return None;
+    }
+
+    let mut current = POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return None;
+        }
+        match POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(PostLoopMemoryCleanupPermit),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn session_memory_post_loop_drain_timeout() -> Duration {
+    match std::env::var(ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV) {
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(ms) => Duration::from_millis(ms),
+            Err(_) => {
+                tracing::warn!(
+                    env = ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV,
+                    value = %value,
+                    default_ms = DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS,
+                    "invalid session-memory post-loop drain timeout; using default"
+                );
+                Duration::from_millis(DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS)
+            }
+        },
+        Err(_) => Duration::from_millis(DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS),
+    }
 }
 
 fn run_admission_error_code(error: RunAdmissionError) -> &'static str {
@@ -414,7 +522,7 @@ type ServerSkillResolverBundle = (
 );
 
 /// Post-loop session-memory cleanup shared by `create_run` and
-/// `stream_chat`. Runs session-end governance (purge working memory +
+/// `stream_chat`. Schedules session-end governance (purge working memory +
 /// persist episodic overview + Memoria reflect) when the per-session
 /// debounce window allows, and always clears the bridge seen-ledger +
 /// extraction-service debounce so long-lived servers don't accumulate
@@ -431,13 +539,66 @@ async fn post_loop_memory_cleanup(
     if session_id.is_empty() {
         return;
     }
-    if let (Some(svc), Some(req)) = (extraction_service, final_extract_request) {
+
+    let session_id = session_id.to_string();
+    let session_facts = session_facts.clone();
+    let extraction_service = extraction_service.cloned();
+
+    match PostLoopMemoryCleanupMode::from_env() {
+        PostLoopMemoryCleanupMode::Disabled => {
+            reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
+        }
+        PostLoopMemoryCleanupMode::Inline => {
+            run_post_loop_memory_cleanup_work(
+                session_id,
+                session_facts,
+                extraction_service,
+                final_extract_request,
+            )
+            .await;
+        }
+        PostLoopMemoryCleanupMode::Async => {
+            let concurrency_limit = post_loop_memory_cleanup_concurrency_limit();
+            let Some(permit) = try_acquire_post_loop_memory_cleanup_permit(concurrency_limit)
+            else {
+                tracing::debug!(
+                    session_id = %session_id,
+                    concurrency_limit,
+                    "post-loop memory cleanup concurrency full; dropping best-effort external cleanup"
+                );
+                reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
+                return;
+            };
+            tokio::spawn(async move {
+                let _permit = permit;
+                run_post_loop_memory_cleanup_work(
+                    session_id,
+                    session_facts,
+                    extraction_service,
+                    final_extract_request,
+                )
+                .await;
+            });
+        }
+    }
+}
+
+async fn run_post_loop_memory_cleanup_work(
+    session_id: String,
+    session_facts: astra_turn_types::session_facts::SessionFacts,
+    extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    final_extract_request: Option<crate::session_memory::ExtractionRequest>,
+) {
+    if let (Some(svc), Some(req)) = (extraction_service.as_ref(), final_extract_request) {
         let _ = svc.maybe_spawn_shutdown_flush(req);
     }
-    if let Some(svc) = extraction_service {
-        let leftover = svc
-            .wait_for_pending(std::time::Duration::from_secs(10))
-            .await;
+    if let Some(svc) = extraction_service.as_ref() {
+        let timeout = session_memory_post_loop_drain_timeout();
+        let leftover = if timeout.is_zero() {
+            svc.pending_drain()
+        } else {
+            svc.wait_for_pending(timeout).await
+        };
         if leftover > 0 {
             tracing::warn!(
                 session_id = %session_id,
@@ -458,12 +619,12 @@ async fn post_loop_memory_cleanup(
     {
         let debouncer = crate::turn::session_end_debounce::global();
         if matches!(
-            debouncer.should_run(session_id),
+            debouncer.should_run(&session_id),
             crate::turn::session_end_debounce::DebounceDecision::Run
         ) {
             match crate::turn::cloud::session_end_governance::run_session_end_governance(
-                session_facts,
-                session_id,
+                &session_facts,
+                &session_id,
                 memoria_client,
             )
             .await
@@ -486,7 +647,7 @@ async fn post_loop_memory_cleanup(
                             "session-end governance complete"
                         );
                     }
-                    debouncer.record(session_id);
+                    debouncer.record(&session_id);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -519,7 +680,7 @@ async fn post_loop_memory_cleanup(
         // the tool dispatch layer to report success/failure per recall,
         // which is a bigger refactor. The episode-level heuristic is
         // the smallest step that closes the loop in production.
-        let snapshots = astra_tools::memoria::MemoriaClient::drain_recalls(session_id, None);
+        let snapshots = astra_tools::memoria::MemoriaClient::drain_recalls(&session_id, None);
         if !snapshots.is_empty() && episode_was_written {
             use crate::turn::cloud::memoria_compact::MemoriaClient as ServerMemoriaClient;
             for snap in &snapshots {
@@ -546,6 +707,13 @@ async fn post_loop_memory_cleanup(
             );
         }
     }
+    reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
+}
+
+fn reset_post_loop_memory_process_state(
+    session_id: &str,
+    extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
+) {
     // ── Always: clear canonical memory process state for this session ──
     //
     // A single process-global set in `astra_tools::memoria` holds both
@@ -5654,9 +5822,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 persist_ctx.run(&loop_state, loop_success).await;
 
                 // Post-loop memory cleanup — shared with the streaming path
-                // (see `stream_chat`). Runs governance once per session
-                // debounce window, clears bridge seen-ledger, and forgets
-                // extraction debounce.
+                // (see `stream_chat`). By default this only schedules external
+                // Memoria work so the run permit can be released promptly.
                 post_loop_memory_cleanup(
                     loop_state.current_session_id.as_deref().unwrap_or(""),
                     &loop_state.session_facts,
@@ -6508,8 +6675,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 drop(event_tx);
 
                 // Post-loop memory cleanup — identical to `create_run`. Runs
-                // AFTER event_tx drops so the client sees the terminal event promptly
-                // and doesn't wait on governance RTT.
+                // AFTER event_tx drops; default async mode schedules external
+                // Memoria work without holding the run permit on governance RTT.
                 post_loop_memory_cleanup(
                     state.current_session_id.as_deref().unwrap_or(""),
                     &state.session_facts,
@@ -8324,10 +8491,41 @@ mod tests {
     use serde_json::json;
     use sqlx::Row;
     use std::collections::HashSet;
+    use std::ffi::OsString;
     use std::sync::Mutex as StdMutex;
     use uuid::Uuid;
 
     static LIFECYCLE_RUN_DB: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     struct ActiveTestModelService;
 
@@ -8407,6 +8605,94 @@ mod tests {
         ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn post_loop_memory_cleanup_mode_parses_supported_values() {
+        assert_eq!(
+            PostLoopMemoryCleanupMode::parse(""),
+            Some(PostLoopMemoryCleanupMode::Async)
+        );
+        assert_eq!(
+            PostLoopMemoryCleanupMode::parse("background"),
+            Some(PostLoopMemoryCleanupMode::Async)
+        );
+        assert_eq!(
+            PostLoopMemoryCleanupMode::parse("inline"),
+            Some(PostLoopMemoryCleanupMode::Inline)
+        );
+        assert_eq!(
+            PostLoopMemoryCleanupMode::parse("off"),
+            Some(PostLoopMemoryCleanupMode::Disabled)
+        );
+        assert_eq!(PostLoopMemoryCleanupMode::parse("surprise"), None);
+    }
+
+    #[test]
+    #[serial_test::serial(post_loop_memory_cleanup_env)]
+    fn post_loop_memory_cleanup_env_defaults_and_parses() {
+        {
+            let _mode = EnvVarGuard::remove(ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV);
+            assert_eq!(
+                PostLoopMemoryCleanupMode::from_env(),
+                PostLoopMemoryCleanupMode::Async
+            );
+        }
+        {
+            let _mode = EnvVarGuard::set(ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV, "disabled");
+            assert_eq!(
+                PostLoopMemoryCleanupMode::from_env(),
+                PostLoopMemoryCleanupMode::Disabled
+            );
+        }
+        {
+            let _limit = EnvVarGuard::remove(ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV);
+            assert_eq!(
+                post_loop_memory_cleanup_concurrency_limit(),
+                DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY
+            );
+        }
+        {
+            let _limit = EnvVarGuard::set(ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV, "0");
+            assert_eq!(post_loop_memory_cleanup_concurrency_limit(), 0);
+        }
+        {
+            let _timeout = EnvVarGuard::remove(ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV);
+            assert_eq!(
+                session_memory_post_loop_drain_timeout(),
+                Duration::from_millis(DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS)
+            );
+        }
+        {
+            let _timeout =
+                EnvVarGuard::set(ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV, "25");
+            assert_eq!(
+                session_memory_post_loop_drain_timeout(),
+                Duration::from_millis(25)
+            );
+        }
+    }
+
+    #[test]
+    fn post_loop_memory_cleanup_permit_respects_limit() {
+        let baseline = POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.load(Ordering::SeqCst);
+        let limit = baseline + 1;
+
+        let permit = try_acquire_post_loop_memory_cleanup_permit(limit)
+            .expect("permit should be available below limit");
+        assert_eq!(
+            POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.load(Ordering::SeqCst),
+            baseline + 1
+        );
+        assert!(
+            try_acquire_post_loop_memory_cleanup_permit(limit).is_none(),
+            "permit should reject at limit"
+        );
+        drop(permit);
+        assert_eq!(
+            POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.load(Ordering::SeqCst),
+            baseline
+        );
     }
 
     fn test_session_task(
