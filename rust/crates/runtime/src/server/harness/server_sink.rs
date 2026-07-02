@@ -1,7 +1,9 @@
-//! DB-backed + SSE broadcast snapshot sink for web/server agent sessions.
+//! In-memory + SSE broadcast snapshot sink for web/server agent sessions.
 //!
-//! Writes every snapshot to `harness_snapshots` and broadcasts via tokio channel
-//! so SSE subscribers receive real-time harness updates.
+//! The default path keeps snapshots in memory and broadcasts them via tokio
+//! channel so SSE subscribers receive real-time harness updates. Durable DB
+//! persistence is opt-in because every hook snapshot is observability data, not
+//! part of the run's success path.
 
 #[cfg(feature = "harness")]
 pub use enabled::ServerSnapshotSink;
@@ -11,13 +13,15 @@ mod enabled {
     use astra_harness::{DecisionRecord, RuntimeSnapshot, SnapshotSink};
     use serde::Serialize;
     use std::collections::VecDeque;
-    use std::sync::RwLock;
+    use std::sync::{OnceLock, RwLock};
     use tokio::sync::broadcast;
 
     const DEFAULT_IN_MEMORY_CAPACITY: usize = 64;
     const DEFAULT_BROADCAST_CAPACITY: usize = 256;
 
     const DB_WRITE_CHANNEL_CAPACITY: usize = 64;
+    pub const ASTRA_HARNESS_SNAPSHOT_DB_PERSIST_ENV: &str = "ASTRA_HARNESS_SNAPSHOT_DB_PERSIST";
+    static HARNESS_SNAPSHOT_DB_PERSIST_ENABLED: OnceLock<bool> = OnceLock::new();
 
     struct DbWriteTask {
         snapshot_id: String,
@@ -29,12 +33,13 @@ mod enabled {
         causal_chain_id: Option<String>,
     }
 
-    /// Server-side snapshot sink: in-memory ring + broadcast + bounded DB worker.
+    /// Server-side snapshot sink: in-memory ring + broadcast + optional bounded DB worker.
     ///
     /// The in-memory ring provides fast `latest()` / `history()` queries.
     /// The broadcast channel pushes snapshots to SSE subscribers.
-    /// DB persistence uses a bounded mpsc channel with a single worker task
-    /// to prevent unbounded spawn storms under load.
+    /// DB persistence is disabled by default. When explicitly enabled, it uses
+    /// a bounded mpsc channel with a single worker task to prevent unbounded
+    /// spawn storms under load.
     pub struct ServerSnapshotSink {
         session_id: String,
         user_id: RwLock<String>,
@@ -75,12 +80,32 @@ mod enabled {
             }
         }
 
-        pub fn with_pool(mut self, pool: sqlx::Pool<sqlx::MySql>) -> Self {
+        pub fn with_pool(self, pool: sqlx::Pool<sqlx::MySql>) -> Self {
+            self.with_pool_if_enabled(pool, harness_snapshot_db_persist_enabled_from_env())
+        }
+
+        fn with_pool_if_enabled(
+            mut self,
+            pool: sqlx::Pool<sqlx::MySql>,
+            persistence_enabled: bool,
+        ) -> Self {
+            if !persistence_enabled {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    env = ASTRA_HARNESS_SNAPSHOT_DB_PERSIST_ENV,
+                    "harness snapshot DB persistence disabled"
+                );
+                return self;
+            }
             let (tx, rx) = tokio::sync::mpsc::channel(DB_WRITE_CHANNEL_CAPACITY);
             let handle = tokio::spawn(db_write_worker(rx, pool));
             self.db_tx = Some(tx);
             self._db_worker = Some(handle);
             self
+        }
+
+        pub fn db_persistence_is_active(&self) -> bool {
+            self.db_tx.is_some()
         }
 
         /// Number of snapshot writes dropped before DB persistence.
@@ -169,6 +194,48 @@ mod enabled {
     fn serialize_snapshot_json<T: Serialize>(snapshot: &T) -> Result<String, String> {
         serde_json::to_string(snapshot)
             .map_err(|source| format!("serialize harness snapshot: {source}"))
+    }
+
+    fn harness_snapshot_db_persist_enabled_from_env() -> bool {
+        *HARNESS_SNAPSHOT_DB_PERSIST_ENABLED.get_or_init(|| {
+            harness_snapshot_db_persist_enabled(
+                std::env::var(ASTRA_HARNESS_SNAPSHOT_DB_PERSIST_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+        })
+    }
+
+    fn harness_snapshot_db_persist_enabled(raw: Option<&str>) -> bool {
+        match raw.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(value)
+                if value.eq_ignore_ascii_case("1")
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes")
+                    || value.eq_ignore_ascii_case("on")
+                    || value.eq_ignore_ascii_case("enabled") =>
+            {
+                true
+            }
+            Some(value)
+                if value.eq_ignore_ascii_case("0")
+                    || value.eq_ignore_ascii_case("false")
+                    || value.eq_ignore_ascii_case("no")
+                    || value.eq_ignore_ascii_case("off")
+                    || value.eq_ignore_ascii_case("disabled") =>
+            {
+                false
+            }
+            Some(value) => {
+                tracing::warn!(
+                    env = ASTRA_HARNESS_SNAPSHOT_DB_PERSIST_ENV,
+                    value,
+                    "invalid harness snapshot DB persistence value; using disabled"
+                );
+                false
+            }
+            None => false,
+        }
     }
 
     async fn db_write_worker(
@@ -362,6 +429,46 @@ mod enabled {
         fn dropped_write_count_starts_at_zero() {
             let sink = ServerSnapshotSink::new("s1".into(), "test-user".into());
             assert_eq!(sink.dropped_write_count(), 0);
+        }
+
+        #[test]
+        fn db_persistence_is_inactive_without_pool() {
+            let sink = ServerSnapshotSink::new("s1".into(), "test-user".into());
+            assert!(!sink.db_persistence_is_active());
+        }
+
+        #[tokio::test]
+        async fn disabled_db_persistence_policy_does_not_start_worker_with_pool() {
+            let pool = sqlx::mysql::MySqlPoolOptions::new()
+                .connect_lazy("mysql://root:pass@127.0.0.1:1/astra_runtime")
+                .expect("lazy MySQL pool should not connect");
+            let sink = ServerSnapshotSink::new("s1".into(), "test-user".into())
+                .with_pool_if_enabled(pool, false);
+
+            assert!(!sink.db_persistence_is_active());
+        }
+
+        #[test]
+        fn harness_snapshot_db_persist_env_defaults_to_disabled() {
+            assert!(!harness_snapshot_db_persist_enabled(None));
+            assert!(!harness_snapshot_db_persist_enabled(Some("")));
+            assert!(!harness_snapshot_db_persist_enabled(Some("disabled")));
+            assert!(!harness_snapshot_db_persist_enabled(Some("0")));
+            assert!(!harness_snapshot_db_persist_enabled(Some("false")));
+        }
+
+        #[test]
+        fn harness_snapshot_db_persist_env_accepts_enabled_values() {
+            assert!(harness_snapshot_db_persist_enabled(Some("1")));
+            assert!(harness_snapshot_db_persist_enabled(Some("true")));
+            assert!(harness_snapshot_db_persist_enabled(Some("yes")));
+            assert!(harness_snapshot_db_persist_enabled(Some("on")));
+            assert!(harness_snapshot_db_persist_enabled(Some("enabled")));
+        }
+
+        #[test]
+        fn harness_snapshot_db_persist_env_invalid_values_disable_persistence() {
+            assert!(!harness_snapshot_db_persist_enabled(Some("maybe")));
         }
     }
 }
