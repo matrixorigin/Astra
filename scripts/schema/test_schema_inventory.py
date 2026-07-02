@@ -427,6 +427,115 @@ class SchemaInventoryTest(unittest.TestCase):
             self.tables["agent_tasks"]["merge_guidance"],
         )
 
+    def test_session_workflow_coordination_tables_have_semantic_metadata(self) -> None:
+        session_workflow_tables = {
+            "agent_event_edges",
+            "session_artifacts",
+            "session_artifacts_grants",
+            "session_checkpoints",
+            "user_preferences",
+            "edge_agent_registry",
+            "task_leases",
+            "plan_templates",
+            "plans",
+            "plan_step_runs",
+            "task_contracts",
+            "verification_results",
+            "wf_triggers",
+            "infra_sandbox_metadata",
+            "team_definitions",
+            "team_execution_history",
+            "team_snapshots",
+        }
+        for table in session_workflow_tables:
+            with self.subTest(table=table):
+                row = self.tables[table]
+                for field in [
+                    "semantic_owner",
+                    "state_class",
+                    "primary_query",
+                    "retention_policy",
+                    "rebuildability",
+                    "merge_guidance",
+                    "migration_owner",
+                    "product_owner",
+                ]:
+                    self.assertNotEqual(
+                        row[field],
+                        "unclassified",
+                        f"{table}.{field} must be explicit metadata",
+                    )
+
+    def test_session_workflow_coordination_metadata_locks_boundary_decisions(self) -> None:
+        self.assertIn(
+            "must be deleted before event rows",
+            self.tables["agent_event_edges"]["merge_guidance"],
+        )
+        self.assertIn(
+            "content and retention state",
+            self.tables["session_artifacts"]["merge_guidance"],
+        )
+        self.assertIn(
+            "visibility/control-plane facts",
+            self.tables["session_artifacts_grants"]["merge_guidance"],
+        )
+        self.assertIn(
+            "session-level restore snapshots",
+            self.tables["session_checkpoints"]["merge_guidance"],
+        )
+        self.assertIn(
+            "per-user sync state",
+            self.tables["user_preferences"]["merge_guidance"],
+        )
+        self.assertIn(
+            "registry is liveness/capability state",
+            self.tables["edge_agent_registry"]["merge_guidance"],
+        )
+        self.assertIn(
+            "must lock before/with task rows",
+            self.tables["task_leases"]["merge_guidance"],
+        )
+        self.assertIn(
+            "reusable learned patterns",
+            self.tables["plan_templates"]["merge_guidance"],
+        )
+        self.assertIn(
+            "current mutable plan state",
+            self.tables["plans"]["merge_guidance"],
+        )
+        self.assertIn(
+            "append-only attempt history",
+            self.tables["plan_step_runs"]["merge_guidance"],
+        )
+        self.assertIn(
+            "contracts define expected criteria",
+            self.tables["task_contracts"]["merge_guidance"],
+        )
+        self.assertIn(
+            "evidence rows fan out",
+            self.tables["verification_results"]["merge_guidance"],
+        )
+        self.assertIn(
+            "separate activation lifecycle",
+            self.tables["wf_triggers"]["merge_guidance"],
+        )
+        self.assertIn(
+            "workspace_records track reusable workspaces",
+            self.tables["infra_sandbox_metadata"]["merge_guidance"],
+        )
+        self.assertIn(
+            "mutable team config",
+            self.tables["team_definitions"]["merge_guidance"],
+        )
+        self.assertIn(
+            "execution history",
+            self.tables["team_execution_history"]["merge_guidance"],
+        )
+        self.assertIn(
+            "point-in-time audit records",
+            self.tables["team_snapshots"]["merge_guidance"],
+        )
+
     def test_high_growth_tables_have_retention_metadata(self) -> None:
         high_growth_tables = [
             "agent_events",
