@@ -403,24 +403,8 @@ fn spawn_data_cleanup(
     })
 }
 
-const EDGE_DISPATCH_CLEANUP_INTERVAL_SECS_ENV: &str = "ASTRA_EDGE_DISPATCH_CLEANUP_INTERVAL_SECS";
-const EDGE_DISPATCH_STALE_SECS_ENV: &str = "ASTRA_EDGE_DISPATCH_STALE_SECS";
-
-fn cleanup_duration_from_env(key: &str, default_secs: u64, min_secs: u64) -> std::time::Duration {
-    cleanup_duration_from_raw(std::env::var(key).ok().as_deref(), default_secs, min_secs)
-}
-
-fn cleanup_duration_from_raw(
-    raw: Option<&str>,
-    default_secs: u64,
-    min_secs: u64,
-) -> std::time::Duration {
-    let secs = raw
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|secs| *secs >= min_secs)
-        .unwrap_or(default_secs);
-    std::time::Duration::from_secs(secs)
-}
+const EDGE_DISPATCH_CLEANUP_INTERVAL_SECS: u64 = 15 * 60;
+const EDGE_DISPATCH_STALE_AFTER_SECS: u64 = 60 * 60;
 
 /// Spawn a background task that expires orphaned edge dispatch rows.
 ///
@@ -431,11 +415,12 @@ fn spawn_edge_dispatch_cleanup(
     dispatch: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    let cleanup_interval =
-        cleanup_duration_from_env(EDGE_DISPATCH_CLEANUP_INTERVAL_SECS_ENV, 15 * 60, 60);
-    let stale_after = cleanup_duration_from_env(EDGE_DISPATCH_STALE_SECS_ENV, 60 * 60, 5 * 60);
-
-    spawn_edge_dispatch_cleanup_with_config(dispatch, cancel, cleanup_interval, stale_after)
+    spawn_edge_dispatch_cleanup_with_config(
+        dispatch,
+        cancel,
+        std::time::Duration::from_secs(EDGE_DISPATCH_CLEANUP_INTERVAL_SECS),
+        std::time::Duration::from_secs(EDGE_DISPATCH_STALE_AFTER_SECS),
+    )
 }
 
 fn spawn_edge_dispatch_cleanup_with_config(
@@ -498,26 +483,6 @@ mod tests {
     };
     use async_trait::async_trait;
     use axum::{Json, http::StatusCode};
-
-    #[test]
-    fn cleanup_duration_from_raw_enforces_minimum_and_default() {
-        assert_eq!(
-            super::cleanup_duration_from_raw(Some("900"), 60, 30),
-            std::time::Duration::from_secs(900)
-        );
-        assert_eq!(
-            super::cleanup_duration_from_raw(Some("10"), 60, 30),
-            std::time::Duration::from_secs(60)
-        );
-        assert_eq!(
-            super::cleanup_duration_from_raw(Some("nope"), 60, 30),
-            std::time::Duration::from_secs(60)
-        );
-        assert_eq!(
-            super::cleanup_duration_from_raw(None, 60, 30),
-            std::time::Duration::from_secs(60)
-        );
-    }
 
     #[derive(Default)]
     struct RecordingEdgeDispatchService {
