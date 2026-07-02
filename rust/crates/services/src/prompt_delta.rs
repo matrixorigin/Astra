@@ -300,8 +300,8 @@ pub async fn persist_prompt_request(
             "INSERT INTO prompt_request_records
              (request_id, session_id, user_id, run_id, turn, round, attempt, source,
               model, provider, max_output_tokens, message_count, tool_count,
-              previous_request_id, request_hash, summary_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+              previous_request_id, request_hash, summary_json, created_at, created_at_unix_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), UNIX_TIMESTAMP(NOW(6)) * 1000)",
         )
         .bind(&plan.request_id)
         .bind(&input.session_id)

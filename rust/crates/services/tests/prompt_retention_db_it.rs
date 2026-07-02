@@ -255,10 +255,11 @@ async fn insert_prompt_fixture(
         "INSERT INTO prompt_request_records
          (request_id, session_id, user_id, run_id, turn, round, attempt, source,
           model, provider, max_output_tokens, message_count, tool_count,
-          previous_request_id, request_hash, summary_json, created_at)
+          previous_request_id, request_hash, summary_json, created_at, created_at_unix_ms)
          VALUES (?, ?, ?, ?, ?, 0, 0, 'retention-test',
                  'test-model', 'test-provider', NULL, 1, 0,
-                 NULL, REPEAT('a', 64), '{}', DATE_SUB(NOW(6), INTERVAL 2 DAY))",
+                 NULL, REPEAT('a', 64), '{}', DATE_SUB(NOW(6), INTERVAL 2 DAY),
+                 UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL 2 DAY)) * 1000)",
     )
     .bind(&request_id)
     .bind(session_id)
@@ -303,7 +304,7 @@ async fn insert_prompt_fixtures_bulk(
             "INSERT INTO prompt_request_records
              (request_id, session_id, user_id, run_id, turn, round, attempt, source,
               model, provider, max_output_tokens, message_count, tool_count,
-              previous_request_id, request_hash, summary_json, created_at) ",
+              previous_request_id, request_hash, summary_json, created_at, created_at_unix_ms) ",
         );
         requests.push_values(chunk.iter().enumerate(), |mut row, (index, request_id)| {
             let turn = chunk_base + index as i64;
@@ -323,7 +324,8 @@ async fn insert_prompt_fixtures_bulk(
                 .push_bind(Option::<&str>::None)
                 .push_bind(format!("{turn:064x}"))
                 .push_bind("{}")
-                .push("DATE_SUB(NOW(6), INTERVAL 2 DAY)");
+                .push("DATE_SUB(NOW(6), INTERVAL 2 DAY)")
+                .push("UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL 2 DAY)) * 1000");
         });
         requests
             .build()

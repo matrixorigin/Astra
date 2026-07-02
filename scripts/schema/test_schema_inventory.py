@@ -126,6 +126,8 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("run is terminal", parent["retention_policy"])
         self.assertIn("ordered bounded batches", parent["retention_policy"])
         self.assertIn("after child deltas", parent["retention_policy"])
+        self.assertIn("created_at_unix_ms", parent["retention_policy"])
+        self.assertIn("MatrixOne", parent["retention_policy"])
         self.assertIn("do not delete child deltas independently", parent["merge_guidance"])
         self.assertIn("prompt_request_records", child["retention_policy"])
         self.assertIn("independent TTL breaks", child["retention_policy"])

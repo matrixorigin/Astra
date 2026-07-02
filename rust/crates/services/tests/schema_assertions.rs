@@ -1473,6 +1473,17 @@ async fn phase2_web_hydration_schema_contract() {
         ],
         "run prompt observability must use owner/run recency index"
     );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "prompt_request_records",
+            "idx_prompt_requests_retention_ms"
+        )
+        .await,
+        ["created_at_unix_ms", "user_id", "request_id", "session_id"],
+        "prompt retention cleanup must use numeric age key to avoid MatrixOne DATETIME cast scans"
+    );
     for removed_index in [
         "idx_prompt_requests_session_created",
         "idx_prompt_requests_run_created",

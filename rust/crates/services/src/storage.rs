@@ -1860,11 +1860,28 @@ pub async fn ensure_core_schema(
             request_hash VARCHAR(64) NOT NULL,
             summary_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            created_at_unix_ms BIGINT NULL,
             PRIMARY KEY (user_id, request_id),
             UNIQUE KEY uq_prompt_request_attempt (user_id, session_id, turn, round, source, attempt),
             INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt),
-            INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt)
+            INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt),
+            INDEX idx_prompt_requests_retention_ms (created_at_unix_ms, user_id, request_id, session_id)
         )",
+    )
+    .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "prompt_request_records",
+        "created_at_unix_ms",
+        "ALTER TABLE prompt_request_records ADD COLUMN created_at_unix_ms BIGINT NULL",
+    )
+    .await?;
+    query(
+        "UPDATE prompt_request_records
+         SET created_at_unix_ms = UNIX_TIMESTAMP(created_at) * 1000
+         WHERE created_at_unix_ms IS NULL",
     )
     .execute(&pool)
     .await?;
@@ -1912,6 +1929,11 @@ pub async fn ensure_core_schema(
                 "attempt",
             ][..],
             "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt)",
+        ),
+        (
+            "idx_prompt_requests_retention_ms",
+            &["created_at_unix_ms", "user_id", "request_id", "session_id"][..],
+            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_retention_ms (created_at_unix_ms, user_id, request_id, session_id)",
         ),
     ] {
         ensure_index_shape(
@@ -5175,6 +5197,20 @@ pub async fn cleanup_expired_data(
 
     // 6. Old prompt observability rows. Select parent request records first so
     // child prompt_deltas and parent prompt_request_records are pruned together.
+    let prompt_request_retention_select_sql = format!(
+        "SELECT p.user_id, p.session_id, p.request_id
+             FROM prompt_request_records p
+             LEFT JOIN agent_sessions s
+               ON s.user_id = p.user_id AND s.session_id = p.session_id
+             LEFT JOIN agent_runs r
+               ON r.user_id = p.user_id AND r.run_id = p.run_id
+             WHERE p.created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL {} DAY)) * 1000
+               AND (s.session_id IS NULL OR s.status IN ('ended', 'closed', 'cancelled', 'deleting'))
+               AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
+             ORDER BY p.created_at_unix_ms ASC, p.user_id ASC, p.request_id ASC
+             LIMIT ?",
+        policy.prompt_request_days
+    );
     let mut prompt_delta_deleted = 0_u64;
     let mut prompt_request_deleted = 0_u64;
     for _ in 0..PROMPT_REQUEST_MAX_BATCHES_PER_RUN {
@@ -5182,24 +5218,11 @@ pub async fn cleanup_expired_data(
             .begin()
             .await
             .map_err(|e| format!("cleanup prompt_request_records begin transaction: {e}"))?;
-        let expired_prompt_rows = sqlx::query(
-            "SELECT p.user_id, p.session_id, p.request_id
-             FROM prompt_request_records p
-             LEFT JOIN agent_sessions s
-               ON s.user_id = p.user_id AND s.session_id = p.session_id
-             LEFT JOIN agent_runs r
-               ON r.user_id = p.user_id AND r.run_id = p.run_id
-             WHERE p.created_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
-               AND (s.session_id IS NULL OR s.status IN ('ended', 'closed', 'cancelled', 'deleting'))
-               AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
-             ORDER BY p.created_at ASC, p.user_id ASC, p.request_id ASC
-             LIMIT ?",
-        )
-        .bind(policy.prompt_request_days)
-        .bind(PROMPT_REQUEST_BATCH_LIMIT)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| format!("cleanup prompt_request_records select expired ids: {e}"))?;
+        let expired_prompt_rows = sqlx::query(&prompt_request_retention_select_sql)
+            .bind(PROMPT_REQUEST_BATCH_LIMIT)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| format!("cleanup prompt_request_records select expired ids: {e}"))?;
         let expired_prompt_request_ids: Vec<(String, String, String)> = expired_prompt_rows
             .iter()
             .map(decode_expired_prompt_request_ref)
@@ -6239,7 +6262,7 @@ mod tests {
             "ORDER BY expires_at ASC, user_id ASC, task_id ASC",
             "ORDER BY created_at ASC, sync_id ASC",
             "ORDER BY created_at ASC, log_id ASC",
-            "ORDER BY p.created_at ASC, p.user_id ASC, p.request_id ASC",
+            "ORDER BY p.created_at_unix_ms ASC, p.user_id ASC, p.request_id ASC",
             "ORDER BY created_at ASC, user_id ASC, event_id ASC",
         ] {
             assert!(
@@ -6260,6 +6283,16 @@ mod tests {
         assert!(
             body.contains("policy.prompt_request_days"),
             "prompt cleanup must be governed by explicit retention policy"
+        );
+        assert!(
+            body.contains(
+                "WHERE p.created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL {} DAY)) * 1000"
+            ),
+            "prompt cleanup must use the numeric retention key instead of MatrixOne DATETIME comparisons"
+        );
+        assert!(
+            body.contains("policy.prompt_request_days") && body.contains("format!("),
+            "prompt cleanup may only inline the retention day literal from its typed u32 policy"
         );
         assert!(
             body.contains("PROMPT_REQUEST_DELETE_CHUNK_SIZE")
