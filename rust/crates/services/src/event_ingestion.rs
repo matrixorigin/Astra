@@ -20,7 +20,8 @@
 //!   MatrixOne failures and retried; duplicate inserts are deduped by
 //!   `(user_id, event_id)` PK
 //! - **Backpressure**: bounded channel; async callers await capacity, sync
-//!   callers defer when running inside Tokio
+//!   callers defer when running inside Tokio. Diagnostic telemetry is shed
+//!   before it consumes channel capacity reserved for critical audit facts.
 //! - **Graceful shutdown**: flush remaining buffer on drop
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,7 @@ pub const DEFAULT_INGESTION_CHANNEL_CAPACITY: usize = 5_000;
 pub const DEFAULT_INGESTION_RETRIES: u32 = 3;
 const MAX_SHUTDOWN_DRAIN_PENDING_YIELDS: usize = 64;
 const DISCONNECTED_PENDING_DEFERRAL_LIMIT: usize = 1;
+const TELEMETRY_CHANNEL_RESERVE_DIVISOR: usize = 10;
 
 /// Configuration for the ingestion worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +157,15 @@ impl IngestionEventPriority {
             Self::Telemetry => "telemetry",
         }
     }
+}
+
+fn telemetry_channel_reserve_slots(channel_capacity: usize) -> usize {
+    if channel_capacity <= 1 {
+        return 0;
+    }
+    (channel_capacity / TELEMETRY_CHANNEL_RESERVE_DIVISOR)
+        .max(1)
+        .min(channel_capacity - 1)
 }
 
 fn ingestion_event_priority_for_type(event_type: &str) -> IngestionEventPriority {
@@ -522,11 +533,30 @@ impl IngestionSender {
 
     /// Enqueue an event for async ingestion.
     ///
-    /// Fast path is non-blocking. If the bounded channel is full and a Tokio
-    /// runtime is available, detach a small async send task so the event waits
-    /// for capacity instead of being dropped. `overflow_count` tracks these
-    /// backpressure deferrals and hard closed-channel drops.
+    /// Fast path is non-blocking. Telemetry is best-effort and will be shed
+    /// once the channel reaches the reserved critical-audit headroom. If the
+    /// bounded channel is full and a Tokio runtime is available, detach a small
+    /// async send task so the event waits for capacity instead of being dropped.
+    /// `overflow_count` tracks these backpressure deferrals and hard
+    /// closed-channel drops.
     pub fn enqueue(&self, event: IngestionEvent) {
+        let priority = event.priority();
+        if priority == IngestionEventPriority::Telemetry {
+            let reserve_slots = telemetry_channel_reserve_slots(self.tx.max_capacity());
+            let available_slots = self.tx.capacity();
+            if reserve_slots > 0 && available_slots <= reserve_slots {
+                let dropped = self.record_drop_before_acceptance(priority);
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    priority = priority.as_label(),
+                    available_slots,
+                    reserve_slots,
+                    dropped_before_acceptance_count = dropped,
+                    "ingestion telemetry event shed to reserve capacity for critical audit events"
+                );
+                return;
+            }
+        }
         match self.tx.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(event)) => {
@@ -614,13 +644,16 @@ impl IngestionSender {
         }
     }
 
-    fn record_drop_before_acceptance(&self, priority: IngestionEventPriority) {
-        self.dropped_before_acceptance_count
-            .fetch_add(1, Ordering::Relaxed);
+    fn record_drop_before_acceptance(&self, priority: IngestionEventPriority) -> u64 {
+        let dropped = self
+            .dropped_before_acceptance_count
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         if priority == IngestionEventPriority::Telemetry {
             self.dropped_telemetry_before_acceptance_count
                 .fetch_add(1, Ordering::Relaxed);
         }
+        dropped
     }
 
     /// Total number of immediate enqueue overflows and closed-channel drops.
@@ -1771,6 +1804,16 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_channel_reserve_slots_keep_critical_headroom() {
+        assert_eq!(telemetry_channel_reserve_slots(0), 0);
+        assert_eq!(telemetry_channel_reserve_slots(1), 0);
+        assert_eq!(telemetry_channel_reserve_slots(2), 1);
+        assert_eq!(telemetry_channel_reserve_slots(10), 1);
+        assert_eq!(telemetry_channel_reserve_slots(100), 10);
+        assert_eq!(telemetry_channel_reserve_slots(5_000), 500);
+    }
+
+    #[test]
     fn ingestion_stats_default() {
         let stats = IngestionStats::default();
         assert_eq!(stats.events_received, 0);
@@ -2760,6 +2803,38 @@ mod tests {
             "event beyond the deferred-send cap must be dropped instead of spawning another waiter"
         );
         assert_eq!(sender.pending_deferral_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn sender_sheds_telemetry_before_consuming_critical_channel_reserve() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals: 10,
+        };
+
+        for i in 0..9 {
+            sender.enqueue(test_event(&format!("critical-{i}"), "s1", "turn"));
+        }
+        sender.enqueue(test_event("telemetry-shed", "s1", "llm_round"));
+        sender.enqueue(test_event("critical-reserved", "s1", "turn"));
+
+        assert_eq!(sender.overflow_count(), 0);
+        assert_eq!(sender.dropped_before_acceptance_count(), 1);
+        assert_eq!(sender.dropped_telemetry_before_acceptance_count(), 1);
+        assert_eq!(sender.dropped_critical_before_acceptance_count(), 0);
+
+        let mut accepted = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            accepted.push(event.event_id);
+        }
+        assert_eq!(accepted.len(), 10);
+        assert!(accepted.iter().any(|id| id == "critical-reserved"));
+        assert!(!accepted.iter().any(|id| id == "telemetry-shed"));
     }
 
     #[tokio::test]
