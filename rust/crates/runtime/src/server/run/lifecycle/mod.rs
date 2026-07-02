@@ -2218,6 +2218,12 @@ impl AgenticRunLifecycleService {
         self.run_semaphore.clone()
     }
 
+    async fn remove_run_channels(&self, run_id: &str) {
+        self.approval_channels.lock().await.remove(run_id);
+        self.user_prompt_channels.lock().await.remove(run_id);
+        self.progress_channels.lock().await.remove(run_id);
+    }
+
     async fn acquire_run_permit(
         &self,
         timeout: Duration,
@@ -5727,6 +5733,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 };
                 self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason)
                     .await;
+                self.remove_run_channels(&run_id).await;
                 if let Some(record) = cloud_workspace_record.as_ref() {
                     self.cleanup_cloud_workspace_after_failed_start(
                         &user_id,
@@ -6580,6 +6587,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 };
                 self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason)
                     .await;
+                self.remove_run_channels(&run_id).await;
                 if let Some(record) = cloud_workspace_record.as_ref() {
                     self.cleanup_cloud_workspace_after_failed_start(
                         &user_id,
@@ -16523,6 +16531,71 @@ mod tests {
             durable.error_code.as_deref(),
             Some("per_user_daily_token_quota")
         );
+    }
+
+    #[tokio::test]
+    async fn interactive_create_run_admission_reject_cleans_ws_channels() {
+        let svc = test_service().with_run_concurrency_limit(1);
+        svc.test_run_semaphore().close();
+        let mut request = test_request("admission closed");
+        request.interactive_client = true;
+
+        let err = svc
+            .create_run("user-1".into(), request)
+            .await
+            .expect_err("closed admission should reject before spawn");
+
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.1.0.error_code.as_deref(), Some("run_admission_closed"));
+        assert!(
+            svc.approval_channels.lock().await.is_empty(),
+            "pre-spawn admission failure must not leak approval channel receivers"
+        );
+        assert!(
+            svc.user_prompt_channels.lock().await.is_empty(),
+            "pre-spawn admission failure must not leak ask_user channel receivers"
+        );
+        assert!(
+            svc.progress_channels.lock().await.is_empty(),
+            "pre-spawn admission failure must not leak progress channel receivers"
+        );
+
+        let (runs, total) = svc
+            .run_engine
+            .list_user_runs("user-1", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(runs[0].status, STATUS_FAILED);
+        assert_eq!(runs[0].error_code.as_deref(), Some("run_admission_closed"));
+    }
+
+    #[tokio::test]
+    async fn interactive_stream_chat_admission_reject_leaves_no_ws_channels() {
+        let svc = test_service().with_run_concurrency_limit(1);
+        svc.test_run_semaphore().close();
+        let mut request = test_request("stream admission closed");
+        request.interactive_client = true;
+
+        let err = svc
+            .stream_chat("user-1".into(), request)
+            .await
+            .expect_err("closed admission should reject streaming before spawn");
+
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.1.0.error_code.as_deref(), Some("run_admission_closed"));
+        assert!(svc.approval_channels.lock().await.is_empty());
+        assert!(svc.user_prompt_channels.lock().await.is_empty());
+        assert!(svc.progress_channels.lock().await.is_empty());
+
+        let (runs, total) = svc
+            .run_engine
+            .list_user_runs("user-1", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(runs[0].status, STATUS_FAILED);
+        assert_eq!(runs[0].error_code.as_deref(), Some("run_admission_closed"));
     }
 
     // ─── DelegationTracker integration tests ────────────────────────────
