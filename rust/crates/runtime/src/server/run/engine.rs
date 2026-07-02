@@ -54,6 +54,28 @@ const METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL: &str = "astra_run_control_poll_error
 const TERMINAL_TRANSITION_MAX_ATTEMPTS: usize = 3;
 const TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS: u64 = 25;
 
+fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
+    [
+        serde_json::json!({
+            "event_type": "run_error",
+            "data": {
+                "error": "recovered from crash",
+                "error_code": "crash_recovery",
+                "error_kind": "crash_recovery",
+            },
+        }),
+        serde_json::json!({
+            "event_type": "run_finished",
+            "data": {
+                "status": STATUS_FAILED,
+                "error": "recovered from crash",
+                "error_code": "crash_recovery",
+                "error_kind": "crash_recovery",
+            },
+        }),
+    ]
+}
+
 /// Durable run execution engine.
 ///
 /// Wraps a [`RunStateStore`] and provides high-level operations for
@@ -839,7 +861,7 @@ impl RunEngine {
     /// - `running` runs with graceful checkpoint_v1: moved to `waiting` and
     ///   annotated with `run_resumed_after_restart` for exactly-once replay.
     /// - other `running` runs: were in-flight when the process died; marked
-    ///   `failed` with reason "recovered from crash".
+    ///   `failed` with crash-recovery terminal events.
     pub async fn recover_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let active = self.store.find_recoverable_active_runs().await?;
         let mut recovered = Vec::with_capacity(active.len());
@@ -897,24 +919,17 @@ impl RunEngine {
                 }
             }
         } else {
-            let event = serde_json::json!({
-                "event_type": "run_error",
-                "data": {
-                    "error": "recovered from crash",
-                    "error_code": "crash_recovery",
-                    "error_kind": "crash_recovery"
-                }
-            });
+            let events = crash_recovery_terminal_events();
             match self
                 .store
-                .update_run_status_with_event_if_current(
+                .update_run_status_with_events_if_current(
                     &run.user_id,
                     &run.run_id,
                     &[expected_status.as_str()],
                     STATUS_FAILED,
                     None,
                     Some("recovered from crash"),
-                    event,
+                    &events,
                 )
                 .await
             {
@@ -923,15 +938,8 @@ impl RunEngine {
                     run.waiting_for = None;
                     run.error_message = Some("recovered from crash".to_string());
                     run.error_code = Some("crash_recovery".to_string());
-                    run.last_event_idx += 1;
-                    run.events.push(serde_json::json!({
-                        "event_type": "run_error",
-                        "data": {
-                            "error": "recovered from crash",
-                            "error_code": "crash_recovery",
-                            "error_kind": "crash_recovery"
-                        }
-                    }));
+                    run.last_event_idx += events.len() as i64;
+                    run.events.extend(events);
                     Some(run)
                 }
                 Ok(false) => self.recovery_conflict_current_run(&run).await,
@@ -3096,15 +3104,23 @@ mod tests {
             "error message must indicate crash recovery"
         );
         assert_eq!(crashed.error_code.as_deref(), Some("crash_recovery"));
-        assert_eq!(
-            crashed.events.last().unwrap()["event_type"],
-            "run_error",
-            "crash recovery failure must be auditable from durable events"
+        let crashed_event_types = crashed
+            .events
+            .iter()
+            .filter_map(|event| event.get("event_type").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            crashed_event_types.ends_with(&["run_error", "run_finished"]),
+            "crash recovery failure must persist a complete terminal event pair"
         );
+        let run_error = &crashed.events[crashed.events.len() - 2];
+        let run_finished = crashed.events.last().unwrap();
+        assert_eq!(run_error["data"]["error_code"], "crash_recovery");
         assert_eq!(
-            crashed.events.last().unwrap()["data"]["error_code"],
-            "crash_recovery"
+            run_finished["data"]["status"], "failed",
+            "crash recovery run_finished must be self-describing across replay boundaries"
         );
+        assert_eq!(run_finished["data"]["error_code"], "crash_recovery");
 
         // The waiting run must remain waiting
         let waiting = engine
@@ -3156,11 +3172,11 @@ mod tests {
         assert!(durable.error_message.is_none());
         assert!(durable.error_code.is_none());
         assert!(
-            durable
-                .events
-                .iter()
-                .all(|event| event["event_type"] != "run_error"),
-            "stale recovery must not append a crash-recovery run_error"
+            durable.events.iter().all(|event| !matches!(
+                event.get("event_type").and_then(serde_json::Value::as_str),
+                Some("run_error" | "run_finished")
+            )),
+            "stale recovery must not append crash-recovery terminal events"
         );
     }
 
@@ -3199,10 +3215,17 @@ mod tests {
             Some("recovered from crash")
         );
         assert_eq!(durable.error_code.as_deref(), Some("crash_recovery"));
-        assert_eq!(
-            durable.events.last().unwrap()["event_type"],
-            "run_error",
-            "input-queued recovery failure must be auditable from durable events"
+        let event_types = durable
+            .events
+            .iter()
+            .filter_map(|event| event.get("event_type").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            event_types.ends_with(&["run_error", "run_finished"]),
+            "input-queued recovery failure must persist a complete terminal event pair"
         );
+        let run_finished = durable.events.last().unwrap();
+        assert_eq!(run_finished["data"]["status"], "failed");
+        assert_eq!(run_finished["data"]["error_code"], "crash_recovery");
     }
 }
