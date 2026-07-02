@@ -45,7 +45,7 @@ pub struct SnapshotListFilter {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SnapshotListRecord {
     pub snapshots: Vec<SnapshotListItem>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
     pub next_cursor: Option<SnapshotListCursor>,
 }
@@ -159,14 +159,6 @@ fn context_row_string(
         return Err(context_decode_error(column, "must not be empty"));
     }
     Ok(value)
-}
-
-fn context_row_i64(
-    row: &sqlx::mysql::MySqlRow,
-    column: &'static str,
-) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
-    row.try_get::<i64, _>(column)
-        .map_err(|error| context_decode_error(column, error.to_string()))
 }
 
 fn parse_context_json(
@@ -317,29 +309,6 @@ impl ContextService for DatabaseContextService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let limit = validate_snapshot_list_limit(filter.limit);
 
-        let count_sql = if filter.session_id.is_some() {
-            "SELECT COUNT(cs.context_capture_id) AS total FROM ctx_snapshots cs \
-             WHERE cs.user_id = ? AND cs.session_id = ?"
-        } else {
-            "SELECT COUNT(cs.context_capture_id) AS total FROM ctx_snapshots cs \
-             WHERE cs.user_id = ?"
-        };
-
-        let total_row = if let Some(sid) = &filter.session_id {
-            query(count_sql)
-                .bind(&filter.user_id)
-                .bind(sid)
-                .fetch_one(&pool)
-                .await
-        } else {
-            query(count_sql)
-                .bind(&filter.user_id)
-                .fetch_one(&pool)
-                .await
-        }
-        .map_err(internal_error)?;
-        let total = context_row_i64(&total_row, "total")?;
-
         let mut list_qb = QueryBuilder::<MySql>::new(format!(
             "SELECT {} FROM ctx_snapshots cs WHERE cs.user_id = ",
             SNAPSHOT_LIST_SELECT_COLS
@@ -392,7 +361,7 @@ impl ContextService for DatabaseContextService {
         };
         Ok(SnapshotListRecord {
             snapshots,
-            total,
+            total: None,
             limit,
             next_cursor,
         })
@@ -506,7 +475,7 @@ pub struct SnapshotResponse {
 #[derive(Serialize, PartialEq)]
 pub struct SnapshotListResponse {
     pub snapshots: Vec<SnapshotListItemResponse>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
     pub next_cursor: Option<SnapshotListCursor>,
 }
@@ -626,6 +595,18 @@ mod tests {
         );
         assert!(!sql.to_ascii_uppercase().contains(" OFFSET "));
         assert!(sql.contains("cs.context_capture_id < ?"));
+    }
+
+    #[test]
+    fn snapshot_list_response_preserves_omitted_total() {
+        let response = SnapshotListResponse::from(SnapshotListRecord {
+            snapshots: Vec::new(),
+            total: None,
+            limit: 50,
+            next_cursor: None,
+        });
+
+        assert_eq!(response.total, None);
     }
 
     #[test]
