@@ -3596,6 +3596,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
         let result = loop {
+            crate::llm_provider_admission::admit_llm_provider_request(
+                self.shared_pool.as_ref(),
+                &llm_cfg.provider,
+                &llm_cfg.model_name,
+            )
+            .await?;
             let prompt_round = state
                 .turn_event_buffer
                 .as_ref()

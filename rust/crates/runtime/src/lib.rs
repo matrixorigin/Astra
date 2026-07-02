@@ -84,6 +84,7 @@ pub(crate) mod capacity_model;
 pub mod deployment;
 pub mod evaluation;
 pub mod learning;
+pub(crate) mod llm_provider_admission;
 pub mod matrix_cloud_runtime;
 pub mod memory_hooks;
 pub mod observability;

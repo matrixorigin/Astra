@@ -72,6 +72,27 @@ pub(super) async fn build_runtime_wiring(
         state.metrics_registry(),
     );
     crate::turn::llm::client::set_llm_nonstream_fallback_metrics_registry(state.metrics_registry());
+    crate::llm_provider_admission::set_llm_provider_admission_metrics_registry(
+        state.metrics_registry(),
+    );
+    let provider_admission_config =
+        crate::llm_provider_admission::ProviderAdmissionConfig::from_env();
+    if let Err(error) =
+        crate::llm_provider_admission::ensure_llm_provider_admission_schema_if_configured(
+            shared_pool,
+        )
+        .await
+    {
+        let message = error.message;
+        if provider_admission_config.is_enabled() && !provider_admission_config.fail_open() {
+            return Err(Box::new(std::io::Error::other(message)));
+        }
+        tracing::warn!(
+            target: "astra_runtime::state_builder",
+            error = %message,
+            "llm provider admission schema init failed"
+        );
+    }
     let resource_governor = initialize_resource_governor(shared_pool).await;
     let run_concurrency_limit = std::env::var("ASTRA_RUN_CONCURRENCY_LIMIT")
         .ok()
