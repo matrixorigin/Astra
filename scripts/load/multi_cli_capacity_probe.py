@@ -462,8 +462,16 @@ async def stream_sse_request(
         header_latency_ms = (time.perf_counter() - started) * 1000.0
         http_status, _reason, response_headers, initial = parse_headers(header_blob)
         parser = SseParser()
+        capture_http_error_body = not (200 <= http_status < 300)
+        http_error_body_parts: list[str] = []
+        http_error_body_chars = 0
         async for chunk in body_chunks(reader, response_headers, initial, request_timeout_secs):
-            for event in parser.feed(chunk.decode("utf-8", errors="replace")):
+            text = chunk.decode("utf-8", errors="replace")
+            if capture_http_error_body and http_error_body_chars < 65536:
+                remaining_chars = 65536 - http_error_body_chars
+                http_error_body_parts.append(text[:remaining_chars])
+                http_error_body_chars += min(len(text), remaining_chars)
+            for event in parser.feed(text):
                 event_count += 1
                 if first_event_ms is None:
                     first_event_ms = (time.perf_counter() - started) * 1000.0
@@ -493,6 +501,12 @@ async def stream_sse_request(
                 outcome = "eof_without_terminal"
             else:
                 outcome = "http_error"
+                body_code, body_message, body_retryable = error_details_from_http_body(
+                    "".join(http_error_body_parts)
+                )
+                error_code = error_code or body_code
+                error_message = error_message or body_message
+                retryable = retryable if retryable is not None else body_retryable
     except asyncio.TimeoutError:
         outcome = "timeout"
         error_message = "request timed out"
@@ -1091,6 +1105,37 @@ def error_code_from_event(event: dict[str, Any]) -> str | None:
 
 def error_message_from_event(event: dict[str, Any]) -> str | None:
     return string_or_none(event.get("message")) or string_or_none(event.get("error"))
+
+
+def error_details_from_http_body(body: str) -> tuple[str | None, str | None, bool | None]:
+    body = body.strip()
+    if not body:
+        return None, None, None
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return None, body[:500], None
+    if not isinstance(parsed, dict):
+        return None, None, None
+
+    nested_error = parsed.get("error")
+    nested = nested_error if isinstance(nested_error, dict) else {}
+    code = (
+        string_or_none(parsed.get("error_code"))
+        or string_or_none(parsed.get("code"))
+        or string_or_none(nested.get("error_code"))
+        or string_or_none(nested.get("code"))
+    )
+    message = (
+        string_or_none(parsed.get("detail"))
+        or string_or_none(parsed.get("message"))
+        or string_or_none(parsed.get("error"))
+        or string_or_none(nested.get("detail"))
+        or string_or_none(nested.get("message"))
+    )
+    retryable_value = parsed.get("retryable", nested.get("retryable"))
+    retryable = retryable_value if isinstance(retryable_value, bool) else None
+    return code, message, retryable
 
 
 def round_or_none(value: float | None) -> float | None:

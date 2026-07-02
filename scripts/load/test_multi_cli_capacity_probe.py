@@ -164,6 +164,40 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(probe.error_code_from_event(legacy_event), "INTERNAL_ERROR")
         self.assertEqual(probe.error_message_from_event(legacy_event), "boom")
 
+    def test_http_error_body_helpers_read_machine_code(self) -> None:
+        code, message, retryable = probe.error_details_from_http_body(
+            json.dumps(
+                {
+                    "error_code": "run_admission_timeout",
+                    "detail": "server capacity timeout",
+                    "retryable": True,
+                }
+            )
+        )
+        self.assertEqual(code, "run_admission_timeout")
+        self.assertEqual(message, "server capacity timeout")
+        self.assertTrue(retryable)
+
+        nested_code, nested_message, nested_retryable = probe.error_details_from_http_body(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "per_user_concurrent_session_quota",
+                        "message": "quota exceeded",
+                        "retryable": False,
+                    }
+                }
+            )
+        )
+        self.assertEqual(nested_code, "per_user_concurrent_session_quota")
+        self.assertEqual(nested_message, "quota exceeded")
+        self.assertFalse(nested_retryable)
+
+        text_code, text_message, text_retryable = probe.error_details_from_http_body("plain boom")
+        self.assertIsNone(text_code)
+        self.assertEqual(text_message, "plain boom")
+        self.assertIsNone(text_retryable)
+
     def test_summarize_results_reports_terminal_failure_reasons(self) -> None:
         args = argparse.Namespace(
             profile="100-cli",
