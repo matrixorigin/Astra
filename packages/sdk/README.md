@@ -41,7 +41,10 @@ const run = await client.createRun({
 
 ```typescript
 // List durable runs (GET /runs)
-const { runs, total } = await client.listRuns({ limit: 20, offset: 0 });
+const firstPage = await client.listRuns({ limit: 20 });
+const secondPage = firstPage.nextCursor
+  ? await client.listRuns({ limit: 20, cursor: firstPage.nextCursor })
+  : null;
 
 // Sub-runs for a parent run (GET /chat/runs/{id}/delegations)
 const { sub_run_ids } = await client.listDelegations(parentRunId);
@@ -195,7 +198,7 @@ Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHA
 | `getSessionAudit` | `GET …/audit/summary` → `SessionAuditSummary` |
 | `getSessionReflect` / `getSessionDecisionTrace` | `GET /chat/session/{id}/reflect` · `…/decision-trace` (optional query: `focus`, `last_n`, `question`) |
 | `createRun` | `POST /chat` (non-streaming run) |
-| `listRuns` | `GET /runs?limit&offset` → `RunListResponse` (`runs` normalized to `RunStatus[]`) |
+| `listRuns` | `GET /runs?limit&after_updated_at&after_run_id` → `RunListResponse` (`runs` normalized to `RunStatus[]`, seek cursor preferred) |
 | `getRunStatus` / `cancelRun` / `pauseRun` / `resumeRun` | `GET`/`DELETE`/`POST` under `/chat/runs/{id}` |
 | `getRunEvents` | `GET /chat/runs/{id}/stream?last_index=` (buffered SSE parsed to `StreamEvent[]`) |
 | `delegateRun` / `listDelegations` / `pauseDelegations` / `resumeDelegations` | Multi-agent: `POST …/delegate`, `GET …/delegations`, `POST …/delegations/pause` · `resume` |

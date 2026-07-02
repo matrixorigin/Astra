@@ -1216,11 +1216,29 @@ export type SessionActivityResponse = {
 
 // ─── Run list ─────────────────────────────────────────────────────
 
+export type RunListCursor = {
+  updatedAt: string;
+  runId: string;
+};
+
+export type RunListParams =
+  | {
+      limit?: number;
+      offset?: number;
+      cursor?: null;
+    }
+  | {
+      limit?: number;
+      cursor: RunListCursor;
+      offset?: never;
+    };
+
 export type RunListResponse = {
   runs: RunStatus[];
-  total: number;
+  total: number | null;
   limit: number;
   offset: number;
+  nextCursor?: RunListCursor | null;
 };
 
 // ─── Delegation (multi-agent) ─────────────────────────────────────

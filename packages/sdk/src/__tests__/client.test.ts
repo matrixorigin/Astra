@@ -500,6 +500,7 @@ describe("AstraClient — Runs", () => {
       total: 1,
       limit: 50,
       offset: 0,
+      next_cursor: null,
     });
     const r = await createClient().listRuns();
     expect(r.runs[0].runId).toBe("r1");
@@ -508,8 +509,60 @@ describe("AstraClient — Runs", () => {
     expect(r.runs[0].executor?.kind).toBe("server_local");
     expect(r.runs[0].transport).toBe("server_local");
     expect(r.runs[0].fallbackPolicy).toBe("disabled");
+    expect(r.total).toBe(1);
+    expect(r.nextCursor).toBeNull();
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/runs");
+  });
+
+  test("listRuns sends seek cursor and preserves nullable total", async () => {
+    globalThis.fetch = mockFetch(200, {
+      runs: [],
+      total: null,
+      limit: 2,
+      offset: 0,
+      next_cursor: {
+        updated_at: "2026-06-29T08:00:00.000000",
+        run_id: "run-2",
+      },
+    });
+
+    const r = await createClient().listRuns({
+      limit: 2,
+      cursor: {
+        updatedAt: "2026-06-29T08:30:00.000000",
+        runId: "run-1",
+      },
+    });
+
+    expect(r.total).toBeNull();
+    expect(r.nextCursor).toEqual({
+      updatedAt: "2026-06-29T08:00:00.000000",
+      runId: "run-2",
+    });
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
+    expect(url).toContain("/runs");
+    expect(url).toContain("limit=2");
+    expect(url).toContain("after_updated_at=2026-06-29T08%3A30%3A00.000000");
+    expect(url).toContain("after_run_id=run-1");
+    expect(url).not.toContain("offset=");
+  });
+
+  test("listRuns rejects cursor mixed with offset before fetch", async () => {
+    globalThis.fetch = mockFetch(200, {});
+
+    await expect(
+      createClient().listRuns({
+        limit: 2,
+        offset: 10,
+        cursor: {
+          updatedAt: "2026-06-29T08:30:00.000000",
+          runId: "run-1",
+        },
+      } as never),
+    ).rejects.toThrow("listRuns cursor cannot be combined with offset");
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
   test("delegateRun posts delegation body", async () => {
