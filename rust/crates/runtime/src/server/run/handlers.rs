@@ -1069,6 +1069,22 @@ mod tests {
                 "result": "ok"
             }),
             json!({
+                "event_type": "approval_required",
+                "data": {
+                    "approval_id": "approval-1",
+                    "request_id": "approval-1",
+                    "tool": "bash",
+                    "approval_kind": "standard"
+                }
+            }),
+            json!({
+                "event_type": "user_input",
+                "data": {
+                    "request_id": "approval-1",
+                    "text": "approved from another pod"
+                }
+            }),
+            json!({
                 "event_type": "text_done",
                 "data": {"full_text": "durable final answer from matrixone"}
             }),
@@ -1110,6 +1126,8 @@ mod tests {
                 "run_started",
                 "tool_call",
                 "tool_call_end",
+                "approval_required",
+                "user_input",
                 "text_done",
                 "run_finished",
             ],
@@ -1161,6 +1179,16 @@ mod tests {
         assert!(
             text.contains("\"type\":\"tool_call_end\""),
             "durable replay should expose tool end boundary: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"approval_required\"")
+                && text.contains("\"request_id\":\"approval-1\""),
+            "durable replay should expose approval request boundary: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"user_input\"")
+                && text.contains("\"text\":\"approved from another pod\""),
+            "durable replay should expose approval/user input response boundary: {text}"
         );
         assert!(
             text.contains("\"full_text\":\"durable final answer from matrixone\""),
