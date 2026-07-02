@@ -12221,6 +12221,8 @@ mod tests {
             json!({"type": "text_delta", "content": "hi"}),
             json!({"type": "reasoning_delta", "content": "thinking"}),
             json!({"type": "thinking_delta", "content": "thinking"}),
+            json!({"type": "reasoning_message_content", "content": "raw chain of thought"}),
+            json!({"event_type": "reasoning_message_content", "data": {"content": "raw chain of thought"}}),
             json!({"type": "agent_live_event", "event_kind": "output_delta", "content": "child"}),
             json!({"type": "agent_live_event", "event_kind": "thinking_delta", "content": "child-thinking"}),
         ];
@@ -12325,18 +12327,23 @@ mod tests {
         let events = vec![
             json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
             json!({"type": "reasoning_delta", "content": "thinking"}),
+            json!({"type": "thinking_delta", "content": "private thinking"}),
+            json!({"type": "reasoning_message_content", "content": "raw chain of thought"}),
+            json!({"event_type": "reasoning_message_content", "data": {"content": "raw chain of thought"}}),
             json!({"type": "reasoning_done"}),
+            json!({"type": "thinking_done"}),
             json!({"event_type": "text_done", "data": {"full_text": "final answer"}}),
             json!({"event_type": "run_error", "data": {"error": "boom"}}),
             json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
         ];
 
         let persisted = terminal_events_for_persistence(&events);
-        assert_eq!(persisted.len(), 4);
+        assert_eq!(persisted.len(), 5);
         assert_eq!(persisted[0]["type"], "reasoning_done");
-        assert_eq!(persisted[1]["event_type"], "text_done");
-        assert_eq!(persisted[2]["event_type"], "run_error");
-        assert_eq!(persisted[3]["event_type"], "run_finished");
+        assert_eq!(persisted[1]["type"], "thinking_done");
+        assert_eq!(persisted[2]["event_type"], "text_done");
+        assert_eq!(persisted[3]["event_type"], "run_error");
+        assert_eq!(persisted[4]["event_type"], "run_finished");
     }
 
     #[tokio::test]

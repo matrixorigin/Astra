@@ -290,7 +290,8 @@ pub fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
                         | "run_interrupted"
                         | "run_waiting"
                         | "run_finished"
-                        | "reasoning_message_content"
+                        // Keep reasoning/thinking completion markers, not raw
+                        // chain-of-thought content or incremental deltas.
                         | "reasoning_done"
                         | "thinking_done"
                 )
@@ -338,7 +339,8 @@ fn durable_replay_boundary_event(event: &Value) -> bool {
                 | "agent_waiting"
                 | "agent_cancelled"
                 | "agent_interrupted"
-                | "reasoning_message_content"
+                // Keep completion markers as replay boundaries. Raw
+                // reasoning_message_content remains live-only.
                 | "reasoning_done"
                 | "thinking_done"
         )
@@ -490,8 +492,9 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
     }
     matches!(
         event_type,
-        "reasoning_message_content"
-            | "reasoning_done"
+        // Reasoning/thinking deltas and raw reasoning_message_content are
+        // live transport only; durable replay keeps completion markers.
+        "reasoning_done"
             | "thinking_done"
             | "workspace_bound"
             | "executor_bound"
