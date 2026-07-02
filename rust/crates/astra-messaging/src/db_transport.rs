@@ -1349,6 +1349,7 @@ async fn release_claimed_for_consumer_in_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 
     #[test]
     fn abort_on_drop_aborts_task() {
@@ -1448,6 +1449,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne; set ASTRA_TEST_DB_IT=1"]
+    async fn db_cleanup_prunes_expired_terminal_and_orphan_delivery_batches() {
+        let pool = live_test_pool().await;
+        ensure_schema(&pool).await.expect("ensure messaging schema");
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let delegation_id = format!("delegation-{}", uuid::Uuid::new_v4());
+        let consumer_id = format!("consumer-{}", uuid::Uuid::new_v4());
+        let expired_message_id = uuid::Uuid::new_v4().to_string();
+        let terminal_message_id = uuid::Uuid::new_v4().to_string();
+        let live_message_id = uuid::Uuid::new_v4().to_string();
+        let orphan_message_id = uuid::Uuid::new_v4().to_string();
+
+        insert_queue_row(
+            &pool,
+            &expired_message_id,
+            &delegation_id,
+            now_ms - 10_000,
+            Some(1),
+            "pending",
+            true,
+        )
+        .await;
+        insert_queue_row(
+            &pool,
+            &terminal_message_id,
+            &delegation_id,
+            now_ms - 7_200_000,
+            None,
+            "acked",
+            true,
+        )
+        .await;
+        insert_queue_row(
+            &pool,
+            &live_message_id,
+            &delegation_id,
+            now_ms,
+            Some(86_400_000),
+            "pending",
+            true,
+        )
+        .await;
+        insert_delivery_row(&pool, &expired_message_id, &consumer_id, &delegation_id).await;
+        insert_delivery_row(&pool, &terminal_message_id, &consumer_id, &delegation_id).await;
+        insert_delivery_row(&pool, &live_message_id, &consumer_id, &delegation_id).await;
+        insert_delivery_row(&pool, &orphan_message_id, &consumer_id, &delegation_id).await;
+
+        let transport = DatabaseTransport::new(pool.clone());
+        assert_eq!(
+            transport.cleanup_expired().await.expect("ttl cleanup"),
+            1,
+            "expired cleanup should prune exactly the expired queue row"
+        );
+        assert_eq!(
+            transport
+                .cleanup_older_than(Duration::from_secs(3600))
+                .await
+                .expect("terminal cleanup"),
+            1,
+            "terminal cleanup should prune exactly the old acked queue row"
+        );
+
+        assert_eq!(count_queue_message(&pool, &expired_message_id).await, 0);
+        assert_eq!(count_queue_message(&pool, &terminal_message_id).await, 0);
+        assert_eq!(count_queue_message(&pool, &live_message_id).await, 1);
+        assert_eq!(count_delivery_message(&pool, &expired_message_id).await, 0);
+        assert_eq!(count_delivery_message(&pool, &terminal_message_id).await, 0);
+        assert_eq!(count_delivery_message(&pool, &orphan_message_id).await, 0);
+        assert_eq!(count_delivery_message(&pool, &live_message_id).await, 1);
+    }
+
     #[test]
     fn transport_metrics_default() {
         let m = TransportMetrics::default();
@@ -1456,5 +1530,157 @@ mod tests {
             0
         );
         assert_eq!(m.poll_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    async fn live_test_pool() -> Pool<MySql> {
+        let _ = dotenvy::dotenv();
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored MatrixOne integration tests"
+        );
+
+        let host = std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let port = std::env::var("MATRIXONE_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(6001);
+        let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
+        let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".to_string());
+        let database = resolved_test_database_name();
+        let bootstrap_catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+
+        assert_test_database_name(&database);
+        assert_test_database_name(&bootstrap_catalog);
+
+        let admin_options = mysql_options(&host, port, &user, &password, &bootstrap_catalog);
+        let admin_pool = MySqlPoolOptions::new()
+            .max_connections(2)
+            .connect_with(admin_options)
+            .await
+            .expect("connect MatrixOne bootstrap catalog");
+        sqlx::query(&format!(
+            "CREATE DATABASE IF NOT EXISTS {}",
+            quote_mysql_identifier(&database)
+        ))
+        .execute(&admin_pool)
+        .await
+        .expect("create MatrixOne test database");
+        admin_pool.close().await;
+
+        MySqlPoolOptions::new()
+            .max_connections(5)
+            .connect_with(mysql_options(&host, port, &user, &password, &database))
+            .await
+            .expect("connect MatrixOne test database")
+    }
+
+    fn mysql_options(
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+        database: &str,
+    ) -> MySqlConnectOptions {
+        MySqlConnectOptions::new()
+            .host(host)
+            .port(port)
+            .username(user)
+            .password(password)
+            .database(database)
+    }
+
+    fn resolved_test_database_name() -> String {
+        let base = std::env::var("ASTRA_DATABASE").unwrap_or_else(|_| "astra_runtime".to_string());
+        match std::env::var("ASTRA_DATABASE_PREFIX") {
+            Ok(prefix) if !prefix.is_empty() => format!("{prefix}{base}"),
+            _ => base,
+        }
+    }
+
+    fn assert_test_database_name(name: &str) {
+        assert!(
+            name.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+            "MatrixOne test database name must be a simple identifier: {name}"
+        );
+        if name == "mysql" {
+            return;
+        }
+        assert!(
+            name.contains("test") || name.contains("smoke"),
+            "refusing to run destructive MatrixOne integration test against non-test database: {name}"
+        );
+    }
+
+    fn quote_mysql_identifier(name: &str) -> String {
+        assert_test_database_name(name);
+        format!("`{name}`")
+    }
+
+    async fn insert_queue_row(
+        pool: &Pool<MySql>,
+        message_id: &str,
+        delegation_id: &str,
+        timestamp_ms: i64,
+        ttl_ms: Option<i64>,
+        status: &str,
+        is_broadcast: bool,
+    ) {
+        query(
+            "INSERT INTO agent_message_queue
+             (message_id, from_run_id, from_agent_id, delegation_id, is_broadcast,
+              payload_json, timestamp_ms, ttl_ms, status)
+             VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?)",
+        )
+        .bind(message_id)
+        .bind(format!("from-run-{message_id}"))
+        .bind("from-agent")
+        .bind(delegation_id)
+        .bind(is_broadcast)
+        .bind(timestamp_ms)
+        .bind(ttl_ms)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert queue row");
+    }
+
+    async fn insert_delivery_row(
+        pool: &Pool<MySql>,
+        message_id: &str,
+        consumer_id: &str,
+        delegation_id: &str,
+    ) {
+        query(
+            "INSERT INTO agent_message_broadcast_delivery
+             (message_id, consumer_id, delegation_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(message_id)
+        .bind(consumer_id)
+        .bind(delegation_id)
+        .execute(pool)
+        .await
+        .expect("insert broadcast delivery row");
+    }
+
+    async fn count_queue_message(pool: &Pool<MySql>, message_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_queue WHERE message_id = ?")
+            .bind(message_id)
+            .fetch_one(pool)
+            .await
+            .expect("count queue message")
+    }
+
+    async fn count_delivery_message(pool: &Pool<MySql>, message_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_message_broadcast_delivery WHERE message_id = ?",
+        )
+        .bind(message_id)
+        .fetch_one(pool)
+        .await
+        .expect("count delivery message")
     }
 }
