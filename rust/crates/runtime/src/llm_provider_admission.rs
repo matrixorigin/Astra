@@ -6,10 +6,13 @@ use std::{
 
 use astra_core::{ClassifiedError, ErrorKind, SharedPool};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
+use sqlx::Row;
 
 const ENV_MODE: &str = "ASTRA_LLM_PROVIDER_ADMISSION_MODE";
 const ENV_RPM: &str = "ASTRA_LLM_PROVIDER_ADMISSION_RPM";
 const ENV_CAPACITY_RPM: &str = "ASTRA_CAPACITY_PROVIDER_RPM";
+const ENV_TPM: &str = "ASTRA_LLM_PROVIDER_ADMISSION_TPM";
+const ENV_CAPACITY_TPM: &str = "ASTRA_CAPACITY_PROVIDER_TPM";
 const ENV_WINDOW_MS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_WINDOW_MS";
 const ENV_SCOPE: &str = "ASTRA_LLM_PROVIDER_ADMISSION_SCOPE";
 const ENV_FAIL_OPEN: &str = "ASTRA_LLM_PROVIDER_ADMISSION_FAIL_OPEN";
@@ -22,12 +25,14 @@ const METRIC_PROVIDER_ADMISSION_ATTEMPTS_TOTAL: &str =
 const METRIC_PROVIDER_ADMISSION_ERRORS_TOTAL: &str = "astra_llm_provider_admission_errors_total";
 const METRIC_PROVIDER_ADMISSION_RETRY_AFTER_MS_TOTAL: &str =
     "astra_llm_provider_admission_retry_after_ms_total";
+const METRIC_PROVIDER_ADMISSION_TOKENS_TOTAL: &str = "astra_llm_provider_admission_tokens_total";
 
 const CREATE_WINDOWS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS llm_provider_admission_windows (
     bucket_key VARCHAR(255) NOT NULL,
     window_start_ms BIGINT NOT NULL,
     request_count BIGINT NOT NULL DEFAULT 0,
+    token_count BIGINT NOT NULL DEFAULT 0,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     PRIMARY KEY (bucket_key, window_start_ms),
@@ -37,23 +42,53 @@ CREATE TABLE IF NOT EXISTS llm_provider_admission_windows (
 
 const INSERT_WINDOW_SQL: &str = r#"
 INSERT IGNORE INTO llm_provider_admission_windows
-    (bucket_key, window_start_ms, request_count)
-VALUES (?, ?, 0)
+    (bucket_key, window_start_ms, request_count, token_count)
+VALUES (?, ?, 0, 0)
 "#;
 
-const CLAIM_WINDOW_SLOT_SQL: &str = r#"
+const CLAIM_WINDOW_SLOT_RPM_SQL: &str = r#"
 UPDATE llm_provider_admission_windows
 SET request_count = request_count + 1,
+    token_count = token_count + ?,
     updated_at = CURRENT_TIMESTAMP(6)
 WHERE bucket_key = ?
   AND window_start_ms = ?
   AND request_count < ?
 "#;
 
+const CLAIM_WINDOW_SLOT_TPM_SQL: &str = r#"
+UPDATE llm_provider_admission_windows
+SET request_count = request_count + 1,
+    token_count = token_count + ?,
+    updated_at = CURRENT_TIMESTAMP(6)
+WHERE bucket_key = ?
+  AND window_start_ms = ?
+  AND token_count + ? <= ?
+"#;
+
+const CLAIM_WINDOW_SLOT_RPM_TPM_SQL: &str = r#"
+UPDATE llm_provider_admission_windows
+SET request_count = request_count + 1,
+    token_count = token_count + ?,
+    updated_at = CURRENT_TIMESTAMP(6)
+WHERE bucket_key = ?
+  AND window_start_ms = ?
+  AND request_count < ?
+  AND token_count + ? <= ?
+"#;
+
+const SELECT_WINDOW_COUNTS_SQL: &str = r#"
+SELECT request_count, token_count
+FROM llm_provider_admission_windows
+WHERE bucket_key = ?
+  AND window_start_ms = ?
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderAdmissionConfig {
     mode: ProviderAdmissionMode,
     rpm_limit: Option<u64>,
+    tpm_limit: Option<u64>,
     window_ms: u64,
     scope: ProviderAdmissionScope,
     fail_open: bool,
@@ -69,6 +104,7 @@ impl ProviderAdmissionConfig {
         Self {
             mode,
             rpm_limit: read_positive_u64(ENV_RPM).or_else(|| read_positive_u64(ENV_CAPACITY_RPM)),
+            tpm_limit: read_positive_u64(ENV_TPM).or_else(|| read_positive_u64(ENV_CAPACITY_TPM)),
             window_ms: read_positive_u64(ENV_WINDOW_MS).unwrap_or(DEFAULT_WINDOW_MS),
             scope: env::var(ENV_SCOPE)
                 .ok()
@@ -84,6 +120,7 @@ impl ProviderAdmissionConfig {
         Self {
             mode: ProviderAdmissionMode::Disabled,
             rpm_limit: None,
+            tpm_limit: None,
             window_ms: DEFAULT_WINDOW_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
@@ -95,6 +132,19 @@ impl ProviderAdmissionConfig {
         Self {
             mode: ProviderAdmissionMode::DbFixedWindow,
             rpm_limit,
+            tpm_limit: None,
+            window_ms: DEFAULT_WINDOW_MS,
+            scope: ProviderAdmissionScope::Provider,
+            fail_open: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn db_fixed_window_with_tpm(rpm_limit: Option<u64>, tpm_limit: Option<u64>) -> Self {
+        Self {
+            mode: ProviderAdmissionMode::DbFixedWindow,
+            rpm_limit,
+            tpm_limit,
             window_ms: DEFAULT_WINDOW_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
@@ -106,6 +156,7 @@ impl ProviderAdmissionConfig {
         Self {
             mode: ProviderAdmissionMode::Unsupported,
             rpm_limit: None,
+            tpm_limit: None,
             window_ms: DEFAULT_WINDOW_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
@@ -164,7 +215,35 @@ impl ProviderAdmissionScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FixedWindowAdmission {
     Admitted,
-    Rejected { retry_after_ms: u64 },
+    Rejected {
+        retry_after_ms: u64,
+        limit: ProviderAdmissionLimit,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderAdmissionLimit {
+    Rpm,
+    Tpm,
+    Capacity,
+}
+
+impl ProviderAdmissionLimit {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Rpm => "rpm",
+            Self::Tpm => "tpm",
+            Self::Capacity => "capacity",
+        }
+    }
+
+    fn rejected_outcome(self) -> &'static str {
+        match self {
+            Self::Rpm => "rejected_rpm",
+            Self::Tpm => "rejected_tpm",
+            Self::Capacity => "rejected_capacity",
+        }
+    }
 }
 
 fn metrics_slot() -> &'static RwLock<Option<Arc<MetricsRegistry>>> {
@@ -198,6 +277,10 @@ fn register_provider_admission_metrics(registry: &MetricsRegistry) {
     registry.register_counter(
         METRIC_PROVIDER_ADMISSION_RETRY_AFTER_MS_TOTAL,
         "Total retry-after milliseconds returned by rejected LLM provider admission attempts.",
+    );
+    registry.register_counter(
+        METRIC_PROVIDER_ADMISSION_TOKENS_TOTAL,
+        "Estimated LLM provider admission tokens by mode, scope, and low-cardinality outcome.",
     );
 }
 
@@ -256,6 +339,22 @@ fn record_retry_after(config: &ProviderAdmissionConfig, retry_after_ms: u64) {
     );
 }
 
+fn record_tokens(config: &ProviderAdmissionConfig, outcome: &'static str, estimated_tokens: u64) {
+    let Some(registry) = provider_admission_metrics_registry() else {
+        return;
+    };
+    register_provider_admission_metrics(&registry);
+    registry.increment_counter(
+        METRIC_PROVIDER_ADMISSION_TOKENS_TOTAL,
+        &[
+            ("mode", config.mode_label()),
+            ("scope", config.scope_label()),
+            ("outcome", outcome),
+        ],
+        estimated_tokens,
+    );
+}
+
 pub(crate) async fn ensure_llm_provider_admission_schema_if_configured(
     shared_pool: &SharedPool,
 ) -> Result<(), ClassifiedError> {
@@ -285,10 +384,14 @@ fn validate_startup_config(config: &ProviderAdmissionConfig) -> Result<(), Class
                 "Unsupported {ENV_MODE}; use disabled or db_fixed_window for LLM provider admission."
             ),
         )),
-        ProviderAdmissionMode::DbFixedWindow if config.rpm_limit.is_none() => {
+        ProviderAdmissionMode::DbFixedWindow
+            if config.rpm_limit.is_none() && config.tpm_limit.is_none() =>
+        {
             Err(ClassifiedError::new(
                 ErrorKind::InvalidRequest,
-                format!("{ENV_MODE}=db_fixed_window requires {ENV_RPM} or {ENV_CAPACITY_RPM}."),
+                format!(
+                    "{ENV_MODE}=db_fixed_window requires {ENV_RPM}/{ENV_CAPACITY_RPM} or {ENV_TPM}/{ENV_CAPACITY_TPM}."
+                ),
             ))
         }
         ProviderAdmissionMode::DbFixedWindow => Ok(()),
@@ -299,20 +402,25 @@ pub(crate) async fn admit_llm_provider_request(
     shared_pool: Option<&SharedPool>,
     provider: &str,
     model: &str,
+    estimated_tokens: u64,
 ) -> Result<(), ClassifiedError> {
     let config = ProviderAdmissionConfig::from_env();
-    admit_llm_provider_request_with_config(shared_pool, provider, model, config).await
+    admit_llm_provider_request_with_config(shared_pool, provider, model, estimated_tokens, config)
+        .await
 }
 
 async fn admit_llm_provider_request_with_config(
     shared_pool: Option<&SharedPool>,
     provider: &str,
     model: &str,
+    estimated_tokens: u64,
     config: ProviderAdmissionConfig,
 ) -> Result<(), ClassifiedError> {
+    let estimated_tokens = estimated_tokens.max(1);
     match config.mode {
         ProviderAdmissionMode::Disabled => {
             record_attempt(&config, "disabled");
+            record_tokens(&config, "disabled", estimated_tokens);
             Ok(())
         }
         ProviderAdmissionMode::Unsupported => handle_admission_error(
@@ -324,20 +432,22 @@ async fn admit_llm_provider_request_with_config(
                     "Unsupported {ENV_MODE}; use disabled or db_fixed_window for LLM provider admission."
                 ),
             ),
+            Some(estimated_tokens),
         ),
         ProviderAdmissionMode::DbFixedWindow => {
-            let Some(rpm_limit) = config.rpm_limit else {
+            if config.rpm_limit.is_none() && config.tpm_limit.is_none() {
                 return handle_admission_error(
                     &config,
                     "misconfigured",
                     ClassifiedError::new(
                         ErrorKind::InvalidRequest,
                         format!(
-                            "{ENV_MODE}=db_fixed_window requires {ENV_RPM} or {ENV_CAPACITY_RPM}."
+                            "{ENV_MODE}=db_fixed_window requires {ENV_RPM}/{ENV_CAPACITY_RPM} or {ENV_TPM}/{ENV_CAPACITY_TPM}."
                         ),
                     ),
+                    Some(estimated_tokens),
                 );
-            };
+            }
             let Some(shared_pool) = shared_pool else {
                 return handle_admission_error(
                     &config,
@@ -346,28 +456,44 @@ async fn admit_llm_provider_request_with_config(
                         ErrorKind::DatabaseError,
                         "LLM provider admission is enabled but no shared database pool is available.",
                     ),
+                    Some(estimated_tokens),
                 );
             };
-            match db_fixed_window_admit(shared_pool, provider, model, &config, rpm_limit).await {
+            match db_fixed_window_admit(shared_pool, provider, model, &config, estimated_tokens)
+                .await
+            {
                 Ok(FixedWindowAdmission::Admitted) => {
                     record_attempt(&config, "admitted");
+                    record_tokens(&config, "admitted", estimated_tokens);
                     Ok(())
                 }
-                Ok(FixedWindowAdmission::Rejected { retry_after_ms }) => {
-                    record_attempt(&config, "rejected");
+                Ok(FixedWindowAdmission::Rejected {
+                    retry_after_ms,
+                    limit,
+                }) => {
+                    record_attempt(&config, limit.rejected_outcome());
+                    record_tokens(&config, limit.rejected_outcome(), estimated_tokens);
                     record_retry_after(&config, retry_after_ms);
                     Err(ClassifiedError::new(
                         ErrorKind::RateLimit,
                         format!(
-                            "LLM provider admission limit reached for {} scope (limit: {} requests per {}ms). Retry after {}s.",
+                            "LLM provider admission {} limit reached for {} scope (rpm: {}, tpm: {}, window: {}ms). Retry after {}s.",
+                            limit.as_label(),
                             config.scope_label(),
-                            rpm_limit,
+                            config
+                                .rpm_limit
+                                .map_or("none".to_string(), |value| value.to_string()),
+                            config
+                                .tpm_limit
+                                .map_or("none".to_string(), |value| value.to_string()),
                             config.window_ms,
                             retry_after_ms.div_ceil(1000)
                         ),
                     ))
                 }
-                Err(error) => handle_admission_error(&config, "database_error", error),
+                Err(error) => {
+                    handle_admission_error(&config, "database_error", error, Some(estimated_tokens))
+                }
             }
         }
     }
@@ -377,13 +503,20 @@ fn handle_admission_error(
     config: &ProviderAdmissionConfig,
     class: &'static str,
     error: ClassifiedError,
+    estimated_tokens: Option<u64>,
 ) -> Result<(), ClassifiedError> {
     record_error(config, class);
     if config.fail_open {
         record_attempt(config, "error_fail_open");
+        if let Some(estimated_tokens) = estimated_tokens {
+            record_tokens(config, "error_fail_open", estimated_tokens);
+        }
         Ok(())
     } else {
         record_attempt(config, "error_fail_closed");
+        if let Some(estimated_tokens) = estimated_tokens {
+            record_tokens(config, "error_fail_closed", estimated_tokens);
+        }
         Err(error)
     }
 }
@@ -393,12 +526,12 @@ async fn db_fixed_window_admit(
     provider: &str,
     model: &str,
     config: &ProviderAdmissionConfig,
-    rpm_limit: u64,
+    estimated_tokens: u64,
 ) -> Result<FixedWindowAdmission, ClassifiedError> {
     let now_ms = now_epoch_ms();
     let window_start_ms = fixed_window_start_ms(now_ms, config.window_ms);
     let bucket_key = bucket_key(config.scope, provider, model);
-    let rpm_limit_i64 = i64::try_from(rpm_limit).unwrap_or(i64::MAX);
+    let estimated_tokens_i64 = i64::try_from(estimated_tokens).unwrap_or(i64::MAX);
 
     sqlx::query(INSERT_WINDOW_SQL)
         .bind(&bucket_key)
@@ -407,20 +540,105 @@ async fn db_fixed_window_admit(
         .await
         .map_err(database_error)?;
 
-    let result = sqlx::query(CLAIM_WINDOW_SLOT_SQL)
-        .bind(&bucket_key)
-        .bind(window_start_ms)
-        .bind(rpm_limit_i64)
-        .execute(shared_pool.get())
-        .await
-        .map_err(database_error)?;
+    let result = match (config.rpm_limit, config.tpm_limit) {
+        (Some(rpm_limit), Some(tpm_limit)) => {
+            sqlx::query(CLAIM_WINDOW_SLOT_RPM_TPM_SQL)
+                .bind(estimated_tokens_i64)
+                .bind(&bucket_key)
+                .bind(window_start_ms)
+                .bind(i64::try_from(rpm_limit).unwrap_or(i64::MAX))
+                .bind(estimated_tokens_i64)
+                .bind(i64::try_from(tpm_limit).unwrap_or(i64::MAX))
+                .execute(shared_pool.get())
+                .await
+        }
+        (Some(rpm_limit), None) => {
+            sqlx::query(CLAIM_WINDOW_SLOT_RPM_SQL)
+                .bind(estimated_tokens_i64)
+                .bind(&bucket_key)
+                .bind(window_start_ms)
+                .bind(i64::try_from(rpm_limit).unwrap_or(i64::MAX))
+                .execute(shared_pool.get())
+                .await
+        }
+        (None, Some(tpm_limit)) => {
+            sqlx::query(CLAIM_WINDOW_SLOT_TPM_SQL)
+                .bind(estimated_tokens_i64)
+                .bind(&bucket_key)
+                .bind(window_start_ms)
+                .bind(estimated_tokens_i64)
+                .bind(i64::try_from(tpm_limit).unwrap_or(i64::MAX))
+                .execute(shared_pool.get())
+                .await
+        }
+        (None, None) => {
+            return Err(ClassifiedError::new(
+                ErrorKind::InvalidRequest,
+                "LLM provider admission DB fixed-window mode has no RPM or TPM limit.",
+            ));
+        }
+    }
+    .map_err(database_error)?;
 
     if result.rows_affected() == 1 {
         Ok(FixedWindowAdmission::Admitted)
     } else {
+        let limit = detect_rejected_limit(
+            shared_pool,
+            &bucket_key,
+            window_start_ms,
+            config,
+            estimated_tokens,
+        )
+        .await?;
         Ok(FixedWindowAdmission::Rejected {
             retry_after_ms: retry_after_ms(now_ms, window_start_ms, config.window_ms),
+            limit,
         })
+    }
+}
+
+async fn detect_rejected_limit(
+    shared_pool: &SharedPool,
+    bucket_key: &str,
+    window_start_ms: i64,
+    config: &ProviderAdmissionConfig,
+    estimated_tokens: u64,
+) -> Result<ProviderAdmissionLimit, ClassifiedError> {
+    let row = sqlx::query(SELECT_WINDOW_COUNTS_SQL)
+        .bind(bucket_key)
+        .bind(window_start_ms)
+        .fetch_optional(shared_pool.get())
+        .await
+        .map_err(database_error)?;
+    let Some(row) = row else {
+        return Ok(ProviderAdmissionLimit::Capacity);
+    };
+    let request_count = row.try_get::<i64, _>("request_count").unwrap_or(0).max(0) as u64;
+    let token_count = row.try_get::<i64, _>("token_count").unwrap_or(0).max(0) as u64;
+    Ok(rejected_limit_from_counts(
+        request_count,
+        token_count,
+        estimated_tokens,
+        config.rpm_limit,
+        config.tpm_limit,
+    ))
+}
+
+fn rejected_limit_from_counts(
+    request_count: u64,
+    token_count: u64,
+    estimated_tokens: u64,
+    rpm_limit: Option<u64>,
+    tpm_limit: Option<u64>,
+) -> ProviderAdmissionLimit {
+    let rpm_exhausted = rpm_limit.is_some_and(|limit| request_count >= limit);
+    let tpm_exhausted =
+        tpm_limit.is_some_and(|limit| token_count.saturating_add(estimated_tokens.max(1)) > limit);
+    match (rpm_exhausted, tpm_exhausted) {
+        (true, false) => ProviderAdmissionLimit::Rpm,
+        (false, true) => ProviderAdmissionLimit::Tpm,
+        _ => ProviderAdmissionLimit::Capacity,
     }
 }
 
@@ -565,16 +783,32 @@ mod tests {
     #[test]
     fn db_fixed_window_sql_uses_atomic_conditional_claim() {
         assert!(CREATE_WINDOWS_TABLE_SQL.contains("PRIMARY KEY (bucket_key, window_start_ms)"));
+        assert!(CREATE_WINDOWS_TABLE_SQL.contains("token_count BIGINT NOT NULL DEFAULT 0"));
         assert!(INSERT_WINDOW_SQL.contains("INSERT IGNORE"));
-        assert!(CLAIM_WINDOW_SLOT_SQL.contains("request_count = request_count + 1"));
-        assert!(CLAIM_WINDOW_SLOT_SQL.contains("request_count < ?"));
+        assert!(INSERT_WINDOW_SQL.contains("request_count, token_count"));
+        assert!(CLAIM_WINDOW_SLOT_RPM_SQL.contains("request_count = request_count + 1"));
+        assert!(CLAIM_WINDOW_SLOT_RPM_SQL.contains("token_count = token_count + ?"));
+        assert!(CLAIM_WINDOW_SLOT_RPM_SQL.contains("request_count < ?"));
+        assert!(CLAIM_WINDOW_SLOT_TPM_SQL.contains("token_count = token_count + ?"));
+        assert!(CLAIM_WINDOW_SLOT_TPM_SQL.contains("token_count + ? <= ?"));
+        assert!(CLAIM_WINDOW_SLOT_RPM_TPM_SQL.contains("request_count < ?"));
+        assert!(CLAIM_WINDOW_SLOT_RPM_TPM_SQL.contains("token_count + ? <= ?"));
     }
 
     #[test]
-    fn startup_validation_rejects_enabled_mode_without_rpm() {
+    fn startup_validation_rejects_enabled_mode_without_any_limit() {
         let error = validate_startup_config(&ProviderAdmissionConfig::db_fixed_window(None))
-            .expect_err("db mode without rpm is a deployment error");
+            .expect_err("db mode without rpm/tpm is a deployment error");
         assert_eq!(error.kind, ErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn startup_validation_allows_tpm_only_mode() {
+        validate_startup_config(&ProviderAdmissionConfig::db_fixed_window_with_tpm(
+            None,
+            Some(120_000),
+        ))
+        .expect("tpm-only admission is valid");
     }
 
     #[test]
@@ -582,6 +816,22 @@ mod tests {
         let error = validate_startup_config(&ProviderAdmissionConfig::unsupported())
             .expect_err("unsupported mode is a deployment error");
         assert_eq!(error.kind, ErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn rejected_limit_classification_distinguishes_rpm_and_tpm() {
+        assert_eq!(
+            rejected_limit_from_counts(60, 10_000, 1_000, Some(60), Some(120_000)),
+            ProviderAdmissionLimit::Rpm
+        );
+        assert_eq!(
+            rejected_limit_from_counts(10, 119_500, 1_000, Some(60), Some(120_000)),
+            ProviderAdmissionLimit::Tpm
+        );
+        assert_eq!(
+            rejected_limit_from_counts(60, 119_500, 1_000, Some(60), Some(120_000)),
+            ProviderAdmissionLimit::Capacity
+        );
     }
 
     #[tokio::test]
@@ -594,6 +844,7 @@ mod tests {
             None,
             "anthropic",
             "claude",
+            2_048,
             ProviderAdmissionConfig::disabled(),
         )
         .await;
@@ -603,10 +854,13 @@ mod tests {
         assert!(rendered.contains(
             r#"astra_llm_provider_admission_attempts_total{mode="disabled",outcome="disabled",scope="provider"} 1"#
         ));
+        assert!(rendered.contains(
+            r#"astra_llm_provider_admission_tokens_total{mode="disabled",outcome="disabled",scope="provider"} 2048"#
+        ));
     }
 
     #[tokio::test]
-    async fn db_mode_without_rpm_fails_closed_before_touching_database() {
+    async fn db_mode_without_any_limit_fails_closed_before_touching_database() {
         let _guard = metrics_test_lock().lock_owned().await;
         let registry = Arc::new(MetricsRegistry::new());
         set_llm_provider_admission_metrics_registry(registry.clone());
@@ -615,11 +869,12 @@ mod tests {
             None,
             "anthropic",
             "claude",
+            2_048,
             ProviderAdmissionConfig::db_fixed_window(None),
         )
         .await;
 
-        let error = result.expect_err("missing rpm must fail closed");
+        let error = result.expect_err("missing rpm/tpm must fail closed");
         assert_eq!(error.kind, ErrorKind::InvalidRequest);
         let rendered = registry.render_prometheus();
         assert!(rendered.contains(
@@ -640,6 +895,7 @@ mod tests {
             None,
             "anthropic",
             "claude",
+            2_048,
             ProviderAdmissionConfig::unsupported(),
         )
         .await;
@@ -664,7 +920,8 @@ mod tests {
         config.fail_open = true;
 
         let result =
-            admit_llm_provider_request_with_config(None, "anthropic", "claude", config).await;
+            admit_llm_provider_request_with_config(None, "anthropic", "claude", 2_048, config)
+                .await;
 
         assert!(result.is_ok());
         let rendered = registry.render_prometheus();
@@ -673,6 +930,9 @@ mod tests {
         ));
         assert!(rendered.contains(
             r#"astra_llm_provider_admission_errors_total{class="missing_pool",mode="db_fixed_window",policy="fail_open",scope="provider"} 1"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_provider_admission_tokens_total{mode="db_fixed_window",outcome="error_fail_open",scope="provider"} 2048"#
         ));
     }
 }

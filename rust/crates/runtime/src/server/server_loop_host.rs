@@ -3596,10 +3596,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
         let result = loop {
+            let admission_estimated_tokens = crate::prompts::estimate_tokens(
+                &llm_messages,
+                state.pinned_tool_schema_tokens as usize,
+                0,
+            )
+            .saturating_add(effective_max_output);
             crate::llm_provider_admission::admit_llm_provider_request(
                 self.shared_pool.as_ref(),
                 &llm_cfg.provider,
                 &llm_cfg.model_name,
+                admission_estimated_tokens as u64,
             )
             .await?;
             let prompt_round = state
