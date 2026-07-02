@@ -12,6 +12,7 @@ scripts/
 │   └── stop-api.sh
 ├── load/
 │   ├── cleanup_pressure_probe.py
+│   ├── durable_event_pressure_probe.py
 │   └── multi_cli_capacity_probe.py
 ├── schema/
 │   └── schema_inventory.py
@@ -60,6 +61,25 @@ Use only against disposable test databases. The default database base contains
 make test-cleanup-pressure
 python3 scripts/load/cleanup_pressure_probe.py --profile smoke
 python3 scripts/load/cleanup_pressure_probe.py --profile pressure --queue-rows 20000 --csl-rows 20000 --prompt-rows 20000 --prompt-fresh-rows 512
+```
+
+### `scripts/load/durable_event_pressure_probe.py`
+Runs an ignored live MatrixOne probe for the durable run-event persistence
+budget. It writes concurrent completed runs with large synthetic streaming
+outputs, then reports `agent_run_events` rows, estimated batch bytes, replay
+rows, and compaction summary frequency under `tmp/durable-event-pressure/`.
+
+This is a DB-layer pressure gate. It deliberately avoids real LLM calls so
+provider quotas do not hide durable event row-amplification regressions. Use the
+multi-CLI probe for end-to-end HTTP/SSE/provider behavior.
+
+Use only against disposable test databases. The default database contains
+`test`, and the script refuses names that do not contain `test` or `smoke`.
+
+```sh
+make test-durable-event-pressure
+python3 scripts/load/durable_event_pressure_probe.py --profile smoke
+python3 scripts/load/durable_event_pressure_probe.py --profile pressure --runs 100 --text-deltas 10000 --progress-rows 525
 ```
 
 ### `scripts/schema/schema_inventory.py`

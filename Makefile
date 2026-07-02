@@ -42,6 +42,7 @@ help:
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see rust/.config/nextest.toml)"
 	@echo "  make test-cleanup-pressure - Live MatrixOne cleanup pressure probes (explicit, not part of test-online)"
+	@echo "  make test-durable-event-pressure - Live MatrixOne durable event pressure probe (explicit, not part of test-online)"
 	@echo "  make test-saas          - SaaS platform E2E (docs/testing/saas-test-plan.md §5; MatrixOne + optional SDK)"
 	@echo "  make test-saas-coverage - SaaS E2E + llvm line coverage report (needs: cargo install cargo-llvm-cov)"
 	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
@@ -134,6 +135,9 @@ NEXTEST_ONLINE_PROFILE  ?= strict-online
 CLEANUP_PRESSURE_PROFILE ?= smoke
 CLEANUP_PRESSURE_DATABASE_BASE ?= astra_runtime_test_cleanup_pressure
 CLEANUP_PRESSURE_ARGS ?=
+DURABLE_EVENT_PRESSURE_PROFILE ?= smoke
+DURABLE_EVENT_PRESSURE_DATABASE ?= astra_runtime_test_durable_event_pressure
+DURABLE_EVENT_PRESSURE_ARGS ?=
 
 NEXTEST_OFFLINE_FLAGS := --profile $(NEXTEST_OFFLINE_PROFILE)
 NEXTEST_ONLINE_FLAGS  := --profile $(NEXTEST_ONLINE_PROFILE)
@@ -960,6 +964,13 @@ test-cleanup-pressure:
 		--profile "$(CLEANUP_PRESSURE_PROFILE)" \
 		--database-base "$(CLEANUP_PRESSURE_DATABASE_BASE)" \
 		$(CLEANUP_PRESSURE_ARGS)
+
+.PHONY: test-durable-event-pressure
+test-durable-event-pressure:
+	@python3 scripts/load/durable_event_pressure_probe.py \
+		--profile "$(DURABLE_EVENT_PRESSURE_PROFILE)" \
+		--database "$(DURABLE_EVENT_PRESSURE_DATABASE)" \
+		$(DURABLE_EVENT_PRESSURE_ARGS)
 
 # SaaS platform E2E (docs/testing/saas-test-plan.md §5): resource governance, admin RBAC,
 # auth refresh, session reaper. Requires MatrixOne + .env secrets (same as test-online).

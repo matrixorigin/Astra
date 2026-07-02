@@ -9940,6 +9940,282 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DurableEventPressureBatch {
+        raw_event_count: usize,
+        candidate_rows: usize,
+        candidate_bytes: usize,
+        budgeted_events: Vec<Value>,
+        budgeted_bytes: usize,
+        compacted: bool,
+    }
+
+    #[derive(Debug)]
+    struct DurableEventPressureRunStats {
+        raw_events: usize,
+        candidate_rows: usize,
+        candidate_bytes: usize,
+        budgeted_rows: usize,
+        budgeted_bytes: usize,
+        persisted_rows: usize,
+        replay_rows: usize,
+        compacted_rows: usize,
+        text_delta_rows: usize,
+        elapsed_ms: u64,
+    }
+
+    fn durable_event_pressure_env_usize(name: &str, default: usize, min: usize) -> usize {
+        match std::env::var(name) {
+            Ok(value) => value
+                .parse::<usize>()
+                .unwrap_or_else(|err| panic!("invalid {name}={value:?}: {err}"))
+                .max(min),
+            Err(_) => default.max(min),
+        }
+    }
+
+    fn replay_event_type(event: &Value) -> Option<&str> {
+        event
+            .get("event_type")
+            .or_else(|| event.get("type"))
+            .and_then(Value::as_str)
+    }
+
+    fn build_durable_event_pressure_batch(
+        run_ordinal: usize,
+        text_delta_count: usize,
+        progress_event_count: usize,
+    ) -> DurableEventPressureBatch {
+        let mut raw_stream_events: Vec<Value> =
+            Vec::with_capacity(text_delta_count + progress_event_count + 5);
+        raw_stream_events.extend((0..text_delta_count).map(|idx| {
+            json!({"type": "text_delta", "content": format!("run-{run_ordinal}-chunk-{idx}")})
+        }));
+        raw_stream_events.push(json!({
+            "type": "tool_call",
+            "tool_call": {"id": format!("call-{run_ordinal}"), "name": "bash"}
+        }));
+        raw_stream_events.push(json!({
+            "type": "tool_call_end",
+            "call_id": format!("call-{run_ordinal}"),
+            "tool": "bash",
+            "result": "ok"
+        }));
+        raw_stream_events.push(json!({
+            "type": "reasoning_done",
+            "data": {"signature": format!("sig-{run_ordinal}")}
+        }));
+        raw_stream_events.extend(
+            (0..progress_event_count).map(
+                |idx| json!({"type": "agent_progress", "run_ordinal": run_ordinal, "seq": idx}),
+            ),
+        );
+        raw_stream_events.push(json!({
+            "event_type": "text_done",
+            "data": {"full_text": format!("large durable final answer {run_ordinal}")}
+        }));
+        raw_stream_events.push(json!({
+            "event_type": "run_finished",
+            "data": {"prompt_tokens": 9, "completion_tokens": 3, "tool_call_count": 1}
+        }));
+
+        let durable_candidates: Vec<Value> = raw_stream_events
+            .iter()
+            .filter(|event| streaming_event_for_persistence(event))
+            .cloned()
+            .collect();
+        let candidate_rows = durable_candidates.len();
+        let candidate_bytes = durable_candidates
+            .iter()
+            .map(durable_run_event_estimated_bytes)
+            .sum::<usize>();
+        let budgeted_events = enforce_durable_run_event_batch_budget(durable_candidates);
+        let budgeted_bytes = budgeted_events
+            .iter()
+            .map(durable_run_event_estimated_bytes)
+            .sum::<usize>();
+        let compacted = budgeted_events
+            .iter()
+            .any(|event| durable_event_type(event) == Some("durable_events_compacted"));
+
+        DurableEventPressureBatch {
+            raw_event_count: raw_stream_events.len(),
+            candidate_rows,
+            candidate_bytes,
+            budgeted_events,
+            budgeted_bytes,
+            compacted,
+        }
+    }
+
+    async fn durable_event_pressure_case(
+        pool: SharedPool,
+        run_ordinal: usize,
+        text_delta_count: usize,
+        progress_event_count: usize,
+    ) -> Result<DurableEventPressureRunStats, String> {
+        let user_id = "durable-event-pressure-user";
+        let run_id = format!("durable-pressure-{run_ordinal}-{}", Uuid::new_v4());
+        let session_id = format!("sess-durable-pressure-{run_ordinal}-{}", Uuid::new_v4());
+        let svc = db_backed_test_service(&pool, &format!("durable-pressure-pod-{run_ordinal}"));
+        cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
+
+        let started = Instant::now();
+        let result = async {
+            svc.run_engine
+                .start_run(&run_id, user_id, &session_id)
+                .await
+                .map_err(|err| format!("start durable DB run {run_id}: {err}"))?;
+
+            let batch = build_durable_event_pressure_batch(
+                run_ordinal,
+                text_delta_count,
+                progress_event_count,
+            );
+            if batch
+                .budgeted_events
+                .iter()
+                .any(|event| durable_event_type(event) == Some("text_delta"))
+            {
+                return Err(format!(
+                    "{run_id}: transport text_delta entered durable batch"
+                ));
+            }
+            if !batch.compacted {
+                return Err(format!("{run_id}: expected semantic overflow compaction"));
+            }
+            for expected in [
+                "durable_events_compacted",
+                "tool_call",
+                "tool_call_end",
+                "reasoning_done",
+                "text_done",
+                "run_finished",
+            ] {
+                if !batch
+                    .budgeted_events
+                    .iter()
+                    .any(|event| durable_event_type(event) == Some(expected))
+                {
+                    return Err(format!("{run_id}: missing budgeted {expected}"));
+                }
+            }
+
+            let transitioned = svc
+                .run_engine
+                .transition_status_with_events_if_current(
+                    user_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                    &batch.budgeted_events,
+                )
+                .await
+                .map_err(|err| format!("commit budgeted terminal events for {run_id}: {err}"))?;
+            if !transitioned {
+                return Err(format!("{run_id}: status transition unexpectedly stale"));
+            }
+
+            let rows = sqlx::query(
+                "SELECT event_type
+                 FROM agent_run_events
+                 WHERE user_id = ? AND run_id = ?
+                 ORDER BY event_idx ASC",
+            )
+            .bind(user_id)
+            .bind(&run_id)
+            .fetch_all(pool.get())
+            .await
+            .map_err(|err| format!("load persisted event rows for {run_id}: {err}"))?;
+            let persisted_types = rows
+                .iter()
+                .map(|row| {
+                    row.try_get::<String, _>("event_type")
+                        .map_err(|err| format!("decode event_type for {run_id}: {err}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let persisted_rows = persisted_types.len();
+            let text_delta_rows = persisted_types
+                .iter()
+                .filter(|event_type| event_type.as_str() == "text_delta")
+                .count();
+            let compacted_rows = persisted_types
+                .iter()
+                .filter(|event_type| event_type.as_str() == "durable_events_compacted")
+                .count();
+            if persisted_rows > MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 1 {
+                return Err(format!(
+                    "{run_id}: persisted {persisted_rows} rows above budget plus run_started"
+                ));
+            }
+            if text_delta_rows != 0 {
+                return Err(format!(
+                    "{run_id}: persisted {text_delta_rows} text_delta rows"
+                ));
+            }
+            if compacted_rows != 1 {
+                return Err(format!(
+                    "{run_id}: expected exactly one compaction row, got {compacted_rows}"
+                ));
+            }
+
+            let replay_events = svc
+                .stream_run(run_id.clone(), user_id.to_string(), 1)
+                .await
+                .map_err(|response| {
+                    format!(
+                        "stream replay failed for {run_id}: {:?}: {}",
+                        response.0, response.1.0.detail
+                    )
+                })?;
+            if replay_events.len() > MAX_DURABLE_RUN_EVENT_BATCH_ROWS {
+                return Err(format!(
+                    "{run_id}: replay returned {} rows above durable batch budget",
+                    replay_events.len()
+                ));
+            }
+            if replay_events
+                .iter()
+                .any(|event| replay_event_type(event) == Some("text_delta"))
+            {
+                return Err(format!("{run_id}: replay returned text_delta"));
+            }
+            let expected_answer = format!("large durable final answer {run_ordinal}");
+            if !replay_events.iter().any(|event| {
+                replay_event_type(event) == Some("text_done")
+                    && event.pointer("/data/full_text").and_then(Value::as_str)
+                        == Some(expected_answer.as_str())
+            }) {
+                return Err(format!("{run_id}: replay missing final answer"));
+            }
+            if !replay_events
+                .iter()
+                .any(|event| replay_event_type(event) == Some("run_finished"))
+            {
+                return Err(format!("{run_id}: replay missing run_finished"));
+            }
+
+            Ok(DurableEventPressureRunStats {
+                raw_events: batch.raw_event_count,
+                candidate_rows: batch.candidate_rows,
+                candidate_bytes: batch.candidate_bytes,
+                budgeted_rows: batch.budgeted_events.len(),
+                budgeted_bytes: batch.budgeted_bytes,
+                persisted_rows,
+                replay_rows: replay_events.len(),
+                compacted_rows,
+                text_delta_rows,
+                elapsed_ms: duration_millis_u64(started.elapsed()),
+            })
+        }
+        .await;
+
+        cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
+        result
+    }
+
     async fn seed_lifecycle_run_for_pause_resume_it(
         svc: &AgenticRunLifecycleService,
         user_id: &str,
@@ -14125,6 +14401,104 @@ mod tests {
         }));
 
         cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn durable_run_event_pressure_probe() {
+        let pool = setup_lifecycle_run_db_it().await;
+        let run_count =
+            durable_event_pressure_env_usize("ASTRA_DURABLE_EVENT_PRESSURE_RUNS", 100, 1);
+        let text_delta_count =
+            durable_event_pressure_env_usize("ASTRA_DURABLE_EVENT_PRESSURE_TEXT_DELTAS", 10_000, 1);
+        let progress_event_count = durable_event_pressure_env_usize(
+            "ASTRA_DURABLE_EVENT_PRESSURE_PROGRESS_ROWS",
+            MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 25,
+            MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 1,
+        );
+
+        let started = Instant::now();
+        let tasks = (0..run_count).map(|run_ordinal| {
+            durable_event_pressure_case(
+                pool.clone(),
+                run_ordinal,
+                text_delta_count,
+                progress_event_count,
+            )
+        });
+        let results = futures_util::future::join_all(tasks).await;
+        let mut stats = Vec::with_capacity(run_count);
+        for result in results {
+            stats.push(result.expect("durable event pressure run"));
+        }
+
+        let total_raw_events: usize = stats.iter().map(|stat| stat.raw_events).sum();
+        let total_candidate_rows: usize = stats.iter().map(|stat| stat.candidate_rows).sum();
+        let total_candidate_bytes: usize = stats.iter().map(|stat| stat.candidate_bytes).sum();
+        let total_budgeted_rows: usize = stats.iter().map(|stat| stat.budgeted_rows).sum();
+        let total_budgeted_bytes: usize = stats.iter().map(|stat| stat.budgeted_bytes).sum();
+        let total_persisted_rows: usize = stats.iter().map(|stat| stat.persisted_rows).sum();
+        let total_replay_rows: usize = stats.iter().map(|stat| stat.replay_rows).sum();
+        let total_text_delta_rows: usize = stats.iter().map(|stat| stat.text_delta_rows).sum();
+        let compacted_runs = stats.iter().filter(|stat| stat.compacted_rows == 1).count();
+        let max_persisted_rows_per_run = stats
+            .iter()
+            .map(|stat| stat.persisted_rows)
+            .max()
+            .unwrap_or_default();
+        let max_replay_rows_per_run = stats
+            .iter()
+            .map(|stat| stat.replay_rows)
+            .max()
+            .unwrap_or_default();
+        let max_run_elapsed_ms = stats
+            .iter()
+            .map(|stat| stat.elapsed_ms)
+            .max()
+            .unwrap_or_default();
+
+        assert_eq!(
+            compacted_runs, run_count,
+            "every overflowed run should emit one compaction summary"
+        );
+        assert_eq!(
+            total_text_delta_rows, 0,
+            "transport deltas must never enter durable run events"
+        );
+        assert!(
+            total_persisted_rows <= run_count * (MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 1),
+            "persisted rows should be bounded by durable batch budget plus run_started"
+        );
+        assert!(
+            total_replay_rows <= run_count * MAX_DURABLE_RUN_EVENT_BATCH_ROWS,
+            "cache-miss replay rows should be bounded by durable batch budget"
+        );
+
+        eprintln!(
+            "DURABLE_EVENT_PRESSURE_RESULT {}",
+            json!({
+                "path": "agent_run_events.durable_event_budget",
+                "runs": run_count,
+                "text_deltas_per_run": text_delta_count,
+                "progress_rows_per_run": progress_event_count,
+                "row_budget": MAX_DURABLE_RUN_EVENT_BATCH_ROWS,
+                "byte_budget": MAX_DURABLE_RUN_EVENT_BATCH_BYTES,
+                "total_raw_events": total_raw_events,
+                "total_candidate_rows": total_candidate_rows,
+                "total_candidate_bytes": total_candidate_bytes,
+                "total_budgeted_rows": total_budgeted_rows,
+                "total_budgeted_bytes": total_budgeted_bytes,
+                "total_persisted_rows": total_persisted_rows,
+                "total_replay_rows": total_replay_rows,
+                "total_text_delta_rows": total_text_delta_rows,
+                "compacted_runs": compacted_runs,
+                "summary_event_frequency": compacted_runs as f64 / run_count as f64,
+                "max_persisted_rows_per_run": max_persisted_rows_per_run,
+                "max_replay_rows_per_run": max_replay_rows_per_run,
+                "max_run_elapsed_ms": max_run_elapsed_ms,
+                "elapsed_ms": duration_millis_u64(started.elapsed())
+            })
+        );
     }
 
     #[tokio::test]
