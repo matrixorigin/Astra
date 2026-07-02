@@ -1574,6 +1574,77 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne pressure DB; set ASTRA_TEST_DB_IT=1"]
+    async fn db_cleanup_expired_pressure_probe() {
+        let _guard = LIVE_DB_TEST_LOCK.lock().await;
+        let pool = live_test_pool().await;
+        ensure_schema(&pool).await.expect("ensure messaging schema");
+        clear_message_tables(&pool).await;
+
+        let row_count = cleanup_pressure_rows(
+            "ASTRA_CLEANUP_PRESSURE_QUEUE_ROWS",
+            QUEUE_CLEANUP_BATCH_LIMIT * 5,
+            QUEUE_CLEANUP_BATCH_LIMIT + 1,
+        );
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let delegation_id = format!("delegation-pressure-{}", uuid::Uuid::new_v4());
+        let consumer_id = format!("consumer-pressure-{}", uuid::Uuid::new_v4());
+        let message_ids = (0..row_count)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+
+        let insert_started = std::time::Instant::now();
+        for chunk in message_ids.chunks(QUEUE_CLEANUP_BATCH_LIMIT as usize) {
+            insert_expired_queue_rows(&pool, chunk, &delegation_id, now_ms).await;
+            insert_delivery_rows(&pool, chunk, &consumer_id, &delegation_id).await;
+        }
+        let insert_ms = insert_started.elapsed().as_millis();
+        wait_for_queue_count(&pool, row_count).await;
+        wait_for_delivery_count(&pool, row_count).await;
+
+        let transport = DatabaseTransport::new(pool.clone());
+        let cleanup_started = std::time::Instant::now();
+        let mut deleted = 0_u64;
+        let mut batches = 0_u64;
+        loop {
+            let removed = transport.cleanup_expired().await.expect("pressure cleanup");
+            assert!(
+                removed <= QUEUE_CLEANUP_BATCH_LIMIT as u64,
+                "cleanup must not exceed one bounded queue batch"
+            );
+            if removed == 0 {
+                break;
+            }
+            batches += 1;
+            deleted += removed;
+            assert!(
+                batches <= ((row_count / QUEUE_CLEANUP_BATCH_LIMIT) + 2) as u64,
+                "cleanup should converge near the expected batch count"
+            );
+        }
+        let cleanup_ms = cleanup_started.elapsed().as_millis();
+
+        assert_eq!(deleted, row_count as u64);
+        wait_for_queue_count(&pool, 0).await;
+        wait_for_delivery_count(&pool, 0).await;
+
+        eprintln!(
+            "CLEANUP_PRESSURE_RESULT {}",
+            serde_json::json!({
+                "path": "agent_message_queue.expired",
+                "rows_inserted": row_count,
+                "rows_deleted": deleted,
+                "batch_limit": QUEUE_CLEANUP_BATCH_LIMIT,
+                "batches": batches,
+                "insert_ms": insert_ms,
+                "cleanup_ms": cleanup_ms,
+                "remaining_queue_rows": count_queue_rows(&pool).await,
+                "remaining_delivery_rows": count_delivery_rows(&pool).await,
+            })
+        );
+    }
+
     #[test]
     fn transport_metrics_default() {
         let m = TransportMetrics::default();
@@ -1840,5 +1911,17 @@ mod tests {
             last, expected,
             "{label} row count did not reach expected value"
         );
+    }
+
+    fn cleanup_pressure_rows(env_key: &str, default: i64, minimum: i64) -> i64 {
+        let rows = std::env::var(env_key)
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(default);
+        assert!(
+            rows >= minimum,
+            "{env_key} must be at least {minimum} rows to exercise pressure cleanup"
+        );
+        rows
     }
 }

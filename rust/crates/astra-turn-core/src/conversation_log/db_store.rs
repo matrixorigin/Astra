@@ -520,6 +520,18 @@ mod tests {
         create_session_for(store, session_id, &store.user_id).await;
     }
 
+    fn cleanup_pressure_rows(env_key: &str, default: i64, minimum: i64) -> i64 {
+        let rows = std::env::var(env_key)
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(default);
+        assert!(
+            rows >= minimum,
+            "{env_key} must be at least {minimum} rows to exercise pressure cleanup"
+        );
+        rows
+    }
+
     async fn create_session_for(store: &DbCslStore, session_id: &str, user_id: &str) {
         let pool = store.get_pool().await.unwrap();
         query(
@@ -920,6 +932,92 @@ mod tests {
         .await
         .expect("count residual CSL rows");
         assert_eq!(residual, (2, Some(before_seq), Some(before_seq + 1)));
+
+        cleanup(&store, sid).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DB pressure run"]
+    async fn db_truncate_gc_pressure_probe() {
+        let store = test_store().await;
+        let sid = &format!("db-test-truncate-pressure-{}", uuid::Uuid::new_v4());
+        cleanup(&store, sid).await;
+        create_session(&store, sid).await;
+
+        let pool = store.get_pool().await.unwrap();
+        let before_seq = cleanup_pressure_rows(
+            "ASTRA_CLEANUP_PRESSURE_CSL_ROWS",
+            CSL_TRUNCATE_BATCH_LIMIT * 5,
+            CSL_TRUNCATE_BATCH_LIMIT + 1,
+        );
+        let tail_rows = 2_i64;
+        let total_rows = before_seq + tail_rows;
+
+        let insert_started = std::time::Instant::now();
+        let mut start = 0_i64;
+        while start < total_rows {
+            let end = (start + CSL_TRUNCATE_BATCH_LIMIT).min(total_rows);
+            let mut builder = QueryBuilder::<sqlx::MySql>::new(
+                "INSERT INTO conversation_log \
+                 (user_id, session_id, seq, turn, entry_type, payload) ",
+            );
+            builder.push_values(start..end, |mut row, seq| {
+                let entry = make_delta(seq as u64, (seq + 1) as u32, vec![user_msg("bulk")]);
+                let payload = serde_json::to_string(&entry).expect("serialize CSL test entry");
+                row.push_bind(&store.user_id)
+                    .push_bind(sid)
+                    .push_bind(seq)
+                    .push_bind((seq + 1) as i32)
+                    .push_bind(1_i8)
+                    .push_bind(payload);
+            });
+            builder
+                .build()
+                .execute(&pool)
+                .await
+                .expect("insert pressure CSL rows");
+            start = end;
+        }
+        let insert_ms = insert_started.elapsed().as_millis();
+
+        let cleanup_started = std::time::Instant::now();
+        let removed = store.truncate_before(sid, before_seq as u64).await.unwrap();
+        let cleanup_ms = cleanup_started.elapsed().as_millis();
+        assert_eq!(
+            removed, before_seq as u64,
+            "truncate_before pressure probe must delete all rows before the boundary"
+        );
+
+        let residual: (i64, Option<i64>, Option<i64>) = query_as(
+            "SELECT COUNT(*) AS count, MIN(seq) AS min_seq, MAX(seq) AS max_seq
+             FROM conversation_log
+             WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&store.user_id)
+        .bind(sid)
+        .fetch_one(&pool)
+        .await
+        .expect("count residual pressure CSL rows");
+        assert_eq!(
+            residual,
+            (tail_rows, Some(before_seq), Some(before_seq + 1))
+        );
+
+        eprintln!(
+            "CLEANUP_PRESSURE_RESULT {}",
+            serde_json::json!({
+                "path": "conversation_log.truncate_before",
+                "rows_inserted": total_rows,
+                "rows_deleted": removed,
+                "batch_limit": CSL_TRUNCATE_BATCH_LIMIT,
+                "expected_batches": (before_seq + CSL_TRUNCATE_BATCH_LIMIT - 1) / CSL_TRUNCATE_BATCH_LIMIT,
+                "insert_ms": insert_ms,
+                "cleanup_ms": cleanup_ms,
+                "remaining_rows": residual.0,
+                "remaining_min_seq": residual.1,
+                "remaining_max_seq": residual.2,
+            })
+        );
 
         cleanup(&store, sid).await;
     }

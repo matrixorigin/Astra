@@ -11,6 +11,7 @@ scripts/
 │   ├── start-api.sh
 │   └── stop-api.sh
 ├── load/
+│   ├── cleanup_pressure_probe.py
 │   └── multi_cli_capacity_probe.py
 ├── schema/
 │   └── schema_inventory.py
@@ -41,6 +42,20 @@ Use `--auth-token` or `--token-file` for existing users. Use `--register-users`
 only against a disposable environment; distinct user testing requires distinct
 real access tokens because the runtime derives ownership from auth, not from a
 request body field.
+
+### `scripts/load/cleanup_pressure_probe.py`
+Runs ignored live MatrixOne cleanup pressure probes for the current retention
+hot paths: `agent_message_queue`, `conversation_log`, and prompt retention.
+The runner captures per-probe stdout/stderr and writes `summary.json` under
+`tmp/cleanup-pressure/`.
+
+Use only against disposable test databases. The default database base contains
+`test`, and the script refuses names that do not contain `test` or `smoke`.
+
+```sh
+python3 scripts/load/cleanup_pressure_probe.py --profile smoke
+python3 scripts/load/cleanup_pressure_probe.py --profile pressure --queue-rows 20000 --csl-rows 20000 --prompt-rows 20000
+```
 
 ### `scripts/schema/schema_inventory.py`
 Builds a stdlib-only inventory of static production `CREATE TABLE IF NOT EXISTS`
