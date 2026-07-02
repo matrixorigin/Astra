@@ -642,6 +642,7 @@ pub struct RunProjectionRecord {
     pub total_completion_tokens: u64,
     pub total_tool_calls: u32,
     pub latest_checkpoint: Option<RunProjectionCheckpointRecord>,
+    pub has_durable_projection: bool,
     pub recent_events: Vec<serde_json::Value>,
 }
 

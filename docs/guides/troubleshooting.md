@@ -36,3 +36,8 @@ make test-contract
 make test
 make check
 ```
+
+## Stale Run Projection
+
+If a run list or projection response looks stale while the durable run status is
+correct, use the [run projection repair runbook](run-projection-repair.md).

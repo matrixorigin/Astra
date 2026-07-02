@@ -19,6 +19,7 @@ Welcome to astra documentation! This guide will help you find the information yo
 - [Testing Guide](guides/testing.md) - Run and write tests
 - [Deployment Guide](guides/deployment.md) - Deploy to various environments
 - [Troubleshooting](guides/troubleshooting.md) - Common issues and solutions
+- [Run Projection Repair](guides/run-projection-repair.md) - Diagnose and rebuild stale run display projections
 
 ## 📚 Reference
 

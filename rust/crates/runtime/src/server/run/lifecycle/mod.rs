@@ -6558,6 +6558,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         created_at: checkpoint.created_at,
                     }
                 }),
+                has_durable_projection: true,
                 recent_events,
             })
         } else {
@@ -6605,6 +6606,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         created_at: checkpoint.created_at,
                     }
                 }),
+                has_durable_projection: false,
                 recent_events,
             })
         }

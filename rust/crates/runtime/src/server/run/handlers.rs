@@ -328,9 +328,7 @@ async fn build_run_projection_response(
         (projection.run_event_high_watermark - projection.projection_event_idx).max(0);
     let (observability_available, prompt_request_count, latest_prompt_request) =
         load_run_prompt_observability(state, user_id, run_id).await?;
-    let has_durable_projection = projection.run_event_high_watermark
-        == projection.projection_event_idx
-        || projection.projection_event_idx >= 0;
+    let has_durable_projection = projection.has_durable_projection;
     Ok(RunProjectionResponse::new(
         projection,
         RunProjectionObservabilityResponse {
@@ -1365,6 +1363,10 @@ mod tests {
             Some(&json!(0))
         );
         assert_eq!(
+            json.pointer("/observability/has_durable_projection"),
+            Some(&json!(true))
+        );
+        assert_eq!(
             json.pointer("/observability/observability_available"),
             Some(&json!(false))
         );
@@ -1473,6 +1475,10 @@ mod tests {
         assert_eq!(
             json.pointer("/projection/observability/projection_lag_events"),
             Some(&json!(0))
+        );
+        assert_eq!(
+            json.pointer("/projection/observability/has_durable_projection"),
+            Some(&json!(true))
         );
         let recent_events = json
             .pointer("/projection/recent_events")
