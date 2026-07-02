@@ -1,0 +1,234 @@
+{
+  "dashboard": {
+    "title": "astra Runtime Capacity",
+    "tags": ["astra", "runtime", "capacity"],
+    "timezone": "browser",
+    "refresh": "10s",
+    "time": {"from": "now-1h", "to": "now"},
+    "panels": [
+      {
+        "title": "Rollout Gate",
+        "type": "stat",
+        "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "astra_capacity_rollout_allowed",
+            "legendFormat": "allowed"
+          }
+        ]
+      },
+      {
+        "title": "Rollout Risks",
+        "type": "graph",
+        "gridPos": {"h": 5, "w": 18, "x": 6, "y": 0},
+        "targets": [
+          {
+            "expr": "astra_capacity_rollout_risk",
+            "legendFormat": "{{risk}}"
+          }
+        ]
+      },
+      {
+        "title": "Configured Capacity",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+        "targets": [
+          {
+            "expr": "astra_capacity_run_slots_total",
+            "legendFormat": "run slots"
+          },
+          {
+            "expr": "astra_capacity_tool_slots_total",
+            "legendFormat": "tool slots"
+          },
+          {
+            "expr": "astra_capacity_endpoint_rpc_slots_total",
+            "legendFormat": "endpoint RPC slots"
+          }
+        ]
+      },
+      {
+        "title": "Control Poll QPS Estimate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+        "targets": [
+          {
+            "expr": "astra_capacity_control_poll_qps_estimate",
+            "legendFormat": "estimated DB poll QPS"
+          }
+        ]
+      },
+      {
+        "title": "Run Admission Outcomes",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+        "targets": [
+          {
+            "expr": "rate(astra_run_admission_attempts_total[5m])",
+            "legendFormat": "{{outcome}}"
+          }
+        ]
+      },
+      {
+        "title": "Run Admission Mean Wait",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+        "targets": [
+          {
+            "expr": "rate(astra_run_admission_wait_ms_total[5m]) / clamp_min(rate(astra_run_admission_attempts_total[5m]), 1)",
+            "legendFormat": "{{outcome}} mean wait ms"
+          }
+        ]
+      },
+      {
+        "title": "Tool Execution Admission",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 21},
+        "targets": [
+          {
+            "expr": "rate(astra_tool_execution_attempts_total[5m])",
+            "legendFormat": "{{outcome}}"
+          }
+        ]
+      },
+      {
+        "title": "Tool Execution Mean Wait",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 21},
+        "targets": [
+          {
+            "expr": "rate(astra_tool_execution_wait_ms_total[5m]) / clamp_min(rate(astra_tool_execution_attempts_total[5m]), 1)",
+            "legendFormat": "{{outcome}} mean wait ms"
+          }
+        ]
+      },
+      {
+        "title": "Provider Admission Attempts",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 29},
+        "targets": [
+          {
+            "expr": "rate(astra_llm_provider_admission_attempts_total[5m])",
+            "legendFormat": "{{mode}} {{scope}} {{outcome}}"
+          }
+        ]
+      },
+      {
+        "title": "Provider Admission Tokens",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 29},
+        "targets": [
+          {
+            "expr": "rate(astra_llm_provider_admission_tokens_total[5m])",
+            "legendFormat": "{{mode}} {{scope}} {{outcome}}"
+          }
+        ]
+      },
+      {
+        "title": "Provider Cooldown State",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 37},
+        "targets": [
+          {
+            "expr": "astra_llm_provider_rate_limit_state",
+            "legendFormat": "{{model}} {{state}}"
+          },
+          {
+            "expr": "astra_llm_provider_rate_limit_cooldown_remaining_ms",
+            "legendFormat": "{{model}} remaining ms"
+          }
+        ]
+      },
+      {
+        "title": "Provider Rate Limit Errors",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 37},
+        "targets": [
+          {
+            "expr": "rate(astra_llm_provider_rate_limit_errors_total[5m])",
+            "legendFormat": "{{model}} {{status}}"
+          },
+          {
+            "expr": "rate(astra_llm_provider_rate_limit_cooldowns_total[5m])",
+            "legendFormat": "{{model}} cooldowns"
+          },
+          {
+            "expr": "rate(astra_llm_provider_rate_limit_fallbacks_total[5m])",
+            "legendFormat": "{{model}} fallbacks"
+          }
+        ]
+      },
+      {
+        "title": "Provider Admission Calibration",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 45},
+        "targets": [
+          {
+            "expr": "rate(astra_llm_provider_admission_calibration_samples_total[5m])",
+            "legendFormat": "{{outcome}} samples"
+          },
+          {
+            "expr": "rate(astra_llm_provider_admission_calibration_abs_error_tokens_total[5m])",
+            "legendFormat": "{{outcome}} abs token error"
+          }
+        ]
+      },
+      {
+        "title": "Run Control Poll Errors",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 45},
+        "targets": [
+          {
+            "expr": "rate(astra_run_control_poll_attempts_total[5m])",
+            "legendFormat": "{{operation}} {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_run_control_poll_errors_total[5m])",
+            "legendFormat": "{{operation}} {{class}}"
+          }
+        ]
+      },
+      {
+        "title": "Durable Run Event Writes",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 53},
+        "targets": [
+          {
+            "expr": "rate(astra_durable_run_event_batches_total[5m])",
+            "legendFormat": "{{path}} {{outcome}} compacted={{compacted}}"
+          },
+          {
+            "expr": "rate(astra_durable_run_event_rows_total[5m])",
+            "legendFormat": "{{path}} rows compacted={{compacted}}"
+          }
+        ]
+      },
+      {
+        "title": "Durable Run Event Bytes",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 53},
+        "targets": [
+          {
+            "expr": "rate(astra_durable_run_event_bytes_total[5m])",
+            "legendFormat": "{{path}} {{outcome}} compacted={{compacted}}"
+          }
+        ]
+      },
+      {
+        "title": "Nonstream Fallback",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 61},
+        "targets": [
+          {
+            "expr": "rate(astra_llm_nonstream_fallback_attempts_total[5m])",
+            "legendFormat": "{{trigger}} {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_llm_nonstream_fallback_errors_total[5m])",
+            "legendFormat": "{{trigger}} {{class}}"
+          }
+        ]
+      }
+    ]
+  }
+}

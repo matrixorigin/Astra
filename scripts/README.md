@@ -10,6 +10,8 @@ scripts/
 │   ├── init.sh
 │   ├── start-api.sh
 │   └── stop-api.sh
+├── load/
+│   └── multi_cli_capacity_probe.py
 ├── setup/
 │   └── demo-init.sh
 ├── ops/
@@ -27,6 +29,16 @@ Initializes local development configuration, generating required local secrets i
 
 ### `scripts/setup/demo-init.sh`
 Sets up a demo environment and performs prerequisite checks.
+
+### `scripts/load/multi_cli_capacity_probe.py`
+Runs a stdlib-only concurrent `POST /chat/stream` SSE capacity probe for the
+100 CLI / 500 CLI rollout model. The probe records per-request JSONL, samples
+`/metrics`, and writes a summary under `tmp/capacity-probe/`.
+
+Use `--auth-token` or `--token-file` for existing users. Use `--register-users`
+only against a disposable environment; distinct user testing requires distinct
+real access tokens because the runtime derives ownership from auth, not from a
+request body field.
 
 ### Public CLI Installer
 The published `astra` CLI installer is owned by the public `matrixorigin/astra-suite` repository:
