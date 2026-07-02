@@ -55,6 +55,7 @@ class CapacityProbeTests(unittest.TestCase):
                     'astra_post_loop_memory_cleanup_dispatches_total{mode="async",outcome="dropped_full"} 4',
                     'astra_session_memory_post_loop_drains_total{outcome="leftover"} 5',
                     'astra_run_control_poll_attempts_total{operation="status",outcome="ok"} 8',
+                    'astra_ws_run_stream_poll_attempts_total{operation="stream_run",outcome="ok"} 9',
                     "astra_event_ingestion_events_dropped_before_acceptance_total 6",
                     'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="critical"} 0',
                     'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="telemetry"} 7',
@@ -84,6 +85,12 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(
             metrics['astra_run_control_poll_attempts_total{operation="status",outcome="ok"}'],
             8.0,
+        )
+        self.assertEqual(
+            metrics[
+                'astra_ws_run_stream_poll_attempts_total{operation="stream_run",outcome="ok"}'
+            ],
+            9.0,
         )
         self.assertEqual(
             metrics["astra_event_ingestion_events_dropped_before_acceptance_total"],
@@ -217,6 +224,7 @@ class CapacityProbeTests(unittest.TestCase):
             None,
         )
         self.assertEqual(summary["run_control"]["attempts_last_total"], None)
+        self.assertEqual(summary["ws_run_stream"]["attempts_last_total"], None)
 
     def test_summarize_metrics_file_reports_event_ingestion_totals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -313,6 +321,68 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(
             run_control["errors_by_operation_class"]["user_input_poll:missing"],
             {"last": 4.0, "delta": 4.0},
+        )
+
+    def test_summarize_metrics_file_reports_ws_run_stream_poll_deltas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "unix_ms": 1_000,
+                                "http_status": 200,
+                                "metrics": {
+                                    'astra_ws_run_stream_poll_attempts_total{operation="stream_run",outcome="ok"}': 10.0,
+                                    'astra_ws_run_stream_poll_attempts_total{operation="get_run_status",outcome="ok"}': 8.0,
+                                    'astra_ws_run_stream_poll_errors_total{operation="stream_run",class="retryable"}': 1.0,
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "unix_ms": 3_000,
+                                "http_status": 200,
+                                "metrics": {
+                                    'astra_ws_run_stream_poll_attempts_total{operation="stream_run",outcome="ok"}': 14.0,
+                                    'astra_ws_run_stream_poll_attempts_total{operation="get_run_status",outcome="ok"}': 11.0,
+                                    'astra_ws_run_stream_poll_attempts_total{operation="get_run_status",outcome="error"}': 2.0,
+                                    'astra_ws_run_stream_poll_errors_total{operation="stream_run",class="retryable"}': 2.0,
+                                    'astra_ws_run_stream_poll_errors_total{operation="get_run_status",class="access_or_missing"}': 1.0,
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = probe.summarize_metrics_file(path)
+
+        ws_run_stream = summary["ws_run_stream"]
+        self.assertEqual(ws_run_stream["attempts_last_total"], 27.0)
+        self.assertEqual(ws_run_stream["attempts_delta_total"], 9.0)
+        self.assertEqual(ws_run_stream["attempts_per_sec"], 4.5)
+        self.assertEqual(
+            ws_run_stream["attempts_by_operation_outcome"]["stream_run:ok"],
+            {"last": 14.0, "delta": 4.0},
+        )
+        self.assertEqual(
+            ws_run_stream["attempts_by_operation_outcome"]["get_run_status:error"],
+            {"last": 2.0, "delta": 2.0},
+        )
+        self.assertEqual(ws_run_stream["errors_last_total"], 3.0)
+        self.assertEqual(ws_run_stream["errors_delta_total"], 2.0)
+        self.assertEqual(ws_run_stream["errors_per_sec"], 1.0)
+        self.assertEqual(
+            ws_run_stream["errors_by_operation_class"]["stream_run:retryable"],
+            {"last": 2.0, "delta": 1.0},
+        )
+        self.assertEqual(
+            ws_run_stream["errors_by_operation_class"]["get_run_status:access_or_missing"],
+            {"last": 1.0, "delta": 1.0},
         )
 
     def test_error_helpers_read_run_lifecycle_machine_code(self) -> None:

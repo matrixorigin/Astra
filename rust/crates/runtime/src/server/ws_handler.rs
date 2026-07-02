@@ -47,6 +47,7 @@ use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
 use astra_server_types::merge_plan_subtask_context;
 use astra_services::runs::durable_run_status_is_terminal;
 use astra_tools::{AskUserAnswers, AskUserPrompt};
+use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use serde_json::Value;
@@ -79,6 +80,43 @@ const RUN_STREAM_IDLE_MAX_AFTER_EMPTY_POLLS: u32 = 5;
 /// Safety valve for retryable lifecycle poll failures to avoid indefinite hung streams.
 /// Wall time depends on the current adaptive poll cadence.
 const MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS: u32 = 60;
+const METRIC_WS_RUN_STREAM_POLL_ATTEMPTS_TOTAL: &str = "astra_ws_run_stream_poll_attempts_total";
+const METRIC_WS_RUN_STREAM_POLL_ERRORS_TOTAL: &str = "astra_ws_run_stream_poll_errors_total";
+
+pub(crate) fn register_ws_run_stream_poll_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_WS_RUN_STREAM_POLL_ATTEMPTS_TOTAL,
+        "WebSocket run stream lifecycle poll attempts by operation and low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_WS_RUN_STREAM_POLL_ERRORS_TOTAL,
+        "WebSocket run stream lifecycle poll errors by operation and low-cardinality class.",
+    );
+}
+
+fn record_ws_run_stream_poll_attempt(
+    registry: &MetricsRegistry,
+    operation: &'static str,
+    outcome: &'static str,
+) {
+    registry.increment_counter(
+        METRIC_WS_RUN_STREAM_POLL_ATTEMPTS_TOTAL,
+        &[("operation", operation), ("outcome", outcome)],
+        1,
+    );
+}
+
+fn record_ws_run_stream_poll_error(
+    registry: &MetricsRegistry,
+    operation: &'static str,
+    class: &'static str,
+) {
+    registry.increment_counter(
+        METRIC_WS_RUN_STREAM_POLL_ERRORS_TOTAL,
+        &[("operation", operation), ("class", class)],
+        1,
+    );
+}
 
 fn ws_connection_limit_reached_with(current: usize) -> bool {
     current >= MAX_WS_CONNECTIONS
@@ -1497,6 +1535,16 @@ fn lifecycle_poll_error_policy(status: StatusCode) -> LifecyclePollErrorPolicy {
     }
 }
 
+fn lifecycle_poll_error_class(status: StatusCode) -> &'static str {
+    if super::http_helpers::status_to_sse_retryable(status) {
+        "retryable"
+    } else if matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
+        "access_or_missing"
+    } else {
+        "fatal"
+    }
+}
+
 fn should_emit_transient_poll_error(
     last_error: &mut Option<(StatusCode, String)>,
     status: StatusCode,
@@ -1664,6 +1712,8 @@ async fn stream_run_over_websocket(
     let mut status_poll_error: Option<(StatusCode, String)> = None;
     let mut consecutive_stream_retryable_errors = 0u32;
     let mut consecutive_status_retryable_errors = 0u32;
+    let metrics_registry = state.metrics_registry();
+    register_ws_run_stream_poll_metrics(&metrics_registry);
 
     loop {
         tokio::select! {
@@ -1926,12 +1976,27 @@ async fn stream_run_over_websocket(
                     .await
                 {
                     Ok(events) => {
+                        record_ws_run_stream_poll_attempt(
+                            &metrics_registry,
+                            "stream_run",
+                            "ok",
+                        );
                         stream_poll_error = None;
                         consecutive_stream_retryable_errors = 0;
                         saw_poll_activity |= !events.is_empty();
                         events
                     }
                     Err((status, err)) => {
+                        record_ws_run_stream_poll_attempt(
+                            &metrics_registry,
+                            "stream_run",
+                            "error",
+                        );
+                        record_ws_run_stream_poll_error(
+                            &metrics_registry,
+                            "stream_run",
+                            lifecycle_poll_error_class(status),
+                        );
                         let message = err.0.detail;
                         let policy = lifecycle_poll_error_policy(status);
                         if policy.continue_polling
@@ -2036,11 +2101,26 @@ async fn stream_run_over_websocket(
                     .await
                 {
                     Ok(status) => {
+                        record_ws_run_stream_poll_attempt(
+                            &metrics_registry,
+                            "get_run_status",
+                            "ok",
+                        );
                         status_poll_error = None;
                         consecutive_status_retryable_errors = 0;
                         status
                     }
                     Err((status, err)) => {
+                        record_ws_run_stream_poll_attempt(
+                            &metrics_registry,
+                            "get_run_status",
+                            "error",
+                        );
+                        record_ws_run_stream_poll_error(
+                            &metrics_registry,
+                            "get_run_status",
+                            lifecycle_poll_error_class(status),
+                        );
                         let message = err.0.detail;
                         let policy = lifecycle_poll_error_policy(status);
                         if policy.continue_polling
@@ -4540,6 +4620,53 @@ mod tests {
         assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
         assert_eq!(cadence.record_successful_poll(false), None);
         assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn ws_run_stream_poll_metrics_use_low_cardinality_labels() {
+        let registry = MetricsRegistry::new();
+        register_ws_run_stream_poll_metrics(&registry);
+
+        record_ws_run_stream_poll_attempt(&registry, "stream_run", "ok");
+        record_ws_run_stream_poll_attempt(&registry, "stream_run", "error");
+        record_ws_run_stream_poll_error(
+            &registry,
+            "stream_run",
+            lifecycle_poll_error_class(StatusCode::SERVICE_UNAVAILABLE),
+        );
+        record_ws_run_stream_poll_attempt(&registry, "get_run_status", "error");
+        record_ws_run_stream_poll_error(
+            &registry,
+            "get_run_status",
+            lifecycle_poll_error_class(StatusCode::NOT_FOUND),
+        );
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains("# TYPE astra_ws_run_stream_poll_attempts_total counter"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_ws_run_stream_poll_attempts_total{operation=\"stream_run\",outcome=\"ok\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_ws_run_stream_poll_errors_total{class=\"retryable\",operation=\"stream_run\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_ws_run_stream_poll_errors_total{class=\"access_or_missing\",operation=\"get_run_status\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("run_id="), "{rendered}");
+        assert!(!rendered.contains("session_id="), "{rendered}");
+        assert!(!rendered.contains("user_id="), "{rendered}");
     }
 
     // ─── SSE parsing edge cases ─────────────────────────────────────────

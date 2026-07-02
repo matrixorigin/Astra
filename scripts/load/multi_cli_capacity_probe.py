@@ -38,6 +38,7 @@ DEFAULT_METRIC_PREFIXES = (
     "astra_durable_run_event_",
     "astra_event_ingestion_",
     "astra_run_control_",
+    "astra_ws_run_stream_",
     "astra_edge_dispatch_",
     "astra_edge_registry_",
     "astra_interaction_",
@@ -601,6 +602,8 @@ EVENT_INGESTION_METRIC_KEYS = {
 
 RUN_CONTROL_ATTEMPTS_METRIC = "astra_run_control_poll_attempts_total"
 RUN_CONTROL_ERRORS_METRIC = "astra_run_control_poll_errors_total"
+WS_RUN_STREAM_ATTEMPTS_METRIC = "astra_ws_run_stream_poll_attempts_total"
+WS_RUN_STREAM_ERRORS_METRIC = "astra_ws_run_stream_poll_errors_total"
 METRIC_KEY_RE = re.compile(r"^(?P<name>[^{]+)(?:\{(?P<labels>.*)\})?$")
 METRIC_LABEL_RE = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:\\.|[^"])*)"')
 
@@ -1086,6 +1089,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
             "last_metric_names": [],
             "event_ingestion": summarize_event_ingestion_metrics({}),
             "run_control": summarize_run_control_metrics({}, {}, None),
+            "ws_run_stream": summarize_ws_run_stream_metrics({}, {}, None),
         }
     sample_count = 0
     samples_with_metrics = 0
@@ -1135,6 +1139,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
         "last_metric_names": sorted(last_metrics)[:50],
         "event_ingestion": summarize_event_ingestion_metrics(last_metrics),
         "run_control": summarize_run_control_metrics(first_metrics, last_metrics, elapsed_ms),
+        "ws_run_stream": summarize_ws_run_stream_metrics(first_metrics, last_metrics, elapsed_ms),
     }
 
 
@@ -1212,6 +1217,35 @@ def summarize_run_control_metrics(
         first_metrics,
         last_metrics,
         RUN_CONTROL_ERRORS_METRIC,
+        ("operation", "class"),
+    )
+    return {
+        "attempts_last_total": attempt_last,
+        "attempts_delta_total": attempt_delta,
+        "attempts_per_sec": rate_per_sec(attempt_delta, elapsed_ms),
+        "attempts_by_operation_outcome": attempts,
+        "errors_last_total": error_last,
+        "errors_delta_total": error_delta,
+        "errors_per_sec": rate_per_sec(error_delta, elapsed_ms),
+        "errors_by_operation_class": errors,
+    }
+
+
+def summarize_ws_run_stream_metrics(
+    first_metrics: dict[str, float],
+    last_metrics: dict[str, float],
+    elapsed_ms: int | None,
+) -> dict[str, Any]:
+    attempt_last, attempt_delta, attempts = summarize_counter_family(
+        first_metrics,
+        last_metrics,
+        WS_RUN_STREAM_ATTEMPTS_METRIC,
+        ("operation", "outcome"),
+    )
+    error_last, error_delta, errors = summarize_counter_family(
+        first_metrics,
+        last_metrics,
+        WS_RUN_STREAM_ERRORS_METRIC,
         ("operation", "class"),
     )
     return {
