@@ -532,7 +532,7 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         .get_session_events(session_id.clone(), user_id.clone(), 2, None)
         .await
         .expect("session events first page");
-    assert_eq!(first_session_page.total, 3);
+    assert_eq!(first_session_page.total, Some(3));
     assert_eq!(
         first_session_page
             .events
@@ -1000,7 +1000,8 @@ async fn get_session_events_uses_session_event_count_summary_without_event_scan(
         .expect("get session events");
 
     assert_eq!(
-        events.total, 7,
+        events.total,
+        Some(7),
         "session event total should use agent_sessions.event_count summary, not COUNT(agent_events)"
     );
     assert_eq!(events.events.len(), 1);
@@ -1019,7 +1020,8 @@ async fn get_session_events_uses_session_event_count_summary_without_event_scan(
         .await
         .expect("list unfiltered session events");
     assert_eq!(
-        listed.total, 7,
+        listed.total,
+        Some(7),
         "unfiltered list_events session total should use agent_sessions.event_count summary"
     );
 

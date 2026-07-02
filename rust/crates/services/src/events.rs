@@ -58,7 +58,7 @@ pub struct EventListFilter {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventListRecord {
     pub events: Vec<EventRecord>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
     pub next_cursor: Option<EventListCursor>,
 }
@@ -157,11 +157,6 @@ fn parse_event_metadata_json(
         .map_err(|e| internal_error(format!("agent_events metadata JSON decode failed: {e}")))
 }
 
-fn event_count_total(row: &impl EventDbRow) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
-    row.i64_column("total")
-        .map_err(|e| internal_error(format!("agent_events decode column `total`: {e}")))
-}
-
 fn agent_session_event_count(
     row: &impl EventDbRow,
 ) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
@@ -196,28 +191,12 @@ fn push_event_list_filters<'a>(qb: &mut QueryBuilder<'a, MySql>, filter: &'a Eve
     }
 }
 
-async fn count_events_from_agent_events(
-    pool: &sqlx::Pool<MySql>,
-    filter: &EventListFilter,
-) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
-    let mut count_qb = QueryBuilder::<MySql>::new(
-        "SELECT COUNT(event_id) AS total FROM agent_events WHERE user_id = ",
-    );
-    push_event_list_filters(&mut count_qb, filter);
-    let total_row = count_qb
-        .build()
-        .fetch_one(pool)
-        .await
-        .map_err(internal_error)?;
-    event_count_total(&total_row)
-}
-
 async fn list_events_total(
     pool: &sqlx::Pool<MySql>,
     filter: &EventListFilter,
-) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Option<i64>, (StatusCode, Json<ErrorResponse>)> {
     if !event_list_can_use_session_summary(filter) {
-        return count_events_from_agent_events(pool, filter).await;
+        return Ok(None);
     }
 
     let session_id = filter.session_id.as_deref().expect("checked above");
@@ -230,8 +209,8 @@ async fn list_events_total(
     .await
     .map_err(internal_error)?;
     match session_row {
-        Some(row) => agent_session_event_count(&row),
-        None => count_events_from_agent_events(pool, filter).await,
+        Some(row) => agent_session_event_count(&row).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -692,7 +671,7 @@ impl EventService for DatabaseEventService {
         };
         Ok(EventListRecord {
             events,
-            total,
+            total: Some(total),
             limit,
             next_cursor,
         })
@@ -919,7 +898,7 @@ pub struct EventResponse {
 #[derive(Serialize, PartialEq)]
 pub struct EventListResponse {
     pub events: Vec<EventResponse>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
     pub next_cursor: Option<EventListCursor>,
 }
@@ -1196,15 +1175,18 @@ mod tests {
     }
 
     #[test]
-    fn event_count_total_preserves_value_and_fails_loudly() {
-        assert_eq!(event_count_total(&FakeEventDbRow::complete()).unwrap(), 9);
+    fn agent_session_event_count_preserves_value_and_fails_loudly() {
+        assert_eq!(
+            agent_session_event_count(&FakeEventDbRow::complete()).unwrap(),
+            7
+        );
 
         let (status, Json(body)) =
-            event_count_total(&FakeEventDbRow::fail_on("total")).unwrap_err();
+            agent_session_event_count(&FakeEventDbRow::fail_on("event_count")).unwrap_err();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(
-            body.detail.contains("decode column `total`"),
-            "error should identify total decode failure: {:?}",
+            body.detail.contains("decode column `event_count`"),
+            "error should identify event_count decode failure: {:?}",
             body.detail
         );
     }
@@ -1292,7 +1274,7 @@ mod tests {
                 metadata: serde_json::json!(null),
                 created_at: "now".to_string(),
             }],
-            total: 42,
+            total: Some(42),
             limit: 10,
             next_cursor: Some(EventListCursor {
                 created_at: "2026-04-01T10:00:00.123456".to_string(),
@@ -1301,13 +1283,25 @@ mod tests {
         };
         let resp = EventListResponse::from(record);
         assert_eq!(resp.events.len(), 1);
-        assert_eq!(resp.total, 42);
+        assert_eq!(resp.total, Some(42));
         assert_eq!(
             resp.next_cursor
                 .as_ref()
                 .map(|cursor| cursor.event_id.as_str()),
             Some("e1")
         );
+    }
+
+    #[test]
+    fn event_list_record_to_response_preserves_omitted_total() {
+        let response = EventListResponse::from(EventListRecord {
+            events: Vec::new(),
+            total: None,
+            limit: 50,
+            next_cursor: None,
+        });
+
+        assert_eq!(response.total, None);
     }
 
     // --- query deserialization defaults ---

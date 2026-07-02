@@ -1315,7 +1315,7 @@ export type EventResponse = {
 
 export type EventListResponse = {
   events: EventResponse[];
-  total: number;
+  total: number | null;
   limit: number;
   next_cursor?: EventListCursor | null;
 };

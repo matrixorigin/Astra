@@ -780,15 +780,16 @@ describe("AstraClient — Events and edges", () => {
   test("listEvents", async () => {
     globalThis.fetch = mockFetch(200, {
       events: [],
-      total: 0,
+      total: null,
       limit: 50,
       next_cursor: null,
     });
-    await createClient().listEvents({ sessionId: "s1", limit: 20 });
+    const result = await createClient().listEvents({ eventType: "tool_call", limit: 20 });
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/events?");
-    expect(url).toContain("session_id=s1");
+    expect(url).toContain("event_type=tool_call");
     expect(url).toContain("limit=20");
+    expect(result.total).toBeNull();
   });
 
   test("getCausalChain", async () => {
