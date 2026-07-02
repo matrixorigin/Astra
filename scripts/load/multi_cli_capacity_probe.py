@@ -604,6 +604,34 @@ RUN_CONTROL_ATTEMPTS_METRIC = "astra_run_control_poll_attempts_total"
 RUN_CONTROL_ERRORS_METRIC = "astra_run_control_poll_errors_total"
 WS_RUN_STREAM_ATTEMPTS_METRIC = "astra_ws_run_stream_poll_attempts_total"
 WS_RUN_STREAM_ERRORS_METRIC = "astra_ws_run_stream_poll_errors_total"
+EDGE_DISPATCH_GAUGE_KEYS = {
+    "queue_depth": "astra_edge_dispatch_queue_depth",
+    "pending_rows": "astra_edge_dispatch_pending_rows",
+    "dispatched_rows": "astra_edge_dispatch_dispatched_rows",
+    "oldest_pending_age_ms": "astra_edge_dispatch_oldest_pending_age_ms",
+    "oldest_dispatched_age_ms": "astra_edge_dispatch_oldest_dispatched_age_ms",
+    "claim_wait_count": "astra_edge_dispatch_claim_wait_count",
+    "deliver_update_count": "astra_edge_dispatch_deliver_update_count",
+}
+EDGE_DISPATCH_COUNTER_KEYS = {
+    "claimed_total": "astra_edge_dispatch_claimed_total",
+    "deliver_hits_total": "astra_edge_dispatch_deliver_hits_total",
+    "deliver_misses_total": "astra_edge_dispatch_deliver_misses_total",
+    "failed_total": "astra_edge_dispatch_failed_total",
+    "cleanup_expired_total": "astra_edge_dispatch_cleanup_expired_total",
+    "cleanup_deleted_total": "astra_edge_dispatch_cleanup_deleted_total",
+    "wait_result_timeouts_total": "astra_edge_dispatch_wait_result_timeouts_total",
+    "backlog_scrape_errors_total": "astra_edge_dispatch_backlog_scrape_errors_total",
+    "claim_wait_us_total": "astra_edge_dispatch_claim_wait_us_total",
+    "deliver_update_us_total": "astra_edge_dispatch_deliver_update_us_total",
+}
+EDGE_DISPATCH_ERROR_COUNTERS = (
+    "deliver_misses_total",
+    "failed_total",
+    "cleanup_expired_total",
+    "wait_result_timeouts_total",
+    "backlog_scrape_errors_total",
+)
 METRIC_KEY_RE = re.compile(r"^(?P<name>[^{]+)(?:\{(?P<labels>.*)\})?$")
 METRIC_LABEL_RE = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:\\.|[^"])*)"')
 
@@ -909,6 +937,10 @@ async def run_probe(args: argparse.Namespace) -> int:
                     "require_metrics": args.require_metrics,
                     "require_error_codes_for_failures": args.require_error_codes_for_failures,
                     "require_no_critical_ingestion_drops": args.require_no_critical_ingestion_drops,
+                    "max_control_plane_polls_per_worker_per_sec": (
+                        args.max_control_plane_polls_per_worker_per_sec
+                    ),
+                    "max_edge_dispatch_errors_per_sec": args.max_edge_dispatch_errors_per_sec,
                     "nofile": {
                         "soft_limit": nofile_soft_limit,
                         "required": nofile_required,
@@ -982,6 +1014,10 @@ async def run_probe(args: argparse.Namespace) -> int:
         await sampler
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         metrics_summary = summarize_metrics_file(writer.metrics_path)
+        metrics_summary["control_plane"] = summarize_control_plane_metrics(
+            metrics_summary,
+            active_worker_count(args),
+        )
         contract_violations: list[str] = []
         if args.require_metrics and metrics_summary["samples_with_metrics"] == 0:
             contract_violations.append("metrics_required_but_no_prefixed_metrics_sampled")
@@ -999,6 +1035,7 @@ async def run_probe(args: argparse.Namespace) -> int:
         )
         if args.require_error_codes_for_failures and failures_missing_error_code > 0:
             contract_violations.append(f"failures_missing_error_code:{failures_missing_error_code}")
+        contract_violations.extend(evaluate_capacity_contracts(args, metrics_summary))
         summary = summarize_results(
             results,
             args,
@@ -1090,6 +1127,8 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
             "event_ingestion": summarize_event_ingestion_metrics({}),
             "run_control": summarize_run_control_metrics({}, {}, None),
             "ws_run_stream": summarize_ws_run_stream_metrics({}, {}, None),
+            "edge_dispatch": summarize_edge_dispatch_metrics({}, {}, None),
+            "control_plane": summarize_control_plane_metrics({}, None),
         }
     sample_count = 0
     samples_with_metrics = 0
@@ -1128,6 +1167,9 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
         if isinstance(first_unix_ms, int) and isinstance(last_unix_ms, int)
         else None
     )
+    run_control = summarize_run_control_metrics(first_metrics, last_metrics, elapsed_ms)
+    ws_run_stream = summarize_ws_run_stream_metrics(first_metrics, last_metrics, elapsed_ms)
+    edge_dispatch = summarize_edge_dispatch_metrics(first_metrics, last_metrics, elapsed_ms)
     return {
         "sample_count": sample_count,
         "samples_with_metrics": samples_with_metrics,
@@ -1138,13 +1180,22 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
         "last_metric_count": len(last_metrics),
         "last_metric_names": sorted(last_metrics)[:50],
         "event_ingestion": summarize_event_ingestion_metrics(last_metrics),
-        "run_control": summarize_run_control_metrics(first_metrics, last_metrics, elapsed_ms),
-        "ws_run_stream": summarize_ws_run_stream_metrics(first_metrics, last_metrics, elapsed_ms),
+        "run_control": run_control,
+        "ws_run_stream": ws_run_stream,
+        "edge_dispatch": edge_dispatch,
+        "control_plane": summarize_control_plane_metrics(
+            {"run_control": run_control, "ws_run_stream": ws_run_stream},
+            None,
+        ),
     }
 
 
 def summarize_event_ingestion_metrics(metrics: dict[str, float]) -> dict[str, float | None]:
     return {name: metrics.get(key) for name, key in EVENT_INGESTION_METRIC_KEYS.items()}
+
+
+def active_worker_count(args: argparse.Namespace) -> int:
+    return max(1, min(int(args.concurrency), int(args.total)))
 
 
 def counter_delta(first: float | None, last: float | None) -> float | None:
@@ -1200,6 +1251,32 @@ def rate_per_sec(delta: float | None, elapsed_ms: int | None) -> float | None:
     if delta is None or not elapsed_ms or elapsed_ms <= 0:
         return None
     return round(delta / (elapsed_ms / 1000.0), 3)
+
+
+def add_optional_rates(values: list[float | None]) -> float | None:
+    seen = [value for value in values if value is not None]
+    if not seen:
+        return None
+    return round(sum(seen), 3)
+
+
+def summarize_named_counter_metrics(
+    first_metrics: dict[str, float],
+    last_metrics: dict[str, float],
+    metric_keys: dict[str, str],
+    elapsed_ms: int | None,
+) -> dict[str, dict[str, float | None]]:
+    summary: dict[str, dict[str, float | None]] = {}
+    for label, metric_key in metric_keys.items():
+        first = first_metrics.get(metric_key)
+        last = last_metrics.get(metric_key)
+        delta = counter_delta(first, last)
+        summary[label] = {
+            "last": last,
+            "delta": delta,
+            "per_sec": rate_per_sec(delta, elapsed_ms),
+        }
+    return summary
 
 
 def summarize_run_control_metrics(
@@ -1258,6 +1335,88 @@ def summarize_ws_run_stream_metrics(
         "errors_per_sec": rate_per_sec(error_delta, elapsed_ms),
         "errors_by_operation_class": errors,
     }
+
+
+def summarize_edge_dispatch_metrics(
+    first_metrics: dict[str, float],
+    last_metrics: dict[str, float],
+    elapsed_ms: int | None,
+) -> dict[str, Any]:
+    counters = summarize_named_counter_metrics(
+        first_metrics,
+        last_metrics,
+        EDGE_DISPATCH_COUNTER_KEYS,
+        elapsed_ms,
+    )
+    error_events_delta = add_optional_rates(
+        [counters[name]["delta"] for name in EDGE_DISPATCH_ERROR_COUNTERS]
+    )
+    error_events_per_sec = add_optional_rates(
+        [counters[name]["per_sec"] for name in EDGE_DISPATCH_ERROR_COUNTERS]
+    )
+    return {
+        "gauges_last": {
+            name: last_metrics.get(metric_key)
+            for name, metric_key in EDGE_DISPATCH_GAUGE_KEYS.items()
+        },
+        "counters": counters,
+        "error_events_delta_total": error_events_delta,
+        "error_events_per_sec": error_events_per_sec,
+    }
+
+
+def summarize_control_plane_metrics(
+    metrics_summary: dict[str, Any],
+    worker_count: int | None,
+) -> dict[str, float | int | None]:
+    run_control_per_sec = (
+        metrics_summary.get("run_control", {}).get("attempts_per_sec")
+        if isinstance(metrics_summary.get("run_control"), dict)
+        else None
+    )
+    ws_run_stream_per_sec = (
+        metrics_summary.get("ws_run_stream", {}).get("attempts_per_sec")
+        if isinstance(metrics_summary.get("ws_run_stream"), dict)
+        else None
+    )
+    total_per_sec = add_optional_rates([run_control_per_sec, ws_run_stream_per_sec])
+    per_worker = (
+        round(total_per_sec / worker_count, 3)
+        if total_per_sec is not None and worker_count and worker_count > 0
+        else None
+    )
+    return {
+        "worker_count": worker_count,
+        "run_control_attempts_per_sec": run_control_per_sec,
+        "ws_run_stream_attempts_per_sec": ws_run_stream_per_sec,
+        "poll_attempts_per_sec": total_per_sec,
+        "poll_attempts_per_worker_per_sec": per_worker,
+    }
+
+
+def evaluate_capacity_contracts(
+    args: argparse.Namespace,
+    metrics_summary: dict[str, Any],
+) -> list[str]:
+    violations: list[str] = []
+    control_plane = metrics_summary.get("control_plane", {})
+    if isinstance(control_plane, dict):
+        observed = control_plane.get("poll_attempts_per_worker_per_sec")
+        limit = args.max_control_plane_polls_per_worker_per_sec
+        if observed is not None and limit is not None and observed > limit:
+            violations.append(
+                "control_plane_poll_attempts_per_worker_per_sec:"
+                f"{observed:g}>{limit:g}"
+            )
+
+    edge_dispatch = metrics_summary.get("edge_dispatch", {})
+    if isinstance(edge_dispatch, dict):
+        observed = edge_dispatch.get("error_events_per_sec")
+        limit = args.max_edge_dispatch_errors_per_sec
+        if observed is not None and limit is not None and observed > limit:
+            violations.append(f"edge_dispatch_error_events_per_sec:{observed:g}>{limit:g}")
+
+    return violations
 
 
 def percentile_summary(values: list[float]) -> dict[str, float | None]:
@@ -1391,6 +1550,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="fail if /metrics reports any critical agent_events ingestion drop before worker acceptance",
     )
     parser.add_argument(
+        "--max-control-plane-polls-per-worker-per-sec",
+        type=float,
+        default=8.0,
+        help=(
+            "fail when run_control + WS run stream poll attempts exceed this per active worker; "
+            "set to a negative value to disable"
+        ),
+    )
+    parser.add_argument(
+        "--max-edge-dispatch-errors-per-sec",
+        type=float,
+        help="fail when edge dispatch error counters exceed this rate; omitted means observe only",
+    )
+    parser.add_argument(
         "--skip-nofile-check",
         action="store_true",
         help="skip local file-descriptor limit preflight; useful only when a wrapper raises limits after validation",
@@ -1415,6 +1588,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ProbeError("timeouts must be positive")
     if args.metrics_interval_secs <= 0:
         raise ProbeError("--metrics-interval-secs must be positive")
+    if args.max_control_plane_polls_per_worker_per_sec is not None:
+        if args.max_control_plane_polls_per_worker_per_sec < 0:
+            args.max_control_plane_polls_per_worker_per_sec = None
+    if (
+        args.max_edge_dispatch_errors_per_sec is not None
+        and args.max_edge_dispatch_errors_per_sec < 0
+    ):
+        raise ProbeError("--max-edge-dispatch-errors-per-sec must be non-negative")
     if not args.dry_run and not args.skip_nofile_check:
         validate_nofile_capacity(concurrency)
 

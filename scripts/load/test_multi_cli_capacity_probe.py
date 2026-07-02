@@ -56,6 +56,7 @@ class CapacityProbeTests(unittest.TestCase):
                     'astra_session_memory_post_loop_drains_total{outcome="leftover"} 5',
                     'astra_run_control_poll_attempts_total{operation="status",outcome="ok"} 8',
                     'astra_ws_run_stream_poll_attempts_total{operation="stream_run",outcome="ok"} 9',
+                    "astra_edge_dispatch_claimed_total 10",
                     "astra_event_ingestion_events_dropped_before_acceptance_total 6",
                     'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="critical"} 0',
                     'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="telemetry"} 7',
@@ -92,6 +93,7 @@ class CapacityProbeTests(unittest.TestCase):
             ],
             9.0,
         )
+        self.assertEqual(metrics["astra_edge_dispatch_claimed_total"], 10.0)
         self.assertEqual(
             metrics["astra_event_ingestion_events_dropped_before_acceptance_total"],
             6.0,
@@ -179,6 +181,8 @@ class CapacityProbeTests(unittest.TestCase):
                 connect_timeout_secs=10.0,
                 request_timeout_secs=300.0,
                 metrics_interval_secs=5.0,
+                max_control_plane_polls_per_worker_per_sec=8.0,
+                max_edge_dispatch_errors_per_sec=None,
                 skip_nofile_check=False,
                 dry_run=dry_run,
             )
@@ -191,6 +195,25 @@ class CapacityProbeTests(unittest.TestCase):
                 probe.validate_args(args(dry_run=False))
         finally:
             probe.current_nofile_soft_limit = original
+
+    def test_validate_args_allows_disabling_control_plane_poll_contract(self) -> None:
+        args = argparse.Namespace(
+            profile="100-cli",
+            concurrency=10,
+            total=10,
+            register_concurrency=20,
+            connect_timeout_secs=10.0,
+            request_timeout_secs=300.0,
+            metrics_interval_secs=5.0,
+            max_control_plane_polls_per_worker_per_sec=-1.0,
+            max_edge_dispatch_errors_per_sec=None,
+            skip_nofile_check=True,
+            dry_run=False,
+        )
+
+        probe.validate_args(args)
+
+        self.assertIsNone(args.max_control_plane_polls_per_worker_per_sec)
 
     def test_summarize_metrics_file_reports_empty_prefixed_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -225,6 +248,14 @@ class CapacityProbeTests(unittest.TestCase):
         )
         self.assertEqual(summary["run_control"]["attempts_last_total"], None)
         self.assertEqual(summary["ws_run_stream"]["attempts_last_total"], None)
+        self.assertEqual(
+            summary["control_plane"]["poll_attempts_per_worker_per_sec"],
+            None,
+        )
+        self.assertEqual(
+            summary["edge_dispatch"]["counters"]["claimed_total"]["last"],
+            None,
+        )
 
     def test_summarize_metrics_file_reports_event_ingestion_totals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -384,6 +415,90 @@ class CapacityProbeTests(unittest.TestCase):
             ws_run_stream["errors_by_operation_class"]["get_run_status:access_or_missing"],
             {"last": 1.0, "delta": 1.0},
         )
+
+    def test_summarize_metrics_file_reports_edge_dispatch_and_control_plane_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "unix_ms": 1_000,
+                                "http_status": 200,
+                                "metrics": {
+                                    'astra_run_control_poll_attempts_total{operation="status",outcome="ok"}': 2.0,
+                                    'astra_ws_run_stream_poll_attempts_total{operation="stream_run",outcome="ok"}': 4.0,
+                                    "astra_edge_dispatch_pending_rows": 3.0,
+                                    "astra_edge_dispatch_claimed_total": 10.0,
+                                    "astra_edge_dispatch_deliver_misses_total": 1.0,
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "unix_ms": 3_000,
+                                "http_status": 200,
+                                "metrics": {
+                                    'astra_run_control_poll_attempts_total{operation="status",outcome="ok"}': 8.0,
+                                    'astra_ws_run_stream_poll_attempts_total{operation="stream_run",outcome="ok"}': 10.0,
+                                    "astra_edge_dispatch_pending_rows": 5.0,
+                                    "astra_edge_dispatch_claimed_total": 18.0,
+                                    "astra_edge_dispatch_deliver_misses_total": 3.0,
+                                    "astra_edge_dispatch_wait_result_timeouts_total": 2.0,
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = probe.summarize_metrics_file(path)
+
+        self.assertEqual(summary["edge_dispatch"]["gauges_last"]["pending_rows"], 5.0)
+        self.assertEqual(
+            summary["edge_dispatch"]["counters"]["claimed_total"],
+            {"last": 18.0, "delta": 8.0, "per_sec": 4.0},
+        )
+        self.assertEqual(summary["edge_dispatch"]["error_events_delta_total"], 4.0)
+        self.assertEqual(summary["edge_dispatch"]["error_events_per_sec"], 2.0)
+        self.assertEqual(summary["control_plane"]["poll_attempts_per_sec"], 6.0)
+        self.assertEqual(summary["control_plane"]["poll_attempts_per_worker_per_sec"], None)
+
+        summary["control_plane"] = probe.summarize_control_plane_metrics(summary, worker_count=3)
+        self.assertEqual(summary["control_plane"]["poll_attempts_per_worker_per_sec"], 2.0)
+
+    def test_evaluate_capacity_contracts_reports_poll_and_edge_budget_violations(self) -> None:
+        args = argparse.Namespace(
+            max_control_plane_polls_per_worker_per_sec=1.5,
+            max_edge_dispatch_errors_per_sec=0.5,
+        )
+        metrics_summary = {
+            "control_plane": {"poll_attempts_per_worker_per_sec": 2.0},
+            "edge_dispatch": {"error_events_per_sec": 1.0},
+        }
+
+        self.assertEqual(
+            probe.evaluate_capacity_contracts(args, metrics_summary),
+            [
+                "control_plane_poll_attempts_per_worker_per_sec:2>1.5",
+                "edge_dispatch_error_events_per_sec:1>0.5",
+            ],
+        )
+
+    def test_evaluate_capacity_contracts_ignores_unobserved_or_disabled_budgets(self) -> None:
+        args = argparse.Namespace(
+            max_control_plane_polls_per_worker_per_sec=None,
+            max_edge_dispatch_errors_per_sec=None,
+        )
+        metrics_summary = {
+            "control_plane": {"poll_attempts_per_worker_per_sec": 100.0},
+            "edge_dispatch": {"error_events_per_sec": 10.0},
+        }
+
+        self.assertEqual(probe.evaluate_capacity_contracts(args, metrics_summary), [])
 
     def test_error_helpers_read_run_lifecycle_machine_code(self) -> None:
         event = {
