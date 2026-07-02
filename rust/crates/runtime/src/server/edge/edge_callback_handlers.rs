@@ -480,10 +480,80 @@ mod edge_callback_insert_tests {
 
     use super::{
         EdgeRegisterRequest, LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry,
+        post_approval_respond_handler,
+    };
+    use crate::server::RequestTrace;
+    use crate::{AppState, HealthChecker, ServiceInfo};
+    use astra_services::{
+        AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
+        AuthTokenRecord, AuthUserRecord,
     };
     use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
+    use async_trait::async_trait;
+    use axum::{
+        Json,
+        extract::{Extension, State},
+        http::{HeaderMap, StatusCode},
+    };
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct TestHealthChecker;
+
+    #[async_trait]
+    impl HealthChecker for TestHealthChecker {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticAuthService;
+
+    #[async_trait]
+    impl AuthService for StaticAuthService {
+        async fn register(
+            &self,
+            _request: AuthRegisterRequestData,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn login(
+            &self,
+            _request: AuthLoginRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn refresh(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn logout(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<(), (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn current_user(
+            &self,
+            _headers: &HeaderMap,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            Ok(AuthUserRecord {
+                user_id: "u-approval".into(),
+                username: "approval-user".into(),
+                email: "approval@example.com".into(),
+                display_name: None,
+            })
+        }
+    }
 
     fn source_index(source: &str, needle: &str) -> usize {
         source
@@ -706,6 +776,62 @@ mod edge_callback_insert_tests {
         )
         .expect("durable fallback path returns Ok(false)");
         assert!(!out, "durable fallback path signals not-enqueued");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_handler_persists_journal_when_ledger_is_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService));
+        {
+            let mut ledger = state.edge_callback_ledger.lock().await;
+            for i in 0..LEDGER_MAX_ENTRIES {
+                ledger.insert(format!("u-approval:tool:filled-{i}"), json!({"i": i}));
+            }
+        }
+
+        let response = post_approval_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-approval".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ApprovalRespondRequest {
+                request_id: "req-approval-journal".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: Some("approved in another pod".into()),
+                session_id: Some("sess-approval-journal".into()),
+                tool_name: Some("write_file".into()),
+                approval_kind: Some(astra_thin_client::ApprovalKind::Explicit),
+            }),
+        )
+        .await
+        .expect("durable approval response should not fail when local ledger is full");
+
+        assert_eq!(response.0["ok"], true);
+        assert_eq!(response.0["ledger_enqueued"], false);
+
+        let decision = astra_services::session_journal::find_latest_approval_decision(
+            "sess-approval-journal",
+            "req-approval-journal",
+        )
+        .unwrap()
+        .expect("approval decision should be durable for no-sticky replay");
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(decision.reason.as_deref(), Some("approved in another pod"));
+        assert_eq!(decision.tool_name.as_deref(), Some("write_file"));
+        assert_eq!(decision.approval_kind.as_deref(), Some("explicit"));
+
+        let ledger = state.edge_callback_ledger.lock().await;
+        assert_eq!(ledger.len(), LEDGER_MAX_ENTRIES);
+        assert!(
+            !ledger.contains_key(&astra_turn_core::edge_ledger::approval_callback_key(
+                "u-approval",
+                "req-approval-journal"
+            )),
+            "full local ledger should not be required after durable approval persistence"
+        );
     }
 
     #[test]

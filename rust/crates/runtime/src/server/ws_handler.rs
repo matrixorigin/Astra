@@ -4674,6 +4674,66 @@ mod tests {
         assert!(serde_json::from_str::<WsClientMessage>(missing_run).is_err());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_prompt_response_handler_persists_journal_and_local_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let conn = WsConnection {
+            principal: AuthPrincipal::internal(test_user()),
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-ws-journal".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-ws-journal".into()),
+            bridge_prepared_run_id: None,
+        };
+        let answers = AskUserAnswers {
+            answers: vec![astra_tools::AskUserQuestionAnswer {
+                question: "Continue?".into(),
+                answers: vec!["yes".into()],
+                multi_select: false,
+                annotation: None,
+            }],
+        };
+
+        handle_user_prompt_response(
+            &state,
+            &conn,
+            "req-ws-journal",
+            "sess-ws-journal",
+            "run-ws-journal",
+            Some(answers.clone()),
+            false,
+        )
+        .await;
+
+        let journal_response = astra_services::session_journal::find_latest_ask_user_response(
+            "sess-ws-journal",
+            "req-ws-journal",
+        )
+        .unwrap()
+        .expect("ask_user response should be durable for no-sticky replay");
+        assert_eq!(journal_response.status, "submitted");
+        assert_eq!(journal_response.run_id.as_deref(), Some("run-ws-journal"));
+        let durable_answers: AskUserAnswers =
+            serde_json::from_value(journal_response.answers.expect("durable answers")).unwrap();
+        assert_eq!(durable_answers, answers);
+
+        let ledger = state.edge_callback_ledger.lock().await;
+        let key = astra_turn_core::edge_ledger::user_prompt_callback_key("u1", "req-ws-journal");
+        assert_eq!(
+            serde_json::from_value::<AskUserAnswers>(
+                ledger
+                    .get(&key)
+                    .expect("local ledger should still wake same-pod waiters")["answers"]
+                    .clone()
+            )
+            .unwrap(),
+            answers
+        );
+    }
+
     // ── ws_ledger_dedup_insert unit tests ──────────────────────────────────
 
     #[test]
