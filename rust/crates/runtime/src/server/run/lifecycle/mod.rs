@@ -5905,7 +5905,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &[]
                     };
                     match run_engine
-                        .transition_status_with_events_if_current(
+                        .transition_terminal_status_with_events_if_current(
                             &bg_user_id,
                             &bg_run_id,
                             &[STATUS_RUNNING, STATUS_WAITING, STATUS_INPUT_QUEUED],
@@ -6791,7 +6791,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &[]
                     };
                     match run_engine
-                        .transition_status_with_events_if_current(
+                        .transition_terminal_status_with_events_if_current(
                             &bg_user_id,
                             &bg_run_id,
                             &[STATUS_RUNNING, STATUS_WAITING, STATUS_INPUT_QUEUED],

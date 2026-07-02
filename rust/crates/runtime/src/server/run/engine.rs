@@ -31,7 +31,7 @@
 //! 5. `recover_active_runs()` — On startup, loads runs that were active when process died
 //! 6. `load_run()` — Loads a run from store (cache miss path)
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use astra_services::{
     DatabaseStateProjectionStore,
@@ -45,12 +45,14 @@ use astra_services::{
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 
 use astra_core::{
-    STATUS_CANCELLED, STATUS_FAILED, STATUS_INPUT_QUEUED, STATUS_PAUSED, STATUS_RUNNING,
-    STATUS_WAITING,
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED, STATUS_PAUSED,
+    STATUS_RUNNING, STATUS_WAITING,
 };
 
 const METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL: &str = "astra_run_control_poll_attempts_total";
 const METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL: &str = "astra_run_control_poll_errors_total";
+const TERMINAL_TRANSITION_MAX_ATTEMPTS: usize = 3;
+const TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS: u64 = 25;
 
 /// Durable run execution engine.
 ///
@@ -148,6 +150,10 @@ fn record_control_poll_error(
         &[("operation", operation), ("class", class)],
         1,
     );
+}
+
+fn terminal_transition_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS.saturating_mul(attempt as u64))
 }
 
 fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
@@ -550,6 +556,90 @@ impl RunEngine {
             }
         }
         Ok(updated)
+    }
+
+    /// Atomically persist a terminal status transition and durable terminal events,
+    /// retrying short-lived store errors without weakening the underlying CAS.
+    ///
+    /// If the store commits but the connection drops before the caller observes
+    /// success, a retry can return `Ok(false)` because the status is already
+    /// terminal. In that case we reconcile by loading the durable row and only
+    /// treat it as committed when the stored status matches the target status.
+    pub async fn transition_terminal_status_with_events_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        let mut saw_store_error = false;
+        let mut last_error: Option<String> = None;
+        for attempt in 1..=TERMINAL_TRANSITION_MAX_ATTEMPTS {
+            match self
+                .transition_status_with_events_if_current(
+                    user_id,
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                    events,
+                )
+                .await
+            {
+                Ok(true) => return Ok(true),
+                Ok(false) if saw_store_error => {
+                    let current = self.store.load_run(user_id, run_id).await.map_err(|error| {
+                        if let Some(last_error) = last_error.as_ref() {
+                            format!(
+                                "{last_error}; failed to reconcile terminal transition after retry: {error}"
+                            )
+                        } else {
+                            error
+                        }
+                    })?;
+                    if current.as_ref().is_some_and(|run| run.status == status) {
+                        let summary = error_message.or(waiting_for);
+                        if let Err(error) = self
+                            .project_delegation_run_if_needed(user_id, run_id, status, summary)
+                            .await
+                        {
+                            tracing::warn!(
+                                user_id,
+                                run_id,
+                                status,
+                                error = %error,
+                                "terminal run transition reconciled but delegation projection refresh failed"
+                            );
+                        }
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    saw_store_error = true;
+                    last_error = Some(error.clone());
+                    if attempt >= TERMINAL_TRANSITION_MAX_ATTEMPTS {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        user_id,
+                        run_id,
+                        status,
+                        attempt,
+                        max_attempts = TERMINAL_TRANSITION_MAX_ATTEMPTS,
+                        error = %error,
+                        "terminal run transition failed; retrying"
+                    );
+                    tokio::time::sleep(terminal_transition_retry_delay(attempt)).await;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "terminal transition retry exhausted".to_string()))
     }
 
     async fn project_delegation_run_if_needed(
@@ -1240,9 +1330,311 @@ impl astra_server_types::team_orchestrator_traits::RunPersistence for RunEngine 
 mod tests {
     use super::*;
     use astra_services::runs::{DurableRunRecord, InMemoryRunStateStore, RunStateStore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_engine() -> RunEngine {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))
+    }
+
+    #[derive(Clone, Copy)]
+    enum BatchTransitionFailureMode {
+        BeforeCommit,
+        AfterCommit,
+        ConcurrentCancelAfterCommit,
+    }
+
+    struct FlakyBatchTransitionStore {
+        inner: InMemoryRunStateStore,
+        fail_remaining: AtomicUsize,
+        attempts: AtomicUsize,
+        mode: BatchTransitionFailureMode,
+    }
+
+    impl FlakyBatchTransitionStore {
+        fn new(failures: usize, mode: BatchTransitionFailureMode) -> Self {
+            Self {
+                inner: InMemoryRunStateStore::new(),
+                fail_remaining: AtomicUsize::new(failures),
+                attempts: AtomicUsize::new(0),
+                mode,
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+
+        fn should_fail_this_attempt(&self) -> bool {
+            self.fail_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RunStateStore for FlakyBatchTransitionStore {
+        async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
+            self.inner.insert_run(record).await
+        }
+
+        async fn load_run(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<DurableRunRecord>, String> {
+            self.inner.load_run(user_id, run_id).await
+        }
+
+        async fn update_run_status(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_run_status(user_id, run_id, status, waiting_for, error_message)
+                .await
+        }
+
+        async fn update_run_status_if_current(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            expected_statuses: &[&str],
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_run_status_if_current(
+                    user_id,
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                )
+                .await
+        }
+
+        async fn update_run_status_with_event_if_current(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            expected_statuses: &[&str],
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+            event: serde_json::Value,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_run_status_with_event_if_current(
+                    user_id,
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                    event,
+                )
+                .await
+        }
+
+        async fn update_run_status_with_events_if_current(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            expected_statuses: &[&str],
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+            events: &[serde_json::Value],
+        ) -> Result<bool, String> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.should_fail_this_attempt() {
+                match self.mode {
+                    BatchTransitionFailureMode::BeforeCommit => {
+                        return Err("transient EOF before commit".to_string());
+                    }
+                    BatchTransitionFailureMode::AfterCommit => {
+                        self.inner
+                            .update_run_status_with_events_if_current(
+                                user_id,
+                                run_id,
+                                expected_statuses,
+                                status,
+                                waiting_for,
+                                error_message,
+                                events,
+                            )
+                            .await?;
+                        return Err("transient EOF after commit".to_string());
+                    }
+                    BatchTransitionFailureMode::ConcurrentCancelAfterCommit => {
+                        self.inner
+                            .update_run_status_with_events_if_current(
+                                user_id,
+                                run_id,
+                                expected_statuses,
+                                STATUS_CANCELLED,
+                                None,
+                                Some("cancelled elsewhere"),
+                                &[serde_json::json!({
+                                    "event_type": "run_finished",
+                                    "data": {"status": STATUS_CANCELLED}
+                                })],
+                            )
+                            .await?;
+                        return Err("transient EOF after concurrent cancel".to_string());
+                    }
+                }
+            }
+            self.inner
+                .update_run_status_with_events_if_current(
+                    user_id,
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                    events,
+                )
+                .await
+        }
+
+        async fn update_run_usage(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            prompt_tokens: u64,
+            completion_tokens: u64,
+            tool_calls: u32,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_run_usage(
+                    user_id,
+                    run_id,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                )
+                .await
+        }
+
+        async fn save_checkpoint(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            checkpoint_json: &str,
+        ) -> Result<bool, String> {
+            self.inner
+                .save_checkpoint(user_id, run_id, checkpoint_json)
+                .await
+        }
+
+        async fn load_latest_checkpoint(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            checkpoint_kind: Option<&str>,
+        ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+            self.inner
+                .load_latest_checkpoint(user_id, run_id, checkpoint_kind)
+                .await
+        }
+
+        async fn load_run_projection(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+            self.inner.load_run_projection(user_id, run_id).await
+        }
+
+        async fn rebuild_run_projection(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+            self.inner.rebuild_run_projection(user_id, run_id).await
+        }
+
+        async fn append_events_batch(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            events: &[serde_json::Value],
+        ) -> Result<(), String> {
+            self.inner
+                .append_events_batch(user_id, run_id, events)
+                .await
+        }
+
+        async fn list_user_runs(
+            &self,
+            user_id: &str,
+            limit: u32,
+            offset: u32,
+        ) -> Result<(Vec<DurableRunRecord>, i64), String> {
+            self.inner.list_user_runs(user_id, limit, offset).await
+        }
+
+        async fn list_user_runs_cursor(
+            &self,
+            user_id: &str,
+            limit: u32,
+            cursor: Option<astra_services::runs::RunListCursor>,
+            include_total: bool,
+        ) -> Result<astra_services::runs::DurableRunListPage, String> {
+            self.inner
+                .list_user_runs_cursor(user_id, limit, cursor, include_total)
+                .await
+        }
+
+        async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.inner.find_waiting_runs().await
+        }
+
+        async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.inner.find_running_runs().await
+        }
+
+        async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.inner.find_recoverable_running_runs().await
+        }
+
+        async fn find_blocking_session_run(
+            &self,
+            user_id: &str,
+            session_id: &str,
+        ) -> Result<Option<DurableRunRecord>, String> {
+            self.inner
+                .find_blocking_session_run(user_id, session_id)
+                .await
+        }
+
+        async fn find_sub_runs(
+            &self,
+            user_id: &str,
+            delegation_id: &str,
+        ) -> Result<Vec<DurableRunRecord>, String> {
+            self.inner.find_sub_runs(user_id, delegation_id).await
+        }
+
+        async fn update_retry_count(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            retry_count: u32,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_retry_count(user_id, run_id, retry_count)
+                .await
+        }
     }
 
     struct FailingLoadRunStore;
@@ -1619,6 +2011,152 @@ mod tests {
             .await
             .unwrap();
         assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_retries_transient_error_before_commit() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            1,
+            BatchTransitionFailureMode::BeforeCommit,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-terminal-retry", "user-1", "sess-1")
+            .await
+            .unwrap();
+        let terminal_events = vec![serde_json::json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_COMPLETED}
+        })];
+
+        let updated = engine
+            .transition_terminal_status_with_events_if_current(
+                "user-1",
+                "run-terminal-retry",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                &terminal_events,
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        assert_eq!(store.attempts(), 2);
+        let run = engine
+            .load_run("user-1", "run-terminal-retry")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_COMPLETED);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(
+                    |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("run_finished")
+                )
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_reconciles_commit_after_unknown_error() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            1,
+            BatchTransitionFailureMode::AfterCommit,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-terminal-reconcile", "user-1", "sess-1")
+            .await
+            .unwrap();
+        let terminal_events = vec![serde_json::json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_COMPLETED}
+        })];
+
+        let updated = engine
+            .transition_terminal_status_with_events_if_current(
+                "user-1",
+                "run-terminal-reconcile",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                &terminal_events,
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        assert_eq!(store.attempts(), 2);
+        let run = engine
+            .load_run("user-1", "run-terminal-reconcile")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_COMPLETED);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(
+                    |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("run_finished")
+                )
+                .count(),
+            1,
+            "commit-after-EOF reconcile must not append duplicate terminal events"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_retry_does_not_override_concurrent_cancel() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            1,
+            BatchTransitionFailureMode::ConcurrentCancelAfterCommit,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-terminal-cancel-race", "user-1", "sess-1")
+            .await
+            .unwrap();
+        let terminal_events = vec![serde_json::json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_COMPLETED}
+        })];
+
+        let updated = engine
+            .transition_terminal_status_with_events_if_current(
+                "user-1",
+                "run-terminal-cancel-race",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                &terminal_events,
+            )
+            .await
+            .unwrap();
+
+        assert!(!updated);
+        assert_eq!(store.attempts(), 2);
+        let run = engine
+            .load_run("user-1", "run-terminal-cancel-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_CANCELLED);
+        assert_eq!(
+            run.events.last().and_then(|event| {
+                event
+                    .pointer("/data/status")
+                    .and_then(serde_json::Value::as_str)
+            }),
+            Some(STATUS_CANCELLED)
+        );
     }
 
     #[tokio::test]
