@@ -48,6 +48,15 @@ class SchemaInventoryTest(unittest.TestCase):
                 self.assertIn(table, self.tables)
                 self.assertEqual(self.tables[table]["domain"], domain)
 
+    def test_schema_source_manifest_covers_all_production_ddl_sources(self) -> None:
+        discovered = set(schema_inventory.discover_production_ddl_source_paths())
+        manifest = {source.path for source in schema_inventory.SCHEMA_SOURCES}
+        self.assertEqual(
+            discovered,
+            manifest,
+            "every production Rust src file with CREATE TABLE DDL must be declared in SCHEMA_SOURCES",
+        )
+
     def test_first_batch_tables_have_semantic_metadata(self) -> None:
         first_batch = {
             "agent_events",

@@ -1185,6 +1185,17 @@ def repository_root() -> Path:
     return REPO_ROOT
 
 
+def discover_production_ddl_source_paths(root: Path | None = None) -> list[str]:
+    root = root or REPO_ROOT
+    crates_dir = root / "rust" / "crates"
+    discovered: list[str] = []
+    for path in sorted(crates_dir.glob("*/src/**/*.rs")):
+        text = production_source(path.read_text(encoding="utf-8"), stop_at_cfg_test=True)
+        if CREATE_TABLE_RE.search(text):
+            discovered.append(path.relative_to(root).as_posix())
+    return discovered
+
+
 def production_source(text: str, *, stop_at_cfg_test: bool) -> str:
     if stop_at_cfg_test:
         text = text.split("#[cfg(test)]", 1)[0]
