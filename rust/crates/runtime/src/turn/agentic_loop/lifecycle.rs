@@ -25,6 +25,8 @@ use astra_turn_core::interruption::{
 use astra_turn_core::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 
 const CHILD_AGENT_CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
+const PAUSE_LOOP_LOCAL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
+const PAUSED_RUN_DURABLE_CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy)]
 pub(crate) struct TurnIterationPrep {
@@ -1148,8 +1150,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // recursive `Box::pin(prepare_turn_iteration(...)).await` which
     // would stack-overflow during long pause windows.
     loop {
-        let mut last_db_poll = std::time::Instant::now();
-        let db_poll_interval = std::time::Duration::from_millis(500);
+        let mut last_db_poll = tokio::time::Instant::now();
 
         while state
             .cancellation
@@ -1181,7 +1182,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             }
 
             // Periodic DB poll for cross-pod cancel/pause
-            if last_db_poll.elapsed() >= db_poll_interval {
+            if last_db_poll.elapsed() >= PAUSED_RUN_DURABLE_CONTROL_POLL_INTERVAL {
                 if let Some(ref rc) = state.run_control {
                     if let (Some(user_id), Some(run_id)) = (
                         state.context_manifest_user_id.as_deref(),
@@ -1228,9 +1229,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                         }
                     }
                 }
-                last_db_poll = std::time::Instant::now();
+                last_db_poll = tokio::time::Instant::now();
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(PAUSE_LOOP_LOCAL_CHECK_INTERVAL).await;
         }
 
         // Fast-path in-memory cancel check (same pod)
@@ -3285,6 +3286,69 @@ mod tests {
         assert!(
             cancel_flag.load(Ordering::Acquire),
             "durable cancel should sync the same-pod cancel flag"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn paused_loop_uses_slow_durable_poll_but_keeps_local_cancel_fast() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.context_manifest_user_id = Some("user-control".to_string());
+        state.current_run_id = Some("run-control-paused".to_string());
+        let pause_flag = Arc::new(AtomicBool::new(true));
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        state.cancellation.pause_flag = Some(pause_flag);
+        state.cancellation.flag = Some(cancel_flag.clone());
+        let provider = Arc::new(CountingStatusRunControl::new(Some(
+            RunControlStatus::Paused,
+        )));
+        state.run_control = Some(provider.clone());
+
+        let mut prepared = Box::pin(prepare_turn_iteration(&mut host, &mut state, 0));
+
+        tokio::select! {
+            _ = &mut prepared => panic!("paused run should not complete before control changes"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(provider.calls(), 0);
+
+        tokio::time::advance(PAUSED_RUN_DURABLE_CONTROL_POLL_INTERVAL - Duration::from_millis(1))
+            .await;
+        tokio::select! {
+            _ = &mut prepared => panic!("paused run should not complete before control changes"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(
+            provider.calls(),
+            0,
+            "paused run should not poll durable control before the slow interval"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::advance(PAUSE_LOOP_LOCAL_CHECK_INTERVAL).await;
+        tokio::select! {
+            _ = &mut prepared => panic!("paused run should not complete while durable status remains paused"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(
+            provider.calls(),
+            1,
+            "paused run should poll durable control after the slow interval and one local tick"
+        );
+
+        cancel_flag.store(true, Ordering::Release);
+        tokio::time::advance(PAUSE_LOOP_LOCAL_CHECK_INTERVAL).await;
+        let prepared = prepared
+            .await
+            .expect("local cancel should exit paused loop");
+        assert!(matches!(
+            prepared,
+            PreparedTurnIteration::Finished(AgenticLoopOutcome::Cancelled)
+        ));
+        assert_eq!(
+            provider.calls(),
+            1,
+            "local cancel should not wait for another durable control poll"
         );
     }
 
