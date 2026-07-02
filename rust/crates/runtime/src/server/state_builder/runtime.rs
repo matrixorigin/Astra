@@ -78,6 +78,9 @@ pub(super) async fn build_runtime_wiring(
     crate::llm_provider_admission::set_llm_provider_admission_metrics_registry(
         state.metrics_registry(),
     );
+    crate::server::server_loop_host::set_llm_main_attempt_metrics_registry(
+        state.metrics_registry(),
+    );
     let provider_admission_config =
         crate::llm_provider_admission::ProviderAdmissionConfig::from_env();
     if let Err(error) =

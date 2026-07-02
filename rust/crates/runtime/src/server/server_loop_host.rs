@@ -15,9 +15,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -65,6 +64,7 @@ use astra_turn_core::bridge_rate_limit_cooldown::{
 };
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::CompactionTier;
+use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
@@ -73,6 +73,8 @@ const MAX_PENDING_PROGRESS_AGENTS: usize = 128;
 const MAX_PENDING_PROGRESS_PER_AGENT: usize = 8;
 const MAX_STREAMED_TURN_EVENT_BUFFER: usize = 2_048;
 const TURN_INTENT_JUDGE_POLICY_ENV: &str = "ASTRA_TURN_INTENT_JUDGE_POLICY";
+const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
+const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnIntentJudgePolicy {
@@ -121,6 +123,117 @@ fn should_skip_builtin_turn_intent_judge_for_capacity() -> Option<&'static str> 
             }
         }
     }
+}
+
+fn llm_main_attempt_metrics_slot() -> &'static RwLock<Option<Arc<MetricsRegistry>>> {
+    static SLOT: OnceLock<RwLock<Option<Arc<MetricsRegistry>>>> = OnceLock::new();
+    SLOT.get_or_init(Default::default)
+}
+
+pub(crate) fn set_llm_main_attempt_metrics_registry(registry: Arc<MetricsRegistry>) {
+    register_llm_main_attempt_metrics(&registry);
+    *llm_main_attempt_metrics_slot()
+        .write()
+        .expect("llm main attempt metrics registry lock poisoned") = Some(registry);
+}
+
+fn llm_main_attempt_metrics_registry() -> Option<Arc<MetricsRegistry>> {
+    llm_main_attempt_metrics_slot()
+        .read()
+        .expect("llm main attempt metrics registry lock poisoned")
+        .clone()
+}
+
+fn register_llm_main_attempt_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_LLM_MAIN_ATTEMPTS_TOTAL,
+        "Main server LLM attempts by phase, retry class, and low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL,
+        "Estimated main server LLM attempt tokens by phase, retry class, and low-cardinality outcome.",
+    );
+}
+
+fn llm_main_attempt_label(attempt_in_round: u32) -> &'static str {
+    if attempt_in_round == 0 {
+        "initial"
+    } else {
+        "retry"
+    }
+}
+
+fn is_llm_provider_admission_error(error: &astra_core::ClassifiedError) -> bool {
+    let Some(details_json) = error.details_json.as_deref() else {
+        return false;
+    };
+    let Ok(Value::Object(details)) = serde_json::from_str::<Value>(details_json) else {
+        return false;
+    };
+    details.get("source").and_then(Value::as_str) == Some("llm_provider_admission")
+}
+
+fn llm_main_error_outcome(error: &astra_core::ClassifiedError) -> &'static str {
+    if is_llm_provider_admission_error(error) {
+        return "admission_rejected";
+    }
+    match error.kind {
+        astra_core::ErrorKind::RateLimit => "error_rate_limit",
+        astra_core::ErrorKind::ServerError => "error_server_error",
+        astra_core::ErrorKind::Auth => "error_auth",
+        astra_core::ErrorKind::ContextWindow => "error_context_window",
+        astra_core::ErrorKind::InvalidRequest => "error_invalid_request",
+        astra_core::ErrorKind::StreamIdle => "error_stream_idle",
+        astra_core::ErrorKind::StreamTransport => "error_stream_transport",
+        astra_core::ErrorKind::ConnectionPoolExhausted => "error_connection_pool_exhausted",
+        astra_core::ErrorKind::BudgetExhausted => "error_budget_exhausted",
+        astra_core::ErrorKind::ToolRoundsExhausted => "error_tool_rounds_exhausted",
+        astra_core::ErrorKind::Network => "error_network",
+        astra_core::ErrorKind::ToolNotFound => "error_tool_not_found",
+        astra_core::ErrorKind::ToolInvalidArgs => "error_tool_invalid_args",
+        astra_core::ErrorKind::ToolTimeout => "error_tool_timeout",
+        astra_core::ErrorKind::ToolUnavailable => "error_tool_unavailable",
+        astra_core::ErrorKind::ToolBinding => "error_tool_binding",
+        astra_core::ErrorKind::ResourceLimit => "error_resource_limit",
+        astra_core::ErrorKind::DatabaseError => "error_database",
+        astra_core::ErrorKind::Stall => "error_stall",
+        astra_core::ErrorKind::MissingModelSelection => "error_missing_model_selection",
+        astra_core::ErrorKind::Cancelled => "error_cancelled",
+        astra_core::ErrorKind::Unknown => "error_unknown",
+    }
+}
+
+fn llm_main_success_outcome(result: &LlmCallResult, will_retry_for_length: bool) -> &'static str {
+    if will_retry_for_length {
+        return "length_retry";
+    }
+    match result.finish_reason.as_deref() {
+        Some("stop") => "success_stop",
+        Some("tool_calls") => "success_tool_calls",
+        Some("length") => "success_length_cap",
+        Some("content_filter") => "success_content_filter",
+        Some(_) => "success_other",
+        None => "success_unknown_finish",
+    }
+}
+
+fn record_llm_main_attempt_metrics(
+    phase: &'static str,
+    attempt: &'static str,
+    outcome: &'static str,
+    estimated_tokens: u64,
+) {
+    let Some(registry) = llm_main_attempt_metrics_registry() else {
+        return;
+    };
+    register_llm_main_attempt_metrics(&registry);
+    let labels = &[("phase", phase), ("attempt", attempt), ("outcome", outcome)];
+    registry.increment_counter(METRIC_LLM_MAIN_ATTEMPTS_TOTAL, labels, 1);
+    registry.increment_counter(
+        METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL,
+        labels,
+        estimated_tokens.max(1),
+    );
 }
 
 #[derive(Debug)]
@@ -3656,19 +3769,37 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
         let result = loop {
+            let attempt_label = llm_main_attempt_label(attempt_in_round);
             let admission_estimated_tokens = crate::prompts::estimate_tokens(
                 &llm_messages,
                 state.pinned_tool_schema_tokens as usize,
                 0,
             )
             .saturating_add(effective_max_output);
-            crate::llm_provider_admission::admit_llm_provider_request(
+            match crate::llm_provider_admission::admit_llm_provider_request(
                 self.shared_pool.as_ref(),
                 &llm_cfg.provider,
                 &llm_cfg.model_name,
                 admission_estimated_tokens as u64,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => record_llm_main_attempt_metrics(
+                    "admission",
+                    attempt_label,
+                    "allowed",
+                    admission_estimated_tokens as u64,
+                ),
+                Err(error) => {
+                    record_llm_main_attempt_metrics(
+                        "admission",
+                        attempt_label,
+                        llm_main_error_outcome(&error),
+                        admission_estimated_tokens as u64,
+                    );
+                    return Err(error);
+                }
+            }
             let prompt_round = state
                 .turn_event_buffer
                 .as_ref()
@@ -3794,6 +3925,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let r = match r {
                 Ok(r) => r,
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
+                    record_llm_main_attempt_metrics(
+                        "call",
+                        attempt_label,
+                        llm_main_error_outcome(e),
+                        admission_estimated_tokens as u64,
+                    );
                     record_full_llm_response_event(
                         state,
                         self.full_llm_capture,
@@ -3875,6 +4012,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     });
                 }
                 Err(e) => {
+                    record_llm_main_attempt_metrics(
+                        "call",
+                        attempt_label,
+                        llm_main_error_outcome(&e),
+                        admission_estimated_tokens as u64,
+                    );
                     record_full_llm_response_event(
                         state,
                         self.full_llm_capture,
@@ -3957,6 +4100,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
             }
 
+            let will_retry_for_length = r.finish_reason.as_deref() == Some("length")
+                && effective_max_output < max_output_tokens * 4;
+            let llm_attempt_outcome = llm_main_success_outcome(&r, will_retry_for_length);
+            record_llm_main_attempt_metrics(
+                "call",
+                attempt_label,
+                llm_attempt_outcome,
+                admission_estimated_tokens as u64,
+            );
             record_full_llm_response_event(
                 state,
                 self.full_llm_capture,
@@ -3965,13 +4117,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg.model_name,
                 &llm_cfg.provider,
                 attempt_in_round,
-                if r.finish_reason.as_deref() == Some("length")
-                    && effective_max_output < max_output_tokens * 4
-                {
-                    "length_retry"
-                } else {
-                    "success"
-                },
+                llm_attempt_outcome,
                 json!({
                     "finish_reason": r.finish_reason.clone(),
                     "full_text": r.full_text.clone(),
@@ -3981,9 +4127,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }),
             );
 
-            if r.finish_reason.as_deref() == Some("length")
-                && effective_max_output < max_output_tokens * 4
-            {
+            if will_retry_for_length {
                 let prev = effective_max_output;
                 effective_max_output = (effective_max_output * 2).min(max_output_tokens * 4);
                 attempt_in_round = attempt_in_round.saturating_add(1);
@@ -4890,6 +5034,61 @@ mod tests {
             }
         }));
         tools
+    }
+
+    #[test]
+    fn llm_main_attempt_outcome_classifiers_are_stable() {
+        let admission_error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::RateLimit,
+            "provider gate rejected request",
+        )
+        .with_details_json(json!({"source": "llm_provider_admission"}).to_string());
+        assert_eq!(
+            llm_main_error_outcome(&admission_error),
+            "admission_rejected"
+        );
+
+        let provider_rate_limit =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::RateLimit, "provider 429");
+        assert_eq!(
+            llm_main_error_outcome(&provider_rate_limit),
+            "error_rate_limit"
+        );
+
+        let success = LlmCallResult {
+            finish_reason: Some("tool_calls".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            llm_main_success_outcome(&success, false),
+            "success_tool_calls"
+        );
+        assert_eq!(llm_main_success_outcome(&success, true), "length_retry");
+    }
+
+    #[test]
+    #[serial_test::serial(llm_main_attempt_metrics)]
+    fn llm_main_attempt_metrics_render_low_cardinality_series() {
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        set_llm_main_attempt_metrics_registry(registry.clone());
+
+        record_llm_main_attempt_metrics("admission", "initial", "allowed", 2_048);
+        record_llm_main_attempt_metrics("call", "initial", "success_stop", 2_048);
+        record_llm_main_attempt_metrics("admission", "retry", "admission_rejected", 4_096);
+
+        let rendered = registry.render_prometheus();
+        assert!(rendered.contains(
+            r#"astra_llm_main_attempts_total{attempt="initial",outcome="allowed",phase="admission"} 1"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_main_attempts_total{attempt="initial",outcome="success_stop",phase="call"} 1"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_main_attempts_total{attempt="retry",outcome="admission_rejected",phase="admission"} 1"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_main_attempt_tokens_total{attempt="retry",outcome="admission_rejected",phase="admission"} 4096"#
+        ));
     }
 
     #[test]
