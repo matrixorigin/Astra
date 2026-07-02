@@ -8001,8 +8001,9 @@ mod tests {
         transcript_page_seq,
     };
     use astra_services::runs::{
-        DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunRecord,
-        InMemoryRunStateStore, RunStateStore, RuntimeMcpBindingRequest, RuntimeSkillBindingRequest,
+        DatabaseRunStateStore, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
+        DurableRunRecord, InMemoryRunStateStore, RunStateStore, RuntimeMcpBindingRequest,
+        RuntimeSkillBindingRequest,
     };
     use astra_services::session_journal::{JournalEventType, ToolCallRecord};
     use astra_services::workspace_records::{
@@ -8014,6 +8015,8 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
     use uuid::Uuid;
+
+    static LIFECYCLE_RUN_DB: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
 
     struct ActiveTestModelService;
 
@@ -9628,6 +9631,76 @@ mod tests {
             engine,
         )
         .with_model_service(Arc::new(ActiveTestModelService))
+    }
+
+    async fn setup_lifecycle_run_db_it() -> SharedPool {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+        );
+        LIFECYCLE_RUN_DB
+            .get_or_init(|| async {
+                let settings = MatrixOneSettings::from_env();
+                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                    .unwrap_or_else(|_| "mysql".to_string());
+                astra_services::ensure_core_schema(&settings, &catalog)
+                    .await
+                    .expect("ensure_core_schema");
+                SharedPool::new(&settings).await.expect("SharedPool::new")
+            })
+            .await
+            .clone()
+    }
+
+    fn db_backed_test_service(
+        shared_pool: &SharedPool,
+        owner_pod_id: &str,
+    ) -> AgenticRunLifecycleService {
+        let store: Arc<dyn RunStateStore> = Arc::new(
+            DatabaseRunStateStore::new(shared_pool.clone()).with_owner_pod_id(owner_pod_id),
+        );
+        let engine = RunEngine::new(store);
+        AgenticRunLifecycleService::new(
+            shared_pool.settings().clone(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        )
+        .with_model_service(Arc::new(ActiveTestModelService))
+    }
+
+    async fn cleanup_lifecycle_run_fixture(pool: &SharedPool, user_id: &str, run_id: &str) {
+        for sql in [
+            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        ] {
+            let _ = sqlx::query(sql)
+                .bind(user_id)
+                .bind(run_id)
+                .execute(pool.get())
+                .await;
+        }
+    }
+
+    async fn seed_lifecycle_run_for_pause_resume_it(
+        svc: &AgenticRunLifecycleService,
+        user_id: &str,
+        run_id: &str,
+        session_id: &str,
+    ) {
+        svc.run_engine
+            .start_run(run_id, user_id, session_id)
+            .await
+            .expect("start durable DB run");
+        let (run_state, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+            run_id.to_string(),
+            session_id.to_string(),
+            user_id.to_string(),
+        );
+        svc.runs.write().await.insert(run_id.to_string(), run_state);
     }
 
     fn test_request(message: &str) -> ChatRequestData {
@@ -13493,6 +13566,52 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn db_pause_resume_promotes_buffered_completed_terminal() {
+        let pool = setup_lifecycle_run_db_it().await;
+        let svc = db_backed_test_service(&pool, "pause-resume-it-pod-completed");
+        let user_id = "user-1";
+        let run_id = format!("pause-it-{}", Uuid::new_v4());
+        let session_id = format!("sess-it-{}", Uuid::new_v4());
+        cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
+        seed_lifecycle_run_for_pause_resume_it(&svc, user_id, &run_id, &session_id).await;
+
+        ok(svc.pause_run(run_id.clone(), user_id.to_string()).await);
+        svc.run_engine
+            .append_event(
+                user_id,
+                &run_id,
+                json!({
+                    "event_type": "run_finished",
+                    "data": {"total_prompt_tokens": 1, "total_completion_tokens": 1}
+                }),
+            )
+            .await
+            .expect("append buffered completed terminal event");
+
+        let result = ok(svc.resume_run(run_id.clone(), user_id.to_string()).await);
+        assert_eq!(result.status, STATUS_COMPLETED);
+        assert_eq!(result.previous_status, STATUS_PAUSED);
+
+        let durable = svc
+            .run_engine
+            .load_run(user_id, &run_id)
+            .await
+            .expect("load durable run")
+            .expect("durable run exists");
+        assert_eq!(durable.status, STATUS_COMPLETED);
+        assert!(durable.waiting_for.is_none());
+        assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
+
+        {
+            let runs = svc.runs.read().await;
+            let live = runs.get(&run_id).expect("live run should still be tracked");
+            assert!(matches!(&live.status, RunStatus::Completed));
+        }
+        cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
+    }
+
+    #[tokio::test]
     async fn resume_run_does_not_promote_cancelled_or_interrupted_finish_to_completed() {
         for (suffix, data) in [
             ("cancelled", json!({"cancelled": true})),
@@ -13526,6 +13645,61 @@ mod tests {
                 .unwrap();
             assert_eq!(durable.status, STATUS_RUNNING, "{suffix}");
             assert_eq!(durable.events.last().unwrap()["event_type"], "run_resumed");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn db_resume_does_not_promote_cancelled_or_interrupted_terminal_markers() {
+        let pool = setup_lifecycle_run_db_it().await;
+        for (suffix, data) in [
+            ("cancelled", json!({"cancelled": true})),
+            ("interrupted", json!({"interrupted": true})),
+        ] {
+            let svc = db_backed_test_service(&pool, &format!("pause-resume-it-pod-{suffix}"));
+            let user_id = "user-1";
+            let run_id = format!("resume-{suffix}-{}", Uuid::new_v4());
+            let session_id = format!("sess-{suffix}-{}", Uuid::new_v4());
+            cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
+            seed_lifecycle_run_for_pause_resume_it(&svc, user_id, &run_id, &session_id).await;
+
+            ok(svc.pause_run(run_id.clone(), user_id.to_string()).await);
+            svc.run_engine
+                .append_event(
+                    user_id,
+                    &run_id,
+                    json!({
+                        "event_type": "run_finished",
+                        "data": data
+                    }),
+                )
+                .await
+                .expect("append buffered non-completed terminal marker");
+
+            let result = ok(svc.resume_run(run_id.clone(), user_id.to_string()).await);
+            assert_eq!(result.status, STATUS_RUNNING, "{suffix}");
+            assert_eq!(result.previous_status, STATUS_PAUSED, "{suffix}");
+
+            let durable = svc
+                .run_engine
+                .load_run(user_id, &run_id)
+                .await
+                .expect("load durable run")
+                .expect("durable run exists");
+            assert_eq!(durable.status, STATUS_RUNNING, "{suffix}");
+            assert!(durable.waiting_for.is_none(), "{suffix}");
+            assert_eq!(
+                durable.events.last().unwrap()["event_type"],
+                "run_resumed",
+                "{suffix}"
+            );
+
+            {
+                let runs = svc.runs.read().await;
+                let live = runs.get(&run_id).expect("live run should still be tracked");
+                assert!(matches!(&live.status, RunStatus::Running));
+            }
+            cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
         }
     }
 
