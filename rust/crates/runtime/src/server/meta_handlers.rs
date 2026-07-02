@@ -63,9 +63,48 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoR
     let bridge = MetricsRegistryBridge(state.metrics_registry().clone());
     state.multi_agent_metrics.register_with(&bridge);
     state.multi_agent_metrics.scrape_to(&bridge);
+    crate::capacity_model::scrape_capacity_metrics_from_env(&state.metrics_registry());
     let body = state.metrics_registry().render_prometheus();
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AppState, HealthChecker, ServiceInfo};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct AlwaysHealthy;
+
+    #[async_trait]
+    impl HealthChecker for AlwaysHealthy {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_handler_scrapes_capacity_metrics() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy));
+
+        let response = metrics_handler(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("metrics body");
+        let text = String::from_utf8(body.to_vec()).expect("metrics utf8");
+
+        assert!(text.contains("# TYPE astra_capacity_run_slots_total gauge"));
+        assert!(text.contains("# TYPE astra_capacity_rollout_allowed gauge"));
+        assert!(
+            text.contains(
+                "astra_capacity_limit_mode{env_var=\"ASTRA_ENDPOINT_RPC_CONCURRENCY\",limit=\"registered_endpoint_rpc\",mode=\"reject\",scope=\"per_endpoint_per_pod\"} 1"
+            ),
+            "{text}"
+        );
+    }
 }

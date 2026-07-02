@@ -80,6 +80,7 @@ pub mod bridge;
 pub mod capabilities;
 pub(crate) mod capability_endpoint_pool;
 pub mod capability_registry;
+pub(crate) mod capacity_model;
 pub mod deployment;
 pub mod evaluation;
 pub mod learning;
