@@ -182,22 +182,31 @@ pub(crate) async fn post_tool_result_handler(
             format!("failed to serialize tool_result for cross-pod delivery: {e}"),
         )
     })?;
-    if let Err(e) = dispatch_svc
-        .deliver_result(
-            &user.user_id,
-            &body.request_id,
-            body.edge_agent_id.as_deref().unwrap_or(""),
-            &result_json,
-        )
+    let edge_agent_id = body.edge_agent_id.as_deref().unwrap_or("");
+    match dispatch_svc
+        .deliver_result(&user.user_id, &body.request_id, edge_agent_id, &result_json)
         .await
     {
-        tracing::warn!(
-            target: "astra_runtime::edge_callback",
-            user_id = %user.user_id,
-            request_id = %body.request_id,
-            error = %e,
-            "Edge: failed to cross-pod deliver tool result"
-        );
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_callback",
+                user_id = %user.user_id,
+                request_id = %body.request_id,
+                edge_agent_id = %edge_agent_id,
+                "Edge: cross-pod tool result did not match an active dispatch row"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_callback",
+                user_id = %user.user_id,
+                request_id = %body.request_id,
+                edge_agent_id = %edge_agent_id,
+                error = %e,
+                "Edge: failed to cross-pod deliver tool result"
+            );
+        }
     }
 
     tracing::info!(

@@ -974,7 +974,7 @@ pub async fn deliver_tool_calls_concurrent(
 mod tests {
     use super::*;
     use crate::contracts::TurnAuxiliaryEventRecord;
-    use astra_thin_client::ApprovalDecision;
+    use astra_thin_client::{ApprovalDecision, ApprovalRespondRequest};
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
 
@@ -1018,6 +1018,21 @@ mod tests {
         })
     }
 
+    fn approval_entry(request_id: &str, decision: ApprovalDecision, reason: Option<&str>) -> Value {
+        json!({
+            "kind": "approval_respond",
+            "body": ApprovalRespondRequest {
+                request_id: request_id.to_string(),
+                decision,
+                reason: reason.map(str::to_string),
+                session_id: Some("test-session".to_string()),
+                run_id: "test-run".to_string(),
+                tool_name: None,
+                approval_kind: None,
+            }
+        })
+    }
+
     #[test]
     fn approval_detail_keeps_recovery_jargon_out_of_primary_prompt() {
         let detail = tool_approval_detail(&write_tool("w1")).expect("detail");
@@ -1046,10 +1061,7 @@ mod tests {
 
     #[test]
     fn parse_allow_from_handler_shape() {
-        let entry = json!({
-            "kind": "approval_respond",
-            "body": {"request_id": "t1", "decision": "allow"}
-        });
+        let entry = approval_entry("t1", ApprovalDecision::Allow, None);
         assert_eq!(
             parse_cloud_approval_outcome(Some(&entry)),
             CloudApprovalResult::Allowed
@@ -1058,10 +1070,7 @@ mod tests {
 
     #[test]
     fn parse_deny_with_reason() {
-        let entry = json!({
-            "kind": "approval_respond",
-            "body": {"request_id": "t1", "decision": "deny", "reason": "nope"}
-        });
+        let entry = approval_entry("t1", ApprovalDecision::Deny, Some("nope"));
         assert_eq!(
             parse_cloud_approval_outcome(Some(&entry)),
             CloudApprovalResult::Denied {
@@ -1332,7 +1341,7 @@ mod tests {
             );
             guard.insert(
                 approval_callback_key("user-b", "shared-approval"),
-                json!({"kind": "approval_respond", "body": {"request_id": "shared-approval", "decision": "allow"}}),
+                approval_entry("shared-approval", ApprovalDecision::Allow, None),
             );
         }
 
@@ -1589,11 +1598,11 @@ mod tests {
             let mut guard = l2.lock().await;
             guard.insert(
                 approval_callback_key(uid, "w1"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+                approval_entry("w1", ApprovalDecision::Allow, None),
             );
             guard.insert(
                 approval_callback_key(uid, "w2"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+                approval_entry("w2", ApprovalDecision::Allow, None),
             );
             drop(guard);
 
@@ -1805,7 +1814,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
                 approval_callback_key(uid, "w1"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+                approval_entry("w1", ApprovalDecision::Allow, None),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
@@ -1820,7 +1829,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
                 approval_callback_key(uid, "w2"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+                approval_entry("w2", ApprovalDecision::Allow, None),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
@@ -1982,9 +1991,7 @@ mod tests {
 
     #[test]
     fn parse_approval_allow_session() {
-        let v = json!({
-            "body": {"request_id": "t1", "decision": "allow_session"}
-        });
+        let v = approval_entry("t1", ApprovalDecision::AllowSession, None);
         assert_eq!(
             parse_cloud_approval_outcome(Some(&v)),
             CloudApprovalResult::Allowed
@@ -1993,9 +2000,7 @@ mod tests {
 
     #[test]
     fn parse_approval_deny_without_reason() {
-        let v = json!({
-            "body": {"request_id": "t1", "decision": "deny"}
-        });
+        let v = approval_entry("t1", ApprovalDecision::Deny, None);
         assert_eq!(
             parse_cloud_approval_outcome(Some(&v)),
             CloudApprovalResult::Denied { reason: None }

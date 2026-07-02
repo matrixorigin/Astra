@@ -3714,6 +3714,9 @@ impl AgenticRunLifecycleService {
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
         }
+        if let Some(svc) = &self.edge_dispatch_service {
+            builder = builder.with_edge_dispatch_service(Arc::clone(svc));
+        }
         if let Some(snapshot) = execution_bindings {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());
         }
@@ -8238,6 +8241,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
+        }
+        if let Some(svc) = &self.edge_dispatch_service {
+            builder = builder.with_edge_dispatch_service(Arc::clone(svc));
         }
         if let Some(snapshot) = execution_bindings.as_ref() {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());

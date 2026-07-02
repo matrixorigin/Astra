@@ -1071,6 +1071,7 @@ pub struct ServerAgenticLoopHost {
 
     // ── Tool execution ──
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    edge_dispatch_service: Option<Arc<dyn EdgeDispatchService>>,
     approval_audit_context: Option<astra_turn_core::cloud_tool_delivery::ApprovalAuditContext>,
     user_id: String,
     session_id: String,
@@ -1177,6 +1178,7 @@ pub struct ServerAgenticLoopHostBuilder {
     edge_profile: Map<String, Value>,
     execution_bindings: Option<ExecutionBindingSnapshot>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    edge_dispatch_service: Option<Arc<dyn EdgeDispatchService>>,
     user_id: String,
     session_id: String,
     progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
@@ -1227,6 +1229,7 @@ impl ServerAgenticLoopHostBuilder {
             edge_profile: Map::new(),
             execution_bindings: None,
             edge_callback_ledger: Arc::new(TokioMutex::new(HashMap::new())),
+            edge_dispatch_service: None,
             user_id,
             session_id,
             progress_broadcaster: None,
@@ -1354,6 +1357,11 @@ impl ServerAgenticLoopHostBuilder {
         ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     ) -> Self {
         self.edge_callback_ledger = ledger;
+        self
+    }
+
+    pub fn with_edge_dispatch_service(mut self, svc: Arc<dyn EdgeDispatchService>) -> Self {
+        self.edge_dispatch_service = Some(svc);
         self
     }
 
@@ -1523,6 +1531,7 @@ impl ServerAgenticLoopHostBuilder {
             static_tool_catalog_admissible: self.static_tool_catalog_admissible,
             always_load_tool_names,
             edge_callback_ledger: self.edge_callback_ledger,
+            edge_dispatch_service: self.edge_dispatch_service,
             approval_audit_context: None,
             user_id: self.user_id,
             session_id: self.session_id,
@@ -2494,7 +2503,7 @@ impl ServerAgenticLoopHost {
         use astra_turn_core::cloud_tool_delivery::{
             cloud_tool_requires_approval_for_delivery, collect_approval_batches,
             local_tool_execution_delivery, sse_maps_through_tool_request,
-            wait_approval_ledger_for_tool, wait_tool_result_ledger_for_tool,
+            wait_approval_ledger_for_tool,
         };
         use astra_turn_core::headless_tool_assembly::{
             ensure_tool_call_ids, parse_flat_tool_call_event,
@@ -2705,13 +2714,9 @@ impl ServerAgenticLoopHost {
                         self.edge_result_fields_with_runtime(&id, &tool_name, &args, None),
                     )
                 } else {
-                    let delivery = wait_tool_result_ledger_for_tool(
-                        &self.edge_callback_ledger,
-                        &self.user_id,
-                        tc,
-                        ledger_wait,
-                    )
-                    .await;
+                    let delivery = self
+                        .wait_tool_result_with_dispatch_fallback(tc, &id, ledger_wait)
+                        .await;
 
                     let duration_ms = started.elapsed().as_millis() as u64;
                     let sse_maps = delivery.sse_maps.clone();
@@ -2792,6 +2797,71 @@ impl ServerAgenticLoopHost {
         }
 
         results
+    }
+
+    async fn wait_tool_result_with_dispatch_fallback(
+        &self,
+        tc: &Value,
+        request_id: &str,
+        ledger_wait: Duration,
+    ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
+        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool;
+        use astra_turn_core::edge_ledger::tool_callback_key;
+
+        let delivery = wait_tool_result_ledger_for_tool(
+            &self.edge_callback_ledger,
+            &self.user_id,
+            tc,
+            ledger_wait,
+        )
+        .await;
+        if !edge_tool_delivery_timed_out(&delivery) {
+            return delivery;
+        }
+
+        let Some(dispatch_service) = &self.edge_dispatch_service else {
+            return delivery;
+        };
+        let result_json = match dispatch_service
+            .wait_result(&self.user_id, request_id, Duration::from_millis(0))
+            .await
+        {
+            Ok(Some(result_json)) => result_json,
+            Ok(None) => return delivery,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::server_loop_host",
+                    user_id = %self.user_id,
+                    session_id = %self.session_id,
+                    request_id = %request_id,
+                    error = %error,
+                    "edge tool ledger timed out and dispatch fallback failed"
+                );
+                return delivery;
+            }
+        };
+
+        let body = serde_json::from_str::<Value>(&result_json)
+            .unwrap_or_else(|_| Value::String(result_json));
+        let key = tool_callback_key(&self.user_id, request_id);
+        {
+            let mut ledger = self.edge_callback_ledger.lock().await;
+            ledger.entry(key).or_insert_with(|| {
+                json!({
+                    "kind": "tool_result",
+                    "user_id": self.user_id.as_str(),
+                    "body": body,
+                })
+            });
+        }
+
+        wait_tool_result_ledger_for_tool(
+            &self.edge_callback_ledger,
+            &self.user_id,
+            tc,
+            Duration::from_millis(0),
+        )
+        .await
     }
 
     fn edge_result_fields_with_runtime(
@@ -5011,6 +5081,15 @@ fn hidden_execution_boundary_tool_names(visible_tools: &[Value]) -> Vec<String> 
         .collect()
 }
 
+fn edge_tool_delivery_timed_out(
+    delivery: &astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery,
+) -> bool {
+    delivery
+        .tool_results
+        .iter()
+        .any(|result| result.status == "timed_out")
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -5062,6 +5141,78 @@ mod tests {
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
         // Use a valid Fernet key for testing
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
+    }
+
+    fn approval_allow_entry(request_id: &str) -> Value {
+        json!({
+            "kind": "approval_respond",
+            "body": astra_thin_client::ApprovalRespondRequest {
+                request_id: request_id.to_string(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: None,
+                session_id: Some("test-session".to_string()),
+                run_id: "test-run".to_string(),
+                tool_name: None,
+                approval_kind: None,
+            }
+        })
+    }
+
+    struct StaticWaitResultEdgeDispatch {
+        result_json: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl EdgeDispatchService for StaticWaitResultEdgeDispatch {
+        async fn insert_dispatch(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _request_id: &str,
+            _payload_json: &str,
+        ) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+            Err("not used".to_string())
+        }
+
+        async fn deliver_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _edge_agent_id: &str,
+            _result_json: &str,
+        ) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+
+        async fn fail_dispatch(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _reason: &str,
+        ) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+
+        async fn wait_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _timeout: Duration,
+        ) -> Result<Option<String>, String> {
+            Ok(self.result_json.clone())
+        }
+
+        async fn cleanup_stale(&self, _older_than: Duration) -> Result<u64, String> {
+            Err("not used".to_string())
+        }
     }
 
     fn sample_edge_tools() -> Vec<Value> {
@@ -6840,11 +6991,11 @@ mod tests {
             let mut guard = ledger.lock().await;
             guard.insert(
                 approval_callback_key("u-batch", "w1"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+                approval_allow_entry("w1"),
             );
             guard.insert(
                 approval_callback_key("u-batch", "w2"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+                approval_allow_entry("w2"),
             );
             drop(guard);
 
@@ -6897,6 +7048,59 @@ mod tests {
         assert_eq!(results[1].request_id, "w2");
         assert_eq!(results[0].status, "ok");
         assert_eq!(results[1].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn wait_tool_result_dispatch_fallback_uses_db_result_after_ledger_timeout() {
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            "r1".to_string(),
+            Some("edge-1".to_string()),
+            "completed".to_string(),
+            "from dispatch".to_string(),
+            17,
+        );
+        let result_json = serde_json::to_string(&body).expect("serialize tool result");
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-dispatch".to_string(),
+            "s-dispatch".to_string(),
+        )
+        .with_edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
+            result_json: Some(result_json),
+        }))
+        .build();
+        let tool_call = json!({
+            "id": "r1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
+        });
+
+        let delivery = host
+            .wait_tool_result_with_dispatch_fallback(&tool_call, "r1", Duration::from_millis(1))
+            .await;
+
+        let tool_message = delivery
+            .tool_messages
+            .first()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .expect("tool message content");
+        assert_eq!(tool_message, "from dispatch");
+        let tool_result = delivery.tool_results.first().expect("structured result");
+        assert_eq!(tool_result.status, "completed");
+        assert_eq!(
+            delivery
+                .sse_maps
+                .first()
+                .and_then(|event| event.get("result"))
+                .and_then(Value::as_str),
+            Some("from dispatch")
+        );
+        assert!(
+            host.edge_callback_ledger.lock().await.is_empty(),
+            "dispatch fallback should consume the synthesized ledger entry"
+        );
     }
 
     #[tokio::test]
@@ -7026,7 +7230,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
                 approval_callback_key("u-mixed", "w1"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+                approval_allow_entry("w1"),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
@@ -7041,7 +7245,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
                 approval_callback_key("u-mixed", "w2"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+                approval_allow_entry("w2"),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
