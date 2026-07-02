@@ -41,6 +41,7 @@ help:
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see rust/.config/nextest.toml)"
+	@echo "  make test-no-sticky-control - Fast no-sticky control-plane tests (approval/ask_user/edge callbacks; no live DB)"
 	@echo "  make test-cleanup-pressure - Live MatrixOne cleanup pressure probes (explicit, not part of test-online)"
 	@echo "  make test-durable-event-pressure - Live MatrixOne durable event pressure probe (explicit, not part of test-online)"
 	@echo "  make test-saas          - SaaS platform E2E (docs/testing/saas-test-plan.md §5; MatrixOne + optional SDK)"
@@ -805,7 +806,7 @@ sweep:
 # Testing
 # ============================================================================
 
-.PHONY: test test-offline test-online test-saas test-saas-coverage test-sdk-offline test-web-offline test-sdk-online
+.PHONY: test test-offline test-online test-no-sticky-control test-saas test-saas-coverage test-sdk-offline test-web-offline test-sdk-online
 test: test-offline test-online
 
 .PHONY: test-dashboard
@@ -815,6 +816,16 @@ test-dashboard: ## Build astra-test and launch live dashboard
 
 .PHONY: test-offline
 test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline test-web-offline
+
+# Fast correctness gate for the no-sticky control plane. This intentionally
+# stays out of the default test targets: it is focused evidence for LB/session
+# affinity removal, not a replacement for live multi-pod deployment validation.
+.PHONY: test-no-sticky-control
+test-no-sticky-control:
+	@echo "Running no-sticky control-plane tests (approval, ask_user, edge callbacks; no live DB required)..."
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib replays_from_journal -- --nocapture
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib do_not_require_sticky_pod -- --nocapture
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test edge_5_5_http_e2e without_sticky_ledger -- --nocapture
 
 .PHONY: test-workspace
 test-workspace: sweep
