@@ -534,7 +534,7 @@ mod tests {
         build_app,
     };
 
-    static HTTP_PROJECTION_REPAIR_DB: tokio::sync::OnceCell<astra_core::SharedPool> =
+    static HTTP_RUN_DB: tokio::sync::OnceCell<astra_core::SharedPool> =
         tokio::sync::OnceCell::const_new();
 
     #[derive(Clone)]
@@ -608,13 +608,13 @@ mod tests {
         astra_core::MatrixOneSettings::mock()
     }
 
-    async fn setup_http_projection_repair_db_it() -> astra_core::SharedPool {
+    async fn setup_http_run_db_it() -> astra_core::SharedPool {
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
             Ok("1"),
             "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
         );
-        HTTP_PROJECTION_REPAIR_DB
+        HTTP_RUN_DB
             .get_or_init(|| async {
                 let settings = astra_core::MatrixOneSettings::from_env();
                 let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
@@ -630,11 +630,7 @@ mod tests {
             .clone()
     }
 
-    async fn cleanup_run_projection_http_fixture(
-        pool: &astra_core::SharedPool,
-        user_id: &str,
-        run_id: &str,
-    ) {
+    async fn cleanup_run_http_fixture(pool: &astra_core::SharedPool, user_id: &str, run_id: &str) {
         for sql in [
             "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
             "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
@@ -646,7 +642,7 @@ mod tests {
                 .bind(run_id)
                 .execute(pool.get())
                 .await
-                .expect("cleanup run projection repair fixture");
+                .expect("cleanup run HTTP fixture");
         }
     }
 
@@ -1037,6 +1033,156 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn stream_run_http_replays_matrixone_cache_miss_durable_events() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
+        use sqlx::Row;
+        use uuid::Uuid;
+
+        let shared_pool = setup_http_run_db_it().await;
+        let settings = shared_pool.settings().clone();
+        let user_id = "u1";
+        let run_id = format!("run-replay-http-it-{}", Uuid::new_v4());
+        let session_id = format!("session-replay-http-it-{}", Uuid::new_v4());
+        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
+
+        let store: Arc<dyn RunStateStore> = Arc::new(
+            DatabaseRunStateStore::new(shared_pool.clone())
+                .with_owner_pod_id("stream-replay-http-it-pod"),
+        );
+        let engine = RunEngine::new(store);
+        engine
+            .start_run(&run_id, user_id, &session_id)
+            .await
+            .expect("start durable DB run");
+        let durable_events = vec![
+            json!({
+                "type": "tool_call",
+                "tool_call": {"id": "call-1", "name": "bash", "arguments": {"cmd": "printf ok"}}
+            }),
+            json!({
+                "type": "tool_call_end",
+                "call_id": "call-1",
+                "tool": "bash",
+                "result": "ok"
+            }),
+            json!({
+                "event_type": "text_done",
+                "data": {"full_text": "durable final answer from matrixone"}
+            }),
+            json!({
+                "event_type": "run_finished",
+                "data": {"prompt_tokens": 2, "completion_tokens": 1, "tool_call_count": 1}
+            }),
+        ];
+        let transitioned = engine
+            .transition_status_with_events_if_current(
+                user_id,
+                &run_id,
+                &[astra_core::STATUS_RUNNING],
+                astra_core::STATUS_COMPLETED,
+                None,
+                None,
+                &durable_events,
+            )
+            .await
+            .expect("commit terminal durable DB events");
+        assert!(transitioned);
+
+        let persisted_event_types = sqlx::query(
+            "SELECT event_type FROM agent_run_events
+             WHERE user_id = ? AND run_id = ?
+             ORDER BY event_idx ASC",
+        )
+        .bind(user_id)
+        .bind(&run_id)
+        .fetch_all(shared_pool.get())
+        .await
+        .expect("load persisted event types")
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("event_type").expect("event_type"))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_event_types,
+            vec![
+                "run_started",
+                "tool_call",
+                "tool_call_end",
+                "text_done",
+                "run_finished",
+            ],
+            "cache-miss replay must be backed by semantic durable facts only"
+        );
+
+        let lifecycle = AgenticRunLifecycleService::new(
+            settings,
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/chat/runs/{run_id}/stream?last_index=1"))
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(
+            text.contains("\"type\":\"tool_call\""),
+            "durable replay should expose tool start boundary: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"tool_call_end\""),
+            "durable replay should expose tool end boundary: {text}"
+        );
+        assert!(
+            text.contains("\"full_text\":\"durable final answer from matrixone\""),
+            "durable replay should expose final answer text: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"usage\""),
+            "run_finished usage should still be transformed for the client: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"run_finished\"") && text.contains("\"status\":\"completed\""),
+            "terminal lifecycle event should still reach the client: {text}"
+        );
+        assert!(
+            !text.contains("text_delta") && !text.contains("agent_live_event"),
+            "cache-miss replay should not require transport-only live deltas: {text}"
+        );
+
+        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
+    }
+
+    #[tokio::test]
     async fn get_run_projection_http_returns_bounded_projection_and_filters_internal_events() {
         use crate::server::run::engine::RunEngine;
         use crate::server::run::lifecycle::AgenticRunLifecycleService;
@@ -1316,12 +1462,12 @@ mod tests {
         use sqlx::Row;
         use uuid::Uuid;
 
-        let shared_pool = setup_http_projection_repair_db_it().await;
+        let shared_pool = setup_http_run_db_it().await;
         let settings = shared_pool.settings().clone();
         let user_id = "u1";
         let run_id = format!("run-http-it-{}", Uuid::new_v4());
         let session_id = format!("session-http-it-{}", Uuid::new_v4());
-        cleanup_run_projection_http_fixture(&shared_pool, user_id, &run_id).await;
+        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
 
         let store: Arc<dyn RunStateStore> = Arc::new(
             DatabaseRunStateStore::new(shared_pool.clone())
@@ -1465,7 +1611,7 @@ mod tests {
         assert_eq!(db_latest_event.as_deref(), Some("run_finished"));
         assert_eq!(db_checkpoint_version.as_deref(), Some("checkpoint_v2"));
 
-        cleanup_run_projection_http_fixture(&shared_pool, user_id, &run_id).await;
+        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
     }
 
     #[tokio::test]
