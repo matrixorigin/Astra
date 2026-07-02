@@ -95,14 +95,6 @@ def build_command(args: argparse.Namespace) -> ProbeCommand:
         "ASTRA_DURABLE_EVENT_PRESSURE_TEXT_DELTAS": str(text_deltas),
         "ASTRA_DURABLE_EVENT_PRESSURE_PROGRESS_ROWS": str(progress_rows),
     }
-    if args.row_budget is not None:
-        env["ASTRA_DURABLE_RUN_EVENT_BATCH_MAX_ROWS"] = str(
-            positive_int(args.row_budget, args.row_budget)
-        )
-    if args.byte_budget is not None:
-        env["ASTRA_DURABLE_RUN_EVENT_BATCH_MAX_BYTES"] = str(
-            positive_int(args.byte_budget, args.byte_budget)
-        )
     command = [
         "cargo",
         "test",
@@ -173,8 +165,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--runs", type=int, help="concurrent durable runs to write")
     parser.add_argument("--text-deltas", type=int, help="live-only text_delta chunks per run")
     parser.add_argument("--progress-rows", type=int, help="durable semantic progress rows per run")
-    parser.add_argument("--row-budget", type=int, help="override durable run event row budget")
-    parser.add_argument("--byte-budget", type=int, help="override durable run event byte budget")
     parser.add_argument(
         "--output-dir",
         type=Path,

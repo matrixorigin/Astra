@@ -351,7 +351,7 @@ fn register_post_loop_memory_cleanup_metrics(
 fn refresh_durable_run_event_budget_metrics(
     registry: &astra_turn_core::pipeline_metrics::MetricsRegistry,
 ) {
-    let budget = DurableRunEventBatchBudget::from_env();
+    let budget = DurableRunEventBatchBudget::default();
     registry.set_gauge(
         METRIC_DURABLE_RUN_EVENT_ROW_BUDGET,
         &[],
@@ -10566,7 +10566,7 @@ mod tests {
         let run_id = format!("durable-pressure-{run_ordinal}-{}", Uuid::new_v4());
         let session_id = format!("sess-durable-pressure-{run_ordinal}-{}", Uuid::new_v4());
         let svc = db_backed_test_service(&pool, &format!("durable-pressure-pod-{run_ordinal}"));
-        let budget = DurableRunEventBatchBudget::from_env();
+        let budget = DurableRunEventBatchBudget::default();
         cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
 
         let started = Instant::now();
@@ -14995,7 +14995,7 @@ mod tests {
             durable_event_pressure_env_usize("ASTRA_DURABLE_EVENT_PRESSURE_RUNS", 100, 1);
         let text_delta_count =
             durable_event_pressure_env_usize("ASTRA_DURABLE_EVENT_PRESSURE_TEXT_DELTAS", 10_000, 1);
-        let budget = DurableRunEventBatchBudget::from_env();
+        let budget = DurableRunEventBatchBudget::default();
         let progress_event_count = durable_event_pressure_env_usize(
             "ASTRA_DURABLE_EVENT_PRESSURE_PROGRESS_ROWS",
             budget.row_budget + 25,

@@ -79,8 +79,6 @@ If `reasoning_model_name` is not set, the server falls back to the cheapest acti
 - `ASTRA_MAX_TOOL_RETRIES`, `ASTRA_RETRY_BASE_MS`
 - `ASTRA_MAX_RETRIEVED`, `ASTRA_MAX_HISTORY_TOKENS`, `ASTRA_COMPRESSION_THRESHOLD`
 - `ASTRA_RETRIEVAL_TOP_K`, `ASTRA_MAX_TURN_INPUT_TOKENS`
-- `ASTRA_DURABLE_RUN_EVENT_BATCH_MAX_ROWS` — max durable run event rows retained per terminal batch; default `500`, minimum `16`
-- `ASTRA_DURABLE_RUN_EVENT_BATCH_MAX_BYTES` — max estimated durable run event bytes retained per terminal batch; default `2097152`, minimum `65536`
 - `ASTRA_LLM_PROVIDER_ADMISSION_MODE` — provider admission mode; unset/`disabled` by default, `db_fixed_window` enables MatrixOne-backed RPM/TPM claims before outbound LLM attempts
 - `ASTRA_LLM_PROVIDER_ADMISSION_RPM`, `ASTRA_LLM_PROVIDER_ADMISSION_TPM` — provider budget used by admission; at least one is required when admission is enabled
 - `ASTRA_LLM_PROVIDER_ADMISSION_SCOPE` — `provider` or `provider_model`; default `provider`

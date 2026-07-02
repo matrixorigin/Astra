@@ -27,8 +27,6 @@ pub const MAX_DURABLE_RUN_EVENT_BATCH_BYTES: usize = 2 * 1024 * 1024;
 pub const MIN_DURABLE_RUN_EVENT_BATCH_ROWS: usize = 16;
 pub const MIN_DURABLE_RUN_EVENT_BATCH_BYTES: usize = 64 * 1024;
 const DURABLE_RUN_EVENT_COMPACTION_SUMMARY_BYTES_RESERVE: usize = 1024;
-const DURABLE_RUN_EVENT_BATCH_MAX_ROWS_ENV: &str = "ASTRA_DURABLE_RUN_EVENT_BATCH_MAX_ROWS";
-const DURABLE_RUN_EVENT_BATCH_MAX_BYTES_ENV: &str = "ASTRA_DURABLE_RUN_EVENT_BATCH_MAX_BYTES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableRunEventBatchBudget {
@@ -52,37 +50,6 @@ impl DurableRunEventBatchBudget {
             byte_budget: byte_budget.max(MIN_DURABLE_RUN_EVENT_BATCH_BYTES),
         }
     }
-
-    pub fn from_env() -> Self {
-        let row_budget = std::env::var(DURABLE_RUN_EVENT_BATCH_MAX_ROWS_ENV).ok();
-        let byte_budget = std::env::var(DURABLE_RUN_EVENT_BATCH_MAX_BYTES_ENV).ok();
-        Self::from_env_values(row_budget.as_deref(), byte_budget.as_deref())
-    }
-
-    fn from_env_values(row_budget: Option<&str>, byte_budget: Option<&str>) -> Self {
-        Self::new(
-            parse_budget_env_value(
-                row_budget,
-                MAX_DURABLE_RUN_EVENT_BATCH_ROWS,
-                MIN_DURABLE_RUN_EVENT_BATCH_ROWS,
-            ),
-            parse_budget_env_value(
-                byte_budget,
-                MAX_DURABLE_RUN_EVENT_BATCH_BYTES,
-                MIN_DURABLE_RUN_EVENT_BATCH_BYTES,
-            ),
-        )
-    }
-}
-
-fn parse_budget_env_value(value: Option<&str>, default: usize, min: usize) -> usize {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return default;
-    };
-    value
-        .parse::<usize>()
-        .map(|parsed| parsed.max(min))
-        .unwrap_or(default)
 }
 
 /// Status of a single agentic run.
@@ -442,7 +409,7 @@ fn retain_budgeted_events(
 pub fn enforce_durable_run_event_batch_budget(events: Vec<Value>) -> Vec<Value> {
     enforce_durable_run_event_batch_budget_with_budget(
         events,
-        DurableRunEventBatchBudget::from_env(),
+        DurableRunEventBatchBudget::default(),
     )
 }
 
@@ -785,28 +752,6 @@ mod tests {
             .map(durable_run_event_estimated_bytes)
             .sum::<usize>();
         assert!(total_bytes < MAX_DURABLE_RUN_EVENT_BATCH_BYTES);
-    }
-
-    #[test]
-    fn durable_run_event_batch_budget_env_values_parse_and_clamp() {
-        assert_eq!(
-            DurableRunEventBatchBudget::from_env_values(Some("32"), Some("131072")),
-            DurableRunEventBatchBudget {
-                row_budget: 32,
-                byte_budget: 131_072
-            }
-        );
-        assert_eq!(
-            DurableRunEventBatchBudget::from_env_values(Some("0"), Some("1")),
-            DurableRunEventBatchBudget {
-                row_budget: MIN_DURABLE_RUN_EVENT_BATCH_ROWS,
-                byte_budget: MIN_DURABLE_RUN_EVENT_BATCH_BYTES
-            }
-        );
-        assert_eq!(
-            DurableRunEventBatchBudget::from_env_values(Some("not-a-number"), Some("")),
-            DurableRunEventBatchBudget::default()
-        );
     }
 
     #[test]

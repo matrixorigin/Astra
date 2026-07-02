@@ -42,16 +42,12 @@ class DurableEventPressureProbeTests(unittest.TestCase):
             runs=7,
             text_deltas=1111,
             progress_rows=555,
-            row_budget=128,
-            byte_budget=262144,
         )
         command = probe.build_command(args)
         self.assertEqual(command.name, "durable_event_pressure")
         self.assertEqual(command.env["ASTRA_DURABLE_EVENT_PRESSURE_RUNS"], "7")
         self.assertEqual(command.env["ASTRA_DURABLE_EVENT_PRESSURE_TEXT_DELTAS"], "1111")
         self.assertEqual(command.env["ASTRA_DURABLE_EVENT_PRESSURE_PROGRESS_ROWS"], "555")
-        self.assertEqual(command.env["ASTRA_DURABLE_RUN_EVENT_BATCH_MAX_ROWS"], "128")
-        self.assertEqual(command.env["ASTRA_DURABLE_RUN_EVENT_BATCH_MAX_BYTES"], "262144")
         self.assertIn("durable_run_event_pressure_probe", command.command)
         self.assertIn("--lib", command.command)
         self.assertIn("--nocapture", command.command)
