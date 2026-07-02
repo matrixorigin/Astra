@@ -338,6 +338,95 @@ class SchemaInventoryTest(unittest.TestCase):
             self.tables["runtime_llm_trusted_domains"]["merge_guidance"],
         )
 
+    def test_skill_and_agent_tables_have_semantic_metadata(self) -> None:
+        skill_agent_tables = {
+            "skills_registry",
+            "skill_metrics",
+            "skill_selection_events",
+            "skill_installations",
+            "skill_settings",
+            "skill_resource_bindings",
+            "skill_user_credentials",
+            "user_skill_sources",
+            "user_skill_versions",
+            "user_skill_evaluations",
+            "agent_agents",
+            "agent_bindings",
+            "agent_tasks",
+        }
+        for table in skill_agent_tables:
+            with self.subTest(table=table):
+                row = self.tables[table]
+                for field in [
+                    "semantic_owner",
+                    "state_class",
+                    "primary_query",
+                    "retention_policy",
+                    "rebuildability",
+                    "merge_guidance",
+                    "migration_owner",
+                    "product_owner",
+                ]:
+                    self.assertNotEqual(
+                        row[field],
+                        "unclassified",
+                        f"{table}.{field} must be explicit metadata",
+                    )
+
+    def test_skill_and_agent_metadata_locks_boundary_decisions(self) -> None:
+        self.assertIn(
+            "shared runtime catalog",
+            self.tables["skills_registry"]["merge_guidance"],
+        )
+        self.assertIn(
+            "high-churn projections",
+            self.tables["skill_metrics"]["merge_guidance"],
+        )
+        self.assertIn(
+            "readers stop querying this table directly",
+            self.tables["skill_selection_events"]["merge_guidance"],
+        )
+        self.assertIn(
+            "user's installed/activated state",
+            self.tables["skill_installations"]["merge_guidance"],
+        )
+        self.assertIn(
+            "different secrecy and lookup semantics",
+            self.tables["skill_settings"]["merge_guidance"],
+        )
+        self.assertIn(
+            "external resources",
+            self.tables["skill_resource_bindings"]["merge_guidance"],
+        )
+        self.assertIn(
+            "encrypted user secrets",
+            self.tables["skill_user_credentials"]["merge_guidance"],
+        )
+        self.assertIn(
+            "source owns authoring identity",
+            self.tables["user_skill_sources"]["merge_guidance"],
+        )
+        self.assertIn(
+            "authoring/version content",
+            self.tables["user_skill_versions"]["merge_guidance"],
+        )
+        self.assertIn(
+            "run-linked review facts",
+            self.tables["user_skill_evaluations"]["merge_guidance"],
+        )
+        self.assertIn(
+            "user-owned agent definitions",
+            self.tables["agent_agents"]["merge_guidance"],
+        )
+        self.assertIn(
+            "idempotent creation semantics",
+            self.tables["agent_bindings"]["merge_guidance"],
+        )
+        self.assertIn(
+            "todos own user scratchpad tasks",
+            self.tables["agent_tasks"]["merge_guidance"],
+        )
+
     def test_high_growth_tables_have_retention_metadata(self) -> None:
         high_growth_tables = [
             "agent_events",
