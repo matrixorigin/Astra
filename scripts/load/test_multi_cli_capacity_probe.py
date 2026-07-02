@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import json
 import sys
@@ -197,6 +198,56 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertIsNone(text_code)
         self.assertEqual(text_message, "plain boom")
         self.assertIsNone(text_retryable)
+
+    def test_stream_request_reads_http_error_json_body(self) -> None:
+        async def run() -> None:
+            async def handle(
+                reader: asyncio.StreamReader,
+                writer: asyncio.StreamWriter,
+            ) -> None:
+                await reader.readuntil(b"\r\n\r\n")
+                body = json.dumps(
+                    {
+                        "error_code": "run_admission_timeout",
+                        "detail": "server capacity timeout",
+                        "retryable": True,
+                    }
+                ).encode("utf-8")
+                writer.write(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"content-type: application/json\r\n"
+                    + f"content-length: {len(body)}\r\n".encode("ascii")
+                    + b"connection: close\r\n\r\n"
+                    + body
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_server(handle, "127.0.0.1", 0)
+            try:
+                port = server.sockets[0].getsockname()[1]
+                result = await probe.stream_sse_request(
+                    request_id=1,
+                    user_index=1,
+                    token_index=None,
+                    url_text=f"http://127.0.0.1:{port}/chat/stream",
+                    headers={},
+                    body=b"{}",
+                    connect_timeout_secs=1,
+                    request_timeout_secs=1,
+                )
+            finally:
+                server.close()
+                await server.wait_closed()
+
+            self.assertEqual(result.outcome, "http_error")
+            self.assertEqual(result.http_status, 503)
+            self.assertEqual(result.error_code, "run_admission_timeout")
+            self.assertEqual(result.error_message, "server capacity timeout")
+            self.assertTrue(result.retryable)
+
+        asyncio.run(run())
 
     def test_summarize_results_reports_terminal_failure_reasons(self) -> None:
         args = argparse.Namespace(
