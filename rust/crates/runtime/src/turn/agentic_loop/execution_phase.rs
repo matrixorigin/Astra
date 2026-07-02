@@ -76,6 +76,46 @@ fn alert_dispatch_session_id(session_id: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn is_llm_provider_admission_error(error: &astra_core::ClassifiedError) -> bool {
+    let Some(details_json) = error.details_json.as_deref() else {
+        return false;
+    };
+    let Ok(serde_json::Value::Object(details)) =
+        serde_json::from_str::<serde_json::Value>(details_json)
+    else {
+        return false;
+    };
+    details.get("source").and_then(serde_json::Value::as_str) == Some("llm_provider_admission")
+}
+
+fn record_direct_llm_error_state(
+    state: &mut AgenticLoopState,
+    error: &astra_core::ClassifiedError,
+) {
+    match error.kind {
+        astra_core::ErrorKind::RateLimit if !is_llm_provider_admission_error(error) => {
+            state.rate_limit_cooldown.record_429(None, false);
+        }
+        astra_core::ErrorKind::ServerError => {
+            state.rate_limit_cooldown.record_529(None, false);
+        }
+        _ => {}
+    }
+
+    if state.interruption.is_some() {
+        return;
+    }
+    if let Some((kind, action)) =
+        astra_turn_core::interruption::interruption_from_error_kind(error.kind)
+    {
+        state.interruption = Some(InterruptionRecord::new(
+            kind,
+            action,
+            interruption_state_summary(state, Some(error.message.clone())),
+        ));
+    }
+}
+
 pub(crate) fn deferred_user_input_text(input: &serde_json::Value) -> Option<String> {
     fn trimmed_text(value: Option<&serde_json::Value>) -> Option<String> {
         value
@@ -1247,7 +1287,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             .await;
         }
     }
-    let turn_result = turn_result?;
+    let turn_result = match turn_result {
+        Ok(turn_result) => turn_result,
+        Err(error) => {
+            record_direct_llm_error_state(state, &error);
+            return Err(error);
+        }
+    };
     state.rate_limit_cooldown.record_success();
     // Clear pipeline recovery escalation after a successful LLM call —
     // the PTL pressure is relieved.
@@ -3465,6 +3511,40 @@ mod tests {
         valid_tools: HashSet<String>,
     }
 
+    struct DirectErrorHost {
+        error: Option<astra_core::ClassifiedError>,
+        valid_tools: HashSet<String>,
+    }
+
+    impl DirectErrorHost {
+        fn new(error: astra_core::ClassifiedError) -> Self {
+            Self {
+                error: Some(error),
+                valid_tools: HashSet::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgenticLoopHost for DirectErrorHost {
+        async fn execute_turn(
+            &mut self,
+            _state: &mut AgenticLoopState,
+        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+            Err(self.error.take().expect("test host called once"))
+        }
+
+        fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, _line: String) {}
+
+        fn is_quiet(&self) -> bool {
+            true
+        }
+
+        fn valid_tool_names(&self) -> &HashSet<String> {
+            &self.valid_tools
+        }
+    }
+
     #[async_trait]
     impl AgenticLoopHost for JudgeOnlyHost {
         async fn execute_turn(
@@ -3844,6 +3924,81 @@ mod tests {
             host.turn_completed_run_ids.is_empty(),
             "hook must not fire on execute_turn error"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_provider_rate_limit_error_records_interruption_and_cooldown() {
+        let mut state = make_state();
+        let mut host = DirectErrorHost::new(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::RateLimit,
+            "provider returned 429",
+        ));
+
+        let result = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let interruption = state
+            .interruption
+            .as_ref()
+            .expect("direct provider 429 must be represented as an interruption");
+        assert_eq!(interruption.kind, InterruptionKind::RateLimited);
+        assert_eq!(state.llm_rounds_completed, 1);
+        let metrics = state.rate_limit_cooldown.metrics();
+        assert_eq!(metrics.total_429_errors, 1);
+        assert_eq!(metrics.consecutive_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn direct_provider_admission_rejection_records_interruption_without_provider_cooldown() {
+        let mut state = make_state();
+        let mut host = DirectErrorHost::new(
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::RateLimit,
+                "LLM provider admission rejected request before provider call",
+            )
+            .with_details_json(
+                serde_json::json!({
+                    "source": "llm_provider_admission",
+                    "scope": "provider",
+                    "limit": 20
+                })
+                .to_string(),
+            ),
+        );
+
+        let result = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let interruption = state
+            .interruption
+            .as_ref()
+            .expect("admission rejection must be represented as an interruption");
+        assert_eq!(interruption.kind, InterruptionKind::RateLimited);
+        assert_eq!(state.llm_rounds_completed, 1);
+        let metrics = state.rate_limit_cooldown.metrics();
+        assert_eq!(
+            metrics.total_429_errors, 0,
+            "local admission rejection must not be counted as a provider 429"
+        );
+        assert_eq!(metrics.consecutive_errors, 0);
     }
 
     #[test]
