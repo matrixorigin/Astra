@@ -586,6 +586,19 @@ METRIC_LINE_RE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?P<labels>\{[^}]*\})?\s+(?P<value>[-+0-9.eE]+)"
 )
 
+EVENT_INGESTION_METRIC_KEYS = {
+    "enqueue_overflows_total": "astra_event_ingestion_enqueue_overflows_total",
+    "dropped_before_acceptance_total": "astra_event_ingestion_events_dropped_before_acceptance_total",
+    "dropped_before_acceptance_critical_total": (
+        'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="critical"}'
+    ),
+    "dropped_before_acceptance_telemetry_total": (
+        'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="telemetry"}'
+    ),
+    "dropped_permanent_total": "astra_event_ingestion_events_dropped_permanent_total",
+    "errors_total": "astra_event_ingestion_errors_total",
+}
+
 
 def parse_prometheus_metrics(text: str, prefixes: tuple[str, ...] = DEFAULT_METRIC_PREFIXES) -> dict[str, float]:
     metrics: dict[str, float] = {}
@@ -875,6 +888,7 @@ async def run_probe(args: argparse.Namespace) -> int:
                     "register_users": args.register_users,
                     "require_metrics": args.require_metrics,
                     "require_error_codes_for_failures": args.require_error_codes_for_failures,
+                    "require_no_critical_ingestion_drops": args.require_no_critical_ingestion_drops,
                     "nofile": {
                         "soft_limit": nofile_soft_limit,
                         "required": nofile_required,
@@ -951,6 +965,15 @@ async def run_probe(args: argparse.Namespace) -> int:
         contract_violations: list[str] = []
         if args.require_metrics and metrics_summary["samples_with_metrics"] == 0:
             contract_violations.append("metrics_required_but_no_prefixed_metrics_sampled")
+        critical_ingestion_drops = metrics_summary.get("event_ingestion", {}).get(
+            "dropped_before_acceptance_critical_total"
+        )
+        if args.require_no_critical_ingestion_drops and critical_ingestion_drops is None:
+            contract_violations.append("critical_ingestion_drop_metric_missing")
+        elif args.require_no_critical_ingestion_drops and critical_ingestion_drops > 0:
+            contract_violations.append(
+                f"critical_ingestion_drops_before_acceptance:{critical_ingestion_drops:g}"
+            )
         failures_missing_error_code = sum(
             1 for result in results if result.outcome != "completed" and not result.error_code
         )
@@ -1044,6 +1067,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
             "last_unix_ms": None,
             "last_metric_count": 0,
             "last_metric_names": [],
+            "event_ingestion": summarize_event_ingestion_metrics({}),
         }
     sample_count = 0
     samples_with_metrics = 0
@@ -1083,7 +1107,12 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
         "last_unix_ms": last_unix_ms,
         "last_metric_count": len(last_metrics),
         "last_metric_names": sorted(last_metrics)[:50],
+        "event_ingestion": summarize_event_ingestion_metrics(last_metrics),
     }
+
+
+def summarize_event_ingestion_metrics(metrics: dict[str, float]) -> dict[str, float | None]:
+    return {name: metrics.get(key) for name, key in EVENT_INGESTION_METRIC_KEYS.items()}
 
 
 def percentile_summary(values: list[float]) -> dict[str, float | None]:
@@ -1210,6 +1239,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-error-codes-for-failures",
         action="store_true",
         help="fail if any non-completed request lacks a machine-readable error_code",
+    )
+    parser.add_argument(
+        "--require-no-critical-ingestion-drops",
+        action="store_true",
+        help="fail if /metrics reports any critical agent_events ingestion drop before worker acceptance",
     )
     parser.add_argument(
         "--skip-nofile-check",

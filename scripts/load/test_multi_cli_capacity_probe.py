@@ -55,6 +55,8 @@ class CapacityProbeTests(unittest.TestCase):
                     'astra_post_loop_memory_cleanup_dispatches_total{mode="async",outcome="dropped_full"} 4',
                     'astra_session_memory_post_loop_drains_total{outcome="leftover"} 5',
                     "astra_event_ingestion_events_dropped_before_acceptance_total 6",
+                    'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="critical"} 0',
+                    'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="telemetry"} 7',
                     "process_cpu_seconds_total 9",
                 ]
             )
@@ -81,6 +83,18 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(
             metrics["astra_event_ingestion_events_dropped_before_acceptance_total"],
             6.0,
+        )
+        self.assertEqual(
+            metrics[
+                'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="critical"}'
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            metrics[
+                'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="telemetry"}'
+            ],
+            7.0,
         )
         self.assertNotIn("process_cpu_seconds_total", metrics)
 
@@ -193,6 +207,46 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(summary["http_status"], {"200": 2})
         self.assertEqual(summary["last_metric_count"], 1)
         self.assertEqual(summary["last_metric_names"], ["astra_capacity_run_slots_total"])
+        self.assertEqual(
+            summary["event_ingestion"]["dropped_before_acceptance_critical_total"],
+            None,
+        )
+
+    def test_summarize_metrics_file_reports_event_ingestion_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "unix_ms": 20,
+                        "http_status": 200,
+                        "metrics": {
+                            "astra_event_ingestion_enqueue_overflows_total": 11.0,
+                            "astra_event_ingestion_events_dropped_before_acceptance_total": 3.0,
+                            'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="critical"}': 0.0,
+                            'astra_event_ingestion_events_dropped_before_acceptance_by_priority_total{priority="telemetry"}': 3.0,
+                            "astra_event_ingestion_events_dropped_permanent_total": 1.0,
+                            "astra_event_ingestion_errors_total": 2.0,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = probe.summarize_metrics_file(path)
+
+        self.assertEqual(
+            summary["event_ingestion"],
+            {
+                "enqueue_overflows_total": 11.0,
+                "dropped_before_acceptance_total": 3.0,
+                "dropped_before_acceptance_critical_total": 0.0,
+                "dropped_before_acceptance_telemetry_total": 3.0,
+                "dropped_permanent_total": 1.0,
+                "errors_total": 2.0,
+            },
+        )
 
     def test_error_helpers_read_run_lifecycle_machine_code(self) -> None:
         event = {
