@@ -136,6 +136,53 @@ pub struct IngestionEvent {
     pub causal_chain_id: Option<String>,
 }
 
+/// Backpressure priority for cloud ingestion events.
+///
+/// Critical events are audit/replay boundaries for the `agent_events` timeline.
+/// Telemetry events are diagnostic traces or high-volume observability signals
+/// that must not starve critical audit events when the async ingestion channel
+/// is under pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestionEventPriority {
+    Critical,
+    Telemetry,
+}
+
+impl IngestionEventPriority {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::Telemetry => "telemetry",
+        }
+    }
+}
+
+fn ingestion_event_priority_for_type(event_type: &str) -> IngestionEventPriority {
+    match event_type {
+        // Diagnostic/high-volume traces. These remain useful when persisted,
+        // but they are not the authoritative run/session/tool result facts.
+        "adaptive_per_turn_applied"
+        | "adaptive_scenario_applied"
+        | "bootstrap"
+        | "context_assembly_recorded"
+        | "llm_request_full"
+        | "llm_response_full"
+        | "llm_round"
+        | "pipeline_alert"
+        | "pipeline_compaction_audit"
+        | "pipeline_feedback"
+        | "session_memory_extraction"
+        | "trace_span" => IngestionEventPriority::Telemetry,
+        _ => IngestionEventPriority::Critical,
+    }
+}
+
+impl IngestionEvent {
+    pub fn priority(&self) -> IngestionEventPriority {
+        ingestion_event_priority_for_type(&self.event_type)
+    }
+}
+
 fn merged_metadata_from_journal_event(
     event: &crate::session_journal::JournalEvent,
 ) -> Option<serde_json::Value> {
@@ -434,6 +481,7 @@ pub struct IngestionSender {
     tx: mpsc::Sender<IngestionEvent>,
     overflow_count: Arc<AtomicU64>,
     dropped_before_acceptance_count: Arc<AtomicU64>,
+    dropped_telemetry_before_acceptance_count: Arc<AtomicU64>,
     pending_deferrals: Arc<AtomicUsize>,
     max_pending_deferrals: usize,
 }
@@ -446,6 +494,7 @@ impl IngestionSender {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
             max_pending_deferrals: DISCONNECTED_PENDING_DEFERRAL_LIMIT,
         }
@@ -463,6 +512,7 @@ impl IngestionSender {
                 tx,
                 overflow_count: Arc::new(AtomicU64::new(0)),
                 dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+                dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
                 pending_deferrals: Arc::new(AtomicUsize::new(0)),
                 max_pending_deferrals: capacity.max(1),
             },
@@ -480,32 +530,37 @@ impl IngestionSender {
         match self.tx.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(event)) => {
+                let priority = event.priority();
                 let n = self.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::warn!(
                     target: "astra_services::event_ingestion",
                     overflow_count = n,
+                    priority = priority.as_label(),
                     "ingestion channel full; deferring event until capacity is available"
                 );
                 let tx = self.tx.clone();
                 let overflow_count = self.overflow_count.clone();
                 let dropped_before_acceptance_count = self.dropped_before_acceptance_count.clone();
+                let dropped_telemetry_before_acceptance_count =
+                    self.dropped_telemetry_before_acceptance_count.clone();
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle) => {
                         let pending_deferrals = self.pending_deferrals.clone();
+                        let max_pending_deferrals = self.max_pending_deferrals_for(priority);
                         if pending_deferrals
                             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
-                                (pending < self.max_pending_deferrals).then_some(pending + 1)
+                                (pending < max_pending_deferrals).then_some(pending + 1)
                             })
                             .is_err()
                         {
                             tracing::warn!(
                                 target: "astra_services::event_ingestion",
                                 overflow_count = n,
-                                max_pending_deferrals = self.max_pending_deferrals,
+                                priority = priority.as_label(),
+                                max_pending_deferrals,
                                 "ingestion deferred-send queue full; event dropped"
                             );
-                            self.dropped_before_acceptance_count
-                                .fetch_add(1, Ordering::Relaxed);
+                            self.record_drop_before_acceptance(priority);
                             return;
                         }
                         drop(handle.spawn(async move {
@@ -513,9 +568,14 @@ impl IngestionSender {
                                 let n = overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
                                 dropped_before_acceptance_count
                                     .fetch_add(1, Ordering::Relaxed);
+                                if priority == IngestionEventPriority::Telemetry {
+                                    dropped_telemetry_before_acceptance_count
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                                 tracing::warn!(
                                     target: "astra_services::event_ingestion",
                                     overflow_count = n,
+                                    priority = priority.as_label(),
                                     "ingestion channel closed while deferred event was waiting; event dropped"
                                 );
                             }
@@ -526,23 +586,40 @@ impl IngestionSender {
                         tracing::warn!(
                             target: "astra_services::event_ingestion",
                             overflow_count = n,
+                            priority = priority.as_label(),
                             "ingestion channel full outside a Tokio runtime; event dropped"
                         );
-                        self.dropped_before_acceptance_count
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.record_drop_before_acceptance(priority);
                     }
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(mpsc::error::TrySendError::Closed(event)) => {
+                let priority = event.priority();
                 let n = self.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
-                self.dropped_before_acceptance_count
-                    .fetch_add(1, Ordering::Relaxed);
+                self.record_drop_before_acceptance(priority);
                 tracing::warn!(
                     target: "astra_services::event_ingestion",
                     overflow_count = n,
+                    priority = priority.as_label(),
                     "ingestion channel closed; event dropped"
                 );
             }
+        }
+    }
+
+    fn max_pending_deferrals_for(&self, priority: IngestionEventPriority) -> usize {
+        match priority {
+            IngestionEventPriority::Critical => self.max_pending_deferrals,
+            IngestionEventPriority::Telemetry => self.max_pending_deferrals / 2,
+        }
+    }
+
+    fn record_drop_before_acceptance(&self, priority: IngestionEventPriority) {
+        self.dropped_before_acceptance_count
+            .fetch_add(1, Ordering::Relaxed);
+        if priority == IngestionEventPriority::Telemetry {
+            self.dropped_telemetry_before_acceptance_count
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -558,6 +635,16 @@ impl IngestionSender {
         self.dropped_before_acceptance_count.load(Ordering::Relaxed)
     }
 
+    pub fn dropped_telemetry_before_acceptance_count(&self) -> u64 {
+        self.dropped_telemetry_before_acceptance_count
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn dropped_critical_before_acceptance_count(&self) -> u64 {
+        self.dropped_before_acceptance_count()
+            .saturating_sub(self.dropped_telemetry_before_acceptance_count())
+    }
+
     #[cfg(test)]
     fn pending_deferral_count(&self) -> usize {
         self.pending_deferrals.load(Ordering::Relaxed)
@@ -565,12 +652,13 @@ impl IngestionSender {
 
     /// Enqueue with backpressure (waits if channel full).
     pub async fn enqueue_async(&self, event: IngestionEvent) {
+        let priority = event.priority();
         if self.tx.send(event).await.is_err() {
             self.overflow_count.fetch_add(1, Ordering::Relaxed);
-            self.dropped_before_acceptance_count
-                .fetch_add(1, Ordering::Relaxed);
+            self.record_drop_before_acceptance(priority);
             tracing::warn!(
                 target: "astra_services::event_ingestion",
+                priority = priority.as_label(),
                 "ingestion channel closed; event dropped"
             );
         }
@@ -969,6 +1057,7 @@ impl EventIngestionWorker {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals,
             max_pending_deferrals,
         };
@@ -1643,6 +1732,45 @@ mod tests {
     }
 
     #[test]
+    fn ingestion_event_priority_classifies_audit_boundaries_as_critical() {
+        for event_type in [
+            SESSION_END_EVENT_TYPE,
+            "turn",
+            "turn_error",
+            "tool_call",
+            "tool_error",
+            "approval_required",
+            "approval_decision",
+            "sync_marker",
+            crate::config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE,
+        ] {
+            assert_eq!(
+                ingestion_event_priority_for_type(event_type),
+                IngestionEventPriority::Critical,
+                "{event_type} must not be treated as droppable telemetry"
+            );
+        }
+    }
+
+    #[test]
+    fn ingestion_event_priority_classifies_diagnostic_traces_as_telemetry() {
+        for event_type in [
+            "context_assembly_recorded",
+            "llm_request_full",
+            "llm_response_full",
+            "llm_round",
+            "pipeline_feedback",
+            "trace_span",
+        ] {
+            assert_eq!(
+                ingestion_event_priority_for_type(event_type),
+                IngestionEventPriority::Telemetry,
+                "{event_type} should not consume critical ingestion backlog"
+            );
+        }
+    }
+
+    #[test]
     fn ingestion_stats_default() {
         let stats = IngestionStats::default();
         assert_eq!(stats.events_received, 0);
@@ -1659,6 +1787,7 @@ mod tests {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
             max_pending_deferrals: 10,
         };
@@ -1672,6 +1801,7 @@ mod tests {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
             max_pending_deferrals: 1,
         };
@@ -1982,6 +2112,7 @@ mod tests {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
             max_pending_deferrals: 10,
         };
@@ -2264,6 +2395,7 @@ mod tests {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
             max_pending_deferrals: 3,
         };
@@ -2288,6 +2420,7 @@ mod tests {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
             max_pending_deferrals: 1,
         };
@@ -2560,6 +2693,7 @@ mod tests {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
             max_pending_deferrals: 2,
         };
@@ -2594,6 +2728,7 @@ mod tests {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals: Arc::new(AtomicUsize::new(0)),
             max_pending_deferrals: 1,
         };
@@ -2625,6 +2760,53 @@ mod tests {
             "event beyond the deferred-send cap must be dropped instead of spawning another waiter"
         );
         assert_eq!(sender.pending_deferral_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn sender_reserves_deferred_backlog_for_critical_events() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+            dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            pending_deferrals: Arc::new(AtomicUsize::new(0)),
+            max_pending_deferrals: 2,
+        };
+
+        sender.enqueue(test_event("critical-buffered", "s1", "turn"));
+        sender.enqueue(test_event("telemetry-deferred", "s1", "llm_round"));
+        sender.enqueue(test_event("critical-deferred", "s1", "turn"));
+        sender.enqueue(test_event("telemetry-dropped", "s1", "llm_round"));
+
+        assert_eq!(sender.overflow_count(), 3);
+        assert_eq!(sender.dropped_before_acceptance_count(), 1);
+        assert_eq!(sender.dropped_telemetry_before_acceptance_count(), 1);
+        assert_eq!(sender.dropped_critical_before_acceptance_count(), 0);
+
+        let mut accepted = Vec::new();
+        for _ in 0..3 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("accepted event should be delivered")
+                .expect("accepted event");
+            accepted.push(event.event_id);
+        }
+        accepted.sort();
+        assert_eq!(
+            accepted,
+            vec![
+                "critical-buffered".to_string(),
+                "critical-deferred".to_string(),
+                "telemetry-deferred".to_string(),
+            ]
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "telemetry beyond its deferred quota must be dropped"
+        );
     }
 
     // ── Shutdown handle tests ───────────────────────────────────────────
@@ -2683,6 +2865,7 @@ mod tests {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
             dropped_before_acceptance_count: Arc::new(AtomicU64::new(0)),
+            dropped_telemetry_before_acceptance_count: Arc::new(AtomicU64::new(0)),
             pending_deferrals,
             max_pending_deferrals: 1,
         };

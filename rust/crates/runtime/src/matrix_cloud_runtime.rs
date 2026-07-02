@@ -301,6 +301,28 @@ impl MatrixCloudRuntime {
             .unwrap_or(0)
     }
 
+    pub fn ingestion_dropped_critical_before_acceptance_count(&self) -> u64 {
+        self.ingestion
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref()
+                    .map(|s| s.dropped_critical_before_acceptance_count())
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn ingestion_dropped_telemetry_before_acceptance_count(&self) -> u64 {
+        self.ingestion
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref()
+                    .map(|s| s.dropped_telemetry_before_acceptance_count())
+            })
+            .unwrap_or(0)
+    }
+
     /// Clone the ingestion sender for use in other subsystems (e.g., durable task lifecycle).
     /// Returns `None` if ingestion is shut down or lock is poisoned.
     pub fn clone_ingestion_sender(

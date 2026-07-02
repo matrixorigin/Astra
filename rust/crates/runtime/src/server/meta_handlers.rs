@@ -80,6 +80,10 @@ fn register_event_ingestion_metrics(registry: &astra_turn_core::pipeline_metrics
         "astra_event_ingestion_events_dropped_before_acceptance_total",
         "Events dropped before the ingestion worker accepted them.",
     );
+    registry.register_counter(
+        "astra_event_ingestion_events_dropped_before_acceptance_by_priority_total",
+        "Events dropped before worker acceptance, split by ingestion priority.",
+    );
 }
 
 fn scrape_event_ingestion_metrics(state: &AppState) {
@@ -119,6 +123,16 @@ fn scrape_event_ingestion_metrics(state: &AppState) {
         "astra_event_ingestion_events_dropped_before_acceptance_total",
         &[],
         runtime.ingestion_dropped_before_acceptance_count(),
+    );
+    registry.set_counter_absolute(
+        "astra_event_ingestion_events_dropped_before_acceptance_by_priority_total",
+        &[("priority", "critical")],
+        runtime.ingestion_dropped_critical_before_acceptance_count(),
+    );
+    registry.set_counter_absolute(
+        "astra_event_ingestion_events_dropped_before_acceptance_by_priority_total",
+        &[("priority", "telemetry")],
+        runtime.ingestion_dropped_telemetry_before_acceptance_count(),
     );
 
     let Some(stats) = runtime.ingestion_stats() else {
@@ -273,6 +287,12 @@ mod tests {
         assert!(
             text.contains(
                 "# TYPE astra_event_ingestion_events_dropped_before_acceptance_total counter"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "# TYPE astra_event_ingestion_events_dropped_before_acceptance_by_priority_total counter"
             ),
             "{text}"
         );
