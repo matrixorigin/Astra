@@ -5545,6 +5545,10 @@ mod tests {
             "waiting runs must be returned by the same recoverable active query as in-flight runs"
         );
         assert!(
+            !body.contains("STATUS_PAUSED"),
+            "paused runs are resumable/user-held state and must not be crash-recovered"
+        );
+        assert!(
             body.contains("owner_pod_id = ?") && body.contains("owner_lease_expires_at < NOW(6)"),
             "recoverable active query must respect the owner lease boundary"
         );

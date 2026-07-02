@@ -2822,6 +2822,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_active_runs_does_not_fail_paused_runs() {
+        let engine = test_engine();
+        engine
+            .start_run("run-paused", "user-1", "sess-paused")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "user-1",
+                "run-paused",
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+
+        assert!(
+            recovered.iter().all(|run| run.run_id != "run-paused"),
+            "paused runs are user-held/resumable state, not crash-recovery candidates"
+        );
+        let durable = engine
+            .load_run("user-1", "run-paused")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_PAUSED);
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
+        assert!(durable.error_code.is_none());
+        assert!(
+            durable
+                .events
+                .iter()
+                .all(|event| event["event_type"] != "run_error"),
+            "startup recovery must not append crash-recovery errors to paused runs"
+        );
+    }
+
+    #[tokio::test]
     async fn recover_active_runs_promotes_graceful_resume_checkpoint_to_waiting() {
         let engine = test_engine();
         engine
