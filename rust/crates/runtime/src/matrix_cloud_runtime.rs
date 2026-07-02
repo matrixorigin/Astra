@@ -104,6 +104,8 @@ pub struct MatrixCloudRuntime {
     session_sync_tasks: Mutex<JoinSet<()>>,
     /// Live ingestion stats (events_received, events_flushed, errors).
     ingestion_stats: Arc<std::sync::Mutex<astra_services::event_ingestion::IngestionStats>>,
+    /// Normalized ingestion config used by this runtime instance.
+    ingestion_config: astra_services::event_ingestion::IngestionConfig,
     sync_orchestrator: TokioMutex<SyncOrchestrator>,
     /// Phase 3: shared with HTTP lease handlers (process-local export filter).
     pub lease_hold_cache: Arc<TaskLeaseHoldCache>,
@@ -146,8 +148,9 @@ impl MatrixCloudRuntime {
         let task_dirty = Arc::new(Mutex::new(HashSet::new()));
 
         let pool = shared_pool.get().clone();
+        let ingestion_config = IngestionConfig::from_env();
         let (sender, ingestion_shutdown, ingestion_stats, ingestion_jh) =
-            event_ingestion::EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
+            event_ingestion::EventIngestionWorker::spawn(pool.clone(), ingestion_config.clone());
         let audit_flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
         let sync_svc = Arc::new(MatrixOneSyncService::new(
             pool,
@@ -163,6 +166,7 @@ impl MatrixCloudRuntime {
             ingestion_shutdown,
             session_sync_tasks: Mutex::new(JoinSet::new()),
             ingestion_stats,
+            ingestion_config,
             sync_orchestrator: TokioMutex::new(orch),
             lease_hold_cache,
             task_mirror,
@@ -273,6 +277,11 @@ impl MatrixCloudRuntime {
         self.ingestion_stats.lock().ok().map(|s| s.clone())
     }
 
+    /// Normalized ingestion configuration used by this runtime instance.
+    pub fn ingestion_config(&self) -> &astra_services::event_ingestion::IngestionConfig {
+        &self.ingestion_config
+    }
+
     /// Number of immediate ingestion overflows, including bounded deferred sends
     /// and closed-channel drops.
     pub fn ingestion_overflow_count(&self) -> u64 {
@@ -280,6 +289,15 @@ impl MatrixCloudRuntime {
             .lock()
             .ok()
             .and_then(|g| g.as_ref().map(|s| s.overflow_count()))
+            .unwrap_or(0)
+    }
+
+    /// Number of ingestion events dropped before the worker accepted them.
+    pub fn ingestion_dropped_before_acceptance_count(&self) -> u64 {
+        self.ingestion
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.dropped_before_acceptance_count()))
             .unwrap_or(0)
     }
 

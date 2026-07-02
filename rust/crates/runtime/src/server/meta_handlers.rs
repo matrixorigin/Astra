@@ -35,6 +35,118 @@ impl MetricTarget for MetricsRegistryBridge {
     }
 }
 
+fn register_event_ingestion_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
+    registry.register_gauge(
+        "astra_event_ingestion_config_batch_size",
+        "Configured event ingestion batch size for this runtime process.",
+    );
+    registry.register_gauge(
+        "astra_event_ingestion_config_flush_interval_secs",
+        "Configured event ingestion flush interval in seconds for this runtime process.",
+    );
+    registry.register_gauge(
+        "astra_event_ingestion_config_channel_capacity",
+        "Configured event ingestion channel capacity for this runtime process.",
+    );
+    registry.register_gauge(
+        "astra_event_ingestion_config_max_retries",
+        "Configured event ingestion max retries for this runtime process.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_events_received_total",
+        "Events accepted by the event ingestion worker.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_events_flushed_total",
+        "Events handled by successful event ingestion flushes.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_events_dropped_permanent_total",
+        "Events permanently dropped by the ingestion worker after acceptance.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_flushes_total",
+        "Successful event ingestion flush attempts.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_errors_total",
+        "Event ingestion worker errors.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_enqueue_overflows_total",
+        "Producer enqueue attempts that found the ingestion channel full or closed.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_events_dropped_before_acceptance_total",
+        "Events dropped before the ingestion worker accepted them.",
+    );
+}
+
+fn scrape_event_ingestion_metrics(state: &AppState) {
+    let registry = state.metrics_registry();
+    register_event_ingestion_metrics(&registry);
+    let Some(runtime) = state.matrix_cloud_runtime.as_ref() else {
+        return;
+    };
+
+    let config = runtime.ingestion_config();
+    registry.set_gauge(
+        "astra_event_ingestion_config_batch_size",
+        &[],
+        config.batch_size as f64,
+    );
+    registry.set_gauge(
+        "astra_event_ingestion_config_flush_interval_secs",
+        &[],
+        config.flush_interval_secs as f64,
+    );
+    registry.set_gauge(
+        "astra_event_ingestion_config_channel_capacity",
+        &[],
+        config.channel_capacity as f64,
+    );
+    registry.set_gauge(
+        "astra_event_ingestion_config_max_retries",
+        &[],
+        config.max_retries as f64,
+    );
+    registry.set_counter_absolute(
+        "astra_event_ingestion_enqueue_overflows_total",
+        &[],
+        runtime.ingestion_overflow_count(),
+    );
+    registry.set_counter_absolute(
+        "astra_event_ingestion_events_dropped_before_acceptance_total",
+        &[],
+        runtime.ingestion_dropped_before_acceptance_count(),
+    );
+
+    let Some(stats) = runtime.ingestion_stats() else {
+        return;
+    };
+    registry.set_counter_absolute(
+        "astra_event_ingestion_events_received_total",
+        &[],
+        stats.events_received,
+    );
+    registry.set_counter_absolute(
+        "astra_event_ingestion_events_flushed_total",
+        &[],
+        stats.events_flushed,
+    );
+    registry.set_counter_absolute(
+        "astra_event_ingestion_events_dropped_permanent_total",
+        &[],
+        stats.events_dropped_permanent,
+    );
+    registry.set_counter_absolute(
+        "astra_event_ingestion_flushes_total",
+        &[],
+        stats.flush_count,
+    );
+    registry.set_counter_absolute("astra_event_ingestion_errors_total", &[], stats.errors);
+}
+
 pub(super) async fn root_handler(State(state): State<AppState>) -> Json<RootResponse> {
     Json(RootResponse {
         name: state.service_info.name,
@@ -82,6 +194,7 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoR
     state.multi_agent_metrics.scrape_to(&bridge);
     crate::server::interaction_metrics::register_interaction_metrics(&state.metrics_registry());
     crate::capacity_model::scrape_capacity_metrics_from_env(&state.metrics_registry());
+    scrape_event_ingestion_metrics(&state);
     crate::turn::bridge::llm_stream::rate_limit_cooldown()
         .scrape_metrics(&state.metrics_registry());
     let body = state.metrics_registry().render_prometheus();
@@ -151,6 +264,16 @@ mod tests {
         );
         assert!(
             text.contains("# TYPE astra_interaction_approval_ledger_insert_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_event_ingestion_events_received_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "# TYPE astra_event_ingestion_events_dropped_before_acceptance_total counter"
+            ),
             "{text}"
         );
     }
