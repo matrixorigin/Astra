@@ -954,7 +954,7 @@ export type RuntimeSessionResponse = {
 
 export type RuntimeSessionListResponse = {
   sessions: RuntimeSessionResponse[];
-  total?: number;
+  total?: number | null;
   limit?: number;
   next_cursor?: RuntimeSessionListCursor | null;
 };

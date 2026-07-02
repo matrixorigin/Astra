@@ -361,7 +361,7 @@ pub struct SessionResponse {
 #[derive(Serialize, PartialEq)]
 pub struct SessionListResponse {
     pub sessions: Vec<SessionResponse>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
     pub next_cursor: Option<SessionListCursor>,
 }

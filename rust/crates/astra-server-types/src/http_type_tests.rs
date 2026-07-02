@@ -635,7 +635,7 @@ fn auth_logout_response_serializes() {
 fn session_list_response_serializes() {
     let resp = SessionListResponse {
         sessions: vec![],
-        total: 0,
+        total: Some(0),
         limit: 50,
         next_cursor: None,
     };
@@ -643,6 +643,15 @@ fn session_list_response_serializes() {
     assert_eq!(v["sessions"], json!([]));
     assert_eq!(v["total"], 0);
     assert!(v["next_cursor"].is_null());
+
+    let resp = SessionListResponse {
+        sessions: vec![],
+        total: None,
+        limit: 50,
+        next_cursor: None,
+    };
+    let v = serde_json::to_value(&resp).unwrap();
+    assert!(v["total"].is_null());
 }
 
 #[test]
@@ -903,7 +912,7 @@ fn session_list_record_to_response() {
             updated_at: None,
             ended_at: None,
         }],
-        total: 1,
+        total: Some(1),
         limit: 50,
         next_cursor: Some(SessionListCursor {
             updated_at: "2024-01-01T00:00:00Z".into(),
@@ -912,7 +921,7 @@ fn session_list_record_to_response() {
     };
     let resp: SessionListResponse = record.into();
     assert_eq!(resp.sessions.len(), 1);
-    assert_eq!(resp.total, 1);
+    assert_eq!(resp.total, Some(1));
     assert_eq!(resp.limit, 50);
     assert_eq!(
         resp.next_cursor
@@ -924,13 +933,13 @@ fn session_list_record_to_response() {
     // empty
     let record = SessionListRecord {
         sessions: vec![],
-        total: 0,
+        total: None,
         limit: 20,
         next_cursor: None,
     };
     let resp: SessionListResponse = record.into();
     assert!(resp.sessions.is_empty());
-    assert_eq!(resp.total, 0);
+    assert_eq!(resp.total, None);
     assert_eq!(resp.limit, 20);
     assert!(resp.next_cursor.is_none());
 }

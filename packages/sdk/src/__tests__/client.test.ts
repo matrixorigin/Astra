@@ -222,7 +222,7 @@ describe("AstraClient — Sessions", () => {
   test("listRuntimeSessions preserves pagination envelope", async () => {
     globalThis.fetch = mockFetch(200, {
       sessions: [],
-      total: 3,
+      total: null,
       limit: 2,
       next_cursor: {
         updated_at: "2026-06-29T08:00:00Z",
@@ -236,7 +236,7 @@ describe("AstraClient — Sessions", () => {
         session_id: "session-1",
       },
     });
-    expect(result.total).toBe(3);
+    expect(result.total).toBeNull();
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
       .calls[0][0] as string;
     expect(url).toContain("limit=2");

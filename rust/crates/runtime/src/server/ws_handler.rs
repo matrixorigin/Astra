@@ -2324,7 +2324,7 @@ mod tests {
         ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionListRecord {
                 sessions: Vec::new(),
-                total: 0,
+                total: Some(0),
                 limit: 20,
                 next_cursor: None,
             })
@@ -2380,7 +2380,7 @@ mod tests {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: Vec::new(),
-                total: 0,
+                total: Some(0),
                 limit: 20,
                 next_cursor: None,
             })

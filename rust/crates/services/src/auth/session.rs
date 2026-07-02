@@ -109,7 +109,7 @@ pub struct SessionRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionListRecord {
     pub sessions: Vec<SessionRecord>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
     pub next_cursor: Option<SessionListCursor>,
 }
@@ -463,27 +463,33 @@ impl SessionService for DatabaseSessionService {
 
         let limit = validate_session_list_limit(filter.limit);
 
-        let mut count_query = QueryBuilder::<MySql>::new(
-            "SELECT COUNT(session_id) AS total FROM agent_sessions WHERE user_id = ",
-        );
-        count_query.push_bind(&filter.user_id);
-        if let Some(agent_id) = &filter.agent_id {
-            count_query.push(" AND agent_id = ");
-            count_query.push_bind(agent_id);
-        }
-        if let Some(status) = &filter.status {
-            count_query.push(" AND status = ");
-            count_query.push_bind(status);
-        }
+        let total = if filter.cursor.is_none() {
+            let mut count_query = QueryBuilder::<MySql>::new(
+                "SELECT COUNT(session_id) AS total FROM agent_sessions WHERE user_id = ",
+            );
+            count_query.push_bind(&filter.user_id);
+            if let Some(agent_id) = &filter.agent_id {
+                count_query.push(" AND agent_id = ");
+                count_query.push_bind(agent_id);
+            }
+            if let Some(status) = &filter.status {
+                count_query.push(" AND status = ");
+                count_query.push_bind(status);
+            }
 
-        let total_row = count_query
-            .build()
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
-        let total = total_row
-            .try_get::<i64, _>("total")
-            .map_err(internal_error)?;
+            let total_row = count_query
+                .build()
+                .fetch_one(&pool)
+                .await
+                .map_err(internal_error)?;
+            Some(
+                total_row
+                    .try_get::<i64, _>("total")
+                    .map_err(internal_error)?,
+            )
+        } else {
+            None
+        };
 
         let mut list_query = QueryBuilder::<MySql>::new(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
@@ -887,6 +893,28 @@ mod tests {
         assert!(!cursor_sql.contains(" OFFSET "));
         assert!(order_sql.contains("SESSION_ID DESC"));
         assert!(cursor_sql.contains("SESSION_ID < ?"));
+    }
+
+    #[test]
+    fn session_list_cursor_path_omits_count_contract() {
+        let source = include_str!("session.rs");
+        let database_impl = source
+            .split("impl SessionService for DatabaseSessionService")
+            .nth(1)
+            .expect("database session service impl should be present");
+        let body = database_impl
+            .split("async fn list_sessions")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn get_session").next())
+            .expect("list_sessions body should be present");
+        assert!(
+            body.contains("let total = if filter.cursor.is_none()"),
+            "non-cursor path may count, but cursor path must skip COUNT(*)"
+        );
+        assert!(
+            body.contains("} else {\n            None\n        };"),
+            "cursor path must return total=None instead of running a count"
+        );
     }
 
     #[test]
