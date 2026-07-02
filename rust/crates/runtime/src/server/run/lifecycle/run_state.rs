@@ -311,10 +311,71 @@ pub fn streaming_event_for_persistence(event: &Value) -> bool {
     streaming_final_event_for_replay(event) || live_delta_event_for_persistence(event)
 }
 
+fn durable_replay_boundary_event(event: &Value) -> bool {
+    matches!(
+        durable_event_type(event),
+        Some(
+            "tool_call"
+                | "tool_call_start"
+                | "tool_call_end"
+                | "tool_result"
+                | "run_blocked"
+                | "workspace_bound"
+                | "executor_bound"
+                | "executor_status_changed"
+                | "tool_routing_decision"
+                | "tool_transport_started"
+                | "tool_transport_completed"
+                | "tool_transport_failed"
+                | "approval_request"
+                | "approval_required"
+                | "approval_batch_required"
+                | "user_input"
+                | "agent_delegated"
+                | "agent_spawned"
+                | "agent_completed"
+                | "agent_failed"
+                | "agent_waiting"
+                | "agent_cancelled"
+                | "agent_interrupted"
+                | "reasoning_message_content"
+                | "reasoning_done"
+                | "thinking_done"
+        )
+    )
+}
+
 pub fn durable_run_event_estimated_bytes(event: &Value) -> usize {
     serde_json::to_vec(event)
         .map(|bytes| bytes.len())
         .unwrap_or_else(|_| event.to_string().len())
+}
+
+fn retain_budgeted_events(
+    events: &[Value],
+    event_bytes: &[usize],
+    keep: &mut [bool],
+    row_budget: usize,
+    byte_budget: usize,
+    retained_rows: &mut usize,
+    retained_bytes: &mut usize,
+    predicate: impl Fn(&Value) -> bool,
+) {
+    for idx in (0..events.len()).rev() {
+        if keep[idx] || !predicate(&events[idx]) {
+            continue;
+        }
+        if *retained_rows >= row_budget {
+            continue;
+        }
+        let bytes = event_bytes[idx];
+        if retained_bytes.saturating_add(bytes) > byte_budget {
+            continue;
+        }
+        keep[idx] = true;
+        *retained_rows += 1;
+        *retained_bytes += bytes;
+    }
 }
 
 pub fn enforce_durable_run_event_batch_budget(events: Vec<Value>) -> Vec<Value> {
@@ -354,21 +415,26 @@ pub fn enforce_durable_run_event_batch_budget(events: Vec<Value>) -> Vec<Value> 
     let mut keep = critical_events;
     let mut kept_noncritical_rows = 0usize;
     let mut kept_noncritical_bytes = 0usize;
-    for idx in (0..events.len()).rev() {
-        if keep[idx] {
-            continue;
-        }
-        if kept_noncritical_rows >= max_noncritical_rows {
-            continue;
-        }
-        let bytes = event_bytes[idx];
-        if kept_noncritical_bytes.saturating_add(bytes) > max_noncritical_bytes {
-            continue;
-        }
-        keep[idx] = true;
-        kept_noncritical_rows += 1;
-        kept_noncritical_bytes += bytes;
-    }
+    retain_budgeted_events(
+        &events,
+        &event_bytes,
+        &mut keep,
+        max_noncritical_rows,
+        max_noncritical_bytes,
+        &mut kept_noncritical_rows,
+        &mut kept_noncritical_bytes,
+        durable_replay_boundary_event,
+    );
+    retain_budgeted_events(
+        &events,
+        &event_bytes,
+        &mut keep,
+        max_noncritical_rows,
+        max_noncritical_bytes,
+        &mut kept_noncritical_rows,
+        &mut kept_noncritical_bytes,
+        |_| true,
+    );
 
     let dropped_count = keep.iter().filter(|keep| !**keep).count();
     if dropped_count == 0 {
@@ -565,6 +631,52 @@ mod tests {
             durable_event_type(&budgeted[budgeted.len() - 1]),
             Some("run_finished")
         );
+    }
+
+    #[test]
+    fn durable_run_event_batch_budget_prioritizes_replay_boundaries_over_progress() {
+        let mut events = vec![
+            json!({"type": "tool_call", "tool_call": {"id": "call-1", "name": "bash"}}),
+            json!({"type": "tool_call_end", "call_id": "call-1", "result": "ok"}),
+        ];
+        events.extend(
+            (0..(MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 20))
+                .map(|idx| json!({"type": "agent_progress", "seq": idx})),
+        );
+        events.push(json!({"event_type": "text_done", "data": {"full_text": "answer"}}));
+        events.push(json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}));
+
+        let budgeted = enforce_durable_run_event_batch_budget(events);
+
+        assert_eq!(budgeted.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
+        assert!(
+            budgeted
+                .iter()
+                .any(|event| durable_event_type(event) == Some("durable_events_compacted"))
+        );
+        assert!(
+            budgeted
+                .iter()
+                .any(|event| durable_event_type(event) == Some("tool_call"))
+        );
+        assert!(
+            budgeted
+                .iter()
+                .any(|event| durable_event_type(event) == Some("tool_call_end"))
+        );
+        assert_eq!(
+            durable_event_type(&budgeted[budgeted.len() - 2]),
+            Some("text_done")
+        );
+        assert_eq!(
+            durable_event_type(&budgeted[budgeted.len() - 1]),
+            Some("run_finished")
+        );
+        let retained_progress = budgeted
+            .iter()
+            .filter(|event| durable_event_type(event) == Some("agent_progress"))
+            .count();
+        assert!(retained_progress < MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
     }
 
     #[test]

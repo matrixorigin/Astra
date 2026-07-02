@@ -13704,6 +13704,168 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn db_durable_event_budget_bounds_large_stream_persistence() {
+        let pool = setup_lifecycle_run_db_it().await;
+        let svc = db_backed_test_service(&pool, "durable-budget-it-pod");
+        let user_id = "user-1";
+        let run_id = format!("budget-it-{}", Uuid::new_v4());
+        let session_id = format!("sess-budget-it-{}", Uuid::new_v4());
+        cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
+        svc.run_engine
+            .start_run(&run_id, user_id, &session_id)
+            .await
+            .expect("start durable DB run");
+
+        let mut raw_stream_events: Vec<Value> = (0..10_000)
+            .map(|idx| json!({"type": "text_delta", "content": format!("chunk-{idx}")}))
+            .collect();
+        raw_stream_events
+            .push(json!({"type": "tool_call", "tool_call": {"id": "call-1", "name": "bash"}}));
+        raw_stream_events.push(json!({
+            "type": "tool_call_end",
+            "call_id": "call-1",
+            "tool": "bash",
+            "result": "ok"
+        }));
+        raw_stream_events.extend(
+            (0..(MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 25))
+                .map(|idx| json!({"type": "agent_progress", "seq": idx})),
+        );
+        raw_stream_events.push(json!({
+            "event_type": "text_done",
+            "data": {"full_text": "large durable final answer"}
+        }));
+        raw_stream_events.push(json!({
+            "event_type": "run_finished",
+            "data": {"prompt_tokens": 9, "completion_tokens": 3, "tool_call_count": 1}
+        }));
+
+        let durable_candidates: Vec<Value> = raw_stream_events
+            .iter()
+            .filter(|event| streaming_event_for_persistence(event))
+            .cloned()
+            .collect();
+        assert_eq!(
+            durable_candidates
+                .iter()
+                .filter(|event| durable_event_type(event) == Some("text_delta"))
+                .count(),
+            0,
+            "transport chunks must stay live-only before DB persistence"
+        );
+
+        let budgeted = enforce_durable_run_event_batch_budget(durable_candidates);
+        assert_eq!(budgeted.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
+        assert!(
+            budgeted
+                .iter()
+                .any(|event| durable_event_type(event) == Some("durable_events_compacted")),
+            "semantic overflow should be summarized"
+        );
+        assert!(
+            budgeted
+                .iter()
+                .any(|event| durable_event_type(event) == Some("tool_call")),
+            "tool start boundary must beat progress noise under budget pressure"
+        );
+        assert!(
+            budgeted
+                .iter()
+                .any(|event| durable_event_type(event) == Some("tool_call_end")),
+            "tool end boundary must beat progress noise under budget pressure"
+        );
+        assert_eq!(
+            durable_event_type(&budgeted[budgeted.len() - 2]),
+            Some("text_done")
+        );
+        assert_eq!(
+            durable_event_type(&budgeted[budgeted.len() - 1]),
+            Some("run_finished")
+        );
+
+        let transitioned = svc
+            .run_engine
+            .transition_status_with_events_if_current(
+                user_id,
+                &run_id,
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                &budgeted,
+            )
+            .await
+            .expect("commit budgeted terminal events");
+        assert!(transitioned);
+
+        let rows = sqlx::query(
+            "SELECT event_type
+             FROM agent_run_events
+             WHERE user_id = ? AND run_id = ?
+             ORDER BY event_idx ASC",
+        )
+        .bind(user_id)
+        .bind(&run_id)
+        .fetch_all(pool.get())
+        .await
+        .expect("load persisted event rows");
+        assert_eq!(
+            rows.len(),
+            MAX_DURABLE_RUN_EVENT_BATCH_ROWS + 1,
+            "DB rows should be bounded to budgeted batch plus run_started"
+        );
+        let persisted_types = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("event_type").expect("event_type"))
+            .collect::<Vec<_>>();
+        assert!(
+            !persisted_types
+                .iter()
+                .any(|event_type| event_type == "text_delta")
+        );
+        for expected in [
+            "durable_events_compacted",
+            "tool_call",
+            "tool_call_end",
+            "text_done",
+            "run_finished",
+        ] {
+            assert!(
+                persisted_types
+                    .iter()
+                    .any(|event_type| event_type == expected),
+                "missing persisted {expected}: {persisted_types:?}"
+            );
+        }
+
+        let replay_events = ok(svc.stream_run(run_id.clone(), user_id.to_string(), 1).await);
+        assert!(replay_events.len() <= MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
+        assert!(replay_events.iter().all(|event| {
+            event.get("type").and_then(Value::as_str) != Some("text_delta")
+                && event.get("event_type").and_then(Value::as_str) != Some("text_delta")
+        }));
+        assert!(replay_events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("tool_call")
+                || event.get("event_type").and_then(Value::as_str) == Some("tool_call")
+        }));
+        assert!(replay_events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("tool_call_end")
+                || event.get("event_type").and_then(Value::as_str) == Some("tool_call_end")
+        }));
+        assert!(replay_events.iter().any(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("text_done")
+                && event.pointer("/data/full_text").and_then(Value::as_str)
+                    == Some("large durable final answer")
+        }));
+        assert!(replay_events.iter().any(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("run_finished")
+        }));
+
+        cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
+    }
+
+    #[tokio::test]
     async fn resume_run_conflict_when_not_paused() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
