@@ -3365,6 +3365,7 @@ impl AgenticRunLifecycleService {
         host: &mut server_loop_host::ServerAgenticLoopHost,
         user_id: &str,
         session_id: &str,
+        run_id: &str,
         turn: u32,
         agent_id: Option<String>,
     ) {
@@ -3375,6 +3376,7 @@ impl AgenticRunLifecycleService {
             astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
                 user_id: user_id.to_string(),
                 session_id: session_id.to_string(),
+                run_id: run_id.to_string(),
                 turn,
                 agent_id,
                 parent_event_id: None,
@@ -4980,6 +4982,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut host,
             &user_id,
             &session_id,
+            &run_id,
             loop_state.session_turn,
             request.agent_id.clone(),
         );
@@ -5849,6 +5852,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut host,
             &user_id,
             &session_id,
+            &run_id,
             state.session_turn,
             request.agent_id.clone(),
         );

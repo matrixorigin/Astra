@@ -1091,6 +1091,8 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::ApprovalRequired => "approval_required",
         JournalEventType::ApprovalDecision => "approval_decision",
         JournalEventType::ApprovalTimeout => "approval_timeout",
+        JournalEventType::AskUserPrompted => "ask_user_prompted",
+        JournalEventType::AskUserResponse => "ask_user_response",
         JournalEventType::PermissionAudit => "permission_audit",
         JournalEventType::ExecutionBoundaryOpened => "execution_boundary_opened",
         JournalEventType::ExecutionBoundaryCommitted => "execution_boundary_committed",

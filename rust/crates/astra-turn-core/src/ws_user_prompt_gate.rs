@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::pipeline_metrics::MetricsRegistry;
 use astra_services::session_journal::{
-    AskUserJournalResponse, JournalEvent, JournalWriter, find_latest_ask_user_response,
+    AskUserJournalResponse, JournalEvent, JournalWriter, find_latest_ask_user_response_for_run,
 };
 use astra_tools::{AskUserAnswers, AskUserDecision, AskUserGate, AskUserPrompt};
 use async_trait::async_trait;
@@ -269,6 +269,7 @@ async fn wait_user_prompt_response(
     ledger: &Arc<TokioMutex<HashMap<String, Value>>>,
     user_id: &str,
     session_id: &str,
+    run_id: &str,
     request_id: &str,
     timeout: Duration,
 ) -> Option<AskUserDecision> {
@@ -290,7 +291,7 @@ async fn wait_user_prompt_response(
             .unwrap_or(true)
         {
             last_journal_lookup = Some(std::time::Instant::now());
-            match find_latest_ask_user_response(session_id, request_id) {
+            match find_latest_ask_user_response_for_run(session_id, request_id, run_id) {
                 Ok(Some(response)) => {
                     record_journal_lookup_metric("hit");
                     let decision = decision_from_journal_response(response);
@@ -358,6 +359,7 @@ impl AskUserGate for WebSocketUserPromptGate {
             &self.edge_callback_ledger,
             &self.user_id,
             &self.session_id,
+            &self.run_id,
             request_id,
             timeout,
         )
@@ -580,6 +582,52 @@ mod tests {
             ),
             "{metrics}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn journal_response_from_other_run_does_not_satisfy_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-user-prompt").unwrap();
+        writer
+            .append(&JournalEvent::ask_user_response(
+                Some("sess-user-prompt"),
+                Some(3),
+                "req-cross-run",
+                Some("other-run"),
+                "submitted",
+                Some(json!({
+                    "answers": [{
+                        "question": "Continue?",
+                        "answers": ["wrong"],
+                        "multi_select": false
+                    }]
+                })),
+            ))
+            .unwrap();
+
+        let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel::<Value>(1);
+        let gate = test_gate(ledger, tx, Duration::from_millis(40));
+
+        let decision = gate
+            .request_questionnaire(
+                "req-cross-run",
+                &AskUserPrompt {
+                    context: None,
+                    questions: vec![astra_tools::AskUserQuestion {
+                        header: "Confirm".into(),
+                        question: "Continue?".into(),
+                        options: vec![],
+                        multi_select: false,
+                        allow_freeform: true,
+                    }],
+                    timeout_ms: Some(40),
+                },
+            )
+            .await;
+
+        assert_eq!(decision, AskUserDecision::Timeout);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -4757,12 +4757,14 @@ mod tests {
         )
         .await;
 
-        let journal_response = astra_services::session_journal::find_latest_ask_user_response(
-            "sess-ws-journal",
-            "req-ws-journal",
-        )
-        .unwrap()
-        .expect("ask_user response should be durable for no-sticky replay");
+        let journal_response =
+            astra_services::session_journal::find_latest_ask_user_response_for_run(
+                "sess-ws-journal",
+                "req-ws-journal",
+                "run-ws-journal",
+            )
+            .unwrap()
+            .expect("ask_user response should be durable for no-sticky replay");
         assert_eq!(journal_response.status, "submitted");
         assert_eq!(journal_response.run_id.as_deref(), Some("run-ws-journal"));
         let durable_answers: AskUserAnswers =

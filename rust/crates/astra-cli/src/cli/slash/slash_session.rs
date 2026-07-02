@@ -1782,6 +1782,62 @@ pub(crate) async fn handle_session_command(
                                     tool,
                                 );
                             }
+                            session_journal::JournalEventType::AskUserPrompted => {
+                                let ask_user =
+                                    evt.metadata.as_ref().and_then(|m| m.get("ask_user"));
+                                let request_id = ask_user
+                                    .and_then(|m| m.get("request_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let prompt = ask_user.and_then(|m| m.get("prompt"));
+                                let question_count = prompt
+                                    .and_then(|p| p.get("questions"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|questions| questions.len())
+                                    .unwrap_or(0);
+                                let context = prompt
+                                    .and_then(|p| p.get("context"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let context_suffix = if context.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · {}", ellipsize(context, 80).dim())
+                                };
+                                eprintln!(
+                                    "  {} ? ask_user prompted: {} ({} questions){}",
+                                    ts_short.dim(),
+                                    ellipsize(request_id, 32),
+                                    question_count,
+                                    context_suffix,
+                                );
+                            }
+                            session_journal::JournalEventType::AskUserResponse => {
+                                let ask_user =
+                                    evt.metadata.as_ref().and_then(|m| m.get("ask_user"));
+                                let request_id = ask_user
+                                    .and_then(|m| m.get("request_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let status = ask_user
+                                    .and_then(|m| m.get("status"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let answer_count = ask_user
+                                    .and_then(|m| m.get("answers"))
+                                    .and_then(|v| v.get("answers"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|answers| answers.len())
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "  {} {} ask_user response: {} -> {} ({} answers)",
+                                    ts_short.dim(),
+                                    theme::icon_ok(),
+                                    ellipsize(request_id, 32),
+                                    status,
+                                    answer_count,
+                                );
+                            }
                             session_journal::JournalEventType::PermissionAudit => {
                                 eprintln!(
                                     "  {} {} permission audit: {}",
@@ -2311,6 +2367,18 @@ pub(crate) async fn handle_session_command(
                             e.event_type == session_journal::JournalEventType::ApprovalTimeout
                         })
                         .count();
+                    let ask_user_prompted = events
+                        .iter()
+                        .filter(|e| {
+                            e.event_type == session_journal::JournalEventType::AskUserPrompted
+                        })
+                        .count();
+                    let ask_user_responses = events
+                        .iter()
+                        .filter(|e| {
+                            e.event_type == session_journal::JournalEventType::AskUserResponse
+                        })
+                        .count();
                     let boundary_opened = events
                         .iter()
                         .filter(|e| {
@@ -2353,6 +2421,14 @@ pub(crate) async fn handle_session_command(
                             approval_required,
                             approval_decisions,
                             approval_timeouts,
+                        );
+                    }
+                    if ask_user_prompted > 0 || ask_user_responses > 0 {
+                        eprintln!(
+                            "  {} {} prompted, {} responses",
+                            "Ask user:".bold(),
+                            ask_user_prompted,
+                            ask_user_responses,
                         );
                     }
                     if boundary_opened > 0 || boundary_committed > 0 || boundary_aborted > 0 {
@@ -3114,6 +3190,48 @@ pub(crate) fn build_export_markdown(
                         evt.turn.unwrap_or(0),
                     ));
                 }
+            }
+            session_journal::JournalEventType::AskUserPrompted => {
+                let ask_user = evt.metadata.as_ref().and_then(|m| m.get("ask_user"));
+                let request_id = ask_user
+                    .and_then(|m| m.get("request_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let prompt = ask_user.and_then(|m| m.get("prompt"));
+                let question_count = prompt
+                    .and_then(|p| p.get("questions"))
+                    .and_then(|v| v.as_array())
+                    .map(|questions| questions.len())
+                    .unwrap_or(0);
+                let context = prompt
+                    .and_then(|p| p.get("context"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!("- **Context:** {s}\n"))
+                    .unwrap_or_default();
+                md.push_str(&format!(
+                    "### Ask user prompted\n- **Time:** {ts_short}\n- **Request:** {request_id}\n- **Questions:** {question_count}\n{context}\n"
+                ));
+            }
+            session_journal::JournalEventType::AskUserResponse => {
+                let ask_user = evt.metadata.as_ref().and_then(|m| m.get("ask_user"));
+                let request_id = ask_user
+                    .and_then(|m| m.get("request_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let status = ask_user
+                    .and_then(|m| m.get("status"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let answer_count = ask_user
+                    .and_then(|m| m.get("answers"))
+                    .and_then(|v| v.get("answers"))
+                    .and_then(|v| v.as_array())
+                    .map(|answers| answers.len())
+                    .unwrap_or(0);
+                md.push_str(&format!(
+                    "### Ask user response\n- **Time:** {ts_short}\n- **Request:** {request_id}\n- **Status:** {status}\n- **Answers:** {answer_count}\n\n"
+                ));
             }
             _ => {}
         }

@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use astra_services::session_journal::{JournalEvent, JournalWriter, find_latest_approval_decision};
+use astra_services::session_journal::{
+    JournalEvent, JournalWriter, find_latest_approval_decision_for_run,
+};
 use astra_thin_client::{ApprovalKind, ApprovalRespondRequest};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -254,6 +256,7 @@ fn structured_tool_result(
 pub struct ApprovalAuditContext {
     pub user_id: String,
     pub session_id: String,
+    pub run_id: String,
     pub turn: u32,
     pub agent_id: Option<String>,
     pub parent_event_id: Option<String>,
@@ -286,6 +289,7 @@ fn approval_kind_str(approval_kind: ApprovalKind) -> &'static str {
 
 fn append_approval_timeout_journal_event(
     session_id: &str,
+    run_id: &str,
     turn: u32,
     request_id: &str,
     tool_name: &str,
@@ -293,10 +297,11 @@ fn append_approval_timeout_journal_event(
 ) -> Result<(), String> {
     let writer = JournalWriter::new(session_id).map_err(|error| error.to_string())?;
     writer
-        .append(&JournalEvent::approval_timeout(
+        .append(&JournalEvent::approval_timeout_for_run(
             Some(session_id),
             Some(turn),
             request_id,
+            Some(run_id),
             tool_name,
             approval_kind_str(approval_kind),
         ))
@@ -317,6 +322,7 @@ async fn persist_approval_aux_event(
 ) -> Result<(), String> {
     let metadata = json!({
         "request_id": request_id,
+        "run_id": context.run_id,
         "tool_name": tool_name,
         "approval_kind": approval_kind_str(approval_kind),
         "detail": detail,
@@ -405,7 +411,7 @@ pub async fn wait_approval_ledger_for_tool(
                 .unwrap_or(true)
         {
             last_journal_lookup = Some(Instant::now());
-            match find_latest_approval_decision(&context.session_id, id) {
+            match find_latest_approval_decision_for_run(&context.session_id, id, &context.run_id) {
                 Ok(Some(decision)) => {
                     let (result, decision_name, reason) =
                         journal_decision_to_cloud_result(decision);
@@ -460,6 +466,7 @@ pub async fn wait_approval_ledger_for_tool(
             CloudApprovalResult::Timeout => {
                 if let Err(error) = append_approval_timeout_journal_event(
                     &context.session_id,
+                    &context.run_id,
                     context.turn,
                     id,
                     tool_name,
@@ -1360,10 +1367,11 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let writer = JournalWriter::new("sess-journal-replay").unwrap();
         writer
-            .append(&JournalEvent::approval_decision(
+            .append(&JournalEvent::approval_decision_for_run(
                 Some("sess-journal-replay"),
                 Some(7),
                 "w-journal",
+                Some("run-journal-replay"),
                 Some("write_file"),
                 Some("standard"),
                 "allow",
@@ -1376,6 +1384,7 @@ mod tests {
         let audit = ApprovalAuditContext {
             user_id: "user-a".to_string(),
             session_id: "sess-journal-replay".to_string(),
+            run_id: "run-journal-replay".to_string(),
             turn: 7,
             agent_id: None,
             parent_event_id: None,
@@ -1414,6 +1423,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_wait_ignores_journal_decision_from_other_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-journal-cross-run").unwrap();
+        writer
+            .append(&JournalEvent::approval_decision_for_run(
+                Some("sess-journal-cross-run"),
+                Some(7),
+                "w-cross-run",
+                Some("other-run"),
+                Some("write_file"),
+                Some("standard"),
+                "allow",
+                None,
+            ))
+            .unwrap();
+
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let recorded_events = Arc::new(StdMutex::new(Vec::new()));
+        let audit = ApprovalAuditContext {
+            user_id: "user-a".to_string(),
+            session_id: "sess-journal-cross-run".to_string(),
+            run_id: "target-run".to_string(),
+            turn: 7,
+            agent_id: None,
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: "chain-journal-cross-run".to_string(),
+            auxiliary_event_writer: Arc::new(RecordingAuxiliaryEventWriter {
+                events: Arc::clone(&recorded_events),
+            }),
+        };
+
+        let denied = wait_approval_ledger_for_tool(
+            &ledger,
+            "user-a",
+            &write_tool("w-cross-run"),
+            Duration::from_millis(30),
+            Some(&audit),
+        )
+        .await
+        .expect_err("approval decision from another run must not allow this run");
+
+        assert_eq!(
+            denied.persist_tool_results[0]["result"],
+            MSG_APPROVAL_LEDGER_TIMEOUT
+        );
+        let timeout = astra_services::session_journal::read_journal("sess-journal-cross-run")
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::ApprovalTimeout
+            })
+            .expect("target run timeout journal");
+        assert_eq!(
+            timeout
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pointer("/approval/run_id"))
+                .and_then(Value::as_str),
+            Some("target-run")
+        );
+    }
+
+    #[tokio::test]
     async fn write_file_waits_approval_then_tool() {
         let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let uid = "u2";
@@ -1430,6 +1506,7 @@ mod tests {
                         decision: ApprovalDecision::Allow,
                         reason: None,
                         session_id: None,
+                        run_id: "run-test".into(),
                         tool_name: None,
                         approval_kind: None,
                     }).unwrap()
@@ -1481,6 +1558,7 @@ mod tests {
                         decision: ApprovalDecision::Deny,
                         reason: Some("policy".into()),
                         session_id: None,
+                        run_id: "run-test".into(),
                         tool_name: None,
                         approval_kind: None,
                     }).unwrap()
@@ -1597,6 +1675,7 @@ mod tests {
                         decision: ApprovalDecision::Allow,
                         reason: None,
                         session_id: None,
+                        run_id: "run-test".into(),
                         tool_name: None,
                         approval_kind: None,
                     }).unwrap()
@@ -1822,6 +1901,7 @@ mod tests {
                         decision: ApprovalDecision::Deny,
                         reason: Some("nope".into()),
                         session_id: None,
+                        run_id: "run-test".into(),
                         tool_name: None,
                         approval_kind: None,
                     }).unwrap()

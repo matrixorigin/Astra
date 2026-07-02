@@ -3685,6 +3685,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         tool: &str,
         approval_kind: astra_thin_client::ApprovalKind,
         session_id: Option<&str>,
+        run_id: Option<&str>,
         detail: Option<&str>,
         display_label: Option<&str>,
     ) -> EdgeApprovalResult {
@@ -3718,6 +3719,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             decision,
             reason: None,
             session_id: session_id.map(ToString::to_string),
+            run_id: run_id.unwrap_or_default().to_string(),
             tool_name: Some(tool.to_string()),
             approval_kind: Some(approval_kind),
         };
@@ -3733,6 +3735,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         &mut self,
         requests: &[EdgeApprovalRequest],
         session_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Vec<EdgeApprovalResult> {
         if requests.is_empty() {
             return Vec::new();
@@ -3775,6 +3778,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 decision,
                 reason: None,
                 session_id: session_id.map(ToString::to_string),
+                run_id: run_id.unwrap_or_default().to_string(),
                 tool_name: Some(request.tool.clone()),
                 approval_kind: Some(request.approval_kind),
             };

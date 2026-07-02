@@ -69,6 +69,7 @@ impl SseStreamHost for SpeculatingHost {
         _tool: &str,
         _approval_kind: ApprovalKind,
         _session_id: Option<&str>,
+        _run_id: Option<&str>,
         _detail: Option<&str>,
         _display_label: Option<&str>,
     ) -> EdgeApprovalResult {
@@ -331,6 +332,7 @@ async fn complex_speculation_off_is_serial() {
             _tool: &str,
             _approval_kind: ApprovalKind,
             _session_id: Option<&str>,
+            _run_id: Option<&str>,
             _detail: Option<&str>,
             _display_label: Option<&str>,
         ) -> EdgeApprovalResult {
