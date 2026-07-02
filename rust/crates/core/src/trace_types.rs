@@ -33,6 +33,8 @@ pub enum TraceCategory {
     MemoryRetrieval,
     /// Skill loading, execution, and teardown lifecycle.
     SkillExecution,
+    /// Durable harness/runtime hook snapshot history.
+    HarnessSnapshots,
     /// System prompt assembly and injection decisions.
     PromptAssembly,
     /// Safety guard evaluations and rulings.
@@ -57,6 +59,7 @@ impl FromStr for TraceCategory {
             "thinking" => Ok(Self::Thinking),
             "memory_retrieval" => Ok(Self::MemoryRetrieval),
             "skill_execution" => Ok(Self::SkillExecution),
+            "harness_snapshots" => Ok(Self::HarnessSnapshots),
             "prompt_assembly" => Ok(Self::PromptAssembly),
             "guard_evaluation" => Ok(Self::GuardEvaluation),
             "all" => Ok(Self::All),
@@ -80,6 +83,7 @@ impl TraceCategory {
             TraceCategory::Thinking,
             TraceCategory::MemoryRetrieval,
             TraceCategory::SkillExecution,
+            TraceCategory::HarnessSnapshots,
             TraceCategory::PromptAssembly,
             TraceCategory::GuardEvaluation,
         ]

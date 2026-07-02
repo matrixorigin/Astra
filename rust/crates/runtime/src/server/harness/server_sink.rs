@@ -2,8 +2,8 @@
 //!
 //! The default path keeps snapshots in memory and broadcasts them via tokio
 //! channel so SSE subscribers receive real-time harness updates. Durable DB
-//! persistence is opt-in because every hook snapshot is observability data, not
-//! part of the run's success path.
+//! persistence follows the trace profile because every hook snapshot is
+//! observability data, not part of the run's success path.
 
 #[cfg(feature = "harness")]
 pub use enabled::ServerSnapshotSink;
@@ -13,15 +13,13 @@ mod enabled {
     use astra_harness::{DecisionRecord, RuntimeSnapshot, SnapshotSink};
     use serde::Serialize;
     use std::collections::VecDeque;
-    use std::sync::{OnceLock, RwLock};
+    use std::sync::RwLock;
     use tokio::sync::broadcast;
 
     const DEFAULT_IN_MEMORY_CAPACITY: usize = 64;
     const DEFAULT_BROADCAST_CAPACITY: usize = 256;
 
     const DB_WRITE_CHANNEL_CAPACITY: usize = 64;
-    pub const ASTRA_HARNESS_SNAPSHOT_DB_PERSIST_ENV: &str = "ASTRA_HARNESS_SNAPSHOT_DB_PERSIST";
-    static HARNESS_SNAPSHOT_DB_PERSIST_ENABLED: OnceLock<bool> = OnceLock::new();
 
     struct DbWriteTask {
         snapshot_id: String,
@@ -81,7 +79,7 @@ mod enabled {
         }
 
         pub fn with_pool(self, pool: sqlx::Pool<sqlx::MySql>) -> Self {
-            self.with_pool_if_enabled(pool, harness_snapshot_db_persist_enabled_from_env())
+            self.with_pool_if_enabled(pool, harness_snapshot_db_persistence_enabled())
         }
 
         fn with_pool_if_enabled(
@@ -92,8 +90,8 @@ mod enabled {
             if !persistence_enabled {
                 tracing::debug!(
                     session_id = %self.session_id,
-                    env = ASTRA_HARNESS_SNAPSHOT_DB_PERSIST_ENV,
-                    "harness snapshot DB persistence disabled"
+                    trace_category = "harness_snapshots",
+                    "harness snapshot DB persistence disabled by trace profile"
                 );
                 return self;
             }
@@ -196,46 +194,16 @@ mod enabled {
             .map_err(|source| format!("serialize harness snapshot: {source}"))
     }
 
-    fn harness_snapshot_db_persist_enabled_from_env() -> bool {
-        *HARNESS_SNAPSHOT_DB_PERSIST_ENABLED.get_or_init(|| {
-            harness_snapshot_db_persist_enabled(
-                std::env::var(ASTRA_HARNESS_SNAPSHOT_DB_PERSIST_ENV)
-                    .ok()
-                    .as_deref(),
-            )
-        })
+    fn harness_snapshot_db_persistence_enabled() -> bool {
+        harness_snapshot_db_persistence_enabled_for_trace(
+            &astra_config::runtime_config::RuntimeConfig::cached().trace,
+        )
     }
 
-    fn harness_snapshot_db_persist_enabled(raw: Option<&str>) -> bool {
-        match raw.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(value)
-                if value.eq_ignore_ascii_case("1")
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("yes")
-                    || value.eq_ignore_ascii_case("on")
-                    || value.eq_ignore_ascii_case("enabled") =>
-            {
-                true
-            }
-            Some(value)
-                if value.eq_ignore_ascii_case("0")
-                    || value.eq_ignore_ascii_case("false")
-                    || value.eq_ignore_ascii_case("no")
-                    || value.eq_ignore_ascii_case("off")
-                    || value.eq_ignore_ascii_case("disabled") =>
-            {
-                false
-            }
-            Some(value) => {
-                tracing::warn!(
-                    env = ASTRA_HARNESS_SNAPSHOT_DB_PERSIST_ENV,
-                    value,
-                    "invalid harness snapshot DB persistence value; using disabled"
-                );
-                false
-            }
-            None => false,
-        }
+    fn harness_snapshot_db_persistence_enabled_for_trace(
+        trace: &astra_config::runtime_config::SessionTraceConfig,
+    ) -> bool {
+        trace.category_enabled(astra_config::runtime_config::TraceCategory::HarnessSnapshots)
     }
 
     async fn db_write_worker(
@@ -449,26 +417,28 @@ mod enabled {
         }
 
         #[test]
-        fn harness_snapshot_db_persist_env_defaults_to_disabled() {
-            assert!(!harness_snapshot_db_persist_enabled(None));
-            assert!(!harness_snapshot_db_persist_enabled(Some("")));
-            assert!(!harness_snapshot_db_persist_enabled(Some("disabled")));
-            assert!(!harness_snapshot_db_persist_enabled(Some("0")));
-            assert!(!harness_snapshot_db_persist_enabled(Some("false")));
-        }
+        fn harness_snapshot_db_persistence_follows_harness_trace_category() {
+            use astra_config::runtime_config::{SessionTraceConfig, TraceCategory, TraceProfile};
 
-        #[test]
-        fn harness_snapshot_db_persist_env_accepts_enabled_values() {
-            assert!(harness_snapshot_db_persist_enabled(Some("1")));
-            assert!(harness_snapshot_db_persist_enabled(Some("true")));
-            assert!(harness_snapshot_db_persist_enabled(Some("yes")));
-            assert!(harness_snapshot_db_persist_enabled(Some("on")));
-            assert!(harness_snapshot_db_persist_enabled(Some("enabled")));
-        }
+            let production = SessionTraceConfig::default();
+            assert!(
+                !harness_snapshot_db_persistence_enabled_for_trace(&production),
+                "production/default trace profile must not persist harness snapshots"
+            );
 
-        #[test]
-        fn harness_snapshot_db_persist_env_invalid_values_disable_persistence() {
-            assert!(!harness_snapshot_db_persist_enabled(Some("maybe")));
+            let dev = SessionTraceConfig::default().apply_profile(TraceProfile::Dev);
+            assert!(
+                harness_snapshot_db_persistence_enabled_for_trace(&dev),
+                "dev trace profile enables all diagnostic persistence categories"
+            );
+
+            let custom = SessionTraceConfig {
+                profile: TraceProfile::Custom,
+                enabled_categories: vec![TraceCategory::HarnessSnapshots],
+                ..SessionTraceConfig::default()
+            }
+            .normalize();
+            assert!(harness_snapshot_db_persistence_enabled_for_trace(&custom));
         }
     }
 }

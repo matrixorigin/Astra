@@ -310,6 +310,16 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             kind: SettingKind::Bool,
             value: Value::from(config.trace.category_enabled(TraceCategory::Thinking)),
         },
+        SettingItem {
+            id: "trace.harness_snapshots".to_string(),
+            label: "Persist harness snapshot diagnostics".to_string(),
+            kind: SettingKind::Bool,
+            value: Value::from(
+                config
+                    .trace
+                    .category_enabled(TraceCategory::HarnessSnapshots),
+            ),
+        },
         // ── Runtime limits (per-turn agentic budget) ──
         SettingItem {
             id: "runtime_limits.max_turns".to_string(),
@@ -634,6 +644,15 @@ pub fn apply_edit(
             mark_trace_custom(&mut config);
             return Ok(config);
         }
+        "trace.harness_snapshots" => {
+            toggle_category(
+                &mut config.trace.enabled_categories,
+                TraceCategory::HarnessSnapshots,
+                as_bool(&new_value, id)?,
+            );
+            mark_trace_custom(&mut config);
+            return Ok(config);
+        }
         "trace.prompt_assembly" => {
             toggle_category(
                 &mut config.trace.enabled_categories,
@@ -708,6 +727,18 @@ mod tests {
     }
 
     #[test]
+    fn catalog_includes_harness_snapshots_toggle() {
+        let config = RuntimeConfig::default();
+        let catalog = build_settings_catalog(&config);
+        let item = catalog
+            .iter()
+            .find(|item| item.id == "trace.harness_snapshots")
+            .expect("catalog must expose the harness snapshots trace toggle");
+        assert_eq!(item.label, "Persist harness snapshot diagnostics");
+        assert_eq!(item.value, Value::Bool(false));
+    }
+
+    #[test]
     fn apply_edit_updates_llm_exchanges_toggle() {
         let updated = apply_edit(
             RuntimeConfig::default(),
@@ -720,6 +751,22 @@ mod tests {
                 .trace
                 .enabled_categories
                 .contains(&TraceCategory::LlmExchanges)
+        );
+    }
+
+    #[test]
+    fn apply_edit_updates_harness_snapshots_toggle() {
+        let updated = apply_edit(
+            RuntimeConfig::default(),
+            "trace.harness_snapshots",
+            Value::Bool(true),
+        )
+        .expect("toggle edit should succeed");
+        assert!(
+            updated
+                .trace
+                .enabled_categories
+                .contains(&TraceCategory::HarnessSnapshots)
         );
     }
 
