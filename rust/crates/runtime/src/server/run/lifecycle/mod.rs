@@ -110,6 +110,9 @@ use astra_runtime_env::{
 const RUN_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const METRIC_RUN_ADMISSION_ATTEMPTS_TOTAL: &str = "astra_run_admission_attempts_total";
 const METRIC_RUN_ADMISSION_WAIT_MS_TOTAL: &str = "astra_run_admission_wait_ms_total";
+const METRIC_DURABLE_RUN_EVENT_BATCHES_TOTAL: &str = "astra_durable_run_event_batches_total";
+const METRIC_DURABLE_RUN_EVENT_ROWS_TOTAL: &str = "astra_durable_run_event_rows_total";
+const METRIC_DURABLE_RUN_EVENT_BYTES_TOTAL: &str = "astra_durable_run_event_bytes_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunAdmissionError {
@@ -128,8 +131,65 @@ fn register_run_admission_metrics(registry: &astra_turn_core::pipeline_metrics::
     );
 }
 
+fn register_durable_run_event_metrics(
+    registry: &astra_turn_core::pipeline_metrics::MetricsRegistry,
+) {
+    registry.register_counter(
+        METRIC_DURABLE_RUN_EVENT_BATCHES_TOTAL,
+        "Durable run event batches by terminal persistence path, outcome, and compaction state.",
+    );
+    registry.register_counter(
+        METRIC_DURABLE_RUN_EVENT_ROWS_TOTAL,
+        "Durable run event rows by terminal persistence path, outcome, and compaction state.",
+    );
+    registry.register_counter(
+        METRIC_DURABLE_RUN_EVENT_BYTES_TOTAL,
+        "Estimated durable run event bytes by terminal persistence path, outcome, and compaction state.",
+    );
+}
+
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn record_durable_run_event_batch_metrics(
+    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    path: &'static str,
+    outcome: &'static str,
+    events: &[Value],
+) {
+    if events.is_empty() {
+        return;
+    }
+    let Some(registry) = registry else {
+        return;
+    };
+    register_durable_run_event_metrics(registry);
+    let compacted = events
+        .iter()
+        .any(|event| durable_event_type(event) == Some("durable_events_compacted"));
+    let compacted_label = if compacted { "true" } else { "false" };
+    let labels = &[
+        ("path", path),
+        ("outcome", outcome),
+        ("compacted", compacted_label),
+    ];
+    registry.increment_counter(METRIC_DURABLE_RUN_EVENT_BATCHES_TOTAL, labels, 1);
+    registry.increment_counter(
+        METRIC_DURABLE_RUN_EVENT_ROWS_TOTAL,
+        labels,
+        events.len().try_into().unwrap_or(u64::MAX),
+    );
+    registry.increment_counter(
+        METRIC_DURABLE_RUN_EVENT_BYTES_TOTAL,
+        labels,
+        events
+            .iter()
+            .map(durable_run_event_estimated_bytes)
+            .sum::<usize>()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    );
 }
 
 use crate::orchestration::spawner::{
@@ -1733,6 +1793,7 @@ impl AgenticRunLifecycleService {
         registry: Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>,
     ) -> Self {
         register_run_admission_metrics(&registry);
+        register_durable_run_event_metrics(&registry);
         self.metrics_registry = Some(registry);
         self
     }
@@ -5140,6 +5201,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_user_id = user_id.clone();
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
+        let bg_metrics_registry = self.metrics_registry.clone();
         let _bg_cancel_flag = cancel_flag.clone();
         let _bg_pause_flag = pause_flag.clone();
         let _bg_llm_cancel_token = llm_cancel_token.clone();
@@ -5312,6 +5374,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let terminal_events = enforce_durable_run_event_batch_budget(
                     terminal_events_for_persistence(&events),
                 );
+                record_durable_run_event_batch_metrics(
+                    bg_metrics_registry.as_ref(),
+                    "non_streaming_terminal",
+                    "planned",
+                    &terminal_events,
+                );
 
                 // Publish terminal run state before best-effort post-run side effects
                 // so background observers do not stay stuck in "running" because a
@@ -5374,6 +5442,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
                 let mut durable_status_committed = !persist_status_update;
                 let mut terminal_events_committed = false;
+                if !persist_terminal_events {
+                    record_durable_run_event_batch_metrics(
+                        bg_metrics_registry.as_ref(),
+                        "non_streaming_terminal",
+                        "skipped",
+                        &terminal_events,
+                    );
+                }
                 if persist_status_update {
                     let events_for_transition: &[Value] = if persist_terminal_events {
                         terminal_events.as_slice()
@@ -5396,9 +5472,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             durable_status_committed = true;
                             terminal_events_committed =
                                 persist_terminal_events && !terminal_events.is_empty();
+                            if terminal_events_committed {
+                                record_durable_run_event_batch_metrics(
+                                    bg_metrics_registry.as_ref(),
+                                    "non_streaming_terminal",
+                                    "committed",
+                                    &terminal_events,
+                                );
+                            }
                         }
                         Ok(false) => {
                             persist_terminal_events = false;
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "non_streaming_terminal",
+                                "stale",
+                                &terminal_events,
+                            );
                             tracing::warn!(
                                 target: "astra_runtime::run_lifecycle",
                                 run_id = %bg_run_id,
@@ -5408,6 +5498,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         }
                         Err(error) => {
                             persist_terminal_events = false;
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "non_streaming_terminal",
+                                "error",
+                                &terminal_events,
+                            );
                             tracing::warn!(
                                 target: "astra_runtime::run_lifecycle",
                                 run_id = %bg_run_id,
@@ -5443,14 +5539,33 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     && !terminal_events.is_empty()
                     && !terminal_events_committed
                 {
-                    astra_core::log_persist!(
-                        run_engine
-                            .append_events_batch(&bg_user_id, &bg_run_id, &terminal_events)
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "append_terminal_events_batch"
-                    );
+                    match run_engine
+                        .append_events_batch(&bg_user_id, &bg_run_id, &terminal_events)
+                        .await
+                    {
+                        Ok(()) => {
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "non_streaming_terminal",
+                                "committed",
+                                &terminal_events,
+                            );
+                        }
+                        Err(error) => {
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "non_streaming_terminal",
+                                "error",
+                                &terminal_events,
+                            );
+                            astra_core::agent_warn!(
+                                "run_lifecycle",
+                                "persist append_terminal_events_batch for run {}: {}",
+                                bg_run_id,
+                                error
+                            );
+                        }
+                    }
                 }
 
                 if persist_terminal_events {
@@ -5987,6 +6102,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
         let missing_lifecycle_spawner = Arc::clone(&stream_agent_spawner);
+        let bg_metrics_registry = self.metrics_registry.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -6092,6 +6208,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &archived_lifecycle_events,
                     ),
                 );
+                record_durable_run_event_batch_metrics(
+                    bg_metrics_registry.as_ref(),
+                    "streaming_terminal",
+                    "planned",
+                    &streaming_events_for_durable,
+                );
                 persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
                 let mut terminal_state_events = streaming_final_events;
 
@@ -6162,6 +6284,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
                 let mut durable_status_committed = !persist_status_update;
                 let mut streaming_events_committed = false;
+                if !persist_streaming_events {
+                    record_durable_run_event_batch_metrics(
+                        bg_metrics_registry.as_ref(),
+                        "streaming_terminal",
+                        "skipped",
+                        &streaming_events_for_durable,
+                    );
+                }
                 if persist_status_update {
                     let events_for_transition: &[Value] = if persist_streaming_events {
                         streaming_events_for_durable.as_slice()
@@ -6184,9 +6314,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             durable_status_committed = true;
                             streaming_events_committed = persist_streaming_events
                                 && !streaming_events_for_durable.is_empty();
+                            if streaming_events_committed {
+                                record_durable_run_event_batch_metrics(
+                                    bg_metrics_registry.as_ref(),
+                                    "streaming_terminal",
+                                    "committed",
+                                    &streaming_events_for_durable,
+                                );
+                            }
                         }
                         Ok(false) => {
                             persist_streaming_events = false;
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "streaming_terminal",
+                                "stale",
+                                &streaming_events_for_durable,
+                            );
                             tracing::warn!(
                                 target: "astra_runtime::run_lifecycle",
                                 run_id = %bg_run_id,
@@ -6196,6 +6340,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         }
                         Err(error) => {
                             persist_streaming_events = false;
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "streaming_terminal",
+                                "error",
+                                &streaming_events_for_durable,
+                            );
                             tracing::warn!(
                                 target: "astra_runtime::run_lifecycle",
                                 run_id = %bg_run_id,
@@ -6229,18 +6379,33 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     && !streaming_events_for_durable.is_empty()
                     && !streaming_events_committed
                 {
-                    astra_core::log_persist!(
-                        run_engine
-                            .append_events_batch(
-                                &bg_user_id,
-                                &bg_run_id,
+                    match run_engine
+                        .append_events_batch(&bg_user_id, &bg_run_id, &streaming_events_for_durable)
+                        .await
+                    {
+                        Ok(()) => {
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "streaming_terminal",
+                                "committed",
                                 &streaming_events_for_durable,
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "append_streaming_events_batch"
-                    );
+                            );
+                        }
+                        Err(error) => {
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "streaming_terminal",
+                                "error",
+                                &streaming_events_for_durable,
+                            );
+                            astra_core::agent_warn!(
+                                "run_lifecycle",
+                                "persist append_streaming_events_batch for run {}: {}",
+                                bg_run_id,
+                                error
+                            );
+                        }
+                    }
                 }
 
                 for event in missing_lifecycle_events {
@@ -15629,6 +15794,63 @@ mod tests {
         assert!(
             rendered.contains("astra_run_admission_attempts_total{outcome=\"closed\"} 1"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn durable_run_event_batch_metrics_record_rows_bytes_and_compaction() {
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        register_durable_run_event_metrics(&registry);
+        let events = vec![
+            json!({"event_type": "durable_events_compacted", "data": {"dropped_events": 10}}),
+            json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
+        ];
+        let bytes = events
+            .iter()
+            .map(durable_run_event_estimated_bytes)
+            .sum::<usize>();
+
+        record_durable_run_event_batch_metrics(
+            Some(&registry),
+            "streaming_terminal",
+            "planned",
+            &events,
+        );
+        record_durable_run_event_batch_metrics(
+            Some(&registry),
+            "streaming_terminal",
+            "error",
+            &events,
+        );
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_durable_run_event_batches_total{compacted=\"true\",outcome=\"planned\",path=\"streaming_terminal\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_durable_run_event_rows_total{compacted=\"true\",outcome=\"planned\",path=\"streaming_terminal\"} 2"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "astra_durable_run_event_bytes_total{{compacted=\"true\",outcome=\"planned\",path=\"streaming_terminal\"}} {bytes}"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_durable_run_event_batches_total{compacted=\"true\",outcome=\"error\",path=\"streaming_terminal\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("run_id=") && !rendered.contains("session_id="),
+            "metrics must stay low-cardinality: {rendered}"
         );
     }
 }
