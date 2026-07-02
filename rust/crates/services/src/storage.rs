@@ -3340,7 +3340,6 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (
-            dispatch_id BIGINT AUTO_INCREMENT PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
             edge_agent_id VARCHAR(255) NOT NULL,
             request_id VARCHAR(128) NOT NULL,
@@ -3351,12 +3350,21 @@ pub async fn ensure_core_schema(
             dispatched_at DATETIME(6) NULL,
             completed_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_edge_dispatch_owner_request (user_id, request_id),
-            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status),
+            PRIMARY KEY (user_id, request_id),
+            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, request_id),
             INDEX idx_edge_dispatch_created (created_at)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "edge_pending_dispatch",
+        &["user_id", "request_id"],
+        &["dispatch_id"],
+        &["uq_edge_dispatch_owner_request"],
+    )
     .await?;
     drop_index_if_present(
         &pool,
@@ -3365,13 +3373,21 @@ pub async fn ensure_core_schema(
         "uq_edge_dispatch_request_id",
     )
     .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "edge_pending_dispatch",
+        &["user_id", "request_id"],
+        "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, request_id)",
+    )
+    .await?;
     ensure_index_shape(
         &pool,
         &settings.database,
         "edge_pending_dispatch",
-        "uq_edge_dispatch_owner_request",
-        &["user_id", "request_id"],
-        "ALTER TABLE edge_pending_dispatch ADD UNIQUE KEY uq_edge_dispatch_owner_request (user_id, request_id)",
+        "idx_edge_dispatch_user_status",
+        &["user_id", "edge_agent_id", "status", "created_at", "request_id"],
+        "ALTER TABLE edge_pending_dispatch ADD INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, request_id)",
     )
     .await?;
 
@@ -5418,6 +5434,35 @@ mod tests {
         assert!(
             create_pos < ensure_pos,
             "fresh databases must create edge_agent_registry before checking its primary-key shape"
+        );
+    }
+
+    #[test]
+    fn edge_pending_dispatch_identity_is_owner_request_bound() {
+        let source = include_str!("storage.rs");
+        let ddl = source
+            .split("CREATE TABLE IF NOT EXISTS edge_pending_dispatch")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("edge_pending_dispatch DDL");
+
+        assert!(
+            ddl.contains("PRIMARY KEY (user_id, request_id)"),
+            "edge_pending_dispatch must use the owner/request product identity"
+        );
+        assert!(
+            !ddl.contains("dispatch_id BIGINT AUTO_INCREMENT"),
+            "edge_pending_dispatch must not reintroduce a global AUTO_INCREMENT surrogate"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, request_id)"
+            ),
+            "schema bootstrap must verify the owner/request primary key"
+        );
+        assert!(
+            source.contains("&[\"dispatch_id\"]"),
+            "legacy dispatch_id schemas must fail startup instead of silently preserving the old hot surrogate"
         );
     }
 

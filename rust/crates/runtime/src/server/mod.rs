@@ -533,7 +533,7 @@ mod tests {
             _edge_agent_id: &str,
             _request_id: &str,
             _payload_json: &str,
-        ) -> Result<i64, String> {
+        ) -> Result<(), String> {
             unreachable!("insert_dispatch is not used in cleanup tests")
         }
 

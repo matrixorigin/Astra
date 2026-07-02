@@ -101,6 +101,7 @@ class SchemaInventoryTest(unittest.TestCase):
         for table in [
             "agent_message_queue",
             "agent_message_broadcast_delivery",
+            "edge_pending_dispatch",
             "resource_limits",
             "resource_usage",
             "llm_provider_admission_windows",
@@ -121,9 +122,9 @@ class SchemaInventoryTest(unittest.TestCase):
 
     def test_auto_increment_audit_baseline_excludes_message_queue(self) -> None:
         auto_increment = set(self.summary["auto_increment_tables"])
-        self.assertEqual(len(auto_increment), 8)
+        self.assertEqual(len(auto_increment), 7)
         self.assertNotIn("agent_message_queue", auto_increment)
-        self.assertIn("edge_pending_dispatch", auto_increment)
+        self.assertNotIn("edge_pending_dispatch", auto_increment)
         self.assertIn("auth_user_roles", auto_increment)
         self.assertIn("mcp_servers", auto_increment)
 
@@ -142,6 +143,13 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
         self.assertIn("consumer-scoped delivery state", row["merge_guidance"])
 
+    def test_edge_pending_dispatch_uses_owner_request_identity(self) -> None:
+        row = self.tables["edge_pending_dispatch"]
+        self.assertEqual(row["primary_key"], ["user_id", "request_id"])
+        self.assertEqual(row["auto_increment_columns"], [])
+        self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
+        self.assertIn("edge poll", row["primary_query"])
+
     def test_every_auto_increment_table_has_risk_audit_metadata(self) -> None:
         self.assertEqual([], self.summary["unaudited_auto_increment_tables"])
         for table in self.summary["auto_increment_tables"]:
@@ -159,14 +167,14 @@ class SchemaInventoryTest(unittest.TestCase):
                         f"{table}.{field} must be explicit for AUTO_INCREMENT audit",
                     )
 
-    def test_auto_increment_risk_classifies_remaining_hot_coordination_tables(self) -> None:
+    def test_auto_increment_risk_classifies_remaining_warm_coordination_tables(self) -> None:
         self.assertEqual(
-            self.tables["edge_pending_dispatch"]["auto_increment_hotspot_risk"],
+            self.tables["context_manifest_items"]["auto_increment_hotspot_risk"],
             "medium",
         )
         self.assertIn(
-            "unique (user_id, request_id)",
-            self.tables["edge_pending_dispatch"]["auto_increment_owner_boundary"],
+            "manifest-bound",
+            self.tables["context_manifest_items"]["auto_increment_owner_boundary"],
         )
 
     def test_auto_increment_risk_keeps_auth_admin_tables_low_priority(self) -> None:

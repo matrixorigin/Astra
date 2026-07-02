@@ -345,7 +345,7 @@ mod tests {
                 _edge_agent_id: &str,
                 _request_id: &str,
                 _payload_json: &str,
-            ) -> Result<i64, String> {
+            ) -> Result<(), String> {
                 Err("mock".into())
             }
             async fn poll_pending(

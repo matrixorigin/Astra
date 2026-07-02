@@ -374,12 +374,12 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         edge_agent_id: &str,
         _request_id: &str,
         _payload_json: &str,
-    ) -> Result<i64, String> {
+    ) -> Result<(), String> {
         self.inserted_edge_agent_ids
             .lock()
             .expect("inserted edge agent ids lock")
             .push(edge_agent_id.to_string());
-        Ok(1)
+        Ok(())
     }
 
     async fn poll_pending(
@@ -463,12 +463,12 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
         edge_agent_id: &str,
         _request_id: &str,
         _payload_json: &str,
-    ) -> Result<i64, String> {
+    ) -> Result<(), String> {
         self.inserted_edge_agent_ids
             .lock()
             .expect("inserted edge agent ids lock")
             .push(edge_agent_id.to_string());
-        Ok(1)
+        Ok(())
     }
 
     async fn poll_pending(

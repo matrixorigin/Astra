@@ -175,12 +175,6 @@ DEFAULT_AUTO_INCREMENT_METADATA = AutoIncrementMetadata(
 
 
 AUTO_INCREMENT_METADATA: dict[str, AutoIncrementMetadata] = {
-    "edge_pending_dispatch": AutoIncrementMetadata(
-        write_profile="hot edge dispatch coordination when edge execution is active",
-        owner_boundary="owner-bound by unique (user_id, request_id)",
-        hotspot_risk="medium",
-        guidance="prefer composite primary identity (user_id, request_id) or request_id-derived dispatch identity; dispatch_id is currently a surrogate",
-    ),
     "context_manifest_items": AutoIncrementMetadata(
         write_profile="warm batch insert during context assembly",
         owner_boundary="manifest-bound by manifest_id and unique item_order",
@@ -366,6 +360,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from durable audit; this is a hot coordination table",
         migration_owner="astra_runtime::llm_provider_admission",
         product_owner="LLM provider admission control",
+    ),
+    "edge_pending_dispatch": TableMetadata(
+        semantic_owner="astra_services::multi_agent::edge_dispatch",
+        state_class="coordination dispatch fact",
+        primary_query="owner/request dispatch lookup by user_id and request_id; edge poll by user_id, edge_agent_id, status, created_at",
+        retention_policy="expire pending/dispatched rows via cleanup_stale and prune terminal rows after the same stale window",
+        rebuildability="not rebuildable while a tool dispatch may still complete",
+        merge_guidance="keep separate from in-memory edge callback ledger; this is the cross-pod durable coordination queue",
+        migration_owner="astra_services::storage / multi_agent::edge_dispatch",
+        product_owner="edge tool dispatch and cross-pod result recovery",
     ),
 }
 

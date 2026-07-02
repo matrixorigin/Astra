@@ -2945,7 +2945,7 @@ esac
             _edge_agent_id: &str,
             _request_id: &str,
             _payload_json: &str,
-        ) -> Result<i64, String> {
+        ) -> Result<(), String> {
             Err("MCP tools must not be routed through edge dispatch".to_string())
         }
 
@@ -3037,8 +3037,8 @@ esac
             _edge_agent_id: &str,
             _request_id: &str,
             _payload_json: &str,
-        ) -> Result<i64, String> {
-            Ok(1)
+        ) -> Result<(), String> {
+            Ok(())
         }
 
         async fn poll_pending(
@@ -3095,8 +3095,8 @@ esac
             _edge_agent_id: &str,
             _request_id: &str,
             _payload_json: &str,
-        ) -> Result<i64, String> {
-            Ok(1)
+        ) -> Result<(), String> {
+            Ok(())
         }
 
         async fn poll_pending(

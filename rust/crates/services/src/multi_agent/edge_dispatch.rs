@@ -17,7 +17,6 @@ use crate::db_row::RowExt as EdgeDispatchDbRow;
 
 #[derive(Debug)]
 pub struct EdgeDispatchRow {
-    pub dispatch_id: i64,
     pub user_id: String,
     pub edge_agent_id: String,
     pub request_id: String,
@@ -35,14 +34,14 @@ async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'
 
 #[async_trait]
 pub trait EdgeDispatchService: Send + Sync {
-    /// Insert a new pending dispatch. Returns the dispatch_id.
+    /// Insert a new pending dispatch idempotently inside the owner/request boundary.
     async fn insert_dispatch(
         &self,
         user_id: &str,
         edge_agent_id: &str,
         request_id: &str,
         payload_json: &str,
-    ) -> Result<i64, String>;
+    ) -> Result<(), String>;
 
     /// Poll for pending dispatches targeting the given (user, agent) pairs.
     /// Returns dispatches that are still 'pending' and not yet dispatched.
@@ -115,9 +114,6 @@ fn edge_dispatch_decode_error(context: &str, column: &'static str, error: sqlx::
 
 fn decode_claimed_dispatch_row(row: &impl EdgeDispatchDbRow) -> Result<EdgeDispatchRow, String> {
     Ok(EdgeDispatchRow {
-        dispatch_id: row
-            .i64_column("dispatch_id")
-            .map_err(|e| edge_dispatch_decode_error("poll row", "dispatch_id", e))?,
         user_id: row
             .string_column("user_id")
             .map_err(|e| edge_dispatch_decode_error("poll row", "user_id", e))?,
@@ -261,12 +257,12 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         edge_agent_id: &str,
         request_id: &str,
         payload_json: &str,
-    ) -> Result<i64, String> {
+    ) -> Result<(), String> {
         // Idempotent insert inside an owner boundary: the same request_id is
-        // reusable by another user, but duplicate calls for the same user
-        // return the existing dispatch_id instead of erroring.
+        // reusable by another user, and duplicate calls for the same user are
+        // harmless retries.
         match sqlx::query(
-            "INSERT INTO edge_pending_dispatch \
+            "INSERT IGNORE INTO edge_pending_dispatch \
              (user_id, edge_agent_id, request_id, payload_json, status) \
              VALUES (?, ?, ?, ?, 'pending')",
         )
@@ -278,28 +274,14 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         .await
         {
             Ok(r) => {
-                if let Some(ref m) = self.metrics {
+                if r.rows_affected() > 0
+                    && let Some(ref m) = self.metrics
+                {
                     m.dispatch_queue_depth.fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(r.last_insert_id() as i64)
+                Ok(())
             }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("1062") || msg.contains("Duplicate entry") {
-                    // Race or retry: fetch the existing row.
-                    let (existing_id,): (i64,) = sqlx::query_as(
-                        "SELECT dispatch_id FROM edge_pending_dispatch WHERE user_id = ? AND request_id = ?",
-                    )
-                    .bind(user_id)
-                    .bind(request_id)
-                    .fetch_one(&self.pool)
-                    .await
-                    .map_err(|e| format!("edge_dispatch insert (fetch existing): {e}"))?;
-                    Ok(existing_id)
-                } else {
-                    Err(format!("edge_dispatch insert: {e}"))
-                }
-            }
+            Err(e) => Err(format!("edge_dispatch insert: {e}")),
         }
     }
     #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
@@ -319,14 +301,14 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .map_err(|e| format!("edge_dispatch poll begin tx: {e}"))?;
 
         let rows = match sqlx::query(
-            "SELECT dispatch_id, user_id, edge_agent_id, request_id, \
+            "SELECT user_id, edge_agent_id, request_id, \
              CAST(payload_json AS CHAR) AS payload_json, \
              CAST(result_json AS CHAR) AS result_json, \
              status, \
              COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
              FROM edge_pending_dispatch \
              WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
-             ORDER BY dispatch_id ASC LIMIT 50 \
+             ORDER BY created_at ASC, request_id ASC LIMIT 50 \
              FOR UPDATE",
         )
         .bind(user_id)
@@ -361,16 +343,19 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         };
 
         // Mark claimed rows as dispatched within the same transaction.
-        let ids: Vec<i64> = claimed_rows.iter().map(|row| row.dispatch_id).collect();
-
         let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "UPDATE edge_pending_dispatch \
              SET status = 'dispatched', dispatched_at = NOW(6) \
-             WHERE dispatch_id IN (",
+             WHERE (user_id, request_id) IN (",
         );
         let mut separated = update.separated(", ");
-        for id in &ids {
-            separated.push_bind(*id);
+        for row in &claimed_rows {
+            separated
+                .push_unseparated("(")
+                .push_bind(&row.user_id)
+                .push_unseparated(", ")
+                .push_bind(&row.request_id)
+                .push_unseparated(")");
         }
         separated.push_unseparated(") AND status = 'pending'");
         let update_result = match update.build().execute(&mut *tx).await {
@@ -380,9 +365,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 return Err(format!("edge_dispatch poll UPDATE: {e}"));
             }
         };
-        if let Err(e) =
-            validate_claimed_dispatch_update_count(ids.len(), update_result.rows_affected())
-        {
+        if let Err(e) = validate_claimed_dispatch_update_count(
+            claimed_rows.len(),
+            update_result.rows_affected(),
+        ) {
             rollback_edge_dispatch_tx(tx, "validate claimed dispatch count").await;
             return Err(e);
         }
@@ -587,7 +573,7 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
         _edge_agent_id: &str,
         _request_id: &str,
         _payload_json: &str,
-    ) -> Result<i64, String> {
+    ) -> Result<(), String> {
         Err("edge dispatch service not configured".to_string())
     }
     async fn poll_pending(
@@ -705,7 +691,6 @@ mod tests {
                 return Err(sqlx::Error::ColumnNotFound(column.to_string()));
             }
             match column {
-                "dispatch_id" => Ok(42),
                 "pending_wait_us" => Ok(1_234),
                 "pending_rows" => Ok(3),
                 "dispatched_rows" => Ok(2),
@@ -744,7 +729,6 @@ mod tests {
     fn claimed_dispatch_row_decode_preserves_values() {
         let row = decode_claimed_dispatch_row(&FakeEdgeDispatchRow::complete()).unwrap();
 
-        assert_eq!(row.dispatch_id, 42);
         assert_eq!(row.user_id, "user-1");
         assert_eq!(row.edge_agent_id, "edge-1");
         assert_eq!(row.request_id, "request-1");
@@ -769,7 +753,6 @@ mod tests {
     #[test]
     fn claimed_dispatch_row_decode_fails_loudly_on_any_column_error() {
         for column in [
-            "dispatch_id",
             "user_id",
             "edge_agent_id",
             "request_id",
@@ -913,15 +896,14 @@ mod tests {
             "args": {"cmd": "printf ok"}
         })
         .to_string();
-        let dispatch_id = pod_a
+        pod_a
             .insert_dispatch(&user_id, &edge_agent_id, &request_id, &payload)
             .await
             .expect("insert pending dispatch");
-        let duplicate_dispatch_id = pod_a
+        pod_a
             .insert_dispatch(&user_id, &edge_agent_id, &request_id, &payload)
             .await
             .expect("duplicate insert should be idempotent");
-        assert_eq!(duplicate_dispatch_id, dispatch_id);
 
         let wrong_agent_rows = pod_b
             .poll_pending(&user_id, &other_edge_agent_id)
@@ -957,7 +939,8 @@ mod tests {
             .await
             .expect("correct edge agent poll");
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].dispatch_id, dispatch_id);
+        assert_eq!(claimed[0].user_id, user_id);
+        assert_eq!(claimed[0].request_id, request_id);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&claimed[0].payload_json)
                 .expect("claimed payload should be valid JSON"),
