@@ -175,12 +175,6 @@ DEFAULT_AUTO_INCREMENT_METADATA = AutoIncrementMetadata(
 
 
 AUTO_INCREMENT_METADATA: dict[str, AutoIncrementMetadata] = {
-    "context_manifest_items": AutoIncrementMetadata(
-        write_profile="warm batch insert during context assembly",
-        owner_boundary="manifest-bound by manifest_id and unique item_order",
-        hotspot_risk="medium",
-        guidance="consider primary identity (manifest_id, item_order); current AUTO_INCREMENT is not required for lookup semantics",
-    ),
     "session_state_item_events": AutoIncrementMetadata(
         write_profile="warm-to-hot state projection append",
         owner_boundary="owner/session/item scoped columns, but primary key is global id",
@@ -370,6 +364,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from in-memory edge callback ledger; this is the cross-pod durable coordination queue",
         migration_owner="astra_services::storage / multi_agent::edge_dispatch",
         product_owner="edge tool dispatch and cross-pod result recovery",
+    ),
+    "context_manifest_items": TableMetadata(
+        semantic_owner="astra_services::context_manifest::ContextManifestStore",
+        state_class="durable manifest item fact",
+        primary_query="manifest-local item lookup/order by manifest_id and item_order; zone filtering by manifest_id, zone, included",
+        retention_policy="delete with parent context_manifests during session deletion or manifest retention cleanup",
+        rebuildability="rebuildable only by recomputing the exact manifest assembly inputs",
+        merge_guidance="keep separate from context_manifests; item-level ordering, source refs, token budgets, and raw refs are independently queried",
+        migration_owner="astra_services::storage / context_manifest",
+        product_owner="LLM context assembly traceability",
     ),
 }
 

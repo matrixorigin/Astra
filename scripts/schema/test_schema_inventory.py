@@ -102,6 +102,7 @@ class SchemaInventoryTest(unittest.TestCase):
             "agent_message_queue",
             "agent_message_broadcast_delivery",
             "edge_pending_dispatch",
+            "context_manifest_items",
             "resource_limits",
             "resource_usage",
             "llm_provider_admission_windows",
@@ -122,9 +123,10 @@ class SchemaInventoryTest(unittest.TestCase):
 
     def test_auto_increment_audit_baseline_excludes_message_queue(self) -> None:
         auto_increment = set(self.summary["auto_increment_tables"])
-        self.assertEqual(len(auto_increment), 7)
+        self.assertEqual(len(auto_increment), 6)
         self.assertNotIn("agent_message_queue", auto_increment)
         self.assertNotIn("edge_pending_dispatch", auto_increment)
+        self.assertNotIn("context_manifest_items", auto_increment)
         self.assertIn("auth_user_roles", auto_increment)
         self.assertIn("mcp_servers", auto_increment)
 
@@ -150,6 +152,13 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
         self.assertIn("edge poll", row["primary_query"])
 
+    def test_context_manifest_items_uses_manifest_order_identity(self) -> None:
+        row = self.tables["context_manifest_items"]
+        self.assertEqual(row["primary_key"], ["manifest_id", "item_order"])
+        self.assertEqual(row["auto_increment_columns"], [])
+        self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
+        self.assertIn("manifest-local item", row["primary_query"])
+
     def test_every_auto_increment_table_has_risk_audit_metadata(self) -> None:
         self.assertEqual([], self.summary["unaudited_auto_increment_tables"])
         for table in self.summary["auto_increment_tables"]:
@@ -169,12 +178,12 @@ class SchemaInventoryTest(unittest.TestCase):
 
     def test_auto_increment_risk_classifies_remaining_warm_coordination_tables(self) -> None:
         self.assertEqual(
-            self.tables["context_manifest_items"]["auto_increment_hotspot_risk"],
+            self.tables["session_state_item_events"]["auto_increment_hotspot_risk"],
             "medium",
         )
         self.assertIn(
-            "manifest-bound",
-            self.tables["context_manifest_items"]["auto_increment_owner_boundary"],
+            "owner/session/item",
+            self.tables["session_state_item_events"]["auto_increment_owner_boundary"],
         )
 
     def test_auto_increment_risk_keeps_auth_admin_tables_low_priority(self) -> None:

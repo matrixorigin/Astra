@@ -2100,7 +2100,6 @@ pub async fn ensure_core_schema(
     }
     query(
         "CREATE TABLE IF NOT EXISTS context_manifest_items (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
             manifest_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
             item_order INT NOT NULL,
@@ -2115,7 +2114,7 @@ pub async fn ensure_core_schema(
             render_mode VARCHAR(64) NOT NULL,
             raw_ref VARCHAR(255) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_manifest_item_order (manifest_id, item_order),
+            PRIMARY KEY (manifest_id, item_order),
             INDEX idx_manifest_items_source (source_table, source_id),
             INDEX idx_manifest_items_manifest_zone (manifest_id, zone, included),
             INDEX idx_manifest_items_raw_ref (raw_ref)
@@ -2123,11 +2122,28 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "context_manifest_items",
+        &["manifest_id", "item_order"],
+        &["id"],
+        &["uq_manifest_item_order"],
+    )
+    .await?;
     drop_index_if_present(
         &pool,
         &settings.database,
         "context_manifest_items",
         "idx_manifest_items_session_zone",
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "context_manifest_items",
+        &["manifest_id", "item_order"],
+        "ALTER TABLE context_manifest_items ADD PRIMARY KEY (manifest_id, item_order)",
     )
     .await?;
     ensure_index_shape(
@@ -5463,6 +5479,35 @@ mod tests {
         assert!(
             source.contains("&[\"dispatch_id\"]"),
             "legacy dispatch_id schemas must fail startup instead of silently preserving the old hot surrogate"
+        );
+    }
+
+    #[test]
+    fn context_manifest_items_identity_is_manifest_order_bound() {
+        let source = include_str!("storage.rs");
+        let ddl = source
+            .split("CREATE TABLE IF NOT EXISTS context_manifest_items")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("context_manifest_items DDL");
+
+        assert!(
+            ddl.contains("PRIMARY KEY (manifest_id, item_order)"),
+            "context_manifest_items must use the manifest-local item ordering identity"
+        );
+        assert!(
+            !ddl.contains("id BIGINT AUTO_INCREMENT"),
+            "context_manifest_items must not reintroduce a global AUTO_INCREMENT surrogate"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE context_manifest_items ADD PRIMARY KEY (manifest_id, item_order)"
+            ),
+            "schema bootstrap must verify the manifest/order primary key"
+        );
+        assert!(
+            source.contains("&[\"uq_manifest_item_order\"]"),
+            "legacy unique-key-plus-surrogate schemas must fail startup instead of preserving the old shape"
         );
     }
 
