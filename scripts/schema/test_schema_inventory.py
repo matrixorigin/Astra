@@ -151,6 +151,18 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("ordered bounded batches", row["retention_policy"])
         self.assertIn("session hard delete", row["retention_policy"])
 
+    def test_session_high_growth_retention_mentions_bounded_hard_delete(self) -> None:
+        for table in [
+            "agent_events",
+            "agent_run_events",
+            "session_tool_output_batches",
+            "session_tool_outputs",
+        ]:
+            with self.subTest(table=table):
+                policy = self.tables[table]["retention_policy"]
+                self.assertIn("session hard delete", policy)
+                self.assertIn("ordered bounded batches", policy)
+
     def test_external_hot_coordination_tables_have_semantic_metadata(self) -> None:
         for table in [
             "agent_message_queue",
