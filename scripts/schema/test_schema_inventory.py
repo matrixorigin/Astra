@@ -125,11 +125,55 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("auth_user_roles", auto_increment)
         self.assertIn("mcp_servers", auto_increment)
 
+    def test_every_auto_increment_table_has_risk_audit_metadata(self) -> None:
+        self.assertEqual([], self.summary["unaudited_auto_increment_tables"])
+        for table in self.summary["auto_increment_tables"]:
+            with self.subTest(table=table):
+                row = self.tables[table]
+                for field in [
+                    "auto_increment_write_profile",
+                    "auto_increment_owner_boundary",
+                    "auto_increment_hotspot_risk",
+                    "auto_increment_guidance",
+                ]:
+                    self.assertNotEqual(
+                        row[field],
+                        "not_applicable",
+                        f"{table}.{field} must be explicit for AUTO_INCREMENT audit",
+                    )
+
+    def test_auto_increment_risk_classifies_hot_coordination_tables(self) -> None:
+        self.assertEqual(
+            self.tables["agent_message_queue"]["auto_increment_hotspot_risk"],
+            "high",
+        )
+        self.assertIn(
+            "claim queries order pending rows by id",
+            self.tables["agent_message_queue"]["auto_increment_write_profile"],
+        )
+        self.assertEqual(
+            self.tables["edge_pending_dispatch"]["auto_increment_hotspot_risk"],
+            "medium",
+        )
+        self.assertIn(
+            "unique (user_id, request_id)",
+            self.tables["edge_pending_dispatch"]["auto_increment_owner_boundary"],
+        )
+
+    def test_auto_increment_risk_keeps_auth_admin_tables_low_priority(self) -> None:
+        for table in ["auth_user_roles", "auth_external_identities", "mcp_servers"]:
+            with self.subTest(table=table):
+                self.assertEqual(
+                    self.tables[table]["auto_increment_hotspot_risk"],
+                    "low",
+                )
+
     def test_inventory_is_json_serializable(self) -> None:
         encoded = json.dumps(self.inventory, sort_keys=True)
         self.assertIn('"schema_sources"', encoded)
         self.assertIn('"tables"', encoded)
         self.assertIn('"classified_table_count"', encoded)
+        self.assertIn('"audited_auto_increment_tables"', encoded)
 
 
 if __name__ == "__main__":

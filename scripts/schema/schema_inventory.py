@@ -128,6 +128,10 @@ class TableInventory:
     merge_guidance: str
     migration_owner: str
     product_owner: str
+    auto_increment_write_profile: str
+    auto_increment_owner_boundary: str
+    auto_increment_hotspot_risk: str
+    auto_increment_guidance: str
 
 
 @dataclass(frozen=True)
@@ -142,6 +146,14 @@ class TableMetadata:
     product_owner: str
 
 
+@dataclass(frozen=True)
+class AutoIncrementMetadata:
+    write_profile: str
+    owner_boundary: str
+    hotspot_risk: str
+    guidance: str
+
+
 DEFAULT_METADATA = TableMetadata(
     semantic_owner="unclassified",
     state_class="unclassified",
@@ -152,6 +164,72 @@ DEFAULT_METADATA = TableMetadata(
     migration_owner="unclassified",
     product_owner="unclassified",
 )
+
+
+DEFAULT_AUTO_INCREMENT_METADATA = AutoIncrementMetadata(
+    write_profile="not_applicable",
+    owner_boundary="not_applicable",
+    hotspot_risk="not_applicable",
+    guidance="not_applicable",
+)
+
+
+AUTO_INCREMENT_METADATA: dict[str, AutoIncrementMetadata] = {
+    "agent_message_queue": AutoIncrementMetadata(
+        write_profile="hot queue append; claim queries order pending rows by id",
+        owner_boundary="run/agent/delegation scoped, not user-owner-bound",
+        hotspot_risk="high",
+        guidance="prioritize replacement before high fan-out: use message_id/ULID or scoped sortable sequence instead of global AUTO_INCREMENT claim order",
+    ),
+    "edge_pending_dispatch": AutoIncrementMetadata(
+        write_profile="hot edge dispatch coordination when edge execution is active",
+        owner_boundary="owner-bound by unique (user_id, request_id)",
+        hotspot_risk="medium",
+        guidance="prefer composite primary identity (user_id, request_id) or request_id-derived dispatch identity; dispatch_id is currently a surrogate",
+    ),
+    "context_manifest_items": AutoIncrementMetadata(
+        write_profile="warm batch insert during context assembly",
+        owner_boundary="manifest-bound by manifest_id and unique item_order",
+        hotspot_risk="medium",
+        guidance="consider primary identity (manifest_id, item_order); current AUTO_INCREMENT is not required for lookup semantics",
+    ),
+    "session_state_item_events": AutoIncrementMetadata(
+        write_profile="warm-to-hot state projection append",
+        owner_boundary="owner/session/item scoped columns, but primary key is global id",
+        hotspot_risk="medium",
+        guidance="consider item-scoped event sequence or ULID if projection event volume grows; id is mainly a tie-breaker in created_at indexes",
+    ),
+    "auth_user_roles": AutoIncrementMetadata(
+        write_profile="low-frequency admin/auth role grant",
+        owner_boundary="user/role unique key",
+        hotspot_risk="low",
+        guidance="acceptable as-is; replace only during broader auth schema cleanup",
+    ),
+    "auth_external_identities": AutoIncrementMetadata(
+        write_profile="low-frequency external login/account linking",
+        owner_boundary="provider/external_subject unique key",
+        hotspot_risk="low",
+        guidance="acceptable as-is; provider/external_subject is the durable identity",
+    ),
+    "mcp_servers": AutoIncrementMetadata(
+        write_profile="low-frequency user-admin MCP registration",
+        owner_boundary="owner_user_id/name unique key",
+        hotspot_risk="low",
+        guidance="acceptable short-term; owner/name is the product identity",
+    ),
+    "mcp_bindings": AutoIncrementMetadata(
+        write_profile="low-frequency credential binding registration",
+        owner_boundary="owner_user_id/mcp_id/key_hash unique key",
+        hotspot_risk="low",
+        guidance="acceptable short-term; composite owner/server/key identity already exists",
+    ),
+    "mcp_tools": AutoIncrementMetadata(
+        write_profile="warm bulk replace during MCP tool discovery",
+        owner_boundary="binding_id/tool_name and binding_id/public_name unique keys",
+        hotspot_risk="low",
+        guidance="acceptable short-term; if discovery becomes high-volume, use binding-scoped tool identity rather than global id",
+    ),
+}
 
 
 TABLE_METADATA: dict[str, TableMetadata] = {
@@ -402,6 +480,11 @@ def classify_table(
 
     ddl_text = f"CREATE TABLE IF NOT EXISTS {table} ({body})"
     metadata = TABLE_METADATA.get(table, DEFAULT_METADATA)
+    auto_increment_metadata = (
+        AUTO_INCREMENT_METADATA.get(table, DEFAULT_AUTO_INCREMENT_METADATA)
+        if auto_increment_columns
+        else DEFAULT_AUTO_INCREMENT_METADATA
+    )
     return TableInventory(
         table=table,
         owner=source.owner,
@@ -427,6 +510,10 @@ def classify_table(
         merge_guidance=metadata.merge_guidance,
         migration_owner=metadata.migration_owner,
         product_owner=metadata.product_owner,
+        auto_increment_write_profile=auto_increment_metadata.write_profile,
+        auto_increment_owner_boundary=auto_increment_metadata.owner_boundary,
+        auto_increment_hotspot_risk=auto_increment_metadata.hotspot_risk,
+        auto_increment_guidance=auto_increment_metadata.guidance,
     )
 
 
@@ -463,6 +550,9 @@ def build_inventory(root: Path | None = None) -> dict[str, object]:
     auto_increment_tables = sorted(
         table.table for table in tables if table.auto_increment_columns
     )
+    audited_auto_increment_tables = sorted(
+        table for table in auto_increment_tables if table in AUTO_INCREMENT_METADATA
+    )
     foreign_key_tables = sorted(table.table for table in tables if table.has_foreign_key)
     by_domain: dict[str, int] = {}
     for table in tables:
@@ -480,6 +570,10 @@ def build_inventory(root: Path | None = None) -> dict[str, object]:
             "duplicate_table_names": duplicates,
             "foreign_key_tables": foreign_key_tables,
             "auto_increment_tables": auto_increment_tables,
+            "audited_auto_increment_tables": audited_auto_increment_tables,
+            "unaudited_auto_increment_tables": sorted(
+                set(auto_increment_tables) - set(audited_auto_increment_tables)
+            ),
             "domain_table_counts": dict(sorted(by_domain.items())),
             "classified_table_count": len(classified_tables),
             "classified_tables": classified_tables,
@@ -505,13 +599,14 @@ def render_markdown(inventory: dict[str, object]) -> str:
         f"- Duplicate table names: {len(summary['duplicate_table_names'])}",
         f"- Foreign-key tables: {len(summary['foreign_key_tables'])}",
         f"- AUTO_INCREMENT tables: {len(summary['auto_increment_tables'])}",
+        f"- Audited AUTO_INCREMENT tables: {len(summary['audited_auto_increment_tables'])}",
         f"- Classified tables: {summary['classified_table_count']}",
         f"- Unclassified tables: {summary['unclassified_table_count']}",
         "",
         "## Tables",
         "",
-        "| Table | Domain | State class | Product owner | Primary query | Rebuildability | Merge guidance | Source | Columns | Nullable | AUTO_INCREMENT | PK | Indexes |",
-        "|---|---|---|---|---|---|---|---|---:|---:|---|---|---:|",
+        "| Table | Domain | State class | Product owner | Primary query | Rebuildability | Merge guidance | AUTO_INCREMENT risk | AUTO_INCREMENT guidance | Source | Columns | Nullable | AUTO_INCREMENT | PK | Indexes |",
+        "|---|---|---|---|---|---|---|---|---|---|---:|---:|---|---|---:|",
     ]
     for table in inventory["tables"]:
         assert isinstance(table, dict)
@@ -519,7 +614,8 @@ def render_markdown(inventory: dict[str, object]) -> str:
         pk = ", ".join(table["primary_key"]) or "-"
         lines.append(
             "| `{table}` | `{domain}` | {state_class} | {product_owner} | {primary_query} | "
-            "{rebuildability} | {merge_guidance} | `{source_path}:{source_line}` | "
+            "{rebuildability} | {merge_guidance} | {auto_increment_hotspot_risk} | "
+            "{auto_increment_guidance} | `{source_path}:{source_line}` | "
             "{column_count} | {nullable_column_count} | `{auto_inc}` | `{pk}` | {index_count} |".format(
                 auto_inc=auto_inc,
                 pk=pk,
