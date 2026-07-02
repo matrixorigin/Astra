@@ -198,10 +198,49 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                 _ = interval.tick() => {
                     match dispatch_svc.poll_pending(&dispatch_user_id, &dispatch_agent_id).await {
                         Ok(rows) if !rows.is_empty() => {
-                            for row in &rows {
-                                if let Ok(msg) = serde_json::from_str::<EdgeServerMessage>(&row.payload_json) {
-                                    let _ = send_edge_msg(&dispatch_sink, msg).await;
+                            let mut stop_dispatch = false;
+                            for (idx, row) in rows.iter().enumerate() {
+                                let msg = match serde_json::from_str::<EdgeServerMessage>(&row.payload_json) {
+                                    Ok(msg) => msg,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %row.user_id,
+                                            edge_agent_id = %row.edge_agent_id,
+                                            request_id = %row.request_id,
+                                            error = %error,
+                                            "Edge dispatch relay failed to decode claimed payload; marking dispatch failed"
+                                        );
+                                        fail_claimed_edge_dispatch(
+                                            dispatch_svc.as_ref(),
+                                            row,
+                                            "edge_dispatch_payload_decode_failed",
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                };
+                                if send_edge_msg(&dispatch_sink, msg).await.is_err() {
+                                    tracing::warn!(
+                                        target: "astra_runtime::edge_ws",
+                                        user_id = %row.user_id,
+                                        edge_agent_id = %row.edge_agent_id,
+                                        request_id = %row.request_id,
+                                        remaining_claimed = rows.len().saturating_sub(idx),
+                                        "Edge dispatch relay failed to write to websocket; marking claimed dispatches failed"
+                                    );
+                                    fail_claimed_edge_dispatches(
+                                        dispatch_svc.as_ref(),
+                                        &rows[idx..],
+                                        "edge_ws_send_failed",
+                                    )
+                                    .await;
+                                    stop_dispatch = true;
+                                    break;
                                 }
+                            }
+                            if stop_dispatch {
+                                break;
                             }
                         }
                         _ => {} // no pending dispatches or error
@@ -384,6 +423,56 @@ async fn send_edge_msg(
         .map_err(|_| ())
 }
 
+async fn fail_claimed_edge_dispatch(
+    dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
+    row: &astra_services::multi_agent::EdgeDispatchRow,
+    reason: &'static str,
+) -> bool {
+    match dispatch
+        .fail_dispatch(&row.user_id, &row.request_id, reason)
+        .await
+    {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_ws",
+                user_id = %row.user_id,
+                edge_agent_id = %row.edge_agent_id,
+                request_id = %row.request_id,
+                reason,
+                "Edge dispatch relay failed to mark claimed dispatch terminal because row was already gone"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_ws",
+                user_id = %row.user_id,
+                edge_agent_id = %row.edge_agent_id,
+                request_id = %row.request_id,
+                reason,
+                error = %error,
+                "Edge dispatch relay failed to mark claimed dispatch terminal"
+            );
+            false
+        }
+    }
+}
+
+async fn fail_claimed_edge_dispatches(
+    dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
+    rows: &[astra_services::multi_agent::EdgeDispatchRow],
+    reason: &'static str,
+) -> usize {
+    let mut failed = 0;
+    for row in rows {
+        if fail_claimed_edge_dispatch(dispatch, row, reason).await {
+            failed += 1;
+        }
+    }
+    failed
+}
+
 /// Validate edge self-reported capabilities against the server-side tool
 /// registry. Strips tool names that don't exist in the built-in registry
 /// (a malicious edge could fabricate them) and ensures the executor type
@@ -460,4 +549,112 @@ fn validate_edge_capabilities(
     }
 
     serde_json::to_value(&advert).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_services::multi_agent::{EdgeDispatchRow, EdgeDispatchService};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingEdgeDispatch {
+        failed: Mutex<Vec<(String, String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EdgeDispatchService for RecordingEdgeDispatch {
+        async fn insert_dispatch(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _request_id: &str,
+            _payload_json: &str,
+        ) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<EdgeDispatchRow>, String> {
+            Err("not used".to_string())
+        }
+
+        async fn deliver_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _edge_agent_id: &str,
+            _result_json: &str,
+        ) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+
+        async fn fail_dispatch(
+            &self,
+            user_id: &str,
+            request_id: &str,
+            reason: &str,
+        ) -> Result<bool, String> {
+            self.failed.lock().unwrap().push((
+                user_id.to_string(),
+                request_id.to_string(),
+                reason.to_string(),
+            ));
+            Ok(true)
+        }
+
+        async fn wait_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<String>, String> {
+            Err("not used".to_string())
+        }
+
+        async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
+            Err("not used".to_string())
+        }
+    }
+
+    fn dispatch_row(request_id: &str) -> EdgeDispatchRow {
+        EdgeDispatchRow {
+            user_id: "user-1".to_string(),
+            edge_agent_id: "edge-1".to_string(),
+            request_id: request_id.to_string(),
+            payload_json: "{}".to_string(),
+            result_json: None,
+            status: "dispatched".to_string(),
+            pending_wait_us: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_claimed_edge_dispatches_marks_each_row_terminal() {
+        let dispatch = RecordingEdgeDispatch::default();
+        let rows = vec![dispatch_row("req-1"), dispatch_row("req-2")];
+
+        let failed = fail_claimed_edge_dispatches(&dispatch, &rows, "edge_ws_send_failed").await;
+
+        assert_eq!(failed, 2);
+        let calls = dispatch.failed.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "user-1".to_string(),
+                    "req-1".to_string(),
+                    "edge_ws_send_failed".to_string()
+                ),
+                (
+                    "user-1".to_string(),
+                    "req-2".to_string(),
+                    "edge_ws_send_failed".to_string()
+                ),
+            ]
+        );
+    }
 }
