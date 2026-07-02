@@ -3521,9 +3521,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut llm_cfg = match self.resolve_llm_config_for_state(state).await {
             Ok(m) => m,
             Err(e) => {
+                let message = format!("Model resolution failed: {e}");
                 return Err(astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::Unknown,
-                    format!("Model resolution failed: {e}"),
+                    astra_core::classify_model_resolution_error_message(&message),
+                    message,
                 ));
             }
         };
@@ -7968,6 +7969,18 @@ mod tests {
         .expect("resolve via llm token service gateway");
         assert_eq!(resolved.model_name, "gpt-4o-mini");
         assert!(resolved.request_timeout.is_none());
+    }
+
+    #[test]
+    fn model_resolution_database_error_maps_to_database_outcome() {
+        let message = "Model resolution failed: DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF";
+        let error = astra_core::ClassifiedError::new(
+            astra_core::classify_model_resolution_error_message(message),
+            message,
+        );
+
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert_eq!(llm_main_error_outcome(&error), "error_database");
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]

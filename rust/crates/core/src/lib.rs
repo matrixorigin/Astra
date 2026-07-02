@@ -398,8 +398,8 @@ pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{
-    ClassifiedError, ErrorKind, classify_llm_error_message, classify_tool_output,
-    is_llm_context_window_error,
+    ClassifiedError, ErrorKind, classify_llm_error_message,
+    classify_model_resolution_error_message, classify_tool_output, is_llm_context_window_error,
 };
 pub use observation::{
     ErrorStreak, EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,

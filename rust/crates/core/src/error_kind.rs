@@ -9,6 +9,8 @@
 //! - [`classify_llm_error_message`] for provider / transport strings when the
 //!   caller did not receive structured metadata.
 //! - [`classify_tool_output`] for external tool output (bash, MCP).
+//! - [`classify_model_resolution_error_message`] for model registry lookup
+//!   failures returned as strings by legacy service boundaries.
 
 use serde::{Deserialize, Serialize};
 
@@ -498,6 +500,24 @@ fn is_rate_limit_error_lower(lower: &str) -> bool {
     lower.contains("rate limit") || lower.contains("429") || lower.contains("too many requests")
 }
 
+fn is_database_error_lower(lower: &str) -> bool {
+    lower.contains("db query:")
+        || lower.contains("database operation failed")
+        || lower.contains("error communicating with database")
+        || lower.contains("error returned from database")
+        || lower.contains("sql syntax error")
+        || lower.contains("sqlx")
+        || lower.contains("deadlock")
+        || lower.contains("matrixone pool timed out")
+        || lower.contains("duplicate entry")
+        || lower.contains("foreign key constraint")
+        || lower.contains("invalid infra_llm_models.")
+        || lower.contains("invalid infra_user_config.")
+        || lower.contains("invalid agent_runs.")
+        || lower.contains("invalid agent_sessions.")
+        || lower.contains("connection pool timed out")
+}
+
 /// Classify an unstructured LLM provider / transport error message.
 ///
 /// This is the single fallback for LLM calls that cross a boundary without
@@ -543,6 +563,35 @@ pub fn classify_llm_error_message(message: &str) -> ErrorKind {
     } else {
         ErrorKind::Unknown
     }
+}
+
+/// Classify model registry / model-selection resolution failures.
+///
+/// This boundary is neither an LLM provider failure nor a tool failure. Keep it
+/// separate so database outages, missing model selection, and invalid model
+/// overrides do not collapse into `unknown` or tool-oriented categories.
+#[must_use]
+pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("model selection is required")
+        || lower.contains("missing model selection")
+        || lower.contains("no concrete model was selected")
+    {
+        return ErrorKind::MissingModelSelection;
+    }
+    if is_database_error_lower(&lower) {
+        return ErrorKind::DatabaseError;
+    }
+    if lower.contains("not configured on this server")
+        || lower.contains("no exact or substring match in infra_llm_models")
+        || lower.contains("registered active models")
+        || lower.contains("is inactive")
+        || lower.contains(" is ambiguous")
+        || lower.contains("empty model name")
+    {
+        return ErrorKind::InvalidRequest;
+    }
+    ErrorKind::Unknown
 }
 
 // ── Tool output fallback classifier ──────────────────────────────────────────
@@ -599,15 +648,7 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     // Database errors — MatrixOne / SQLx. Must come before Network because
     // "connection pool timed out" reads like a network issue but the fix
     // lives in the DB layer (pool config, slow queries, deadlocks).
-    if lower.contains("sql syntax error")
-        || lower.contains("error returned from database")
-        || lower.contains("sqlx")
-        || lower.contains("deadlock")
-        || lower.contains("matrixone pool timed out")
-        || (lower.contains("column") && lower.contains("group by"))
-        || lower.contains("duplicate entry")
-        || lower.contains("foreign key constraint")
-    {
+    if is_database_error_lower(&lower) || (lower.contains("column") && lower.contains("group by")) {
         return ErrorKind::DatabaseError;
     }
 
@@ -1110,6 +1151,44 @@ mod tests {
         assert!(!is_llm_context_window_error(""));
     }
 
+    #[test]
+    fn classify_model_resolution_error_message_cases() {
+        let cases: &[(&str, ErrorKind)] = &[
+            (
+                "Model resolution failed: DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF",
+                ErrorKind::DatabaseError,
+            ),
+            (
+                "Model resolution failed: Model selection is required. Select a concrete model with `/model set <name>`.",
+                ErrorKind::MissingModelSelection,
+            ),
+            (
+                "Model resolution failed: Model 'foo' is not configured on this server (no exact or substring match in infra_llm_models). Registered active models: []",
+                ErrorKind::InvalidRequest,
+            ),
+            (
+                "Model resolution failed: Model 'foo' is inactive (connectivity failed or disabled).",
+                ErrorKind::InvalidRequest,
+            ),
+            (
+                "Model resolution failed: Model 'gpt' is ambiguous -- matches multiple registered models",
+                ErrorKind::InvalidRequest,
+            ),
+            (
+                "Model resolution failed: something novel",
+                ErrorKind::Unknown,
+            ),
+        ];
+
+        for &(input, expected) in cases {
+            assert_eq!(
+                classify_model_resolution_error_message(input),
+                expected,
+                "classify_model_resolution_error_message({input:?}) should be {expected:?}"
+            );
+        }
+    }
+
     // ── classify_tool_output ──
 
     #[test]
@@ -1130,6 +1209,15 @@ mod tests {
             ("connection timed out after 30s", ErrorKind::Network),
             ("ETIMEDOUT", ErrorKind::Network),
             ("HTTP 503 Service Unavailable", ErrorKind::Network),
+            // Database
+            (
+                "DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF",
+                ErrorKind::DatabaseError,
+            ),
+            (
+                "database operation failed: operation=load_run_metadata_for_user, source=connection pool timed out",
+                ErrorKind::DatabaseError,
+            ),
             // Auth
             ("401 Unauthorized", ErrorKind::Auth),
             ("Permission denied: insufficient scope", ErrorKind::Auth),
@@ -1258,6 +1346,24 @@ mod tests {
         assert_eq!(
             classify_tool_output("connection timed out after 30s"),
             ErrorKind::Network
+        );
+        // DB pool timeouts must not collapse into generic network timeouts.
+        assert_eq!(
+            classify_tool_output("DB query: connection pool timed out after 5s"),
+            ErrorKind::DatabaseError
+        );
+    }
+
+    #[test]
+    fn classified_error_from_recovers_model_resolution_database_error() {
+        let err = ClassifiedError::from(
+            "Model resolution failed: DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF"
+                .to_string(),
+        );
+        assert_eq!(err.kind, ErrorKind::DatabaseError);
+        assert_eq!(
+            err.message,
+            "Model resolution failed: DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF"
         );
     }
 
