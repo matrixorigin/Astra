@@ -85,6 +85,7 @@ If `reasoning_model_name` is not set, the server falls back to the cheapest acti
 - `ASTRA_LLM_PROVIDER_ADMISSION_RPM`, `ASTRA_LLM_PROVIDER_ADMISSION_TPM` — provider budget used by admission; at least one is required when admission is enabled
 - `ASTRA_LLM_PROVIDER_ADMISSION_SCOPE` — `provider` or `provider_model`; default `provider`
 - `ASTRA_LLM_PROVIDER_ADMISSION_BURST` — optional RPM pacing burst; defaults to strict smoothing (`1`), raise only when provider burst capacity is proven
+- `ASTRA_RUN_ADMISSION_TIMEOUT_SECS` — per-run wait time before the pod-local run semaphore returns `run_admission_timeout`; default `30`
 - `ASTRA_AUX_LLM_POLICY` — global policy for optional auxiliary LLM calls; `capacity_aware` by default skips optional auxiliary calls when provider admission is enabled, `always` preserves them, `disabled` turns them off
 - `ASTRA_TURN_INTENT_JUDGE_POLICY`, `ASTRA_FACTUAL_RETRY_JUDGE_POLICY`, `ASTRA_PRE_TURN_COMPACTION_LLM_POLICY` — per-purpose overrides for auxiliary LLM policy
 - `ASTRA_TURN_OBSERVER_MODE` — server-loop Memoria observer dispatch mode; `async` by default keeps terminal run finalization from waiting on observer HTTP calls, `inline` restores synchronous completion, `disabled` skips the optional observer

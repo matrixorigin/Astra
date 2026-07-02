@@ -107,7 +107,8 @@ use astra_runtime_env::{
     validate_workspace_id,
 };
 
-const RUN_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+const ASTRA_RUN_ADMISSION_TIMEOUT_SECS_ENV: &str = "ASTRA_RUN_ADMISSION_TIMEOUT_SECS";
+const DEFAULT_RUN_ADMISSION_TIMEOUT_SECS: u64 = 30;
 const METRIC_RUN_ADMISSION_ATTEMPTS_TOTAL: &str = "astra_run_admission_attempts_total";
 const METRIC_RUN_ADMISSION_WAIT_MS_TOTAL: &str = "astra_run_admission_wait_ms_total";
 const METRIC_DURABLE_RUN_EVENT_BATCHES_TOTAL: &str = "astra_durable_run_event_batches_total";
@@ -129,6 +130,26 @@ const ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV: &str =
 const DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY: usize = 4;
 const DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS: u64 = 1_000;
 static POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+fn run_admission_timeout() -> Duration {
+    match std::env::var(ASTRA_RUN_ADMISSION_TIMEOUT_SECS_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => Duration::from_secs(DEFAULT_RUN_ADMISSION_TIMEOUT_SECS),
+            Ok(value) => Duration::from_secs(value),
+            Err(error) => {
+                tracing::warn!(
+                    env = ASTRA_RUN_ADMISSION_TIMEOUT_SECS_ENV,
+                    value = %raw,
+                    default_secs = DEFAULT_RUN_ADMISSION_TIMEOUT_SECS,
+                    error = %error,
+                    "invalid run admission timeout; using default"
+                );
+                Duration::from_secs(DEFAULT_RUN_ADMISSION_TIMEOUT_SECS)
+            }
+        },
+        Err(_) => Duration::from_secs(DEFAULT_RUN_ADMISSION_TIMEOUT_SECS),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunAdmissionError {
@@ -5566,9 +5587,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         };
 
         // ── Global admission control: limit concurrent agentic loop tasks ──
-        // Wait up to 30 s for a slot (previously immediate 503);
-        // if no slot frees up, return 503.
-        let permit = match self.acquire_run_permit(RUN_ADMISSION_TIMEOUT).await {
+        // Wait for a configured interval before returning a structured 503.
+        let permit = match self.acquire_run_permit(run_admission_timeout()).await {
             Ok(permit) => permit,
             Err(error) => {
                 let failure_reason = match error {
@@ -6462,8 +6482,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         };
 
         // ── Global admission control: limit concurrent agentic loop tasks ──
-        // Wait up to 30 s for a slot; if no slot frees up, return 503.
-        let permit = match self.acquire_run_permit(RUN_ADMISSION_TIMEOUT).await {
+        // Wait for a configured interval before returning a structured 503.
+        let permit = match self.acquire_run_permit(run_admission_timeout()).await {
             Ok(permit) => permit,
             Err(error) => {
                 let failure_reason = match error {
@@ -16757,6 +16777,30 @@ mod tests {
         assert!(
             rendered.contains("astra_run_admission_attempts_total{outcome=\"closed\"} 1"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn run_admission_timeout_is_configurable_with_default_fallback() {
+        let _default = EnvVarGuard::remove(ASTRA_RUN_ADMISSION_TIMEOUT_SECS_ENV);
+        assert_eq!(
+            run_admission_timeout(),
+            Duration::from_secs(DEFAULT_RUN_ADMISSION_TIMEOUT_SECS)
+        );
+
+        let _custom = EnvVarGuard::set(ASTRA_RUN_ADMISSION_TIMEOUT_SECS_ENV, "90");
+        assert_eq!(run_admission_timeout(), Duration::from_secs(90));
+
+        let _zero = EnvVarGuard::set(ASTRA_RUN_ADMISSION_TIMEOUT_SECS_ENV, "0");
+        assert_eq!(
+            run_admission_timeout(),
+            Duration::from_secs(DEFAULT_RUN_ADMISSION_TIMEOUT_SECS)
+        );
+
+        let _invalid = EnvVarGuard::set(ASTRA_RUN_ADMISSION_TIMEOUT_SECS_ENV, "not-a-number");
+        assert_eq!(
+            run_admission_timeout(),
+            Duration::from_secs(DEFAULT_RUN_ADMISSION_TIMEOUT_SECS)
         );
     }
 
