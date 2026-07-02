@@ -23,7 +23,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{MySql, QueryBuilder, Row};
 
 use crate::db_row::{
     RowExt as LearningStatsDbRow, RowExt as TaskListDbRow, RowExt as TaskRecordDbRow,
@@ -240,6 +240,19 @@ pub struct TaskListItem {
     pub claimability: Option<TaskClaimability>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskListCursor {
+    pub updated_at: String,
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskListPage {
+    pub tasks: Vec<TaskListItem>,
+    pub limit: usize,
+    pub next_cursor: Option<TaskListCursor>,
+}
+
 /// Task outcome for learning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -374,6 +387,18 @@ pub trait TaskService: Send + Sync {
         status_filter: Option<TaskStatus>,
     ) -> Result<Vec<TaskListItem>, String>;
 
+    /// Cursor-paginated recent task history for a user.
+    async fn list_recent_tasks_page(
+        &self,
+        user_id: &str,
+        status_filter: Option<TaskStatus>,
+        limit: usize,
+        cursor: Option<TaskListCursor>,
+    ) -> Result<TaskListPage, String> {
+        let tasks = self.list_recent_tasks(user_id, status_filter).await?;
+        task_list_page_from_items(tasks, limit, cursor)
+    }
+
     /// List recent task history for a single session (optionally filter by status).
     async fn list_recent_tasks_for_session(
         &self,
@@ -381,6 +406,21 @@ pub trait TaskService: Send + Sync {
         session_id: &str,
         status_filter: Option<TaskStatus>,
     ) -> Result<Vec<TaskListItem>, String>;
+
+    /// Cursor-paginated recent task history for a single session.
+    async fn list_recent_tasks_for_session_page(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        status_filter: Option<TaskStatus>,
+        limit: usize,
+        cursor: Option<TaskListCursor>,
+    ) -> Result<TaskListPage, String> {
+        let tasks = self
+            .list_recent_tasks_for_session(user_id, session_id, status_filter)
+            .await?;
+        task_list_page_from_items(tasks, limit, cursor)
+    }
 
     /// Search tasks for a user using the shared CLI lookup semantics.
     ///
@@ -613,6 +653,108 @@ pub(crate) const AGENT_TASK_LIST_SELECT_COLUMNS: &str = "task_id, user_id, sessi
      CAST(updated_at AS CHAR) AS updated_at, \
      CAST(completed_at AS CHAR) AS completed_at";
 
+const AGENT_TASK_LIST_CURSOR_SELECT_COLUMNS: &str = "task_id, user_id, session_id, parent_task_id, title, \
+     NULL AS description, status, progress_pct, items_done, items_total, \
+     NULL AS plan_json, NULL AS checkpoint_json, error_message, \
+     user_rating, completion_time_sec, replan_count, auto_adjustments, \
+     outcome, project_type, goal_pattern, agent_id, NULL AS claimability, \
+     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at, \
+     DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%f') AS updated_at, \
+     DATE_FORMAT(completed_at, '%Y-%m-%dT%H:%i:%s.%f') AS completed_at";
+
+#[must_use]
+pub fn validate_task_list_limit(limit: usize) -> usize {
+    limit.clamp(1, MAX_TASK_LIST_ROWS)
+}
+
+#[must_use]
+fn task_list_query_limit(limit: usize) -> i64 {
+    validate_task_list_limit(limit) as i64 + 1
+}
+
+pub fn task_list_cursor_db_updated_at(cursor: &TaskListCursor) -> Result<String, String> {
+    let updated_at = cursor.updated_at.trim();
+    if updated_at.is_empty() {
+        return Err("invalid task list cursor: updated_at is required".to_string());
+    }
+    let mut db_updated_at = updated_at.replace('T', " ");
+    if let Some(stripped) = db_updated_at.strip_suffix('Z') {
+        db_updated_at = stripped.to_string();
+    }
+    if chrono::NaiveDateTime::parse_from_str(&db_updated_at, "%Y-%m-%d %H:%M:%S%.f").is_err() {
+        return chrono::DateTime::parse_from_rfc3339(updated_at)
+            .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+            .map_err(|_| format!("invalid task list cursor timestamp: {updated_at}"));
+    }
+    Ok(db_updated_at)
+}
+
+pub fn task_list_cursor_task_id(cursor: &TaskListCursor) -> Result<String, String> {
+    let task_id = cursor.task_id.trim();
+    if task_id.is_empty() {
+        return Err("invalid task list cursor: task_id is required".to_string());
+    }
+    Ok(task_id.to_string())
+}
+
+fn task_list_sort_recent(tasks: &mut [TaskListItem]) {
+    tasks.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.task_id.cmp(&left.task_id))
+    });
+}
+
+fn task_list_item_after_cursor(task: &TaskListItem, cursor: &TaskListCursor) -> bool {
+    task.updated_at < cursor.updated_at
+        || (task.updated_at == cursor.updated_at && task.task_id < cursor.task_id)
+}
+
+fn task_list_cursor_from_item(task: &TaskListItem) -> Result<TaskListCursor, String> {
+    if task.updated_at.trim().is_empty() {
+        return Err(format!(
+            "invalid agent_tasks cursor: task_id={}, column=updated_at, value is empty",
+            task.task_id
+        ));
+    }
+    if task.task_id.trim().is_empty() {
+        return Err("invalid agent_tasks cursor: column=task_id, value is empty".to_string());
+    }
+    Ok(TaskListCursor {
+        updated_at: task.updated_at.clone(),
+        task_id: task.task_id.clone(),
+    })
+}
+
+fn task_list_page_from_items(
+    mut tasks: Vec<TaskListItem>,
+    limit: usize,
+    cursor: Option<TaskListCursor>,
+) -> Result<TaskListPage, String> {
+    let limit = validate_task_list_limit(limit);
+    task_list_sort_recent(&mut tasks);
+    if let Some(cursor) = &cursor {
+        task_list_cursor_db_updated_at(cursor)?;
+        task_list_cursor_task_id(cursor)?;
+        tasks.retain(|task| task_list_item_after_cursor(task, cursor));
+    }
+    let has_more = tasks.len() > limit;
+    if has_more {
+        tasks.truncate(limit);
+    }
+    let next_cursor = if has_more {
+        tasks.last().map(task_list_cursor_from_item).transpose()?
+    } else {
+        None
+    };
+    Ok(TaskListPage {
+        tasks,
+        limit,
+        next_cursor,
+    })
+}
+
 fn decode_task_status_guard_row(
     row: &impl TaskStatusGuardDbRow,
     task_id: &str,
@@ -706,6 +848,31 @@ fn decode_task_list_item(row: &impl TaskListDbRow) -> Result<TaskListItem, Strin
         error_message: task_list_optional_string(row, "error_message")?,
         project_type: task_list_optional_string(row, "project_type")?,
         claimability: task_list_claimability(row)?,
+    })
+}
+
+fn task_list_page_from_db_rows(
+    rows: Vec<sqlx::mysql::MySqlRow>,
+    limit: usize,
+) -> Result<TaskListPage, String> {
+    let limit = validate_task_list_limit(limit);
+    let mut tasks = rows
+        .iter()
+        .map(MatrixOneTaskService::parse_mysql_list_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    let has_more = tasks.len() > limit;
+    if has_more {
+        tasks.truncate(limit);
+    }
+    let next_cursor = if has_more {
+        tasks.last().map(task_list_cursor_from_item).transpose()?
+    } else {
+        None
+    };
+    Ok(TaskListPage {
+        tasks,
+        limit,
+        next_cursor,
     })
 }
 
@@ -1146,7 +1313,8 @@ impl TaskService for MatrixOneTaskService {
         let rows = if let Some(status) = status_filter {
             sqlx::query(&format!(
                 "SELECT {AGENT_TASK_LIST_SELECT_COLUMNS} \
-                 FROM agent_tasks WHERE user_id = ? AND status = ? ORDER BY updated_at DESC LIMIT {}",
+                 FROM agent_tasks WHERE user_id = ? AND status = ? \
+                 ORDER BY updated_at DESC, task_id DESC LIMIT {}",
                 MAX_TASK_LIST_ROWS
             ))
             .bind(user_id)
@@ -1156,7 +1324,8 @@ impl TaskService for MatrixOneTaskService {
         } else {
             sqlx::query(&format!(
                 "SELECT {AGENT_TASK_LIST_SELECT_COLUMNS} \
-                 FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC LIMIT {}",
+                 FROM agent_tasks WHERE user_id = ? \
+                 ORDER BY updated_at DESC, task_id DESC LIMIT {}",
                 MAX_TASK_LIST_ROWS
             ))
             .bind(user_id)
@@ -1166,6 +1335,45 @@ impl TaskService for MatrixOneTaskService {
         .map_err(|e| format!("list_recent_tasks: {e}"))?;
 
         rows.iter().map(Self::parse_mysql_list_row).collect()
+    }
+
+    async fn list_recent_tasks_page(
+        &self,
+        user_id: &str,
+        status_filter: Option<TaskStatus>,
+        limit: usize,
+        cursor: Option<TaskListCursor>,
+    ) -> Result<TaskListPage, String> {
+        let limit = validate_task_list_limit(limit);
+        let mut qb = QueryBuilder::<MySql>::new(format!(
+            "SELECT {AGENT_TASK_LIST_CURSOR_SELECT_COLUMNS} \
+             FROM agent_tasks WHERE user_id = "
+        ));
+        qb.push_bind(user_id);
+        if let Some(status) = status_filter {
+            qb.push(" AND status = ");
+            qb.push_bind(status.as_str());
+        }
+        if let Some(cursor) = &cursor {
+            let updated_at = task_list_cursor_db_updated_at(cursor)?;
+            let task_id = task_list_cursor_task_id(cursor)?;
+            qb.push(" AND (updated_at < ");
+            qb.push_bind(updated_at.clone());
+            qb.push(" OR (updated_at = ");
+            qb.push_bind(updated_at);
+            qb.push(" AND task_id < ");
+            qb.push_bind(task_id);
+            qb.push("))");
+        }
+        qb.push(" ORDER BY updated_at DESC, task_id DESC LIMIT ");
+        qb.push_bind(task_list_query_limit(limit));
+
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("list_recent_tasks_page: {e}"))?;
+        task_list_page_from_db_rows(rows, limit)
     }
 
     async fn list_recent_tasks_for_session(
@@ -1178,7 +1386,7 @@ impl TaskService for MatrixOneTaskService {
             sqlx::query(&format!(
                 "SELECT {AGENT_TASK_LIST_SELECT_COLUMNS} \
                  FROM agent_tasks WHERE user_id = ? AND session_id = ? AND status = ? \
-                 ORDER BY updated_at DESC LIMIT {}",
+                 ORDER BY updated_at DESC, task_id DESC LIMIT {}",
                 MAX_TASK_LIST_ROWS
             ))
             .bind(user_id)
@@ -1190,7 +1398,7 @@ impl TaskService for MatrixOneTaskService {
             sqlx::query(&format!(
                 "SELECT {AGENT_TASK_LIST_SELECT_COLUMNS} \
                  FROM agent_tasks WHERE user_id = ? AND session_id = ? \
-                 ORDER BY updated_at DESC LIMIT {}",
+                 ORDER BY updated_at DESC, task_id DESC LIMIT {}",
                 MAX_TASK_LIST_ROWS
             ))
             .bind(user_id)
@@ -1201,6 +1409,48 @@ impl TaskService for MatrixOneTaskService {
         .map_err(|e| format!("list_recent_tasks_for_session: {e}"))?;
 
         rows.iter().map(Self::parse_mysql_list_row).collect()
+    }
+
+    async fn list_recent_tasks_for_session_page(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        status_filter: Option<TaskStatus>,
+        limit: usize,
+        cursor: Option<TaskListCursor>,
+    ) -> Result<TaskListPage, String> {
+        let limit = validate_task_list_limit(limit);
+        let mut qb = QueryBuilder::<MySql>::new(format!(
+            "SELECT {AGENT_TASK_LIST_CURSOR_SELECT_COLUMNS} \
+             FROM agent_tasks WHERE user_id = "
+        ));
+        qb.push_bind(user_id);
+        qb.push(" AND session_id = ");
+        qb.push_bind(session_id);
+        if let Some(status) = status_filter {
+            qb.push(" AND status = ");
+            qb.push_bind(status.as_str());
+        }
+        if let Some(cursor) = &cursor {
+            let updated_at = task_list_cursor_db_updated_at(cursor)?;
+            let task_id = task_list_cursor_task_id(cursor)?;
+            qb.push(" AND (updated_at < ");
+            qb.push_bind(updated_at.clone());
+            qb.push(" OR (updated_at = ");
+            qb.push_bind(updated_at);
+            qb.push(" AND task_id < ");
+            qb.push_bind(task_id);
+            qb.push("))");
+        }
+        qb.push(" ORDER BY updated_at DESC, task_id DESC LIMIT ");
+        qb.push_bind(task_list_query_limit(limit));
+
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("list_recent_tasks_for_session_page: {e}"))?;
+        task_list_page_from_db_rows(rows, limit)
     }
 
     async fn search_tasks(
@@ -1234,7 +1484,7 @@ impl TaskService for MatrixOneTaskService {
                  OR LOWER(title) = LOWER(?) \
                  OR LOWER(title) LIKE LOWER(?) ESCAPE '\\\\' \
              ) \
-             ORDER BY match_rank ASC, updated_at DESC \
+             ORDER BY match_rank ASC, updated_at DESC, task_id DESC \
              LIMIT {}",
             sql_limit
         ))
@@ -1919,7 +2169,7 @@ impl TaskService for LocalTaskService {
                 });
             }
         }
-        tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        task_list_sort_recent(&mut tasks);
         Ok(tasks)
     }
 
@@ -1963,7 +2213,7 @@ impl TaskService for LocalTaskService {
                 });
             }
         }
-        tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        task_list_sort_recent(&mut tasks);
         Ok(tasks)
     }
 
@@ -3852,6 +4102,102 @@ mod tests {
     #[test]
     fn task_list_limit_is_bounded() {
         assert_eq!(MAX_TASK_LIST_ROWS, 200);
+        assert_eq!(validate_task_list_limit(0), 1);
+        assert_eq!(validate_task_list_limit(20), 20);
+        assert_eq!(validate_task_list_limit(usize::MAX), MAX_TASK_LIST_ROWS);
+        assert_eq!(task_list_query_limit(MAX_TASK_LIST_ROWS), 201);
+    }
+
+    #[test]
+    fn task_list_cursor_validates_timestamp_and_task_id() {
+        let cursor = TaskListCursor {
+            updated_at: "2026-10-01T12:34:56.123456".to_string(),
+            task_id: "task-1".to_string(),
+        };
+        assert_eq!(
+            task_list_cursor_db_updated_at(&cursor).unwrap(),
+            "2026-10-01 12:34:56.123456"
+        );
+        assert_eq!(task_list_cursor_task_id(&cursor).unwrap(), "task-1");
+
+        let rfc3339_offset = TaskListCursor {
+            updated_at: "2026-10-01T20:34:56.123456+08:00".to_string(),
+            task_id: "task-1".to_string(),
+        };
+        assert_eq!(
+            task_list_cursor_db_updated_at(&rfc3339_offset).unwrap(),
+            "2026-10-01 12:34:56.123456"
+        );
+
+        let invalid_time = TaskListCursor {
+            updated_at: "not-a-date".to_string(),
+            task_id: "task-1".to_string(),
+        };
+        assert!(task_list_cursor_db_updated_at(&invalid_time).is_err());
+
+        let missing_id = TaskListCursor {
+            updated_at: "2026-10-01T12:34:56.123456".to_string(),
+            task_id: "  ".to_string(),
+        };
+        assert!(task_list_cursor_task_id(&missing_id).is_err());
+    }
+
+    fn test_task_list_item(task_id: &str, updated_at: &str) -> TaskListItem {
+        TaskListItem {
+            task_id: task_id.to_string(),
+            title: format!("Task {task_id}"),
+            session_id: Some("sess-1".to_string()),
+            status: TaskStatus::Pending,
+            progress_pct: 0,
+            items_done: 0,
+            items_total: 1,
+            created_at: "2026-10-01T00:00:00.000000".to_string(),
+            updated_at: updated_at.to_string(),
+            completed_at: None,
+            outcome: None,
+            error_message: None,
+            project_type: None,
+            claimability: None,
+        }
+    }
+
+    #[test]
+    fn task_list_page_uses_stable_seek_cursor() {
+        let tasks = vec![
+            test_task_list_item("task-a", "2026-10-01T12:00:00.000000"),
+            test_task_list_item("task-c", "2026-10-01T12:00:00.000000"),
+            test_task_list_item("task-b", "2026-10-01T12:00:00.000000"),
+            test_task_list_item("task-old", "2026-09-30T12:00:00.000000"),
+        ];
+
+        let first = task_list_page_from_items(tasks.clone(), 2, None).unwrap();
+        assert_eq!(first.limit, 2);
+        assert_eq!(
+            first
+                .tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-c", "task-b"]
+        );
+        assert_eq!(
+            first.next_cursor,
+            Some(TaskListCursor {
+                updated_at: "2026-10-01T12:00:00.000000".to_string(),
+                task_id: "task-b".to_string(),
+            })
+        );
+
+        let second = task_list_page_from_items(tasks, 2, first.next_cursor).unwrap();
+        assert_eq!(
+            second
+                .tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-a", "task-old"]
+        );
+        assert!(second.next_cursor.is_none());
     }
 
     // ── LocalTaskService ──

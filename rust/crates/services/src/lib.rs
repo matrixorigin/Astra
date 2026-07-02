@@ -321,8 +321,9 @@ pub use sync_engine::{
 };
 pub use task_orchestrator::{
     LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskClaimability,
-    TaskCreateRequest, TaskListItem, TaskOutcome, TaskPlan, TaskRecord, TaskService, TaskStatus,
-    UnconfiguredTaskService,
+    TaskCreateRequest, TaskListCursor, TaskListItem, TaskListPage, TaskOutcome, TaskPlan,
+    TaskRecord, TaskService, TaskStatus, UnconfiguredTaskService, task_list_cursor_db_updated_at,
+    task_list_cursor_task_id, validate_task_list_limit,
 };
 pub use triggers::{
     DatabaseTriggerService, TriggerCreateRequestData, TriggerRecord, TriggerService,

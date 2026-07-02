@@ -12,6 +12,10 @@ pub(super) struct TaskListQuery {
     pub status: Option<String>,
     /// Optional session filter.
     pub session_id: Option<String>,
+    #[serde(default = "default_task_list_limit")]
+    pub limit: usize,
+    pub after_updated_at: Option<String>,
+    pub after_task_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -26,7 +30,8 @@ pub(super) struct TaskProgressQuery {
 #[derive(Serialize)]
 pub(super) struct TaskListResponse {
     pub tasks: Vec<astra_services::TaskListItem>,
-    pub total: usize,
+    pub limit: usize,
+    pub next_cursor: Option<astra_services::TaskListCursor>,
 }
 
 #[derive(Serialize)]
@@ -46,6 +51,35 @@ pub(super) struct TaskProgressResponse {
     pub progress_events: Vec<PlanProgressEventResponse>,
 }
 
+fn default_task_list_limit() -> usize {
+    50
+}
+
+impl TaskListQuery {
+    fn cursor(
+        &self,
+    ) -> Result<Option<astra_services::TaskListCursor>, (StatusCode, Json<ErrorResponse>)> {
+        match (&self.after_updated_at, &self.after_task_id) {
+            (None, None) => Ok(None),
+            (Some(updated_at), Some(task_id)) => {
+                let cursor = astra_services::TaskListCursor {
+                    updated_at: updated_at.clone(),
+                    task_id: task_id.clone(),
+                };
+                astra_services::task_list_cursor_db_updated_at(&cursor)
+                    .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+                astra_services::task_list_cursor_task_id(&cursor)
+                    .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+                Ok(Some(cursor))
+            }
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "task list cursor requires both after_updated_at and after_task_id",
+            )),
+        }
+    }
+}
+
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
 /// `GET /tasks` — list background tasks for the authenticated user.
@@ -58,24 +92,34 @@ pub(super) async fn list_tasks_handler(
 
     let status_filter = parse_task_status_filter("status", query.status.as_deref())?;
 
-    let tasks = if let Some(session_id) = query.session_id.as_deref() {
+    let cursor = query.cursor()?;
+    let page = if let Some(session_id) = query.session_id.as_deref() {
         state
             .execution
             .task_service
-            .list_recent_tasks_for_session(&user.user_id, session_id, status_filter)
+            .list_recent_tasks_for_session_page(
+                &user.user_id,
+                session_id,
+                status_filter,
+                query.limit,
+                cursor,
+            )
             .await
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
     } else {
         state
             .execution
             .task_service
-            .list_recent_tasks(&user.user_id, status_filter)
+            .list_recent_tasks_page(&user.user_id, status_filter, query.limit, cursor)
             .await
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
     };
 
-    let total = tasks.len();
-    Ok(Json(TaskListResponse { tasks, total }))
+    Ok(Json(TaskListResponse {
+        tasks: page.tasks,
+        limit: page.limit,
+        next_cursor: page.next_cursor,
+    }))
 }
 
 /// `GET /tasks/{task_id}` — get a single background task with its plan.
@@ -1025,6 +1069,38 @@ mod tests {
         assert!(
             status.is_err(),
             "PUT /tasks/:task_id/status should reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn task_list_query_cursor_requires_complete_seek_key() {
+        let q = serde_json::from_value::<TaskListQuery>(serde_json::json!({
+            "limit": 10,
+            "after_updated_at": "2026-10-01T12:34:56.123456",
+            "after_task_id": "task-5"
+        }))
+        .unwrap();
+        let cursor = q.cursor().unwrap().unwrap();
+        assert_eq!(cursor.updated_at, "2026-10-01T12:34:56.123456");
+        assert_eq!(cursor.task_id, "task-5");
+
+        let missing_task_id = serde_json::from_value::<TaskListQuery>(serde_json::json!({
+            "after_updated_at": "2026-10-01T12:34:56.123456"
+        }))
+        .unwrap();
+        assert_eq!(
+            missing_task_id.cursor().unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let invalid_timestamp = serde_json::from_value::<TaskListQuery>(serde_json::json!({
+            "after_updated_at": "not-a-date",
+            "after_task_id": "task-5"
+        }))
+        .unwrap();
+        assert_eq!(
+            invalid_timestamp.cursor().unwrap_err().0,
+            StatusCode::BAD_REQUEST
         );
     }
 
