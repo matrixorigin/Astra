@@ -87,6 +87,8 @@ If `reasoning_model_name` is not set, the server falls back to the cheapest acti
 - `ASTRA_LLM_PROVIDER_ADMISSION_BURST` — optional RPM pacing burst; defaults to strict smoothing (`1`), raise only when provider burst capacity is proven
 - `ASTRA_AUX_LLM_POLICY` — global policy for optional auxiliary LLM calls; `capacity_aware` by default skips optional auxiliary calls when provider admission is enabled, `always` preserves them, `disabled` turns them off
 - `ASTRA_TURN_INTENT_JUDGE_POLICY`, `ASTRA_FACTUAL_RETRY_JUDGE_POLICY`, `ASTRA_PRE_TURN_COMPACTION_LLM_POLICY` — per-purpose overrides for auxiliary LLM policy
+- `ASTRA_TURN_OBSERVER_MODE` — server-loop Memoria observer dispatch mode; `async` by default keeps terminal run finalization from waiting on observer HTTP calls, `inline` restores synchronous completion, `disabled` skips the optional observer
+- `ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY` — max in-flight async server-loop observer calls per process; default `4`, and `0` drops async observer requests without sending them
 - `ASTRA_CAPTURE_TRACES`
 
 ### Observability

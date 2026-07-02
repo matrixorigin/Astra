@@ -53,6 +53,92 @@ struct TranscriptPageItemRow {
     content_hash: String,
 }
 
+const ASTRA_TURN_OBSERVER_MODE_ENV: &str = "ASTRA_TURN_OBSERVER_MODE";
+const ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV: &str = "ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY";
+const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
+static TURN_OBSERVER_ASYNC_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnObserverMode {
+    Async,
+    Inline,
+    Disabled,
+}
+
+impl TurnObserverMode {
+    fn from_env() -> Self {
+        match std::env::var(ASTRA_TURN_OBSERVER_MODE_ENV) {
+            Ok(value) => Self::parse(&value).unwrap_or_else(|| {
+                tracing::warn!(
+                    env = ASTRA_TURN_OBSERVER_MODE_ENV,
+                    value = %value,
+                    "invalid turn observer mode; defaulting to async"
+                );
+                Self::Async
+            }),
+            Err(_) => Self::Async,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "async" | "background" | "fire_and_forget" => Some(Self::Async),
+            "inline" | "sync" | "synchronous" => Some(Self::Inline),
+            "disabled" | "disable" | "off" | "none" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+}
+
+struct TurnObserverAsyncPermit;
+
+impl Drop for TurnObserverAsyncPermit {
+    fn drop(&mut self) {
+        TURN_OBSERVER_ASYNC_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+fn turn_observer_async_concurrency_limit() -> usize {
+    match std::env::var(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV) {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(limit) => limit,
+            Err(_) => {
+                tracing::warn!(
+                    env = ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV,
+                    value = %value,
+                    default = DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
+                    "invalid turn observer async concurrency; using default"
+                );
+                DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY
+            }
+        },
+        Err(_) => DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
+    }
+}
+
+fn try_acquire_turn_observer_async_permit(limit: usize) -> Option<TurnObserverAsyncPermit> {
+    if limit == 0 {
+        return None;
+    }
+
+    let mut current = TURN_OBSERVER_ASYNC_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return None;
+        }
+        match TURN_OBSERVER_ASYNC_IN_FLIGHT.compare_exchange_weak(
+            current,
+            current + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(TurnObserverAsyncPermit),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn lifecycle_token_usage_json(
     input_tokens: u64,
     cached_input_tokens: u64,
@@ -173,9 +259,8 @@ impl PostLoopPersistContext {
         }
 
         // 5. Fire Memoria observer (cross-session knowledge extraction).
-        if let Some(ref worker) = self.observer_worker {
-            fire_server_loop_observer(worker.as_ref(), &self.user_id, &self.session_id, state)
-                .await;
+        if let Some(worker) = self.observer_worker.clone() {
+            fire_server_loop_observer(worker, &self.user_id, &self.session_id, state).await;
         }
 
         // 6. Fire SessionEnd hooks.
@@ -1840,11 +1925,50 @@ async fn persist_server_loop_hook_events(
 /// This sends the conversation messages to the Memoria `/v1/observe` endpoint
 /// for cross-session knowledge extraction.
 async fn fire_server_loop_observer(
-    observer_worker: &dyn TurnObserverWorker,
+    observer_worker: Arc<dyn TurnObserverWorker>,
     user_id: &str,
     session_id: &str,
     state: &AgenticLoopState,
 ) {
+    let Some(request) = build_server_loop_observer_request(user_id, session_id, state) else {
+        return;
+    };
+
+    match TurnObserverMode::from_env() {
+        TurnObserverMode::Disabled => {
+            tracing::debug!(
+                session_id = %session_id,
+                "server-loop observer disabled"
+            );
+        }
+        TurnObserverMode::Inline => {
+            run_server_loop_observer_request(observer_worker.as_ref(), session_id, request).await;
+        }
+        TurnObserverMode::Async => {
+            let concurrency_limit = turn_observer_async_concurrency_limit();
+            let Some(permit) = try_acquire_turn_observer_async_permit(concurrency_limit) else {
+                tracing::debug!(
+                    session_id = %session_id,
+                    concurrency_limit,
+                    "server-loop observer async concurrency full; dropping best-effort request"
+                );
+                return;
+            };
+            let session_id = session_id.to_string();
+            tokio::spawn(async move {
+                let _permit = permit;
+                run_server_loop_observer_request(observer_worker.as_ref(), &session_id, request)
+                    .await;
+            });
+        }
+    }
+}
+
+fn build_server_loop_observer_request(
+    user_id: &str,
+    session_id: &str,
+    state: &AgenticLoopState,
+) -> Option<TurnObserverRequest> {
     let messages: Vec<serde_json::Map<String, serde_json::Value>> = state
         .messages
         .iter()
@@ -1852,21 +1976,27 @@ async fn fire_server_loop_observer(
         .collect();
 
     if messages.is_empty() {
-        return;
+        return None;
     }
 
     let turn_count = state
         .session_turn
         .max(state.max_turns.saturating_sub(state.remaining_turns) as u32)
         as i64;
-    let request = TurnObserverRequest {
+    Some(TurnObserverRequest {
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
         messages,
         turn_count,
         session_start: None,
-    };
+    })
+}
 
+async fn run_server_loop_observer_request(
+    observer_worker: &dyn TurnObserverWorker,
+    session_id: &str,
+    request: TurnObserverRequest,
+) {
     if let Err(e) = observer_worker.run(request).await {
         astra_core::agent_error!(
             "server-loop",
@@ -1952,6 +2082,9 @@ pub(crate) fn build_run_turn_complete_event_with_interruption(
 mod tests {
     use super::*;
     use sqlx::Row;
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     static SHARED_BOOTSTRAP: tokio::sync::OnceCell<astra_core::SharedPool> =
@@ -1979,6 +2112,36 @@ mod tests {
             .clone()
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[derive(Default)]
     struct CaptureToolEventWriter {
         plans: std::sync::Mutex<Vec<TurnToolEventPersistPlan>>,
@@ -2003,6 +2166,234 @@ mod tests {
             self.plans.lock().expect("capture lock").push(plan);
             Ok(())
         }
+    }
+
+    struct CaptureObserverWorker {
+        calls: AtomicUsize,
+        requests: std::sync::Mutex<Vec<TurnObserverRequest>>,
+        started: Notify,
+        release: Notify,
+        block_until_released: bool,
+    }
+
+    impl CaptureObserverWorker {
+        fn new(block_until_released: bool) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                requests: std::sync::Mutex::new(Vec::new()),
+                started: Notify::new(),
+                release: Notify::new(),
+                block_until_released,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnObserverWorker for CaptureObserverWorker {
+        async fn run(&self, request: TurnObserverRequest) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().expect("capture lock").push(request);
+            self.started.notify_waiters();
+            if self.block_until_released {
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    fn observer_test_state() -> AgenticLoopState {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "world"}),
+        ];
+        state.session_turn = 3;
+        state.max_turns = 12;
+        state.remaining_turns = 8;
+        state
+    }
+
+    async fn wait_for_observer_calls(worker: &CaptureObserverWorker, expected: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            if worker.call_count() >= expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "observer call count did not reach {expected}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_observer_in_flight(expected: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let current = TURN_OBSERVER_ASYNC_IN_FLIGHT.load(Ordering::SeqCst);
+            if current == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "observer in-flight count stayed at {current}, expected {expected}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn turn_observer_mode_parses_supported_values() {
+        assert_eq!(TurnObserverMode::parse(""), Some(TurnObserverMode::Async));
+        assert_eq!(
+            TurnObserverMode::parse("background"),
+            Some(TurnObserverMode::Async)
+        );
+        assert_eq!(
+            TurnObserverMode::parse("inline"),
+            Some(TurnObserverMode::Inline)
+        );
+        assert_eq!(
+            TurnObserverMode::parse("off"),
+            Some(TurnObserverMode::Disabled)
+        );
+        assert_eq!(TurnObserverMode::parse("surprise"), None);
+    }
+
+    #[test]
+    #[serial_test::serial(turn_observer_mode_env)]
+    fn turn_observer_mode_defaults_to_async() {
+        let _mode = EnvVarGuard::remove(ASTRA_TURN_OBSERVER_MODE_ENV);
+        assert_eq!(TurnObserverMode::from_env(), TurnObserverMode::Async);
+    }
+
+    #[test]
+    #[serial_test::serial(turn_observer_mode_env)]
+    fn turn_observer_async_concurrency_defaults_and_parses() {
+        {
+            let _limit = EnvVarGuard::remove(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV);
+            assert_eq!(
+                turn_observer_async_concurrency_limit(),
+                DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY
+            );
+        }
+        {
+            let _limit = EnvVarGuard::set(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV, "0");
+            assert_eq!(turn_observer_async_concurrency_limit(), 0);
+        }
+        {
+            let _limit = EnvVarGuard::set(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV, "7");
+            assert_eq!(turn_observer_async_concurrency_limit(), 7);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(turn_observer_mode_env)]
+    async fn server_loop_observer_disabled_does_not_run_worker() {
+        let _mode = EnvVarGuard::set(ASTRA_TURN_OBSERVER_MODE_ENV, "disabled");
+        let observer = Arc::new(CaptureObserverWorker::new(false));
+        let state = observer_test_state();
+
+        fire_server_loop_observer(observer.clone(), "user-1", "session-1", &state).await;
+
+        assert_eq!(observer.call_count(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(turn_observer_mode_env)]
+    async fn server_loop_observer_async_does_not_block_caller() {
+        let _mode = EnvVarGuard::set(ASTRA_TURN_OBSERVER_MODE_ENV, "async");
+        let _limit = EnvVarGuard::set(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV, "4");
+        let observer = Arc::new(CaptureObserverWorker::new(true));
+        let started = observer.started.notified();
+        let state = observer_test_state();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fire_server_loop_observer(observer.clone(), "user-1", "session-1", &state),
+        )
+        .await
+        .expect("async observer dispatch should return without waiting for worker");
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), started)
+            .await
+            .expect("spawned observer should start");
+        wait_for_observer_calls(observer.as_ref(), 1).await;
+        observer.release.notify_waiters();
+        wait_for_observer_in_flight(0).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(turn_observer_mode_env)]
+    async fn server_loop_observer_async_limit_drops_extra_request() {
+        let _mode = EnvVarGuard::set(ASTRA_TURN_OBSERVER_MODE_ENV, "async");
+        let _limit = EnvVarGuard::set(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV, "1");
+        let first = Arc::new(CaptureObserverWorker::new(true));
+        let second = Arc::new(CaptureObserverWorker::new(false));
+        let first_started = first.started.notified();
+        let state = observer_test_state();
+
+        fire_server_loop_observer(first.clone(), "user-1", "session-1", &state).await;
+        tokio::time::timeout(std::time::Duration::from_millis(500), first_started)
+            .await
+            .expect("first observer should start");
+        wait_for_observer_calls(first.as_ref(), 1).await;
+        wait_for_observer_in_flight(1).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fire_server_loop_observer(second.clone(), "user-1", "session-2", &state),
+        )
+        .await
+        .expect("full async observer pool should drop without blocking");
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(second.call_count(), 0);
+        first.release.notify_waiters();
+        wait_for_observer_in_flight(0).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(turn_observer_mode_env)]
+    async fn server_loop_observer_inline_waits_for_worker() {
+        let _mode = EnvVarGuard::set(ASTRA_TURN_OBSERVER_MODE_ENV, "inline");
+        let observer = Arc::new(CaptureObserverWorker::new(true));
+        let observer_for_task = observer.clone();
+        let started = observer.started.notified();
+        let state = observer_test_state();
+        let mut dispatch = tokio::spawn(async move {
+            fire_server_loop_observer(observer_for_task, "user-1", "session-1", &state).await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), started)
+            .await
+            .expect("inline observer should start");
+        assert_eq!(observer.call_count(), 1);
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut dispatch)
+            .await
+            .expect_err("inline observer should wait for worker completion");
+
+        observer.release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut dispatch)
+            .await
+            .expect("inline observer should finish after worker release")
+            .expect("inline observer task should not panic");
+    }
+
+    #[test]
+    fn server_loop_observer_request_uses_session_turn_count() {
+        let state = observer_test_state();
+        let request = build_server_loop_observer_request("user-1", "session-1", &state)
+            .expect("observer request");
+
+        assert_eq!(request.user_id, "user-1");
+        assert_eq!(request.session_id, "session-1");
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.turn_count, 4);
     }
 
     #[test]
