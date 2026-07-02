@@ -30,7 +30,7 @@ use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::turn::run_control::RunInputProvider;
+use crate::turn::run_control::{RunControlProvider, RunControlStatus, RunInputProvider};
 use astra_core::{
     ErrorResponse, SharedPool, connect_matrixone, error_response, error_response_coded,
 };
@@ -464,6 +464,7 @@ const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
 const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
 const MAX_ACTIVE_RUN_LIVE_EVENTS: usize = MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS as usize;
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
+const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 #[cfg(test)]
@@ -1825,6 +1826,72 @@ pub(crate) fn spawn_observed(
             tracing::error!(task = name, panic = %msg, "background task panicked");
         }
     });
+}
+
+struct ActiveRunControlWatcher {
+    stop_tx: Option<oneshot::Sender<()>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ActiveRunControlWatcher {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        self.join.abort();
+    }
+}
+
+fn start_active_run_control_watcher(
+    run_control: Option<Arc<dyn RunControlProvider>>,
+    user_id: String,
+    run_id: String,
+    cancel_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
+    cancel_token: Arc<CancellationToken>,
+) -> Option<ActiveRunControlWatcher> {
+    let run_control = run_control?;
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let join = tokio::spawn(async move {
+        let mut poll = tokio::time::interval_at(
+            tokio::time::Instant::now() + ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
+            ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
+        );
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                _ = poll.tick() => {
+                    if cancel_flag.load(Ordering::Acquire) || cancel_token.is_cancelled() {
+                        break;
+                    }
+                    match run_control.control_status(&user_id, &run_id).await {
+                        Ok(Some(RunControlStatus::Cancelled)) => {
+                            cancel_flag.store(true, Ordering::SeqCst);
+                            cancel_token.cancel();
+                            break;
+                        }
+                        Ok(Some(RunControlStatus::Paused)) => {
+                            pause_flag.store(true, Ordering::SeqCst);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %run_id,
+                                error = %error,
+                                "active run control watcher failed to poll durable status"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Some(ActiveRunControlWatcher {
+        stop_tx: Some(stop_tx),
+        join,
+    })
 }
 
 /// Production [`RunLifecycleService`] that executes agentic loops via
@@ -5637,9 +5704,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
         let bg_metrics_registry = self.metrics_registry.clone();
-        let _bg_cancel_flag = cancel_flag.clone();
-        let _bg_pause_flag = pause_flag.clone();
-        let _bg_llm_cancel_token = llm_cancel_token.clone();
+        let bg_cancel_flag = cancel_flag.clone();
+        let bg_pause_flag = pause_flag.clone();
+        let bg_llm_cancel_token = llm_cancel_token.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -5755,6 +5822,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         return;
                     }
                 }
+                let _control_watcher = start_active_run_control_watcher(
+                    loop_state.run_control.clone(),
+                    bg_user_id.clone(),
+                    bg_run_id.clone(),
+                    bg_cancel_flag.clone(),
+                    bg_pause_flag.clone(),
+                    bg_llm_cancel_token.clone(),
+                );
 
                 let outcome =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
@@ -6496,6 +6571,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_workspace_record_store = self.workspace_record_store.clone();
         let missing_lifecycle_spawner = Arc::clone(&stream_agent_spawner);
         let bg_metrics_registry = self.metrics_registry.clone();
+        let bg_cancel_flag = cancel_flag.clone();
+        let bg_pause_flag = pause_flag.clone();
+        let bg_llm_cancel_token = llm_cancel_token.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -6607,6 +6685,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         return;
                     }
                 }
+                let _control_watcher = start_active_run_control_watcher(
+                    state.run_control.clone(),
+                    bg_user_id.clone(),
+                    bg_run_id.clone(),
+                    bg_cancel_flag.clone(),
+                    bg_pause_flag.clone(),
+                    bg_llm_cancel_token.clone(),
+                );
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
                 let loop_success = loop_result.is_ok();
@@ -8715,6 +8801,61 @@ mod tests {
                     None => std::env::remove_var(self.key),
                 }
             }
+        }
+    }
+
+    struct StaticRunControlProvider {
+        status: Option<RunControlStatus>,
+        calls: AtomicUsize,
+    }
+
+    impl StaticRunControlProvider {
+        fn new(status: Option<RunControlStatus>) -> Self {
+            Self {
+                status,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Acquire)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::turn::run_control::RunStatusProvider for StaticRunControlProvider {
+        async fn control_status(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+        ) -> Result<Option<RunControlStatus>, String> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(self.status)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RunInputProvider for StaticRunControlProvider {
+        async fn poll_user_inputs(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+            after_event_index: usize,
+        ) -> crate::turn::run_control::RunQueuedInputPoll {
+            crate::turn::run_control::RunQueuedInputPoll {
+                next_cursor: after_event_index,
+                inputs: Vec::new(),
+                error: None,
+            }
+        }
+
+        async fn mark_user_inputs_released(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+            _event_indices: &[usize],
+        ) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -13640,6 +13781,79 @@ mod tests {
         assert_eq!(
             svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
             Some(true)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_run_control_watcher_cancels_token_after_slow_durable_poll() {
+        let provider = Arc::new(StaticRunControlProvider::new(Some(
+            RunControlStatus::Cancelled,
+        )));
+        let run_control: Arc<dyn RunControlProvider> = provider.clone();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
+        let cancel_token = Arc::new(CancellationToken::new());
+
+        let _watcher = start_active_run_control_watcher(
+            Some(run_control),
+            "user-1".to_string(),
+            "run-1".to_string(),
+            cancel_flag.clone(),
+            pause_flag.clone(),
+            cancel_token.clone(),
+        )
+        .expect("watcher");
+
+        tokio::task::yield_now().await;
+        assert_eq!(provider.calls(), 0, "watcher must not poll immediately");
+        tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL - Duration::from_millis(1))
+            .await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            provider.calls(),
+            0,
+            "watcher must respect the slow interval"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        cancel_token.cancelled().await;
+
+        assert!(cancel_flag.load(Ordering::Acquire));
+        assert!(cancel_token.is_cancelled());
+        assert!(!pause_flag.load(Ordering::Acquire));
+        assert_eq!(provider.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
+        let provider = Arc::new(StaticRunControlProvider::new(Some(
+            RunControlStatus::Paused,
+        )));
+        let run_control: Arc<dyn RunControlProvider> = provider.clone();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
+        let cancel_token = Arc::new(CancellationToken::new());
+
+        let _watcher = start_active_run_control_watcher(
+            Some(run_control),
+            "user-1".to_string(),
+            "run-1".to_string(),
+            cancel_flag.clone(),
+            pause_flag.clone(),
+            cancel_token.clone(),
+        )
+        .expect("watcher");
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(provider.calls(), 1);
+        assert!(!cancel_flag.load(Ordering::Acquire));
+        assert!(pause_flag.load(Ordering::Acquire));
+        assert!(
+            !cancel_token.is_cancelled(),
+            "pause must not abort in-flight work"
         );
     }
 
