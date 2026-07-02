@@ -803,6 +803,21 @@ async fn poll_loop(
                     metrics
                         .poll_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
+                        &pool,
+                        &consumer_id,
+                        now_ms,
+                        max_delivery_attempts,
+                    )
+                    .await
+                    {
+                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                            "  ⚠ messaging: failed to release direct claimed batch after fetch error for {}@{}: {:?}",
+                            addr.agent_id,
+                            addr.run_id,
+                            e
+                        );
+                    }
                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
                         "  ⚠ messaging: direct fetch error for {}@{}: {:?}",
                         addr.agent_id,
@@ -1344,6 +1359,56 @@ async fn release_claimed_for_consumer_in_pool(
     Ok(())
 }
 
+async fn release_direct_claimed_batch_for_consumer_in_pool(
+    pool: &Pool<MySql>,
+    consumer_id: &str,
+    claimed_at_ms: i64,
+    max_delivery_attempts: u32,
+) -> Result<(), MailboxError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MailboxError::Transport(format!("release direct batch begin: {e}")))?;
+
+    query(
+        "UPDATE agent_message_queue
+         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL
+         WHERE status = 'claimed'
+           AND is_broadcast = FALSE
+           AND claimed_by = ?
+           AND claimed_at_ms = ?
+           AND attempt_count < ?",
+    )
+    .bind(consumer_id)
+    .bind(claimed_at_ms)
+    .bind(max_delivery_attempts as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MailboxError::Transport(format!("release direct batch requeue: {e}")))?;
+
+    query(
+        "UPDATE agent_message_queue
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         WHERE status = 'claimed'
+           AND is_broadcast = FALSE
+           AND claimed_by = ?
+           AND claimed_at_ms = ?
+           AND attempt_count >= ?",
+    )
+    .bind(consumer_id)
+    .bind(claimed_at_ms)
+    .bind(max_delivery_attempts as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MailboxError::Transport(format!("release direct batch dead-letter: {e}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| MailboxError::Transport(format!("release direct batch commit: {e}")))?;
+
+    Ok(())
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1451,6 +1516,36 @@ mod tests {
         assert!(
             !scheduler_body.contains("DELETE FROM agent_message_broadcast_delivery"),
             "cleanup scheduler must not inline unbounded broadcast delivery DELETE statements"
+        );
+    }
+
+    #[test]
+    fn direct_fetch_error_releases_only_current_claim_batch() {
+        let source = include_str!("db_transport.rs");
+        let poll_body = source
+            .split("async fn poll_loop(")
+            .nth(1)
+            .and_then(|rest| rest.split("// 2. Poll broadcast messages").next())
+            .expect("poll_loop direct-claim body");
+        assert!(
+            poll_body.contains("release_direct_claimed_batch_for_consumer_in_pool")
+                && poll_body.contains("now_ms"),
+            "direct fetch error must release the just-claimed batch instead of waiting for visibility timeout"
+        );
+
+        let helper_body = source
+            .split("async fn release_direct_claimed_batch_for_consumer_in_pool")
+            .nth(1)
+            .and_then(|rest| rest.split("// ─── Tests").next())
+            .expect("release direct claimed batch helper");
+        assert!(
+            helper_body.contains("AND claimed_at_ms = ?"),
+            "direct fetch error release must be scoped to the current claimed_at_ms batch"
+        );
+        assert!(
+            helper_body.contains("AND attempt_count < ?")
+                && helper_body.contains("AND attempt_count >= ?"),
+            "direct fetch error release must preserve max-attempt dead-letter semantics"
         );
     }
 
