@@ -861,6 +861,8 @@ async def run_probe(args: argparse.Namespace) -> int:
         validate_stream_body_contract(args, template)
 
     if args.dry_run:
+        nofile_soft_limit = current_nofile_soft_limit()
+        nofile_required = estimated_nofile_required(args.concurrency)
         print(
             json.dumps(
                 {
@@ -872,6 +874,11 @@ async def run_probe(args: argparse.Namespace) -> int:
                     "register_users": args.register_users,
                     "require_metrics": args.require_metrics,
                     "require_error_codes_for_failures": args.require_error_codes_for_failures,
+                    "nofile": {
+                        "soft_limit": nofile_soft_limit,
+                        "required": nofile_required,
+                        "sufficient": nofile_soft_limit is None or nofile_soft_limit >= nofile_required,
+                    },
                     "output_dir": str(args.output_dir),
                     "body_example": json.loads(body_for_request(args, template, 0, 0).decode("utf-8")),
                 },
@@ -1203,6 +1210,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fail if any non-completed request lacks a machine-readable error_code",
     )
+    parser.add_argument(
+        "--skip-nofile-check",
+        action="store_true",
+        help="skip local file-descriptor limit preflight; useful only when a wrapper raises limits after validation",
+    )
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--dry-run", action="store_true")
@@ -1223,6 +1235,40 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ProbeError("timeouts must be positive")
     if args.metrics_interval_secs <= 0:
         raise ProbeError("--metrics-interval-secs must be positive")
+    if not args.dry_run and not args.skip_nofile_check:
+        validate_nofile_capacity(concurrency)
+
+
+def validate_nofile_capacity(concurrency: int) -> None:
+    soft_limit = current_nofile_soft_limit()
+    if soft_limit is None:
+        return
+    required = estimated_nofile_required(concurrency)
+    if soft_limit < required:
+        raise ProbeError(
+            "file descriptor limit too low for this probe: "
+            f"soft={soft_limit}, required>={required}, concurrency={concurrency}. "
+            "Run the API server and probe from shells with a higher limit, for example: "
+            "ulimit -n 4096"
+        )
+
+
+def estimated_nofile_required(concurrency: int) -> int:
+    # Each in-flight SSE request owns one client socket. Keep explicit headroom
+    # for auth/metrics sockets, persistent output files, DNS/proxy internals,
+    # and Python/runtime bookkeeping so the probe fails before EMFILE noise.
+    return concurrency + max(64, math.ceil(concurrency * 0.1))
+
+
+def current_nofile_soft_limit() -> int | None:
+    try:
+        import resource
+    except ImportError:
+        return None
+    soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < 0:
+        return None
+    return int(soft)
 
 
 def main(argv: list[str] | None = None) -> int:

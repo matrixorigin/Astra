@@ -123,6 +123,44 @@ class CapacityProbeTests(unittest.TestCase):
         }
         probe.validate_stream_body_contract(args, template)
 
+    def test_nofile_capacity_preflight_rejects_low_soft_limit(self) -> None:
+        original = probe.current_nofile_soft_limit
+        try:
+            probe.current_nofile_soft_limit = lambda: 256
+            with self.assertRaises(probe.ProbeError) as ctx:
+                probe.validate_nofile_capacity(500)
+            self.assertIn("file descriptor limit too low", str(ctx.exception))
+            self.assertIn("ulimit -n 4096", str(ctx.exception))
+        finally:
+            probe.current_nofile_soft_limit = original
+
+    def test_nofile_capacity_estimate_has_headroom(self) -> None:
+        self.assertEqual(probe.estimated_nofile_required(10), 74)
+        self.assertEqual(probe.estimated_nofile_required(500), 564)
+
+    def test_validate_args_skips_nofile_failure_for_dry_run_only(self) -> None:
+        def args(dry_run: bool) -> argparse.Namespace:
+            return argparse.Namespace(
+                profile="500-cli",
+                concurrency=None,
+                total=None,
+                register_concurrency=20,
+                connect_timeout_secs=10.0,
+                request_timeout_secs=300.0,
+                metrics_interval_secs=5.0,
+                skip_nofile_check=False,
+                dry_run=dry_run,
+            )
+
+        original = probe.current_nofile_soft_limit
+        try:
+            probe.current_nofile_soft_limit = lambda: 256
+            probe.validate_args(args(dry_run=True))
+            with self.assertRaises(probe.ProbeError):
+                probe.validate_args(args(dry_run=False))
+        finally:
+            probe.current_nofile_soft_limit = original
+
     def test_summarize_metrics_file_reports_empty_prefixed_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "metrics.jsonl"
