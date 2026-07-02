@@ -1113,9 +1113,6 @@ impl RunInputProvider for RunEngine {
                 | DurableRunStatusKind::Failed => return Ok(()),
                 _ => {}
             }
-            if current.status == STATUS_INPUT_QUEUED {
-                return Ok(());
-            }
         }
         self.append_event(user_id, run_id, release_event).await
     }
