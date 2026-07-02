@@ -345,6 +345,7 @@ struct StaticEdgeDispatch {
     inserted_edge_agent_ids: Mutex<Vec<String>>,
     failed_dispatches: Mutex<Vec<(String, String)>>,
     return_result: bool,
+    result_status: &'static str,
 }
 
 impl Default for StaticEdgeDispatch {
@@ -353,6 +354,7 @@ impl Default for StaticEdgeDispatch {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: true,
+            result_status: "completed",
         }
     }
 }
@@ -363,6 +365,16 @@ impl StaticEdgeDispatch {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
+            result_status: "completed",
+        }
+    }
+
+    fn legacy_failed_result() -> Self {
+        Self {
+            inserted_edge_agent_ids: Mutex::new(Vec::new()),
+            failed_dispatches: Mutex::new(Vec::new()),
+            return_result: true,
+            result_status: "failed",
         }
     }
 }
@@ -426,8 +438,12 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         let result = astra_thin_client::ToolResultRequest::new_with_hash(
             request_id.to_string(),
             Some("edge-selected".to_string()),
-            "completed".to_string(),
-            "ledger-result".to_string(),
+            self.result_status.to_string(),
+            if self.result_status == "completed" {
+                "ledger-result".to_string()
+            } else {
+                "edge dispatch expired".to_string()
+            },
             12,
         );
         serde_json::to_string(&result)
@@ -2548,6 +2564,49 @@ async fn edge_dispatch_result_reports_edge_ledger_transport() {
             .expect("inserted edge agent ids lock"),
         vec!["edge-selected".to_string()]
     );
+}
+
+#[tokio::test]
+async fn edge_dispatch_legacy_failed_result_reports_tool_error() {
+    let dispatch = Arc::new(StaticEdgeDispatch::legacy_failed_result());
+    let _local = CountingLocalTransport::new();
+
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(result.output, "edge dispatch expired");
+    let metadata = result.metadata.expect("ledger metadata");
+    assert_eq!(metadata["transport"], "edge_ledger");
+    assert_eq!(metadata["executor"]["transport"], "edge_ledger");
+    assert_eq!(metadata["executor"]["status"], "online");
+    assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+    assert_eq!(local.calls(), 0);
 }
 
 #[tokio::test]

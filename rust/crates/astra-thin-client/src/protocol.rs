@@ -215,7 +215,7 @@ impl ToolResultRequest {
         let is_error = v
             .get("status")
             .and_then(|v| v.as_str())
-            .map(|s| s == "error")
+            .map(|s| matches!(s, "error" | "failed"))
             .unwrap_or(false);
         (output, is_error)
     }
@@ -1256,6 +1256,14 @@ mod tests {
     #[test]
     fn tool_result_parse_output_and_error_error_status() {
         let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"error","output":"fail"}"#;
+        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
+        assert_eq!(output, "fail");
+        assert!(is_error);
+    }
+
+    #[test]
+    fn tool_result_parse_output_and_error_legacy_failed_status() {
+        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"failed","output":"fail"}"#;
         let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
         assert_eq!(output, "fail");
         assert!(is_error);

@@ -284,7 +284,7 @@ async fn try_edge_dispatch(
         .map(|request| {
             (
                 request.output.unwrap_or_default(),
-                request.status.as_str() == "error",
+                matches!(request.status.as_str(), "error" | "failed"),
             )
         })
         .unwrap_or_else(|| {

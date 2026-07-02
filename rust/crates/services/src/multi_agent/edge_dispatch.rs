@@ -142,6 +142,16 @@ struct EdgeDispatchBacklogRow {
     oldest_dispatched_age_ms: u64,
 }
 
+fn edge_dispatch_failed_result_json(request_id: serde_json::Value, output: String) -> String {
+    serde_json::json!({
+        "request_id": request_id,
+        "status": "error",
+        "output": output,
+        "duration_ms": 0,
+    })
+    .to_string()
+}
+
 impl EdgeDispatchBacklogRow {
     fn empty() -> Self {
         Self {
@@ -433,13 +443,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         reason: &str,
     ) -> Result<bool, String> {
         let output = format!("edge dispatch {reason}");
-        let result_json = serde_json::json!({
-            "request_id": request_id,
-            "status": "failed",
-            "output": output,
-            "duration_ms": 0,
-        })
-        .to_string();
+        let result_json = edge_dispatch_failed_result_json(serde_json::json!(request_id), output);
         let n = sqlx::query(
             "UPDATE edge_pending_dispatch \
              SET status = 'failed', result_json = ?, completed_at = NOW(6) \
@@ -517,13 +521,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
 
     async fn cleanup_stale(&self, older_than: std::time::Duration) -> Result<u64, String> {
         let secs = older_than.as_secs() as i64;
-        let expired_result_json = serde_json::json!({
-            "request_id": null,
-            "status": "failed",
-            "output": "edge dispatch expired",
-            "duration_ms": 0,
-        })
-        .to_string();
+        let expired_result_json = edge_dispatch_failed_result_json(
+            serde_json::Value::Null,
+            "edge dispatch expired".to_string(),
+        );
         let expired = sqlx::query(
             "UPDATE edge_pending_dispatch \
              SET status = 'failed', result_json = ?, completed_at = NOW(6) \
@@ -835,6 +836,21 @@ mod tests {
         assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("status IN ('pending', 'dispatched')"));
         assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("oldest_pending_age_us"));
         assert!(EDGE_DISPATCH_BACKLOG_SQL.contains("oldest_dispatched_age_us"));
+    }
+
+    #[test]
+    fn failed_dispatch_result_json_uses_tool_error_status() {
+        let result = edge_dispatch_failed_result_json(
+            serde_json::json!("request-1"),
+            "edge dispatch expired".to_string(),
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&result).expect("failed result should be JSON");
+
+        assert_eq!(value["request_id"], "request-1");
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["output"], "edge dispatch expired");
+        assert_eq!(value["duration_ms"], 0);
     }
 
     #[test]
