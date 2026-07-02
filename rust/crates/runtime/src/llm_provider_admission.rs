@@ -20,10 +20,12 @@ const ENV_RETENTION_WINDOWS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_RETENTION_WIND
 const ENV_CLEANUP_INTERVAL_MS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_CLEANUP_INTERVAL_MS";
 const ENV_SCOPE: &str = "ASTRA_LLM_PROVIDER_ADMISSION_SCOPE";
 const ENV_FAIL_OPEN: &str = "ASTRA_LLM_PROVIDER_ADMISSION_FAIL_OPEN";
+const ENV_BURST: &str = "ASTRA_LLM_PROVIDER_ADMISSION_BURST";
 
 const DEFAULT_WINDOW_MS: u64 = 60_000;
 const DEFAULT_RETENTION_WINDOWS: u64 = 120;
 const DEFAULT_CLEANUP_INTERVAL_MS: u64 = 300_000;
+const DEFAULT_RPM_BURST: u64 = 1;
 const MAX_BUCKET_KEY_BYTES: usize = 240;
 
 const METRIC_PROVIDER_ADMISSION_ATTEMPTS_TOTAL: &str =
@@ -58,10 +60,40 @@ CREATE TABLE IF NOT EXISTS llm_provider_admission_windows (
 )
 "#;
 
+const CREATE_PACING_TABLE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS llm_provider_admission_pacing (
+    bucket_key VARCHAR(255) NOT NULL,
+    tat_ms BIGINT NOT NULL DEFAULT 0,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (bucket_key)
+)
+"#;
+
 const INSERT_WINDOW_SQL: &str = r#"
 INSERT IGNORE INTO llm_provider_admission_windows
     (bucket_key, window_start_ms, request_count, token_count)
 VALUES (?, ?, 0, 0)
+"#;
+
+const INSERT_PACING_SQL: &str = r#"
+INSERT IGNORE INTO llm_provider_admission_pacing
+    (bucket_key, tat_ms)
+VALUES (?, 0)
+"#;
+
+const CLAIM_PACING_SQL: &str = r#"
+UPDATE llm_provider_admission_pacing
+SET tat_ms = (CASE WHEN tat_ms > ? THEN tat_ms ELSE ? END) + ?,
+    updated_at = CURRENT_TIMESTAMP(6)
+WHERE bucket_key = ?
+  AND tat_ms <= ?
+"#;
+
+const SELECT_PACING_SQL: &str = r#"
+SELECT tat_ms
+FROM llm_provider_admission_pacing
+WHERE bucket_key = ?
 "#;
 
 const CLAIM_WINDOW_SLOT_RPM_SQL: &str = r#"
@@ -117,6 +149,7 @@ pub(crate) struct ProviderAdmissionConfig {
     cleanup_interval_ms: u64,
     scope: ProviderAdmissionScope,
     fail_open: bool,
+    burst: u64,
 }
 
 impl ProviderAdmissionConfig {
@@ -141,6 +174,7 @@ impl ProviderAdmissionConfig {
                 .map(parse_scope)
                 .unwrap_or(ProviderAdmissionScope::Provider),
             fail_open: read_bool(ENV_FAIL_OPEN).unwrap_or(false),
+            burst: read_positive_u64(ENV_BURST).unwrap_or(DEFAULT_RPM_BURST),
         }
     }
 
@@ -155,6 +189,7 @@ impl ProviderAdmissionConfig {
             cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
+            burst: DEFAULT_RPM_BURST,
         }
     }
 
@@ -169,6 +204,7 @@ impl ProviderAdmissionConfig {
             cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
+            burst: DEFAULT_RPM_BURST,
         }
     }
 
@@ -183,6 +219,7 @@ impl ProviderAdmissionConfig {
             cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
+            burst: DEFAULT_RPM_BURST,
         }
     }
 
@@ -197,6 +234,7 @@ impl ProviderAdmissionConfig {
             cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
             scope: ProviderAdmissionScope::Provider,
             fail_open: false,
+            burst: DEFAULT_RPM_BURST,
         }
     }
 
@@ -506,6 +544,15 @@ pub(crate) async fn ensure_llm_provider_admission_schema_if_configured(
                 format!("LLM provider admission schema init failed: {error}"),
             )
         })?;
+    sqlx::query(CREATE_PACING_TABLE_SQL)
+        .execute(shared_pool.get())
+        .await
+        .map_err(|error| {
+            ClassifiedError::new(
+                ErrorKind::DatabaseError,
+                format!("LLM provider admission pacing schema init failed: {error}"),
+            )
+        })?;
     Ok(())
 }
 
@@ -762,6 +809,13 @@ async fn db_fixed_window_admit(
     let window_start_ms = fixed_window_start_ms(now_ms, config.window_ms);
     let bucket_key = bucket_key(config.scope, provider, model);
     let estimated_tokens_i64 = i64::try_from(estimated_tokens).unwrap_or(i64::MAX);
+    if let Some(retry_after_ms) = claim_rpm_pacing(shared_pool, &bucket_key, config, now_ms).await?
+    {
+        return Ok(FixedWindowAdmission::Rejected {
+            retry_after_ms,
+            limit: ProviderAdmissionLimit::Rpm,
+        });
+    }
     let previous_window_start_ms = previous_window_start_ms(window_start_ms, config.window_ms);
     let previous_counts =
         fetch_window_counts(shared_pool, &bucket_key, previous_window_start_ms).await?;
@@ -882,6 +936,63 @@ async fn fetch_window_counts(
     })
 }
 
+async fn claim_rpm_pacing(
+    shared_pool: &SharedPool,
+    bucket_key: &str,
+    config: &ProviderAdmissionConfig,
+    now_ms: i64,
+) -> Result<Option<u64>, ClassifiedError> {
+    let Some(rpm_limit) = config.rpm_limit else {
+        return Ok(None);
+    };
+    let interval_ms = pacing_interval_ms(config.window_ms, rpm_limit);
+    let burst_tolerance_ms = pacing_burst_tolerance_ms(interval_ms, config.burst);
+    sqlx::query(INSERT_PACING_SQL)
+        .bind(bucket_key)
+        .execute(shared_pool.get())
+        .await
+        .map_err(database_error)?;
+    let allowed_tat_ms =
+        now_ms.saturating_add(i64::try_from(burst_tolerance_ms).unwrap_or(i64::MAX));
+    let result = sqlx::query(CLAIM_PACING_SQL)
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(i64::try_from(interval_ms).unwrap_or(i64::MAX))
+        .bind(bucket_key)
+        .bind(allowed_tat_ms)
+        .execute(shared_pool.get())
+        .await
+        .map_err(database_error)?;
+    if result.rows_affected() == 1 {
+        return Ok(None);
+    }
+    let retry_after_ms =
+        fetch_pacing_retry_after_ms(shared_pool, bucket_key, now_ms, burst_tolerance_ms).await?;
+    Ok(Some(retry_after_ms))
+}
+
+async fn fetch_pacing_retry_after_ms(
+    shared_pool: &SharedPool,
+    bucket_key: &str,
+    now_ms: i64,
+    burst_tolerance_ms: u64,
+) -> Result<u64, ClassifiedError> {
+    let row = sqlx::query(SELECT_PACING_SQL)
+        .bind(bucket_key)
+        .fetch_optional(shared_pool.get())
+        .await
+        .map_err(database_error)?;
+    let Some(row) = row else {
+        return Ok(1);
+    };
+    let tat_ms = row.try_get::<i64, _>("tat_ms").unwrap_or(now_ms);
+    let eligible_at_ms =
+        tat_ms.saturating_sub(i64::try_from(burst_tolerance_ms).unwrap_or(i64::MAX));
+    Ok(u64::try_from(eligible_at_ms.saturating_sub(now_ms))
+        .unwrap_or(1)
+        .max(1))
+}
+
 fn rejected_limit_from_counts(
     request_count: u64,
     token_count: u64,
@@ -957,6 +1068,14 @@ fn weighted_previous_value(value: u64, elapsed_ms: u64, window_ms: u64) -> u64 {
 
 fn remaining_limit_after_previous_weight(limit: u64, previous_weight: u64) -> i64 {
     i64::try_from(limit.saturating_sub(previous_weight)).unwrap_or(i64::MAX)
+}
+
+fn pacing_interval_ms(window_ms: u64, rpm_limit: u64) -> u64 {
+    window_ms.max(1).div_ceil(rpm_limit.max(1)).max(1)
+}
+
+fn pacing_burst_tolerance_ms(interval_ms: u64, burst: u64) -> u64 {
+    interval_ms.saturating_mul(burst.saturating_sub(1))
 }
 
 fn retry_after_ms(now_ms: i64, window_start_ms: i64, window_ms: u64) -> u64 {
@@ -1097,6 +1216,15 @@ mod tests {
     }
 
     #[test]
+    fn rpm_pacing_defaults_to_small_burst_and_stable_interval() {
+        assert_eq!(ProviderAdmissionConfig::db_fixed_window(Some(20)).burst, 1);
+        assert_eq!(pacing_interval_ms(60_000, 20), 3_000);
+        assert_eq!(pacing_interval_ms(60_000, 7), 8_572);
+        assert_eq!(pacing_burst_tolerance_ms(3_000, 4), 9_000);
+        assert_eq!(pacing_burst_tolerance_ms(3_000, 1), 0);
+    }
+
+    #[test]
     fn bucket_key_keeps_metrics_labels_out_of_the_database_key() {
         assert_eq!(
             bucket_key(ProviderAdmissionScope::Provider, "Anthropic", "ignored"),
@@ -1116,8 +1244,13 @@ mod tests {
     fn db_fixed_window_sql_uses_atomic_conditional_claim() {
         assert!(CREATE_WINDOWS_TABLE_SQL.contains("PRIMARY KEY (bucket_key, window_start_ms)"));
         assert!(CREATE_WINDOWS_TABLE_SQL.contains("token_count BIGINT NOT NULL DEFAULT 0"));
+        assert!(CREATE_PACING_TABLE_SQL.contains("PRIMARY KEY (bucket_key)"));
+        assert!(CREATE_PACING_TABLE_SQL.contains("tat_ms BIGINT NOT NULL DEFAULT 0"));
         assert!(INSERT_WINDOW_SQL.contains("INSERT IGNORE"));
         assert!(INSERT_WINDOW_SQL.contains("request_count, token_count"));
+        assert!(INSERT_PACING_SQL.contains("INSERT IGNORE"));
+        assert!(CLAIM_PACING_SQL.contains("CASE WHEN tat_ms > ? THEN tat_ms ELSE ? END"));
+        assert!(CLAIM_PACING_SQL.contains("tat_ms <= ?"));
         assert!(CLAIM_WINDOW_SLOT_RPM_SQL.contains("request_count = request_count + 1"));
         assert!(CLAIM_WINDOW_SLOT_RPM_SQL.contains("token_count = token_count + ?"));
         assert!(CLAIM_WINDOW_SLOT_RPM_SQL.contains("request_count < ?"));

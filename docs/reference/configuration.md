@@ -84,6 +84,7 @@ If `reasoning_model_name` is not set, the server falls back to the cheapest acti
 - `ASTRA_LLM_PROVIDER_ADMISSION_MODE` — provider admission mode; unset/`disabled` by default, `db_fixed_window` enables MatrixOne-backed RPM/TPM claims before outbound LLM attempts
 - `ASTRA_LLM_PROVIDER_ADMISSION_RPM`, `ASTRA_LLM_PROVIDER_ADMISSION_TPM` — provider budget used by admission; at least one is required when admission is enabled
 - `ASTRA_LLM_PROVIDER_ADMISSION_SCOPE` — `provider` or `provider_model`; default `provider`
+- `ASTRA_LLM_PROVIDER_ADMISSION_BURST` — optional RPM pacing burst; defaults to strict smoothing (`1`), raise only when provider burst capacity is proven
 - `ASTRA_TURN_INTENT_JUDGE_POLICY` — `capacity_aware` by default; skips built-in turn-intent LLM judging when provider admission is enabled, `always` preserves the auxiliary judge, `disabled` turns it off
 - `ASTRA_CAPTURE_TRACES`
 
