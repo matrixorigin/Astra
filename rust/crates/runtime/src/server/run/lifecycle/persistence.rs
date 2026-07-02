@@ -53,8 +53,6 @@ struct TranscriptPageItemRow {
     content_hash: String,
 }
 
-const ASTRA_TURN_OBSERVER_MODE_ENV: &str = "ASTRA_TURN_OBSERVER_MODE";
-const ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV: &str = "ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY";
 const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
 const METRIC_TURN_OBSERVER_DISPATCHES_TOTAL: &str = "astra_turn_observer_dispatches_total";
 const METRIC_TURN_OBSERVER_RUNS_TOTAL: &str = "astra_turn_observer_runs_total";
@@ -69,20 +67,7 @@ enum TurnObserverMode {
 }
 
 impl TurnObserverMode {
-    fn from_env() -> Self {
-        match std::env::var(ASTRA_TURN_OBSERVER_MODE_ENV) {
-            Ok(value) => Self::parse(&value).unwrap_or_else(|| {
-                tracing::warn!(
-                    env = ASTRA_TURN_OBSERVER_MODE_ENV,
-                    value = %value,
-                    "invalid turn observer mode; defaulting to async"
-                );
-                Self::Async
-            }),
-            Err(_) => Self::Async,
-        }
-    }
-
+    #[cfg(test)]
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "async" | "background" | "fire_and_forget" => Some(Self::Async),
@@ -98,24 +83,6 @@ struct TurnObserverAsyncPermit;
 impl Drop for TurnObserverAsyncPermit {
     fn drop(&mut self) {
         TURN_OBSERVER_ASYNC_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
-fn turn_observer_async_concurrency_limit() -> usize {
-    match std::env::var(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV) {
-        Ok(value) => match value.trim().parse::<usize>() {
-            Ok(limit) => limit,
-            Err(_) => {
-                tracing::warn!(
-                    env = ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV,
-                    value = %value,
-                    default = DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
-                    "invalid turn observer async concurrency; using default"
-                );
-                DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY
-            }
-        },
-        Err(_) => DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
     }
 }
 
@@ -1984,12 +1951,33 @@ async fn fire_server_loop_observer(
     state: &AgenticLoopState,
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 ) {
+    fire_server_loop_observer_with_mode(
+        observer_worker,
+        user_id,
+        session_id,
+        state,
+        metrics_registry,
+        TurnObserverMode::Async,
+        DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
+    )
+    .await;
+}
+
+async fn fire_server_loop_observer_with_mode(
+    observer_worker: Arc<dyn TurnObserverWorker>,
+    user_id: &str,
+    session_id: &str,
+    state: &AgenticLoopState,
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    mode: TurnObserverMode,
+    async_concurrency_limit: usize,
+) {
     let Some(request) = build_server_loop_observer_request(user_id, session_id, state) else {
         record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "none", "skipped_empty");
         return;
     };
 
-    match TurnObserverMode::from_env() {
+    match mode {
         TurnObserverMode::Disabled => {
             record_turn_observer_dispatch_metrics(
                 metrics_registry.as_ref(),
@@ -2013,8 +2001,8 @@ async fn fire_server_loop_observer(
             .await;
         }
         TurnObserverMode::Async => {
-            let concurrency_limit = turn_observer_async_concurrency_limit();
-            let Some(permit) = try_acquire_turn_observer_async_permit(concurrency_limit) else {
+            let Some(permit) = try_acquire_turn_observer_async_permit(async_concurrency_limit)
+            else {
                 record_turn_observer_dispatch_metrics(
                     metrics_registry.as_ref(),
                     "async",
@@ -2022,7 +2010,7 @@ async fn fire_server_loop_observer(
                 );
                 tracing::debug!(
                     session_id = %session_id,
-                    concurrency_limit,
+                    concurrency_limit = async_concurrency_limit,
                     "server-loop observer async concurrency full; dropping best-effort request"
                 );
                 return;
@@ -2167,7 +2155,6 @@ pub(crate) fn build_run_turn_complete_event_with_interruption(
 mod tests {
     use super::*;
     use sqlx::Row;
-    use std::ffi::OsString;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
     use uuid::Uuid;
@@ -2195,36 +2182,6 @@ mod tests {
             })
             .await
             .clone()
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::remove_var(key) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
     }
 
     #[derive(Default)]
@@ -2349,57 +2306,44 @@ mod tests {
         assert_eq!(TurnObserverMode::parse("surprise"), None);
     }
 
-    #[test]
-    #[serial_test::serial(turn_observer_mode_env)]
-    fn turn_observer_mode_defaults_to_async() {
-        let _mode = EnvVarGuard::remove(ASTRA_TURN_OBSERVER_MODE_ENV);
-        assert_eq!(TurnObserverMode::from_env(), TurnObserverMode::Async);
-    }
-
-    #[test]
-    #[serial_test::serial(turn_observer_mode_env)]
-    fn turn_observer_async_concurrency_defaults_and_parses() {
-        {
-            let _limit = EnvVarGuard::remove(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV);
-            assert_eq!(
-                turn_observer_async_concurrency_limit(),
-                DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY
-            );
-        }
-        {
-            let _limit = EnvVarGuard::set(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV, "0");
-            assert_eq!(turn_observer_async_concurrency_limit(), 0);
-        }
-        {
-            let _limit = EnvVarGuard::set(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV, "7");
-            assert_eq!(turn_observer_async_concurrency_limit(), 7);
-        }
-    }
-
     #[tokio::test]
-    #[serial_test::serial(turn_observer_mode_env)]
+    #[serial_test::serial(turn_observer_async)]
     async fn server_loop_observer_disabled_does_not_run_worker() {
-        let _mode = EnvVarGuard::set(ASTRA_TURN_OBSERVER_MODE_ENV, "disabled");
         let observer = Arc::new(CaptureObserverWorker::new(false));
         let state = observer_test_state();
 
-        fire_server_loop_observer(observer.clone(), "user-1", "session-1", &state, None).await;
+        fire_server_loop_observer_with_mode(
+            observer.clone(),
+            "user-1",
+            "session-1",
+            &state,
+            None,
+            TurnObserverMode::Disabled,
+            DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
+        )
+        .await;
 
         assert_eq!(observer.call_count(), 0);
     }
 
     #[tokio::test]
-    #[serial_test::serial(turn_observer_mode_env)]
+    #[serial_test::serial(turn_observer_async)]
     async fn server_loop_observer_async_does_not_block_caller() {
-        let _mode = EnvVarGuard::set(ASTRA_TURN_OBSERVER_MODE_ENV, "async");
-        let _limit = EnvVarGuard::set(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV, "4");
         let observer = Arc::new(CaptureObserverWorker::new(true));
         let started = observer.started.notified();
         let state = observer_test_state();
 
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            fire_server_loop_observer(observer.clone(), "user-1", "session-1", &state, None),
+            fire_server_loop_observer_with_mode(
+                observer.clone(),
+                "user-1",
+                "session-1",
+                &state,
+                None,
+                TurnObserverMode::Async,
+                DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
+            ),
         )
         .await
         .expect("async observer dispatch should return without waiting for worker");
@@ -2413,16 +2357,23 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(turn_observer_mode_env)]
+    #[serial_test::serial(turn_observer_async)]
     async fn server_loop_observer_async_limit_drops_extra_request() {
-        let _mode = EnvVarGuard::set(ASTRA_TURN_OBSERVER_MODE_ENV, "async");
-        let _limit = EnvVarGuard::set(ASTRA_TURN_OBSERVER_ASYNC_CONCURRENCY_ENV, "1");
         let first = Arc::new(CaptureObserverWorker::new(true));
         let second = Arc::new(CaptureObserverWorker::new(false));
         let first_started = first.started.notified();
         let state = observer_test_state();
 
-        fire_server_loop_observer(first.clone(), "user-1", "session-1", &state, None).await;
+        fire_server_loop_observer_with_mode(
+            first.clone(),
+            "user-1",
+            "session-1",
+            &state,
+            None,
+            TurnObserverMode::Async,
+            1,
+        )
+        .await;
         tokio::time::timeout(std::time::Duration::from_millis(500), first_started)
             .await
             .expect("first observer should start");
@@ -2431,7 +2382,15 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            fire_server_loop_observer(second.clone(), "user-1", "session-2", &state, None),
+            fire_server_loop_observer_with_mode(
+                second.clone(),
+                "user-1",
+                "session-2",
+                &state,
+                None,
+                TurnObserverMode::Async,
+                1,
+            ),
         )
         .await
         .expect("full async observer pool should drop without blocking");
@@ -2443,15 +2402,23 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(turn_observer_mode_env)]
+    #[serial_test::serial(turn_observer_async)]
     async fn server_loop_observer_inline_waits_for_worker() {
-        let _mode = EnvVarGuard::set(ASTRA_TURN_OBSERVER_MODE_ENV, "inline");
         let observer = Arc::new(CaptureObserverWorker::new(true));
         let observer_for_task = observer.clone();
         let started = observer.started.notified();
         let state = observer_test_state();
         let mut dispatch = tokio::spawn(async move {
-            fire_server_loop_observer(observer_for_task, "user-1", "session-1", &state, None).await;
+            fire_server_loop_observer_with_mode(
+                observer_for_task,
+                "user-1",
+                "session-1",
+                &state,
+                None,
+                TurnObserverMode::Inline,
+                DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
+            )
+            .await;
         });
 
         tokio::time::timeout(std::time::Duration::from_millis(500), started)
@@ -2470,19 +2437,20 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(turn_observer_mode_env)]
+    #[serial_test::serial(turn_observer_async)]
     async fn server_loop_observer_metrics_stay_low_cardinality() {
-        let _mode = EnvVarGuard::set(ASTRA_TURN_OBSERVER_MODE_ENV, "inline");
         let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
         let observer = Arc::new(CaptureObserverWorker::new(false));
         let state = observer_test_state();
 
-        fire_server_loop_observer(
+        fire_server_loop_observer_with_mode(
             observer,
             "user-1",
             "session-1",
             &state,
             Some(registry.clone()),
+            TurnObserverMode::Inline,
+            DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
         )
         .await;
 

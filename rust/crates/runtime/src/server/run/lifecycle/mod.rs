@@ -123,11 +123,6 @@ const METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL: &str =
     "astra_post_loop_memory_cleanup_workers_total";
 const METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL: &str =
     "astra_session_memory_post_loop_drains_total";
-const ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV: &str = "ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE";
-const ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV: &str =
-    "ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY";
-const ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV: &str =
-    "ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS";
 const DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY: usize = 4;
 const DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS: u64 = 1_000;
 static POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -166,20 +161,7 @@ enum PostLoopMemoryCleanupMode {
 }
 
 impl PostLoopMemoryCleanupMode {
-    fn from_env() -> Self {
-        match std::env::var(ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV) {
-            Ok(value) => Self::parse(&value).unwrap_or_else(|| {
-                tracing::warn!(
-                    env = ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV,
-                    value = %value,
-                    "invalid post-loop memory cleanup mode; defaulting to async"
-                );
-                Self::Async
-            }),
-            Err(_) => Self::Async,
-        }
-    }
-
+    #[cfg(test)]
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "async" | "background" | "fire_and_forget" => Some(Self::Async),
@@ -195,24 +177,6 @@ struct PostLoopMemoryCleanupPermit;
 impl Drop for PostLoopMemoryCleanupPermit {
     fn drop(&mut self) {
         POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn post_loop_memory_cleanup_concurrency_limit() -> usize {
-    match std::env::var(ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV) {
-        Ok(value) => match value.trim().parse::<usize>() {
-            Ok(limit) => limit,
-            Err(_) => {
-                tracing::warn!(
-                    env = ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV,
-                    value = %value,
-                    default = DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY,
-                    "invalid post-loop memory cleanup concurrency; using default"
-                );
-                DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY
-            }
-        },
-        Err(_) => DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY,
     }
 }
 
@@ -237,24 +201,6 @@ fn try_acquire_post_loop_memory_cleanup_permit(
             Ok(_) => return Some(PostLoopMemoryCleanupPermit),
             Err(observed) => current = observed,
         }
-    }
-}
-
-fn session_memory_post_loop_drain_timeout() -> Duration {
-    match std::env::var(ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV) {
-        Ok(value) => match value.trim().parse::<u64>() {
-            Ok(ms) => Duration::from_millis(ms),
-            Err(_) => {
-                tracing::warn!(
-                    env = ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV,
-                    value = %value,
-                    default_ms = DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS,
-                    "invalid session-memory post-loop drain timeout; using default"
-                );
-                Duration::from_millis(DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS)
-            }
-        },
-        Err(_) => Duration::from_millis(DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS),
     }
 }
 
@@ -689,6 +635,29 @@ async fn post_loop_memory_cleanup(
     final_extract_request: Option<crate::session_memory::ExtractionRequest>,
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 ) {
+    post_loop_memory_cleanup_with_policy(
+        session_id,
+        session_facts,
+        extraction_service,
+        final_extract_request,
+        metrics_registry,
+        PostLoopMemoryCleanupMode::Async,
+        DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY,
+        Duration::from_millis(DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS),
+    )
+    .await;
+}
+
+async fn post_loop_memory_cleanup_with_policy(
+    session_id: &str,
+    session_facts: &astra_turn_types::session_facts::SessionFacts,
+    extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
+    final_extract_request: Option<crate::session_memory::ExtractionRequest>,
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    mode: PostLoopMemoryCleanupMode,
+    async_concurrency_limit: usize,
+    drain_timeout: Duration,
+) {
     if session_id.is_empty() {
         return;
     }
@@ -697,7 +666,7 @@ async fn post_loop_memory_cleanup(
     let session_facts = session_facts.clone();
     let extraction_service = extraction_service.cloned();
 
-    match PostLoopMemoryCleanupMode::from_env() {
+    match mode {
         PostLoopMemoryCleanupMode::Disabled => {
             record_post_loop_memory_cleanup_dispatch_metrics(
                 metrics_registry.as_ref(),
@@ -718,12 +687,12 @@ async fn post_loop_memory_cleanup(
                 extraction_service,
                 final_extract_request,
                 metrics_registry,
+                drain_timeout,
             )
             .await;
         }
         PostLoopMemoryCleanupMode::Async => {
-            let concurrency_limit = post_loop_memory_cleanup_concurrency_limit();
-            let Some(permit) = try_acquire_post_loop_memory_cleanup_permit(concurrency_limit)
+            let Some(permit) = try_acquire_post_loop_memory_cleanup_permit(async_concurrency_limit)
             else {
                 record_post_loop_memory_cleanup_dispatch_metrics(
                     metrics_registry.as_ref(),
@@ -732,7 +701,7 @@ async fn post_loop_memory_cleanup(
                 );
                 tracing::debug!(
                     session_id = %session_id,
-                    concurrency_limit,
+                    concurrency_limit = async_concurrency_limit,
                     "post-loop memory cleanup concurrency full; dropping best-effort external cleanup"
                 );
                 reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
@@ -751,6 +720,7 @@ async fn post_loop_memory_cleanup(
                     extraction_service,
                     final_extract_request,
                     metrics_registry,
+                    drain_timeout,
                 )
                 .await;
             });
@@ -764,16 +734,16 @@ async fn run_post_loop_memory_cleanup_work(
     extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     final_extract_request: Option<crate::session_memory::ExtractionRequest>,
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    drain_timeout: Duration,
 ) {
     if let (Some(svc), Some(req)) = (extraction_service.as_ref(), final_extract_request) {
         let _ = svc.maybe_spawn_shutdown_flush(req);
     }
     if let Some(svc) = extraction_service.as_ref() {
-        let timeout = session_memory_post_loop_drain_timeout();
-        let leftover = if timeout.is_zero() {
+        let leftover = if drain_timeout.is_zero() {
             svc.pending_drain()
         } else {
-            svc.wait_for_pending(timeout).await
+            svc.wait_for_pending(drain_timeout).await
         };
         if leftover > 0 {
             record_session_memory_post_loop_drain_metrics(metrics_registry.as_ref(), "leftover");
@@ -8875,51 +8845,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(post_loop_memory_cleanup_env)]
-    fn post_loop_memory_cleanup_env_defaults_and_parses() {
-        {
-            let _mode = EnvVarGuard::remove(ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV);
-            assert_eq!(
-                PostLoopMemoryCleanupMode::from_env(),
-                PostLoopMemoryCleanupMode::Async
-            );
-        }
-        {
-            let _mode = EnvVarGuard::set(ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV, "disabled");
-            assert_eq!(
-                PostLoopMemoryCleanupMode::from_env(),
-                PostLoopMemoryCleanupMode::Disabled
-            );
-        }
-        {
-            let _limit = EnvVarGuard::remove(ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV);
-            assert_eq!(
-                post_loop_memory_cleanup_concurrency_limit(),
-                DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY
-            );
-        }
-        {
-            let _limit = EnvVarGuard::set(ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV, "0");
-            assert_eq!(post_loop_memory_cleanup_concurrency_limit(), 0);
-        }
-        {
-            let _timeout = EnvVarGuard::remove(ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV);
-            assert_eq!(
-                session_memory_post_loop_drain_timeout(),
-                Duration::from_millis(DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS)
-            );
-        }
-        {
-            let _timeout =
-                EnvVarGuard::set(ASTRA_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS_ENV, "25");
-            assert_eq!(
-                session_memory_post_loop_drain_timeout(),
-                Duration::from_millis(25)
-            );
-        }
-    }
-
-    #[test]
     fn post_loop_memory_cleanup_permit_respects_limit() {
         let baseline = POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.load(Ordering::SeqCst);
         let limit = baseline + 1;
@@ -8942,7 +8867,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(post_loop_memory_cleanup_env)]
     async fn post_loop_memory_cleanup_metrics_stay_low_cardinality() {
         let _memoria = EnvVarGuard::remove("MEMORIA_MASTER_KEY");
         let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
@@ -8954,6 +8878,7 @@ mod tests {
             None,
             None,
             Some(registry.clone()),
+            Duration::from_millis(DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS),
         )
         .await;
 
