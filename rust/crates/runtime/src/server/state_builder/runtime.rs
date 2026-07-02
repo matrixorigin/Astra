@@ -71,6 +71,7 @@ pub(super) async fn build_runtime_wiring(
     astra_turn_core::parallel_tool_exec::set_tool_execution_metrics_registry(
         state.metrics_registry(),
     );
+    crate::turn::llm::client::set_llm_nonstream_fallback_metrics_registry(state.metrics_registry());
     let resource_governor = initialize_resource_governor(shared_pool).await;
     let run_concurrency_limit = std::env::var("ASTRA_RUN_CONCURRENCY_LIMIT")
         .ok()

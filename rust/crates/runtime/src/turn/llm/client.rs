@@ -19,8 +19,8 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, OnceLock, RwLock},
     time::Instant,
 };
 
@@ -37,6 +37,7 @@ use astra_text_utils::output_style::current_output_style;
 use astra_turn_core::bridge_rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
+use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
 use astra_turn_core::sse_data_lines::{
     json_events_from_sse_event_block, validate_sse_event_block_json,
@@ -83,9 +84,89 @@ const LLM_FALLBACK_TIMEOUT_S: u64 = 120;
 /// Total budget across all retries + fallback for a single LLM call (seconds).
 /// Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
 const LLM_TOTAL_BUDGET_S: u64 = 300;
+const METRIC_LLM_NONSTREAM_FALLBACK_ATTEMPTS_TOTAL: &str =
+    "astra_llm_nonstream_fallback_attempts_total";
+const METRIC_LLM_NONSTREAM_FALLBACK_ERRORS_TOTAL: &str =
+    "astra_llm_nonstream_fallback_errors_total";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonstreamFallbackTrigger {
+    StreamIdle,
+    StreamTransport,
+}
+
+impl NonstreamFallbackTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamIdle => "stream_idle",
+            Self::StreamTransport => "stream_transport",
+        }
+    }
+}
+
+fn llm_nonstream_fallback_metrics_slot() -> &'static RwLock<Option<Arc<MetricsRegistry>>> {
+    static SLOT: OnceLock<RwLock<Option<Arc<MetricsRegistry>>>> = OnceLock::new();
+    SLOT.get_or_init(Default::default)
+}
+
+pub(crate) fn set_llm_nonstream_fallback_metrics_registry(registry: Arc<MetricsRegistry>) {
+    register_llm_nonstream_fallback_metrics(&registry);
+    *llm_nonstream_fallback_metrics_slot()
+        .write()
+        .expect("llm fallback metrics registry lock poisoned") = Some(registry);
+}
+
+fn llm_nonstream_fallback_metrics_registry() -> Option<Arc<MetricsRegistry>> {
+    llm_nonstream_fallback_metrics_slot()
+        .read()
+        .expect("llm fallback metrics registry lock poisoned")
+        .clone()
+}
+
+fn register_llm_nonstream_fallback_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_LLM_NONSTREAM_FALLBACK_ATTEMPTS_TOTAL,
+        "Non-stream LLM fallback attempts by trigger and outcome.",
+    );
+    registry.register_counter(
+        METRIC_LLM_NONSTREAM_FALLBACK_ERRORS_TOTAL,
+        "Non-stream LLM fallback errors by trigger and classified error kind.",
+    );
+}
+
+fn record_llm_nonstream_fallback_outcome(
+    trigger: NonstreamFallbackTrigger,
+    result: &Result<LlmCallResult, astra_core::ClassifiedError>,
+) {
+    let Some(registry) = llm_nonstream_fallback_metrics_registry() else {
+        return;
+    };
+    register_llm_nonstream_fallback_metrics(&registry);
+    let trigger_label = trigger.as_str();
+    match result {
+        Ok(_) => {
+            registry.increment_counter(
+                METRIC_LLM_NONSTREAM_FALLBACK_ATTEMPTS_TOTAL,
+                &[("trigger", trigger_label), ("outcome", "success")],
+                1,
+            );
+        }
+        Err(error) => {
+            registry.increment_counter(
+                METRIC_LLM_NONSTREAM_FALLBACK_ATTEMPTS_TOTAL,
+                &[("trigger", trigger_label), ("outcome", "error")],
+                1,
+            );
+            registry.increment_counter(
+                METRIC_LLM_NONSTREAM_FALLBACK_ERRORS_TOTAL,
+                &[("trigger", trigger_label), ("class", error.kind.as_str())],
+                1,
+            );
+        }
+    }
+}
 
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
-use std::sync::OnceLock;
 
 /// Per-model rate-limit cooldown tracker — shared with bridge_llm_stream.
 use super::super::bridge::llm_stream::rate_limit_cooldown;
@@ -2784,7 +2865,8 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
                             "stream transport error after partial output — attempting non-stream fallback (timeout {}s)",
                             fb_timeout.as_secs()
                         );
-                        return call_llm_nonstream_fallback_with_request_overrides(
+                        return call_llm_nonstream_fallback_with_request_overrides_for_trigger(
+                            NonstreamFallbackTrigger::StreamTransport,
                             client,
                             &messages,
                             tools,
@@ -2864,7 +2946,8 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
                         made_progress,
                         fb_timeout.as_secs()
                     );
-                    return call_llm_nonstream_fallback_with_request_overrides(
+                    return call_llm_nonstream_fallback_with_request_overrides_for_trigger(
+                        NonstreamFallbackTrigger::StreamIdle,
                         client,
                         &messages,
                         tools,
@@ -3710,6 +3793,47 @@ pub(crate) async fn call_llm_nonstream_fallback(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn call_llm_nonstream_fallback_with_request_overrides_for_trigger(
+    trigger: NonstreamFallbackTrigger,
+    client: &reqwest::Client,
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    api_key: &str,
+    base_url: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    timeout: std::time::Duration,
+    wire_model_name: Option<&str>,
+    header_overrides: Option<&HashMap<String, String>>,
+    request_body_overrides: Option<&Map<String, Value>>,
+    completions_url_override: Option<&str>,
+    request_timeout: Option<std::time::Duration>,
+    thinking: &ThinkingConfig,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let result = call_llm_nonstream_fallback_with_request_overrides(
+        client,
+        messages,
+        tools,
+        model_name,
+        api_key,
+        base_url,
+        provider,
+        max_output_tokens,
+        timeout,
+        wire_model_name,
+        header_overrides,
+        request_body_overrides,
+        completions_url_override,
+        request_timeout,
+        thinking,
+    )
+    .await;
+    record_llm_nonstream_fallback_outcome(trigger, &result);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     client: &reqwest::Client,
     messages: &[Value],
@@ -4172,6 +4296,19 @@ mod tests {
             }
         }
         Guard
+    }
+
+    async fn install_llm_fallback_metrics_for_test()
+    -> (tokio::sync::OwnedMutexGuard<()>, Arc<MetricsRegistry>) {
+        static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await;
+        let registry = Arc::new(MetricsRegistry::new());
+        set_llm_nonstream_fallback_metrics_registry(registry.clone());
+        (guard, registry)
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -6772,6 +6909,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_llm_and_collect_falls_back_immediately_after_partial_stream_idle() {
+        let (_metrics_guard, registry) = install_llm_fallback_metrics_for_test().await;
         let _guard = set_test_stream_timeouts(10, Some(10));
         let state = StreamIdleHit {
             stream_hits: Arc::new(AtomicU32::new(0)),
@@ -6807,10 +6945,22 @@ mod tests {
             "partial stream idle should skip the extra streaming retry"
         );
         assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_llm_nonstream_fallback_attempts_total{outcome=\"success\",trigger=\"stream_idle\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("model=") && !rendered.contains("user_id="),
+            "fallback metrics must stay low-cardinality: {rendered}"
+        );
     }
 
     #[tokio::test]
     async fn call_llm_and_collect_preserves_partial_stream_details_when_fallback_fails() {
+        let (_metrics_guard, registry) = install_llm_fallback_metrics_for_test().await;
         let _guard = set_test_stream_timeouts(10, Some(10));
         let state = StreamIdleHit {
             stream_hits: Arc::new(AtomicU32::new(0)),
@@ -6847,10 +6997,24 @@ mod tests {
         assert_eq!(details["partial_full_text"], "partial");
         assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
         assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_llm_nonstream_fallback_attempts_total{outcome=\"error\",trigger=\"stream_idle\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_llm_nonstream_fallback_errors_total{class=\"server_error\",trigger=\"stream_idle\"} 1"
+            ),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]
     async fn call_llm_and_collect_falls_back_after_partial_stream_transport_error() {
+        let (_metrics_guard, registry) = install_llm_fallback_metrics_for_test().await;
         let state = StreamIdleHit {
             stream_hits: Arc::new(AtomicU32::new(0)),
             fallback_hits: Arc::new(AtomicU32::new(0)),
@@ -6880,6 +7044,13 @@ mod tests {
         assert_eq!(res.full_text, "from-transport-fallback");
         assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
         assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_llm_nonstream_fallback_attempts_total{outcome=\"success\",trigger=\"stream_transport\"} 1"
+            ),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]
@@ -6936,6 +7107,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_llm_and_collect_preserves_partial_stream_details_when_transport_fallback_fails() {
+        let (_metrics_guard, registry) = install_llm_fallback_metrics_for_test().await;
         let state = StreamIdleHit {
             stream_hits: Arc::new(AtomicU32::new(0)),
             fallback_hits: Arc::new(AtomicU32::new(0)),
@@ -6970,6 +7142,19 @@ mod tests {
         assert_eq!(details["partial_full_text"], "partial");
         assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
         assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_llm_nonstream_fallback_attempts_total{outcome=\"error\",trigger=\"stream_transport\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_llm_nonstream_fallback_errors_total{class=\"server_error\",trigger=\"stream_transport\"} 1"
+            ),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]
