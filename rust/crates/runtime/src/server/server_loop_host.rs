@@ -1638,21 +1638,32 @@ impl ServerAgenticLoopHost {
     }
 
     async fn resolve_llm_config_for_state(
-        &self,
+        &mut self,
         state: &AgenticLoopState,
     ) -> Result<ResolvedTurnLlmConfig, String> {
+        if let Some(config) = self.resolved_llm_config.as_ref() {
+            if self.cached_llm_config_matches_state(state) {
+                return Ok(config.clone());
+            }
+            self.clear_resolved_llm_config();
+        }
+
         // Skill-level model override takes precedence over the host-level one.
-        let effective_model_override = self.effective_model_override_for_state(state);
+        let effective_model_override = self
+            .effective_model_override_for_state(state)
+            .map(ToString::to_string);
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-        resolve_llm_model_for_turn(
+        let llm_cfg = resolve_llm_model_for_turn(
             &self.matrixone,
             self.encryptor.as_ref(),
-            effective_model_override,
+            effective_model_override.as_deref(),
             pool_ref,
             self.llm_token_service.as_ref(),
             &state.hooks.forward_headers,
         )
-        .await
+        .await?;
+        self.remember_resolved_llm_config(&llm_cfg);
+        Ok(llm_cfg)
     }
 
     fn effective_model_override_for_state<'a>(
@@ -1670,6 +1681,11 @@ impl ServerAgenticLoopHost {
         let Some(config) = self.resolved_llm_config.as_ref() else {
             return false;
         };
+        if self.llm_token_service.is_some()
+            && config.header_overrides != state.hooks.forward_headers
+        {
+            return false;
+        }
         match self.effective_model_override_for_state(state) {
             Some(requested) => config.model_name.eq_ignore_ascii_case(requested),
             None => true,
@@ -8173,6 +8189,112 @@ mod tests {
         .expect("resolve via llm token service gateway");
         assert_eq!(resolved.model_name, "gpt-4o-mini");
         assert!(resolved.request_timeout.is_none());
+    }
+
+    #[tokio::test]
+    async fn host_model_resolution_reuses_cached_config_for_same_forward_headers() {
+        let mut state = create_test_state();
+        state
+            .hooks
+            .forward_headers
+            .insert("authorization".to_string(), "Bearer first".to_string());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-model-cache".to_string(),
+            "session-model-cache".to_string(),
+        )
+        .with_model(Some("gpt-5-mini".to_string()))
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: "http://catalog-a/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(1000),
+        }))
+        .build();
+
+        let first = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("first resolution");
+        host.llm_token_service = Some(LlmTokenServiceConfig {
+            url: "http://catalog-b/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(2000),
+        });
+        let second = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("second resolution");
+
+        assert_eq!(
+            first.completions_url_override,
+            Some("http://catalog-a/api/v1/chat/completions".to_string())
+        );
+        assert_eq!(
+            second.completions_url_override,
+            first.completions_url_override
+        );
+        assert_eq!(second.request_timeout, first.request_timeout);
+        assert_eq!(
+            second
+                .header_overrides
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer first")
+        );
+    }
+
+    #[tokio::test]
+    async fn host_model_resolution_invalidates_cached_token_config_when_headers_change() {
+        let mut state = create_test_state();
+        state
+            .hooks
+            .forward_headers
+            .insert("authorization".to_string(), "Bearer first".to_string());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-model-cache".to_string(),
+            "session-model-cache".to_string(),
+        )
+        .with_model(Some("gpt-5-mini".to_string()))
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: "http://catalog-a/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(1000),
+        }))
+        .build();
+
+        let first = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("first resolution");
+        state
+            .hooks
+            .forward_headers
+            .insert("authorization".to_string(), "Bearer second".to_string());
+        host.llm_token_service = Some(LlmTokenServiceConfig {
+            url: "http://catalog-b/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(2000),
+        });
+        let second = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("second resolution");
+
+        assert_ne!(
+            second.completions_url_override,
+            first.completions_url_override
+        );
+        assert_eq!(
+            second.completions_url_override,
+            Some("http://catalog-b/api/v1/chat/completions".to_string())
+        );
+        assert_eq!(second.request_timeout, Some(Duration::from_millis(2000)));
+        assert_eq!(
+            second
+                .header_overrides
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer second")
+        );
     }
 
     #[test]
