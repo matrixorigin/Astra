@@ -120,6 +120,33 @@ enum RunAdmissionError {
     Closed,
 }
 
+fn run_admission_error_code(error: RunAdmissionError) -> &'static str {
+    match error {
+        RunAdmissionError::Timeout => "run_admission_timeout",
+        RunAdmissionError::Closed => "run_admission_closed",
+    }
+}
+
+fn run_admission_capacity_response(error: RunAdmissionError) -> (StatusCode, Json<ErrorResponse>) {
+    let error_code = run_admission_error_code(error);
+    error_response_coded(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("server at capacity ({error_code}), please retry"),
+        error_code,
+    )
+}
+
+fn per_user_run_quota_response(
+    limit: astra_services::resource_governor::ResourceLimitKind,
+    reason: String,
+) -> (StatusCode, Json<ErrorResponse>) {
+    error_response_coded(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("Per-user run quota exceeded ({}): {reason}", limit.as_str()),
+        limit.error_code(),
+    )
+}
+
 fn register_run_admission_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
     registry.register_counter(
         METRIC_RUN_ADMISSION_ATTEMPTS_TOTAL,
@@ -4750,13 +4777,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── Resource governance check (Phase 5) ─────────────────────
         if let Some(ref gov) = self.resource_governor {
-            if let astra_services::resource_governor::LimitCheck::Denied { reason } =
+            if let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
                 gov.check_run_start(&user_id).await
             {
-                return Err(error_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    format!("Resource limit exceeded: {reason}"),
-                ));
+                return Err(per_user_run_quota_response(limit, reason));
             }
         }
 
@@ -5246,10 +5270,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     )
                     .await;
                 }
-                return Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "server at capacity, please retry",
-                ));
+                return Err(run_admission_capacity_response(error));
             }
         };
 
@@ -5273,12 +5294,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // Pre-flight: check daily token budget before starting the agentic loop.
                 if let Some(ref gov) = bg_resource_governor {
                     use astra_services::resource_governor::LimitCheck;
-                    if let LimitCheck::Denied { reason } = gov.check_token_budget(&bg_user_id).await
+                    if let LimitCheck::Denied { limit, reason } =
+                        gov.check_token_budget(&bg_user_id).await
                     {
                         tracing::warn!(
                             target: "astra_runtime::run_lifecycle",
                             user_id = %bg_user_id,
                             run_id = %bg_run_id,
+                            limit = %limit.as_str(),
                             reason = %reason,
                             "run rejected: daily token budget exhausted"
                         );
@@ -5633,13 +5656,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── Resource governance check ────────────────────────────────
         if let Some(ref gov) = self.resource_governor {
-            if let astra_services::resource_governor::LimitCheck::Denied { reason } =
+            if let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
                 gov.check_run_start(&user_id).await
             {
-                return Err(error_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    format!("Resource limit exceeded: {reason}"),
-                ));
+                return Err(per_user_run_quota_response(limit, reason));
             }
         }
 
@@ -6143,10 +6163,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     )
                     .await;
                 }
-                return Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "server at capacity, please retry",
-                ));
+                return Err(run_admission_capacity_response(error));
             }
         };
 
@@ -15795,6 +15812,38 @@ mod tests {
             rendered.contains("astra_run_admission_attempts_total{outcome=\"closed\"} 1"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn run_admission_capacity_response_uses_distinct_error_codes() {
+        let timeout = run_admission_capacity_response(RunAdmissionError::Timeout);
+        assert_eq!(timeout.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            timeout.1.error_code.as_deref(),
+            Some("run_admission_timeout")
+        );
+        assert!(timeout.1.detail.contains("run_admission_timeout"));
+
+        let closed = run_admission_capacity_response(RunAdmissionError::Closed);
+        assert_eq!(closed.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(closed.1.error_code.as_deref(), Some("run_admission_closed"));
+        assert!(closed.1.detail.contains("run_admission_closed"));
+    }
+
+    #[test]
+    fn per_user_run_quota_response_uses_quota_error_code() {
+        let response = per_user_run_quota_response(
+            astra_services::resource_governor::ResourceLimitKind::ConcurrentSessions,
+            "concurrent session limit reached (5/5)".to_string(),
+        );
+
+        assert_eq!(response.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.1.error_code.as_deref(),
+            Some("per_user_concurrent_session_quota")
+        );
+        assert!(response.1.detail.contains("Per-user run quota exceeded"));
+        assert!(response.1.detail.contains("concurrent_sessions"));
     }
 
     #[test]

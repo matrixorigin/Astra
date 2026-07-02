@@ -60,13 +60,43 @@ struct DatedUsage {
     usage: ResourceUsage,
 }
 
+/// Machine-readable limit class for quota denials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceLimitKind {
+    ConcurrentSessions,
+    DailySessions,
+    DailyTokens,
+}
+
+impl ResourceLimitKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConcurrentSessions => "concurrent_sessions",
+            Self::DailySessions => "daily_sessions",
+            Self::DailyTokens => "daily_tokens",
+        }
+    }
+
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::ConcurrentSessions => "per_user_concurrent_session_quota",
+            Self::DailySessions => "per_user_daily_session_quota",
+            Self::DailyTokens => "per_user_daily_token_quota",
+        }
+    }
+}
+
 /// Result of a pre-execution limit check.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LimitCheck {
     /// Proceed — within budget.
     Allowed,
     /// Denied — which limit was hit and a human-readable reason.
-    Denied { reason: String },
+    Denied {
+        limit: ResourceLimitKind,
+        reason: String,
+    },
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────
@@ -99,6 +129,7 @@ pub trait ResourceGovernor: Send + Sync + 'static {
             && usage.active_sessions >= limits.max_concurrent_sessions
         {
             return LimitCheck::Denied {
+                limit: ResourceLimitKind::ConcurrentSessions,
                 reason: format!(
                     "concurrent session limit reached ({}/{})",
                     usage.active_sessions, limits.max_concurrent_sessions
@@ -108,6 +139,7 @@ pub trait ResourceGovernor: Send + Sync + 'static {
 
         if limits.max_tokens_per_day > 0 && usage.tokens_consumed >= limits.max_tokens_per_day {
             return LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
                 reason: format!(
                     "daily token budget exhausted ({}/{})",
                     usage.tokens_consumed, limits.max_tokens_per_day
@@ -137,6 +169,7 @@ pub trait ResourceGovernor: Send + Sync + 'static {
         let usage = self.get_usage(user_id).await;
         if usage.tokens_consumed >= limits.max_tokens_per_day {
             LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
                 reason: format!(
                     "daily token budget exhausted ({}/{})",
                     usage.tokens_consumed, limits.max_tokens_per_day
@@ -314,6 +347,7 @@ impl ResourceGovernor for DatabaseResourceGovernor {
             && usage.active_sessions >= limits.max_concurrent_sessions
         {
             return LimitCheck::Denied {
+                limit: ResourceLimitKind::ConcurrentSessions,
                 reason: format!(
                     "concurrent session limit reached ({}/{})",
                     usage.active_sessions, limits.max_concurrent_sessions
@@ -324,6 +358,7 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         if limits.max_sessions_per_day > 0 && usage.sessions_created >= limits.max_sessions_per_day
         {
             return LimitCheck::Denied {
+                limit: ResourceLimitKind::DailySessions,
                 reason: format!(
                     "daily session limit reached ({}/{})",
                     usage.sessions_created, limits.max_sessions_per_day
@@ -333,6 +368,7 @@ impl ResourceGovernor for DatabaseResourceGovernor {
 
         if limits.max_tokens_per_day > 0 && usage.tokens_consumed >= limits.max_tokens_per_day {
             return LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
                 reason: format!(
                     "daily token budget exhausted ({}/{})",
                     usage.tokens_consumed, limits.max_tokens_per_day
@@ -487,6 +523,7 @@ impl ResourceGovernor for InMemoryResourceGovernor {
             && usage.active_sessions >= limits.max_concurrent_sessions
         {
             return LimitCheck::Denied {
+                limit: ResourceLimitKind::ConcurrentSessions,
                 reason: format!(
                     "concurrent session limit reached ({}/{})",
                     usage.active_sessions, limits.max_concurrent_sessions
@@ -496,6 +533,7 @@ impl ResourceGovernor for InMemoryResourceGovernor {
         if limits.max_sessions_per_day > 0 && usage.sessions_created >= limits.max_sessions_per_day
         {
             return LimitCheck::Denied {
+                limit: ResourceLimitKind::DailySessions,
                 reason: format!(
                     "daily session limit reached ({}/{})",
                     usage.sessions_created, limits.max_sessions_per_day
@@ -504,6 +542,7 @@ impl ResourceGovernor for InMemoryResourceGovernor {
         }
         if limits.max_tokens_per_day > 0 && usage.tokens_consumed >= limits.max_tokens_per_day {
             return LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
                 reason: format!(
                     "daily token budget exhausted ({}/{})",
                     usage.tokens_consumed, limits.max_tokens_per_day
@@ -580,7 +619,10 @@ mod tests {
             );
         }
         match gov.check_session_create("u1").await {
-            LimitCheck::Denied { reason } => assert!(reason.contains("concurrent")),
+            LimitCheck::Denied { limit, reason } => {
+                assert_eq!(limit, ResourceLimitKind::ConcurrentSessions);
+                assert!(reason.contains("concurrent"));
+            }
             _ => panic!("expected denied"),
         }
     }
@@ -602,7 +644,10 @@ mod tests {
             );
         }
         match gov.check_session_create("u1").await {
-            LimitCheck::Denied { reason } => assert!(reason.contains("daily session")),
+            LimitCheck::Denied { limit, reason } => {
+                assert_eq!(limit, ResourceLimitKind::DailySessions);
+                assert!(reason.contains("daily session"));
+            }
             _ => panic!("expected denied"),
         }
     }
@@ -624,7 +669,10 @@ mod tests {
             );
         }
         match gov.check_session_create("u1").await {
-            LimitCheck::Denied { reason } => assert!(reason.contains("token budget")),
+            LimitCheck::Denied { limit, reason } => {
+                assert_eq!(limit, ResourceLimitKind::DailyTokens);
+                assert!(reason.contains("token budget"));
+            }
             _ => panic!("expected denied"),
         }
     }
@@ -745,7 +793,10 @@ mod tests {
             );
         }
         match gov.check_run_start("u1").await {
-            LimitCheck::Denied { reason } => assert!(reason.contains("concurrent")),
+            LimitCheck::Denied { limit, reason } => {
+                assert_eq!(limit, ResourceLimitKind::ConcurrentSessions);
+                assert!(reason.contains("concurrent"));
+            }
             _ => panic!("expected denied"),
         }
     }
@@ -800,7 +851,8 @@ mod tests {
         // Consume 300 more — now over budget (1100 > 1000)
         gov.record_tokens(user, 300).await;
         match gov.check_token_budget(user).await {
-            LimitCheck::Denied { reason } => {
+            LimitCheck::Denied { limit, reason } => {
+                assert_eq!(limit, ResourceLimitKind::DailyTokens);
                 assert!(
                     reason.contains("token"),
                     "denial reason must mention tokens: {reason}"
@@ -860,7 +912,8 @@ mod tests {
         // Simulate second run completing and recording tokens
         gov.record_tokens(user, 600).await;
         match gov.check_token_budget(user).await {
-            LimitCheck::Denied { reason } => {
+            LimitCheck::Denied { limit, reason } => {
+                assert_eq!(limit, ResourceLimitKind::DailyTokens);
                 assert!(
                     reason.contains("1200") || reason.contains("1000"),
                     "denial reason must mention token counts, got: {reason}"
