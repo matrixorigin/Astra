@@ -183,10 +183,7 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
         .await;
     if let Some(error) = &poll.error {
         tracing::warn!(run_id, error = %error, "deferred user input poll failed");
-        return Err(astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::DatabaseError,
-            format!("failed to poll deferred user input for run {run_id}: {error}"),
-        ));
+        return Ok(());
     }
     let observed = state
         .deferred_input
@@ -5766,7 +5763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_user_input_poll_error_fails_closed() {
+    async fn deferred_user_input_poll_error_degrades_without_advancing_cursor() {
         let mut state = make_state();
         state.current_run_id = Some("run-missing".into());
         state.context_manifest_user_id = Some("user-deferred".into());
@@ -5778,14 +5775,13 @@ mod tests {
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        let error = inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
             .await
-            .expect_err("poll errors must stop the loop instead of being treated as empty input");
+            .expect("poll errors are control-plane misses and should not fail the main turn");
 
-        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
-        assert!(error.message.contains("run-missing"));
         assert_eq!(state.deferred_input.deferred_user_input_cursor(), 0);
         assert!(state.messages.is_empty());
+        assert!(state.volatile_pending.is_empty());
         assert!(provider.released.lock().await.is_empty());
     }
 
