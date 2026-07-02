@@ -284,6 +284,33 @@ fn per_user_run_quota_response(
     )
 }
 
+fn per_user_run_quota_terminal_events(
+    limit: astra_services::resource_governor::ResourceLimitKind,
+    reason: &str,
+) -> [Value; 2] {
+    let error_code = limit.error_code();
+    [
+        json!({
+            "event_type": "run_error",
+            "data": {
+                "error": reason,
+                "error_code": error_code,
+                "error_kind": "budget_exhausted",
+            },
+        }),
+        json!({
+            "event_type": "run_finished",
+            "data": {
+                "total_prompt_tokens": 0,
+                "total_completion_tokens": 0,
+                "error": reason,
+                "error_code": error_code,
+                "error_kind": "budget_exhausted",
+            },
+        }),
+    ]
+}
+
 fn classified_terminal_error_code(error: &astra_core::ClassifiedError) -> String {
     if let Some(details_json) = error.details_json.as_deref()
         && let Ok(Value::Object(details)) = serde_json::from_str::<Value>(details_json)
@@ -4493,6 +4520,68 @@ impl AgenticRunLifecycleService {
         }
     }
 
+    async fn persist_started_run_quota_rejection(
+        run_engine: &RunEngine,
+        runs: &Arc<RwLock<HashMap<String, RunState>>>,
+        user_id: &str,
+        run_id: &str,
+        limit: astra_services::resource_governor::ResourceLimitKind,
+        reason: &str,
+    ) -> Option<Vec<Value>> {
+        let terminal_events = per_user_run_quota_terminal_events(limit, reason);
+        let committed = match run_engine
+            .transition_status_with_events_if_current(
+                user_id,
+                run_id,
+                &[
+                    STATUS_RUNNING,
+                    STATUS_PAUSED,
+                    STATUS_WAITING,
+                    STATUS_INPUT_QUEUED,
+                ],
+                STATUS_FAILED,
+                None,
+                Some(reason),
+                &terminal_events,
+            )
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    limit = %limit.as_str(),
+                    "skipping quota rejection terminal events after stale status CAS"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    limit = %limit.as_str(),
+                    error = %error,
+                    "failed to persist quota rejection status/events transition"
+                );
+                false
+            }
+        };
+        if !committed {
+            return None;
+        }
+
+        let terminal_events = terminal_events.to_vec();
+        if let Some(run) = runs.write().await.get_mut(run_id) {
+            if run.status.try_transition(&RunStatus::Failed).is_ok() {
+                run.status = RunStatus::Failed;
+            }
+            run.events.extend(terminal_events.iter().cloned());
+            run.live_tx = None;
+        }
+        Some(terminal_events)
+    }
+
     fn durable_recent_events(run: &DurableRunRecord, limit: u32) -> Vec<Value> {
         let capped = limit.clamp(1, MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS) as usize;
         let offset = run.events.len().saturating_sub(capped);
@@ -5646,58 +5735,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             reason = %reason,
                             "run rejected: daily token budget exhausted"
                         );
-                        let budget_reject_committed = match run_engine
-                            .persist_status_if_current(
-                                &bg_user_id,
-                                &bg_run_id,
-                                &[
-                                    STATUS_RUNNING,
-                                    STATUS_PAUSED,
-                                    STATUS_WAITING,
-                                    STATUS_INPUT_QUEUED,
-                                ],
-                                astra_core::STATUS_FAILED,
-                                None,
-                                Some(&reason),
-                            )
-                            .await
-                        {
-                            Ok(true) => true,
-                            Ok(false) => {
-                                tracing::warn!(
-                                    target: "astra_runtime::run_lifecycle",
-                                    run_id = %bg_run_id,
-                                    "skipping budget rejection failure events after stale status CAS"
-                                );
-                                false
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    target: "astra_runtime::run_lifecycle",
-                                    run_id = %bg_run_id,
-                                    error = %error,
-                                    "failed to persist budget rejection status"
-                                );
-                                false
-                            }
-                        };
-                        if budget_reject_committed {
-                            if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                                if run.status.try_transition(&RunStatus::Failed).is_ok() {
-                                    run.status = RunStatus::Failed;
-                                }
-                                // Push terminal events so SSE clients see the failure.
-                                run.events.push(json!({
-                                    "event_type": "run_error",
-                                    "data": {"error": reason.clone()}
-                                }));
-                                run.events.push(json!({
-                                    "event_type": "run_finished",
-                                    "data": {"total_prompt_tokens": 0, "total_completion_tokens": 0}
-                                }));
-                                run.live_tx = None;
-                            }
-                        }
+                        let budget_reject_committed = Self::persist_started_run_quota_rejection(
+                            &run_engine,
+                            &runs,
+                            &bg_user_id,
+                            &bg_run_id,
+                            limit,
+                            &reason,
+                        )
+                        .await
+                        .is_some();
                         // Clean up channels for this run.
                         bg_approval_channels.lock().await.remove(&bg_run_id);
                         bg_user_prompt_channels.lock().await.remove(&bg_run_id);
@@ -6525,6 +6572,54 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
                 let _guard = TaskCountGuard(bg_task_count_2);
+                if let Some(ref gov) = bg_resource_governor {
+                    use astra_services::resource_governor::LimitCheck;
+                    if let LimitCheck::Denied { limit, reason } =
+                        gov.check_token_budget(&bg_user_id).await
+                    {
+                        tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            user_id = %bg_user_id,
+                            run_id = %bg_run_id,
+                            limit = %limit.as_str(),
+                            reason = %reason,
+                            "streaming run rejected: daily token budget exhausted"
+                        );
+                        let terminal_events = Self::persist_started_run_quota_rejection(
+                            &run_engine,
+                            &runs,
+                            &bg_user_id,
+                            &bg_run_id,
+                            limit,
+                            &reason,
+                        )
+                        .await;
+                        if let Some(terminal_events) = terminal_events {
+                            for event in run_handlers::transform_stream_run_events_for_client(
+                                &bg_run_id,
+                                terminal_events,
+                            ) {
+                                if event_tx.send(event).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                            if let Some(record) = bg_cloud_workspace_record.as_ref() {
+                                Self::cleanup_cloud_workspace_after_terminal_run(
+                                    bg_workspace_record_store.clone(),
+                                    &bg_user_id,
+                                    &bg_session_id,
+                                    &bg_run_id,
+                                    record,
+                                    &RunStatus::Failed,
+                                )
+                                .await;
+                            }
+                        }
+                        drop(event_tx);
+                        return;
+                    }
+                }
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
                 let loop_success = loop_result.is_ok();
@@ -10320,6 +10415,55 @@ mod tests {
             self.inner
                 .update_retry_count(user_id, run_id, retry_count)
                 .await
+        }
+    }
+
+    struct DenyTokenBudgetGovernor;
+
+    #[async_trait]
+    impl astra_services::resource_governor::ResourceGovernor for DenyTokenBudgetGovernor {
+        async fn get_limits(
+            &self,
+            _user_id: &str,
+        ) -> astra_services::resource_governor::ResourceLimits {
+            astra_services::resource_governor::ResourceLimits::default()
+        }
+
+        async fn set_limits(
+            &self,
+            _user_id: &str,
+            _limits: astra_services::resource_governor::ResourceLimits,
+        ) {
+        }
+
+        async fn get_usage(
+            &self,
+            _user_id: &str,
+        ) -> astra_services::resource_governor::ResourceUsage {
+            astra_services::resource_governor::ResourceUsage::default()
+        }
+
+        async fn check_session_create(
+            &self,
+            _user_id: &str,
+        ) -> astra_services::resource_governor::LimitCheck {
+            astra_services::resource_governor::LimitCheck::Allowed
+        }
+
+        async fn record_session_created(&self, _user_id: &str) {}
+
+        async fn record_tool_calls(&self, _user_id: &str, _count: u64) {}
+
+        async fn record_tokens(&self, _user_id: &str, _tokens: u64) {}
+
+        async fn check_token_budget(
+            &self,
+            _user_id: &str,
+        ) -> astra_services::resource_governor::LimitCheck {
+            astra_services::resource_governor::LimitCheck::Denied {
+                limit: astra_services::resource_governor::ResourceLimitKind::DailyTokens,
+                reason: "daily token budget exhausted (1000/1000)".to_string(),
+            }
         }
     }
 
@@ -16047,6 +16191,156 @@ mod tests {
         .await
         .expect("timeout waiting for durable run status to finalize");
         assert_ne!(durable.status, "running");
+    }
+
+    #[tokio::test]
+    async fn create_run_token_budget_reject_persists_terminal_events() {
+        let svc = test_service()
+            .with_resource_governor(Arc::new(DenyTokenBudgetGovernor))
+            .with_run_concurrency_limit(1);
+        let run = ok(svc
+            .create_run("user-1".into(), test_request("over budget"))
+            .await);
+
+        assert!(
+            svc.drain_background_tasks(Duration::from_secs(1)).await,
+            "budget rejection task should finish promptly"
+        );
+        let durable = svc
+            .run_engine
+            .load_run("user-1", &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(durable.status, STATUS_FAILED);
+        assert_eq!(
+            durable.error_code.as_deref(),
+            Some("per_user_daily_token_quota")
+        );
+        assert!(
+            durable
+                .events
+                .iter()
+                .any(
+                    |event| event.get("event_type").and_then(Value::as_str) == Some("run_error")
+                        && event
+                            .get("data")
+                            .and_then(Value::as_object)
+                            .and_then(|data| data.get("error_code"))
+                            .and_then(Value::as_str)
+                            == Some("per_user_daily_token_quota")
+                ),
+            "durable run_error must explain the quota failure"
+        );
+        assert!(
+            durable
+                .events
+                .iter()
+                .any(|event| event.get("event_type").and_then(Value::as_str)
+                    == Some("run_finished")
+                    && event
+                        .get("data")
+                        .and_then(Value::as_object)
+                        .and_then(|data| data.get("error_kind"))
+                        .and_then(Value::as_str)
+                        == Some("budget_exhausted")),
+            "durable run_finished must preserve the terminal quota code"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_budget_reject_transition_failure_does_not_commit_status_or_events() {
+        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]));
+        let svc = test_service_with_store(store);
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-quota-fail", "user-1", "session-1")
+            .await
+            .unwrap();
+
+        let committed_events = AgenticRunLifecycleService::persist_started_run_quota_rejection(
+            engine,
+            &svc.runs_handle(),
+            "user-1",
+            "run-quota-fail",
+            astra_services::resource_governor::ResourceLimitKind::DailyTokens,
+            "daily token budget exhausted (1000/1000)",
+        )
+        .await;
+
+        assert!(
+            committed_events.is_none(),
+            "injected transition failure must not report committed events"
+        );
+        let durable = engine
+            .load_run("user-1", "run-quota-fail")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_RUNNING);
+        assert!(durable.error_code.is_none());
+        assert!(
+            durable.events.iter().all(|event| {
+                !matches!(
+                    event.get("event_type").and_then(Value::as_str),
+                    Some("run_error" | "run_finished")
+                )
+            }),
+            "failed quota transition must not leave partial terminal events"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_token_budget_reject_sends_sse_terminal_events() {
+        let svc = test_service()
+            .with_resource_governor(Arc::new(DenyTokenBudgetGovernor))
+            .with_run_concurrency_limit(1);
+        let mut stream = ok(svc
+            .stream_chat("user-1".into(), test_request("over budget"))
+            .await);
+        let mut rx = stream.event_rx.take().expect("stream event receiver");
+        let events = tokio::time::timeout(Duration::from_secs(1), async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        })
+        .await
+        .expect("budget rejection stream should close promptly");
+
+        assert!(
+            svc.drain_background_tasks(Duration::from_secs(1)).await,
+            "budget rejection task should finish promptly"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("run_error")
+                    && event.get("error_code").and_then(Value::as_str)
+                        == Some("per_user_daily_token_quota")
+            }),
+            "SSE stream must include a structured run_error: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("run_finished")
+                    && event.get("status").and_then(Value::as_str) == Some(STATUS_FAILED)
+            }),
+            "SSE stream must include failed run_finished: {events:?}"
+        );
+
+        let durable = svc
+            .run_engine
+            .load_run("user-1", &stream.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_FAILED);
+        assert_eq!(
+            durable.error_code.as_deref(),
+            Some("per_user_daily_token_quota")
+        );
     }
 
     // ─── DelegationTracker integration tests ────────────────────────────
