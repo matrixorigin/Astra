@@ -145,6 +145,97 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("clear and rebuild", projections["retention_policy"])
         self.assertIn("repairable display state", projections["merge_guidance"])
 
+    def test_state_task_workspace_tables_have_semantic_metadata(self) -> None:
+        second_batch = {
+            "config_versions",
+            "context_manifests",
+            "session_state_revisions",
+            "session_device_leases",
+            "session_device_lease_events",
+            "session_state_items",
+            "session_delegations",
+            "session_plan_todos",
+            "session_todos",
+            "session_todo_counters",
+            "session_todo_idempotency",
+            "data_versioning_checkpoints",
+            "sweeper_leases",
+            "workspace_records",
+            "workspace_cleanup_debts",
+        }
+        for table in second_batch:
+            with self.subTest(table=table):
+                row = self.tables[table]
+                for field in [
+                    "semantic_owner",
+                    "state_class",
+                    "primary_query",
+                    "retention_policy",
+                    "rebuildability",
+                    "merge_guidance",
+                    "migration_owner",
+                    "product_owner",
+                ]:
+                    self.assertNotEqual(
+                        row[field],
+                        "unclassified",
+                        f"{table}.{field} must be explicit metadata",
+                    )
+
+    def test_state_task_workspace_metadata_locks_boundary_decisions(self) -> None:
+        self.assertIn(
+            "parent manifest summary",
+            self.tables["context_manifests"]["merge_guidance"],
+        )
+        self.assertIn(
+            "current projection surface",
+            self.tables["session_state_items"]["merge_guidance"],
+        )
+        self.assertIn(
+            "session-level revision",
+            self.tables["session_state_revisions"]["merge_guidance"],
+        )
+        self.assertIn(
+            "mutable current state",
+            self.tables["session_device_leases"]["merge_guidance"],
+        )
+        self.assertIn(
+            "append-only audit",
+            self.tables["session_device_lease_events"]["merge_guidance"],
+        )
+        self.assertIn(
+            "do not merge into agent_runs",
+            self.tables["session_delegations"]["merge_guidance"],
+        )
+        self.assertIn(
+            "incompatible schema and consumers",
+            self.tables["session_plan_todos"]["merge_guidance"],
+        )
+        self.assertIn(
+            "live task scratchpad",
+            self.tables["session_todos"]["merge_guidance"],
+        )
+        self.assertIn(
+            "deleted todos still reserve ids",
+            self.tables["session_todo_counters"]["merge_guidance"],
+        )
+        self.assertIn(
+            "queried directly",
+            self.tables["session_todo_idempotency"]["merge_guidance"],
+        )
+        self.assertIn(
+            "DatabaseDataVersioningService reads and writes",
+            self.tables["data_versioning_checkpoints"]["merge_guidance"],
+        )
+        self.assertIn(
+            "cleanup debt can outlive the workspace record",
+            self.tables["workspace_cleanup_debts"]["merge_guidance"],
+        )
+        self.assertIn(
+            "shared multi-pod leader election",
+            self.tables["sweeper_leases"]["merge_guidance"],
+        )
+
     def test_high_growth_tables_have_retention_metadata(self) -> None:
         high_growth_tables = [
             "agent_events",
