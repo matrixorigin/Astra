@@ -115,6 +115,12 @@ const METRIC_DURABLE_RUN_EVENT_ROWS_TOTAL: &str = "astra_durable_run_event_rows_
 const METRIC_DURABLE_RUN_EVENT_BYTES_TOTAL: &str = "astra_durable_run_event_bytes_total";
 const METRIC_DURABLE_RUN_EVENT_ROW_BUDGET: &str = "astra_durable_run_event_row_budget";
 const METRIC_DURABLE_RUN_EVENT_BYTE_BUDGET: &str = "astra_durable_run_event_byte_budget";
+const METRIC_POST_LOOP_MEMORY_CLEANUP_DISPATCHES_TOTAL: &str =
+    "astra_post_loop_memory_cleanup_dispatches_total";
+const METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL: &str =
+    "astra_post_loop_memory_cleanup_workers_total";
+const METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL: &str =
+    "astra_session_memory_post_loop_drains_total";
 const ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE_ENV: &str = "ASTRA_POST_LOOP_MEMORY_CLEANUP_MODE";
 const ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY_ENV: &str =
     "ASTRA_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY";
@@ -304,6 +310,23 @@ fn register_durable_run_event_metrics(
     refresh_durable_run_event_budget_metrics(registry);
 }
 
+fn register_post_loop_memory_cleanup_metrics(
+    registry: &astra_turn_core::pipeline_metrics::MetricsRegistry,
+) {
+    registry.register_counter(
+        METRIC_POST_LOOP_MEMORY_CLEANUP_DISPATCHES_TOTAL,
+        "Post-loop memory cleanup dispatches by mode and low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL,
+        "Post-loop memory cleanup workers by low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL,
+        "Post-loop session-memory extraction drains by low-cardinality outcome.",
+    );
+}
+
 fn refresh_durable_run_event_budget_metrics(
     registry: &astra_turn_core::pipeline_metrics::MetricsRegistry,
 ) {
@@ -362,6 +385,52 @@ fn record_durable_run_event_batch_metrics(
             .sum::<usize>()
             .try_into()
             .unwrap_or(u64::MAX),
+    );
+}
+
+fn record_post_loop_memory_cleanup_dispatch_metrics(
+    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    mode: &'static str,
+    outcome: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_post_loop_memory_cleanup_metrics(registry);
+    registry.increment_counter(
+        METRIC_POST_LOOP_MEMORY_CLEANUP_DISPATCHES_TOTAL,
+        &[("mode", mode), ("outcome", outcome)],
+        1,
+    );
+}
+
+fn record_post_loop_memory_cleanup_worker_metrics(
+    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    outcome: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_post_loop_memory_cleanup_metrics(registry);
+    registry.increment_counter(
+        METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL,
+        &[("outcome", outcome)],
+        1,
+    );
+}
+
+fn record_session_memory_post_loop_drain_metrics(
+    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    outcome: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_post_loop_memory_cleanup_metrics(registry);
+    registry.increment_counter(
+        METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL,
+        &[("outcome", outcome)],
+        1,
     );
 }
 
@@ -535,6 +604,7 @@ async fn post_loop_memory_cleanup(
     session_facts: &astra_turn_types::session_facts::SessionFacts,
     extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
     final_extract_request: Option<crate::session_memory::ExtractionRequest>,
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 ) {
     if session_id.is_empty() {
         return;
@@ -546,14 +616,25 @@ async fn post_loop_memory_cleanup(
 
     match PostLoopMemoryCleanupMode::from_env() {
         PostLoopMemoryCleanupMode::Disabled => {
+            record_post_loop_memory_cleanup_dispatch_metrics(
+                metrics_registry.as_ref(),
+                "disabled",
+                "disabled",
+            );
             reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
         }
         PostLoopMemoryCleanupMode::Inline => {
+            record_post_loop_memory_cleanup_dispatch_metrics(
+                metrics_registry.as_ref(),
+                "inline",
+                "started",
+            );
             run_post_loop_memory_cleanup_work(
                 session_id,
                 session_facts,
                 extraction_service,
                 final_extract_request,
+                metrics_registry,
             )
             .await;
         }
@@ -561,6 +642,11 @@ async fn post_loop_memory_cleanup(
             let concurrency_limit = post_loop_memory_cleanup_concurrency_limit();
             let Some(permit) = try_acquire_post_loop_memory_cleanup_permit(concurrency_limit)
             else {
+                record_post_loop_memory_cleanup_dispatch_metrics(
+                    metrics_registry.as_ref(),
+                    "async",
+                    "dropped_full",
+                );
                 tracing::debug!(
                     session_id = %session_id,
                     concurrency_limit,
@@ -569,6 +655,11 @@ async fn post_loop_memory_cleanup(
                 reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
                 return;
             };
+            record_post_loop_memory_cleanup_dispatch_metrics(
+                metrics_registry.as_ref(),
+                "async",
+                "scheduled",
+            );
             tokio::spawn(async move {
                 let _permit = permit;
                 run_post_loop_memory_cleanup_work(
@@ -576,6 +667,7 @@ async fn post_loop_memory_cleanup(
                     session_facts,
                     extraction_service,
                     final_extract_request,
+                    metrics_registry,
                 )
                 .await;
             });
@@ -588,6 +680,7 @@ async fn run_post_loop_memory_cleanup_work(
     session_facts: astra_turn_types::session_facts::SessionFacts,
     extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     final_extract_request: Option<crate::session_memory::ExtractionRequest>,
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 ) {
     if let (Some(svc), Some(req)) = (extraction_service.as_ref(), final_extract_request) {
         let _ = svc.maybe_spawn_shutdown_flush(req);
@@ -600,12 +693,17 @@ async fn run_post_loop_memory_cleanup_work(
             svc.wait_for_pending(timeout).await
         };
         if leftover > 0 {
+            record_session_memory_post_loop_drain_metrics(metrics_registry.as_ref(), "leftover");
             tracing::warn!(
                 session_id = %session_id,
                 leftover,
                 "session-memory extraction still in flight after post-loop drain timeout"
             );
+        } else {
+            record_session_memory_post_loop_drain_metrics(metrics_registry.as_ref(), "clean");
         }
+    } else {
+        record_session_memory_post_loop_drain_metrics(metrics_registry.as_ref(), "no_service");
     }
     // ── Governance, debounced ──
     //
@@ -708,6 +806,7 @@ async fn run_post_loop_memory_cleanup_work(
         }
     }
     reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
+    record_post_loop_memory_cleanup_worker_metrics(metrics_registry.as_ref(), "completed");
 }
 
 fn reset_post_loop_memory_process_state(
@@ -5462,6 +5561,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
             tool_event_writer: self.tool_event_writer.clone(),
+            metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
 
@@ -5829,6 +5929,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &loop_state.session_facts,
                     loop_state.memory_extraction_service.as_ref(),
                     build_shutdown_extraction_request(&loop_state),
+                    bg_metrics_registry.clone(),
                 )
                 .await;
 
@@ -6356,6 +6457,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
             tool_event_writer: self.tool_event_writer.clone(),
+            metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
 
@@ -6682,6 +6784,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &state.session_facts,
                     state.memory_extraction_service.as_ref(),
                     build_shutdown_extraction_request(&state),
+                    bg_metrics_registry.clone(),
                 )
                 .await;
 
@@ -8692,6 +8795,47 @@ mod tests {
         assert_eq!(
             POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.load(Ordering::SeqCst),
             baseline
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(post_loop_memory_cleanup_env)]
+    async fn post_loop_memory_cleanup_metrics_stay_low_cardinality() {
+        let _memoria = EnvVarGuard::remove("MEMORIA_MASTER_KEY");
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+
+        record_post_loop_memory_cleanup_dispatch_metrics(Some(&registry), "async", "scheduled");
+        run_post_loop_memory_cleanup_work(
+            "session-1".to_string(),
+            astra_turn_types::session_facts::SessionFacts::default(),
+            None,
+            None,
+            Some(registry.clone()),
+        )
+        .await;
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_post_loop_memory_cleanup_dispatches_total{mode=\"async\",outcome=\"scheduled\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("astra_post_loop_memory_cleanup_workers_total{outcome=\"completed\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("astra_session_memory_post_loop_drains_total{outcome=\"no_service\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("user_id=")
+                && !rendered.contains("session_id=")
+                && !rendered.contains("run_id="),
+            "memory cleanup metrics must stay low-cardinality: {rendered}"
         );
     }
 
