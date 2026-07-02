@@ -343,6 +343,40 @@
             "legendFormat": "{{trigger}} {{class}}"
           }
         ]
+      },
+      {
+        "title": "Memory Sidecar Observer",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 85},
+        "targets": [
+          {
+            "expr": "rate(astra_turn_observer_dispatches_total[5m])",
+            "legendFormat": "dispatch {{mode}} {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_turn_observer_runs_total[5m])",
+            "legendFormat": "run {{mode}} {{outcome}}"
+          }
+        ]
+      },
+      {
+        "title": "Post-loop Memory Cleanup",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 85},
+        "targets": [
+          {
+            "expr": "rate(astra_post_loop_memory_cleanup_dispatches_total[5m])",
+            "legendFormat": "dispatch {{mode}} {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_post_loop_memory_cleanup_workers_total[5m])",
+            "legendFormat": "worker {{outcome}}"
+          },
+          {
+            "expr": "rate(astra_session_memory_post_loop_drains_total[5m])",
+            "legendFormat": "drain {{outcome}}"
+          }
+        ]
       }
     ]
   }

@@ -42,6 +42,9 @@ DEFAULT_METRIC_PREFIXES = (
     "astra_interaction_",
     "astra_task_lease_",
     "astra_multi_agent_",
+    "astra_turn_observer_",
+    "astra_post_loop_memory_cleanup_",
+    "astra_session_memory_post_loop_",
 )
 
 

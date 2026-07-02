@@ -50,6 +50,9 @@ class CapacityProbeTests(unittest.TestCase):
                     "# TYPE astra_capacity_run_slots_total gauge",
                     "astra_capacity_run_slots_total 100",
                     'astra_run_admission_attempts_total{outcome="timeout"} 2',
+                    'astra_turn_observer_dispatches_total{mode="async",outcome="scheduled"} 3',
+                    'astra_post_loop_memory_cleanup_dispatches_total{mode="async",outcome="dropped_full"} 4',
+                    'astra_session_memory_post_loop_drains_total{outcome="leftover"} 5',
                     "process_cpu_seconds_total 9",
                 ]
             )
@@ -58,6 +61,20 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(
             metrics['astra_run_admission_attempts_total{outcome="timeout"}'],
             2.0,
+        )
+        self.assertEqual(
+            metrics['astra_turn_observer_dispatches_total{mode="async",outcome="scheduled"}'],
+            3.0,
+        )
+        self.assertEqual(
+            metrics[
+                'astra_post_loop_memory_cleanup_dispatches_total{mode="async",outcome="dropped_full"}'
+            ],
+            4.0,
+        )
+        self.assertEqual(
+            metrics['astra_session_memory_post_loop_drains_total{outcome="leftover"}'],
+            5.0,
         )
         self.assertNotIn("process_cpu_seconds_total", metrics)
 
