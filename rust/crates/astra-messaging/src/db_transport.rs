@@ -1499,6 +1499,12 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("async fn reclaim_stale_in_pool").next())
             .expect("cleanup scheduler body");
+        assert!(
+            scheduler_body.contains(
+                "reclaim_stale_in_pool(&pool, visibility_timeout, max_delivery_attempts)"
+            ),
+            "cleanup scheduler must reclaim stale claimed messages, not only prune old rows"
+        );
         for helper in [
             "cleanup_expired_in_pool(&pool, now_ms)",
             "cleanup_terminal_older_than_in_pool(&pool, cutoff_ms)",
@@ -1516,6 +1522,34 @@ mod tests {
         assert!(
             !scheduler_body.contains("DELETE FROM agent_message_broadcast_delivery"),
             "cleanup scheduler must not inline unbounded broadcast delivery DELETE statements"
+        );
+    }
+
+    #[test]
+    fn reclaim_stale_has_retry_and_dead_letter_branches() {
+        let source = include_str!("db_transport.rs");
+        let helper_body = source
+            .split("async fn reclaim_stale_in_pool")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn release_claimed_for_consumer_in_pool")
+                    .next()
+            })
+            .expect("reclaim_stale helper body");
+
+        assert!(
+            helper_body.contains("SET status = 'pending'")
+                && helper_body.contains("AND attempt_count < ?"),
+            "stale claimed retryable messages must be requeued below max attempts"
+        );
+        assert!(
+            helper_body.contains("SET status = 'failed'")
+                && helper_body.contains("AND attempt_count >= ?"),
+            "stale claimed exhausted messages must be dead-lettered at max attempts"
+        );
+        assert!(
+            helper_body.contains("claimed_at_ms < ?"),
+            "stale reclaim must be visibility-timeout bound"
         );
     }
 
