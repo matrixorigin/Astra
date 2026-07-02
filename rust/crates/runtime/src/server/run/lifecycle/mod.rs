@@ -159,6 +159,13 @@ fn wire_executor_into_state(
     state.server_tool_executor = Some(executor);
 }
 
+fn wire_reflect_service_into_executor(
+    executor: server_tool_executor::ServerToolExecutor,
+    service: &Arc<dyn astra_services::ReflectService>,
+) -> server_tool_executor::ServerToolExecutor {
+    executor.with_reflect_service(Arc::clone(service))
+}
+
 struct NonInteractiveApprovalGate;
 
 #[async_trait]
@@ -613,6 +620,7 @@ fn build_server_skill_executor(
     request_constraints: RequestConstraints,
     inherited_permissions: InheritedPermissions,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    reflect_service: Arc<dyn astra_services::ReflectService>,
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
@@ -638,6 +646,7 @@ fn build_server_skill_executor(
     .with_request_constraints(request_constraints)
     .with_inherited_permissions(inherited_permissions)
     .with_skill_resolver(skill_resolver)
+    .with_reflect_service(reflect_service)
     .with_cancel_token(cancel_token);
     if let Some(snapshot) = execution_bindings {
         subrun_executor = subrun_executor.with_execution_binding_snapshot(snapshot.clone());
@@ -1485,6 +1494,8 @@ pub struct AgenticRunLifecycleService {
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     /// Shared ToolExecutionService so executors share the same disabled_tools set.
     tool_execution_service: Option<ToolExecutionService>,
+    /// Shared persisted-reflection service used by the visible `reflect` tool.
+    reflect_service: Arc<dyn astra_services::ReflectService>,
 }
 
 impl AgenticRunLifecycleService {
@@ -1532,6 +1543,7 @@ impl AgenticRunLifecycleService {
             harness_registry: None,
             memory_extraction_service: None,
             tool_execution_service: None,
+            reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
         }
     }
 
@@ -1600,6 +1612,14 @@ impl AgenticRunLifecycleService {
 
     pub fn with_tool_execution_service(mut self, service: ToolExecutionService) -> Self {
         self.tool_execution_service = Some(service);
+        self
+    }
+
+    pub fn with_reflect_service(
+        mut self,
+        service: Arc<dyn astra_services::ReflectService>,
+    ) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -1810,7 +1830,8 @@ impl AgenticRunLifecycleService {
             .with_pool(self.shared_pool.clone())
             .with_edge_connection_pool(self.edge_connection_pool.clone())
             .with_skill_service(self.skill_service.clone())
-            .with_memory_extraction_service(self.memory_extraction_service.clone()),
+            .with_memory_extraction_service(self.memory_extraction_service.clone())
+            .with_reflect_service(Arc::clone(&self.reflect_service)),
         );
         let executor_for_spawner: Arc<dyn SpawnAgentExecutor> = executor.clone();
         let mut spawner = DynamicAgentSpawner::with_broadcaster(
@@ -3128,6 +3149,7 @@ impl AgenticRunLifecycleService {
         .with_static_tool_catalog_admissible(static_tool_catalog_admissible)
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
+            self.reflect_service.is_configured(),
         ))
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
@@ -3406,6 +3428,7 @@ impl AgenticRunLifecycleService {
             request_constraints.clone(),
             root_permissions.clone(),
             skill_resolver.clone(),
+            Arc::clone(&self.reflect_service),
             session_id,
             self.edge_connection_pool.as_ref(),
             cancel_token,
@@ -4844,15 +4867,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 session_id.clone(),
                 memoria_base,
                 None,
-            )
-            .with_cancel_token(loop_state.cancellation.token.clone())
-            .with_task_store(task_store);
+            );
+            executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
+                .with_cancel_token(loop_state.cancellation.token.clone())
+                .with_task_store(task_store);
             if agent_binding_mode {
                 executor = executor.with_server_builtin_tools_disabled();
             } else {
-                executor = executor.with_capabilities(
-                    crate::capabilities::lifecycle_server_capabilities(self.shared_pool.is_some()),
-                );
+                executor =
+                    executor.with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                        self.shared_pool.is_some(),
+                        self.reflect_service.is_configured(),
+                    ));
             }
 
             // Enable exactly-once tool execution for crash recovery dedup.
@@ -5670,15 +5696,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 session_id.clone(),
                 memoria_base,
                 None,
-            )
-            .with_cancel_token(state.cancellation.token.clone())
-            .with_task_store(task_store);
+            );
+            executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
+                .with_cancel_token(state.cancellation.token.clone())
+                .with_task_store(task_store);
             if agent_binding_mode {
                 executor = executor.with_server_builtin_tools_disabled();
             } else {
-                executor = executor.with_capabilities(
-                    crate::capabilities::lifecycle_server_capabilities(self.shared_pool.is_some()),
-                );
+                executor =
+                    executor.with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                        self.shared_pool.is_some(),
+                        self.reflect_service.is_configured(),
+                    ));
             }
 
             // Enable exactly-once tool execution for crash recovery dedup.
@@ -6707,6 +6736,7 @@ pub struct ServerSpawnAgentExecutor {
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    reflect_service: Arc<dyn astra_services::ReflectService>,
     runtime_contexts: Arc<RwLock<HashMap<String, ServerSpawnRuntimeContext>>>,
 }
 
@@ -6726,6 +6756,7 @@ impl ServerSpawnAgentExecutor {
             edge_registry_service: None,
             skill_service: None,
             memory_extraction_service: None,
+            reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             runtime_contexts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -6769,6 +6800,14 @@ impl ServerSpawnAgentExecutor {
         svc: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     ) -> Self {
         self.memory_extraction_service = svc;
+        self
+    }
+
+    pub fn with_reflect_service(
+        mut self,
+        service: Arc<dyn astra_services::ReflectService>,
+    ) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -6831,6 +6870,7 @@ impl ServerSpawnAgentExecutor {
         if let Some(svc) = self.memory_extraction_service.clone() {
             executor = executor.with_memory_extraction_service(svc);
         }
+        executor = executor.with_reflect_service(Arc::clone(&self.reflect_service));
         executor
     }
 }
@@ -7095,6 +7135,7 @@ pub struct ServerSubRunExecutor {
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    reflect_service: Arc<dyn astra_services::ReflectService>,
     inherited_permissions: InheritedPermissions,
     /// Shared ToolExecutionService so executors share the same disabled_tools set.
     pub tool_execution_service: Option<ToolExecutionService>,
@@ -7118,6 +7159,7 @@ impl ServerSubRunExecutor {
             edge_registry_service: None,
             skill_service: None,
             memory_extraction_service: None,
+            reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             inherited_permissions: InheritedPermissions::auto_approve(),
             tool_execution_service: None,
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -7143,6 +7185,14 @@ impl ServerSubRunExecutor {
         inherited_permissions: InheritedPermissions,
     ) -> Self {
         self.inherited_permissions = inherited_permissions;
+        self
+    }
+
+    pub fn with_reflect_service(
+        mut self,
+        service: Arc<dyn astra_services::ReflectService>,
+    ) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -7273,6 +7323,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         .with_llm_token_service(config.llm_token_service.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
+            self.reflect_service.is_configured(),
         ))
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone());
@@ -7525,12 +7576,14 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 config.session_id.clone(),
                 memoria_base,
                 None,
-            )
-            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
-                self.shared_pool.is_some(),
-            ))
-            .with_cancel_token(config.cancel_token.clone())
-            .with_task_store(task_store);
+            );
+            executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
+                .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                    self.shared_pool.is_some(),
+                    self.reflect_service.is_configured(),
+                ))
+                .with_cancel_token(config.cancel_token.clone())
+                .with_task_store(task_store);
 
             // Enable exactly-once tool execution for crash recovery dedup.
             // This prevents side-effect tools (github_create_issue, task create, etc.)
@@ -14364,6 +14417,52 @@ mod tests {
         assert!(
             fn_body.contains("with_inherited_permissions"),
             "build_server_skill_executor must pass request-level permissions to server skill sub-runs"
+        );
+    }
+
+    #[test]
+    fn build_server_skill_executor_wires_reflect_service() {
+        let source = include_str!("mod.rs");
+        let fn_start = source
+            .find("fn build_server_skill_executor(")
+            .expect("build_server_skill_executor must exist");
+        let fn_end = source[fn_start..]
+            .find("\npub(crate) fn ")
+            .or_else(|| source[fn_start..].find("\nfn "))
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("reflect_service: Arc<dyn astra_services::ReflectService>"),
+            "build_server_skill_executor must accept the shared reflect service"
+        );
+        assert!(
+            fn_body.contains(".with_reflect_service(reflect_service)"),
+            "build_server_skill_executor must pass reflect service to server skill sub-runs"
+        );
+    }
+
+    #[test]
+    fn lifecycle_executor_construction_wires_reflect_service() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production lifecycle source");
+        let root_wires = production
+            .matches("wire_reflect_service_into_executor(executor, &self.reflect_service)")
+            .count();
+        assert!(
+            root_wires >= 3,
+            "root/resume/sub-run ServerToolExecutor construction must all inject the shared reflect service"
+        );
+        assert!(
+            production.contains(".with_reflect_service(Arc::clone(&self.reflect_service))"),
+            "dynamic agent spawner/sub-run builders must inherit the shared reflect service"
+        );
+        assert!(
+            production.contains("self.reflect_service.is_configured()"),
+            "capability construction must derive reflect visibility from reflect service readiness"
         );
     }
 

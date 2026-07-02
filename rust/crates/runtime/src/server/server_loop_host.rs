@@ -2670,6 +2670,29 @@ impl ServerAgenticLoopHost {
         filter_tool_schemas_by_excluded_names(self.edge_tools.clone(), restricted_tools)
     }
 
+    fn runtime_ready_turn_tools(&self, tools: Vec<Value>, state: &AgenticLoopState) -> Vec<Value> {
+        let Some(executor) = state.server_tool_executor.as_deref() else {
+            return tools;
+        };
+        tools
+            .into_iter()
+            .filter(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| executor.tool_runtime_ready(name))
+            })
+            .collect()
+    }
+
+    fn filtered_runtime_ready_turn_tools(
+        &self,
+        restricted_tools: &HashSet<String>,
+        state: &AgenticLoopState,
+    ) -> Vec<Value> {
+        self.runtime_ready_turn_tools(self.filtered_turn_tools(restricted_tools), state)
+    }
+
     fn runtime_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
         let disabled: HashSet<String> = self
             .disabled_tools
@@ -2908,7 +2931,7 @@ impl ServerAgenticLoopHost {
     #[cfg(test)]
     fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
         let effective_restricted = self.compute_effective_restricted(state, true);
-        let visible = self.filtered_turn_tools(&effective_restricted);
+        let visible = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
         self.sync_valid_tools_to_wire_surface_for_state(&visible, state);
         visible
     }
@@ -3386,7 +3409,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .to_string();
 
         let effective_restricted = self.compute_effective_restricted(state, true);
-        let visible_tools = self.filtered_turn_tools(&effective_restricted);
+        let visible_tools = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
@@ -4047,7 +4070,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .to_string();
 
         let effective_restricted = self.compute_effective_restricted(state, false);
-        let visible_tools = self.filtered_turn_tools(&effective_restricted);
+        let visible_tools = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
         // We only need the system messages here — the inline summary call
         // reuses the main turn's system prefix, not its tools.
         let system_messages = match self.run_turn_pipeline(
@@ -4791,7 +4814,9 @@ mod tests {
             "u1".to_string(),
             "s1".to_string(),
         )
-        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
         .build();
 
         assert!(host.server_side_tools);
@@ -4809,7 +4834,9 @@ mod tests {
             "u1".to_string(),
             "s1".to_string(),
         )
-        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
         .with_server_tool_catalog_enabled(false)
         .build();
 
@@ -4828,7 +4855,9 @@ mod tests {
             "u1".to_string(),
             "s1".to_string(),
         )
-        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
         .with_server_tool_catalog_enabled(false)
         .with_static_tool_catalog_admissible(false)
         .build();
@@ -4856,7 +4885,9 @@ mod tests {
             "u1".to_string(),
             "s1".to_string(),
         )
-        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
         .with_server_tool_catalog_enabled(false)
         .with_static_tool_catalog_admissible(false)
         .build();
@@ -4887,7 +4918,9 @@ mod tests {
             "u1".to_string(),
             "s1".to_string(),
         )
-        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
@@ -7060,6 +7093,66 @@ mod tests {
             "soft health must not mutate hard restricted_tools"
         );
         assert!(state.restricted_tools.contains("read_file"));
+    }
+
+    #[test]
+    fn visible_turn_tools_filters_executor_service_unready_tools() {
+        let dir = tempfile::TempDir::new().expect("temp workspace");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_server_sandbox_workspace(dir.path())
+        .build();
+        let raw_names = astra_turn_core::tool::schema::tool_names_from_schemas(&host.edge_tools);
+        assert!(
+            raw_names.contains("reflect"),
+            "capability-only server surface starts with reflect before executor readiness filtering"
+        );
+
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "u".to_string(),
+                "s".to_string(),
+                None,
+                None,
+            ),
+        ));
+
+        let visible = host.visible_turn_tools(&mut state);
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible);
+        assert!(
+            !names.contains("reflect"),
+            "service-unready tools must not be visible to the model: {names:?}"
+        );
+        assert!(
+            names.contains("introspect"),
+            "ready observation tools should remain visible"
+        );
+    }
+
+    #[test]
+    fn builder_hides_reflect_without_reflect_service_capability() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&host.edge_tools);
+        assert!(
+            !names.contains("reflect"),
+            "builder must fail closed before executor filtering when the reflect service is unconfigured: {names:?}"
+        );
     }
 
     #[test]

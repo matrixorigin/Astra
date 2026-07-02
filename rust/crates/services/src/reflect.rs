@@ -468,6 +468,8 @@ fn evidence_event_from_row(row: &impl ReflectRow) -> ServiceResult<EvidenceEvent
 
 #[async_trait]
 pub trait ReflectService: Send + Sync {
+    fn is_configured(&self) -> bool;
+
     async fn build_evidence(
         &self,
         user_id: &str,
@@ -898,6 +900,10 @@ fn filter_evidence_events_for_graph(
 
 #[async_trait]
 impl ReflectService for DatabaseReflectService {
+    fn is_configured(&self) -> bool {
+        self.pool.is_some()
+    }
+
     async fn build_evidence(
         &self,
         user_id: &str,
@@ -1305,6 +1311,10 @@ pub struct UnconfiguredReflectService;
 
 #[async_trait]
 impl ReflectService for UnconfiguredReflectService {
+    fn is_configured(&self) -> bool {
+        false
+    }
+
     async fn build_evidence(
         &self,
         _: &str,

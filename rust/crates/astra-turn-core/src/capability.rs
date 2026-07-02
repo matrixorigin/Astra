@@ -28,9 +28,25 @@ pub enum Capability {
     PlanLifecycle,
     /// Local/edge background task registry and projection control.
     LocalBackgroundTasks,
+    /// Persisted session reflection service used by `reflect`.
+    ReflectService,
 }
 
 impl Capability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::AgentSpawner => "agent_spawner",
+            Capability::MemoryService => "memory_service",
+            Capability::Database => "database",
+            Capability::SkillsCatalog => "skills_catalog",
+            Capability::GitHubAuth => "github_auth",
+            Capability::LSPServer => "lsp_server",
+            Capability::PlanLifecycle => "plan_lifecycle",
+            Capability::LocalBackgroundTasks => "local_background_tasks",
+            Capability::ReflectService => "reflect_service",
+        }
+    }
+
     /// Whether this capability requires a runtime executor binding.
     ///
     /// An executor-gated capability cannot be satisfied by a service or static
@@ -62,6 +78,7 @@ impl CapabilitySet {
             .with(Capability::GitHubAuth)
             .with(Capability::LSPServer)
             .with(Capability::PlanLifecycle)
+            .with(Capability::ReflectService)
         // NOTE: LocalBackgroundTasks is intentionally excluded — it is an
         // edge-only capability (typed background tasks like bg-shell).
         // Server-side ToolEngine has no handlers for task_output / task_stop
@@ -129,6 +146,7 @@ mod tests {
             Capability::GitHubAuth,
             Capability::LSPServer,
             Capability::PlanLifecycle,
+            Capability::ReflectService,
         ] {
             assert!(caps.has(capability), "missing {capability:?}");
         }

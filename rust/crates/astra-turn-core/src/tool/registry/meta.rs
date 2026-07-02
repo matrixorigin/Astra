@@ -341,7 +341,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         ],
         intents: &[IntentType::Introspect, IntentType::CodeRead],
         scope: Scope::Local,
-        requires: &[],
+        requires: &[Capability::ReflectService],
         binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 45,
     },
@@ -946,6 +946,7 @@ mod tests {
             ("skill", Capability::SkillsCatalog),
             ("enter_plan_mode", Capability::PlanLifecycle),
             ("exit_plan_mode", Capability::PlanLifecycle),
+            ("reflect", Capability::ReflectService),
         ];
         for (name, expected) in cases {
             let tool = TOOL_CATALOG

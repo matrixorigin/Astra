@@ -136,6 +136,7 @@ pub fn full_server_capabilities_for_tests() -> astra_turn_core::capability::Capa
 /// Production-truth `CapabilitySet` for an agentic-run lifecycle.
 pub fn lifecycle_server_capabilities(
     database_pool_present: bool,
+    reflect_service_configured: bool,
 ) -> astra_turn_core::capability::CapabilitySet {
     use astra_turn_core::capability::{Capability, CapabilitySet};
     CapabilitySet::empty()
@@ -145,13 +146,17 @@ pub fn lifecycle_server_capabilities(
         .with(Capability::SkillsCatalog)
         .with(Capability::GitHubAuth)
         .with(Capability::PlanLifecycle)
+        .with_if(reflect_service_configured, Capability::ReflectService)
 }
 
 /// Production-truth server `CapabilitySet` derived from [`crate::app_state::AppState`].
 pub fn server_capabilities_from(
     state: &crate::app_state::AppState,
 ) -> astra_turn_core::capability::CapabilitySet {
-    lifecycle_server_capabilities(state.shared_pool.is_some())
+    lifecycle_server_capabilities(
+        state.shared_pool.is_some(),
+        state.reflect_service.is_configured(),
+    )
 }
 
 /// Tool schemas for Web agent / server-executed turns.
@@ -647,7 +652,7 @@ mod tests {
         );
 
         // ── Background task tools: local-only ──
-        let server_caps = lifecycle_server_capabilities(true);
+        let server_caps = lifecycle_server_capabilities(true, true);
         let local_caps = CapabilitySet::empty()
             .with(Capability::MemoryService)
             .with(Capability::SkillsCatalog)
@@ -680,7 +685,7 @@ mod tests {
 
     #[test]
     fn server_executed_tool_descriptions_do_not_reference_unavailable_job_tool() {
-        let caps = lifecycle_server_capabilities(true);
+        let caps = lifecycle_server_capabilities(true, true);
         let server_tools = server_runtime_tool_schemas(&caps);
         let remote_tools = cli_remote_tool_schemas(Vec::new(), &caps);
 
@@ -756,19 +761,35 @@ mod tests {
     }
 
     #[test]
+    fn server_executed_surfaces_hide_reflect_without_reflect_service_capability() {
+        let caps = lifecycle_server_capabilities(true, false);
+        let web = names(server_runtime_tool_schemas(&caps));
+        let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
+
+        for (surface, names) in [("web", web), ("remote", remote)] {
+            assert!(
+                !names.contains(&"reflect".to_string()),
+                "{surface} must not advertise reflect until the reflect service is configured: {names:?}"
+            );
+        }
+    }
+
+    #[test]
     fn server_lifecycle_capabilities() {
         use astra_turn_core::capability::Capability;
 
         // AgentSpawner is always included
-        let caps = lifecycle_server_capabilities(true);
+        let caps = lifecycle_server_capabilities(true, true);
         assert!(
             caps.has(Capability::AgentSpawner),
             "server lifecycle must include AgentSpawner"
         );
 
         // Database is gated on pool availability
-        assert!(!lifecycle_server_capabilities(false).has(Capability::Database));
+        assert!(!lifecycle_server_capabilities(false, true).has(Capability::Database));
         assert!(caps.has(Capability::Database));
+        assert!(!lifecycle_server_capabilities(true, false).has(Capability::ReflectService));
+        assert!(caps.has(Capability::ReflectService));
 
         // Web resolve with lifecycle caps advertises agent tool
         let tool_names = names(server_runtime_tool_schemas(&caps));

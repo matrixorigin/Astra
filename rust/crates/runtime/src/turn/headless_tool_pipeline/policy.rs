@@ -685,16 +685,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 exec.current_activatable_tool_names_snapshot()
                     .contains(&execution.name)
             });
-            let has_runtime_binding = |name: &str| {
+            let tool_runtime_ready = |name: &str| {
                 self.ctx
                     .server_tool_executor
-                    .is_some_and(|exec| exec.has_runtime_binding(name))
+                    .is_some_and(|exec| exec.tool_runtime_ready(name))
             };
             let action = execution.args.get("action").and_then(Value::as_str);
             let (err_msg, skip_reason) = match classify_direct_deferred_call(
                 &execution.name,
                 is_activatable_deferred,
-                has_runtime_binding,
+                tool_runtime_ready,
             ) {
                 DirectDeferredCallAdmission::Activate { name } => {
                     if let Some(exec) = self.ctx.server_tool_executor {
@@ -725,7 +725,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
                 DirectDeferredCallAdmission::Unknown => {
                     if is_prompt_deferred {
-                        if has_runtime_binding(&execution.name) {
+                        if tool_runtime_ready(&execution.name) {
                             (
                                 deferred_tool_not_activatable_message(&execution.name),
                                 "tool_not_admitted",

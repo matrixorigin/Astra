@@ -17,7 +17,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::SharedPool;
 use astra_runtime_env::validate_workspace_id;
-use astra_services::LlmTokenServiceConfig;
+use astra_services::{LlmTokenServiceConfig, ReflectService, UnconfiguredReflectService};
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
@@ -89,6 +89,8 @@ pub struct ServerSkillSubRunExecutor {
     /// from the parent lifecycle service. `None` → no extraction in
     /// skill sub-runs (rarely surfaces user-relevant memory).
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    /// Shared persisted-reflection service inherited from the parent run.
+    reflect_service: Arc<dyn ReflectService>,
     /// Request-level permissions inherited from the parent server run.
     inherited_permissions: crate::orchestration::InheritedPermissions,
 }
@@ -119,6 +121,7 @@ impl ServerSkillSubRunExecutor {
             #[cfg(feature = "harness")]
             harness_sink: None,
             memory_extraction_service: None,
+            reflect_service: Arc::new(UnconfiguredReflectService),
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
         }
     }
@@ -128,6 +131,11 @@ impl ServerSkillSubRunExecutor {
         svc: Arc<crate::session_memory::MemoryExtractionService>,
     ) -> Self {
         self.memory_extraction_service = Some(svc);
+        self
+    }
+
+    pub fn with_reflect_service(mut self, service: Arc<dyn ReflectService>) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -309,6 +317,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         .with_edge_tools(self.edge_tools.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
+            self.reflect_service.is_configured(),
         ))
         .with_edge_profile(self.edge_profile.clone())
         .with_edge_callback_ledger(Arc::new(TokioMutex::new(HashMap::new())));
@@ -555,8 +564,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 memoria_base,
                 None,
             )
+            .with_reflect_service(Arc::clone(&self.reflect_service))
             .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
                 self.shared_pool.is_some(),
+                self.reflect_service.is_configured(),
             ))
             .with_cancel_token(self.cancel_token.clone())
             .with_tool_execution_service(builder.build());
@@ -593,6 +604,7 @@ mod tests {
     use crate::server::tool_transport::{
         ExecutorBinding, ExecutorStatus, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
     };
+    use async_trait::async_trait;
 
     fn mock_matrixone() -> MatrixOneSettings {
         MatrixOneSettings::mock()
@@ -619,6 +631,24 @@ mod tests {
         )
     }
 
+    struct ReadyReflectService;
+
+    #[async_trait]
+    impl ReflectService for ReadyReflectService {
+        fn is_configured(&self) -> bool {
+            true
+        }
+
+        async fn build_evidence(
+            &self,
+            _user_id: &str,
+            _session_id: &str,
+            _request: astra_services::reflect::ReflectRequest,
+        ) -> astra_services::reflect::ServiceResult<astra_services::ReflectReport> {
+            unreachable!("server skill subrun tests only inspect service readiness")
+        }
+    }
+
     #[test]
     fn server_skill_subrun_executor_builds() {
         let executor = ServerSkillSubRunExecutor::new(
@@ -632,6 +662,10 @@ mod tests {
         assert_eq!(
             executor.inherited_permissions.mode,
             crate::orchestration::PermissionMode::Auto
+        );
+        assert!(
+            !executor.reflect_service.is_configured(),
+            "skill sub-runs must fail closed until the parent reflect service is injected"
         );
     }
 
@@ -656,6 +690,18 @@ mod tests {
         assert!(executor.llm_token_service.is_some());
         assert_eq!(executor.edge_tools.len(), 1);
         assert!(executor.cancel_token.is_some());
+    }
+
+    #[test]
+    fn server_skill_subrun_executor_keeps_reflect_service() {
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-session".to_string(),
+        )
+        .with_reflect_service(Arc::new(ReadyReflectService));
+
+        assert!(executor.reflect_service.is_configured());
     }
 
     #[test]

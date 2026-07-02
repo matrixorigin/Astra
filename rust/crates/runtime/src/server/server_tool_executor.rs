@@ -89,6 +89,14 @@ fn resolved_server_tool_names(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolAdmission {
+    Ready,
+    MissingRuntimeBinding,
+    MissingCapability(Capability),
+    MissingService(Capability),
+}
+
 /// Per-turn mutation accounting for self-modifying session config tools.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionConfigInner {
@@ -521,6 +529,9 @@ impl ServerToolExecutor {
             let mut activatable_pool =
                 crate::capabilities::server_runtime_tool_schemas(&self.capabilities);
             retain_tool_schemas_by_names(&mut activatable_pool, &activatable);
+            activatable_pool.retain(|schema| {
+                tool_schema_name(schema).is_some_and(|name| self.tool_runtime_ready(name))
+            });
             extend_tool_schema_pool_unique(&mut pool, activatable_pool);
         }
         pool.extend(self.external_schemas_snapshot("external_schemas_tool_search"));
@@ -670,7 +681,7 @@ impl ServerToolExecutor {
             self.execution_binding.executor(),
             self.execution_binding.runtime(),
         );
-        supported_names.contains(tool) && self.tool_has_runtime_binding(tool)
+        supported_names.contains(tool) && self.tool_runtime_ready(tool)
     }
 
     fn capability_filtered_server_tool_schemas(&self) -> Vec<Value> {
@@ -684,7 +695,7 @@ impl ServerToolExecutor {
             self.execution_binding.runtime(),
         );
         schemas.retain(|schema| {
-            tool_schema_name(schema).is_some_and(|name| self.tool_has_runtime_binding(name))
+            tool_schema_name(schema).is_some_and(|name| self.tool_runtime_ready(name))
         });
         schemas
     }
@@ -695,8 +706,48 @@ impl ServerToolExecutor {
 
     pub(crate) fn runtime_bound_tool_names(&self, names: HashSet<String>) -> HashSet<String> {
         astra_turn_core::tool::deferred_activation::runtime_bound_tool_names(names, |name| {
-            self.tool_has_runtime_binding(name)
+            self.tool_runtime_ready(name)
         })
+    }
+
+    pub(crate) fn tool_runtime_ready(&self, name: &str) -> bool {
+        matches!(self.tool_admission(name), ToolAdmission::Ready)
+    }
+
+    fn tool_admission(&self, name: &str) -> ToolAdmission {
+        if name.starts_with("mcp__") {
+            return if self.mcp_tool_has_runtime_binding(name) {
+                ToolAdmission::Ready
+            } else {
+                ToolAdmission::MissingRuntimeBinding
+            };
+        }
+
+        let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
+            return if self.tool_engine.contains(name) || self.plugin_schema_has_name(name) {
+                ToolAdmission::Ready
+            } else {
+                ToolAdmission::MissingRuntimeBinding
+            };
+        };
+
+        for capability in meta.requires {
+            if !self.capabilities.has(*capability) {
+                return if self.capability_is_service_dependency(*capability) {
+                    ToolAdmission::MissingService(*capability)
+                } else {
+                    ToolAdmission::MissingCapability(*capability)
+                };
+            }
+            if !self.capability_has_runtime_binding(*capability) {
+                return ToolAdmission::MissingRuntimeBinding;
+            }
+            if !self.capability_service_dependency_ready(*capability) {
+                return ToolAdmission::MissingService(*capability);
+            }
+        }
+
+        ToolAdmission::Ready
     }
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
@@ -743,6 +794,17 @@ impl ServerToolExecutor {
         }
     }
 
+    fn capability_is_service_dependency(&self, capability: Capability) -> bool {
+        matches!(capability, Capability::ReflectService)
+    }
+
+    fn capability_service_dependency_ready(&self, capability: Capability) -> bool {
+        match capability {
+            Capability::ReflectService => self.reflect_service.is_configured(),
+            _ => true,
+        }
+    }
+
     fn tool_can_validate_without_runtime_binding(&self, name: &str, args: &Value) -> bool {
         let action = args.get("action").and_then(Value::as_str);
         astra_turn_core::tool::registry::meta::tool_allows_validation_without_runtime_binding(
@@ -773,17 +835,68 @@ impl ServerToolExecutor {
         )
     }
 
+    fn capability_unavailable_error_result(
+        &self,
+        name: &str,
+        capability: Capability,
+    ) -> astra_tools::ToolResult {
+        let error = format!(
+            "Tool `{name}` is not available in this turn because required runtime capability `{}` is not configured.",
+            capability.as_str()
+        );
+        tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error": error,
+                "error_kind": astra_core::ErrorKind::ToolUnavailable.as_str(),
+                "retryable": false,
+            })
+            .to_string(),
+        )
+    }
+
+    fn service_dependency_error_result(
+        &self,
+        name: &str,
+        capability: Capability,
+    ) -> astra_tools::ToolResult {
+        let error = format!(
+            "Tool `{name}` is not available in this turn because required service `{}` is not configured.",
+            capability.as_str()
+        );
+        tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error": error,
+                "error_kind": astra_core::ErrorKind::ToolUnavailable.as_str(),
+                "retryable": false,
+            })
+            .to_string(),
+        )
+    }
+
     fn tool_binding_preflight_result(
         &self,
         name: &str,
         args: &Value,
     ) -> Option<astra_tools::ToolResult> {
-        if self.tool_has_runtime_binding(name)
-            || self.tool_can_validate_without_runtime_binding(name, args)
-        {
-            return None;
+        match self.tool_admission(name) {
+            ToolAdmission::Ready => None,
+            ToolAdmission::MissingRuntimeBinding
+                if self.tool_can_validate_without_runtime_binding(name, args) =>
+            {
+                None
+            }
+            ToolAdmission::MissingRuntimeBinding => {
+                Some(self.runtime_binding_error_result(name, args))
+            }
+            ToolAdmission::MissingCapability(capability) => {
+                Some(self.capability_unavailable_error_result(name, capability))
+            }
+            ToolAdmission::MissingService(capability) => {
+                Some(self.service_dependency_error_result(name, capability))
+            }
         }
-        Some(self.runtime_binding_error_result(name, args))
     }
 
     /// Inject the plan repository so plan-mode tools and the write-tool guard
@@ -1298,6 +1411,52 @@ mod tests {
             .collect()
     }
 
+    struct ReadyReflectService;
+
+    #[async_trait]
+    impl astra_services::ReflectService for ReadyReflectService {
+        fn is_configured(&self) -> bool {
+            true
+        }
+
+        async fn build_evidence(
+            &self,
+            _user_id: &str,
+            session_id: &str,
+            request: astra_services::reflect::ReflectRequest,
+        ) -> astra_services::reflect::ServiceResult<astra_services::ReflectReport> {
+            let data_coverage = astra_core::ObservationDataCoverage {
+                overall: "fresh".to_string(),
+                source: "test".to_string(),
+                events: 0,
+                decisions: 0,
+                providers: Default::default(),
+                warnings: Vec::new(),
+            };
+            Ok(astra_services::ReflectReport {
+                schema_version: 1,
+                tool: "reflect".to_string(),
+                session_id: session_id.to_string(),
+                analysis_view: request.analysis_view,
+                topic: request.topic.as_str().to_string(),
+                facet: request.facet.as_str().to_string(),
+                depth: request.depth.as_str().to_string(),
+                horizon: request.horizon.as_str().to_string(),
+                source_policy: request.source_policy.as_str().to_string(),
+                include_context: request.include_context,
+                data_coverage,
+                view: None,
+                summary: "reflect ready".to_string(),
+                observations: Vec::new(),
+                evidence: Vec::new(),
+                action_hints: Vec::new(),
+                failure_clusters: Vec::new(),
+                graph_slice: Default::default(),
+                budget_result: Default::default(),
+            })
+        }
+    }
+
     #[test]
     fn tool_schemas_hide_project_tools_without_workspace_runtime() {
         let (mut exec, _dir) = test_executor();
@@ -1359,6 +1518,57 @@ mod tests {
             !exec.supports_server_tool_name("bash"),
             "project tools must not remain supported after binding changes to no-runtime"
         );
+    }
+
+    #[tokio::test]
+    async fn service_unready_tools_are_not_advertised_or_executable() {
+        let (exec, _dir) = test_executor();
+
+        assert!(
+            exec.has_runtime_binding("reflect"),
+            "reflect does not need an executor binding; service readiness is a separate admission gate"
+        );
+        assert!(
+            !exec.tool_runtime_ready("reflect"),
+            "reflect must not be runtime-ready without a configured reflect service"
+        );
+        let names = schema_name_set(exec.tool_schemas());
+        assert!(
+            !names.contains("reflect"),
+            "prompt-visible schema must not include service-unready tools: {names:?}"
+        );
+
+        let result = exec
+            .execute_with_metadata("reflect", &json!({"topic": "execution"}))
+            .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("reflect_service"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn service_ready_tools_are_advertised_and_execute_through_shared_admission() {
+        let (exec, _dir) = test_executor();
+        let exec = exec.with_reflect_service(Arc::new(ReadyReflectService));
+
+        assert!(
+            exec.tool_runtime_ready("reflect"),
+            "configured reflect service should make reflect runtime-ready"
+        );
+        let names = schema_name_set(exec.tool_schemas());
+        assert!(
+            names.contains("reflect"),
+            "runtime-ready reflect should remain prompt-visible"
+        );
+
+        let result = exec
+            .execute_with_metadata("reflect", &json!({"topic": "execution"}))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains("reflect ready"), "{}", result.output);
     }
 
     #[tokio::test]
@@ -1802,7 +2012,7 @@ mod tests {
 
     #[test]
     fn tool_engine_handlers_are_schema_and_runtime_registry_backed() {
-        let (exec, _dir) = test_executor_with_agent_context();
+        let (exec, _dir) = test_executor_with_agent_context_and_reflect_service();
         let schema_names = schema_name_set(exec.tool_schemas());
         let registry = astra_runtime_env::ToolRegistry::builtins();
 
@@ -1840,7 +2050,7 @@ mod tests {
             is_server_control_plane_tool, is_server_runtime_tool,
         };
 
-        let (exec, _dir) = test_executor_with_agent_context();
+        let (exec, _dir) = test_executor_with_agent_context_and_reflect_service();
         let schema_names = schema_name_set(exec.tool_schemas());
 
         // 1. Every control_plane tool must have a handler.
@@ -2196,6 +2406,14 @@ esac
         let (mut exec, dir) = test_executor();
         exec.set_agent_tool_context(test_agent_tool_context(dir.path()));
         (exec, dir)
+    }
+
+    fn test_executor_with_agent_context_and_reflect_service() -> (ServerToolExecutor, TempDir) {
+        let (exec, dir) = test_executor_with_agent_context();
+        (
+            exec.with_reflect_service(Arc::new(ReadyReflectService)),
+            dir,
+        )
     }
 
     fn test_agent_tool_context(work_dir: &Path) -> AgentToolContext {
@@ -4080,7 +4298,7 @@ esac
     /// is the right pool.
     #[tokio::test]
     async fn server_tool_search_resolves_deferred_via_activatable_set() {
-        let (exec, _dir) = test_executor();
+        let (exec, _dir) = test_executor_with_agent_context();
         exec.set_current_searchable_tool_schemas(&[
             json!({"type": "function", "function": {"name": "bash"}}),
             json!({"type": "function", "function": {"name": "tool_search"}}),
