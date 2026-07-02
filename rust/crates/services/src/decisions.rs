@@ -51,7 +51,7 @@ pub struct DecisionListFilter {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecisionListRecord {
     pub decisions: Vec<DecisionRecord>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
     pub next_cursor: Option<DecisionListCursor>,
 }
@@ -245,14 +245,6 @@ fn decision_row_optional_string(
         .map_err(|error| decision_decode_error(column, error.to_string()))
 }
 
-fn decision_row_i64(
-    row: &sqlx::mysql::MySqlRow,
-    column: &'static str,
-) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
-    row.try_get::<i64, _>(column)
-        .map_err(|error| decision_decode_error(column, error.to_string()))
-}
-
 fn parse_decision_json(
     column: &'static str,
     raw: &str,
@@ -359,26 +351,6 @@ impl DecisionService for DatabaseDecisionService {
 
         let limit = validate_decision_list_limit(filter.limit);
 
-        let mut count_qb = QueryBuilder::<MySql>::new(
-            "SELECT COUNT(d.decision_id) AS total FROM ctx_decision_audits d \
-             WHERE d.user_id = ",
-        );
-        count_qb.push_bind(&filter.user_id);
-        if let Some(sid) = &filter.session_id {
-            count_qb.push(" AND d.session_id = ");
-            count_qb.push_bind(sid);
-        }
-        if let Some(dt) = &filter.decision_type {
-            count_qb.push(" AND d.decision_type = ");
-            count_qb.push_bind(dt);
-        }
-        let total_row = count_qb
-            .build()
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
-        let total = decision_row_i64(&total_row, "total")?;
-
         let mut list_qb = QueryBuilder::<MySql>::new(
             "SELECT d.decision_id, d.session_id, d.event_id, d.context_capture_id, d.decision_type, \
              CAST(d.decision_output AS CHAR) AS decision_output_json, \
@@ -434,7 +406,7 @@ impl DecisionService for DatabaseDecisionService {
 
         Ok(DecisionListRecord {
             decisions,
-            total,
+            total: None,
             limit,
             next_cursor,
         })
@@ -637,7 +609,7 @@ pub struct DecisionWithContextResponse {
 #[derive(Serialize, PartialEq)]
 pub struct DecisionListResponse {
     pub decisions: Vec<DecisionResponse>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
     pub next_cursor: Option<DecisionListCursor>,
 }
@@ -760,6 +732,18 @@ mod tests {
              ORDER BY d.created_at DESC, d.decision_id DESC LIMIT ?";
         assert!(!sql.to_ascii_uppercase().contains(" OFFSET "));
         assert!(sql.contains("d.decision_id < ?"));
+    }
+
+    #[test]
+    fn decision_list_response_preserves_omitted_total() {
+        let response = DecisionListResponse::from(DecisionListRecord {
+            decisions: Vec::new(),
+            total: None,
+            limit: 50,
+            next_cursor: None,
+        });
+
+        assert_eq!(response.total, None);
     }
 
     #[test]
