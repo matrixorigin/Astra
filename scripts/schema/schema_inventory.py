@@ -175,18 +175,6 @@ DEFAULT_AUTO_INCREMENT_METADATA = AutoIncrementMetadata(
 
 
 AUTO_INCREMENT_METADATA: dict[str, AutoIncrementMetadata] = {
-    "auth_user_roles": AutoIncrementMetadata(
-        write_profile="low-frequency admin/auth role grant",
-        owner_boundary="user/role unique key",
-        hotspot_risk="low",
-        guidance="acceptable as-is; replace only during broader auth schema cleanup",
-    ),
-    "auth_external_identities": AutoIncrementMetadata(
-        write_profile="low-frequency external login/account linking",
-        owner_boundary="provider/external_subject unique key",
-        hotspot_risk="low",
-        guidance="acceptable as-is; provider/external_subject is the durable identity",
-    ),
     "mcp_servers": AutoIncrementMetadata(
         write_profile="low-frequency user-admin MCP registration",
         owner_boundary="owner_user_id/name unique key",
@@ -378,6 +366,26 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from session_state_items; the item table is current projection state, while this table records mutation history",
         migration_owner="astra_services::storage / state_projection",
         product_owner="session state projection, compaction invariants, active skill/delegation audit",
+    ),
+    "auth_user_roles": TableMetadata(
+        semantic_owner="astra_services::auth::admin / auth registration",
+        state_class="durable auth grant fact",
+        primary_query="role membership lookup and grant/revoke by user_id and role_id; admin role member lookup by role_id",
+        retention_policy="retain while the user-role grant is active; delete is revoke",
+        rebuildability="rebuildable only from an external auth/identity source if one exists",
+        merge_guidance="keep separate from auth_users/auth_roles; this is the many-to-many grant fact with independent revoke lifecycle",
+        migration_owner="astra_services::storage / auth",
+        product_owner="auth and admin role management",
+    ),
+    "auth_external_identities": TableMetadata(
+        semantic_owner="astra_services::auth",
+        state_class="durable external identity link fact",
+        primary_query="external login lookup by provider_id and external_subject; user lookup by astra_user_id",
+        retention_policy="retain while the external identity remains linked to an astra user",
+        rebuildability="not rebuildable after provider link metadata is lost",
+        merge_guidance="keep separate from auth_external_sessions; identity link outlives individual provider sessions",
+        migration_owner="astra_services::storage / auth",
+        product_owner="external auth login and account linking",
     ),
 }
 

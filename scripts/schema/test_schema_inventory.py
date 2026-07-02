@@ -123,12 +123,13 @@ class SchemaInventoryTest(unittest.TestCase):
 
     def test_auto_increment_audit_baseline_excludes_message_queue(self) -> None:
         auto_increment = set(self.summary["auto_increment_tables"])
-        self.assertEqual(len(auto_increment), 5)
+        self.assertEqual(len(auto_increment), 3)
         self.assertNotIn("agent_message_queue", auto_increment)
         self.assertNotIn("edge_pending_dispatch", auto_increment)
         self.assertNotIn("context_manifest_items", auto_increment)
         self.assertNotIn("session_state_item_events", auto_increment)
-        self.assertIn("auth_user_roles", auto_increment)
+        self.assertNotIn("auth_user_roles", auto_increment)
+        self.assertNotIn("auth_external_identities", auto_increment)
         self.assertIn("mcp_servers", auto_increment)
 
     def test_agent_message_queue_uses_message_identity(self) -> None:
@@ -167,6 +168,19 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
         self.assertIn("state item audit", row["primary_query"])
 
+    def test_auth_grants_and_external_identities_use_product_identity(self) -> None:
+        role_row = self.tables["auth_user_roles"]
+        self.assertEqual(role_row["primary_key"], ["user_id", "role_id"])
+        self.assertEqual(role_row["auto_increment_columns"], [])
+        self.assertEqual(role_row["auto_increment_hotspot_risk"], "not_applicable")
+        self.assertIn("many-to-many grant fact", role_row["merge_guidance"])
+
+        identity_row = self.tables["auth_external_identities"]
+        self.assertEqual(identity_row["primary_key"], ["provider_id", "external_subject"])
+        self.assertEqual(identity_row["auto_increment_columns"], [])
+        self.assertEqual(identity_row["auto_increment_hotspot_risk"], "not_applicable")
+        self.assertIn("external identity link", identity_row["state_class"])
+
     def test_every_auto_increment_table_has_risk_audit_metadata(self) -> None:
         self.assertEqual([], self.summary["unaudited_auto_increment_tables"])
         for table in self.summary["auto_increment_tables"]:
@@ -186,8 +200,6 @@ class SchemaInventoryTest(unittest.TestCase):
 
     def test_auto_increment_risk_keeps_remaining_admin_tables_low_priority(self) -> None:
         remaining = {
-            "auth_external_identities",
-            "auth_user_roles",
             "mcp_bindings",
             "mcp_servers",
             "mcp_tools",

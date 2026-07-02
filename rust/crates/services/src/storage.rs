@@ -935,16 +935,47 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_user_roles (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
             role_id VARCHAR(64) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_auth_user_roles_user_role (user_id, role_id),
-            INDEX idx_auth_user_roles_user_id (user_id),
+            PRIMARY KEY (user_id, role_id),
             INDEX idx_auth_user_roles_role_id (role_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "auth_user_roles",
+        &["user_id", "role_id"],
+        &["id"],
+        &["uq_auth_user_roles_user_role"],
+    )
+    .await?;
+    drop_index_if_present(
+        &pool,
+        &settings.database,
+        "auth_user_roles",
+        "idx_auth_user_roles_user_id",
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "auth_user_roles",
+        &["user_id", "role_id"],
+        "ALTER TABLE auth_user_roles ADD PRIMARY KEY (user_id, role_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "auth_user_roles",
+        "idx_auth_user_roles_role_id",
+        &["role_id"],
+        "ALTER TABLE auth_user_roles ADD INDEX idx_auth_user_roles_role_id (role_id)",
+    )
     .await?;
 
     query(
@@ -986,7 +1017,6 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_external_identities (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
             provider_id VARCHAR(64) NOT NULL,
             external_subject VARCHAR(255) NOT NULL,
             astra_user_id VARCHAR(64) NOT NULL,
@@ -995,11 +1025,37 @@ pub async fn ensure_core_schema(
             display_name VARCHAR(255) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_auth_external_identity_provider_subject (provider_id, external_subject),
+            PRIMARY KEY (provider_id, external_subject),
             INDEX idx_auth_external_identities_user (astra_user_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "auth_external_identities",
+        &["provider_id", "external_subject"],
+        &["id"],
+        &["uq_auth_external_identity_provider_subject"],
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "auth_external_identities",
+        &["provider_id", "external_subject"],
+        "ALTER TABLE auth_external_identities ADD PRIMARY KEY (provider_id, external_subject)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "auth_external_identities",
+        "idx_auth_external_identities_user",
+        &["astra_user_id"],
+        "ALTER TABLE auth_external_identities ADD INDEX idx_auth_external_identities_user (astra_user_id)",
+    )
     .await?;
 
     query(
@@ -5589,6 +5645,61 @@ mod tests {
                 "\"session_state_item_events\",\n        &[\"user_id\", \"event_id\"],\n        &[\"id\"]"
             ),
             "legacy id schemas must fail startup instead of preserving the old hot surrogate"
+        );
+    }
+
+    #[test]
+    fn auth_join_tables_use_product_identity_without_surrogate_ids() {
+        let source = include_str!("storage.rs");
+        let user_roles = source
+            .split("CREATE TABLE IF NOT EXISTS auth_user_roles")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("auth_user_roles DDL");
+        let external_identities = source
+            .split("CREATE TABLE IF NOT EXISTS auth_external_identities")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("auth_external_identities DDL");
+
+        assert!(
+            user_roles.contains("PRIMARY KEY (user_id, role_id)"),
+            "auth_user_roles identity is the user/role grant"
+        );
+        assert!(
+            external_identities.contains("PRIMARY KEY (provider_id, external_subject)"),
+            "auth_external_identities identity is the provider subject link"
+        );
+        for (table, ddl) in [
+            ("auth_user_roles", user_roles),
+            ("auth_external_identities", external_identities),
+        ] {
+            assert!(
+                !ddl.contains("id BIGINT AUTO_INCREMENT"),
+                "{table} must not reintroduce a global AUTO_INCREMENT surrogate"
+            );
+        }
+        assert!(
+            !user_roles.contains("idx_auth_user_roles_user_id"),
+            "auth_user_roles primary key already covers user_id lookups"
+        );
+        assert!(
+            source.contains("ALTER TABLE auth_user_roles ADD PRIMARY KEY (user_id, role_id)"),
+            "schema bootstrap must verify auth_user_roles primary-key shape"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE auth_external_identities ADD PRIMARY KEY (provider_id, external_subject)"
+            ),
+            "schema bootstrap must verify auth_external_identities primary-key shape"
+        );
+        assert!(
+            source.contains("&[\"uq_auth_user_roles_user_role\"]"),
+            "legacy auth_user_roles unique-key-plus-surrogate schemas must fail startup"
+        );
+        assert!(
+            source.contains("&[\"uq_auth_external_identity_provider_subject\"]"),
+            "legacy auth_external_identities unique-key-plus-surrogate schemas must fail startup"
         );
     }
 
