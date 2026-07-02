@@ -99,6 +99,7 @@ pub(super) async fn build_runtime_wiring(
     .with_tool_event_writer(state.turn_persistence.tool_event_writer.clone())
     .with_auxiliary_event_writer(state.turn_persistence.auxiliary_event_writer.clone())
     .with_run_concurrency_limit(run_concurrency_limit)
+    .with_metrics_registry(state.metrics_registry())
     .with_tool_execution_service(state.tool_execution_service.clone());
     if let Some(svc) = memory_extraction_service.as_ref() {
         run_lifecycle = run_lifecycle.with_memory_extraction_service(Arc::clone(svc));

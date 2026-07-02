@@ -24,7 +24,7 @@ use axum::http::StatusCode;
 use futures_util::FutureExt;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, RwLock, broadcast, mpsc, oneshot};
 
 use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
@@ -106,6 +106,31 @@ use astra_runtime_env::{
     WorkspaceRecord as RuntimeWorkspaceRecord, WorkspaceSource as RuntimeWorkspaceSource,
     validate_workspace_id,
 };
+
+const RUN_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+const METRIC_RUN_ADMISSION_ATTEMPTS_TOTAL: &str = "astra_run_admission_attempts_total";
+const METRIC_RUN_ADMISSION_WAIT_MS_TOTAL: &str = "astra_run_admission_wait_ms_total";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunAdmissionError {
+    Timeout,
+    Closed,
+}
+
+fn register_run_admission_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
+    registry.register_counter(
+        METRIC_RUN_ADMISSION_ATTEMPTS_TOTAL,
+        "Run admission attempts by outcome.",
+    );
+    registry.register_counter(
+        METRIC_RUN_ADMISSION_WAIT_MS_TOTAL,
+        "Total milliseconds spent waiting for run admission by outcome.",
+    );
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
 
 use crate::orchestration::spawner::{
     agent_status_to_progress_event, project_subrun_status_to_spawn,
@@ -1484,6 +1509,8 @@ pub struct AgenticRunLifecycleService {
     /// agentic loop tasks across all users. A permit is acquired before
     /// spawn and automatically released when the task completes.
     run_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Shared metrics registry for capacity/admission signals exposed via /metrics.
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
     /// Harness sink registry for server-side harness observation (Phase 2A).
     #[cfg(feature = "harness")]
     harness_registry: Option<crate::server::harness::handlers::HarnessSinkRegistry>,
@@ -1539,6 +1566,7 @@ impl AgenticRunLifecycleService {
             auxiliary_event_writer: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
+            metrics_registry: None,
             #[cfg(feature = "harness")]
             harness_registry: None,
             memory_extraction_service: None,
@@ -1700,9 +1728,56 @@ impl AgenticRunLifecycleService {
         self
     }
 
+    pub fn with_metrics_registry(
+        mut self,
+        registry: Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>,
+    ) -> Self {
+        register_run_admission_metrics(&registry);
+        self.metrics_registry = Some(registry);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn test_run_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
         self.run_semaphore.clone()
+    }
+
+    async fn acquire_run_permit(
+        &self,
+        timeout: Duration,
+    ) -> Result<OwnedSemaphorePermit, RunAdmissionError> {
+        let start = Instant::now();
+        match tokio::time::timeout(timeout, self.run_semaphore.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => {
+                self.record_run_admission("acquired", start.elapsed());
+                Ok(permit)
+            }
+            Ok(Err(_closed)) => {
+                self.record_run_admission("closed", start.elapsed());
+                Err(RunAdmissionError::Closed)
+            }
+            Err(_elapsed) => {
+                self.record_run_admission("timeout", start.elapsed());
+                Err(RunAdmissionError::Timeout)
+            }
+        }
+    }
+
+    fn record_run_admission(&self, outcome: &'static str, wait: Duration) {
+        let Some(registry) = self.metrics_registry.as_ref() else {
+            return;
+        };
+        register_run_admission_metrics(registry);
+        registry.increment_counter(
+            METRIC_RUN_ADMISSION_ATTEMPTS_TOTAL,
+            &[("outcome", outcome)],
+            1,
+        );
+        registry.increment_counter(
+            METRIC_RUN_ADMISSION_WAIT_MS_TOTAL,
+            &[("outcome", outcome)],
+            duration_millis_u64(wait),
+        );
     }
 
     fn dynamic_agent_progress_broadcaster(&self) -> Arc<ProgressBroadcaster> {
@@ -5086,27 +5161,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // ── Global admission control: limit concurrent agentic loop tasks ──
         // Wait up to 30 s for a slot (previously immediate 503);
         // if no slot frees up, return 503.
-        let permit = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.run_semaphore.clone().acquire_owned(),
-        )
-        .await
-        {
+        let permit = match self.acquire_run_permit(RUN_ADMISSION_TIMEOUT).await {
             Ok(permit) => permit,
-            Err(_elapsed) => {
-                self.fail_started_run_before_spawn(
-                    &user_id,
-                    &run_id,
-                    "server capacity timeout before agentic loop start",
-                )
-                .await;
+            Err(error) => {
+                let failure_reason = match error {
+                    RunAdmissionError::Timeout => {
+                        "server capacity timeout before agentic loop start"
+                    }
+                    RunAdmissionError::Closed => {
+                        "server capacity admission closed before agentic loop start"
+                    }
+                };
+                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason)
+                    .await;
                 if let Some(record) = cloud_workspace_record.as_ref() {
                     self.cleanup_cloud_workspace_after_failed_start(
                         &user_id,
                         &session_id,
                         &run_id,
                         record,
-                        "server capacity timeout before agentic loop start".to_string(),
+                        failure_reason.to_string(),
                     )
                     .await;
                 }
@@ -5930,27 +6004,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── Global admission control: limit concurrent agentic loop tasks ──
         // Wait up to 30 s for a slot; if no slot frees up, return 503.
-        let permit = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.run_semaphore.clone().acquire_owned(),
-        )
-        .await
-        {
+        let permit = match self.acquire_run_permit(RUN_ADMISSION_TIMEOUT).await {
             Ok(permit) => permit,
-            Err(_elapsed) => {
-                self.fail_started_run_before_spawn(
-                    &user_id,
-                    &run_id,
-                    "server capacity timeout before streaming agentic loop start",
-                )
-                .await;
+            Err(error) => {
+                let failure_reason = match error {
+                    RunAdmissionError::Timeout => {
+                        "server capacity timeout before streaming agentic loop start"
+                    }
+                    RunAdmissionError::Closed => {
+                        "server capacity admission closed before streaming agentic loop start"
+                    }
+                };
+                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason)
+                    .await;
                 if let Some(record) = cloud_workspace_record.as_ref() {
                     self.cleanup_cloud_workspace_after_failed_start(
                         &user_id,
                         &session_id,
                         &run_id,
                         record,
-                        "server capacity timeout before streaming agentic loop start".to_string(),
+                        failure_reason.to_string(),
                     )
                     .await;
                 }
@@ -15499,5 +15572,63 @@ mod tests {
         drop(p1); // release the slot
         let p2 = waiter.await.expect("waiter panicked");
         drop(p2);
+    }
+
+    #[tokio::test]
+    async fn run_admission_metrics_record_acquired_and_timeout() {
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        let svc = test_service()
+            .with_run_concurrency_limit(1)
+            .with_metrics_registry(registry.clone());
+        let sem = svc.test_run_semaphore();
+        let first = sem.clone().try_acquire_owned().expect("first permit");
+
+        let timed_out = match svc.acquire_run_permit(Duration::from_millis(5)).await {
+            Ok(_) => panic!("admission should time out while the only permit is held"),
+            Err(error) => error,
+        };
+        assert_eq!(timed_out, RunAdmissionError::Timeout);
+
+        drop(first);
+        let acquired = svc
+            .acquire_run_permit(Duration::from_secs(1))
+            .await
+            .expect("released permit should be acquired");
+        drop(acquired);
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains("astra_run_admission_attempts_total{outcome=\"timeout\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("astra_run_admission_attempts_total{outcome=\"acquired\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("astra_run_admission_wait_ms_total{outcome=\"timeout\"}"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_admission_closed_semaphore_is_rejected_and_counted() {
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        let svc = test_service()
+            .with_run_concurrency_limit(1)
+            .with_metrics_registry(registry.clone());
+        svc.test_run_semaphore().close();
+
+        let error = match svc.acquire_run_permit(Duration::from_secs(1)).await {
+            Ok(_) => panic!("closed semaphore must not admit a run without a permit"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, RunAdmissionError::Closed);
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains("astra_run_admission_attempts_total{outcome=\"closed\"} 1"),
+            "{rendered}"
+        );
     }
 }
