@@ -168,6 +168,19 @@ class SchemaInventoryTest(unittest.TestCase):
                 self.assertIn("session hard delete", policy)
                 self.assertIn("ordered bounded batches", policy)
 
+    def test_replay_and_tool_output_tables_do_not_have_independent_age_ttl(self) -> None:
+        run_events = self.tables["agent_run_events"]
+        self.assertIn("no independent age-based TTL", run_events["retention_policy"])
+        self.assertIn("projection repair", run_events["retention_policy"])
+        self.assertIn("not rebuildable", run_events["rebuildability"])
+
+        batches = self.tables["session_tool_output_batches"]
+        outputs = self.tables["session_tool_outputs"]
+        self.assertIn("no independent age-based TTL", batches["retention_policy"])
+        self.assertIn("no independent age-based TTL", outputs["retention_policy"])
+        self.assertIn("artifact refs", outputs["retention_policy"])
+        self.assertIn("not rebuildable", outputs["rebuildability"])
+
     def test_external_hot_coordination_tables_have_semantic_metadata(self) -> None:
         for table in [
             "agent_message_queue",

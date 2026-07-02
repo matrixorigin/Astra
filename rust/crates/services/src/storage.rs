@@ -6282,6 +6282,26 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_expired_data_does_not_age_delete_replay_or_tool_output_facts() {
+        let source = include_str!("storage.rs");
+        let body = source
+            .split("pub async fn cleanup_expired_data")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("cleanup_expired_data body");
+        for table in [
+            "DELETE FROM agent_run_events",
+            "DELETE FROM session_tool_outputs",
+            "DELETE FROM session_tool_output_batches",
+        ] {
+            assert!(
+                !body.contains(table),
+                "global age-based cleanup must not directly delete replay/tool-output facts: {table}"
+            );
+        }
+    }
+
+    #[test]
     fn tool_output_schema_drops_ownerless_legacy_indexes() {
         let source = include_str!("storage.rs");
         for removed in [
