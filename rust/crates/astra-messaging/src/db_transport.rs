@@ -1349,7 +1349,12 @@ async fn release_claimed_for_consumer_in_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+    use sqlx::{
+        QueryBuilder,
+        mysql::{MySqlConnectOptions, MySqlPoolOptions},
+    };
+
+    static LIVE_DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn abort_on_drop_aborts_task() {
@@ -1452,8 +1457,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live MatrixOne; set ASTRA_TEST_DB_IT=1"]
     async fn db_cleanup_prunes_expired_terminal_and_orphan_delivery_batches() {
+        let _guard = LIVE_DB_TEST_LOCK.lock().await;
         let pool = live_test_pool().await;
         ensure_schema(&pool).await.expect("ensure messaging schema");
+        clear_message_tables(&pool).await;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let delegation_id = format!("delegation-{}", uuid::Uuid::new_v4());
@@ -1520,6 +1527,51 @@ mod tests {
         assert_eq!(count_delivery_message(&pool, &terminal_message_id).await, 0);
         assert_eq!(count_delivery_message(&pool, &orphan_message_id).await, 0);
         assert_eq!(count_delivery_message(&pool, &live_message_id).await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne; set ASTRA_TEST_DB_IT=1"]
+    async fn db_cleanup_expired_prunes_more_than_one_queue_batch() {
+        let _guard = LIVE_DB_TEST_LOCK.lock().await;
+        let pool = live_test_pool().await;
+        ensure_schema(&pool).await.expect("ensure messaging schema");
+        clear_message_tables(&pool).await;
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let delegation_id = format!("delegation-batch-{}", uuid::Uuid::new_v4());
+        let consumer_id = format!("consumer-batch-{}", uuid::Uuid::new_v4());
+        let row_count = QUEUE_CLEANUP_BATCH_LIMIT + 5;
+        let message_ids = (0..row_count)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+
+        insert_expired_queue_rows(&pool, &message_ids, &delegation_id, now_ms).await;
+        insert_delivery_rows(&pool, &message_ids, &consumer_id, &delegation_id).await;
+        wait_for_queue_count(&pool, row_count).await;
+        wait_for_delivery_count(&pool, row_count).await;
+
+        let transport = DatabaseTransport::new(pool.clone());
+        let first = transport.cleanup_expired().await.expect("first cleanup");
+        assert_eq!(
+            first, QUEUE_CLEANUP_BATCH_LIMIT as u64,
+            "first cleanup must stop at one bounded queue batch"
+        );
+        wait_for_queue_count(&pool, row_count - QUEUE_CLEANUP_BATCH_LIMIT).await;
+
+        let second = transport.cleanup_expired().await.expect("second cleanup");
+        assert_eq!(
+            second,
+            (row_count - QUEUE_CLEANUP_BATCH_LIMIT) as u64,
+            "second cleanup must prune the remaining expired rows"
+        );
+        wait_for_queue_count(&pool, 0).await;
+        wait_for_delivery_count(&pool, 0).await;
+
+        let third = transport.cleanup_expired().await.expect("third cleanup");
+        assert_eq!(
+            third, 0,
+            "cleanup should converge after expired rows are gone"
+        );
     }
 
     #[test]
@@ -1682,5 +1734,111 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("count delivery message")
+    }
+
+    async fn insert_expired_queue_rows(
+        pool: &Pool<MySql>,
+        message_ids: &[String],
+        delegation_id: &str,
+        now_ms: i64,
+    ) {
+        let mut builder = QueryBuilder::<MySql>::new(
+            "INSERT INTO agent_message_queue
+             (message_id, from_run_id, from_agent_id, delegation_id, is_broadcast,
+              payload_json, timestamp_ms, ttl_ms, status) ",
+        );
+        builder.push_values(message_ids, |mut row, message_id| {
+            row.push_bind(message_id)
+                .push_bind(format!("from-run-{message_id}"))
+                .push_bind("from-agent")
+                .push_bind(delegation_id)
+                .push_bind(true)
+                .push_bind("{}")
+                .push_bind(now_ms - 10_000)
+                .push_bind(1_i64)
+                .push_bind("pending");
+        });
+        builder
+            .build()
+            .execute(pool)
+            .await
+            .expect("insert expired queue rows");
+    }
+
+    async fn clear_message_tables(pool: &Pool<MySql>) {
+        query("DELETE FROM agent_message_broadcast_delivery")
+            .execute(pool)
+            .await
+            .expect("clear broadcast delivery table");
+        query("DELETE FROM agent_message_queue")
+            .execute(pool)
+            .await
+            .expect("clear message queue table");
+    }
+
+    async fn insert_delivery_rows(
+        pool: &Pool<MySql>,
+        message_ids: &[String],
+        consumer_id: &str,
+        delegation_id: &str,
+    ) {
+        let mut builder = QueryBuilder::<MySql>::new(
+            "INSERT INTO agent_message_broadcast_delivery
+             (message_id, consumer_id, delegation_id) ",
+        );
+        builder.push_values(message_ids, |mut row, message_id| {
+            row.push_bind(message_id)
+                .push_bind(consumer_id)
+                .push_bind(delegation_id);
+        });
+        builder
+            .build()
+            .execute(pool)
+            .await
+            .expect("insert broadcast delivery rows");
+    }
+
+    async fn count_queue_rows(pool: &Pool<MySql>) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_queue")
+            .fetch_one(pool)
+            .await
+            .expect("count queue rows")
+    }
+
+    async fn count_delivery_rows(pool: &Pool<MySql>) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_broadcast_delivery")
+            .fetch_one(pool)
+            .await
+            .expect("count delivery rows")
+    }
+
+    async fn wait_for_queue_count(pool: &Pool<MySql>, expected: i64) {
+        wait_for_count("queue", expected, || async { count_queue_rows(pool).await }).await;
+    }
+
+    async fn wait_for_delivery_count(pool: &Pool<MySql>, expected: i64) {
+        wait_for_count("broadcast delivery", expected, || async {
+            count_delivery_rows(pool).await
+        })
+        .await;
+    }
+
+    async fn wait_for_count<F, Fut>(label: &str, expected: i64, mut current: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = i64>,
+    {
+        let mut last = current().await;
+        for _ in 0..20 {
+            if last == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            last = current().await;
+        }
+        assert_eq!(
+            last, expected,
+            "{label} row count did not reach expected value"
+        );
     }
 }

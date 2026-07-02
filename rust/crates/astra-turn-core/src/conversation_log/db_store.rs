@@ -375,7 +375,7 @@ mod tests {
     use super::*;
     use crate::conversation_log::{AppendMeta, SessionStateCompact};
     use serde_json::json;
-    use sqlx::query_as;
+    use sqlx::{QueryBuilder, query_as};
 
     fn meta() -> AppendMeta {
         AppendMeta::default()
@@ -863,6 +863,63 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].seq(), 2);
         assert_eq!(entries[1].seq(), 3);
+
+        cleanup(&store, sid).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DB"]
+    async fn db_truncate_gc_deletes_more_than_one_batch() {
+        let store = test_store().await;
+        let sid = &format!("db-test-truncate-batch-{}", uuid::Uuid::new_v4());
+        cleanup(&store, sid).await;
+        create_session(&store, sid).await;
+
+        let pool = store.get_pool().await.unwrap();
+        let before_seq = CSL_TRUNCATE_BATCH_LIMIT + 5;
+        let total_rows = before_seq + 2;
+
+        let mut builder = QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO conversation_log \
+             (user_id, session_id, seq, turn, entry_type, payload) ",
+        );
+        builder.push_values(0..total_rows, |mut row, seq| {
+            let entry = make_delta(seq as u64, (seq + 1) as u32, vec![user_msg("bulk")]);
+            let payload = serde_json::to_string(&entry).expect("serialize CSL test entry");
+            row.push_bind(&store.user_id)
+                .push_bind(sid)
+                .push_bind(seq)
+                .push_bind((seq + 1) as i32)
+                .push_bind(1_i8)
+                .push_bind(payload);
+        });
+        builder
+            .build()
+            .execute(&pool)
+            .await
+            .expect("insert bulk CSL rows");
+
+        let removed = store.truncate_before(sid, before_seq as u64).await.unwrap();
+        assert_eq!(
+            removed, before_seq as u64,
+            "truncate_before must keep deleting beyond one batch"
+        );
+        assert!(
+            removed > CSL_TRUNCATE_BATCH_LIMIT as u64,
+            "test must cross the configured truncate batch limit"
+        );
+
+        let residual: (i64, Option<i64>, Option<i64>) = query_as(
+            "SELECT COUNT(*) AS count, MIN(seq) AS min_seq, MAX(seq) AS max_seq
+             FROM conversation_log
+             WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&store.user_id)
+        .bind(sid)
+        .fetch_one(&pool)
+        .await
+        .expect("count residual CSL rows");
+        assert_eq!(residual, (2, Some(before_seq), Some(before_seq + 1)));
 
         cleanup(&store, sid).await;
     }
