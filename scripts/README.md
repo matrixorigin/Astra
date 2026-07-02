@@ -46,7 +46,8 @@ request body field.
 Builds a stdlib-only inventory of static production `CREATE TABLE IF NOT EXISTS`
 DDL across current schema owners, not just `storage.rs`. It reports owner,
 source line, column count, primary keys, index count, AUTO_INCREMENT columns,
-duplicate table names, and FK usage.
+duplicate table names, FK usage, and explicit semantic metadata for audited
+tables.
 
 Useful checks:
 
