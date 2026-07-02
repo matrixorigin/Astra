@@ -2203,6 +2203,7 @@ mod tests {
         AuthRegisterRequestData, AuthService, AuthTokenRecord, ExternalRuntimeContextRequestData,
         ExternalRuntimeContextResponse,
     };
+    use astra_tools::AskUserGate;
 
     #[derive(Clone)]
     struct StubHealthChecker;
@@ -4796,6 +4797,98 @@ mod tests {
             metrics
                 .contains("astra_interaction_ask_user_ledger_insert_total{outcome=\"inserted\"} 1"),
             "{metrics}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_prompt_response_on_other_appstate_replays_from_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let callback_state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let waiter_state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let conn = WsConnection {
+            principal: AuthPrincipal::internal(test_user()),
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-ws-no-sticky".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-ws-no-sticky".into()),
+            bridge_prepared_run_id: None,
+        };
+        let answers = AskUserAnswers {
+            answers: vec![astra_tools::AskUserQuestionAnswer {
+                question: "Continue?".into(),
+                answers: vec!["yes".into()],
+                multi_select: false,
+                annotation: None,
+            }],
+        };
+
+        handle_user_prompt_response(
+            &callback_state,
+            &conn,
+            "req-ws-no-sticky",
+            "sess-ws-no-sticky",
+            "run-ws-no-sticky",
+            Some(answers.clone()),
+            false,
+        )
+        .await;
+
+        let callback_key =
+            astra_turn_core::edge_ledger::user_prompt_callback_key("u1", "req-ws-no-sticky");
+        assert!(
+            callback_state
+                .edge_callback_ledger
+                .lock()
+                .await
+                .contains_key(&callback_key),
+            "callback pod may keep its same-pod wakeup entry"
+        );
+        assert!(
+            waiter_state.edge_callback_ledger.lock().await.is_empty(),
+            "waiter pod intentionally has no same-pod ledger entry"
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let gate = astra_turn_core::ws_user_prompt_gate::WebSocketUserPromptGate::new(
+            "u1".into(),
+            "sess-ws-no-sticky".into(),
+            "run-ws-no-sticky".into(),
+            Some(4),
+            waiter_state.edge_callback_ledger.clone(),
+            tx,
+        );
+        let prompt = AskUserPrompt {
+            context: Some("Need confirmation".into()),
+            questions: vec![astra_tools::AskUserQuestion {
+                header: "Confirm".into(),
+                question: "Continue?".into(),
+                options: vec![
+                    astra_tools::AskUserChoice {
+                        label: "yes".into(),
+                        description: None,
+                        preview: None,
+                    },
+                    astra_tools::AskUserChoice {
+                        label: "no".into(),
+                        description: None,
+                        preview: None,
+                    },
+                ],
+                multi_select: false,
+                allow_freeform: false,
+            }],
+            timeout_ms: Some(200),
+        };
+
+        let decision = gate
+            .request_questionnaire("req-ws-no-sticky", &prompt)
+            .await;
+        assert_eq!(decision, astra_tools::AskUserDecision::Submitted(answers));
+        assert!(
+            waiter_state.edge_callback_ledger.lock().await.is_empty(),
+            "journal replay should not require or populate waiter ledger"
         );
     }
 
