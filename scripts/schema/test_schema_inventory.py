@@ -144,6 +144,13 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("ordered bounded batches", delivery["retention_policy"])
         self.assertIn("consumer-scoped delivery state", delivery["merge_guidance"])
 
+    def test_conversation_log_retention_has_runtime_compaction_boundary(self) -> None:
+        row = self.tables["conversation_log"]
+        self.assertIn("model context reconstruction", row["retention_policy"])
+        self.assertIn("runtime compaction", row["retention_policy"])
+        self.assertIn("ordered bounded batches", row["retention_policy"])
+        self.assertIn("session hard delete", row["retention_policy"])
+
     def test_external_hot_coordination_tables_have_semantic_metadata(self) -> None:
         for table in [
             "agent_message_queue",

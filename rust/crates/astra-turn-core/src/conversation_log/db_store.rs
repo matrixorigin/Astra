@@ -21,6 +21,13 @@ use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
 
 use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
 
+const CSL_TRUNCATE_BATCH_LIMIT: i64 = 1000;
+
+const TRUNCATE_BEFORE_SQL: &str = "DELETE FROM conversation_log \
+             WHERE user_id = ? AND session_id = ? AND seq < ? \
+             ORDER BY seq ASC \
+             LIMIT ?";
+
 /// Database-backed CSL store. Each session's entries live in the
 /// `conversation_log` table, keyed by `(user_id, session_id, seq)`.
 ///
@@ -247,18 +254,27 @@ impl CslStore for DbCslStore {
         validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
         self.ensure_owner_access(&pool, session_id).await?;
-        let result = query(
-            "DELETE FROM conversation_log \
-             WHERE user_id = ? AND session_id = ? AND seq < ?",
-        )
-        .bind(&self.user_id)
-        .bind(session_id)
-        .bind(before_seq as i64)
-        .execute(&pool)
-        .await
-        .map_err(|e| CslStoreError::Other(format!("truncate: {e}")))?;
+        let before_seq = i64::try_from(before_seq).unwrap_or(i64::MAX);
+        let mut total_deleted = 0_u64;
+        loop {
+            let deleted = query(TRUNCATE_BEFORE_SQL)
+                .bind(&self.user_id)
+                .bind(session_id)
+                .bind(before_seq)
+                .bind(CSL_TRUNCATE_BATCH_LIMIT)
+                .execute(&pool)
+                .await
+                .map_err(|e| CslStoreError::Other(format!("truncate: {e}")))?
+                .rows_affected();
+            total_deleted = total_deleted.checked_add(deleted).ok_or_else(|| {
+                CslStoreError::Other("truncate: deleted row total overflow".to_string())
+            })?;
+            if deleted == 0 {
+                break;
+            }
+        }
 
-        Ok(result.rows_affected())
+        Ok(total_deleted)
     }
 
     async fn fork(
@@ -411,6 +427,54 @@ mod tests {
                 "DbCslStore tests must use astra_services::ensure_core_schema instead of private {table} DDL"
             );
         }
+    }
+
+    #[test]
+    fn truncate_before_sql_is_owner_scoped_and_batch_bounded() {
+        let normalized = TRUNCATE_BEFORE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized.contains("WHERE user_id = ? AND session_id = ? AND seq < ?"),
+            "CSL truncate must stay owner/session scoped"
+        );
+        assert!(
+            normalized.contains("ORDER BY seq ASC"),
+            "CSL truncate must delete in deterministic sequence order"
+        );
+        assert!(
+            normalized.ends_with("LIMIT ?"),
+            "CSL truncate must be batch bounded"
+        );
+        assert!(CSL_TRUNCATE_BATCH_LIMIT > 0);
+        assert!(CSL_TRUNCATE_BATCH_LIMIT <= 10_000);
+    }
+
+    #[test]
+    fn truncate_before_loops_until_batch_is_empty() {
+        let source = include_str!("db_store.rs");
+        let body = source
+            .split("async fn truncate_before")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn fork").next())
+            .expect("truncate_before body");
+        assert!(
+            body.contains("let before_seq = i64::try_from(before_seq).unwrap_or(i64::MAX);"),
+            "truncate_before must not wrap large u64 sequence values into negative BIGINT values"
+        );
+        assert!(
+            body.contains("loop {") && body.contains("if deleted == 0"),
+            "truncate_before must keep pruning batches until no rows remain"
+        );
+        assert!(
+            body.contains("checked_add(deleted)"),
+            "truncate_before must fail loudly on impossible deleted-row overflow"
+        );
+        assert!(
+            body.contains("CSL_TRUNCATE_BATCH_LIMIT"),
+            "truncate_before must bind the batch limit constant"
+        );
     }
 
     async fn test_store() -> DbCslStore {
