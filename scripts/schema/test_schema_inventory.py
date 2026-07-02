@@ -536,6 +536,110 @@ class SchemaInventoryTest(unittest.TestCase):
             self.tables["team_snapshots"]["merge_guidance"],
         )
 
+    def test_ctx_eval_harness_preview_tables_have_semantic_metadata(self) -> None:
+        ctx_eval_harness_preview_tables = {
+            "ctx_decision_audits",
+            "ctx_snapshots",
+            "eval_calibration_assessments",
+            "eval_gate_results",
+            "eval_quality_assessments",
+            "eval_training_datasets",
+            "eval_user_feedback",
+            "harness_citations",
+            "harness_items",
+            "harness_runs",
+            "harness_skill_drafts",
+            "harness_skill_rules",
+            "harness_snapshots",
+            "llm_provider_admission_pacing",
+            "preview_template_registry",
+            "raw_ref_scheme_registry",
+        }
+        for table in ctx_eval_harness_preview_tables:
+            with self.subTest(table=table):
+                row = self.tables[table]
+                for field in [
+                    "semantic_owner",
+                    "state_class",
+                    "primary_query",
+                    "retention_policy",
+                    "rebuildability",
+                    "merge_guidance",
+                    "migration_owner",
+                    "product_owner",
+                ]:
+                    self.assertNotEqual(
+                        row[field],
+                        "unclassified",
+                        f"{table}.{field} must be explicit metadata",
+                    )
+
+    def test_ctx_eval_harness_preview_metadata_locks_boundary_decisions(self) -> None:
+        self.assertIn(
+            "avoid polluting session event counts",
+            self.tables["harness_snapshots"]["merge_guidance"],
+        )
+        self.assertIn(
+            "product workflow parents",
+            self.tables["harness_runs"]["merge_guidance"],
+        )
+        self.assertIn(
+            "higher cardinality",
+            self.tables["harness_items"]["merge_guidance"],
+        )
+        self.assertIn(
+            "pre-publication generated skill candidates",
+            self.tables["harness_skill_drafts"]["merge_guidance"],
+        )
+        self.assertIn(
+            "fan out from a draft",
+            self.tables["harness_skill_rules"]["merge_guidance"],
+        )
+        self.assertIn(
+            "evidence fanout rows",
+            self.tables["harness_citations"]["merge_guidance"],
+        )
+        self.assertIn(
+            "not timeline events or manifest item ordering",
+            self.tables["ctx_snapshots"]["merge_guidance"],
+        )
+        self.assertIn(
+            "capture model/routing decisions",
+            self.tables["ctx_decision_audits"]["merge_guidance"],
+        )
+        self.assertIn(
+            "change-level release decisions",
+            self.tables["eval_gate_results"]["merge_guidance"],
+        )
+        self.assertIn(
+            "target-level assessment state",
+            self.tables["eval_quality_assessments"]["merge_guidance"],
+        )
+        self.assertIn(
+            "confidence reliability",
+            self.tables["eval_calibration_assessments"]["merge_guidance"],
+        )
+        self.assertIn(
+            "materialized training/eval corpora",
+            self.tables["eval_training_datasets"]["merge_guidance"],
+        )
+        self.assertIn(
+            "feedback is evaluation input",
+            self.tables["eval_user_feedback"]["merge_guidance"],
+        )
+        self.assertIn(
+            "not preview rendering templates",
+            self.tables["raw_ref_scheme_registry"]["merge_guidance"],
+        )
+        self.assertIn(
+            "raw ref schemes control resolver",
+            self.tables["preview_template_registry"]["merge_guidance"],
+        )
+        self.assertIn(
+            "virtual-time concurrency smoothing",
+            self.tables["llm_provider_admission_pacing"]["merge_guidance"],
+        )
+
     def test_high_growth_tables_have_retention_metadata(self) -> None:
         high_growth_tables = [
             "agent_events",
