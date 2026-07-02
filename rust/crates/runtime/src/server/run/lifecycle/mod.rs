@@ -7124,70 +7124,28 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .try_transition(&RunStatus::InputQueued)
             .map_err(|_| Self::run_state_conflict("submit input to", &durable.status))?;
 
-        self.run_engine
-            .append_event(&user_id, &run_id, event.clone())
-            .await
-            .map_err(|error| Self::durable_persist_error("input", error))?;
-
-        let durable_after_append = self.require_durable_run_for_user(&run_id, &user_id).await?;
-        let durable_status_after_append =
-            Self::run_status_from_durable(&durable_after_append.status)?;
-        if matches!(
-            durable_status_after_append,
-            RunStatus::Paused | RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
-        ) {
-            if let Some(event_index) = durable_after_append.events.iter().enumerate().find_map(
-                |(index, persisted_event)| {
-                    (persisted_event
-                        .get("idempotency_key")
-                        .and_then(Value::as_str)
-                        == Some(idempotency_key.as_str()))
-                    .then_some(index)
-                },
-            ) {
-                self.run_engine
-                    .mark_user_inputs_released(&user_id, &run_id, &[event_index])
-                    .await
-                    .map_err(|error| {
-                        Self::durable_persist_error("input release rollback", error)
-                    })?;
-            }
-            return Err(Self::run_state_conflict(
-                "submit input to",
-                &durable_after_append.status,
-            ));
-        }
         let status_updated = self
             .run_engine
-            .persist_status_if_current(
+            .transition_status_with_events_if_current(
                 &user_id,
                 &run_id,
                 &[STATUS_RUNNING, STATUS_INPUT_QUEUED, STATUS_WAITING],
                 STATUS_INPUT_QUEUED,
                 Some("user_input"),
                 None,
+                &[
+                    event.clone(),
+                    json!({
+                        "event_type": "run_input_queued",
+                        "data": { "waiting_for": "user_input" },
+                    }),
+                ],
             )
             .await
-            .map_err(|error| Self::durable_persist_error("input status", error))?;
+            .map_err(|error| Self::durable_persist_error("input transition", error))?;
         if !status_updated {
             let durable_after_conflict =
                 self.require_durable_run_for_user(&run_id, &user_id).await?;
-            if let Some(event_index) = durable_after_conflict.events.iter().enumerate().find_map(
-                |(index, persisted_event)| {
-                    (persisted_event
-                        .get("idempotency_key")
-                        .and_then(Value::as_str)
-                        == Some(idempotency_key.as_str()))
-                    .then_some(index)
-                },
-            ) {
-                self.run_engine
-                    .mark_user_inputs_released(&user_id, &run_id, &[event_index])
-                    .await
-                    .map_err(|error| {
-                        Self::durable_persist_error("input release rollback", error)
-                    })?;
-            }
             return Err(Self::run_state_conflict(
                 "submit input to",
                 &durable_after_conflict.status,
@@ -7197,16 +7155,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             "event_type": "run_input_queued",
             "data": { "waiting_for": "user_input" },
         });
-        self.run_engine
-            .append_event(&user_id, &run_id, input_queued_event.clone())
-            .await
-            .map_err(|error| Self::durable_persist_error("input queued event", error))?;
         let mut stream_input_queued_event = input_queued_event.clone();
         if let Some(obj) = stream_input_queued_event.as_object_mut() {
-            obj.insert(
-                "index".to_string(),
-                json!(durable_after_append.events.len()),
-            );
+            obj.insert("index".to_string(), json!(durable.events.len() + 1));
         }
         let live_events = run_handlers::transform_stream_run_events_for_client(
             &run_id,
@@ -15679,11 +15630,65 @@ mod tests {
             .iter()
             .filter(|event| event.get("idempotency_key").and_then(Value::as_str) == Some("key-1"))
             .count();
+        let input_queued_events = durable
+            .events
+            .iter()
+            .filter(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("run_input_queued")
+            })
+            .count();
         assert!(!first.duplicate);
         assert!(duplicate.duplicate);
         assert_eq!(matching_inputs, 1);
+        assert_eq!(input_queued_events, 1);
         assert_eq!(durable.status, STATUS_INPUT_QUEUED);
         assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
+    }
+
+    #[tokio::test]
+    async fn submit_run_input_transition_failure_does_not_commit_status_or_events() {
+        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]));
+        let svc = test_service_with_store(store);
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-input-fail", "user-1", "session-1")
+            .await
+            .unwrap();
+
+        let e = err(svc
+            .submit_run_input(
+                "run-input-fail".into(),
+                "user-1".into(),
+                RunInputData {
+                    idempotency_key: "key-fail".into(),
+                    input: json!({"answer": "not committed"}),
+                },
+            )
+            .await);
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(e.1.0.detail.contains("input transition"));
+
+        let durable = engine
+            .load_run("user-1", "run-input-fail")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_RUNNING);
+        assert!(durable.waiting_for.is_none());
+        assert!(
+            durable.events.iter().all(|event| {
+                event.get("idempotency_key").and_then(Value::as_str) != Some("key-fail")
+            }),
+            "failed input transition must not leave a partial user_input event"
+        );
+        assert!(
+            durable
+                .events
+                .iter()
+                .all(|event| event.get("event_type").and_then(Value::as_str)
+                    != Some("run_input_queued")),
+            "failed input transition must not append run_input_queued"
+        );
     }
 
     #[tokio::test]
