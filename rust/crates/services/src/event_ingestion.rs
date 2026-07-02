@@ -174,6 +174,7 @@ fn ingestion_event_priority_for_type(event_type: &str) -> IngestionEventPriority
         // but they are not the authoritative run/session/tool result facts.
         "adaptive_per_turn_applied"
         | "adaptive_scenario_applied"
+        | "agent_progress"
         | "bootstrap"
         | "context_assembly_recorded"
         | "llm_request_full"
@@ -1774,6 +1775,11 @@ mod tests {
             "tool_error",
             "approval_required",
             "approval_decision",
+            "agent_spawned",
+            "agent_completed",
+            "agent_failed",
+            "agent_cancelled",
+            "agent_interrupted",
             "sync_marker",
             crate::config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE,
         ] {
@@ -1789,6 +1795,7 @@ mod tests {
     fn ingestion_event_priority_classifies_diagnostic_traces_as_telemetry() {
         for event_type in [
             "context_assembly_recorded",
+            "agent_progress",
             "llm_request_full",
             "llm_response_full",
             "llm_round",
