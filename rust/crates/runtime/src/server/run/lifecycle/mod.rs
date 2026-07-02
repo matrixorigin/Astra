@@ -153,25 +153,6 @@ enum RunAdmissionError {
     Closed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PostLoopMemoryCleanupMode {
-    Async,
-    Inline,
-    Disabled,
-}
-
-impl PostLoopMemoryCleanupMode {
-    #[cfg(test)]
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "" | "async" | "background" | "fire_and_forget" => Some(Self::Async),
-            "inline" | "sync" | "synchronous" => Some(Self::Inline),
-            "disabled" | "disable" | "off" | "none" => Some(Self::Disabled),
-            _ => None,
-        }
-    }
-}
-
 struct PostLoopMemoryCleanupPermit;
 
 impl Drop for PostLoopMemoryCleanupPermit {
@@ -635,26 +616,24 @@ async fn post_loop_memory_cleanup(
     final_extract_request: Option<crate::session_memory::ExtractionRequest>,
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 ) {
-    post_loop_memory_cleanup_with_policy(
+    post_loop_memory_cleanup_with_limits(
         session_id,
         session_facts,
         extraction_service,
         final_extract_request,
         metrics_registry,
-        PostLoopMemoryCleanupMode::Async,
         DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY,
         Duration::from_millis(DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS),
     )
     .await;
 }
 
-async fn post_loop_memory_cleanup_with_policy(
+async fn post_loop_memory_cleanup_with_limits(
     session_id: &str,
     session_facts: &astra_turn_types::session_facts::SessionFacts,
     extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
     final_extract_request: Option<crate::session_memory::ExtractionRequest>,
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    mode: PostLoopMemoryCleanupMode,
     async_concurrency_limit: usize,
     drain_timeout: Duration,
 ) {
@@ -666,66 +645,37 @@ async fn post_loop_memory_cleanup_with_policy(
     let session_facts = session_facts.clone();
     let extraction_service = extraction_service.cloned();
 
-    match mode {
-        PostLoopMemoryCleanupMode::Disabled => {
-            record_post_loop_memory_cleanup_dispatch_metrics(
-                metrics_registry.as_ref(),
-                "disabled",
-                "disabled",
-            );
-            reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
-        }
-        PostLoopMemoryCleanupMode::Inline => {
-            record_post_loop_memory_cleanup_dispatch_metrics(
-                metrics_registry.as_ref(),
-                "inline",
-                "started",
-            );
-            run_post_loop_memory_cleanup_work(
-                session_id,
-                session_facts,
-                extraction_service,
-                final_extract_request,
-                metrics_registry,
-                drain_timeout,
-            )
-            .await;
-        }
-        PostLoopMemoryCleanupMode::Async => {
-            let Some(permit) = try_acquire_post_loop_memory_cleanup_permit(async_concurrency_limit)
-            else {
-                record_post_loop_memory_cleanup_dispatch_metrics(
-                    metrics_registry.as_ref(),
-                    "async",
-                    "dropped_full",
-                );
-                tracing::debug!(
-                    session_id = %session_id,
-                    concurrency_limit = async_concurrency_limit,
-                    "post-loop memory cleanup concurrency full; dropping best-effort external cleanup"
-                );
-                reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
-                return;
-            };
-            record_post_loop_memory_cleanup_dispatch_metrics(
-                metrics_registry.as_ref(),
-                "async",
-                "scheduled",
-            );
-            tokio::spawn(async move {
-                let _permit = permit;
-                run_post_loop_memory_cleanup_work(
-                    session_id,
-                    session_facts,
-                    extraction_service,
-                    final_extract_request,
-                    metrics_registry,
-                    drain_timeout,
-                )
-                .await;
-            });
-        }
-    }
+    let Some(permit) = try_acquire_post_loop_memory_cleanup_permit(async_concurrency_limit) else {
+        record_post_loop_memory_cleanup_dispatch_metrics(
+            metrics_registry.as_ref(),
+            "async",
+            "dropped_full",
+        );
+        tracing::debug!(
+            session_id = %session_id,
+            concurrency_limit = async_concurrency_limit,
+            "post-loop memory cleanup concurrency full; dropping best-effort external cleanup"
+        );
+        reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
+        return;
+    };
+    record_post_loop_memory_cleanup_dispatch_metrics(
+        metrics_registry.as_ref(),
+        "async",
+        "scheduled",
+    );
+    tokio::spawn(async move {
+        let _permit = permit;
+        run_post_loop_memory_cleanup_work(
+            session_id,
+            session_facts,
+            extraction_service,
+            final_extract_request,
+            metrics_registry,
+            drain_timeout,
+        )
+        .await;
+    });
 }
 
 async fn run_post_loop_memory_cleanup_work(
@@ -8846,27 +8796,6 @@ mod tests {
         ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
             unimplemented!()
         }
-    }
-
-    #[test]
-    fn post_loop_memory_cleanup_mode_parses_supported_values() {
-        assert_eq!(
-            PostLoopMemoryCleanupMode::parse(""),
-            Some(PostLoopMemoryCleanupMode::Async)
-        );
-        assert_eq!(
-            PostLoopMemoryCleanupMode::parse("background"),
-            Some(PostLoopMemoryCleanupMode::Async)
-        );
-        assert_eq!(
-            PostLoopMemoryCleanupMode::parse("inline"),
-            Some(PostLoopMemoryCleanupMode::Inline)
-        );
-        assert_eq!(
-            PostLoopMemoryCleanupMode::parse("off"),
-            Some(PostLoopMemoryCleanupMode::Disabled)
-        );
-        assert_eq!(PostLoopMemoryCleanupMode::parse("surprise"), None);
     }
 
     #[test]
