@@ -7,6 +7,7 @@
 use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sqlx::{MySql, QueryBuilder};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -16,6 +17,8 @@ use crate::coordination::{
 };
 
 const MAX_TEAM_LIST_ROWS: usize = 200;
+const MAX_TEAM_EXECUTION_LIST_ROWS: u32 = 500;
+const MAX_TEAM_SNAPSHOT_LIST_ROWS: u32 = 200;
 const TEAM_LIST_SELECT_SQL: &str = "\
     SELECT team_id, user_id, name, description, coordination, \
            members_json, context_json, worktree_mode, \
@@ -26,6 +29,51 @@ const TEAM_LIST_SELECT_SQL: &str = "\
     WHERE user_id = ? \
     ORDER BY name \
     LIMIT ?";
+
+fn validate_team_execution_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_TEAM_EXECUTION_LIST_ROWS)
+}
+
+fn validate_team_snapshot_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_TEAM_SNAPSHOT_LIST_ROWS)
+}
+
+fn team_list_query_limit(limit: u32) -> i64 {
+    i64::from(limit) + 1
+}
+
+fn team_cursor_db_timestamp(
+    label: &'static str,
+    value: &str,
+    context: &str,
+) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("invalid {context} cursor: {label} is required"));
+    }
+    let mut db_value = trimmed.replace('T', " ");
+    if let Some(stripped) = db_value.strip_suffix('Z') {
+        db_value = stripped.to_string();
+    }
+    if chrono::NaiveDateTime::parse_from_str(&db_value, "%Y-%m-%d %H:%M:%S%.f").is_ok() {
+        return Ok(db_value);
+    }
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+        .map_err(|_| format!("invalid {context} cursor timestamp: {value}"))
+}
+
+fn team_cursor_required_id(
+    label: &'static str,
+    value: &str,
+    context: &str,
+) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("invalid {context} cursor: {label} is required"));
+    }
+    Ok(trimmed.to_string())
+}
 
 // ─── Team Definition Types ──────────────────────────────────────────────────
 
@@ -467,6 +515,192 @@ fn validate_optional_json(label: &'static str, raw: Option<&str>) -> Result<(), 
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamExecutionListCursor {
+    pub started_at: String,
+    pub execution_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamExecutionListPage {
+    pub executions: Vec<TeamExecutionRecord>,
+    pub limit: u32,
+    pub next_cursor: Option<TeamExecutionListCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamSnapshotListCursor {
+    pub created_at: String,
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamSnapshotListPage {
+    pub snapshots: Vec<TeamSnapshotRecord>,
+    pub limit: u32,
+    pub next_cursor: Option<TeamSnapshotListCursor>,
+}
+
+pub fn team_execution_cursor_db_started_at(
+    cursor: &TeamExecutionListCursor,
+) -> Result<String, String> {
+    team_cursor_db_timestamp("started_at", &cursor.started_at, "team execution list")
+}
+
+pub fn team_execution_cursor_execution_id(
+    cursor: &TeamExecutionListCursor,
+) -> Result<String, String> {
+    team_cursor_required_id("execution_id", &cursor.execution_id, "team execution list")
+}
+
+pub fn team_snapshot_cursor_db_created_at(
+    cursor: &TeamSnapshotListCursor,
+) -> Result<String, String> {
+    team_cursor_db_timestamp("created_at", &cursor.created_at, "team snapshot list")
+}
+
+pub fn team_snapshot_cursor_snapshot_id(cursor: &TeamSnapshotListCursor) -> Result<String, String> {
+    team_cursor_required_id("snapshot_id", &cursor.snapshot_id, "team snapshot list")
+}
+
+fn sort_team_executions_recent(executions: &mut [TeamExecutionRecord]) {
+    executions.sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| right.execution_id.cmp(&left.execution_id))
+    });
+}
+
+fn sort_team_snapshots_recent(snapshots: &mut [TeamSnapshotRecord]) {
+    snapshots.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.snapshot_id.cmp(&left.snapshot_id))
+    });
+}
+
+fn team_execution_after_cursor(
+    execution: &TeamExecutionRecord,
+    cursor: &TeamExecutionListCursor,
+) -> bool {
+    execution.started_at < cursor.started_at
+        || (execution.started_at == cursor.started_at
+            && execution.execution_id < cursor.execution_id)
+}
+
+fn team_snapshot_after_cursor(
+    snapshot: &TeamSnapshotRecord,
+    cursor: &TeamSnapshotListCursor,
+) -> bool {
+    snapshot.created_at < cursor.created_at
+        || (snapshot.created_at == cursor.created_at && snapshot.snapshot_id < cursor.snapshot_id)
+}
+
+fn team_execution_cursor_from_record(
+    execution: &TeamExecutionRecord,
+) -> Result<TeamExecutionListCursor, String> {
+    if execution.started_at.trim().is_empty() {
+        return Err(format!(
+            "invalid team_execution_history cursor: execution_id={}, column=started_at, value is empty",
+            execution.execution_id
+        ));
+    }
+    if execution.execution_id.trim().is_empty() {
+        return Err(
+            "invalid team_execution_history cursor: column=execution_id, value is empty"
+                .to_string(),
+        );
+    }
+    Ok(TeamExecutionListCursor {
+        started_at: execution.started_at.clone(),
+        execution_id: execution.execution_id.clone(),
+    })
+}
+
+fn team_snapshot_cursor_from_record(
+    snapshot: &TeamSnapshotRecord,
+) -> Result<TeamSnapshotListCursor, String> {
+    if snapshot.created_at.trim().is_empty() {
+        return Err(format!(
+            "invalid team_snapshots cursor: snapshot_id={}, column=created_at, value is empty",
+            snapshot.snapshot_id
+        ));
+    }
+    if snapshot.snapshot_id.trim().is_empty() {
+        return Err(
+            "invalid team_snapshots cursor: column=snapshot_id, value is empty".to_string(),
+        );
+    }
+    Ok(TeamSnapshotListCursor {
+        created_at: snapshot.created_at.clone(),
+        snapshot_id: snapshot.snapshot_id.clone(),
+    })
+}
+
+fn team_execution_page_from_records(
+    mut executions: Vec<TeamExecutionRecord>,
+    limit: u32,
+    cursor: Option<TeamExecutionListCursor>,
+) -> Result<TeamExecutionListPage, String> {
+    let limit = validate_team_execution_list_limit(limit);
+    sort_team_executions_recent(&mut executions);
+    if let Some(cursor) = &cursor {
+        team_execution_cursor_db_started_at(cursor)?;
+        team_execution_cursor_execution_id(cursor)?;
+        executions.retain(|execution| team_execution_after_cursor(execution, cursor));
+    }
+    let has_more = executions.len() > limit as usize;
+    if has_more {
+        executions.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        executions
+            .last()
+            .map(team_execution_cursor_from_record)
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(TeamExecutionListPage {
+        executions,
+        limit,
+        next_cursor,
+    })
+}
+
+fn team_snapshot_page_from_records(
+    mut snapshots: Vec<TeamSnapshotRecord>,
+    limit: u32,
+    cursor: Option<TeamSnapshotListCursor>,
+) -> Result<TeamSnapshotListPage, String> {
+    let limit = validate_team_snapshot_list_limit(limit);
+    sort_team_snapshots_recent(&mut snapshots);
+    if let Some(cursor) = &cursor {
+        team_snapshot_cursor_db_created_at(cursor)?;
+        team_snapshot_cursor_snapshot_id(cursor)?;
+        snapshots.retain(|snapshot| team_snapshot_after_cursor(snapshot, cursor));
+    }
+    let has_more = snapshots.len() > limit as usize;
+    if has_more {
+        snapshots.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        snapshots
+            .last()
+            .map(team_snapshot_cursor_from_record)
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(TeamSnapshotListPage {
+        snapshots,
+        limit,
+        next_cursor,
+    })
+}
+
 // ─── Persistence Trait ──────────────────────────────────────────────────────
 
 /// CRUD operations for team definitions, execution history, and snapshots.
@@ -514,6 +748,18 @@ pub trait TeamPersistenceService: Send + Sync {
         Ok(vec![])
     }
 
+    async fn list_executions_page(
+        &self,
+        team_id: &str,
+        limit: u32,
+        cursor: Option<TeamExecutionListCursor>,
+    ) -> Result<TeamExecutionListPage, String> {
+        let executions = self
+            .list_executions(team_id, MAX_TEAM_EXECUTION_LIST_ROWS)
+            .await?;
+        team_execution_page_from_records(executions, limit, cursor)
+    }
+
     // ── Snapshots ───────────────────────────────────────────────
 
     /// Save a team snapshot. Default: no-op.
@@ -529,6 +775,19 @@ pub trait TeamPersistenceService: Send + Sync {
         _limit: u32,
     ) -> Result<Vec<TeamSnapshotRecord>, String> {
         Ok(vec![])
+    }
+
+    async fn list_snapshots_page(
+        &self,
+        team_name: &str,
+        user_id: &str,
+        limit: u32,
+        cursor: Option<TeamSnapshotListCursor>,
+    ) -> Result<TeamSnapshotListPage, String> {
+        let snapshots = self
+            .list_snapshots(team_name, user_id, MAX_TEAM_SNAPSHOT_LIST_ROWS)
+            .await?;
+        team_snapshot_page_from_records(snapshots, limit, cursor)
     }
 
     /// Find a snapshot by exact ID or unique prefix. Default: None.
@@ -703,9 +962,24 @@ impl TeamPersistenceService for InMemoryTeamStore {
             .filter(|r| r.team_id == team_id)
             .cloned()
             .collect();
-        matching.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        sort_team_executions_recent(&mut matching);
         matching.truncate(limit as usize);
         Ok(matching)
+    }
+
+    async fn list_executions_page(
+        &self,
+        team_id: &str,
+        limit: u32,
+        cursor: Option<TeamExecutionListCursor>,
+    ) -> Result<TeamExecutionListPage, String> {
+        let execs = self.executions.read().map_err(|e| e.to_string())?;
+        let matching: Vec<_> = execs
+            .iter()
+            .filter(|r| r.team_id == team_id)
+            .cloned()
+            .collect();
+        team_execution_page_from_records(matching, limit, cursor)
     }
 
     // ── Snapshots ───────────────────────────────────────────────
@@ -728,9 +1002,25 @@ impl TeamPersistenceService for InMemoryTeamStore {
             .filter(|s| s.team_name == team_name && s.user_id == user_id)
             .cloned()
             .collect();
-        matching.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        sort_team_snapshots_recent(&mut matching);
         matching.truncate(limit as usize);
         Ok(matching)
+    }
+
+    async fn list_snapshots_page(
+        &self,
+        team_name: &str,
+        user_id: &str,
+        limit: u32,
+        cursor: Option<TeamSnapshotListCursor>,
+    ) -> Result<TeamSnapshotListPage, String> {
+        let snaps = self.snapshots.read().map_err(|e| e.to_string())?;
+        let matching: Vec<_> = snaps
+            .iter()
+            .filter(|s| s.team_name == team_name && s.user_id == user_id)
+            .cloned()
+            .collect();
+        team_snapshot_page_from_records(matching, limit, cursor)
     }
 
     async fn find_snapshot(
@@ -1039,7 +1329,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
                     CAST(completed_at AS CHAR) AS completed_at \
              FROM team_execution_history \
              WHERE team_id = ? \
-             ORDER BY started_at DESC \
+             ORDER BY started_at DESC, execution_id DESC \
              LIMIT ?",
         )
         .bind(team_id)
@@ -1053,6 +1343,63 @@ impl TeamPersistenceService for MatrixOneTeamStore {
             records.push(row_to_team_execution_record(row)?);
         }
         Ok(records)
+    }
+
+    async fn list_executions_page(
+        &self,
+        team_id: &str,
+        limit: u32,
+        cursor: Option<TeamExecutionListCursor>,
+    ) -> Result<TeamExecutionListPage, String> {
+        let limit = validate_team_execution_list_limit(limit);
+        let mut qb = QueryBuilder::<MySql>::new(
+            "SELECT execution_id, team_id, user_id, `task`, status, \
+                    result_json, DATE_FORMAT(started_at, '%Y-%m-%dT%H:%i:%s.%f') AS started_at, \
+                    DATE_FORMAT(completed_at, '%Y-%m-%dT%H:%i:%s.%f') AS completed_at \
+             FROM team_execution_history \
+             WHERE team_id = ",
+        );
+        qb.push_bind(team_id);
+        if let Some(cursor) = &cursor {
+            let started_at = team_execution_cursor_db_started_at(cursor)?;
+            let execution_id = team_execution_cursor_execution_id(cursor)?;
+            qb.push(" AND (started_at < ");
+            qb.push_bind(started_at.clone());
+            qb.push(" OR (started_at = ");
+            qb.push_bind(started_at);
+            qb.push(" AND execution_id < ");
+            qb.push_bind(execution_id);
+            qb.push("))");
+        }
+        qb.push(" ORDER BY started_at DESC, execution_id DESC LIMIT ");
+        qb.push_bind(team_list_query_limit(limit));
+
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("execution page SELECT failed: {e}"))?;
+        let mut executions = rows
+            .iter()
+            .map(row_to_team_execution_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = executions.len() > limit as usize;
+        if has_more {
+            executions.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            executions
+                .last()
+                .map(team_execution_cursor_from_record)
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(TeamExecutionListPage {
+            executions,
+            limit,
+            next_cursor,
+        })
     }
 
     // ── Snapshots ───────────────────────────────────────────────
@@ -1089,7 +1436,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
                     CAST(created_at AS CHAR) AS created_at \
              FROM team_snapshots \
              WHERE user_id = ? AND team_name = ? \
-             ORDER BY created_at DESC \
+             ORDER BY created_at DESC, snapshot_id DESC \
              LIMIT ?",
         )
         .bind(user_id)
@@ -1104,6 +1451,66 @@ impl TeamPersistenceService for MatrixOneTeamStore {
             records.push(row_to_team_snapshot_record(row)?);
         }
         Ok(records)
+    }
+
+    async fn list_snapshots_page(
+        &self,
+        team_name: &str,
+        user_id: &str,
+        limit: u32,
+        cursor: Option<TeamSnapshotListCursor>,
+    ) -> Result<TeamSnapshotListPage, String> {
+        let limit = validate_team_snapshot_list_limit(limit);
+        let mut qb = QueryBuilder::<MySql>::new(
+            "SELECT snapshot_id, team_name, user_id, label, git_commit, \
+                    session_id, team_definition_json, \
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
+             FROM team_snapshots \
+             WHERE user_id = ",
+        );
+        qb.push_bind(user_id);
+        qb.push(" AND team_name = ");
+        qb.push_bind(team_name);
+        if let Some(cursor) = &cursor {
+            let created_at = team_snapshot_cursor_db_created_at(cursor)?;
+            let snapshot_id = team_snapshot_cursor_snapshot_id(cursor)?;
+            qb.push(" AND (created_at < ");
+            qb.push_bind(created_at.clone());
+            qb.push(" OR (created_at = ");
+            qb.push_bind(created_at);
+            qb.push(" AND snapshot_id < ");
+            qb.push_bind(snapshot_id);
+            qb.push("))");
+        }
+        qb.push(" ORDER BY created_at DESC, snapshot_id DESC LIMIT ");
+        qb.push_bind(team_list_query_limit(limit));
+
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("snapshot page SELECT failed: {e}"))?;
+        let mut snapshots = rows
+            .iter()
+            .map(row_to_team_snapshot_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = snapshots.len() > limit as usize;
+        if has_more {
+            snapshots.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            snapshots
+                .last()
+                .map(team_snapshot_cursor_from_record)
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(TeamSnapshotListPage {
+            snapshots,
+            limit,
+            next_cursor,
+        })
     }
 
     async fn find_snapshot(
@@ -1775,6 +2182,170 @@ mod tests {
         assert_eq!(parsed.execution_id, "exec-1");
         assert_eq!(parsed.status, "completed");
         assert!(parsed.completed_at.is_some());
+    }
+
+    #[test]
+    fn team_execution_cursor_accepts_db_and_rfc3339_timestamps() {
+        let db_cursor = TeamExecutionListCursor {
+            started_at: "2026-10-01T12:34:56.123456".to_string(),
+            execution_id: "exec-1".to_string(),
+        };
+        assert_eq!(
+            team_execution_cursor_db_started_at(&db_cursor).unwrap(),
+            "2026-10-01 12:34:56.123456"
+        );
+        assert_eq!(
+            team_execution_cursor_execution_id(&db_cursor).unwrap(),
+            "exec-1"
+        );
+
+        let rfc3339_cursor = TeamExecutionListCursor {
+            started_at: "2026-10-01T20:34:56.123456+08:00".to_string(),
+            execution_id: "exec-1".to_string(),
+        };
+        assert_eq!(
+            team_execution_cursor_db_started_at(&rfc3339_cursor).unwrap(),
+            "2026-10-01 12:34:56.123456"
+        );
+
+        let missing_id = TeamExecutionListCursor {
+            started_at: "2026-10-01T12:34:56.123456".to_string(),
+            execution_id: " ".to_string(),
+        };
+        assert!(team_execution_cursor_execution_id(&missing_id).is_err());
+    }
+
+    fn test_execution_record(execution_id: &str, started_at: &str) -> TeamExecutionRecord {
+        TeamExecutionRecord {
+            execution_id: execution_id.to_string(),
+            team_id: "team-1".to_string(),
+            user_id: "user-1".to_string(),
+            task: format!("task {execution_id}"),
+            status: "completed".to_string(),
+            result_json: None,
+            started_at: started_at.to_string(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn team_execution_page_uses_stable_seek_cursor() {
+        let executions = vec![
+            test_execution_record("exec-a", "2026-10-01T12:00:00.000000"),
+            test_execution_record("exec-c", "2026-10-01T12:00:00.000000"),
+            test_execution_record("exec-b", "2026-10-01T12:00:00.000000"),
+            test_execution_record("exec-old", "2026-09-30T12:00:00.000000"),
+        ];
+
+        let first = team_execution_page_from_records(executions.clone(), 2, None).unwrap();
+        assert_eq!(
+            first
+                .executions
+                .iter()
+                .map(|execution| execution.execution_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exec-c", "exec-b"]
+        );
+        assert_eq!(
+            first.next_cursor,
+            Some(TeamExecutionListCursor {
+                started_at: "2026-10-01T12:00:00.000000".to_string(),
+                execution_id: "exec-b".to_string(),
+            })
+        );
+
+        let second = team_execution_page_from_records(executions, 2, first.next_cursor).unwrap();
+        assert_eq!(
+            second
+                .executions
+                .iter()
+                .map(|execution| execution.execution_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exec-a", "exec-old"]
+        );
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn team_snapshot_cursor_accepts_db_and_rfc3339_timestamps() {
+        let db_cursor = TeamSnapshotListCursor {
+            created_at: "2026-10-01T12:34:56.123456".to_string(),
+            snapshot_id: "snap-1".to_string(),
+        };
+        assert_eq!(
+            team_snapshot_cursor_db_created_at(&db_cursor).unwrap(),
+            "2026-10-01 12:34:56.123456"
+        );
+        assert_eq!(
+            team_snapshot_cursor_snapshot_id(&db_cursor).unwrap(),
+            "snap-1"
+        );
+
+        let rfc3339_cursor = TeamSnapshotListCursor {
+            created_at: "2026-10-01T20:34:56.123456+08:00".to_string(),
+            snapshot_id: "snap-1".to_string(),
+        };
+        assert_eq!(
+            team_snapshot_cursor_db_created_at(&rfc3339_cursor).unwrap(),
+            "2026-10-01 12:34:56.123456"
+        );
+
+        let missing_id = TeamSnapshotListCursor {
+            created_at: "2026-10-01T12:34:56.123456".to_string(),
+            snapshot_id: " ".to_string(),
+        };
+        assert!(team_snapshot_cursor_snapshot_id(&missing_id).is_err());
+    }
+
+    fn test_snapshot_record(snapshot_id: &str, created_at: &str) -> TeamSnapshotRecord {
+        TeamSnapshotRecord {
+            snapshot_id: snapshot_id.to_string(),
+            team_name: "team-a".to_string(),
+            user_id: "user-1".to_string(),
+            label: format!("snapshot {snapshot_id}"),
+            git_commit: None,
+            session_id: None,
+            team_definition_json: None,
+            created_at: created_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn team_snapshot_page_uses_stable_seek_cursor() {
+        let snapshots = vec![
+            test_snapshot_record("snap-a", "2026-10-01T12:00:00.000000"),
+            test_snapshot_record("snap-c", "2026-10-01T12:00:00.000000"),
+            test_snapshot_record("snap-b", "2026-10-01T12:00:00.000000"),
+            test_snapshot_record("snap-old", "2026-09-30T12:00:00.000000"),
+        ];
+
+        let first = team_snapshot_page_from_records(snapshots.clone(), 2, None).unwrap();
+        assert_eq!(
+            first
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.snapshot_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["snap-c", "snap-b"]
+        );
+        assert_eq!(
+            first.next_cursor,
+            Some(TeamSnapshotListCursor {
+                created_at: "2026-10-01T12:00:00.000000".to_string(),
+                snapshot_id: "snap-b".to_string(),
+            })
+        );
+
+        let second = team_snapshot_page_from_records(snapshots, 2, first.next_cursor).unwrap();
+        assert_eq!(
+            second
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.snapshot_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["snap-a", "snap-old"]
+        );
+        assert!(second.next_cursor.is_none());
     }
 
     #[test]

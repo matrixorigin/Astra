@@ -18,7 +18,10 @@ use astra_server_types::team_orchestrator_types::{OrchestratorConfig, sum_usage}
 use super::super::*;
 use crate::server::team::orchestrator::{TeamExecutionOrchestrator, TeamExecutionReport};
 use astra_services::team_persistence::{
-    TeamDefinition, TeamExecutionRecord, TeamPersistenceService,
+    TeamDefinition, TeamExecutionListCursor, TeamExecutionRecord, TeamPersistenceService,
+    TeamSnapshotListCursor, team_execution_cursor_db_started_at,
+    team_execution_cursor_execution_id, team_snapshot_cursor_db_created_at,
+    team_snapshot_cursor_snapshot_id,
 };
 
 fn require_team_store(
@@ -193,9 +196,65 @@ pub(crate) async fn delete_team_handler(
 pub(crate) struct ExecutionHistoryQuery {
     #[serde(default = "default_limit")]
     limit: u32,
+    pub after_started_at: Option<String>,
+    pub after_execution_id: Option<String>,
 }
 fn default_limit() -> u32 {
     50
+}
+
+impl ExecutionHistoryQuery {
+    fn cursor(&self) -> Result<Option<TeamExecutionListCursor>, (StatusCode, Json<ErrorResponse>)> {
+        match (&self.after_started_at, &self.after_execution_id) {
+            (None, None) => Ok(None),
+            (Some(started_at), Some(execution_id)) => {
+                let cursor = TeamExecutionListCursor {
+                    started_at: started_at.clone(),
+                    execution_id: execution_id.clone(),
+                };
+                team_execution_cursor_db_started_at(&cursor)
+                    .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+                team_execution_cursor_execution_id(&cursor)
+                    .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+                Ok(Some(cursor))
+            }
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "team execution list cursor requires both after_started_at and after_execution_id",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SnapshotHistoryQuery {
+    #[serde(default = "default_limit")]
+    limit: u32,
+    pub after_created_at: Option<String>,
+    pub after_snapshot_id: Option<String>,
+}
+
+impl SnapshotHistoryQuery {
+    fn cursor(&self) -> Result<Option<TeamSnapshotListCursor>, (StatusCode, Json<ErrorResponse>)> {
+        match (&self.after_created_at, &self.after_snapshot_id) {
+            (None, None) => Ok(None),
+            (Some(created_at), Some(snapshot_id)) => {
+                let cursor = TeamSnapshotListCursor {
+                    created_at: created_at.clone(),
+                    snapshot_id: snapshot_id.clone(),
+                };
+                team_snapshot_cursor_db_created_at(&cursor)
+                    .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+                team_snapshot_cursor_snapshot_id(&cursor)
+                    .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+                Ok(Some(cursor))
+            }
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "team snapshot list cursor requires both after_created_at and after_snapshot_id",
+            )),
+        }
+    }
 }
 
 /// GET /teams/{name}/executions
@@ -218,15 +277,21 @@ pub(crate) async fn list_executions_handler(
         query.limit.clamp(1, 500)
     };
 
-    let executions = store
-        .list_executions(&team.team_id, limit)
+    let page = store
+        .list_executions_page(&team.team_id, limit, query.cursor()?)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(ExecutionListResponse {
         team_id: team.team_id,
         team_name: team.name,
-        executions: executions.into_iter().map(ExecutionEntry::from).collect(),
+        executions: page
+            .executions
+            .into_iter()
+            .map(ExecutionEntry::from)
+            .collect(),
+        limit: page.limit,
+        next_cursor: page.next_cursor,
     }))
 }
 
@@ -380,6 +445,8 @@ pub(crate) struct ExecutionListResponse {
     pub team_id: String,
     pub team_name: String,
     pub executions: Vec<ExecutionEntry>,
+    pub limit: u32,
+    pub next_cursor: Option<TeamExecutionListCursor>,
 }
 
 #[derive(Debug, Serialize)]
@@ -413,6 +480,7 @@ impl From<TeamExecutionRecord> for ExecutionEntry {
 pub(crate) async fn list_snapshots_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    Query(query): Query<SnapshotHistoryQuery>,
     headers: HeaderMap,
 ) -> Result<Json<SnapshotListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
@@ -422,12 +490,23 @@ pub(crate) async fn list_snapshots_handler(
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, format!("team '{name}' not found")))?;
-    let snaps = store
-        .list_snapshots(&name, &user.user_id, 50)
+    let limit = if query.limit == 0 {
+        default_limit()
+    } else {
+        query.limit
+    };
+    let page = store
+        .list_snapshots_page(&name, &user.user_id, limit, query.cursor()?)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(SnapshotListResponse {
-        snapshots: snaps.into_iter().map(SnapshotEntry::from).collect(),
+        snapshots: page
+            .snapshots
+            .into_iter()
+            .map(SnapshotEntry::from)
+            .collect(),
+        limit: page.limit,
+        next_cursor: page.next_cursor,
     }))
 }
 
@@ -498,6 +577,8 @@ pub(crate) struct CreateSnapshotRequest {
 #[derive(Debug, Serialize)]
 pub(crate) struct SnapshotListResponse {
     pub snapshots: Vec<SnapshotEntry>,
+    pub limit: u32,
+    pub next_cursor: Option<TeamSnapshotListCursor>,
 }
 
 #[derive(Debug, Serialize)]
@@ -522,5 +603,68 @@ impl From<astra_services::team_persistence::TeamSnapshotRecord> for SnapshotEntr
             team_definition_json: r.team_definition_json,
             created_at: r.created_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn team_execution_query_cursor_requires_complete_seek_key() {
+        let q = serde_json::from_value::<ExecutionHistoryQuery>(serde_json::json!({
+            "limit": 10,
+            "after_started_at": "2026-10-01T12:34:56.123456",
+            "after_execution_id": "exec-5"
+        }))
+        .unwrap();
+        let cursor = q.cursor().unwrap().unwrap();
+        assert_eq!(cursor.started_at, "2026-10-01T12:34:56.123456");
+        assert_eq!(cursor.execution_id, "exec-5");
+
+        let missing_id = serde_json::from_value::<ExecutionHistoryQuery>(serde_json::json!({
+            "after_started_at": "2026-10-01T12:34:56.123456"
+        }))
+        .unwrap();
+        assert_eq!(missing_id.cursor().unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        let invalid_time = serde_json::from_value::<ExecutionHistoryQuery>(serde_json::json!({
+            "after_started_at": "not-a-date",
+            "after_execution_id": "exec-5"
+        }))
+        .unwrap();
+        assert_eq!(
+            invalid_time.cursor().unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn team_snapshot_query_cursor_requires_complete_seek_key() {
+        let q = serde_json::from_value::<SnapshotHistoryQuery>(serde_json::json!({
+            "limit": 10,
+            "after_created_at": "2026-10-01T12:34:56.123456",
+            "after_snapshot_id": "snap-5"
+        }))
+        .unwrap();
+        let cursor = q.cursor().unwrap().unwrap();
+        assert_eq!(cursor.created_at, "2026-10-01T12:34:56.123456");
+        assert_eq!(cursor.snapshot_id, "snap-5");
+
+        let missing_id = serde_json::from_value::<SnapshotHistoryQuery>(serde_json::json!({
+            "after_created_at": "2026-10-01T12:34:56.123456"
+        }))
+        .unwrap();
+        assert_eq!(missing_id.cursor().unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        let invalid_time = serde_json::from_value::<SnapshotHistoryQuery>(serde_json::json!({
+            "after_created_at": "not-a-date",
+            "after_snapshot_id": "snap-5"
+        }))
+        .unwrap();
+        assert_eq!(
+            invalid_time.cursor().unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
     }
 }
