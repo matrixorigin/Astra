@@ -1399,6 +1399,7 @@ impl RunStateStore for InMemoryRunStateStore {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
+        let terminal_error_code = terminal_error_code_from_message(status, error_message);
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
@@ -1409,6 +1410,9 @@ impl RunStateStore for InMemoryRunStateStore {
                     run.waiting_for = waiting_for.map(ToString::to_string);
                     if let Some(msg) = error_message {
                         run.error_message = Some(msg.to_string());
+                    }
+                    if let Some(code) = terminal_error_code.as_ref() {
+                        run.error_code = Some(code.clone());
                     }
                     run.updated_at = chrono::Utc::now().to_rfc3339();
                     Some(run.clone())
@@ -1437,6 +1441,7 @@ impl RunStateStore for InMemoryRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
+        let terminal_error_code = terminal_error_code_from_message(status, error_message);
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
@@ -1447,6 +1452,9 @@ impl RunStateStore for InMemoryRunStateStore {
                     run.waiting_for = waiting_for.map(ToString::to_string);
                     if let Some(msg) = error_message {
                         run.error_message = Some(msg.to_string());
+                    }
+                    if let Some(code) = terminal_error_code.as_ref() {
+                        run.error_code = Some(code.clone());
                     }
                     run.updated_at = chrono::Utc::now().to_rfc3339();
                     Some(run.clone())
@@ -1477,8 +1485,11 @@ impl RunStateStore for InMemoryRunStateStore {
             return Ok(false);
         }
         let latest_event_type = extract_event_type(&event);
-        let terminal_error_code =
-            terminal_error_code_from_events(status, std::slice::from_ref(&event));
+        let terminal_error_code = terminal_error_code_from_transition(
+            status,
+            error_message,
+            std::slice::from_ref(&event),
+        );
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
@@ -1525,7 +1536,8 @@ impl RunStateStore for InMemoryRunStateStore {
             return Ok(false);
         }
         let latest_event_type = events.last().map(extract_event_type);
-        let terminal_error_code = terminal_error_code_from_events(status, events);
+        let terminal_error_code =
+            terminal_error_code_from_transition(status, error_message, events);
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
@@ -2804,34 +2816,28 @@ impl RunStateStore for DatabaseRunStateStore {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
-        let result = if let Some(error_message) = error_message {
-            sqlx::query(
-                "UPDATE agent_runs
-                 SET status = ?, waiting_for = ?, error_message = ?, updated_at = NOW(6)
-                 WHERE user_id = ? AND run_id = ?",
-            )
-            .bind(status)
-            .bind(waiting_for)
-            .bind(error_message)
-            .bind(user_id)
-            .bind(run_id)
+        let terminal_error_code = terminal_error_code_from_message(status, error_message);
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
+        query.push_bind(status);
+        query.push(", waiting_for = ");
+        query.push_bind(waiting_for);
+        if let Some(error_message) = error_message {
+            query.push(", error_message = ");
+            query.push_bind(error_message);
+        }
+        if let Some(error_code) = terminal_error_code.as_deref() {
+            query.push(", error_code = ");
+            query.push_bind(error_code);
+        }
+        query.push(", updated_at = NOW(6) WHERE user_id = ");
+        query.push_bind(user_id);
+        query.push(" AND run_id = ");
+        query.push_bind(run_id);
+        let result = query
+            .build()
             .execute(self.pool.get())
             .await
-            .map_err(|source| db_error("update_run_status", run_id, source).to_string())?
-        } else {
-            sqlx::query(
-                "UPDATE agent_runs
-                 SET status = ?, waiting_for = ?, updated_at = NOW(6)
-                 WHERE user_id = ? AND run_id = ?",
-            )
-            .bind(status)
-            .bind(waiting_for)
-            .bind(user_id)
-            .bind(run_id)
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| db_error("update_run_status", run_id, source).to_string())?
-        };
+            .map_err(|source| db_error("update_run_status", run_id, source).to_string())?;
         if result.rows_affected() > 0
             && let Err(error) = self
                 .sync_projection_for_user(user_id, run_id, None, None)
@@ -2866,6 +2872,11 @@ impl RunStateStore for DatabaseRunStateStore {
         if let Some(error_message) = error_message {
             query.push(", error_message = ");
             query.push_bind(error_message);
+        }
+        let terminal_error_code = terminal_error_code_from_message(status, error_message);
+        if let Some(error_code) = terminal_error_code.as_deref() {
+            query.push(", error_code = ");
+            query.push_bind(error_code);
         }
         query.push(", updated_at = NOW(6) WHERE user_id = ");
         query.push_bind(user_id);
@@ -2912,8 +2923,11 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
-        let terminal_error_code =
-            terminal_error_code_from_events(status, std::slice::from_ref(&event));
+        let terminal_error_code = terminal_error_code_from_transition(
+            status,
+            error_message,
+            std::slice::from_ref(&event),
+        );
 
         let mut tx = self.pool.get().begin().await.map_err(|source| {
             db_error("transition_run_status_with_event_begin", run_id, source).to_string()
@@ -3100,7 +3114,8 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
-        let terminal_error_code = terminal_error_code_from_events(status, events);
+        let terminal_error_code =
+            terminal_error_code_from_transition(status, error_message, events);
 
         let mut tx = self.pool.get().begin().await.map_err(|source| {
             db_error("transition_run_status_with_events_begin", run_id, source).to_string()
@@ -4423,6 +4438,31 @@ fn terminal_error_code_from_events(status: &str, events: &[serde_json::Value]) -
         return None;
     }
     events.iter().rev().find_map(run_error_code_from_event)
+}
+
+fn terminal_error_code_from_message(status: &str, error_message: Option<&str>) -> Option<String> {
+    if status != STATUS_FAILED {
+        return None;
+    }
+    let message = error_message?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(
+        astra_core::ClassifiedError::from(message.to_string())
+            .kind
+            .as_str()
+            .to_string(),
+    )
+}
+
+fn terminal_error_code_from_transition(
+    status: &str,
+    error_message: Option<&str>,
+    events: &[serde_json::Value],
+) -> Option<String> {
+    terminal_error_code_from_events(status, events)
+        .or_else(|| terminal_error_code_from_message(status, error_message))
 }
 
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
@@ -6720,6 +6760,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_status_transition_classifies_error_message_without_events() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("transition-message-code"))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_run_status_if_current(
+                "u1",
+                "transition-message-code",
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some(
+                    "database operation failed: error communicating with database: unexpected EOF",
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        let loaded = store
+            .load_run("u1", "transition-message-code")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_FAILED);
+        assert_eq!(loaded.error_code.as_deref(), Some("database_error"));
+        assert_eq!(
+            loaded.error_message.as_deref(),
+            Some("database operation failed: error communicating with database: unexpected EOF")
+        );
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_direct_status_update_classifies_error_message_without_events() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("direct-message-code"))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_run_status(
+                "u1",
+                "direct-message-code",
+                STATUS_FAILED,
+                None,
+                Some("[stream_transport] stream body closed"),
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        let loaded = store
+            .load_run("u1", "direct-message-code")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_FAILED);
+        assert_eq!(loaded.error_code.as_deref(), Some("stream_transport"));
+        assert_eq!(
+            loaded.error_message.as_deref(),
+            Some("[stream_transport] stream body closed")
+        );
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_empty_event_batch_classifies_error_message() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("transition-empty-failed-batch"))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_run_status_with_events_if_current(
+                "u1",
+                "transition-empty-failed-batch",
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some("[network] LLM request failed: connection reset"),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        let loaded = store
+            .load_run("u1", "transition-empty-failed-batch")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_FAILED);
+        assert_eq!(loaded.error_code.as_deref(), Some("network"));
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
     async fn status_with_events_transition_rejects_unexpected_status_without_batch() {
         let store = InMemoryRunStateStore::new();
         store
@@ -6822,6 +6968,7 @@ mod tests {
             .expect("run exists");
         assert_eq!(loaded.status, STATUS_FAILED);
         assert_eq!(loaded.error_message.as_deref(), Some("boom"));
+        assert_eq!(loaded.error_code.as_deref(), Some("unknown"));
         assert_eq!(loaded.last_event_idx, 1);
         assert_eq!(loaded.events.len(), 2);
         assert_eq!(loaded.events[0]["event_type"], "run_error");
