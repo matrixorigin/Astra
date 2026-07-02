@@ -621,7 +621,13 @@ impl MemoryExtractionService {
                 } else {
                     Some(req.session_id.as_str())
                 };
-                self.emit_skip_event(sid_opt, req.turn_number, reason, &skip_breadcrumbs);
+                self.emit_skip_event(
+                    &req.user_id,
+                    sid_opt,
+                    req.turn_number,
+                    reason,
+                    &skip_breadcrumbs,
+                );
                 self.record_skipped(sid_opt, req.turn_number, trigger, label, None);
                 return SpawnDecision::Skipped;
             }
@@ -641,7 +647,13 @@ impl MemoryExtractionService {
                 } else {
                     Some(req.session_id.as_str())
                 };
-                self.emit_skip_event(sid_opt, req.turn_number, reason, &skip_breadcrumbs);
+                self.emit_skip_event(
+                    &req.user_id,
+                    sid_opt,
+                    req.turn_number,
+                    reason,
+                    &skip_breadcrumbs,
+                );
                 self.record_skipped(sid_opt, req.turn_number, trigger, label, None);
                 return SpawnDecision::Skipped;
             }
@@ -713,6 +725,7 @@ impl MemoryExtractionService {
         ));
         let session_id = req.session_id.clone();
         let _in_flight_guard = InFlightGuard::new(Arc::clone(&self.in_flight), session_id.clone());
+        let user_id = req.user_id.clone();
         let turn = req.turn_number;
         let messages_count = req.messages.len() as u32;
         let started = Instant::now();
@@ -744,6 +757,7 @@ impl MemoryExtractionService {
                 persist_detail: None,
             };
             self.emit_skip_event(
+                &user_id,
                 Some(&session_id),
                 turn,
                 SessionMemoryExtractionSkipReason::SelectorCooldown,
@@ -873,6 +887,7 @@ impl MemoryExtractionService {
                         persist_detail: Some(error.clone()),
                     };
                     self.emit_error_event(
+                        &user_id,
                         Some(&session_id),
                         turn,
                         SessionMemoryExtractionErrorReason::WriteFailed,
@@ -921,6 +936,7 @@ impl MemoryExtractionService {
                     persist_detail: None,
                 };
                 self.emit_success_event(
+                    &user_id,
                     Some(&session_id),
                     turn,
                     source,
@@ -981,6 +997,7 @@ impl MemoryExtractionService {
                         persist_detail: Some(error.clone()),
                     };
                     self.emit_error_event(
+                        &user_id,
                         Some(&session_id),
                         turn,
                         SessionMemoryExtractionErrorReason::WriteFailed,
@@ -1027,6 +1044,7 @@ impl MemoryExtractionService {
                     persist_detail: None,
                 };
                 self.emit_success_event(
+                    &user_id,
                     Some(&session_id),
                     turn,
                     SessionMemoryExtractionSource::RuleFallback,
@@ -1096,7 +1114,14 @@ impl MemoryExtractionService {
                     llm_detail: llm_error_detail.clone(),
                     persist_detail: persist_error_detail.clone(),
                 };
-                self.emit_error_event(Some(&session_id), turn, error_reason, duration_ms, &bc);
+                self.emit_error_event(
+                    &user_id,
+                    Some(&session_id),
+                    turn,
+                    error_reason,
+                    duration_ms,
+                    &bc,
+                );
                 self.broker.emit(BackgroundActivity::Errored {
                     session_id: session_id.clone(),
                     turn,
@@ -1284,11 +1309,11 @@ impl MemoryExtractionService {
 
     // ── event emission helpers ────────────────────────────────────────
 
-    fn enqueue(&self, event: JournalEvent) {
+    fn enqueue(&self, event: JournalEvent, user_id: &str) {
         if let Some(sink) = self.local_event_sink.as_ref() {
             sink(&event);
         }
-        match IngestionEvent::from_journal_event(&event, &self.user_id) {
+        match IngestionEvent::from_journal_event(&event, user_id) {
             Ok(ingestion_event) => self.ingestion.enqueue(ingestion_event),
             Err(error) => tracing::warn!(
                 target: "astra_runtime::session_memory",
@@ -1358,22 +1383,27 @@ impl MemoryExtractionService {
 
     fn emit_skip_event(
         &self,
+        user_id: &str,
         session_id: Option<&str>,
         turn: u32,
         reason: SessionMemoryExtractionSkipReason,
         breadcrumbs: &SessionMemoryExtractionBreadcrumbs,
     ) {
-        self.enqueue(JournalEvent::session_memory_extraction(
-            session_id,
-            turn,
-            0,
-            SessionMemoryExtractionOutcome::Skipped { reason },
-            breadcrumbs,
-        ));
+        self.enqueue(
+            JournalEvent::session_memory_extraction(
+                session_id,
+                turn,
+                0,
+                SessionMemoryExtractionOutcome::Skipped { reason },
+                breadcrumbs,
+            ),
+            user_id,
+        );
     }
 
     fn emit_success_event(
         &self,
+        user_id: &str,
         session_id: Option<&str>,
         turn: u32,
         source: SessionMemoryExtractionSource,
@@ -1381,33 +1411,40 @@ impl MemoryExtractionService {
         duration_ms: u64,
         breadcrumbs: &SessionMemoryExtractionBreadcrumbs,
     ) {
-        self.enqueue(JournalEvent::session_memory_extraction(
-            session_id,
-            turn,
-            duration_ms,
-            SessionMemoryExtractionOutcome::Extracted {
-                source,
-                bytes_written,
-            },
-            breadcrumbs,
-        ));
+        self.enqueue(
+            JournalEvent::session_memory_extraction(
+                session_id,
+                turn,
+                duration_ms,
+                SessionMemoryExtractionOutcome::Extracted {
+                    source,
+                    bytes_written,
+                },
+                breadcrumbs,
+            ),
+            user_id,
+        );
     }
 
     fn emit_error_event(
         &self,
+        user_id: &str,
         session_id: Option<&str>,
         turn: u32,
         reason: SessionMemoryExtractionErrorReason,
         duration_ms: u64,
         breadcrumbs: &SessionMemoryExtractionBreadcrumbs,
     ) {
-        self.enqueue(JournalEvent::session_memory_extraction(
-            session_id,
-            turn,
-            duration_ms,
-            SessionMemoryExtractionOutcome::Errored { reason },
-            breadcrumbs,
-        ));
+        self.enqueue(
+            JournalEvent::session_memory_extraction(
+                session_id,
+                turn,
+                duration_ms,
+                SessionMemoryExtractionOutcome::Errored { reason },
+                breadcrumbs,
+            ),
+            user_id,
+        );
     }
 }
 
@@ -1553,6 +1590,7 @@ mod tests {
 
     fn sample_req(session_id: &str, tokens: usize, had_error: bool) -> ExtractionRequest {
         ExtractionRequest {
+            user_id: "test-user".to_string(),
             session_id: session_id.to_string(),
             messages: vec![json!({"role": "user", "content": "hello world"})],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
@@ -1567,6 +1605,7 @@ mod tests {
 
     fn meaningful_shutdown_req(session_id: &str, tokens: usize) -> ExtractionRequest {
         ExtractionRequest {
+            user_id: "test-user".to_string(),
             session_id: session_id.to_string(),
             messages: vec![
                 json!({"role": "user", "content": "Need a cache-safe session memory design that still captures shutdown summaries for short sessions and resumed work."}),
@@ -1641,6 +1680,31 @@ mod tests {
         assert_eq!(m["outcome"], "skipped");
         assert_eq!(m["reason"], "below_init_gate");
         assert!(ctx.memoria.stored.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingestion_event_uses_request_user_not_service_fallback_user() {
+        let (ingestion, mut rx) = IngestionSender::for_tests(8);
+        let broker = Arc::new(BackgroundActivityBroker::new());
+        let memoria = Arc::new(CapturingMemoria::default());
+        let svc = Arc::new(MemoryExtractionService::new(
+            Arc::new(ConstSelectorResolver(None)),
+            memoria,
+            ingestion,
+            "service-fallback-user",
+            broker,
+        ));
+        let mut req = sample_req("sess-request-user", 1_000, false);
+        req.user_id = "request-user".to_string();
+
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Skipped);
+
+        let events = collect_extraction_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].user_id, "request-user",
+            "cloud ingestion identity must follow the run/request owner"
+        );
     }
 
     #[tokio::test]
@@ -1742,6 +1806,7 @@ mod tests {
     async fn shutdown_flush_skips_trivial_session() {
         let ctx = build_ctx(None);
         let req = ExtractionRequest {
+            user_id: "test-user".to_string(),
             session_id: format!("shutdown-trivial-{}", nanos()),
             messages: vec![
                 json!({"role": "user", "content": "hi"}),
@@ -2568,6 +2633,7 @@ mod tests {
         let sid = format!("bc-skip-{}", nanos());
         // Below init gate → Skipped{BelowInitGate}.
         let req = ExtractionRequest {
+            user_id: "test-user".to_string(),
             session_id: sid,
             messages: vec![json!({"role": "user", "content": "x"})],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),

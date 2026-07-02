@@ -4263,8 +4263,10 @@ impl AgenticRunLifecycleService {
 fn build_shutdown_extraction_request(
     state: &AgenticLoopState,
 ) -> Option<crate::session_memory::ExtractionRequest> {
+    let user_id = state.context_manifest_user_id.clone()?;
     state.current_session_id.as_ref().map(|session_id| {
         crate::session_memory::ExtractionRequest {
+            user_id,
             session_id: session_id.clone(),
             messages: state.messages.clone(),
             session_facts: state.session_facts.clone(),

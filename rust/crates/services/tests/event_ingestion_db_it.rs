@@ -591,33 +591,44 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn event_ingest_rejects_foreign_owned_session_without_mutation() {
+async fn event_ingest_drops_foreign_owned_session_without_blocking_valid_events() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();
 
-    let session_id = Uuid::new_v4().to_string();
+    let foreign_session_id = Uuid::new_v4().to_string();
+    let valid_session_id = Uuid::new_v4().to_string();
     let foreign_user_id = format!("foreign-user-{}", Uuid::new_v4());
-    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
-    cleanup_session(&pool, &foreign_user_id, &session_id).await;
-    insert_session_root_with_count(&pool, &foreign_user_id, &session_id, 7).await;
+    cleanup_session(&pool, TEST_USER_ID, &foreign_session_id).await;
+    cleanup_session(&pool, &foreign_user_id, &foreign_session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &valid_session_id).await;
+    insert_session_root_with_count(&pool, &foreign_user_id, &foreign_session_id, 7).await;
+    insert_session_root(&pool, TEST_USER_ID, &valid_session_id).await;
 
-    let event_id = format!("evt-foreign-session-{}", Uuid::new_v4());
-    let event = test_event_for_user(
+    let foreign_event_id = format!("evt-foreign-session-{}", Uuid::new_v4());
+    let valid_event_id = format!("evt-valid-session-{}", Uuid::new_v4());
+    let foreign_event = test_event_for_user(
         TEST_USER_ID,
-        &event_id,
-        &session_id,
+        &foreign_event_id,
+        &foreign_session_id,
         "test_foreign_session_rejected",
+    );
+    let valid_event = test_event_for_user(
+        TEST_USER_ID,
+        &valid_event_id,
+        &valid_session_id,
+        "test_valid_session_persists",
     );
     let config = IngestionConfig::default();
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event).await;
+    sender.enqueue_async(foreign_event).await;
+    sender.enqueue_async(valid_event).await;
     shutdown.signal();
     handle.await.unwrap();
 
     let test_user_event_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND user_id = ?",
     )
-    .bind(&session_id)
+    .bind(&foreign_session_id)
     .bind(TEST_USER_ID)
     .fetch_one(&pool)
     .await
@@ -630,7 +641,7 @@ async fn event_ingest_rejects_foreign_owned_session_without_mutation() {
     let test_user_session_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_sessions WHERE session_id = ? AND user_id = ?",
     )
-    .bind(&session_id)
+    .bind(&foreign_session_id)
     .bind(TEST_USER_ID)
     .fetch_one(&pool)
     .await
@@ -639,22 +650,37 @@ async fn event_ingest_rejects_foreign_owned_session_without_mutation() {
         test_user_session_count, 0,
         "foreign-owned session must not create a test-user session root"
     );
-    assert_session_event_count(&pool, &foreign_user_id, &session_id, 7).await;
+    assert_session_event_count(&pool, &foreign_user_id, &foreign_session_id, 7).await;
+    assert_session_event_count(&pool, TEST_USER_ID, &valid_session_id, 1).await;
+
+    let valid_event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE event_id = ? AND user_id = ?")
+            .bind(&valid_event_id)
+            .bind(TEST_USER_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("count valid event");
+    assert_eq!(
+        valid_event_count, 1,
+        "valid event in the same flush must persist even when another session group is invalid"
+    );
 
     let stats = stats.lock().expect("stats lock").clone();
-    assert_eq!(stats.events_flushed, 0);
-    assert_eq!(stats.flush_count, 0);
+    assert_eq!(stats.events_flushed, 2);
+    assert_eq!(stats.events_dropped_permanent, 1);
+    assert_eq!(stats.flush_count, 1);
     assert_eq!(stats.errors, 1);
     assert!(
         stats
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("event_count delta")),
+            .is_some_and(|error| error.contains("permanently invalid ingestion events")),
         "unexpected ingestion error: {:?}",
         stats.last_error
     );
 
-    cleanup_session(&pool, &foreign_user_id, &session_id).await;
+    cleanup_session(&pool, &foreign_user_id, &foreign_session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &valid_session_id).await;
 }
 
 /// Verifies that a duplicate event in a mixed batch cannot mutate causal

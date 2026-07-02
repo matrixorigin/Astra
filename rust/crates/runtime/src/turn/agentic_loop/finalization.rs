@@ -1013,6 +1013,13 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     let Some(session_id) = state.current_session_id.clone() else {
         return;
     };
+    let Some(user_id) = state.context_manifest_user_id.clone() else {
+        tracing::warn!(
+            session_id = %session_id,
+            "Skipping session-memory extraction: missing durable user_id"
+        );
+        return;
+    };
     let turn_number = state.max_turns.saturating_sub(state.remaining_turns);
 
     let had_error = state.error_recovery.consecutive_same_error > 0;
@@ -1032,6 +1039,7 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
         .saturating_add(state.total_cache_creation) as usize;
 
     let req = crate::session_memory::ExtractionRequest {
+        user_id,
         session_id,
         messages: state.messages.clone(),
         session_facts: state.session_facts.clone(),

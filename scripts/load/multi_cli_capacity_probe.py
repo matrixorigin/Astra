@@ -951,6 +951,8 @@ def summarize_results(
     header_latencies = [r.header_latency_ms for r in results if r.header_latency_ms is not None]
     outcomes = counts_by([r.outcome for r in results])
     error_codes = counts_by([r.error_code or "none" for r in results if r.outcome != "completed"])
+    terminal_statuses = counts_by([r.terminal_status or "none" for r in results])
+    failure_reasons = counts_by([failure_reason(r) for r in results if r.outcome != "completed"])
     failed = sum(1 for r in results if r.outcome != "completed")
     return {
         "profile": args.profile,
@@ -967,6 +969,8 @@ def summarize_results(
         "outcomes": outcomes,
         "http_status": counts_by([str(r.http_status or "none") for r in results]),
         "error_codes": error_codes,
+        "terminal_statuses": terminal_statuses,
+        "failure_reasons": failure_reasons,
         "duration_ms": percentile_summary(durations),
         "first_event_ms": percentile_summary(first_events),
         "header_latency_ms": percentile_summary(header_latencies),
@@ -974,6 +978,14 @@ def summarize_results(
         "contract_violations": contract_violations,
         "output_dir": str(args.output_dir),
     }
+
+
+def failure_reason(result: StreamResult) -> str:
+    if result.error_code:
+        return f"error_code:{result.error_code}"
+    if result.terminal_status:
+        return f"terminal_status:{result.terminal_status}"
+    return f"outcome:{result.outcome}"
 
 
 def summarize_metrics_file(path: Path) -> dict[str, Any]:

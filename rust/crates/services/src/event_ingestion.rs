@@ -563,9 +563,15 @@ impl IngestionSender {
 pub struct IngestionStats {
     pub events_received: u64,
     pub events_flushed: u64,
+    pub events_dropped_permanent: u64,
     pub flush_count: u64,
     pub errors: u64,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct IngestionBatchOutcome {
+    events_dropped_permanent: usize,
 }
 
 /// Convert ISO 8601 / RFC 3339 timestamp to MySQL DATETIME(6) format.
@@ -1060,10 +1066,18 @@ impl EventIngestionWorker {
 
         for attempt in 0..self.config.max_retries {
             match self.insert_batch(&batch).await {
-                Ok(()) => {
+                Ok(outcome) => {
                     if let Ok(mut s) = self.stats.lock() {
                         s.events_flushed += count as u64;
                         s.flush_count += 1;
+                        if outcome.events_dropped_permanent > 0 {
+                            s.events_dropped_permanent += outcome.events_dropped_permanent as u64;
+                            s.errors += 1;
+                            s.last_error = Some(format!(
+                                "dropped {} permanently invalid ingestion events",
+                                outcome.events_dropped_permanent
+                            ));
+                        }
                     }
                     return;
                 }
@@ -1111,10 +1125,18 @@ impl EventIngestionWorker {
         let batch: Vec<IngestionEvent> = std::mem::take(buffer);
         let count = batch.len();
         match self.insert_batch(&batch).await {
-            Ok(()) => {
+            Ok(outcome) => {
                 if let Ok(mut s) = self.stats.lock() {
                     s.events_flushed += count as u64;
                     s.flush_count += 1;
+                    if outcome.events_dropped_permanent > 0 {
+                        s.events_dropped_permanent += outcome.events_dropped_permanent as u64;
+                        s.errors += 1;
+                        s.last_error = Some(format!(
+                            "dropped {} permanently invalid ingestion events",
+                            outcome.events_dropped_permanent
+                        ));
+                    }
                 }
             }
             Err(e) => {
@@ -1132,9 +1154,12 @@ impl EventIngestionWorker {
         }
     }
 
-    async fn insert_batch(&self, events: &[IngestionEvent]) -> Result<(), String> {
+    async fn insert_batch(
+        &self,
+        events: &[IngestionEvent],
+    ) -> Result<IngestionBatchOutcome, String> {
         if events.is_empty() {
-            return Ok(());
+            return Ok(IngestionBatchOutcome::default());
         }
 
         let mut tx = self
@@ -1153,9 +1178,37 @@ impl EventIngestionWorker {
         }
 
         let mut rows_inserted = 0_i64;
+        let mut outcome = IngestionBatchOutcome::default();
         let mut inserted_session_end_sessions =
             std::collections::BTreeSet::<(String, String)>::new();
         for ((user_id, session_id), session_events) in grouped_events {
+            let session_event_count = session_events.len();
+            let foreign_owner: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id <> ? LIMIT 1",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("session owner check for {user_id}/{session_id}: {e}"))?;
+            if foreign_owner.is_some() {
+                outcome.events_dropped_permanent = outcome
+                    .events_dropped_permanent
+                    .checked_add(session_event_count)
+                    .ok_or_else(|| {
+                        "event_ingestion.events_dropped_permanent: dropped event total overflow"
+                            .to_string()
+                    })?;
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    user_id = %user_id,
+                    session_id = %session_id,
+                    event_count = session_event_count,
+                    "dropping ingestion events for a session_id owned by another user"
+                );
+                continue;
+            }
+
             let mut plain_events = Vec::new();
             let mut plain_session_end_events = Vec::new();
             let mut parented_events = Vec::new();
@@ -1327,7 +1380,7 @@ impl EventIngestionWorker {
 
         tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
 
-        Ok(())
+        Ok(outcome)
     }
 }
 

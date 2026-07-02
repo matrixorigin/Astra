@@ -133,6 +133,65 @@ class CapacityProbeTests(unittest.TestCase):
         self.assertEqual(summary["last_metric_count"], 1)
         self.assertEqual(summary["last_metric_names"], ["astra_capacity_run_slots_total"])
 
+    def test_summarize_results_reports_terminal_failure_reasons(self) -> None:
+        args = argparse.Namespace(
+            profile="100-cli",
+            base_url="http://127.0.0.1:17001",
+            endpoint="/chat/stream",
+            concurrency=2,
+            total=2,
+            output_dir=Path("tmp/probe-test"),
+        )
+        results = [
+            probe.StreamResult(
+                request_id=0,
+                user_index=0,
+                token_index=0,
+                http_status=200,
+                header_latency_ms=1.0,
+                first_event_ms=1.0,
+                duration_ms=10.0,
+                event_count=3,
+                session_id="s0",
+                run_id="r0",
+                terminal_status="completed",
+                error_code=None,
+                error_message=None,
+                retryable=None,
+                outcome="completed",
+            ),
+            probe.StreamResult(
+                request_id=1,
+                user_index=1,
+                token_index=1,
+                http_status=200,
+                header_latency_ms=2.0,
+                first_event_ms=2.0,
+                duration_ms=20.0,
+                event_count=3,
+                session_id="s1",
+                run_id="r1",
+                terminal_status="failed",
+                error_code=None,
+                error_message=None,
+                retryable=None,
+                outcome="terminal_non_success",
+            ),
+        ]
+
+        summary = probe.summarize_results(
+            results,
+            args,
+            started_unix_ms=1,
+            ended_unix_ms=2,
+            elapsed_ms=30.0,
+            metrics_summary={"sample_count": 0, "samples_with_metrics": 0},
+            contract_violations=[],
+        )
+
+        self.assertEqual(summary["terminal_statuses"], {"completed": 1, "failed": 1})
+        self.assertEqual(summary["failure_reasons"], {"terminal_status:failed": 1})
+
     def test_percentile_summary_handles_empty(self) -> None:
         self.assertEqual(
             probe.percentile_summary([]),
