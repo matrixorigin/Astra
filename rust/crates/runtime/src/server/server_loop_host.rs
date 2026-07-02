@@ -72,6 +72,56 @@ use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 const MAX_PENDING_PROGRESS_AGENTS: usize = 128;
 const MAX_PENDING_PROGRESS_PER_AGENT: usize = 8;
 const MAX_STREAMED_TURN_EVENT_BUFFER: usize = 2_048;
+const TURN_INTENT_JUDGE_POLICY_ENV: &str = "ASTRA_TURN_INTENT_JUDGE_POLICY";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnIntentJudgePolicy {
+    CapacityAware,
+    Always,
+    Disabled,
+}
+
+impl TurnIntentJudgePolicy {
+    fn from_env() -> Self {
+        std::env::var(TURN_INTENT_JUDGE_POLICY_ENV)
+            .ok()
+            .as_deref()
+            .map(parse_turn_intent_judge_policy)
+            .unwrap_or(Self::CapacityAware)
+    }
+
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::CapacityAware => "capacity_aware",
+            Self::Always => "always",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+fn parse_turn_intent_judge_policy(raw: &str) -> TurnIntentJudgePolicy {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "always" | "on" | "true" | "1" => TurnIntentJudgePolicy::Always,
+        "disabled" | "disable" | "off" | "false" | "0" => TurnIntentJudgePolicy::Disabled,
+        "capacity_aware" | "capacity-aware" | "auto" | "" => TurnIntentJudgePolicy::CapacityAware,
+        _ => TurnIntentJudgePolicy::CapacityAware,
+    }
+}
+
+fn should_skip_builtin_turn_intent_judge_for_capacity() -> Option<&'static str> {
+    let policy = TurnIntentJudgePolicy::from_env();
+    match policy {
+        TurnIntentJudgePolicy::Disabled => Some("disabled"),
+        TurnIntentJudgePolicy::Always => None,
+        TurnIntentJudgePolicy::CapacityAware => {
+            if crate::llm_provider_admission::ProviderAdmissionConfig::from_env().is_enabled() {
+                Some("provider_admission_enabled")
+            } else {
+                None
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct RunScopedAgentProgressFilter {
@@ -3191,6 +3241,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 has_prior_assistant_turn,
             )
             .await;
+        }
+
+        if let Some(reason) = should_skip_builtin_turn_intent_judge_for_capacity() {
+            tracing::debug!(
+                target: "astra::turn_intent",
+                policy = TurnIntentJudgePolicy::from_env().as_label(),
+                reason,
+                "turn intent judge skipped by capacity policy"
+            );
+            return None;
         }
 
         let client = self.turn_intent_summary_client(state).await?;
@@ -9388,6 +9448,38 @@ mod tests {
             LlmTokenServiceConfig, TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError,
         };
         use async_trait::async_trait;
+        use std::ffi::OsString;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct EnvVarGuard {
+            key: &'static str,
+            previous: Option<OsString>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let previous = std::env::var_os(key);
+                unsafe { std::env::set_var(key, value) };
+                Self { key, previous }
+            }
+
+            fn remove(key: &'static str) -> Self {
+                let previous = std::env::var_os(key);
+                unsafe { std::env::remove_var(key) };
+                Self { key, previous }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.previous.take() {
+                        Some(value) => std::env::set_var(self.key, value),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
 
         struct ScriptedJudge {
             calls: std::sync::Mutex<Vec<TurnIntentJudgeContext>>,
@@ -9437,6 +9529,26 @@ mod tests {
             .build();
             host.set_turn_intent_judge(judge);
             host
+        }
+
+        #[test]
+        fn turn_intent_capacity_policy_parser_is_stable() {
+            assert_eq!(
+                parse_turn_intent_judge_policy("always"),
+                TurnIntentJudgePolicy::Always
+            );
+            assert_eq!(
+                parse_turn_intent_judge_policy("off"),
+                TurnIntentJudgePolicy::Disabled
+            );
+            assert_eq!(
+                parse_turn_intent_judge_policy("capacity-aware"),
+                TurnIntentJudgePolicy::CapacityAware
+            );
+            assert_eq!(
+                parse_turn_intent_judge_policy("surprise"),
+                TurnIntentJudgePolicy::CapacityAware
+            );
         }
 
         #[tokio::test]
@@ -9503,9 +9615,12 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial(turn_intent_capacity_policy_env)]
         async fn judge_turn_intent_uses_gateway_llm_when_no_judge_is_injected() {
             use axum::{Router, extract::State, routing::post};
             use tokio::net::TcpListener;
+
+            let _policy = EnvVarGuard::set(TURN_INTENT_JUDGE_POLICY_ENV, "always");
 
             #[derive(Default)]
             struct RequestCapture {
@@ -9622,6 +9737,72 @@ mod tests {
             assert!(
                 prompt.contains("不对，我要的是系统性修复，不是临时补丁"),
                 "judge prompt must include the current user message as data"
+            );
+
+            server.abort();
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(turn_intent_capacity_policy_env)]
+        async fn builtin_turn_intent_judge_skips_gateway_when_provider_admission_is_enabled() {
+            use axum::{Router, routing::post};
+            use tokio::net::TcpListener;
+
+            let _policy = EnvVarGuard::remove(TURN_INTENT_JUDGE_POLICY_ENV);
+            let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
+            let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let request_count_for_handler = request_count.clone();
+            let app = Router::new().route(
+                "/gateway/chat/completions",
+                post(move || {
+                    let request_count = request_count_for_handler.clone();
+                    async move {
+                        request_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        axum::Json(json!({
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": "{\"requested_scenario\":\"refactoring\"}"
+                                    },
+                                    "finish_reason": "stop"
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                        }))
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr().expect("listener addr");
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("test server should run");
+            });
+
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .with_llm_token_service(Some(LlmTokenServiceConfig {
+                url: format!("http://{addr}/gateway/chat/completions"),
+                timeout_ms: Some(2_000),
+            }))
+            .build();
+
+            let mut state = crate::turn::agentic_loop::host::tests::make_state();
+            state.message = "继续，但要系统性一点".to_string();
+
+            assert_eq!(host.judge_turn_intent(&state).await, None);
+            assert_eq!(
+                request_count.load(AtomicOrdering::SeqCst),
+                0,
+                "capacity-aware default must not spend provider RPM on built-in turn intent judge"
             );
 
             server.abort();
