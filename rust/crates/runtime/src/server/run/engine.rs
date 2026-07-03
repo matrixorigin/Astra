@@ -1252,10 +1252,9 @@ impl RunEngine {
         user_id: &str,
         limit: u32,
         cursor: Option<RunListCursor>,
-        include_total: bool,
     ) -> Result<DurableRunListPage, String> {
         self.store
-            .list_user_runs_cursor(user_id, limit, cursor, include_total)
+            .list_user_runs_cursor(user_id, limit, cursor)
             .await
     }
 
@@ -1915,10 +1914,9 @@ mod tests {
             user_id: &str,
             limit: u32,
             cursor: Option<astra_services::runs::RunListCursor>,
-            include_total: bool,
         ) -> Result<astra_services::runs::DurableRunListPage, String> {
             self.inner
-                .list_user_runs_cursor(user_id, limit, cursor, include_total)
+                .list_user_runs_cursor(user_id, limit, cursor)
                 .await
         }
 

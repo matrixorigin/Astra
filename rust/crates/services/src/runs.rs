@@ -1062,24 +1062,16 @@ pub trait RunStateStore: Send + Sync {
         offset: u32,
     ) -> Result<(Vec<DurableRunRecord>, i64), String>;
 
-    /// List runs with seek pagination. Cursor callers can skip the exact
-    /// `COUNT(*)`; offset callers can still request it through the legacy API.
+    /// List runs with seek pagination. This path intentionally does not compute
+    /// an exact total; callers should use `next_cursor`/short page semantics.
     async fn list_user_runs_cursor(
         &self,
         user_id: &str,
         limit: u32,
         cursor: Option<RunListCursor>,
-        include_total: bool,
     ) -> Result<DurableRunListPage, String> {
-        if cursor.is_some() {
-            return Err("run list cursor pagination is not supported by this store".to_string());
-        }
-        let (runs, total) = self.list_user_runs(user_id, limit, 0).await?;
-        Ok(DurableRunListPage {
-            runs,
-            total: include_total.then_some(total),
-            next_cursor: None,
-        })
+        let _ = (user_id, limit, cursor);
+        Err("run list cursor pagination is not supported by this store".to_string())
     }
 
     /// Find runs in WAITING status (for resume engine).
@@ -1804,7 +1796,6 @@ impl RunStateStore for InMemoryRunStateStore {
         user_id: &str,
         limit: u32,
         cursor: Option<RunListCursor>,
-        include_total: bool,
     ) -> Result<DurableRunListPage, String> {
         if let Some(cursor) = &cursor {
             run_list_cursor_run_id(cursor)?;
@@ -1822,7 +1813,6 @@ impl RunStateStore for InMemoryRunStateStore {
                 .then_with(|| b.created_at.cmp(&a.created_at))
                 .then_with(|| b.run_id.cmp(&a.run_id))
         });
-        let total = user_runs.len() as i64;
         if let Some(cursor) = &cursor {
             user_runs.retain(|run| durable_run_after_cursor(run, cursor));
         }
@@ -1837,7 +1827,7 @@ impl RunStateStore for InMemoryRunStateStore {
         };
         Ok(DurableRunListPage {
             runs: user_runs,
-            total: include_total.then_some(total),
+            total: None,
             next_cursor,
         })
     }
@@ -3585,23 +3575,8 @@ impl RunStateStore for DatabaseRunStateStore {
         user_id: &str,
         limit: u32,
         cursor: Option<RunListCursor>,
-        include_total: bool,
     ) -> Result<DurableRunListPage, String> {
         let limit = validate_run_list_limit(limit);
-        let total = if include_total {
-            let total_row =
-                sqlx::query("SELECT COUNT(*) AS total FROM agent_runs WHERE user_id = ?")
-                    .bind(user_id)
-                    .fetch_one(self.pool.get())
-                    .await
-                    .map_err(|source| db_error("count_user_runs", user_id, source).to_string())?;
-            Some(
-                run_row_non_negative_i64(&total_row, "count_user_runs", "agent_runs", "total")
-                    .map_err(|e| e.to_string())?,
-            )
-        } else {
-            None
-        };
         let query_limit = run_list_query_limit(limit);
         let rows = if let Some(cursor) = cursor {
             let updated_at = run_list_cursor_db_updated_at(&cursor)?;
@@ -3650,7 +3625,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let runs = entries.into_iter().map(|(run, _)| run).collect();
         Ok(DurableRunListPage {
             runs,
-            total,
+            total: None,
             next_cursor,
         })
     }
@@ -5764,10 +5739,7 @@ mod tests {
             store.insert_run(run).await.unwrap();
         }
 
-        let first = store
-            .list_user_runs_cursor("u1", 2, None, false)
-            .await
-            .unwrap();
+        let first = store.list_user_runs_cursor("u1", 2, None).await.unwrap();
         assert_eq!(first.total, None);
         assert_eq!(
             first
@@ -5786,7 +5758,7 @@ mod tests {
         );
 
         let second = store
-            .list_user_runs_cursor("u1", 2, first.next_cursor, false)
+            .list_user_runs_cursor("u1", 2, first.next_cursor)
             .await
             .unwrap();
         assert_eq!(
@@ -5799,7 +5771,7 @@ mod tests {
         );
 
         let third = store
-            .list_user_runs_cursor("u1", 2, second.next_cursor, false)
+            .list_user_runs_cursor("u1", 2, second.next_cursor)
             .await
             .unwrap();
         assert_eq!(
@@ -5812,11 +5784,8 @@ mod tests {
         );
         assert!(third.next_cursor.is_none());
 
-        let with_total = store
-            .list_user_runs_cursor("u1", 2, None, true)
-            .await
-            .unwrap();
-        assert_eq!(with_total.total, Some(5));
+        let without_total = store.list_user_runs_cursor("u1", 2, None).await.unwrap();
+        assert_eq!(without_total.total, None);
     }
 
     #[test]

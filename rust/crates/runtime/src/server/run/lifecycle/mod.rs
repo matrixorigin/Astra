@@ -7506,7 +7506,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let limit = astra_services::runs::validate_run_list_limit(limit);
         let durable_page = self
             .run_engine
-            .list_user_runs_cursor(&user_id, limit, cursor, false)
+            .list_user_runs_cursor(&user_id, limit, cursor)
             .await
             .map_err(|error| {
                 error_response(
