@@ -25,7 +25,6 @@ const ENV_PROVIDER_TPM: &str = "ASTRA_CAPACITY_PROVIDER_TPM";
 const ENV_AVG_TOKENS: &str = "ASTRA_CAPACITY_AVG_TOKENS_PER_LLM_REQUEST";
 const ENV_AVG_LLM_REQUESTS_PER_RUN_MIN: &str =
     "ASTRA_CAPACITY_AVG_LLM_REQUESTS_PER_ACTIVE_RUN_PER_MINUTE";
-const ENV_CONTROL_POLL_INTERVAL_MS: &str = "ASTRA_CAPACITY_CONTROL_POLL_INTERVAL_MS";
 const ENV_MAX_CONTROL_POLL_QPS: &str = "ASTRA_CAPACITY_MAX_CONTROL_POLL_QPS";
 const ENV_TARGET_UTILIZATION: &str = "ASTRA_CAPACITY_TARGET_UTILIZATION";
 
@@ -151,10 +150,7 @@ impl CapacityInput {
             avg_llm_requests_per_active_run_per_minute: env_optional_f64(
                 ENV_AVG_LLM_REQUESTS_PER_RUN_MIN,
             ),
-            control_poll_interval_ms: env_u64(
-                ENV_CONTROL_POLL_INTERVAL_MS,
-                DEFAULT_CONTROL_POLL_INTERVAL_MS,
-            ),
+            control_poll_interval_ms: DEFAULT_CONTROL_POLL_INTERVAL_MS,
             max_control_poll_qps: env_optional_f64(ENV_MAX_CONTROL_POLL_QPS),
             target_utilization: env_optional_f64(ENV_TARGET_UTILIZATION)
                 .filter(|v| *v > 0.0 && *v <= 1.0)
@@ -414,14 +410,6 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
 fn env_optional_u64(name: &str) -> Option<u64> {
     std::env::var(name)
         .ok()
@@ -532,6 +520,22 @@ mod tests {
         assert_eq!(plan.estimated_control_poll_qps, 80.0);
         assert!(plan.decision.allowed);
         assert!(plan.decision.risks.is_empty());
+    }
+
+    #[test]
+    fn capacity_from_env_does_not_expose_control_poll_interval() {
+        let source = include_str!("capacity_model.rs");
+        let from_env_body = source
+            .split("pub(crate) fn from_env() -> Self")
+            .nth(1)
+            .and_then(|rest| rest.split("pub(crate) fn evaluate(&self)").next())
+            .expect("from_env body");
+
+        assert!(
+            !from_env_body.contains("ASTRA_CAPACITY_CONTROL_POLL_INTERVAL_MS")
+                && !from_env_body.contains("ENV_CONTROL_POLL_INTERVAL_MS"),
+            "control poll interval is runtime policy, not a deployment capacity input"
+        );
     }
 
     #[test]
