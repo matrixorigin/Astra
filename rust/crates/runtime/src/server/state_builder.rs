@@ -65,7 +65,6 @@ pub async fn build_server_state(
     );
 
     let state = state.with_matrix_cloud_runtime(Some(matrix_rt));
-    state.start_edge_dispatch_backlog_metrics_refresh();
     Ok(state)
 }
 

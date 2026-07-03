@@ -703,55 +703,6 @@ impl AppState {
         self
     }
 
-    pub(crate) fn start_edge_dispatch_backlog_metrics_refresh(&self) {
-        const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-        const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        let Some(shared_pool) = self.shared_pool.clone() else {
-            return;
-        };
-        let metrics = self.multi_agent_metrics.clone();
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(
-                target: "astra_runtime::metrics",
-                "edge dispatch backlog metrics refresh not started outside a Tokio runtime"
-            );
-            return;
-        };
-        drop(handle.spawn(async move {
-            loop {
-                let refresh = astra_services::multi_agent::refresh_edge_dispatch_backlog_metrics(
-                    &shared_pool,
-                    &metrics,
-                );
-                let outcome = tokio::time::timeout(REFRESH_TIMEOUT, refresh).await;
-                match outcome {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        metrics
-                            .dispatch_backlog_scrape_errors_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!(
-                            target: "astra_runtime::metrics",
-                            error = %error,
-                            "failed to refresh edge dispatch backlog metrics"
-                        );
-                    }
-                    Err(_) => {
-                        metrics
-                            .dispatch_backlog_scrape_errors_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!(
-                            target: "astra_runtime::metrics",
-                            timeout_ms = REFRESH_TIMEOUT.as_millis(),
-                            "timed out refreshing edge dispatch backlog metrics"
-                        );
-                    }
-                }
-                tokio::time::sleep(REFRESH_INTERVAL).await;
-            }
-        }));
-    }
-
     pub fn with_matrix_cloud_runtime(
         mut self,
         rt: Option<Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>>,

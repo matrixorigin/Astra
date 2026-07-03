@@ -1202,13 +1202,6 @@ mod tests {
         let _tpm = EnvVarGuard::set(ENV_TPM, "120000");
         let _capacity_rpm = EnvVarGuard::remove(ENV_CAPACITY_RPM);
         let _capacity_tpm = EnvVarGuard::remove(ENV_CAPACITY_TPM);
-        let _legacy_window = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_WINDOW_MS", "1000");
-        let _legacy_retention =
-            EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RETENTION_WINDOWS", "1");
-        let _legacy_cleanup =
-            EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_CLEANUP_INTERVAL_MS", "1");
-        let _legacy_scope = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_SCOPE", "model");
-        let _legacy_fail_open = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_FAIL_OPEN", "1");
 
         let config = ProviderAdmissionConfig::from_env();
 

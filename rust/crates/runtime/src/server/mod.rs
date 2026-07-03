@@ -249,6 +249,11 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             state.execution.edge_dispatch_service.clone(),
             bg_cancel.clone(),
         ));
+        bg_handles.push(spawn_edge_dispatch_backlog_metrics_refresh(
+            pool.clone(),
+            state.multi_agent_metrics.clone(),
+            bg_cancel.clone(),
+        ));
         bg_handles.push(astra_services::session_reaper::spawn_session_reaper(
             pool.clone(),
             bg_cancel.clone(),
@@ -405,6 +410,8 @@ fn spawn_data_cleanup(
 
 const EDGE_DISPATCH_CLEANUP_INTERVAL_SECS: u64 = 15 * 60;
 const EDGE_DISPATCH_STALE_AFTER_SECS: u64 = 60 * 60;
+const EDGE_DISPATCH_BACKLOG_METRICS_REFRESH_INTERVAL_SECS: u64 = 15;
+const EDGE_DISPATCH_BACKLOG_METRICS_REFRESH_TIMEOUT_SECS: u64 = 5;
 
 /// Spawn a background task that expires orphaned edge dispatch rows.
 ///
@@ -463,6 +470,68 @@ fn spawn_edge_dispatch_cleanup_with_config(
                 }
             }
         }
+    })
+}
+
+fn spawn_edge_dispatch_backlog_metrics_refresh(
+    shared_pool: astra_core::SharedPool,
+    metrics: astra_services::multi_agent::SharedMultiAgentMetrics,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let refresh_interval =
+            std::time::Duration::from_secs(EDGE_DISPATCH_BACKLOG_METRICS_REFRESH_INTERVAL_SECS);
+        let refresh_timeout =
+            std::time::Duration::from_secs(EDGE_DISPATCH_BACKLOG_METRICS_REFRESH_TIMEOUT_SECS);
+
+        loop {
+            let refresh = astra_services::multi_agent::refresh_edge_dispatch_backlog_metrics(
+                &shared_pool,
+                &metrics,
+            );
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break;
+                }
+                outcome = tokio::time::timeout(refresh_timeout, refresh) => {
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            metrics
+                                .dispatch_backlog_scrape_errors_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                target: "astra_runtime::metrics",
+                                error = %error,
+                                "failed to refresh edge dispatch backlog metrics"
+                            );
+                        }
+                        Err(_) => {
+                            metrics
+                                .dispatch_backlog_scrape_errors_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                target: "astra_runtime::metrics",
+                                timeout_ms = refresh_timeout.as_millis(),
+                                "timed out refreshing edge dispatch backlog metrics"
+                            );
+                        }
+                    }
+                }
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break;
+                }
+                _ = tokio::time::sleep(refresh_interval) => {}
+            }
+        }
+
+        tracing::info!(
+            target: "astra_runtime::metrics",
+            "edge dispatch backlog metrics refresh received cancellation; exiting"
+        );
     })
 }
 

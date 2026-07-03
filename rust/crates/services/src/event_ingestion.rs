@@ -112,12 +112,17 @@ pub fn redacted_content_marker(raw: &str) -> String {
 
 fn stable_event_id(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"astra-event-ingestion-v1");
+    hasher.update(b"astra-ingestion-event-id");
     for part in parts {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
     format!("evt-{:x}", hasher.finalize())
+}
+
+fn stable_json_digest<T: Serialize>(value: &T) -> Result<String, String> {
+    let bytes = serde_json::to_vec(value).map_err(|e| format!("serialize event identity: {e}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 /// A journal event prepared for cloud ingestion.
@@ -316,18 +321,12 @@ impl IngestionEvent {
             })?
             .to_string();
 
-        // Stable storage id: hash of (session_id, turn, event_type, ts).
-        // This makes re-ingestion idempotent via INSERT IGNORE across Rust
-        // versions and process boundaries.
-        let turn = event.turn.map(|turn| turn.to_string()).unwrap_or_default();
+        // Stable storage id: content-address the full journal event. This keeps
+        // re-ingestion idempotent while preserving same-timestamp observability
+        // events as distinct rows without maintaining a fragile field allowlist.
+        let event_digest = stable_json_digest(event)?;
         let event_type_name = format!("{:?}", event.event_type);
-        let event_id = stable_event_id(&[
-            "journal",
-            &session_id,
-            &turn,
-            &event_type_name,
-            event.ts.as_str(),
-        ]);
+        let event_id = stable_event_id(&["journal", &session_id, &event_digest]);
 
         let event_type = event_type_name
             .chars()
@@ -2497,6 +2496,57 @@ mod tests {
         assert_eq!(
             id1, id2,
             "event_id must be deterministic for INSERT IGNORE dedup"
+        );
+    }
+
+    #[test]
+    fn event_id_distinguishes_same_timestamp_rounds() {
+        let mut first = make_turn_event();
+        first.event_type = crate::session_journal::JournalEventType::LlmRound;
+        first.round = Some(0);
+        first.offset_ms = Some(120);
+
+        let mut second = first.clone();
+        second.round = Some(1);
+
+        let id1 = IngestionEvent::from_journal_event(&first, "u1")
+            .expect("valid journal event")
+            .event_id;
+        let id2 = IngestionEvent::from_journal_event(&second, "u1")
+            .expect("valid journal event")
+            .event_id;
+
+        assert_ne!(
+            id1, id2,
+            "same-timestamp llm_round events with different round indexes must not collapse"
+        );
+    }
+
+    #[test]
+    fn event_id_distinguishes_same_timestamp_metadata_payloads() {
+        let mut first = make_turn_event();
+        first.event_type = crate::session_journal::JournalEventType::PipelineFeedback;
+        first.metadata = Some(serde_json::json!({
+            "stage": "retrieval",
+            "accepted": false,
+        }));
+
+        let mut second = first.clone();
+        second.metadata = Some(serde_json::json!({
+            "stage": "retrieval",
+            "accepted": true,
+        }));
+
+        let id1 = IngestionEvent::from_journal_event(&first, "u1")
+            .expect("valid journal event")
+            .event_id;
+        let id2 = IngestionEvent::from_journal_event(&second, "u1")
+            .expect("valid journal event")
+            .event_id;
+
+        assert_ne!(
+            id1, id2,
+            "same-timestamp telemetry events with different payloads must not collapse"
         );
     }
 
