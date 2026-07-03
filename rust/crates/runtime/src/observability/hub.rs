@@ -386,11 +386,13 @@ pub fn on_turn_start(hub: &ObservabilityHub, session_id: &str, user_id: &str, qu
         let behavior = session.observe_query_behavior(query);
         let attribution = session_signal_attribution(&session);
 
-        if behavior.correction_detected {
-            let mut signal = with_signal_attribution(
-                FeedbackSignal::new(SignalType::Correction),
-                Some(&attribution),
-            );
+        if let Some(correction_signal) = behavior.correction_signal {
+            let signal_type = match correction_signal {
+                astra_turn_types::UserCorrectionSignalKind::Correction => SignalType::Correction,
+                astra_turn_types::UserCorrectionSignalKind::Reanchor => SignalType::Reanchor,
+            };
+            let mut signal =
+                with_signal_attribution(FeedbackSignal::new(signal_type), Some(&attribution));
             if let Some(delay_ms) = behavior.delay_since_last_query_ms {
                 signal = signal.with_context("query_delay_ms", serde_json::json!(delay_ms));
             }
@@ -542,6 +544,25 @@ mod tests {
             dir.path().join("feedback-signals.json").exists(),
             "feedback signals must be stored beside the other observation-plane files"
         );
+    }
+
+    #[test]
+    fn reanchor_turn_records_reanchor_without_correction_pressure() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("user-1", "session-1");
+
+        on_turn_start(
+            &hub,
+            "session-1",
+            "user-1",
+            "我要的是长久健康运行，不是临时补丁",
+        );
+
+        let signals = hub.recent_feedback_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].signal_type, SignalType::Reanchor);
+        let session = astra_core::sync_poison::recover_rwlock_read(&session);
+        assert!(session.user_corrections.is_empty());
     }
 
     #[test]

@@ -149,12 +149,12 @@ impl SkillExecutor for SyntheticSkillDiagnosisExecutor {
                 "budget pressure returns below the auto-invoke threshold",
             ),
             AutoInvokeCause::RepeatedCorrections { count } => (
-                format!("user issued {count} corrections this session"),
-                format!("{count} distinct corrections recorded"),
+                format!("user issued {count} direct corrections in the recent window"),
+                format!("{count} direct corrections recorded in the recent window"),
                 "corrections_delta",
                 "lte",
                 0.0,
-                "new user corrections stop increasing",
+                "new direct corrections stop increasing",
             ),
         };
         let payload = serde_json::json!({
@@ -330,10 +330,10 @@ fn compare(lhs: f64, op: DiagnosisOperator, rhs: f64) -> bool {
 ///   an "any stall in this session" gate is sound.
 /// - `budget_pressure` → the most recent `context_traces` pressure
 ///   value, else 0.0 when no traces have been recorded yet.
-/// - `recent_corrections` → `obs.user_corrections.len()`. These are
-///   already session-scoped, so the list's length doubles as a count.
-/// - `corrections_window` → fixed 10 turns (the gate doesn't re-window;
-///   this field is surfaced only for logging).
+/// - `recent_corrections` → direct correction turns within the last 10 turns.
+///   Session lifetime totals are not used as pressure, because old resolved
+///   corrections should not keep biasing the current turn.
+/// - `corrections_window` → fixed 10 turns.
 ///
 /// Returns a zero-valued `SessionSignals` when `obs` is `None`, so the
 /// caller can use this unconditionally and let the gate's thresholds
@@ -352,13 +352,22 @@ pub fn compute_session_signals(
         .map(|trace| trace.token_budget.budget_pressure)
         .unwrap_or(0.0);
 
-    let recent_corrections = u32::try_from(session.user_corrections.len()).unwrap_or(u32::MAX);
+    let corrections_window = 10;
+    let correction_window_start = session.turn_number.saturating_sub(corrections_window);
+    let recent_corrections = u32::try_from(
+        session
+            .user_corrections
+            .iter()
+            .filter(|turn| **turn >= correction_window_start)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
 
     SessionSignals {
         session_stalls: session.stall_event_count,
         budget_pressure,
         recent_corrections,
-        corrections_window: 10,
+        corrections_window,
     }
 }
 
@@ -475,10 +484,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_three_triggers_fire_executor_twice_with_dedup() {
-        // Stalls + repeated-corrections both map to `analyze_session`; the
-        // gate dedupes so only the first firing in the returned vec is
-        // kept. Budget pressure stays distinct. See commit dba1e945.
+    async fn stall_and_pressure_triggers_fire_executor_twice() {
+        // Direct corrections remain advisory signals. Runtime auto-diagnosis
+        // fires only on runtime health signals: stalls and budget pressure.
         let exec = Arc::new(
             StubExecutor::new()
                 .with(
@@ -612,13 +620,14 @@ mod tests {
     }
 
     #[test]
-    fn compute_signals_reads_user_corrections_length() {
+    fn compute_signals_reads_recent_direct_corrections_window() {
         use crate::observability::ObservabilitySession;
         let mut obs = ObservabilitySession::new_simple("s-p7b");
-        obs.user_corrections = vec![1, 2, 5, 7];
+        obs.turn_number = 20;
+        obs.user_corrections = vec![1, 2, 5, 17, 20];
 
         let s = compute_session_signals(Some(&obs));
-        assert_eq!(s.recent_corrections, 4);
+        assert_eq!(s.recent_corrections, 2);
         assert_eq!(s.corrections_window, 10);
     }
 
@@ -724,7 +733,6 @@ mod tests {
         let skills: std::collections::HashSet<&str> =
             out.iter().map(|d| d.skill.as_str()).collect();
         assert!(skills.contains("analyze_session"));
-        assert!(skills.contains("analyze_session"));
         for diag in &out {
             assert_eq!(diag.schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
             assert_eq!(diag.source, DiagnosisSource::SyntheticFallback);
@@ -789,17 +797,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compute_signals_end_to_end_with_handler_fires_stall_and_corrections() {
-        // Observability populated with stall + corrections must drive the
-        // handler to fire analyze_session + evaluate_session (budget
-        // pressure requires a ContextAssemblyTrace, which is verified in
-        // its own unit test above).
+    async fn compute_signals_end_to_end_with_handler_treats_corrections_as_advisory() {
+        // Observability still surfaces recent direct corrections, but only
+        // runtime health signals drive auto-diagnosis.
         use crate::observability::ObservabilitySession;
         let mut obs = ObservabilitySession::new_simple("s-p7b-e2e");
+        obs.turn_number = 20;
         for _ in 0..5 {
             obs.record_stall_event();
         }
-        obs.user_corrections = vec![1, 2, 3, 4, 5];
+        obs.user_corrections = vec![16, 17, 18, 19, 20];
 
         let signals = compute_session_signals(Some(&obs));
         assert!(signals.session_stalls >= 5);
@@ -830,7 +837,7 @@ mod tests {
         let skills: std::collections::HashSet<&str> =
             out.iter().map(|d| d.skill.as_str()).collect();
         assert!(skills.contains("analyze_session"));
-        assert!(skills.contains("analyze_session"));
+        assert_eq!(out.len(), 1);
     }
 
     // ── R5: unwired metric fail-safe ────────────────────────────────────────

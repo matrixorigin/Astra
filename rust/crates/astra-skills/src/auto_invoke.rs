@@ -19,8 +19,6 @@
 //!
 //! * **≥3 session stalls** → invoke `analyze_session` (cooldown 60s)
 //! * **budget pressure > 0.85** → invoke `optimize_prompt` (cooldown 120s)
-//! * **≥3 user corrections in the trailing window** → invoke
-//!   `analyze_session --focus corrections` (cooldown 180s)
 //!
 //! Cooldown is tracked *per cause* — a single stall storm must not burn
 //! through every diagnostic in one turn.
@@ -39,7 +37,9 @@ pub enum AutoInvokeCause {
     SessionStalls { count: u32 },
     /// Budget pressure (0.0-1.0) exceeded the threshold.
     BudgetPressure { level: f64 },
-    /// `count` user corrections in the trailing window.
+    /// `count` direct user corrections in the trailing window. This is an
+    /// advisory diagnosis cause only; the auto-invoke gate does not fire from
+    /// correction pressure.
     RepeatedCorrections { count: u32 },
 }
 
@@ -78,7 +78,7 @@ pub struct SessionSignals {
     pub session_stalls: u32,
     /// Current budget pressure, `0.0..=1.0`.
     pub budget_pressure: f64,
-    /// Count of user corrections in the trailing `corrections_window` turns.
+    /// Count of direct user corrections in the trailing `corrections_window` turns.
     pub recent_corrections: u32,
     /// Size of the trailing window used to count `recent_corrections`. Only
     /// used for context when logging; gate does not re-window.
@@ -91,12 +91,8 @@ pub struct SessionSignals {
 pub const STALL_TRIGGER_COUNT: u32 = 5;
 /// Minimum budget pressure (`0.0..=1.0`) to fire `optimize_prompt`.
 pub const PRESSURE_TRIGGER_LEVEL: f64 = 0.85;
-/// Minimum user corrections in the window to fire `analyze_session`.
-pub const CORRECTION_TRIGGER_COUNT: u32 = 5;
-
 const STALL_COOLDOWN: Duration = Duration::from_secs(60);
 const PRESSURE_COOLDOWN: Duration = Duration::from_secs(120);
-const CORRECTION_COOLDOWN: Duration = Duration::from_secs(180);
 
 // ── Gate ─────────────────────────────────────────────────────────────────────
 
@@ -105,7 +101,6 @@ const CORRECTION_COOLDOWN: Duration = Duration::from_secs(180);
 pub struct AutoInvokeGate {
     last_stall_fire: Option<Instant>,
     last_pressure_fire: Option<Instant>,
-    last_correction_fire: Option<Instant>,
 }
 
 impl AutoInvokeGate {
@@ -121,10 +116,8 @@ impl AutoInvokeGate {
     ///
     /// `now` is injected to keep the state machine deterministic under test.
     ///
-    /// Per-turn de-duplication: if multiple triggers map to the same skill
-    /// (e.g. `SessionStalls` + `RepeatedCorrections` both → `analyze_session`),
-    /// only the first firing in the returned vec is kept. The losing trigger
-    /// still records its cooldown so it doesn't keep trying next turn.
+    /// Per-turn de-duplication: if multiple triggers map to the same skill,
+    /// only the first firing in the returned vec is kept.
     #[must_use]
     pub fn evaluate(&mut self, signals: &SessionSignals, now: Instant) -> Vec<AutoInvokeRequest> {
         let mut out: Vec<AutoInvokeRequest> = Vec::new();
@@ -167,22 +160,6 @@ impl AutoInvokeGate {
             self.last_pressure_fire = Some(now);
         }
 
-        if signals.recent_corrections >= CORRECTION_TRIGGER_COUNT
-            && Self::cooldown_elapsed(self.last_correction_fire, now, CORRECTION_COOLDOWN)
-        {
-            push_if_new(
-                &mut out,
-                AutoInvokeRequest {
-                    skill: "analyze_session",
-                    focus: "corrections",
-                    cause: AutoInvokeCause::RepeatedCorrections {
-                        count: signals.recent_corrections,
-                    },
-                },
-            );
-            self.last_correction_fire = Some(now);
-        }
-
         out
     }
 
@@ -214,7 +191,7 @@ pub const SKILL_DIAGNOSIS_SCHEMA_VERSION: u32 = 2;
 /// |---------|--------|--------|
 /// | `SessionStallsDelta` | **Yes** | `ObservabilitySession::stall_event_count` → `compute_session_signals` |
 /// | `BudgetPressure` | **Yes** | latest `ContextAssemblyTrace::token_budget.budget_pressure` |
-/// | `CorrectionsDelta` | **Yes** | `ObservabilitySession::user_corrections.len()` |
+/// | `CorrectionsDelta` | **Yes** | direct corrections in the trailing session window |
 /// | `ToolCallCount` | **Pending** | not yet surfaced in `SessionSignals`; evaluates as `Pending` |
 /// | `UnmetPostconditionsDelta` | **Pending** | `ObservabilitySession::unmet_postcondition_count` exists but not yet in `SessionSignals` |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -519,7 +496,7 @@ fn default_criterion_for_cause(cause: &AutoInvokeCause) -> DiagnosisCriterion {
             operator: DiagnosisOperator::Lte,
             threshold: 0.0,
             window_turns: 3,
-            description: "new user corrections stop increasing".into(),
+            description: "new direct corrections stop increasing".into(),
         },
     }
 }
@@ -653,24 +630,15 @@ mod tests {
     }
 
     #[test]
-    fn correction_threshold_fires_analyze_session() {
+    fn correction_pressure_is_advisory_and_does_not_auto_fire() {
         let mut gate = AutoInvokeGate::new();
         let now = Instant::now();
         let out = gate.evaluate(&signals(0, 0.1, 5), now);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].skill, "analyze_session");
-        assert_eq!(out[0].focus, "corrections");
-        assert_eq!(
-            out[0].cause,
-            AutoInvokeCause::RepeatedCorrections { count: 5 }
-        );
+        assert!(out.is_empty());
     }
 
     #[test]
-    fn all_three_triggers_fire_in_one_evaluation() {
-        // Stalls + corrections both map to analyze_session; the gate
-        // dedupes so only the first is emitted. Budget pressure stays
-        // distinct.
+    fn stall_and_pressure_triggers_fire_in_one_evaluation() {
         let mut gate = AutoInvokeGate::new();
         let now = Instant::now();
         let out = gate.evaluate(&signals(5, 0.95, 5), now);
@@ -700,7 +668,7 @@ mod tests {
 
     #[test]
     fn cooldown_is_per_cause_independent() {
-        // A stall fire must not silence pressure or correction causes.
+        // A stall fire must not silence pressure.
         let mut gate = AutoInvokeGate::new();
         let t0 = Instant::now();
         let first = gate.evaluate(&signals(5, 0.1, 0), t0);
@@ -708,9 +676,9 @@ mod tests {
         assert_eq!(first[0].skill, "analyze_session");
 
         let second = gate.evaluate(&signals(5, 0.95, 5), t0);
-        // stalls are on cooldown (0s elapsed), but pressure & corrections are fresh
+        // stalls are on cooldown (0s elapsed), but pressure is fresh.
         let names: Vec<&str> = second.iter().map(|r| r.skill).collect();
-        assert_eq!(names, vec!["optimize_prompt", "analyze_session"]);
+        assert_eq!(names, vec!["optimize_prompt"]);
     }
 
     #[test]

@@ -59,6 +59,9 @@ pub enum SignalType {
     Retry { count: u32 },
     /// User corrected agent output.
     Correction,
+    /// User clarified or re-anchored the task without saying the previous
+    /// output was wrong.
+    Reanchor,
     /// User interrupted the agent.
     Interruption,
     /// User accepted output without changes.
@@ -101,6 +104,7 @@ impl SignalType {
         match self {
             Self::Retry { .. } => "retry",
             Self::Correction => "correction",
+            Self::Reanchor => "reanchor",
             Self::Interruption => "interruption",
             Self::Acceptance => "acceptance",
             Self::QuickFollowUp { .. } => "quick_follow_up",

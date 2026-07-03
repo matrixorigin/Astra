@@ -247,7 +247,7 @@ pub struct ExecutionState {
     pub active_experiment: Option<String>,
     /// Session elapsed time in seconds.
     pub session_elapsed_secs: u64,
-    /// Number of user corrections detected this session.
+    /// Number of direct user corrections detected this session.
     pub correction_count: usize,
     /// Number of history compressions triggered.
     pub compression_count: usize,
@@ -472,23 +472,25 @@ impl SelfModel {
             plan_goal: plan_goal.map(|s| s.to_string()),
         };
 
-        // ── Recent signals (last 10) ──
+        // ── Recent signals: short-lived advisory inputs, not session history. ──
+        const RECENT_SIGNAL_MAX_AGE_SECS: u64 = 10 * 60;
+        const RECENT_SIGNAL_PROMPT_LIMIT: usize = 5;
         let now = std::time::SystemTime::now();
         let signal_summaries: Vec<SignalSummary> = recent_signals
             .iter()
             .rev()
-            .take(10)
-            .map(|sig| {
+            .filter_map(|sig| {
                 let secs_ago = now
                     .duration_since(sig.timestamp)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                SignalSummary {
+                (secs_ago <= RECENT_SIGNAL_MAX_AGE_SECS).then(|| SignalSummary {
                     signal_type: signal_type_display(&sig.signal_type),
                     turn_id: sig.turn_id.clone(),
                     secs_ago,
-                }
+                })
             })
+            .take(RECENT_SIGNAL_PROMPT_LIMIT)
             .collect();
 
         Self {
@@ -886,9 +888,9 @@ impl SelfModel {
             let _ = writeln!(s, "Stale runtime signals: {}", rendered.join(" · "));
         }
 
-        // ── Recent signals ──
+        // ── Recent advisory signals ──
         if !self.recent_signals.is_empty() {
-            s.push_str("Recent signals: ");
+            s.push_str("Interaction signals (advisory): ");
             let signal_strs: Vec<String> = self
                 .recent_signals
                 .iter()
@@ -906,28 +908,19 @@ impl SelfModel {
         }
 
         // ── Corrections / compression ──
-        if self.state.correction_count > 0 {
+        if !self.recent_correction_excerpts.is_empty() {
+            let rendered: Vec<String> = self
+                .recent_correction_excerpts
+                .iter()
+                .rev()
+                .take(3)
+                .map(|e| format!("\"{}\"", truncate_str(e, 80)))
+                .collect();
             let _ = writeln!(
                 s,
-                "User corrections: {} this session — adjust approach accordingly",
-                self.state.correction_count
+                "Recent direct corrections (most recent first): {}",
+                rendered.join(" · ")
             );
-            // Gap 5: render up to 3 recent correction excerpts so the agent
-            // can see *what* it's being corrected on, not just the count.
-            if !self.recent_correction_excerpts.is_empty() {
-                let rendered: Vec<String> = self
-                    .recent_correction_excerpts
-                    .iter()
-                    .rev()
-                    .take(3)
-                    .map(|e| format!("\"{}\"", truncate_str(e, 80)))
-                    .collect();
-                let _ = writeln!(
-                    s,
-                    "  Recent corrections (most recent first): {}",
-                    rendered.join(" · ")
-                );
-            }
         }
 
         // ── Tools summary ──
@@ -1194,7 +1187,11 @@ impl SelfModel {
             let _ = writeln!(s, "- Active experiment: {}", exp);
         }
         let _ = writeln!(s, "- Session elapsed: {}s", self.state.session_elapsed_secs);
-        let _ = writeln!(s, "- User corrections: {}", self.state.correction_count);
+        let _ = writeln!(
+            s,
+            "- Direct user corrections: {}",
+            self.state.correction_count
+        );
         let _ = writeln!(
             s,
             "- History compressions: {}",
@@ -1308,6 +1305,7 @@ fn signal_type_display(st: &SignalType) -> String {
     match st {
         SignalType::Retry { count } => format!("Retry({})", count),
         SignalType::Correction => "Correction".to_string(),
+        SignalType::Reanchor => "Reanchor".to_string(),
         SignalType::Interruption => "Interruption".to_string(),
         SignalType::Acceptance => "Acceptance".to_string(),
         SignalType::QuickFollowUp { .. } => "QuickFollowUp".to_string(),
@@ -1626,12 +1624,12 @@ mod tests {
         assert!(text.contains("Agent Self-Model"));
         assert!(text.contains("Turn: 10"));
         assert!(text.contains("exp-123"));
-        assert!(text.contains("User corrections: 2"));
+        assert!(text.contains("Direct user corrections: 2"));
         assert!(text.contains("Implement feature X"));
     }
 
     #[test]
-    fn signal_summaries_limited_to_10() {
+    fn signal_summaries_limited_to_recent_prompt_window() {
         let config = RuntimeConfig::default();
         let signals: Vec<FeedbackSignal> = (0..20)
             .map(|_| FeedbackSignal::new(SignalType::Acceptance))
@@ -1651,7 +1649,35 @@ mod tests {
             &signals,
             &config,
         );
-        assert_eq!(model.recent_signals.len(), 10);
+        assert_eq!(model.recent_signals.len(), 5);
+    }
+
+    #[test]
+    fn stale_signal_summaries_are_not_prompted() {
+        let config = RuntimeConfig::default();
+        let mut stale = FeedbackSignal::new(SignalType::Correction);
+        stale.timestamp = std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60);
+        let fresh = FeedbackSignal::new(SignalType::Reanchor);
+        let signals = vec![stale, fresh];
+
+        let model = SelfModel::snapshot(
+            &[],
+            &[],
+            None,
+            1,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            None,
+            &signals,
+            &config,
+        );
+
+        assert_eq!(model.recent_signals.len(), 1);
+        assert_eq!(model.recent_signals[0].signal_type, "Reanchor");
     }
 
     #[test]
@@ -2043,13 +2069,18 @@ mod tests {
     }
 
     #[test]
-    fn correction_excerpts_render_only_when_correction_count_positive() {
-        // With zero corrections, excerpts are suppressed even if provided
-        // (the count line itself is gated).
+    fn correction_excerpts_render_when_actionable_excerpts_exist() {
         let model = minimal_model()
             .with_recent_correction_excerpts(vec!["no I meant read the file".into()]);
         let rendered = model.to_system_prompt_section();
-        assert!(!rendered.contains("Recent corrections"), "got: {rendered}");
+        assert!(
+            rendered.contains("Recent direct corrections"),
+            "got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("User corrections:"),
+            "system prompt must not render lifetime correction pressure: {rendered}"
+        );
     }
 
     #[test]
@@ -2064,7 +2095,7 @@ mod tests {
             None,
             None,
             0,
-            2, // correction_count > 0
+            2,
             0,
             None,
             &[],
@@ -2075,7 +2106,11 @@ mod tests {
             "second correction".into(),
         ]);
         let rendered = model.to_system_prompt_section();
-        assert!(rendered.contains("User corrections: 2"), "got: {rendered}");
+        assert!(
+            rendered.contains("Recent direct corrections"),
+            "got: {rendered}"
+        );
+        assert!(!rendered.contains("User corrections: 2"), "got: {rendered}");
         // Most-recent-first ordering
         let pos_first = rendered.find("first correction");
         let pos_second = rendered.find("second correction");

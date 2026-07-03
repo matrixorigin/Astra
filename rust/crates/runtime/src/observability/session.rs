@@ -381,10 +381,11 @@ impl ObservabilitySession {
         }
     }
 
-    /// Record that user provided a correction at the current turn.
+    /// Record that user provided a direct correction at the current turn.
     ///
-    /// Called when user correction signals are detected (e.g., "no, I meant...",
-    /// "that's wrong", explicit redirection).
+    /// Called for hard corrections such as "no, that's wrong". Reanchors and
+    /// additional constraints are tracked as feedback, but they must not
+    /// inflate session correction pressure.
     pub fn record_user_correction(&mut self) {
         let turn = self.turn_number;
         if !self.user_corrections.contains(&turn) {
@@ -392,13 +393,18 @@ impl ObservabilitySession {
         }
     }
 
-    /// Detect if the current query appears to be a user correction.
-    ///
-    /// Heuristic detection of correction phrases that indicate drift.
-    pub fn detect_correction_signal(&mut self, query: &str) -> bool {
-        let is_correction = astra_turn_core::input_classifier::is_correction_signal(query);
+    /// Classify correction-like input without collapsing all reanchors into
+    /// user-correction pressure.
+    pub fn detect_correction_signal(
+        &mut self,
+        query: &str,
+    ) -> Option<astra_turn_types::UserCorrectionSignalKind> {
+        let signal = astra_turn_core::input_classifier::classify_correction_signal(query);
 
-        if is_correction {
+        if matches!(
+            signal,
+            Some(astra_turn_types::UserCorrectionSignalKind::Correction)
+        ) {
             self.record_user_correction();
             // Gap 5: capture a short excerpt of the corrective utterance so
             // the SelfModel can tell the agent *what* is being corrected,
@@ -406,7 +412,7 @@ impl ObservabilitySession {
             self.record_correction_excerpt(query);
         }
 
-        is_correction
+        signal
     }
 
     /// Gap 5: push a compact excerpt of the most recent user-correction
@@ -499,11 +505,11 @@ impl ObservabilitySession {
         let delay_since_last_query_ms = self
             .last_query_at
             .map(|previous| query_time.duration_since(previous).as_millis() as u64);
-        let correction_detected = self.detect_correction_signal(query);
+        let correction_signal = self.detect_correction_signal(query);
         self.record_query_at(query, query_time);
         QueryBehavior {
             delay_since_last_query_ms,
-            correction_detected,
+            correction_signal,
         }
     }
 
@@ -515,7 +521,7 @@ impl ObservabilitySession {
     /// Check for focus drift using all available signals.
     ///
     /// Uses the original query (from session start), recent queries,
-    /// compression events, and user corrections to detect drift.
+    /// compression events, and direct user corrections to detect drift.
 
     /// Record a tool result (no-op; previously fed the goal tracker).
     pub fn record_tool_result(&mut self, _tool_name: &str, _output: &str, _exit_code: Option<i32>) {
@@ -541,5 +547,39 @@ impl ObservabilitySession {
         self.user_corrections = snapshot.user_corrections.clone();
         self.context_traces = snapshot.context_traces.clone();
         self.last_query_at = snapshot.last_query_at;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_turn_types::UserCorrectionSignalKind;
+
+    #[test]
+    fn observe_query_behavior_does_not_count_reanchors_as_corrections() {
+        let mut session = ObservabilitySession::new_simple("s-reanchor");
+
+        let behavior = session.observe_query_behavior("我要的是长久健康运行，不是临时补丁");
+
+        assert_eq!(
+            behavior.correction_signal,
+            Some(UserCorrectionSignalKind::Reanchor)
+        );
+        assert!(session.user_corrections.is_empty());
+        assert!(session.recent_correction_excerpts.is_empty());
+    }
+
+    #[test]
+    fn observe_query_behavior_counts_direct_corrections() {
+        let mut session = ObservabilitySession::new_simple("s-correction");
+
+        let behavior = session.observe_query_behavior("不对，我的意思是改这里");
+
+        assert_eq!(
+            behavior.correction_signal,
+            Some(UserCorrectionSignalKind::Correction)
+        );
+        assert_eq!(session.user_corrections, vec![0]);
+        assert_eq!(session.recent_correction_excerpts.len(), 1);
     }
 }

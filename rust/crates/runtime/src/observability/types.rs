@@ -14,6 +14,7 @@ use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, User
 use astra_core::feedback::FeedbackSignal;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use astra_turn_core::decision_explainer::DecisionExplanation;
+use astra_turn_types::UserCorrectionSignalKind;
 
 pub struct ObservabilitySession {
     /// User ID for this session.
@@ -45,7 +46,7 @@ pub struct ObservabilitySession {
     /// Turns where history compression occurred.
     pub compressed_turns: Vec<u32>,
 
-    /// Turns where user provided correction/redirection.
+    /// Turns where user provided a direct correction.
     pub user_corrections: Vec<u32>,
 
     /// The original user query at session start (for drift comparison).
@@ -180,7 +181,7 @@ pub struct ObservabilitySessionRollbackSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryBehavior {
     pub delay_since_last_query_ms: Option<u64>,
-    pub correction_detected: bool,
+    pub correction_signal: Option<UserCorrectionSignalKind>,
 }
 
 /// Raw per-turn text for the CLI-owned subset of
