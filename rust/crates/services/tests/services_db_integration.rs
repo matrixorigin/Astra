@@ -2700,6 +2700,8 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
             &TurnListParams {
                 page: 1,
                 per_page: 10,
+                after_created_at: None,
+                after_event_id: None,
             },
         )
         .await
@@ -3159,6 +3161,8 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
             &TurnListParams {
                 page: 1,
                 per_page: 20,
+                after_created_at: None,
+                after_event_id: None,
             },
         )
         .await
