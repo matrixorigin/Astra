@@ -7,6 +7,7 @@ use astra_runtime::{
     SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
     SessionRecord, SessionService, SessionUpdateRequestData, build_app,
 };
+use astra_services::runs::RunListCursor;
 use async_trait::async_trait;
 use axum::{
     Json,
@@ -253,11 +254,11 @@ impl RunLifecycleService for RecordingLifecycle {
         unreachable!()
     }
 
-    async fn list_runs(
+    async fn list_runs_cursor(
         &self,
         _user_id: String,
         _limit: u32,
-        _offset: u32,
+        _cursor: Option<RunListCursor>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         unreachable!()
     }

@@ -12,8 +12,8 @@ use astra_runtime::{
 };
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
-    DurableRunRecord, RunInputData, RunInputRecord, RunLifecycleService, RunListRecord,
-    RunMutationRecord, RunStateStore, RunStatusRecord, SSE_HEARTBEAT_INTERVAL_SECS,
+    DurableRunRecord, RunInputData, RunInputRecord, RunLifecycleService, RunListCursor,
+    RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord, SSE_HEARTBEAT_INTERVAL_SECS,
     ToolOutputBatchItem, transform_run_event_for_client,
 };
 use async_trait::async_trait;
@@ -369,17 +369,17 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         })
     }
 
-    async fn list_runs(
+    async fn list_runs_cursor(
         &self,
         _user_id: String,
         limit: u32,
-        offset: u32,
+        _cursor: Option<RunListCursor>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         Ok(RunListRecord {
             runs: Vec::new(),
-            total: Some(0),
+            total: None,
             limit,
-            offset,
+            offset: 0,
             next_cursor: None,
         })
     }

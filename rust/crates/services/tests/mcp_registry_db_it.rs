@@ -82,6 +82,7 @@ async fn mcp_registry_round_trips_runtime_binding_on_live_matrixone() {
         .upsert_binding(owner.clone(), register_request(server_name.clone()))
         .await
         .expect("upsert MCP binding");
+    let binding_id = binding.binding_id.clone();
     let first_schema = json!({
         "type": "object",
         "properties": {
@@ -98,7 +99,7 @@ async fn mcp_registry_round_trips_runtime_binding_on_live_matrixone() {
     let registered = service
         .replace_binding_tools(
             owner.clone(),
-            binding.binding_id,
+            binding_id.clone(),
             vec![
                 tool("read_file", "mcp__test__read_file", first_schema.clone()),
                 tool("search", "mcp__test__search", second_schema),
@@ -109,7 +110,7 @@ async fn mcp_registry_round_trips_runtime_binding_on_live_matrixone() {
     assert_eq!(registered.tools.len(), 2);
 
     let bindings = service
-        .load_runtime_bindings(owner.clone(), &[binding.binding_id, binding.binding_id])
+        .load_runtime_bindings(owner.clone(), &[binding_id.clone(), binding_id])
         .await
         .expect("load runtime bindings");
     assert_eq!(bindings.len(), 1);
@@ -141,24 +142,25 @@ async fn mcp_registry_runtime_load_fails_loud_on_empty_tool_name() {
         .upsert_binding(owner.clone(), register_request(server_name))
         .await
         .expect("upsert MCP binding");
+    let binding_id = binding.binding_id.clone();
     let schema = json!({"type": "object"});
     service
         .replace_binding_tools(
             owner.clone(),
-            binding.binding_id,
+            binding_id.clone(),
             vec![tool("valid_name", "mcp__test__valid_name", schema)],
         )
         .await
         .expect("replace discovered tools");
 
     sqlx::query("UPDATE mcp_tools SET tool_name = '' WHERE binding_id = ?")
-        .bind(binding.binding_id)
+        .bind(binding_id.clone())
         .execute(&pool)
         .await
         .expect("corrupt tool name");
 
     let (status, error) = service
-        .load_runtime_bindings(owner.clone(), &[binding.binding_id])
+        .load_runtime_bindings(owner.clone(), &[binding_id])
         .await
         .expect_err("empty persisted tool_name must fail loud");
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

@@ -62,6 +62,7 @@ fn approval_decision_roundtrips_through_journal() {
         found,
         ApprovalJournalDecision {
             request_id: "req-1".into(),
+            run_id: None,
             decision: "allow".into(),
             reason: Some("user responded via prompt".into()),
             tool_name: Some("bash".into()),

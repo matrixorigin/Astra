@@ -11,8 +11,8 @@ use astra_runtime::{
 };
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
-    RunInputData, RunInputRecord, RunLifecycleService, RunListRecord, RunMutationRecord,
-    RunStateStore, RunStatusRecord,
+    RunInputData, RunInputRecord, RunLifecycleService, RunListCursor, RunListRecord,
+    RunMutationRecord, RunStateStore, RunStatusRecord,
 };
 use astra_services::session_workspace::{WorkspaceMetadata, persist_remote_workspace};
 use astra_services::{
@@ -416,17 +416,17 @@ impl RunLifecycleService for JointRunLifecycle {
         })
     }
 
-    async fn list_runs(
+    async fn list_runs_cursor(
         &self,
         _user_id: String,
         limit: u32,
-        offset: u32,
+        _cursor: Option<RunListCursor>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         Ok(RunListRecord {
             runs: Vec::new(),
-            total: Some(0),
+            total: None,
             limit,
-            offset,
+            offset: 0,
             next_cursor: None,
         })
     }

@@ -46,11 +46,9 @@ async fn edge_dispatch_full_lifecycle() {
 
     // 1. Insert dispatch
     let payload = r#"{"tool":"bash","args":{"command":"echo hi"}}"#;
-    let dispatch_id = svc
-        .insert_dispatch(&user_id, &agent_id, &request_id, payload)
+    svc.insert_dispatch(&user_id, &agent_id, &request_id, payload)
         .await
         .expect("insert_dispatch");
-    assert!(dispatch_id > 0, "dispatch_id should be positive");
 
     // 2. Poll atomically claims and marks as dispatched within a transaction
     let rows = svc
@@ -58,7 +56,7 @@ async fn edge_dispatch_full_lifecycle() {
         .await
         .expect("poll_pending");
     assert_eq!(rows.len(), 1, "should have 1 pending dispatch");
-    assert_eq!(rows[0].dispatch_id, dispatch_id);
+    assert_eq!(rows[0].request_id, request_id);
 
     // 3. Poll again — now empty (row was claimed in step 2)
     let rows = svc
