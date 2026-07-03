@@ -923,16 +923,16 @@ async fn persist_runtime_promotion_events(
     session_id: &str,
     run_id: &str,
     promotions: &[RuntimePromotionEventData],
-) {
+) -> Result<(), String> {
     if promotions.is_empty() {
-        return;
+        return Ok(());
     }
     let Some(pool) = shared_pool else {
         tracing::debug!(
             session_id,
             "runtime promotion persistence skipped: shared_pool not configured"
         );
-        return;
+        return Ok(());
     };
 
     let service = build_runtime_event_service(matrixone, pool);
@@ -978,6 +978,7 @@ async fn persist_runtime_promotion_events(
             );
         }
     }
+    Ok(())
 }
 
 pub(crate) use persistence::{
@@ -2209,7 +2210,17 @@ impl AgenticRunLifecycleService {
                         (RunStatus::Completed, None)
                     }
                 }
-                Ok(AgenticLoopOutcome::Cancelled) => unreachable!("handled by cancellation gate"),
+                Ok(AgenticLoopOutcome::Cancelled) => {
+                    // This branch should be handled by the cancellation gate check above,
+                    // but handle it gracefully instead of panicking in production.
+                    let mut data = usage;
+                    data["cancelled"] = Value::Bool(true);
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": data,
+                    }));
+                    (RunStatus::Cancelled, None)
+                }
                 Ok(AgenticLoopOutcome::Error(e)) => {
                     let classified = astra_core::ClassifiedError::from(e.clone());
                     let error_kind = classified.kind.as_str();
@@ -5290,7 +5301,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
                 // Best-effort post-loop persistence (core events, tool events,
                 // hook DB, observer, session-end hooks, promotion events).
-                persist_ctx.run(&loop_state, loop_success).await;
+                if let Err(e) = persist_ctx.run(&loop_state, loop_success).await {
+                    tracing::error!(
+                        session_id = %bg_session_id,
+                        run_id = %bg_run_id,
+                        error = %e,
+                        "post-loop persistence failed"
+                    );
+                }
 
                 // Post-loop memory cleanup — shared with the streaming path
                 // (see `stream_chat`). By default this only schedules external
@@ -5944,7 +5962,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
                 // Best-effort post-loop persistence (core events, tool events,
                 // hook DB, observer, session-end hooks, promotion events).
-                persist_ctx.run(&state, loop_success).await;
+                if let Err(e) = persist_ctx.run(&state, loop_success).await {
+                    tracing::error!(
+                        session_id = %bg_session_id,
+                        run_id = %bg_run_id,
+                        error = %e,
+                        "post-loop persistence failed"
+                    );
+                }
 
                 let (final_events, final_status, error_msg) =
                     Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
@@ -7833,7 +7858,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &config.run_id,
             &loop_state.telemetry.promotion_events,
         )
-        .await;
+        .await?;
         persist_turn_evaluation_journal(&config.session_id, "server_subrun", &loop_state);
         flush_turn_observability(&mut loop_state, &config.session_id, false);
 

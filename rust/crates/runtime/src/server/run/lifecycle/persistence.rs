@@ -6,15 +6,15 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tracing;
 use uuid::Uuid;
 
-use astra_core::{ErrorResponse, SharedPool, connect_matrixone};
+use astra_core::{connect_matrixone, ErrorResponse, SharedPool};
 use astra_services::coordination::AgentProfile;
-use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
+use astra_services::session_audit::{RuntimePromotionEventData, RUNTIME_PROMOTION_EVENT_TYPE};
 use astra_services::skills::SkillService;
 use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
@@ -32,9 +32,9 @@ use astra_turn_core::contracts::{
 };
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
-use crate::MatrixOneSettings;
 use crate::turn::agentic_loop::host::AgenticLoopState;
 use crate::turn::token_usage::TokenUsage;
+use crate::MatrixOneSettings;
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
     EventCreateRequestData, EventService,
@@ -204,8 +204,13 @@ impl PostLoopPersistContext {
     ///
     /// The `loop_success` flag comes from `outcome.is_ok()` (before consuming
     /// the outcome in `finalize_run_events`).
-    pub(crate) async fn run(&self, state: &AgenticLoopState, loop_success: bool) {
-        let _ = loop_success;
+    pub(crate) async fn run(
+        &self,
+        state: &AgenticLoopState,
+        loop_success: bool,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+
         // 0. Persist CSL via CslManager.
         if let Some(ref mgr) = self.csl_manager {
             let mut mgr = mgr.lock().await;
@@ -215,33 +220,40 @@ impl PostLoopPersistContext {
                 .persist_turn(state.session_turn, &messages, &session_state)
                 .await
             {
+                let msg = format!("CSL persist failed: {}", e);
                 tracing::warn!(
                     session_id = %self.session_id,
                     error = %e,
                     "CSL persist failed"
                 );
+                errors.push(msg);
             }
         }
 
         // 1–2. Persist core events + trace detail events in a single MatrixOne
         // transaction so that a crash between writes leaves a consistent state.
-        let _mo_tx = self.persist_core_and_trace_in_transaction(state).await;
+        if let Err(e) = self.persist_core_and_trace_in_transaction(state).await {
+            errors.push(format!("core+trace transaction failed: {}", e));
+        }
 
         // 3. Persist audit-facing tool_call events for session_audit metrics.
         if let Some(ref writer) = self.tool_event_writer {
-            persist_server_loop_tool_events(
+            if let Err(e) = persist_server_loop_tool_events(
                 writer.as_ref(),
                 &self.user_id,
                 &self.session_id,
                 self.agent_id.as_deref(),
                 state,
             )
-            .await;
+            .await
+            {
+                errors.push(format!("tool events persist failed: {}", e));
+            }
         }
 
         // 4. Persist decision audit + skill selection to hook DB.
         if let Some(ref writer) = self.hook_db_writer {
-            persist_server_loop_hook_events(
+            if let Err(e) = persist_server_loop_hook_events(
                 writer.as_ref(),
                 &self.user_id,
                 &self.session_id,
@@ -249,19 +261,25 @@ impl PostLoopPersistContext {
                 state,
                 self.model_name.as_deref(),
             )
-            .await;
+            .await
+            {
+                errors.push(format!("hook events persist failed: {}", e));
+            }
         }
 
         // 5. Fire Memoria observer (cross-session knowledge extraction).
         if let Some(worker) = self.observer_worker.clone() {
-            fire_server_loop_observer(
+            if let Err(e) = fire_server_loop_observer(
                 worker,
                 &self.user_id,
                 &self.session_id,
                 state,
                 self.metrics_registry.clone(),
             )
-            .await;
+            .await
+            {
+                errors.push(format!("observer fire failed: {}", e));
+            }
         }
 
         // 6. Fire SessionEnd hooks.
@@ -272,7 +290,7 @@ impl PostLoopPersistContext {
         .await;
 
         // 7. Persist runtime promotion events.
-        persist_runtime_promotion_events(
+        if let Err(e) = persist_runtime_promotion_events(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &self.user_id,
@@ -280,10 +298,13 @@ impl PostLoopPersistContext {
             &self.run_id,
             &state.telemetry.promotion_events,
         )
-        .await;
+        .await
+        {
+            errors.push(format!("promotion events persist failed: {}", e));
+        }
 
         // 8. Persist web-agent state projection rows generated by the agentic loop.
-        persist_server_loop_projection_state(
+        if let Err(e) = persist_server_loop_projection_state(
             self.shared_pool.as_ref(),
             &self.user_id,
             &self.session_id,
@@ -292,13 +313,42 @@ impl PostLoopPersistContext {
             self.model_name.as_deref(),
             state,
         )
-        .await;
+        .await
+        {
+            errors.push(format!("projection state persist failed: {}", e));
+        }
+
+        // Use loop_success to conditionally log severity
+        if loop_success && !errors.is_empty() {
+            tracing::warn!(
+                session_id = %self.session_id,
+                run_id = %self.run_id,
+                error_count = errors.len(),
+                "post-loop persistence completed with errors"
+            );
+        } else if !loop_success && !errors.is_empty() {
+            tracing::error!(
+                session_id = %self.session_id,
+                run_id = %self.run_id,
+                error_count = errors.len(),
+                "post-loop persistence failed on failed run"
+            );
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     /// Persist core events and trace detail events in a single MatrixOne
     /// transaction. If the transaction fails, all writes are rolled back
     /// atomically — preventing partial state on crash.
-    async fn persist_core_and_trace_in_transaction(&self, state: &AgenticLoopState) {
+    async fn persist_core_and_trace_in_transaction(
+        &self,
+        state: &AgenticLoopState,
+    ) -> Result<(), String> {
         let Some(pool) = self.shared_pool.as_ref() else {
             // Without a pool, fall back to individual non-transactional calls.
             persist_server_loop_core_events(
@@ -330,12 +380,13 @@ impl PostLoopPersistContext {
                 self.model_name.as_deref(),
             )
             .await;
-            return;
+            return Ok(());
         };
 
         let mut tx = match pool.get().begin().await {
             Ok(tx) => tx,
             Err(error) => {
+                let msg = format!("failed to begin MO transaction: {}", error);
                 tracing::warn!(
                     session_id = %self.session_id,
                     error = %error,
@@ -370,7 +421,7 @@ impl PostLoopPersistContext {
                     self.model_name.as_deref(),
                 )
                 .await;
-                return;
+                return Err(msg);
             }
         };
 
@@ -396,13 +447,14 @@ impl PostLoopPersistContext {
         {
             Ok(()) => {}
             Err(error) => {
+                let msg = format!("core events tx failed: {}", error);
                 tracing::warn!(
                     session_id = %self.session_id,
                     error = %error,
                     "post-loop: core events tx failed, rolling back MO transaction"
                 );
                 let _ = tx.rollback().await;
-                return;
+                return Err(msg);
             }
         }
 
@@ -421,23 +473,27 @@ impl PostLoopPersistContext {
         )
         .await
         {
+            let msg = format!("detail events tx failed: {}", error);
             tracing::warn!(
                 session_id = %self.session_id,
                 error = %error,
                 "post-loop: detail events tx failed, rolling back MO transaction"
             );
             let _ = tx.rollback().await;
-            return;
+            return Err(msg);
         }
 
         // Best-effort commit: on failure, rollback naturally drops the tx.
         if let Err(error) = tx.commit().await {
+            let msg = format!("MO transaction commit failed: {}", error);
             tracing::warn!(
                 session_id = %self.session_id,
                 error = %error,
                 "post-loop: MO transaction commit failed, writes rolled back"
             );
+            return Err(msg);
         }
+        Ok(())
     }
 }
 
@@ -449,9 +505,9 @@ async fn persist_server_loop_projection_state(
     agent_id: Option<&str>,
     model_name: Option<&str>,
     state: &AgenticLoopState,
-) {
+) -> Result<(), String> {
     let Some(pool) = shared_pool else {
-        return;
+        return Ok(());
     };
     let store = DatabaseStateProjectionStore::new(pool.clone());
     let final_text = state.final_text.trim();
@@ -510,6 +566,10 @@ async fn persist_server_loop_projection_state(
     {
         Ok(row) => row,
         Err(error) => {
+            let error_msg = format!(
+                "failed to inspect post-compaction context manifest count: {}",
+                error
+            );
             tracing::warn!(
                 target: "astra_runtime::state_projection",
                 session_id = %session_id,
@@ -517,13 +577,17 @@ async fn persist_server_loop_projection_state(
                 error = %error,
                 "failed to inspect post-compaction context manifest count"
             );
-            return;
+            return Err(error_msg);
         }
     };
     let post_compaction_count =
         match decode_post_compaction_manifest_count(&post_compaction_count_row) {
             Ok(count) => count,
             Err(error) => {
+                let error_msg = format!(
+                    "failed to decode post-compaction context manifest count: {}",
+                    error
+                );
                 tracing::warn!(
                     target: "astra_runtime::state_projection",
                     session_id = %session_id,
@@ -531,7 +595,7 @@ async fn persist_server_loop_projection_state(
                     error = %error,
                     "failed to decode post-compaction context manifest count"
                 );
-                return;
+                return Err(error_msg);
             }
         };
     if post_compaction_count > 0 {
@@ -566,6 +630,10 @@ async fn persist_server_loop_projection_state(
                     })
                     .await;
                 if let Err(error) = result {
+                    let error_msg = format!(
+                        "failed to persist post-compaction summary projection: {}",
+                        error
+                    );
                     tracing::warn!(
                         target: "astra_runtime::state_projection",
                         session_id = %session_id,
@@ -573,9 +641,11 @@ async fn persist_server_loop_projection_state(
                         error = %error,
                         "failed to persist post-compaction summary projection"
                     );
+                    return Err(error_msg);
                 }
             }
             Ok(results) => {
+                let error_msg = format!("post-compaction invariant check failed: {:?}", results);
                 tracing::warn!(
                     target: "astra_runtime::state_projection",
                     session_id = %session_id,
@@ -583,8 +653,11 @@ async fn persist_server_loop_projection_state(
                     ?results,
                     "post-compaction invariant check failed after loop"
                 );
+                return Err(error_msg);
             }
             Err(error) => {
+                let error_msg =
+                    format!("failed to run post-compaction invariant checks: {}", error);
                 tracing::warn!(
                     target: "astra_runtime::state_projection",
                     session_id = %session_id,
@@ -592,9 +665,11 @@ async fn persist_server_loop_projection_state(
                     error = %error,
                     "failed to run post-compaction invariant checks"
                 );
+                return Err(error_msg);
             }
         }
     }
+    Ok(())
 }
 
 fn truncate_for_projection(text: &str, max_chars: usize) -> String {
@@ -1797,9 +1872,9 @@ async fn persist_server_loop_tool_events(
     session_id: &str,
     agent_id: Option<&str>,
     state: &AgenticLoopState,
-) {
+) -> Result<(), String> {
     if state.telemetry.all_tools_used.is_empty() {
-        return;
+        return Ok(());
     }
 
     let chain_id = server_loop_causal_chain_id("server-loop-tools");
@@ -1824,12 +1899,10 @@ async fn persist_server_loop_tool_events(
     }
 
     let plan = TurnToolEventPersistPlan { events };
-    if let Err(e) = writer.persist(plan).await {
-        astra_core::agent_error!(
-            "server-loop",
-            "failed to persist tool events for session {session_id}: {e}"
-        );
-    }
+    writer
+        .persist(plan)
+        .await
+        .map_err(|e| format!("tool events persist failed: {}", e))
 }
 
 /// Persist decision audit + skill selection to hook DB tables after the
@@ -1844,7 +1917,7 @@ async fn persist_server_loop_hook_events(
     user_message: &str,
     state: &AgenticLoopState,
     model_name: Option<&str>,
-) {
+) -> Result<(), String> {
     // Use the telemetry accumulator — state.telemetry.all_tools_used tracks every
     // tool name across all rounds.  state.messages does NOT carry assistant
     // tool_call objects in the server loop path.
@@ -1905,8 +1978,6 @@ async fn persist_server_loop_hook_events(
                 execution_time_ms: None,
             })
     };
-    let _ = &selected_skills;
-
     let plan = TurnHookDbPersistPlan {
         decision_audit,
         skill_selection,
@@ -1914,12 +1985,10 @@ async fn persist_server_loop_hook_events(
         reflection_lesson: None,
     };
 
-    if let Err(e) = hook_db_writer.persist(plan).await {
-        astra_core::agent_error!(
-            "server-loop",
-            "failed to persist hook events for session {session_id}: {e}"
-        );
-    }
+    hook_db_writer
+        .persist(plan)
+        .await
+        .map_err(|e| format!("hook events persist failed: {}", e))
 }
 
 /// Fire the Memoria observer after the server-driven loop completes.
@@ -1931,7 +2000,7 @@ async fn fire_server_loop_observer(
     session_id: &str,
     state: &AgenticLoopState,
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-) {
+) -> Result<(), String> {
     fire_server_loop_observer_with_async_limit(
         observer_worker,
         user_id,
@@ -1941,6 +2010,7 @@ async fn fire_server_loop_observer(
         DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
     )
     .await;
+    Ok(())
 }
 
 async fn fire_server_loop_observer_with_async_limit(
@@ -2377,16 +2447,12 @@ mod tests {
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["content"], "不要review啊！");
         assert_eq!(messages[2]["content"], "ok");
-        assert!(
-            messages
-                .iter()
-                .all(|msg| msg["role"] != "tool" && msg.get("reasoning_content").is_none())
-        );
-        assert!(
-            messages
-                .iter()
-                .all(|msg| !msg["content"].as_str().unwrap_or("").contains("old review"))
-        );
+        assert!(messages
+            .iter()
+            .all(|msg| msg["role"] != "tool" && msg.get("reasoning_content").is_none()));
+        assert!(messages
+            .iter()
+            .all(|msg| !msg["content"].as_str().unwrap_or("").contains("old review")));
         assert!(messages.iter().all(|msg| {
             !msg["content"]
                 .as_str()
