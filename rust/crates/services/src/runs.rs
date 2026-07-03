@@ -2307,6 +2307,30 @@ impl DatabaseRunStateStore {
         row.map(run_projection_record_from_row).transpose()
     }
 
+    async fn load_latest_event_type_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<Option<String>> {
+        let row = sqlx::query(
+            "SELECT event_type
+             FROM agent_run_events
+             WHERE user_id = ? AND run_id = ?
+             ORDER BY event_idx DESC
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_latest_event_type_for_user", run_id, source))?;
+        row.map(|row| {
+            row.try_get::<String, _>("event_type")
+                .map_err(|source| db_error("decode_latest_event_type", run_id, source))
+        })
+        .transpose()
+    }
+
     async fn upsert_run_projection(
         &self,
         projection: &DurableRunDisplayProjectionRecord,
@@ -2413,7 +2437,7 @@ impl DatabaseRunStateStore {
                  latest_event_type = COALESCE(?, latest_event_type),
                  projection_hash = ?,
                  updated_at = NOW(6)
-             WHERE user_id = ? AND run_id = ?",
+             WHERE user_id = ? AND run_id = ? AND projection_event_idx <= ?",
         )
         .bind(status)
         .bind(waiting_for)
@@ -2423,6 +2447,7 @@ impl DatabaseRunStateStore {
         .bind(&projection_hash)
         .bind(user_id)
         .bind(run_id)
+        .bind(projection_event_idx)
         .execute(self.pool.get())
         .await
         .map_err(|source| db_error("patch_run_projection_status", run_id, source))?;
@@ -2453,16 +2478,41 @@ impl DatabaseRunStateStore {
             .await
         {
             Ok(0) => {
-                if let Err(error) = self
-                    .sync_projection_for_user(user_id, run_id, latest_event_type, None)
+                match self
+                    .load_run_projection_metadata_for_user(user_id, run_id)
                     .await
                 {
-                    tracing::warn!(
-                        user_id,
-                        run_id,
-                        error = %error,
-                        "run transition committed but display projection repair failed"
-                    );
+                    Ok(None) => {
+                        if let Err(error) = self
+                            .sync_projection_for_user(user_id, run_id, None, None)
+                            .await
+                        {
+                            tracing::warn!(
+                                user_id,
+                                run_id,
+                                error = %error,
+                                "run transition committed but missing display projection repair failed"
+                            );
+                        }
+                    }
+                    Ok(Some(existing)) if existing.projection_event_idx > projection_event_idx => {
+                        tracing::debug!(
+                            user_id,
+                            run_id,
+                            attempted_projection_event_idx = projection_event_idx,
+                            current_projection_event_idx = existing.projection_event_idx,
+                            "ignored stale run display projection status patch"
+                        );
+                    }
+                    Ok(Some(_)) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            user_id,
+                            run_id,
+                            error = %error,
+                            "run transition committed but display projection state check failed"
+                        );
+                    }
                 }
             }
             Ok(_) => {}
@@ -2490,13 +2540,26 @@ impl DatabaseRunStateStore {
         let existing = self
             .load_run_projection_metadata_for_user(user_id, run_id)
             .await?;
+        let latest_event_type = if let Some(latest_event_type) = latest_event_type {
+            Some(latest_event_type.to_owned())
+        } else {
+            let existing_event_type = existing
+                .as_ref()
+                .and_then(|entry| entry.latest_event_type.clone());
+            if existing
+                .as_ref()
+                .is_some_and(|entry| entry.projection_event_idx >= run.last_event_idx)
+            {
+                existing_event_type
+            } else {
+                self.load_latest_event_type_for_user(user_id, run_id)
+                    .await?
+                    .or(existing_event_type)
+            }
+        };
         let projection = build_run_display_projection(
             &run,
-            latest_event_type.map(ToOwned::to_owned).or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|entry| entry.latest_event_type.clone())
-            }),
+            latest_event_type,
             latest_checkpoint.map(checkpoint_summary_tuple).or_else(|| {
                 existing.as_ref().and_then(|entry| {
                     Some((
@@ -5680,6 +5743,53 @@ mod tests {
         assert_ne!(
             base,
             status_projection_patch_hash("run-1", STATUS_FAILED, None, Some("boom"), 2, None)
+        );
+    }
+
+    #[test]
+    fn database_projection_status_patch_is_event_idx_monotonic() {
+        let source = include_str!("runs.rs");
+        let patch_body = source
+            .split("async fn patch_run_projection_status_for_user")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn patch_or_repair_run_projection_status_for_user")
+                    .next()
+            })
+            .expect("projection status patch body");
+        assert!(
+            patch_body.contains("AND projection_event_idx <= ?"),
+            "status projection patch must reject stale event_idx writes"
+        );
+        assert!(
+            patch_body.contains(".bind(projection_event_idx)\n        .execute"),
+            "status projection patch must bind the event_idx guard"
+        );
+
+        let repair_body = source
+            .split("async fn patch_or_repair_run_projection_status_for_user")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn sync_projection_for_user").next())
+            .expect("projection repair body");
+        assert!(
+            repair_body.contains("existing.projection_event_idx > projection_event_idx"),
+            "zero-row status patches must distinguish stale writes from missing projections"
+        );
+        assert!(
+            repair_body.contains("sync_projection_for_user(user_id, run_id, None, None)"),
+            "missing-row repair must not reuse a possibly stale transition event type"
+        );
+        let sync_body = source
+            .split("async fn sync_projection_for_user")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn allocate_event_indices_batch_for_user")
+                    .next()
+            })
+            .expect("projection sync body");
+        assert!(
+            sync_body.contains("load_latest_event_type_for_user"),
+            "projection sync must derive latest_event_type from durable events when projection lags"
         );
     }
 

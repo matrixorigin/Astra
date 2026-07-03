@@ -872,6 +872,96 @@ async fn l3_11b_real_run_engine_populates_projection() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn delegation_projection_refresh_uses_current_run_status() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, root_run_id) = ids();
+    insert_session(&pool, &session_id, &user_id).await;
+    let child_run_id = format!("child-{}", Uuid::new_v4());
+    let delegation_id = format!("delegation-{}", Uuid::new_v4());
+    let projection_store = Arc::new(DatabaseStateProjectionStore::new(pool.clone()));
+    let run_store = Arc::new(DatabaseRunStateStore::new(pool.clone()));
+    let run_engine = astra_runtime::server::run::engine::RunEngine::new(run_store)
+        .with_projection_store(projection_store.clone());
+
+    run_engine
+        .start_run(&root_run_id, &user_id, &session_id)
+        .await
+        .unwrap();
+    run_engine
+        .start_run_ext(
+            &child_run_id,
+            &user_id,
+            &session_id,
+            Some(&root_run_id),
+            Some(&delegation_id),
+            Some("coder"),
+            None,
+        )
+        .await
+        .unwrap();
+    run_engine
+        .persist_status(&user_id, &child_run_id, "completed", None, None)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE session_delegations
+         SET status = 'running'
+         WHERE delegation_id = ? AND user_id = ?",
+    )
+    .bind(&delegation_id)
+    .bind(&user_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE session_state_items
+         SET status = 'running'
+         WHERE session_id = ? AND user_id = ? AND category = 'delegation_state' AND item_key = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&delegation_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+
+    projection_store
+        .upsert_delegation_projection_for_run(
+            &user_id,
+            &child_run_id,
+            Some("coder"),
+            Some("late projection refresh"),
+        )
+        .await
+        .unwrap();
+
+    let row = sqlx::query(
+        "SELECT
+          (SELECT status FROM session_delegations WHERE delegation_id = ? AND user_id = ?) AS delegation_status,
+          (SELECT status FROM session_state_items
+           WHERE session_id = ? AND user_id = ? AND category = 'delegation_state' AND item_key = ?) AS state_status",
+    )
+    .bind(&delegation_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&delegation_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("delegation_status").unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        row.try_get::<String, _>("state_status").unwrap(),
+        "completed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_43_backlog_pool_restores_todos_across_sessions() {
     let pool = setup_pool().await;
     let (old_session_id, user_id, _) = ids();

@@ -618,7 +618,7 @@ Follow these steps:
                         eprintln!(
                             "{}",
                             format!(
-                                "  \u{2717} Skill directory not found for '{name}' (searched .astra/skills, .claude/skills, skills/, ~/.astra/skills, ~/.claude/skills)"
+                                "  \u{2717} Skill directory not found for '{name}' (searched .astra/skills, .claude/skills, ~/.astra/skills, ~/.claude/skills)"
                             )
                             .yellow()
                         );
@@ -723,8 +723,8 @@ Follow these steps:
                 }
                 return Ok(());
             }
-            // Search all shared loader paths: project .astra/.claude skills,
-            // cwd skills/, and user-level .astra/.claude skills.
+            // Search all shared loader paths: project .astra/.claude skills
+            // and user-level .astra/.claude skills.
             let search_paths = crate::skill_instructions::skill_search_paths();
             let found = search_paths.iter().find_map(|base| {
                 let dir = base.join(name);
@@ -830,7 +830,7 @@ Follow these steps:
             if !api_ok {
                 eprintln!(
                     "  {}",
-                    "Local view: unified catalog + on-disk paths (.astra/skills, .claude/skills, skills/, ~/.astra/skills, ~/.claude/skills)."
+                    "Local view: unified catalog + on-disk paths (.astra/skills, .claude/skills, ~/.astra/skills, ~/.claude/skills)."
                         .dim()
                 );
                 let registry = &state.unified_skill_registry;
@@ -1322,8 +1322,8 @@ fn parse_skill_info_args(sub_arg: &str) -> (String, bool) {
     (s.to_string(), false)
 }
 
-/// Same resolution order as `/skill dev`: shared loader paths for project,
-/// legacy cwd, and user-level skills.
+/// Same resolution order as `/skill dev`: shared loader paths for project and
+/// user-level skills.
 fn resolve_skill_dir_on_disk(name: &str) -> Option<std::path::PathBuf> {
     crate::skill_instructions::skill_search_paths()
         .into_iter()

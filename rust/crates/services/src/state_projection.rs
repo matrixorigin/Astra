@@ -376,6 +376,7 @@ fn decode_run_projection_row(
         run_id: state_projection_row_string(row, OPERATION, run_id, "run_id")?,
         user_id: state_projection_row_string(row, OPERATION, run_id, "user_id")?,
         session_id: state_projection_row_string(row, OPERATION, run_id, "session_id")?,
+        status: state_projection_row_string(row, OPERATION, run_id, "status")?,
         parent_run_id: state_projection_row_optional_string(
             row,
             OPERATION,
@@ -787,7 +788,6 @@ impl DatabaseStateProjectionStore {
         &self,
         user_id: &str,
         child_run_id: &str,
-        status: &str,
         agent_id_hint: Option<&str>,
         last_summary_text: Option<&str>,
     ) -> Result<(), StateProjectionError> {
@@ -860,7 +860,7 @@ impl DatabaseStateProjectionStore {
                 .agent_id
                 .or_else(|| agent_id_hint.map(ToString::to_string)),
             title: agent_id_hint.map(|agent_id| format!("Delegated run {agent_id}")),
-            status: status.to_string(),
+            status: child.status,
             retry_of: child.retry_of,
             retry_scope: child.retry_scope.unwrap_or_else(|| "node".to_string()),
             last_summary_ref: None,
@@ -1671,7 +1671,7 @@ impl DatabaseStateProjectionStore {
     ) -> Result<Option<RunProjectionRow>, StateProjectionError> {
         let row = sqlx::query(
             "SELECT run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path,
-                    depth, delegation_id, agent_id, retry_of, retry_scope
+                    depth, delegation_id, agent_id, status, retry_of, retry_scope
              FROM agent_runs WHERE user_id = ? AND run_id = ?",
         )
         .bind(user_id)
@@ -1702,6 +1702,7 @@ struct RunProjectionRow {
     run_id: String,
     user_id: String,
     session_id: String,
+    status: String,
     parent_run_id: Option<String>,
     root_run_id: Option<String>,
     ancestor_path: Option<String>,
@@ -2142,6 +2143,7 @@ mod tests {
         assert_eq!(projection.run_id, "run-1");
         assert_eq!(projection.user_id, "user-1");
         assert_eq!(projection.session_id, "session-1");
+        assert_eq!(projection.status, "active");
         assert_eq!(projection.parent_run_id.as_deref(), Some("parent-run"));
         assert_eq!(projection.root_run_id.as_deref(), Some("root-run"));
         assert_eq!(projection.ancestor_path.as_deref(), Some("root-run/run-1"));
@@ -2155,6 +2157,7 @@ mod tests {
             "run_id",
             "user_id",
             "session_id",
+            "status",
             "parent_run_id",
             "root_run_id",
             "ancestor_path",

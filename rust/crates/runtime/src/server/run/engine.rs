@@ -565,7 +565,7 @@ impl RunEngine {
             updated_at: now,
         };
         self.store.insert_run(record).await?;
-        self.project_delegation_run_if_needed(user_id, run_id, STATUS_RUNNING, None)
+        self.project_delegation_run_if_needed(user_id, run_id, None)
             .await?;
         Ok(())
     }
@@ -586,7 +586,7 @@ impl RunEngine {
         if updated {
             let summary = error_message.or(waiting_for);
             if let Err(error) = self
-                .project_delegation_run_if_needed(user_id, run_id, status, summary)
+                .project_delegation_run_if_needed(user_id, run_id, summary)
                 .await
             {
                 tracing::warn!(
@@ -627,7 +627,7 @@ impl RunEngine {
         if updated {
             let summary = error_message.or(waiting_for);
             if let Err(error) = self
-                .project_delegation_run_if_needed(user_id, run_id, status, summary)
+                .project_delegation_run_if_needed(user_id, run_id, summary)
                 .await
             {
                 tracing::warn!(
@@ -671,7 +671,7 @@ impl RunEngine {
         if updated {
             let summary = error_message.or(waiting_for);
             if let Err(error) = self
-                .project_delegation_run_if_needed(user_id, run_id, status, summary)
+                .project_delegation_run_if_needed(user_id, run_id, summary)
                 .await
             {
                 tracing::warn!(
@@ -714,7 +714,7 @@ impl RunEngine {
         if updated {
             let summary = error_message.or(waiting_for);
             if let Err(error) = self
-                .project_delegation_run_if_needed(user_id, run_id, status, summary)
+                .project_delegation_run_if_needed(user_id, run_id, summary)
                 .await
             {
                 tracing::warn!(
@@ -854,7 +854,7 @@ impl RunEngine {
         }
         let summary = error_message.or(waiting_for);
         if let Err(error) = self
-            .project_delegation_run_if_needed(user_id, run_id, status, summary)
+            .project_delegation_run_if_needed(user_id, run_id, summary)
             .await
         {
             tracing::warn!(
@@ -872,7 +872,6 @@ impl RunEngine {
         &self,
         user_id: &str,
         run_id: &str,
-        status: &str,
         last_summary_text: Option<&str>,
     ) -> Result<(), String> {
         let Some(projection_store) = self.projection_store.as_ref() else {
@@ -888,7 +887,6 @@ impl RunEngine {
             .upsert_delegation_projection_for_run(
                 &run.user_id,
                 run_id,
-                status,
                 run.agent_id.as_deref(),
                 last_summary_text,
             )

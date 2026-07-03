@@ -1,8 +1,8 @@
 //! File-system watcher for skill hot-reload.
 //!
-//! Watches skill search paths (`.astra/skills/`, `skills/`, `~/.astra/skills/`)
-//! for changes and triggers a registry re-discover when SKILL.md or manifest.yaml
-//! files are created, modified, or deleted.
+//! Watches skill search paths (`.astra/skills/`, `.claude/skills/`, and HOME
+//! skill directories) for changes and triggers a registry re-discover when
+//! SKILL.md or manifest.yaml files are created, modified, or deleted.
 //!
 //! ## fd budget
 //!

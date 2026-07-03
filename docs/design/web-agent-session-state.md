@@ -2707,7 +2707,7 @@ Publish flow:
 Runtime visibility contract:
 
 - Standalone CLI discovers project-local filesystem skills from cwd walk-up
-  paths (`.astra/skills`, `.claude/skills`, and `skills/`). These project-local
+  paths (`.astra/skills` and `.claude/skills`). These project-local
   skills are CLI-only unless imported into `skills_registry`.
 - API-server local skills are discovered independently by the server from the
   server process HOME only: `~/.astra/skills` and `~/.claude/skills`. They have

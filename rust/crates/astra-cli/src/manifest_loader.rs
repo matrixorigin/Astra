@@ -236,7 +236,7 @@ pub fn manifest_tool_to_entry(skill_name: &str, tool: &ManifestToolDef) -> Plugi
         scope: parse_scope(&tool.scope),
         schema,
         schema_tokens,
-        source: format!("skills/{}", skill_name),
+        source: format!("skill:{skill_name}"),
         enabled: true,
     }
 }
@@ -437,8 +437,8 @@ pub fn register_manifest_tools(skills_dir: &Path, registry: &mut PluginRegistry)
 /// Uses [`skill_instructions::skill_search_paths()`] for consistent directory
 /// resolution across the CLI. That wrapper delegates to the shared
 /// `astra-skills` loader, so manifest tools and MCP configs see the same
-/// `.astra/skills`, Agent Skills-compatible `.claude/skills`, legacy
-/// `skills/`, and HOME global paths as the runtime skill registry.
+/// `.astra/skills`, Agent Skills-compatible `.claude/skills`, and HOME
+/// global paths as the runtime skill registry.
 ///
 /// Silently skips if no skills directory exists.
 pub fn load_skills_directory(registry: &mut PluginRegistry) {
@@ -832,7 +832,7 @@ depends_on: []
         let entry = manifest_tool_to_entry("kubernetes", &manifest.tools[0]);
 
         assert_eq!(entry.name, "kubectl_get");
-        assert_eq!(entry.source, "skills/kubernetes");
+        assert_eq!(entry.source, "skill:kubernetes");
         assert!(entry.enabled);
         assert!(!entry.always_load);
         assert!(entry.intents.contains(&IntentType::CodeRead));

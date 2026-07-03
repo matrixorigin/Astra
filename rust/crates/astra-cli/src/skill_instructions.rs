@@ -30,8 +30,8 @@
 //!
 //! Skills are discovered with the shared `astra-skills` loader. That keeps
 //! legacy CLI manifest/MCP discovery aligned with the runtime skill registry:
-//! cwd walk-up `.astra/skills` and `.claude/skills`, cwd `skills/`, and user
-//! global `.astra/skills` / `.claude/skills`.
+//! cwd walk-up `.astra/skills` and `.claude/skills`, plus user global
+//! `.astra/skills` / `.claude/skills`.
 //!
 //! # Three-Level Loading
 //!
@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Delegates to `astra_skills::loader::skill_search_paths()` so all CLI and
 /// runtime skill surfaces agree on `.astra/skills`, Agent Skills-compatible
-/// `.claude/skills`, legacy `skills/`, and HOME-level global paths.
+/// `.claude/skills`, and HOME-level global paths.
 pub fn skill_search_paths() -> Vec<std::path::PathBuf> {
     astra_skills::loader::skill_search_paths()
 }

@@ -10,8 +10,8 @@
 //! - Database skills come from `skills_registry` through `DatabaseSkillProvider`;
 //!   that provider delegates visibility to `SkillService`, whose query contract
 //!   is `created_by = current_user OR is_public = 1`.
-//! - Project-local CLI skills (`{cwd}/.astra/skills`, `{cwd}/.claude/skills`,
-//!   `{cwd}/skills`) are intentionally excluded here. They remain local to the
+//! - Project-local CLI skills (`{cwd}/.astra/skills`, `{cwd}/.claude/skills`)
+//!   are intentionally excluded here. They remain local to the
 //!   CLI process unless the user publishes/registers them into the database.
 
 use std::sync::Arc;

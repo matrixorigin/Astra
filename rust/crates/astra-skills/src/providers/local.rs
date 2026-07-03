@@ -196,7 +196,7 @@ mod tests {
         assert!(matches!(result, Err(SkillError::NotFound(_))));
     }
 
-    /// Kebab-case manifest `name` with snake_case directory (common in `skills/<dir>/`).
+    /// Kebab-case manifest `name` with snake_case directory.
     #[tokio::test]
     async fn load_resolves_kebab_name_from_snake_case_dir() {
         let dir = TempDir::new().unwrap();
