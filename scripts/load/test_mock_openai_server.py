@@ -7,9 +7,8 @@ import http.client
 import importlib.util
 import json
 import sys
-import threading
 import unittest
-from http.server import ThreadingHTTPServer
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +24,7 @@ SPEC.loader.exec_module(mock)
 class RunningServer:
     def __init__(self, config: Any) -> None:
         self.state = mock.ServerState(config)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), mock.make_handler(self.state))
+        self.server = mock.CapacityMockOpenAiServer(("127.0.0.1", 0), mock.make_handler(self.state))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.host, self.port = self.server.server_address
@@ -143,6 +142,10 @@ class MockOpenAiServerTests(unittest.TestCase):
         self.assertIn("api_key: mock-key", text)
         self.assertIn("base_url: http://127.0.0.1:18080", text)
         self.assertIn("supported_parameters: [tools]", text)
+
+    def test_server_backlog_is_large_enough_for_capacity_probes(self) -> None:
+        self.assertGreaterEqual(mock.CapacityMockOpenAiServer.request_queue_size, 512)
+        self.assertTrue(mock.CapacityMockOpenAiServer.daemon_threads)
 
 
 if __name__ == "__main__":

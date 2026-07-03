@@ -15,6 +15,28 @@ fi
 
 echo "Starting API server (mode: $BUILD_MODE)..."
 
+# High-concurrency local probes keep one inbound SSE socket per client and open
+# outbound DB/LLM/Memoria sockets from the same process. macOS shells commonly
+# start with a 256 soft nofile limit, which is too low for 200+ client probes.
+CURRENT_NOFILE=$(ulimit -n)
+TARGET_NOFILE=4096
+case "$CURRENT_NOFILE" in
+    ''|*[!0-9]*)
+        echo "⚠️  Could not inspect file descriptor limit: $CURRENT_NOFILE"
+        ;;
+    *)
+        if [ "$CURRENT_NOFILE" -lt "$TARGET_NOFILE" ]; then
+            if ulimit -n "$TARGET_NOFILE" 2>/dev/null; then
+                echo "✅ File descriptor limit raised to $(ulimit -n)"
+            else
+                echo "⚠️  File descriptor limit remains $CURRENT_NOFILE; high-concurrency probes may fail"
+            fi
+        else
+            echo "✅ File descriptor limit: $CURRENT_NOFILE"
+        fi
+        ;;
+esac
+
 # Check if already running
 if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
     echo "⚠️  API server already running (PID: $(cat $PID_FILE))"

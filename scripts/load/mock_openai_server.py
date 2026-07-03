@@ -35,6 +35,11 @@ from urllib.parse import urlparse
 COMPLETIONS_PATHS = {"/chat/completions", "/v1/chat/completions"}
 
 
+class CapacityMockOpenAiServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 1024
+
+
 @dataclass(frozen=True)
 class MockConfig:
     model_name: str
@@ -338,7 +343,7 @@ def serve(args: argparse.Namespace) -> int:
         api_key=args.api_key,
     )
     state = ServerState(config)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(state))
+    server = CapacityMockOpenAiServer((args.host, args.port), make_handler(state))
     host, port = server.server_address
     base_url = f"http://{host}:{port}"
     if args.write_model_yaml:
