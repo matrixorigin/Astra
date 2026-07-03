@@ -4,7 +4,8 @@
 //! `plans/tool-surface-deferred-simplification-2026-06-23.md`.
 //!
 //! Contracts under test:
-//!   1. Default T1 (always_load) members come from `ToolSpec.load_policy`.
+//!   1. Default T1 (always_load) candidate members come from
+//!      `ToolSpec.load_policy`; final visibility is provider/binding gated.
 //!   2. User config can add extra tools to the default always_load set.
 //!   3. Every non-T1 tool appears in the deferred list as `name + short_desc`
 //!      (no schema, no parameters).
@@ -159,48 +160,68 @@ fn server_builtin_inventory_is_public_schema_backed() {
     }
 }
 
-/// The default always_load set is the core surface.
-/// See `astra_runtime_env::ToolSpec::load_policy` for the per-tool classification.
+/// The declaration-level default always_load set follows ToolSpec load policy.
+/// It is intentionally not the final per-access-mode visible surface.
 #[test]
-fn always_load_default_members_are_the_core_set() {
+fn always_load_default_candidates_follow_tool_spec_load_policy() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
-    let always_load_names = names(&surface.always_load_schemas());
-    let expected: std::collections::HashSet<&str> = [
-        "ask_user", // structured clarification; interaction mode filters when unavailable
-        "bash",
-        "read_file",
-        "write_file",
-        "str_replace", // astra's editor tool
-        "git",         // VCS observability is part of the coding loop
-        "grep",
-        "glob",
-        "introspect", // self-observation must be available before the agent knows it needs it
-        "list_dir",
-        "memory",  // intrinsic per ToolSpec load policy
-        "notify",  // non-blocking user communication; pairs with ask_user
-        "reflect", // session diagnosis/recovery entrypoint
-        "tool_search",
-        "skill",
-        "task", // session_todos surface — TUI dashboard depends on it
-    ]
-    .into_iter()
-    .collect();
+    let always_load_names: std::collections::BTreeSet<String> =
+        names(&surface.always_load_schemas()).into_iter().collect();
+    let expected: std::collections::BTreeSet<String> = astra_runtime_env::ToolRegistry::builtins()
+        .iter()
+        .filter(|spec| spec.load_policy == astra_runtime_env::ToolLoadPolicy::AlwaysLoad)
+        .map(|spec| spec.name.clone())
+        .collect();
 
-    for must_have in &expected {
+    assert_eq!(
+        always_load_names, expected,
+        "default always_load candidates must come from ToolSpec.load_policy"
+    );
+}
+
+#[test]
+fn web_no_workspace_final_surface_filters_workspace_executor_candidates() {
+    let cfg = ToolSurfaceConfig::default();
+    let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
+    let candidate_names: std::collections::BTreeSet<String> =
+        names(&surface.always_load_schemas()).into_iter().collect();
+
+    for candidate in ["bash", "read_file", "write_file", "git"] {
         assert!(
-            always_load_names.iter().any(|n| n == must_have),
-            "default always_load must contain {must_have}; got {always_load_names:?}"
+            candidate_names.contains(candidate),
+            "{candidate} remains a declaration-level T1 candidate"
         );
     }
-    assert_eq!(
-        always_load_names.len(),
-        expected.len(),
-        "exactly {} default always_load, got {}: {always_load_names:?}",
-        expected.len(),
-        always_load_names.len()
-    );
+
+    let filtered =
+        crate::server::tool_binding_projection::capability_filter_tool_schemas_for_binding(
+            surface.always_load_schemas(),
+            &crate::server::tool_execution_binding::WorkspaceBinding {
+                kind: astra_runtime_env::WorkspaceBindingKind::None,
+                display_name: "No workspace".to_string(),
+                cwd: None,
+                authority: astra_runtime_env::WorkspaceAuthority::None,
+                fallback_policy: crate::server::tool_execution_binding::FallbackPolicy::Disabled,
+            },
+            &crate::server::tool_execution_binding::ExecutorBinding::server_control_plane(),
+            None,
+        );
+    let final_names: std::collections::BTreeSet<String> = names(&filtered).into_iter().collect();
+
+    for visible in ["ask_user", "tool_search", "introspect", "reflect"] {
+        assert!(
+            final_names.contains(visible),
+            "{visible} should remain visible in Web/no-workspace mode"
+        );
+    }
+    for hidden in ["bash", "read_file", "write_file", "git"] {
+        assert!(
+            !final_names.contains(hidden),
+            "{hidden} must be hidden until an execution provider binding exists"
+        );
+    }
 }
 
 #[test]

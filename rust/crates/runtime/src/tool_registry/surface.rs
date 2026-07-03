@@ -3,8 +3,10 @@
 //! See `plans/tool-surface-deferred-simplification-2026-06-23.md` and
 //! `docs/design/skills-and-tools.md` for the architectural story. Short version:
 //!
-//! - **T1 always_load** = a small, stable set of tool schemas that go into the
-//!   LLM `tools[]` array on every turn. Byte-stable across a session so the
+//! - **T1 always_load** = a small, stable set of candidate tool schemas. After
+//!   this declaration step, the server still applies the runtime
+//!   provider/binding/capability gate before anything reaches the LLM
+//!   `tools[]` array. The post-gate bytes stay stable across a session so the
 //!   Anthropic/Bedrock prompt cache can hit the whole prefix.
 //! - **T2 deferred** = every other known tool, listed as `name + short_desc`
 //!   in a system-reminder block. The model activates one by calling
@@ -12,8 +14,11 @@
 //!   schema visible in upcoming `tools[]` payloads until the model actually
 //!   calls that tool once.
 //!
-//! The default T1 set is the coding core, derived from
-//! `astra_runtime_env::ToolSpec::load_policy`.
+//! The default T1 candidate set is derived from
+//! `astra_runtime_env::ToolSpec::load_policy`. It intentionally is not the
+//! final visible surface for every access mode: Web/no-workspace runs must hide
+//! workspace/process executor tools, while CLI/edge/sandbox/managed runtimes may
+//! expose them when their provider binding is ready.
 //! Users can add extra T1 tools via `runtime.tool_surface.pinned_tools` in TOML.
 //!
 //! Implementation is complete and wired into production.
@@ -26,10 +31,11 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-/// Default T1 always_load tool names, derived from the single authority
-/// [`astra_runtime_env::ToolSpec`] classification.
+/// Default T1 always_load candidate tool names, derived from the single
+/// authority [`astra_runtime_env::ToolSpec`] classification.
 /// Any name classified as `ToolLoadPolicy::AlwaysLoad` automatically
-/// appears here — no manual copy needed.
+/// appears here — no manual copy needed. Callers must still apply the current
+/// provider/binding/capability filter before exposing schemas to a model.
 pub fn default_always_load_names() -> &'static [String] {
     static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
         let registry = astra_runtime_env::ToolRegistry::builtins();
@@ -235,7 +241,11 @@ impl ToolSurface {
         Self::build(catalog_schemas, cfg, &plugin_schemas)
     }
 
-    /// The byte-stable T1 schemas to feed into `tools[]`.
+    /// The byte-stable T1 candidate schemas.
+    ///
+    /// This is the declaration-level surface. Server/Web paths must pass these
+    /// schemas through `tool_binding_projection` before feeding `tools[]`.
+    /// CLI/edge/local paths should likewise use their resolved runtime binding.
     ///
     /// Returned by value so callers can annotate `cache_control` without
     /// mutating the surface.
