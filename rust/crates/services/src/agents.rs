@@ -50,7 +50,7 @@ pub struct AgentListItem {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentListRecord {
     pub agents: Vec<AgentListItem>,
-    pub total: i64,
+    pub total: Option<i64>,
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -249,16 +249,6 @@ impl AgentService for DatabaseAgentService {
     ) -> Result<AgentListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let count_row =
-            query("SELECT COUNT(agent_id) AS total FROM agent_agents WHERE owner_user_id = ?")
-                .bind(&user_id)
-                .fetch_one(&pool)
-                .await
-                .map_err(internal_error)?;
-        let total = count_row
-            .try_get::<i64, _>("total")
-            .map_err(internal_error)?;
-
         let select_sql = format!(
             "SELECT {} FROM agent_agents WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT ?",
             AGENT_LIST_SELECT_COLS
@@ -283,7 +273,10 @@ impl AgentService for DatabaseAgentService {
             });
         }
 
-        Ok(AgentListRecord { agents, total })
+        Ok(AgentListRecord {
+            agents,
+            total: None,
+        })
     }
 
     async fn get_agent(
@@ -536,7 +529,7 @@ impl AgentService for InMemoryAgentService {
         let total = items.len() as i64;
         Ok(AgentListRecord {
             agents: items,
-            total,
+            total: Some(total),
         })
     }
 
@@ -629,7 +622,7 @@ pub struct AgentResponse {
 #[derive(Serialize, PartialEq)]
 pub struct AgentListResponse {
     pub agents: Vec<AgentListItemResponse>,
-    pub total: i64,
+    pub total: Option<i64>,
 }
 
 #[derive(Serialize, PartialEq)]
@@ -731,8 +724,26 @@ mod tests {
         .unwrap();
 
         let list = svc.list_agents("u1".into()).await.unwrap();
-        assert_eq!(list.total, 1);
+        assert_eq!(list.total, Some(1));
         assert_eq!(list.agents[0].name, "a1");
+    }
+
+    #[test]
+    fn agent_list_hot_path_does_not_count_rows() {
+        let body = include_str!("agents.rs")
+            .split("impl AgentService for DatabaseAgentService")
+            .nth(1)
+            .expect("database agent service impl")
+            .split("async fn list_agents(")
+            .nth(1)
+            .expect("database list_agents body")
+            .split("async fn get_agent(")
+            .next()
+            .expect("database list_agents body end");
+        assert!(
+            !body.contains("COUNT("),
+            "agent list is capped and must not count agent_agents"
+        );
     }
 
     #[tokio::test]

@@ -71,7 +71,7 @@ async fn agent_service_crud_round_trips_on_live_matrixone() {
         .list_agents(user_id.clone())
         .await
         .expect("list agents");
-    assert_eq!(listed.total, 1);
+    assert_eq!(listed.total, None);
     assert_eq!(listed.agents[0].agent_id, created.agent_id);
     assert!(!listed.agents[0].is_active);
 
