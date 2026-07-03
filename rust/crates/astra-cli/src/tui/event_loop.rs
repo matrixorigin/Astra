@@ -162,6 +162,34 @@ impl ReopenTarget {
     }
 }
 
+/// Blit any images the `display_sixel` tool queued during the turn.
+///
+/// Under the inline-viewport TUI the tool cannot write to the terminal itself —
+/// the render loop would paint over it (the "white box" symptom). Instead it
+/// queues raw sixel bytes and we show each here on a clean, paused screen via
+/// `with_restored`, which drops raw mode, hands the whole screen to the image,
+/// and forces a full repaint once the user presses Enter to dismiss it.
+async fn render_pending_sixel_images(guard: &mut TerminalGuard) {
+    for bytes in astra_tools::display_sixel::take_pending_sixel() {
+        let _ = guard
+            .with_restored(|| async move {
+                use std::io::Write as _;
+                let mut out = std::io::stdout();
+                // Home + clear-to-end, blit the image at the top (full height),
+                // then a prompt line.
+                let _ = out.write_all(b"\x1b[H\x1b[J");
+                let _ = out.write_all(&bytes);
+                let _ = out.write_all(b"\r\n\x1b[7m Press Enter to continue \x1b[0m");
+                let _ = out.flush();
+                // Raw mode is off inside `with_restored`, so this is a cooked,
+                // line-buffered read that returns when the user hits Enter.
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+            })
+            .await;
+    }
+}
+
 /// Drain newly-committed cells from the widget and render each
 /// to the terminal scrollback. Single choke point for all
 /// "a cell just landed in history" writes — callers don't touch
@@ -2686,6 +2714,9 @@ pub(crate) async fn run_tui_session(
                                                 }
                                             }
                                         };
+                                        // Turn fully settled: blit any images display_sixel
+                                        // queued this turn on a paused screen (see fn docs).
+                                        render_pending_sixel_images(&mut guard).await;
                                         r
                                     };
 

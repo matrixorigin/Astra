@@ -55,6 +55,17 @@ impl TerminalGuard {
             pending_history: Vec::new(),
             is_zellij,
         };
+        // Tell display_sixel the TUI owns the terminal, so it queues images for
+        // the event loop to blit on a paused screen instead of writing bytes the
+        // render loop would paint over. Cleared in Drop.
+        astra_tools::display_sixel::set_tui_active(true);
+        // Probe sixel support once, now — raw mode is on and the event-loop input
+        // reader hasn't started, so it's safe to read the DA1 reply directly.
+        // Cached so display_sixel skips the image (with a message) on terminals
+        // that would only show a blank box.
+        astra_tools::display_sixel::set_sixel_supported(
+            astra_tools::display_sixel::probe_sixel_support(),
+        );
         std::mem::forget(early_guard);
         Ok(guard)
     }
@@ -222,6 +233,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        astra_tools::display_sixel::set_tui_active(false);
         let area = self.terminal.viewport_area;
         let _ = execute!(stdout(), cursor::MoveTo(0, area.bottom()), cursor::Show);
         let _ = disable_raw_mode();

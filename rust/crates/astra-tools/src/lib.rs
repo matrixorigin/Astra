@@ -8,6 +8,7 @@
 //! on this crate and compose its `DefaultToolExecutor` with their own wrappers.
 
 pub mod ask_user;
+pub mod display_sixel;
 pub mod memoria;
 pub mod schemas;
 pub mod web_fetch;

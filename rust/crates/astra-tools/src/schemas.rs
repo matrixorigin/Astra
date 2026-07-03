@@ -147,6 +147,23 @@ fn all_tool_schemas_core() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "display_sixel",
+                "description": "Render an image file (PNG, JPEG, GIF, etc.) inline in the terminal using sixel graphics. Requires img2sixel (libsixel) and a sixel-capable terminal. Use this after creating a plot or image in /tmp — first generate the image file, then call display_sixel to show it. In the interactive TUI the image is shown on a paused screen; press Enter to return. Raises an error if img2sixel is not installed or the file cannot be converted.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the image file to display (e.g. /tmp/sin_plot.png)."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "bash",
                 "description": "Execute a shell command. Use for builds, tests, installs, or actions with no dedicated tool. Identical commands are cached; set force=true to bypass.",
                 "parameters": {

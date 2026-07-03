@@ -622,6 +622,12 @@ impl DefaultToolExecutor {
                 string_to_result(output)
             }
 
+            // ── Display sixel (terminal image rendering) ──────────────
+            "display_sixel" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                crate::display_sixel::display_sixel(path)
+            }
+
             // ── Memory tools (require configured endpoint) ───────────
             "memory" => {
                 let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
