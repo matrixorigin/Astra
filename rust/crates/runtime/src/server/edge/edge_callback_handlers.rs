@@ -167,11 +167,20 @@ pub(crate) async fn post_tool_result_handler(
             )
         })?,
     });
-    {
+    let ledger_insert_result = {
         let mut lock = state.edge_callback_ledger.lock().await;
         insert_ledger_entry(&mut lock, key.clone(), ledger_value)
-            .map_err(|err| ledger_insert_error_response(&key, err))?;
-    }
+    };
+    let (ledger_enqueued, ledger_capacity_exceeded) = match ledger_insert_result {
+        Ok(enqueued) => (enqueued, false),
+        Err(LedgerInsertError::DuplicateKey) => {
+            return Err(ledger_insert_error_response(
+                &key,
+                LedgerInsertError::DuplicateKey,
+            ));
+        }
+        Err(LedgerInsertError::CapacityExceeded) => (false, true),
+    };
 
     // Cross-pod: also call deliver_result so other pods' turn bridges
     // waiting on wait_result() can see this result.
@@ -183,11 +192,11 @@ pub(crate) async fn post_tool_result_handler(
         )
     })?;
     let edge_agent_id = body.edge_agent_id.as_deref().unwrap_or("");
-    match dispatch_svc
+    let dispatch_delivered = match dispatch_svc
         .deliver_result(&user.user_id, &body.request_id, edge_agent_id, &result_json)
         .await
     {
-        Ok(true) => {}
+        Ok(true) => true,
         Ok(false) => {
             tracing::warn!(
                 target: "astra_runtime::edge_callback",
@@ -196,6 +205,7 @@ pub(crate) async fn post_tool_result_handler(
                 edge_agent_id = %edge_agent_id,
                 "Edge: cross-pod tool result did not match an active dispatch row"
             );
+            false
         }
         Err(e) => {
             tracing::warn!(
@@ -206,7 +216,15 @@ pub(crate) async fn post_tool_result_handler(
                 error = %e,
                 "Edge: failed to cross-pod deliver tool result"
             );
+            false
         }
+    };
+
+    if ledger_capacity_exceeded && !dispatch_delivered {
+        return Err(ledger_insert_error_response(
+            &key,
+            LedgerInsertError::CapacityExceeded,
+        ));
     }
 
     tracing::info!(
@@ -221,6 +239,8 @@ pub(crate) async fn post_tool_result_handler(
     Ok(Json(serde_json::json!({
         "ok": true,
         "request_id": body.request_id,
+        "ledger_enqueued": ledger_enqueued,
+        "dispatch_delivered": dispatch_delivered,
     })))
 }
 
@@ -592,13 +612,13 @@ mod edge_callback_insert_tests {
 
     use super::{
         EdgeRegisterRequest, LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry,
-        post_approval_respond_handler,
+        post_approval_respond_handler, post_tool_result_handler,
     };
     use crate::server::RequestTrace;
     use crate::{AppState, HealthChecker, ServiceInfo};
     use astra_services::{
         AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
-        AuthTokenRecord, AuthUserRecord,
+        AuthTokenRecord, AuthUserRecord, EdgeDispatchRow, EdgeDispatchService,
     };
     use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
     use async_trait::async_trait;
@@ -609,7 +629,7 @@ mod edge_callback_insert_tests {
     };
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
     struct TestHealthChecker;
@@ -667,6 +687,71 @@ mod edge_callback_insert_tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingEdgeDispatch {
+        deliver_result: bool,
+        delivered: Mutex<Vec<(String, String, String, String)>>,
+    }
+
+    #[async_trait]
+    impl EdgeDispatchService for RecordingEdgeDispatch {
+        async fn insert_dispatch(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _request_id: &str,
+            _payload_json: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<EdgeDispatchRow>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn deliver_result(
+            &self,
+            user_id: &str,
+            request_id: &str,
+            edge_agent_id: &str,
+            result_json: &str,
+        ) -> Result<bool, String> {
+            self.delivered.lock().unwrap().push((
+                user_id.to_string(),
+                request_id.to_string(),
+                edge_agent_id.to_string(),
+                result_json.to_string(),
+            ));
+            Ok(self.deliver_result)
+        }
+
+        async fn fail_dispatch(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _reason: &str,
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        async fn wait_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
+        async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
     fn source_index(source: &str, needle: &str) -> usize {
         source
             .find(needle)
@@ -714,11 +799,11 @@ mod edge_callback_insert_tests {
             source,
             "let mut lock = state.edge_callback_ledger.lock().await;",
         );
-        let insert_done_idx = source_index(
-            source,
-            ".map_err(|err| ledger_insert_error_response(&key, err))?;\n    }\n\n    // Cross-pod",
-        );
+        let insert_done_idx =
+            source_index(source, "let (ledger_enqueued, ledger_capacity_exceeded)");
         let deliver_idx = source_index(source, ".deliver_result(");
+        let capacity_fallback_idx =
+            source_index(source, "if ledger_capacity_exceeded && !dispatch_delivered");
 
         assert!(
             lock_idx < insert_done_idx,
@@ -727,6 +812,10 @@ mod edge_callback_insert_tests {
         assert!(
             insert_done_idx < deliver_idx,
             "cross-pod delivery must happen after the ledger lock scope closes"
+        );
+        assert!(
+            deliver_idx < capacity_fallback_idx,
+            "ledger capacity errors should be recoverable when durable dispatch delivery succeeds"
         );
     }
 
@@ -967,6 +1056,62 @@ mod edge_callback_insert_tests {
             ),
             "{metrics}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_result_handler_uses_dispatch_when_local_ledger_is_full() {
+        let dispatch = Arc::new(RecordingEdgeDispatch {
+            deliver_result: true,
+            delivered: Mutex::new(Vec::new()),
+        });
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_edge_dispatch_service(dispatch.clone());
+        {
+            let mut ledger = state.edge_callback_ledger.lock().await;
+            for i in 0..LEDGER_MAX_ENTRIES {
+                ledger.insert(format!("u-approval:tool:filled-{i}"), json!({"i": i}));
+            }
+        }
+
+        let response = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace-tool-dispatch".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ToolResultRequest::new_with_hash(
+                "req-tool-dispatch".into(),
+                Some("edge-a".into()),
+                "completed".into(),
+                "tool output".into(),
+                12,
+            )),
+        )
+        .await
+        .expect("dispatch delivery should recover from local ledger capacity");
+
+        assert_eq!(response.0["ok"], true);
+        assert_eq!(response.0["ledger_enqueued"], false);
+        assert_eq!(response.0["dispatch_delivered"], true);
+
+        let ledger = state.edge_callback_ledger.lock().await;
+        assert_eq!(ledger.len(), LEDGER_MAX_ENTRIES);
+        assert!(
+            !ledger.contains_key(&astra_turn_core::edge_ledger::tool_callback_key(
+                "u-approval",
+                "req-tool-dispatch"
+            )),
+            "full local ledger should not be required when dispatch delivery succeeds"
+        );
+        drop(ledger);
+
+        let delivered = dispatch.delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, "u-approval");
+        assert_eq!(delivered[0].1, "req-tool-dispatch");
+        assert_eq!(delivered[0].2, "edge-a");
+        assert!(delivered[0].3.contains("tool output"));
     }
 
     #[tokio::test(flavor = "current_thread")]
