@@ -32,7 +32,7 @@ class SchemaInventoryTest(unittest.TestCase):
         ]
         self.assertEqual(
             len(core_tables),
-            91,
+            90,
             "core storage DDL count changed; update the schema plan and inventory baseline",
         )
 
@@ -662,7 +662,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "session_tool_outputs",
             "prompt_request_records",
             "prompt_deltas",
-            "session_sync_log",
             "agent_message_queue",
         ]
         for table in high_growth_tables:
@@ -692,12 +691,25 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("before prompt_request_records", child["retention_policy"])
         self.assertIn("position/delta_seq", child["primary_query"])
 
-    def test_session_sync_log_is_product_audit_not_dead_table(self) -> None:
-        row = self.tables["session_sync_log"]
-        self.assertIn("best-effort", row["state_class"])
-        self.assertIn("sync_status", row["merge_guidance"])
-        self.assertIn("sync_log_days default 30", row["retention_policy"])
-        self.assertIn("not exactly rebuildable", row["rebuildability"])
+    def test_session_sync_log_is_removed_from_production_schema(self) -> None:
+        self.assertNotIn(
+            "session_sync_log",
+            self.tables,
+            "sync audit is tracing-only now; session_sync_log must not return to production DDL",
+        )
+
+        storage = (schema_inventory.REPO_ROOT / "rust/crates/services/src/storage.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS session_sync_log", storage)
+        self.assertIn("DROP TABLE IF EXISTS session_sync_log", storage)
+
+        state_sync = (
+            schema_inventory.REPO_ROOT / "rust/crates/services/src/state_sync.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("SyncAuditWriter", state_sync)
+        self.assertIn("Audit is intentionally not persisted to MatrixOne", state_sync)
+        self.assertNotIn("session_sync_log", state_sync)
 
     def test_p1_5_consolidation_reviews_are_evidence_backed(self) -> None:
         expected = {
@@ -713,7 +725,7 @@ class SchemaInventoryTest(unittest.TestCase):
             with self.subTest(candidate=candidate):
                 self.assertIn(
                     review["decision"],
-                    {"keep", "keep_separate", "keep_with_bounded_retention"},
+                    {"keep", "keep_separate", "removed"},
                 )
                 self.assertGreaterEqual(len(review["current_read_paths"]), 1)
                 self.assertGreaterEqual(len(review["current_write_paths"]), 1)
@@ -727,7 +739,7 @@ class SchemaInventoryTest(unittest.TestCase):
                     self.assertNotEqual(review[field], "")
                     self.assertNotIn("TBD", review[field])
 
-        self.assertIn("sync status", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
+        self.assertIn("tracing-only", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
         self.assertIn(
             "rollback/list",
             self.p1_5_reviews["data_versioning_checkpoints"]["user_api_impact"],
@@ -754,9 +766,8 @@ class SchemaInventoryTest(unittest.TestCase):
     def test_p1_5_consolidation_source_evidence_still_exists(self) -> None:
         expectations = {
             "rust/crates/services/src/state_sync.rs": [
-                "session_sync_log",
                 "SyncAuditWriter",
-                "sync_status",
+                "Audit is intentionally not persisted to MatrixOne",
             ],
             "rust/crates/services/src/data_versioning.rs": [
                 "data_versioning_checkpoints",

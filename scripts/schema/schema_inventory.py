@@ -751,16 +751,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / state_sync",
         product_owner="user preferences, edge/cloud sync, prompt personalization",
     ),
-    "session_sync_log": TableMetadata(
-        semantic_owner="astra_services::state_sync::SyncAuditWriter",
-        state_class="best-effort sync observability audit",
-        primary_query="sync status and latest error by status/created_at, with owner/session deletion by user_id/session_id",
-        retention_policy="Storage cleanup prunes old rows by sync_log_days default 30 in ordered batches; session deletion removes owner/session rows",
-        rebuildability="not required for business correctness and not exactly rebuildable after audit rows are dropped",
-        merge_guidance="do not replace with tracing until sync_status readers stop querying this product audit table",
-        migration_owner="astra_services::storage / state_sync",
-        product_owner="session sync status, operational diagnostics",
-    ),
     "admin_config": TableMetadata(
         semantic_owner="astra_services::admin_config",
         state_class="durable server admin configuration fact",
@@ -1197,32 +1187,31 @@ TABLE_METADATA: dict[str, TableMetadata] = {
 P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
     ConsolidationReview(
         candidate="session_sync_log",
-        decision="keep_with_bounded_retention",
+        decision="removed",
         current_read_paths=[
-            "rust/crates/services/src/state_sync.rs::get_sync_status",
-            "rust/crates/services/tests/services_db_integration.rs::session_sync_log_*",
+            "none; MatrixOneSyncService::status no longer queries audit storage",
         ],
         current_write_paths=[
-            "rust/crates/services/src/state_sync.rs::SyncAuditWriter::enqueue",
-            "rust/crates/services/src/storage.rs::cleanup_expired_data",
+            "none; SyncAuditWriter emits tracing debug events only",
         ],
         user_api_impact=(
-            "sync status and operational diagnostics currently read this product audit table; "
-            "removing it would make sync_status less explainable even if tracing exists"
+            "sync audit is tracing-only; durable sync facts remain in domain tables, and "
+            "sync status no longer depends on session_sync_log"
         ),
         migration_backfill=(
-            "no merge/backfill now; keep pruning by sync_log_days in bounded batches"
+            "no backfill; schema setup drops the legacy table and live MatrixOne tests assert it is absent"
         ),
         rollback=(
-            "if a future replacement lands, rollback is recreating the table and re-enabling "
-            "SyncAuditWriter writes; historical rows are not exactly reconstructable"
+            "rollback would require explicitly reintroducing the DDL and persistence path; "
+            "that is intentionally not part of the current schema contract"
         ),
         test_evidence=[
-            "scripts/schema/test_schema_inventory.py::test_session_sync_log_is_product_audit_not_dead_table",
-            "rust/crates/services/tests/services_db_integration.rs::session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone",
+            "scripts/schema/test_schema_inventory.py::test_session_sync_log_is_removed_from_production_schema",
+            "rust/crates/services/tests/services_db_integration.rs::sync_audit_no_longer_persists_session_sync_log_on_live_matrixone",
         ],
         rationale=(
-            "best-effort but product-readable audit is not the same lifecycle as external tracing"
+            "session_sync_log was a best-effort audit side effect, not a recovery or product fact; "
+            "removing it reduces schema surface without losing durable sync state"
         ),
     ),
     ConsolidationReview(
