@@ -38,6 +38,9 @@
     "zod": "^4.4.3"
   },
   "overrides": {
+    "@floating-ui/core": "1.7.5",
+    "@floating-ui/dom": "1.7.5",
+    "@floating-ui/react-dom": "2.1.7",
     "postcss": "^8.5.15"
   },
   "devDependencies": {
