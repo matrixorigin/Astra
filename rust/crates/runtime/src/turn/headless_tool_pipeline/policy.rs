@@ -693,7 +693,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             let action = execution.args.get("action").and_then(Value::as_str);
             let (err_msg, skip_reason) = match classify_direct_deferred_call(
                 &execution.name,
-                is_activatable_deferred,
+                is_prompt_deferred && is_activatable_deferred,
                 tool_runtime_ready,
             ) {
                 DirectDeferredCallAdmission::Activate { name } => {

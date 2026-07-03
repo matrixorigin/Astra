@@ -2019,12 +2019,12 @@ mod tests {
     #[tokio::test]
     async fn validator_direct_deferred_call_records_activation_hint() {
         let mut harness = PipelineHarness::new();
-        push_unknown_server_tool_call(&mut harness, "github");
+        push_unknown_server_tool_call(&mut harness, "memory");
         begin_recorded_turn(&mut harness, 1);
 
         let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
         harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
-        harness.deferred_tool_names = HashSet::from(["github".to_string()]);
+        harness.deferred_tool_names = HashSet::from(["memory".to_string()]);
         let dir = tempfile::TempDir::new().unwrap();
         let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
             dir.path().to_path_buf(),
@@ -2033,7 +2033,7 @@ mod tests {
             None,
             None,
         );
-        server_exec.set_current_activatable_tool_names(HashSet::from(["github".to_string()]));
+        server_exec.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
 
         let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
         let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
@@ -2050,7 +2050,7 @@ mod tests {
             .unwrap_or_default();
         assert!(
             body.contains("requires `tool_search` activation first")
-                && body.contains("select:github")
+                && body.contains("select:memory")
                 && body.contains("not executed"),
             "direct deferred call must become a non-executing activation hint; got: {body}"
         );
@@ -2060,14 +2060,14 @@ mod tests {
         );
         assert_eq!(
             server_exec.activated_deferred_tool_names(),
-            vec!["github".to_string()],
+            vec!["memory".to_string()],
             "validator path must record activation for the next model request"
         );
         let record = harness
             .tool_call_records
             .last()
             .expect("direct deferred activation should record a journal placeholder");
-        assert_eq!(record.name, "github");
+        assert_eq!(record.name, "memory");
         assert!(record.ok);
         assert_eq!(record.error.as_deref(), Some("tool_not_admitted"));
         assert!(record.is_synthetic_placeholder());
@@ -2105,6 +2105,50 @@ mod tests {
         assert!(
             halluc_body.starts_with("Unknown tool"),
             "hallucinated names must still get the bare unknown-tool copy; got: {halluc_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validator_ignores_stale_activatable_name_without_prompt_manifest() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "github");
+        begin_recorded_turn(&mut harness, 1);
+
+        let visible = vec![json!({"type": "function", "function": {"name": "tool_search"}})];
+        harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
+        harness.deferred_tool_names = HashSet::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        server_exec.set_current_activatable_tool_names(HashSet::from(["github".to_string()]));
+
+        let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        drop(pipeline);
+
+        let body = harness
+            .tool_results
+            .last()
+            .and_then(|tr| tr.get("result"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            body.starts_with("Unknown tool"),
+            "a name not shown in this turn's deferred manifest must not be treated as activatable: {body}"
+        );
+        assert!(
+            !body.contains("select:github"),
+            "validator must not invent activation guidance without a prompt manifest: {body}"
+        );
+        assert!(
+            server_exec.activated_deferred_tool_names().is_empty(),
+            "stale activatable state must not activate a tool that was not prompt-advertised"
         );
     }
 
