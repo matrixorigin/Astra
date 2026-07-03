@@ -81,12 +81,13 @@ If `reasoning_model_name` is not set, the server falls back to the cheapest acti
 - `ASTRA_RETRIEVAL_TOP_K`, `ASTRA_MAX_TURN_INPUT_TOKENS`
 - `ASTRA_LLM_PROVIDER_ADMISSION_MODE` — provider admission mode; unset/`disabled` by default, `db_fixed_window` enables MatrixOne-backed RPM/TPM claims before outbound LLM attempts
 - `ASTRA_LLM_PROVIDER_ADMISSION_RPM`, `ASTRA_LLM_PROVIDER_ADMISSION_TPM` — provider budget used by admission; at least one is required when admission is enabled
-- `ASTRA_LLM_PROVIDER_ADMISSION_SCOPE` — `provider` or `provider_model`; default `provider`
 - `ASTRA_RUN_ADMISSION_TIMEOUT_SECS` — per-run wait time before the pod-local run semaphore returns `run_admission_timeout`; default `30`
 - `ASTRA_AUX_LLM_POLICY` — global policy for optional auxiliary LLM calls; `capacity_aware` by default skips optional auxiliary calls when provider admission is enabled, `always` preserves them, `disabled` turns them off
 - `ASTRA_CAPTURE_TRACES`
 
 Diagnostic DB history is controlled through `runtime.toml` trace categories, not separate environment variables. Production defaults keep high-volume diagnostic tables off; `trace.profile = "dev"` enables them. For custom profiles, enable `context_assembly` for context manifests, `prompt_assembly` for prompt request deltas, and `harness_snapshots` for durable harness snapshot history.
+
+Provider admission is intentionally configured by capacity inputs only. Scope is fixed at provider level; window size, retention, cleanup cadence, burst, and fail-closed behavior are internal runtime policy rather than deployment knobs.
 
 Server-loop Memoria observer and post-loop memory cleanup are fixed internal async best-effort side effects with bounded in-process concurrency. They are intentionally not environment-configurable; they must not hold run admission slots or become deployment-specific tuning surfaces.
 

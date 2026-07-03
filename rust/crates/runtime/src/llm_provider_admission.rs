@@ -15,11 +15,6 @@ const ENV_RPM: &str = "ASTRA_LLM_PROVIDER_ADMISSION_RPM";
 const ENV_CAPACITY_RPM: &str = "ASTRA_CAPACITY_PROVIDER_RPM";
 const ENV_TPM: &str = "ASTRA_LLM_PROVIDER_ADMISSION_TPM";
 const ENV_CAPACITY_TPM: &str = "ASTRA_CAPACITY_PROVIDER_TPM";
-const ENV_WINDOW_MS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_WINDOW_MS";
-const ENV_RETENTION_WINDOWS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_RETENTION_WINDOWS";
-const ENV_CLEANUP_INTERVAL_MS: &str = "ASTRA_LLM_PROVIDER_ADMISSION_CLEANUP_INTERVAL_MS";
-const ENV_SCOPE: &str = "ASTRA_LLM_PROVIDER_ADMISSION_SCOPE";
-const ENV_FAIL_OPEN: &str = "ASTRA_LLM_PROVIDER_ADMISSION_FAIL_OPEN";
 
 const DEFAULT_WINDOW_MS: u64 = 60_000;
 const DEFAULT_RETENTION_WINDOWS: u64 = 120;
@@ -146,7 +141,6 @@ pub(crate) struct ProviderAdmissionConfig {
     window_ms: u64,
     retention_windows: u64,
     cleanup_interval_ms: u64,
-    scope: ProviderAdmissionScope,
     fail_open: bool,
     burst: u64,
 }
@@ -162,17 +156,10 @@ impl ProviderAdmissionConfig {
             mode,
             rpm_limit: read_positive_u64(ENV_RPM).or_else(|| read_positive_u64(ENV_CAPACITY_RPM)),
             tpm_limit: read_positive_u64(ENV_TPM).or_else(|| read_positive_u64(ENV_CAPACITY_TPM)),
-            window_ms: read_positive_u64(ENV_WINDOW_MS).unwrap_or(DEFAULT_WINDOW_MS),
-            retention_windows: read_positive_u64(ENV_RETENTION_WINDOWS)
-                .unwrap_or(DEFAULT_RETENTION_WINDOWS),
-            cleanup_interval_ms: read_positive_u64(ENV_CLEANUP_INTERVAL_MS)
-                .unwrap_or(DEFAULT_CLEANUP_INTERVAL_MS),
-            scope: env::var(ENV_SCOPE)
-                .ok()
-                .as_deref()
-                .map(parse_scope)
-                .unwrap_or(ProviderAdmissionScope::Provider),
-            fail_open: read_bool(ENV_FAIL_OPEN).unwrap_or(false),
+            window_ms: DEFAULT_WINDOW_MS,
+            retention_windows: DEFAULT_RETENTION_WINDOWS,
+            cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
+            fail_open: false,
             burst: DEFAULT_RPM_BURST,
         }
     }
@@ -186,7 +173,6 @@ impl ProviderAdmissionConfig {
             window_ms: DEFAULT_WINDOW_MS,
             retention_windows: DEFAULT_RETENTION_WINDOWS,
             cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
-            scope: ProviderAdmissionScope::Provider,
             fail_open: false,
             burst: DEFAULT_RPM_BURST,
         }
@@ -201,7 +187,6 @@ impl ProviderAdmissionConfig {
             window_ms: DEFAULT_WINDOW_MS,
             retention_windows: DEFAULT_RETENTION_WINDOWS,
             cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
-            scope: ProviderAdmissionScope::Provider,
             fail_open: false,
             burst: DEFAULT_RPM_BURST,
         }
@@ -216,7 +201,6 @@ impl ProviderAdmissionConfig {
             window_ms: DEFAULT_WINDOW_MS,
             retention_windows: DEFAULT_RETENTION_WINDOWS,
             cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
-            scope: ProviderAdmissionScope::Provider,
             fail_open: false,
             burst: DEFAULT_RPM_BURST,
         }
@@ -231,7 +215,6 @@ impl ProviderAdmissionConfig {
             window_ms: DEFAULT_WINDOW_MS,
             retention_windows: DEFAULT_RETENTION_WINDOWS,
             cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
-            scope: ProviderAdmissionScope::Provider,
             fail_open: false,
             burst: DEFAULT_RPM_BURST,
         }
@@ -250,7 +233,7 @@ impl ProviderAdmissionConfig {
     }
 
     fn scope_label(&self) -> &'static str {
-        self.scope.as_label()
+        "provider"
     }
 }
 
@@ -267,21 +250,6 @@ impl ProviderAdmissionMode {
             Self::Disabled => "disabled",
             Self::DbFixedWindow => "db_fixed_window",
             Self::Unsupported => "unsupported",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderAdmissionScope {
-    Provider,
-    ProviderModel,
-}
-
-impl ProviderAdmissionScope {
-    fn as_label(self) -> &'static str {
-        match self {
-            Self::Provider => "provider",
-            Self::ProviderModel => "provider_model",
         }
     }
 }
@@ -799,14 +767,14 @@ fn cleanup_cutoff_ms(now_ms: i64, window_ms: u64, retention_windows: u64) -> i64
 async fn db_fixed_window_admit(
     shared_pool: &SharedPool,
     provider: &str,
-    model: &str,
+    _model: &str,
     config: &ProviderAdmissionConfig,
     estimated_tokens: u64,
 ) -> Result<FixedWindowAdmission, ClassifiedError> {
     let now_ms = now_epoch_ms();
     cleanup_stale_windows_if_due(shared_pool, config, now_ms).await;
     let window_start_ms = fixed_window_start_ms(now_ms, config.window_ms);
-    let bucket_key = bucket_key(config.scope, provider, model);
+    let bucket_key = bucket_key(provider);
     let estimated_tokens_i64 = i64::try_from(estimated_tokens).unwrap_or(i64::MAX);
     if let Some(retry_after_ms) = claim_rpm_pacing(shared_pool, &bucket_key, config, now_ms).await?
     {
@@ -1085,15 +1053,8 @@ fn retry_after_ms(now_ms: i64, window_start_ms: i64, window_ms: u64) -> u64 {
         .max(1)
 }
 
-fn bucket_key(scope: ProviderAdmissionScope, provider: &str, model: &str) -> String {
-    let raw = match scope {
-        ProviderAdmissionScope::Provider => format!("provider:{}", normalize_key_part(provider)),
-        ProviderAdmissionScope::ProviderModel => format!(
-            "provider_model:{}:{}",
-            normalize_key_part(provider),
-            normalize_key_part(model)
-        ),
-    };
+fn bucket_key(provider: &str) -> String {
+    let raw = format!("provider:{}", normalize_key_part(provider));
     truncate_to_bytes(raw, MAX_BUCKET_KEY_BYTES)
 }
 
@@ -1134,13 +1095,6 @@ fn parse_mode(raw: &str) -> ProviderAdmissionMode {
     }
 }
 
-fn parse_scope(raw: &str) -> ProviderAdmissionScope {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "provider_model" | "model" | "provider:model" => ProviderAdmissionScope::ProviderModel,
-        _ => ProviderAdmissionScope::Provider,
-    }
-}
-
 fn read_positive_u64(name: &str) -> Option<u64> {
     env::var(name)
         .ok()
@@ -1148,19 +1102,9 @@ fn read_positive_u64(name: &str) -> Option<u64> {
         .filter(|value| *value > 0)
 }
 
-fn read_bool(name: &str) -> Option<bool> {
-    env::var(name)
-        .ok()
-        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, sync::OnceLock};
+    use std::{ffi::OsString, sync::Arc, sync::Mutex as StdMutex, sync::OnceLock};
 
     use tokio::sync::Mutex;
 
@@ -1169,6 +1113,69 @@ mod tests {
     fn metrics_test_lock() -> Arc<Mutex<()>> {
         static LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
         LOCK.get_or_init(|| Arc::new(Mutex::new(()))).clone()
+    }
+
+    fn env_test_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(Default::default)
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            unsafe { env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            unsafe { env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_reads_only_capacity_inputs_and_keeps_internal_policy_fixed() {
+        let _guard = env_test_lock().lock().expect("env test lock poisoned");
+        let _mode = EnvVarGuard::set(ENV_MODE, "db_fixed_window");
+        let _rpm = EnvVarGuard::set(ENV_RPM, "60");
+        let _tpm = EnvVarGuard::set(ENV_TPM, "120000");
+        let _capacity_rpm = EnvVarGuard::remove(ENV_CAPACITY_RPM);
+        let _capacity_tpm = EnvVarGuard::remove(ENV_CAPACITY_TPM);
+        let _legacy_window = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_WINDOW_MS", "1000");
+        let _legacy_retention =
+            EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RETENTION_WINDOWS", "1");
+        let _legacy_cleanup =
+            EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_CLEANUP_INTERVAL_MS", "1");
+        let _legacy_scope = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_SCOPE", "model");
+        let _legacy_fail_open = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_FAIL_OPEN", "1");
+
+        let config = ProviderAdmissionConfig::from_env();
+
+        assert_eq!(config.mode, ProviderAdmissionMode::DbFixedWindow);
+        assert_eq!(config.rpm_limit, Some(60));
+        assert_eq!(config.tpm_limit, Some(120_000));
+        assert_eq!(config.window_ms, DEFAULT_WINDOW_MS);
+        assert_eq!(config.retention_windows, DEFAULT_RETENTION_WINDOWS);
+        assert_eq!(config.cleanup_interval_ms, DEFAULT_CLEANUP_INTERVAL_MS);
+        assert_eq!(config.scope_label(), "provider");
+        assert!(!config.fail_open);
     }
 
     #[test]
@@ -1225,18 +1232,8 @@ mod tests {
 
     #[test]
     fn bucket_key_keeps_metrics_labels_out_of_the_database_key() {
-        assert_eq!(
-            bucket_key(ProviderAdmissionScope::Provider, "Anthropic", "ignored"),
-            "provider:anthropic"
-        );
-        assert_eq!(
-            bucket_key(
-                ProviderAdmissionScope::ProviderModel,
-                "OpenAI Proxy",
-                "GPT-4.1/Preview"
-            ),
-            "provider_model:openai_proxy:gpt-4.1_preview"
-        );
+        assert_eq!(bucket_key("Anthropic"), "provider:anthropic");
+        assert_eq!(bucket_key("OpenAI Proxy"), "provider:openai_proxy");
     }
 
     #[test]
