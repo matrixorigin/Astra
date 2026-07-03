@@ -15,7 +15,9 @@ use crossterm::style::Stylize;
 use std::time::Duration;
 
 use super::session_guard::{ShutdownSignal, clear_panic_guard};
-use crate::cli::cli_config::cli_utils::clear_profile_last_session_if_matches_or_warn;
+use crate::cli::cli_config::cli_utils::{
+    clear_profile_last_session_if_matches_or_warn, cli_user_id,
+};
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::cli::session::session_state::SessionState;
 use crate::edge_tools;
@@ -109,7 +111,14 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
     //    selector calls return in well under 5s.
     if let Some(svc) = state.session_memory_extractor.as_ref() {
         if let Some(session_id) = state.session_id.as_deref().filter(|sid| !sid.is_empty()) {
+            let user_id = state
+                .ingestion_user_id
+                .as_deref()
+                .filter(|user_id| !user_id.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(cli_user_id);
             let _ = svc.maybe_spawn_shutdown_flush(astra_runtime::session_memory::ExtractionRequest {
+                user_id,
                 session_id: session_id.to_string(),
                 messages: super::session_projection::history_as_messages(&state.history),
                 session_facts: shutdown_session_facts(state),

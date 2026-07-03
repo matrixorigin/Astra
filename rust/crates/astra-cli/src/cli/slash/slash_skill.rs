@@ -3703,9 +3703,9 @@ async fn list_installed_marketplace(api: &astra_thin_client::ThinClient, token: 
                             );
                         }
                         eprintln!(
-                            "\n  {} {} total",
+                            "\n  {} {}",
                             "Installed:".dim(),
-                            resp.total.to_string().dim()
+                            resp.installations.len().to_string().dim()
                         );
                     }
                 }

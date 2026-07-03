@@ -21,7 +21,7 @@ pub struct InstallationResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InstalledListResponse {
     pub installations: Vec<InstallationResponse>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: i64,
     pub next_cursor: Option<InstalledListCursor>,
 }
@@ -421,13 +421,6 @@ impl MarketplaceService for DatabaseMarketplaceService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let limit = validate_installed_list_limit(limit);
 
-        let count_row = query("SELECT COUNT(*) AS cnt FROM skill_installations WHERE user_id = ?")
-            .bind(&user_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
-        let total: i64 = count_row.try_get("cnt").map_err(internal_error)?;
-
         let list_sql = if cursor.is_some() {
             format!(
                 "SELECT {INSTALLED_LIST_SELECT} FROM skill_installations WHERE user_id = ? \
@@ -474,7 +467,7 @@ impl MarketplaceService for DatabaseMarketplaceService {
 
         Ok(InstalledListResponse {
             installations,
-            total,
+            total: None,
             limit,
             next_cursor,
         })
@@ -787,5 +780,23 @@ mod tests {
         assert!(!sql.to_ascii_uppercase().contains(" OFFSET "));
         assert!(sql.contains("installed_at < ?"));
         assert!(sql.contains("installation_id < ?"));
+    }
+
+    #[test]
+    fn list_installed_hot_path_does_not_count_rows() {
+        let body = include_str!("marketplace.rs")
+            .split("impl MarketplaceService for DatabaseMarketplaceService")
+            .nth(1)
+            .expect("database marketplace service impl")
+            .split("async fn list_installed(")
+            .nth(1)
+            .expect("database list_installed body")
+            .split("async fn save_credential(")
+            .next()
+            .expect("database list_installed body end");
+        assert!(
+            !body.contains("COUNT(*)"),
+            "installed skills list uses seek pagination and must not count skill_installations"
+        );
     }
 }
