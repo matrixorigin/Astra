@@ -46,25 +46,25 @@ ls -lt /tmp/debug-*-turn*-full.json 2>/dev/null | head
 
 Evidence priority:
 
-| Source | Use |
-| --- | --- |
-| Heavy checkpoint | Exact message array sent to the model |
-| Debug full turn dump | Full turn prompt/tool snapshot when present |
-| Journal digest | Per-turn tokens, visible tools, selected skills, budget pressure, latency |
-| Source code | Owner and intended assembly rule |
+| Source               | Use                                                                       |
+| -------------------- | ------------------------------------------------------------------------- |
+| Heavy checkpoint     | Exact message array sent to the model                                     |
+| Debug full turn dump | Full turn prompt/tool snapshot when present                               |
+| Journal digest       | Per-turn tokens, visible tools, selected skills, budget pressure, latency |
+| Source code          | Owner and intended assembly rule                                          |
 
 Do not optimize from vague impressions such as "prompt feels long".
 
 ## Phase 2: Map Component Owner
 
-| Component | Owner |
-| --- | --- |
-| System prompt strings/builders | `rust/crates/runtime/src/prompts/`, `rust/crates/astra-prompts/src/` |
-| Context budget and token estimation | `rust/crates/runtime/src/prompts/context.rs`, runtime turn budget modules |
-| Tool schema surface | `rust/crates/runtime/src/tool_registry/`, `rust/crates/runtime/src/capabilities.rs`, `astra-turn-core::tool_surface` |
-| Skill instructions/listing | `rust/crates/astra-prompts/src/skills.rs`, `rust/crates/astra-skills/src/`, `.claude/skills/`, `.agent/skills/` |
-| Learning/context pipeline | `rust/crates/astra-pipeline/src/` |
-| Turn telemetry | `rust/crates/services/src/session_journal.rs`, `rust/crates/astra-cli/src/cli/journal_digest.rs` |
+| Component                           | Owner                                                                                                                |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| System prompt strings/builders      | `rust/crates/runtime/src/prompts/`, `rust/crates/astra-prompts/src/`                                                 |
+| Context budget and token estimation | `rust/crates/runtime/src/prompts/context.rs`, runtime turn budget modules                                            |
+| Tool schema surface                 | `rust/crates/runtime/src/tool_registry/`, `rust/crates/runtime/src/capabilities.rs`, `astra-turn-core::tool_surface` |
+| Skill instructions/listing          | `rust/crates/astra-prompts/src/skills.rs`, `rust/crates/astra-skills/src/`, `.claude/skills/`, `.agent/skills/`      |
+| Learning/context pipeline           | `rust/crates/astra-pipeline/src/`                                                                                    |
+| Turn telemetry                      | `rust/crates/services/src/session_journal.rs`, `rust/crates/astra-cli/src/cli/journal_digest.rs`                     |
 
 ## Phase 3: Measure Waste
 
@@ -141,4 +141,25 @@ Do not change:
 
 Verify:
 - <digest/checkpoint/test command>
+```
+
+```skill-diagnosis
+{
+  "schema_version": 2,
+  "skill": "optimize_prompt",
+  "cause": "budget_pressure",
+  "headline": "system prompt and tool surface contribute 60% of token budget with low tool utilization",
+  "findings": ["visible_tools_count=45 but only 3 tools used across 12 turns"],
+  "recommended_action": "defer rarely-used tools and trim system prompt static sections",
+  "success_criteria": [
+    {
+      "metric": "budget_pressure",
+      "operator": "lte",
+      "threshold": 0.85,
+      "window_turns": 3,
+      "description": "sustained budget pressure drops below threshold"
+    }
+  ],
+  "source": "real_skill"
+}
 ```

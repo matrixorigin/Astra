@@ -16,7 +16,7 @@
 //!   • blocks with malformed JSON (→ None)
 //!   • oversized fields (→ truncated to caps, parser still returns Some)
 
-use astra_skills::auto_invoke::{SKILL_DIAGNOSIS_SCHEMA_VERSION, SkillDiagnosis};
+use astra_skills::auto_invoke::{SkillDiagnosis, SKILL_DIAGNOSIS_SCHEMA_VERSION};
 
 // ─── Happy path ────────────────────────────────────────────────────────────
 
@@ -269,7 +269,10 @@ fn skill_md_example_blocks_are_parseable() {
         .expect("walk up to repo root");
 
     for skill_name in ["analyze_session", "optimize_prompt"] {
-        let path = repo_root.join("skills").join(skill_name).join("SKILL.md");
+        let path = repo_root
+            .join(".agent/skills")
+            .join(skill_name)
+            .join("SKILL.md");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let diag = SkillDiagnosis::parse_from_skill_output(&text)
@@ -293,7 +296,7 @@ fn review_changes_skill_requires_parallel_fallback_and_self_critique_gate() {
         .nth(3)
         .expect("walk up to repo root");
     let path = repo_root
-        .join("skills")
+        .join(".agent/skills")
         .join("review_changes")
         .join("SKILL.md");
     let text =

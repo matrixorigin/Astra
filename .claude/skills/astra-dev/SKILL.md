@@ -20,19 +20,29 @@ allowed_tools:
 
 # Astra Dev
 
-Use this as an execution workflow, not as a project encyclopedia. The goal is to
-identify the owning crate, preserve the intent of existing edits, change the
-smallest correct surface, and verify with the narrowest gate that proves the behavior.
+Use this as an engineering state machine, not as a project encyclopedia.
+The loop is:
+
+```text
+Explore -> Integrate -> Execute -> Verify
+             ^            |
+             |            v
+        Re-open only on explicit invalidation
+```
+
+The goal is to identify the owning crate, preserve the intent of existing edits,
+convert known facts into an executable checklist, change the smallest correct
+surface, and verify with the narrowest gate that proves the behavior.
 
 ## Task
 
 $ARGUMENTS
 
-## Phase 1: Understand Task (finish in about 3 minutes)
+## Phase 1: Explore Task (finish in about 3 minutes)
 
 1. Run `git status --short`.
-2. If focus files are known, run `git log --oneline -10 -- <FILES>` and inspect the current diff for those files.
-3. Read only the owning module and its immediate caller/callee. Use the Ownership Map below.
+2. If focus files are known, inspect both staged and unstaged diffs for them, then run `git log --oneline -10 -- <FILES>`.
+3. Read only the owning module and the immediate caller/callee needed to explain the change. Use the Ownership Map below.
 4. State the task location in one line:
 
 ```text
@@ -47,26 +57,68 @@ Rules:
 - Treat uncommitted changes as intentional until disproven.
 - If you cannot explain the intent of a previous edit, inspect more before replacing it.
 - Do not read every design document up front; load context only when it changes a decision.
+- Stop exploring when you can name the owner, contract boundary, and intended behavior.
 
-## Phase 2: Plan Only When It Pays
+## Phase 2: Integrate Findings
 
-Create an explicit plan before editing when the task touches more than 3 files, more than 1 crate, runtime plus services, persistence schema, prompt/tool visibility, delegation, or any user-visible workflow.
+Before editing, convert discoveries into a compact execution record. Do this even
+when the task is small; keep it brief for one-file fixes.
 
-If the host supports plan mode, enter it for those cases. Otherwise write a short checklist and update it as work completes.
+```text
+Facts:
+- <session-stable facts: owner, files, functions, invariants, review findings>
 
-Skip a formal plan for narrow one-file fixes once Phase 1 has identified the owner.
+Assumptions:
+- <claims that tests or compilation must confirm>
 
-## Phase 3: Execute
+Edit checklist:
+- [ ] <file>: <region/function>; <change>; <invariant preserved>
 
-1. Read the target region immediately before editing.
-2. Edit the owning module first. Change callers only when the contract changes.
-3. For Rust code, after each logical edit batch run a narrow compile gate:
+Verification:
+- <narrowest command(s) proving the behavior>
+
+Re-open conditions:
+- <what would justify returning to exploration>
+```
+
+Use an explicit plan before editing when the task touches more than 3 files, more
+than 1 crate, runtime plus services, persistence schema, prompt/tool visibility,
+delegation, or any user-visible workflow. If the host supports plan mode, enter
+it for those cases. Otherwise keep the checklist current.
+
+Information durability:
+
+- Session-stable: user goal, prior edit intent, owning file/module, function names,
+  contracts, review findings, and invariants until an invalidation occurs.
+- Volatile: line numbers after edits, test output, command output, branch status,
+  diff context, runtime state, and anything another process may have changed.
+- Do not re-grep a session-stable fact just because it came from a previous review
+  or checklist.
+
+Re-open exploration only when one of these happens:
+
+- Target text or local context no longer matches.
+- A patch/edit fails.
+- Compile or test output contradicts the model.
+- The user changes the goal or scope.
+- The worktree changes outside your edits.
+- A contract boundary is unknown and affects the edit.
+
+## Phase 3: Execute Checklist
+
+1. Work checklist items in dependency order.
+2. Immediately before each edit, read the smallest complete local context needed
+   to patch safely. Usually this is 20-80 lines around the target, not a whole file.
+3. Do not use broad `grep`/`glob` during execution unless it tests a specific
+   hypothesis from the checklist or a re-open condition fired.
+4. Edit the owning module first. Change callers only when the contract changes.
+5. For Rust code, after each logical edit batch run a narrow compile gate:
 
 ```bash
 cd rust && cargo check -p <crate>
 ```
 
-4. Add or update tests at the same layer as the behavior:
+6. Add or update tests at the same layer as the behavior:
 
 - Pure helper behavior: unit test in the owning crate.
 - Runtime/turn behavior: focused runtime or turn-core test.
@@ -74,7 +126,7 @@ cd rust && cargo check -p <crate>
 - CLI behavior: CLI parser/rendering test or focused command test.
 - Skill/docs change: frontmatter/path/stale-reference validation, not a Rust build.
 
-5. If compatibility is explicitly out of scope, delete the obsolete path instead of layering a second model.
+7. If compatibility is explicitly out of scope, delete the obsolete path instead of layering a second model.
 
 ## Phase 4: Failure Triage
 

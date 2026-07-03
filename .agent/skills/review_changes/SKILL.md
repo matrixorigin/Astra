@@ -16,6 +16,7 @@ allowed_tools:
   - grep
   - glob
   - git
+  - agent
 ---
 
 # Review Changes
@@ -39,19 +40,23 @@ git diff --stat
 
 Target resolution:
 
-| Target | Diff command |
-| --- | --- |
-| omitted / unstaged+staged | `git diff` plus `git diff --cached` when staged changes exist |
-| `staged` | `git diff --cached` |
-| `unstaged` | `git diff` |
-| `branch:<name>` | `git diff <name>...HEAD` |
-| `commit:<sha>` | `git show --stat <sha>` then `git show <sha>` |
-| `commits:<N>` | `git log --oneline -N`, then `git show` for every one of the N commits |
-| `pr:<number>` / PR URL | `gh pr diff` if `gh` is installed and authenticated; otherwise ask for the diff |
+| Target                    | Diff command                                                                    |
+| ------------------------- | ------------------------------------------------------------------------------- |
+| omitted / unstaged+staged | `git diff` plus `git diff --cached` when staged changes exist                   |
+| `staged`                  | `git diff --cached`                                                             |
+| `unstaged`                | `git diff`                                                                      |
+| `branch:<name>`           | `git diff <name>...HEAD`                                                        |
+| `commit:<sha>`            | `git show --stat <sha>` then `git show <sha>`                                   |
+| `commits:<N>`             | `git log --oneline -N`, then `git show` for every one of the N commits          |
+| `pr:<number>` / PR URL    | `gh pr diff` if `gh` is installed and authenticated; otherwise ask for the diff |
 
 If the diff is empty after checking staged and unstaged changes, report "No changes found."
 
 Hard rule for `commits:<N>`: fetch all N full diffs before presenting a full review. If only K of N are available, label the review partial before findings.
+
+If the user requests parallel reviews or multiple reviewers, use `git worktree` to create
+isolated checkouts — never degrade to serial execution when the user explicitly asked for
+parallelism.
 
 ## Step 2: Build Review Map
 
@@ -90,6 +95,10 @@ Do not report:
 - issues already fixed later in the same diff or commit range.
 
 ## Output Contract
+
+Self-critique gate: before publishing the final report, re-scan the diff with
+`git diff --check` to catch trailing whitespace and merge-conflict markers that
+may have been introduced.
 
 Findings first, ordered by severity:
 
