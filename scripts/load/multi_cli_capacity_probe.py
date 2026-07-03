@@ -876,43 +876,53 @@ async def bootstrap_tokens(args: argparse.Namespace, requested_count: int) -> li
     return generated
 
 
-async def metrics_sampler(
+async def sample_metrics_once(
     args: argparse.Namespace,
     writer: OutputWriter,
-    stop_event: asyncio.Event,
+    sample_kind: str,
 ) -> None:
     metrics_url = merge_base_url(args.base_url, args.metrics_path)
     headers = {}
     if args.metrics_auth_token:
         headers["authorization"] = f"Bearer {strip_bearer(args.metrics_auth_token)}"
-    while not stop_event.is_set():
-        unix_ms = int(time.time() * 1000)
-        try:
-            response = await http_request(
-                "GET",
-                metrics_url,
-                headers,
-                None,
-                args.connect_timeout_secs,
-                min(args.request_timeout_secs, 30),
-            )
-            raw = response.body.decode("utf-8", errors="replace")
-            sample = {
+    unix_ms = int(time.time() * 1000)
+    try:
+        response = await http_request(
+            "GET",
+            metrics_url,
+            headers,
+            None,
+            args.connect_timeout_secs,
+            min(args.request_timeout_secs, 30),
+        )
+        raw = response.body.decode("utf-8", errors="replace")
+        sample = {
+            "unix_ms": unix_ms,
+            "sample_kind": sample_kind,
+            "http_status": response.status,
+            "metrics": parse_prometheus_metrics(raw),
+        }
+        await writer.write_metrics(sample, raw)
+    except Exception as exc:  # noqa: BLE001
+        await writer.write_metrics(
+            {
                 "unix_ms": unix_ms,
-                "http_status": response.status,
-                "metrics": parse_prometheus_metrics(raw),
-            }
-            await writer.write_metrics(sample, raw)
-        except Exception as exc:  # noqa: BLE001
-            await writer.write_metrics(
-                {
-                    "unix_ms": unix_ms,
-                    "http_status": None,
-                    "error": str(exc),
-                    "metrics": {},
-                },
-                "",
-            )
+                "sample_kind": sample_kind,
+                "http_status": None,
+                "error": str(exc),
+                "metrics": {},
+            },
+            "",
+        )
+
+
+async def metrics_sampler(
+    args: argparse.Namespace,
+    writer: OutputWriter,
+    stop_event: asyncio.Event,
+) -> None:
+    while not stop_event.is_set():
+        await sample_metrics_once(args, writer, "periodic")
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=args.metrics_interval_secs)
         except asyncio.TimeoutError:
@@ -1021,6 +1031,7 @@ async def run_probe(args: argparse.Namespace) -> int:
         await asyncio.gather(*(worker(i) for i in range(args.concurrency)))
         stop_metrics.set()
         await sampler
+        await sample_metrics_once(args, writer, "final")
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         metrics_summary = summarize_metrics_file(writer.metrics_path)
         metrics_summary["control_plane"] = summarize_control_plane_metrics(

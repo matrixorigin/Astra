@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import importlib.util
 import json
 import sys
@@ -227,6 +229,118 @@ class CapacityProbeTests(unittest.TestCase):
         probe.validate_args(args)
 
         self.assertIsNone(args.max_control_plane_polls_per_worker_per_sec)
+
+    def test_run_probe_records_final_metrics_sample_after_workers_finish(self) -> None:
+        async def run_case(output_dir: Path) -> int:
+            args = argparse.Namespace(
+                profile="100-cli",
+                concurrency=1,
+                total=1,
+                output_dir=output_dir,
+                body_template=None,
+                dry_run=False,
+                base_url="http://127.0.0.1:17001",
+                endpoint="/chat/stream",
+                metrics_path="/metrics",
+                metrics_auth_token=None,
+                auth_token="test-token",
+                token_file=None,
+                register_users=False,
+                register_concurrency=1,
+                require_distinct_users=True,
+                user_mode="worker",
+                message="capacity probe request {request_id}",
+                agent_id=None,
+                model="capacity-mock",
+                session_id_template=None,
+                connect_timeout_secs=1.0,
+                request_timeout_secs=5.0,
+                metrics_interval_secs=60.0,
+                require_metrics=True,
+                require_error_codes_for_failures=True,
+                require_no_critical_ingestion_drops=False,
+                require_no_run_control_errors=False,
+                require_no_durable_event_errors=False,
+                require_no_edge_dispatch_errors=False,
+                max_control_plane_polls_per_worker_per_sec=None,
+                max_edge_dispatch_errors_per_sec=None,
+                progress_every=1,
+            )
+
+            async def fake_http_request(
+                method: str,
+                url_text: str,
+                headers: dict[str, str],
+                body: bytes | None,
+                connect_timeout_secs: float,
+                request_timeout_secs: float,
+            ) -> probe.HttpResponse:
+                del method, url_text, headers, body, connect_timeout_secs, request_timeout_secs
+                fake_http_request.calls += 1
+                raw = "astra_capacity_run_slots_total 1\n"
+                if fake_http_request.calls >= 2:
+                    raw += (
+                        'astra_durable_run_event_batches_total{path="streaming_terminal",'
+                        'outcome="committed",compacted="false"} 1\n'
+                    )
+                return probe.HttpResponse(
+                    status=200,
+                    reason="OK",
+                    headers={},
+                    body=raw.encode("utf-8"),
+                    header_latency_ms=1.0,
+                )
+
+            fake_http_request.calls = 0
+
+            async def fake_stream_sse_request(**kwargs: object) -> probe.StreamResult:
+                del kwargs
+                await asyncio.sleep(0.01)
+                return probe.StreamResult(
+                    request_id=0,
+                    user_index=0,
+                    token_index=0,
+                    http_status=200,
+                    header_latency_ms=1.0,
+                    first_event_ms=1.0,
+                    duration_ms=10.0,
+                    event_count=2,
+                    session_id="session-1",
+                    run_id="run-1",
+                    terminal_status="completed",
+                    error_code=None,
+                    error_message=None,
+                    retryable=None,
+                    outcome="completed",
+                )
+
+            original_http_request = probe.http_request
+            original_stream_sse_request = probe.stream_sse_request
+            try:
+                probe.http_request = fake_http_request
+                probe.stream_sse_request = fake_stream_sse_request
+                return await probe.run_probe(args)
+            finally:
+                probe.http_request = original_http_request
+                probe.stream_sse_request = original_stream_sse_request
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = asyncio.run(run_case(output_dir))
+            samples = [
+                json.loads(line)
+                for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertGreaterEqual(len(samples), 2)
+        self.assertEqual(samples[-1]["sample_kind"], "final")
+        self.assertEqual(summary["metrics"]["durable_run_events"]["batches_last_total"], 1.0)
+        self.assertEqual(summary["metrics"]["durable_run_events"]["batches_delta_total"], 1.0)
 
     def test_summarize_metrics_file_reports_empty_prefixed_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
