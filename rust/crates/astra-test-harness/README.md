@@ -8,7 +8,7 @@ matchers + optional LLM judger), and emits a scored report.
 ## Why a dedicated harness
 
 Unit and integration tests prove code correctness; this harness
-proves *end-to-end behavior* — that a model, wired through the astra
+proves _end-to-end behavior_ — that a model, wired through the astra
 CLI against a running server, produces the expected tool-call
 sequence, session state, and performance characteristics. The
 existing runtime tests exercise components in isolation; the harness
@@ -77,7 +77,7 @@ description: |
 prompt: |
   You have a spawn_agent tool. Spawn child "G1", task
   "Reply: inherited-ok", inherit_prefix: {}. Surface the reply.
-debug_log: true            # turn on session journal capture
+debug_log: true # turn on session journal capture
 timeout_seconds: 240
 criteria:
   - type: exit_code
@@ -109,33 +109,33 @@ criteria:
 
 ### Criteria types
 
-| Type | What passes | Data source |
-|------|-------------|-------------|
-| `exit_code { code }` | subprocess exit equals `code` | envelope |
-| `tool_called { name }` | `tools_used` envelope contains `name` | envelope |
-| `tools_count_between { min, max }` | `tool_calls_count` inclusive | envelope |
-| `tool_sequence { tools }` | `tools_used` contains tools as ordered subsequence | envelope |
-| `tokens_between { min, max }` | total tokens (prompt + completion) in range | envelope |
-| `duration_between { min_ms, max_ms }` | wall-clock duration in range | envelope |
-| `turn_rounds_between { min, max }` | LLM round-trips (StepStarted events) in range | step_events |
-| `cache_rate_above { threshold }` | tool cache hit rate ≥ threshold (0.0–1.0) | step_events |
-| `prompt_cache_tokens { min_read, min_creation }` | provider prompt-cache read/write token buckets meet minimums | envelope |
-| `stderr_matches { pattern }` | multi-line regex on stderr | stderr |
-| `text_contains { needle }` | substring in final text | envelope |
-| `fork_cache_outcome { expect }` | `[fork-cache]` event `outcome` ∈ `expect` | stderr |
-| `session_event_count { event_type, min, optional }` | journal has ≥ `min` events of that type | journal |
-| `journal_tool_called { name, optional }` | tool name appears in journal `tool_calls` | journal |
-| `judger { question, threshold, model }` | LLM scores ≥ threshold | LLM |
+| Type                                                | What passes                                                  | Data source |
+| --------------------------------------------------- | ------------------------------------------------------------ | ----------- |
+| `exit_code { code }`                                | subprocess exit equals `code`                                | envelope    |
+| `tool_called { name }`                              | `tools_used` envelope contains `name`                        | envelope    |
+| `tools_count_between { min, max }`                  | `tool_calls_count` inclusive                                 | envelope    |
+| `tool_sequence { tools }`                           | `tools_used` contains tools as ordered subsequence           | envelope    |
+| `tokens_between { min, max }`                       | total tokens (prompt + completion) in range                  | envelope    |
+| `duration_between { min_ms, max_ms }`               | wall-clock duration in range                                 | envelope    |
+| `turn_rounds_between { min, max }`                  | LLM round-trips (StepStarted events) in range                | step_events |
+| `cache_rate_above { threshold }`                    | tool cache hit rate ≥ threshold (0.0–1.0)                    | step_events |
+| `prompt_cache_tokens { min_read, min_creation }`    | provider prompt-cache read/write token buckets meet minimums | envelope    |
+| `stderr_matches { pattern }`                        | multi-line regex on stderr                                   | stderr      |
+| `text_contains { needle }`                          | substring in final text                                      | envelope    |
+| `fork_cache_outcome { expect }`                     | `[fork-cache]` event `outcome` ∈ `expect`                    | stderr      |
+| `session_event_count { event_type, min, optional }` | journal has ≥ `min` events of that type                      | journal     |
+| `journal_tool_called { name, optional }`            | tool name appears in journal `tool_calls`                    | journal     |
+| `judger { question, threshold, model }`             | LLM scores ≥ threshold                                       | LLM         |
 
 ### Criterion severity levels
 
 Each criterion has a severity that controls how failures are treated:
 
-| Severity | Meaning | Criteria types |
-|----------|---------|----------------|
-| **Hard** | Fundamental correctness — failure means the case did not work. Blocks the LLM judger from running (no point scoring a broken run). | `exit_code`, `tool_called`, `text_contains`, `tool_sequence`, `fork_cache_outcome` |
-| **Soft** | Efficiency / performance bounds — failure means the case worked but outside acceptable limits. Does NOT block the judger. | `tools_count_between`, `tokens_between`, `duration_between`, `turn_rounds_between`, `cache_rate_above`, `prompt_cache_tokens`, `stderr_matches` |
-| **Quality** | Continuous quality score (0.0-1.0) rather than binary pass/fail. | `judger`, `session_event_count`, `journal_tool_called` |
+| Severity    | Meaning                                                                                                                            | Criteria types                                                                                                                                  |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Hard**    | Fundamental correctness — failure means the case did not work. Blocks the LLM judger from running (no point scoring a broken run). | `exit_code`, `tool_called`, `text_contains`, `tool_sequence`, `fork_cache_outcome`                                                              |
+| **Soft**    | Efficiency / performance bounds — failure means the case worked but outside acceptable limits. Does NOT block the judger.          | `tools_count_between`, `tokens_between`, `duration_between`, `turn_rounds_between`, `cache_rate_above`, `prompt_cache_tokens`, `stderr_matches` |
+| **Quality** | Continuous quality score (0.0-1.0) rather than binary pass/fail.                                                                   | `judger`, `session_event_count`, `journal_tool_called`                                                                                          |
 
 Severity is assigned automatically based on criterion type (see
 `criterion_severity()` in `src/criteria.rs`). Case authors do not set
@@ -186,7 +186,7 @@ The harness's LLM judger scores free-form questions ("did the agent
 correctly do X?"). Key features:
 
 - **Anti-gaming rubric**: the prompt's data sections are wrapped in
-  fenced `` ```data `` blocks with an explicit preamble calling out
+  fenced ` ```data ` blocks with an explicit preamble calling out
   untrusted data. A fabricated `SCORE:` line in an agent's output
   can't hijack the judge's output.
 - **Sees stderr**: the `[fork-cache]` / `[selector]` observability
@@ -285,12 +285,12 @@ environment is healthy.
 
 Every FAIL is auto-classified into one of:
 
-| Class | Meaning | Suggested action |
-|-------|---------|-----------------|
-| `Infra` | timeout, spawn error, rate limit | retry / check server |
-| `Model` | wrong answer, bad tool choice | adjust prompt or model |
-| `Platform` | exit ≠ 0 with tool errors | investigate astra bug |
-| `Flaky` | passes on retry | add to flaky watchlist |
+| Class      | Meaning                          | Suggested action       |
+| ---------- | -------------------------------- | ---------------------- |
+| `Infra`    | timeout, spawn error, rate limit | retry / check server   |
+| `Model`    | wrong answer, bad tool choice    | adjust prompt or model |
+| `Platform` | exit ≠ 0 with tool errors        | investigate astra bug  |
+| `Flaky`    | passes on retry                  | add to flaky watchlist |
 
 ## Design principles
 
@@ -321,5 +321,5 @@ rounds' worth of drift; the integration tests under
 - `astra journal digest` — stable aggregate metrics for a session.
 - `astra journal tree` — delegation / sub-run tree view.
 - `astra journal diff A B` — compare two runs.
-- `skills/analyze_session` — human workflow for single-session
+- `.agent/skills/analyze_session` — human workflow for single-session
   analysis (superseded in automation by this harness).

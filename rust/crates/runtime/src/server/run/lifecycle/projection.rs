@@ -40,7 +40,13 @@ pub(super) struct AgentProgressStreamBridge {
 impl AgentProgressStreamBridge {
     pub(super) async fn stop_and_drain(self) -> AgentProgressLifecycleLedger {
         let _ = self.stop_tx.send(());
-        let _ = self.join.await;
+        if let Err(e) = self.join.await {
+            tracing::warn!(
+                target: "astra_runtime::projection",
+                "agent progress stream bridge task panicked or was cancelled: {:?}",
+                e,
+            );
+        }
         self.sent_lifecycle_events
     }
 }

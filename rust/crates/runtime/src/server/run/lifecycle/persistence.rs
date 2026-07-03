@@ -453,7 +453,14 @@ impl PostLoopPersistContext {
                     error = %error,
                     "post-loop: core events tx failed, rolling back MO transaction"
                 );
-                let _ = tx.rollback().await;
+                // rollback consumes the transaction; cannot use tx after this
+                if let Err(rollback_err) = tx.rollback().await {
+                    tracing::error!(
+                        session_id = %self.session_id,
+                        error = %rollback_err,
+                        "post-loop: rollback also failed after core events tx error"
+                    );
+                }
                 return Err(msg);
             }
         }

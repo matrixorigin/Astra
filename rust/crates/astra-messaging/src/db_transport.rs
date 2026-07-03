@@ -208,9 +208,21 @@ async fn recreate_legacy_agent_message_queue_if_needed(
         return Ok(());
     }
 
+    // Safety gate: refuse auto-migration; require explicit operator opt-in.
+    let force_migrate = std::env::var("ASTRA_MSG_QUEUE_MIGRATE_DROP_LEGACY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !force_migrate {
+        return Err(sqlx::Error::Protocol(
+            "legacy agent_message_queue schema detected (AUTO_INCREMENT `id` column). \
+             Drain all pending messages, then set ASTRA_MSG_QUEUE_MIGRATE_DROP_LEGACY=true to recreate."
+                .into(),
+        ));
+    }
+
     tracing::warn!(
         target: "astra_runtime::messaging::db_transport",
-        "recreating legacy agent_message_queue schema with global AUTO_INCREMENT id; drain pending messages before rollout if queue preservation matters"
+        "ASTRA_MSG_QUEUE_MIGRATE_DROP_LEGACY=true: dropping legacy agent_message_queue and agent_message_broadcast_delivery"
     );
     query("DROP TABLE IF EXISTS agent_message_broadcast_delivery")
         .execute(pool)
@@ -702,31 +714,31 @@ async fn poll_loop(
                     for row in rows {
                         let message_id: Option<String> = row.try_get("message_id").ok();
                         if message_id.is_none() {
+                            had_error = true;
                             metrics
-                                .messages_dropped
+                                .poll_errors
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            match mark_direct_failed_by_identity(
+                            if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
                                 &pool,
-                                message_id.as_deref(),
                                 &consumer_id,
+                                &claim_token,
+                                max_delivery_attempts,
                             )
                             .await
                             {
-                                Ok(()) => continue,
-                                Err(e) => {
-                                    had_error = true;
-                                    metrics
-                                        .poll_errors
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                        "  ⚠ messaging: failed to dead-letter direct row without message_id for {}@{}: {:?}",
-                                        addr.agent_id,
-                                        addr.run_id,
-                                        e
-                                    );
-                                    break;
-                                }
+                                tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                    "  ⚠ messaging: failed to release direct claimed batch after missing message_id for {}@{}: {:?}",
+                                    addr.agent_id,
+                                    addr.run_id,
+                                    e
+                                );
                             }
+                            tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                "  ⚠ messaging: claimed direct row without message_id for {}@{}; released current claim batch",
+                                addr.agent_id,
+                                addr.run_id,
+                            );
+                            break;
                         }
                         let json: String = match row.try_get("payload_json") {
                             Ok(j) => j,
@@ -1618,6 +1630,17 @@ mod tests {
         assert!(
             poll_body.contains("claim_token = ?"),
             "direct claim fetch must use claim_token rather than claimed_at_ms as the batch discriminator"
+        );
+        let missing_message_id_branch = poll_body
+            .split("if message_id.is_none()")
+            .nth(1)
+            .and_then(|rest| rest.split("let json: String").next())
+            .expect("missing message_id branch");
+        assert!(
+            missing_message_id_branch.contains("had_error = true")
+                && missing_message_id_branch
+                    .contains("release_direct_claimed_batch_for_consumer_in_pool"),
+            "claimed direct rows without message_id must be treated as poll errors and release the current claim batch"
         );
 
         let helper_body = source

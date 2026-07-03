@@ -26,7 +26,7 @@ make dev-stop           # Stop all
 - `rust/crates/runtime/` — Axum HTTP server, contract tests in `tests/`
 - `rust/crates/astra-cli/` — CLI, edge tools, plan executor, code intel
 - `rust/crates/astra-cli/` — CLI (admin subcommands under `src/admin_cli/`)
-- `skills/` — Agent Skills (SKILL.md format, see `skills/README.md`)
+- `.agent/skills/` — Agent Skills (SKILL.md format, see `.agent/skills/`)
 - `web/` — Next.js admin dashboard
 
 ## Rust Conventions
@@ -117,15 +117,15 @@ Schemas must match their actual read/write/query patterns.
 4. `make format-check` — formatting
 5. For DB-dependent tests: `make dev-start` then `make test` (or `make test-online` for ignored suites only)
 
-## Built-in Skills (read `skills/<name>/SKILL.md` for full instructions)
+## Built-in Skills (read `.agent/skills/<name>/SKILL.md` for full instructions)
 
 When the user asks you to perform any of the following tasks, read the corresponding SKILL.md file first and follow its phased workflow:
 
-- **Review code changes**: `skills/review_changes/SKILL.md` — context-aware code review combining git diff with symbol-level impact analysis.
-- **Review code (test quality)**: `skills/review_code/SKILL.md` — code review focused on unhappy paths, error scenarios, E2E test coverage with real DB assertions.
-- **Verify task completion**: `skills/verify_task/SKILL.md` — run build/test/lint/grep checks against acceptance criteria, produce a delivery report.
-- **Analyze session**: `skills/analyze_session/SKILL.md` — diagnose astra session issues (token waste, tool selection, stalls, loops).
-- **Evaluate session**: `skills/evaluate_session/SKILL.md` — evaluate session performance metrics and optimization recommendations.
-- **Optimize prompt**: `skills/optimize_prompt/SKILL.md` — analyze LLM prompt assembly to reduce context bloat.
-- **Audit cloud sync**: `skills/audit_cloud_sync/SKILL.md` — audit edge-cloud sync integrity.
-- **Trace delegation**: `skills/trace_delegation/SKILL.md` — trace multi-agent delegation flows.
+- **Review code changes**: `.agent/skills/review_changes/SKILL.md` — context-aware code review combining git diff with symbol-level impact analysis.
+- **Review code (test quality)**: `.agent/skills/review_code/SKILL.md` — code review focused on unhappy paths, error scenarios, E2E test coverage with real DB assertions.
+- **Verify task completion**: `.agent/skills/verify_task/SKILL.md` — run build/test/lint/grep checks against acceptance criteria, produce a delivery report.
+- **Analyze session**: `.agent/skills/analyze_session/SKILL.md` — diagnose astra session issues (token waste, tool selection, stalls, loops).
+- **Optimize prompt**: `.agent/skills/optimize_prompt/SKILL.md` — analyze LLM prompt assembly to reduce context bloat.
+- **Audit unhappy paths**: `.agent/skills/unhappy_path_audit/SKILL.md` — systematically inspect failure modes, error propagation, and recovery coverage.
+- **Audit cloud sync**: `.agent/skills/audit_cloud_sync/SKILL.md` — audit edge-cloud sync integrity.
+- **Trace delegation**: `.agent/skills/trace_delegation/SKILL.md` — trace multi-agent delegation flows.

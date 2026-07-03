@@ -522,7 +522,17 @@ fn mock_round_error(round: &Value) -> Option<astra_core::ClassifiedError> {
 #[cfg(feature = "bridge-e2e-hooks")]
 fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String> {
     let details = error.details_json.as_deref()?;
-    let value: Value = serde_json::from_str(details).ok()?;
+    let value: Value = match serde_json::from_str(details) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(
+                target: "astra_runtime::server_loop",
+                error = %e,
+                "failed to parse error details_json; partial_text unavailable"
+            );
+            return None;
+        }
+    };
     value
         .get("partial_full_text")
         .and_then(Value::as_str)

@@ -502,10 +502,18 @@ impl RunEngine {
         } else {
             (Some(run_id.to_string()), Some(run_id.to_string()), 0)
         };
-        let selected_model_json = context
-            .selected_model
-            .as_ref()
-            .and_then(|selected_model| serde_json::to_string(selected_model).ok());
+        let selected_model_json = context.selected_model.as_ref().and_then(|m| {
+            serde_json::to_string(m)
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        target: "astra_runtime::engine",
+                        run_id = %run_id,
+                        error = %e,
+                        "failed to serialize selected_model for durable run record"
+                    );
+                })
+                .ok()
+        });
         let selected_model_name = context
             .selected_model
             .as_ref()
@@ -514,10 +522,19 @@ impl RunEngine {
             .selected_model
             .as_ref()
             .and_then(|selected_model| selected_model.gateway.clone());
-        let capability_server_refs_json = context
-            .capability_server_refs
-            .as_ref()
-            .and_then(|refs| serde_json::to_string(refs).ok());
+        let capability_server_refs_json =
+            context.capability_server_refs.as_ref().and_then(|refs| {
+                serde_json::to_string(refs)
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            target: "astra_runtime::engine",
+                            run_id = %run_id,
+                            error = %e,
+                            "failed to serialize capability_server_refs for durable run record"
+                        );
+                    })
+                    .ok()
+            });
         let runtime_profile = context
             .runtime_profile
             .map(runtime_profile_label)
@@ -782,7 +799,7 @@ impl RunEngine {
                     saw_store_error = true;
                     last_error = Some(error.clone());
                     if attempt >= TERMINAL_TRANSITION_MAX_ATTEMPTS {
-                        return Err(error);
+                        break;
                     }
                     tracing::warn!(
                         user_id,
@@ -2556,6 +2573,31 @@ mod tests {
                     .and_then(serde_json::Value::as_str)
             }),
             Some(STATUS_CANCELLED)
+        );
+    }
+
+    #[test]
+    fn terminal_reconcile_projection_refresh_is_warn_only() {
+        let source = include_str!("engine.rs");
+        let reconcile_body = source
+            .split("async fn reconcile_terminal_transition_after_store_error")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn project_delegation_run_if_needed")
+                    .next()
+            })
+            .expect("terminal reconcile body");
+
+        assert!(
+            reconcile_body.contains("project_delegation_run_if_needed"),
+            "terminal reconcile must still refresh delegated run projections"
+        );
+        assert!(
+            !reconcile_body.contains("propagating error")
+                && !reconcile_body.contains(
+                    "terminal transition reconciled but delegation projection refresh failed:"
+                ),
+            "projection refresh failure must not overturn a reconciled durable terminal transition"
         );
     }
 

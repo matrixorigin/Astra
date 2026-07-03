@@ -140,6 +140,7 @@ WHERE bucket_key = ?
 const CLEANUP_WINDOWS_SQL: &str = r#"
 DELETE FROM llm_provider_admission_windows
 WHERE window_start_ms < ?
+LIMIT ?
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -741,6 +742,7 @@ async fn cleanup_stale_windows(
     let cutoff_ms = cleanup_cutoff_ms(now_ms, config.window_ms, config.retention_windows);
     let result = sqlx::query(CLEANUP_WINDOWS_SQL)
         .bind(cutoff_ms)
+        .bind(10_000i64)
         .execute(shared_pool.get())
         .await
         .map_err(database_error)?;

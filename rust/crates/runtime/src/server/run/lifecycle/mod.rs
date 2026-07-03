@@ -6634,7 +6634,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         };
         if let Some(live_tx) = live_tx {
             for event in live_events {
-                let _ = live_tx.send(event);
+                if live_tx.send(event).is_err() {
+                    tracing::warn!(
+                        target: "astra_runtime::lifecycle",
+                        run_id = %run_id,
+                        "live event channel closed; event fanout may be incomplete"
+                    );
+                    break;
+                }
             }
         }
 
