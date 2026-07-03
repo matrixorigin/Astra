@@ -22,6 +22,7 @@ pub mod event_coordinator;
 pub mod event_ingestion;
 pub mod events;
 pub mod harness;
+pub mod interaction_contract;
 pub mod introspection;
 pub mod jobs;
 pub mod llm_trusted_domains;
@@ -195,6 +196,10 @@ pub use harness::{
     SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifyAgentRule,
     SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
     SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
+};
+pub use interaction_contract::{
+    InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
+    InteractionStatus, approval_decision_status, ask_user_response_status, edge_dispatch_status,
 };
 pub use introspection::{
     DatabaseIntrospectionService, IntrospectionService, UnconfiguredIntrospectionService,
