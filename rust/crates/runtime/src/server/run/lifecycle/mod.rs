@@ -2842,6 +2842,7 @@ impl AgenticRunLifecycleService {
     fn build_runtime_manifest(
         request: &ChatRequestData,
         runtime_capabilities: &PreparedRuntimeCapabilities,
+        workspace_executor_admitted: bool,
     ) -> Option<Value> {
         let selected_model = request.selected_model.as_ref()?;
         let selected_model_json = json!({
@@ -2881,7 +2882,13 @@ impl AgenticRunLifecycleService {
                 "attachments": &request.attachments,
                 "edge_executor_id": &request.edge_executor_id,
                 "capabilities": &request.capabilities,
+                "requested_capabilities": &request.capabilities,
                 "context": turn_context
+            },
+            "capacity_resolution": {
+                "requested_capabilities": &request.capabilities,
+                "workspace_executor_admitted": workspace_executor_admitted,
+                "server_builtin_surface": "server_service_control_plane_only"
             }
         });
 
@@ -4625,19 +4632,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             Some(workspace)
         } else if let Some(workspace) = server_workspace.clone() {
             Some(workspace)
-        } else if (server_side_tool_catalog || requires_runtime_mcp_executor)
-            && execution_bindings.is_some()
-        {
-            match self.provision_server_workspace(&session_id) {
-                Ok(workspace) => Some(workspace),
-                Err(error) => {
-                    self.runs.write().await.remove(&run_id);
-                    return Err(error);
-                }
-            }
         } else {
             None
         };
+        let _ = (server_side_tool_catalog, requires_runtime_mcp_executor);
 
         if let Err(error) = self
             .persist_run_start(
@@ -4719,7 +4717,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.agent_binding.as_ref(),
         );
         loop_state.context_manifest_user_id = Some(user_id.clone());
-        loop_state.runtime_manifest = Self::build_runtime_manifest(&request, &runtime_capabilities);
+        loop_state.runtime_manifest = Self::build_runtime_manifest(
+            &request,
+            &runtime_capabilities,
+            tool_runtime_workspace.is_some(),
+        );
         // Inject user_id into the harness sink used by DB-persistence tests.
         #[cfg(feature = "harness")]
         loop_state.harness.set_user_id(&user_id);
@@ -5519,7 +5521,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.agent_binding.as_ref(),
         );
         state.context_manifest_user_id = Some(user_id.clone());
-        state.runtime_manifest = Self::build_runtime_manifest(&request, &runtime_capabilities);
+        state.runtime_manifest = Self::build_runtime_manifest(
+            &request,
+            &runtime_capabilities,
+            tool_runtime_workspace.is_some(),
+        );
         // Inject user_id into the harness sink used by DB-persistence tests.
         #[cfg(feature = "harness")]
         state.harness.set_user_id(&user_id);

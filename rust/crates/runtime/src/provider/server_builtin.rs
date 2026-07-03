@@ -92,6 +92,17 @@ impl ServerBuiltinProvider {
         runtime: Arc<dyn ServerToolRuntime>,
         tools: Option<Vec<String>>,
     ) -> Self {
+        if let Some(configured_tools) = tools.as_ref() {
+            for tool in configured_tools {
+                if !SERVER_BUILTIN_TOOL_NAMES.contains(&tool.as_str()) {
+                    tracing::warn!(
+                        tool = %tool,
+                        "ignoring non-server-builtin tool in ServerBuiltinProvider whitelist; declare an explicit runtime/workspace provider for executor tools"
+                    );
+                }
+            }
+        }
+
         Self {
             priority,
             runtime,
