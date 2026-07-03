@@ -3287,24 +3287,9 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    query(
-        "CREATE TABLE IF NOT EXISTS session_sync_log (
-            sync_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            sync_type VARCHAR(50) NOT NULL,
-            sync_direction VARCHAR(10) NOT NULL DEFAULT 'push',
-            payload_size INT NOT NULL DEFAULT 0,
-            duration_ms BIGINT NULL,
-            status VARCHAR(20) NOT NULL DEFAULT 'pending',
-            error_message TEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_sync_user_session_created (user_id, session_id, created_at),
-            INDEX idx_sync_user_status_created (user_id, status, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
+    query("DROP TABLE IF EXISTS session_sync_log")
+        .execute(&pool)
+        .await?;
 
     // Skills registry — master catalog for database-backed skills.
     //
@@ -4094,11 +4079,6 @@ pub async fn ensure_core_schema(
             "agent_sessions",
             "project_retention_policy",
             "ALTER TABLE agent_sessions ADD COLUMN project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session'",
-        ),
-        (
-            "session_sync_log",
-            "duration_ms",
-            "ALTER TABLE session_sync_log ADD COLUMN duration_ms BIGINT NULL",
         ),
     ] {
         if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
@@ -5017,8 +4997,6 @@ pub struct RetentionPolicy {
     pub auth_token_days: u32,
     /// Max age in days for expired task leases (default: 7)
     pub task_lease_days: u32,
-    /// Max age in days for sync log entries (default: 30)
-    pub sync_log_days: u32,
     /// Max age in days for audit logs (default: 90)
     pub audit_log_days: u32,
     /// Max age in days for prompt observability rows after their session/run is inactive (default: 90)
@@ -5033,7 +5011,6 @@ impl Default for RetentionPolicy {
             refresh_token_days: 7,
             auth_token_days: 30,
             task_lease_days: 7,
-            sync_log_days: 30,
             audit_log_days: 90,
             prompt_request_days: 90,
             event_days: 90,
@@ -5100,7 +5077,6 @@ pub async fn cleanup_expired_data(
     const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const AUTH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const TASK_LEASE_BATCH_LIMIT: u32 = 1000;
-    const SESSION_SYNC_LOG_BATCH_LIMIT: u32 = 1000;
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
     const PROMPT_REQUEST_BATCH_LIMIT: u32 = 1000;
     const PROMPT_REQUEST_MAX_BATCHES_PER_RUN: u32 = 10;
@@ -5165,25 +5141,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 4. Old sync log entries
-    let deleted = sqlx::query(
-        "DELETE FROM session_sync_log \
-         WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-         ORDER BY created_at ASC, sync_id ASC \
-         LIMIT ?",
-    )
-    .bind(policy.sync_log_days)
-    .bind(SESSION_SYNC_LOG_BATCH_LIMIT)
-    .execute(pool)
-    .await
-    .map(|r| r.rows_affected())
-    .map_err(|e| format!("cleanup session_sync_log: {e}"))?;
-    results.push(CleanupResult {
-        table: "session_sync_log",
-        rows_deleted: deleted,
-    });
-
-    // 5. Old audit logs
+    // 4. Old audit logs
     let deleted = sqlx::query(
         "DELETE FROM auth_audit_logs \
          WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
@@ -5201,7 +5159,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 6. Old prompt observability rows. Select parent request records first so
+    // 5. Old prompt observability rows. Select parent request records first so
     // child prompt_deltas and parent prompt_request_records are pruned together.
     let prompt_request_retention_select_sql = format!(
         "SELECT p.user_id, p.session_id, p.request_id
@@ -6271,7 +6229,6 @@ mod tests {
             "AUTH_REFRESH_TOKEN_BATCH_LIMIT",
             "AUTH_TOKEN_BATCH_LIMIT",
             "TASK_LEASE_BATCH_LIMIT",
-            "SESSION_SYNC_LOG_BATCH_LIMIT",
             "AUTH_AUDIT_LOG_BATCH_LIMIT",
             "PROMPT_REQUEST_BATCH_LIMIT",
             "PROMPT_REQUEST_MAX_BATCHES_PER_RUN",
@@ -6285,7 +6242,6 @@ mod tests {
         for ordering in [
             "ORDER BY created_at ASC, token_id ASC",
             "ORDER BY expires_at ASC, user_id ASC, task_id ASC",
-            "ORDER BY created_at ASC, sync_id ASC",
             "ORDER BY created_at ASC, log_id ASC",
             "ORDER BY p.created_at_unix_ms ASC, p.user_id ASC, p.request_id ASC",
             "ORDER BY created_at ASC, user_id ASC, event_id ASC",

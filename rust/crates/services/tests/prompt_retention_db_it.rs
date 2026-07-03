@@ -92,7 +92,6 @@ async fn prompt_retention_prunes_inactive_parent_and_child_rows_only() {
         refresh_token_days: 10_000,
         auth_token_days: 10_000,
         task_lease_days: 10_000,
-        sync_log_days: 10_000,
         audit_log_days: 10_000,
         event_days: 10_000,
     };
@@ -192,7 +191,6 @@ async fn prompt_retention_pressure_probe() {
         refresh_token_days: 10_000,
         auth_token_days: 10_000,
         task_lease_days: 10_000,
-        sync_log_days: 10_000,
         audit_log_days: 10_000,
         event_days: 10_000,
     };

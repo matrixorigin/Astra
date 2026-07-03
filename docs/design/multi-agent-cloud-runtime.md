@@ -1613,7 +1613,7 @@ All events carry:
 |--------|--------|-----------------|
 | Agent heartbeat age | agent_registry | > lease_ttl_secs |
 | Task lease expiry rate | task_leases | > 5% in 1 hour |
-| Sync conflict rate | session_sync_log | > 10% of pushes |
+| Sync conflict rate | StateSyncService logs/metrics | > 10% of pushes |
 | Event ingestion lag | IngestionStats | pending > 1000 |
 | Tool error rate (per-tool) | ToolHealthTracker | > 30% in 10 invocations |
 | Stall detection rate | TurnGuard | > 2 stalls per session |
@@ -1992,7 +1992,6 @@ user_preferences  -- PK: pref_id, UNIQUE: (user_id, pref_key)
 agent_tasks       -- PK: task_id, indexes: user_status_updated, parent_updated
 plan_templates    -- PK: template_id, indexes: user_goal_project
 session_checkpoints-- PK: checkpoint_id, UNIQUE: (session_id, number)
-session_sync_log  -- PK: sync_id, indexes: user_session_created
 ```
 
 ### Proposed New Tables

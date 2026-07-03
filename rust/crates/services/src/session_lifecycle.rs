@@ -212,10 +212,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM skill_selection_events WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "session_sync_log",
-        sql: "DELETE FROM session_sync_log WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "agent_tasks",
         sql: "DELETE FROM agent_tasks WHERE session_id = ? AND user_id = ?",
     },
