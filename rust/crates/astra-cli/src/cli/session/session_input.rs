@@ -6,7 +6,7 @@ use astra_turn_core::input_classifier;
 
 /// Detect if a user message appears to be a correction/redirection.
 pub(crate) fn detect_correction_signal(message: &str) -> bool {
-    input_classifier::is_correction_signal(message)
+    input_classifier::is_reanchor_signal(message)
 }
 
 pub(crate) fn apply_resume_context(

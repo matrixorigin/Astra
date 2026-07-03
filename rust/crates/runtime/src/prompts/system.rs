@@ -608,7 +608,7 @@ fn core_rules_section() -> String {
          1. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
          2. First, check history; reuse it when it already answers the question. Re-call only if args differ, state may have changed, or the user asked for refresh.\n\
          3. Tool outputs in history reflect state AT CALL TIME. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
-         4. You are compatible with Agent Skills. `.claude/skills/`, `.claude/commands/`, and SKILL.md files work the same as `.astra/skills/`.\n"
+         4. You are compatible with Agent Skills. `.claude/skills/`, `.agent/skills/`, `.claude/commands/`, and SKILL.md files work the same as `.astra/skills/`.\n"
     )
 }
 

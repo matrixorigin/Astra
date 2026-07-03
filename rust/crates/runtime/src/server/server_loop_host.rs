@@ -2865,8 +2865,8 @@ impl ServerAgenticLoopHost {
             }
         };
 
-        let body = serde_json::from_str::<Value>(&result_json)
-            .unwrap_or(Value::String(result_json));
+        let body =
+            serde_json::from_str::<Value>(&result_json).unwrap_or(Value::String(result_json));
         let key = tool_callback_key(&self.user_id, request_id);
         {
             let mut ledger = self.edge_callback_ledger.lock().await;

@@ -476,8 +476,10 @@ pub fn discover_skills_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
 ///
 /// 1. Walk-up from cwd: `{ancestor}/.astra/skills/` for each ancestor
 /// 2. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor
-/// 3. `~/.astra/skills/`      — user-level global skills
-/// 4. `~/.claude/skills/`     — user-level Agent Skills compatibility path
+/// 3. Walk-up from cwd: `{ancestor}/.agent/skills/` for each ancestor
+/// 4. `~/.astra/skills/`      — user-level global skills
+/// 5. `~/.claude/skills/`     — user-level Agent Skills compatibility path
+/// 6. `~/.agent/skills/`      — user-level Agent-compatible path
 ///
 /// Walk-up discovery traverses from `cwd` upward to the filesystem root,
 /// collecting skill directories. Astra's SKILL.md format is compatible with
@@ -493,6 +495,7 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
     let mut paths = vec![
         PathBuf::from(".astra/skills"),
         PathBuf::from(".claude/skills"),
+        PathBuf::from(".agent/skills"),
     ];
     if let Some(home) = home {
         for global in home_skill_search_paths_from(&home) {
@@ -513,11 +516,13 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(12);
 
-    // Single walk-up collecting both .astra/skills/ and .claude/skills/.
-    // .astra paths first at each level so they take priority over .claude.
-    let (astra, claude) = walk_up_skill_paths_from(cwd, home);
+    // Single walk-up collecting .astra/skills/, .claude/skills/, and
+    // .agent/skills/. Native .astra paths keep priority over compatibility
+    // roots when names collide.
+    let (astra, claude, agent) = walk_up_skill_paths_from(cwd, home);
     paths.extend(astra);
     paths.extend(claude);
+    paths.extend(agent);
 
     if let Some(home) = home {
         for global in home_skill_search_paths_from(home) {
@@ -535,12 +540,14 @@ pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> 
 /// This intentionally excludes cwd/project walk-up paths. Server-backed runtimes
 /// use these paths as the "api-server local" catalog: skills installed into the
 /// account that runs the API server are deployment-level skills visible to every
-/// authenticated user of that server, while project-local `.astra/skills` or
-/// `.claude/skills` directories remain CLI-only unless explicitly published.
+/// authenticated user of that server, while project-local `.astra/skills`,
+/// `.claude/skills`, or `.agent/skills` directories remain CLI-only unless
+/// explicitly published.
 pub fn home_skill_search_paths_from(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".astra").join("skills"),
         home.join(".claude").join("skills"),
+        home.join(".agent").join("skills"),
     ]
 }
 
@@ -555,12 +562,12 @@ pub fn home_skill_search_paths() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Walk from `start` upward once, collecting both `.astra/skills/` and
-/// `.claude/skills/` at each ancestor. Returns `(astra_paths, claude_paths)`
-/// so the caller can maintain priority (astra before claude).
+/// Walk from `start` upward once, collecting `.astra/skills/`,
+/// `.claude/skills/`, and `.agent/skills/` at each ancestor. Returns grouped
+/// paths so the caller can maintain priority.
 ///
 /// Stops at repository root (`.git`) or user's home directory.
-pub fn walk_up_skill_paths(start: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+pub fn walk_up_skill_paths(start: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let home = dirs::home_dir();
     walk_up_skill_paths_from(start, home.as_deref())
 }
@@ -570,9 +577,13 @@ pub fn walk_up_skill_paths(start: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// This exists so tests can assert the CLI/Web skill visibility boundary
 /// without mutating process-global cwd or HOME. See [`skill_search_paths_from`]
 /// for why API servers must not expose the project-local paths discovered here.
-pub fn walk_up_skill_paths_from(start: &Path, home: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+pub fn walk_up_skill_paths_from(
+    start: &Path,
+    home: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let mut astra = Vec::new();
     let mut claude = Vec::new();
+    let mut agent = Vec::new();
     let mut dir = start.to_path_buf();
 
     loop {
@@ -583,6 +594,10 @@ pub fn walk_up_skill_paths_from(start: &Path, home: Option<&Path>) -> (Vec<PathB
         let c = dir.join(".claude").join("skills");
         if c.is_dir() {
             claude.push(c);
+        }
+        let g = dir.join(".agent").join("skills");
+        if g.is_dir() {
+            agent.push(g);
         }
 
         if dir.join(".git").exists() {
@@ -596,7 +611,7 @@ pub fn walk_up_skill_paths_from(start: &Path, home: Option<&Path>) -> (Vec<PathB
         }
     }
 
-    (astra, claude)
+    (astra, claude, agent)
 }
 
 #[cfg(test)]
@@ -948,7 +963,7 @@ Hooked body."#;
     #[test]
     fn skill_search_paths_returns_at_least_two() {
         let paths = skill_search_paths();
-        assert!(paths.len() >= 2);
+        assert!(paths.len() >= 3);
     }
 
     #[test]
@@ -964,6 +979,18 @@ Hooked body."#;
     }
 
     #[test]
+    fn skill_search_paths_includes_agent_dirs() {
+        let paths = skill_search_paths();
+        let has_agent = paths
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == ".agent"));
+        assert!(
+            has_agent,
+            "should include .agent/skills/ paths, got: {paths:?}"
+        );
+    }
+
+    #[test]
     fn home_skill_search_paths_are_home_only() {
         let home = PathBuf::from("/tmp/astra-home-test");
         let paths = home_skill_search_paths_from(&home);
@@ -971,7 +998,8 @@ Hooked body."#;
             paths,
             vec![
                 home.join(".astra").join("skills"),
-                home.join(".claude").join("skills")
+                home.join(".claude").join("skills"),
+                home.join(".agent").join("skills")
             ],
             "api-server local skill discovery must be restricted to HOME-level catalogs"
         );
@@ -991,8 +1019,10 @@ Hooked body."#;
         for dir in [
             home.join(".astra").join("skills"),
             home.join(".claude").join("skills"),
+            home.join(".agent").join("skills"),
             project.join(".astra").join("skills"),
             project.join(".claude").join("skills"),
+            project.join(".agent").join("skills"),
         ] {
             std::fs::create_dir_all(dir).unwrap();
         }
@@ -1008,12 +1038,17 @@ Hooked body."#;
             "CLI discovery must see project-local .claude skills: {cli_paths:?}"
         );
         assert!(
+            cli_paths.contains(&project.join(".agent").join("skills")),
+            "CLI discovery must see project-local .agent skills: {cli_paths:?}"
+        );
+        assert!(
             !cli_paths.contains(&cwd.join("skills")),
             "CLI discovery must not include the removed legacy cwd/skills tree: {cli_paths:?}"
         );
         assert!(
             cli_paths.contains(&home.join(".astra").join("skills"))
-                && cli_paths.contains(&home.join(".claude").join("skills")),
+                && cli_paths.contains(&home.join(".claude").join("skills"))
+                && cli_paths.contains(&home.join(".agent").join("skills")),
             "CLI discovery must also see HOME-level skills: {cli_paths:?}"
         );
 
@@ -1022,7 +1057,8 @@ Hooked body."#;
             server_paths,
             vec![
                 home.join(".astra").join("skills"),
-                home.join(".claude").join("skills")
+                home.join(".claude").join("skills"),
+                home.join(".agent").join("skills")
             ],
             "Web/server discovery must be restricted to API-server HOME catalogs"
         );
@@ -1182,7 +1218,7 @@ Hooked body."#;
         let mid_skills = dir.path().join("a").join(".astra").join("skills");
         std::fs::create_dir_all(&mid_skills).unwrap();
 
-        let (astra, _claude) = walk_up_skill_paths(&deep);
+        let (astra, _claude, _agent) = walk_up_skill_paths(&deep);
         assert_eq!(astra.len(), 2);
         assert_eq!(astra[0], mid_skills);
         assert_eq!(astra[1], root_skills);
@@ -1204,7 +1240,7 @@ Hooked body."#;
         let outside_skills = dir.path().join(".astra").join("skills");
         std::fs::create_dir_all(&outside_skills).unwrap();
 
-        let (astra, _claude) = walk_up_skill_paths(&deep);
+        let (astra, _claude, _agent) = walk_up_skill_paths(&deep);
 
         assert!(
             astra.contains(&repo_skills),
@@ -1224,9 +1260,10 @@ Hooked body."#;
         // Place .git so we don't walk outside the temp dir
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
 
-        let (astra, claude) = walk_up_skill_paths(&deep);
+        let (astra, claude, agent) = walk_up_skill_paths(&deep);
         assert!(astra.is_empty());
         assert!(claude.is_empty());
+        assert!(agent.is_empty());
     }
 
     #[test]
@@ -1239,10 +1276,27 @@ Hooked body."#;
         let cc_skills = dir.path().join(".claude").join("skills");
         std::fs::create_dir_all(&cc_skills).unwrap();
 
-        let (astra, claude) = walk_up_skill_paths(&deep);
+        let (astra, claude, agent) = walk_up_skill_paths(&deep);
         assert!(astra.is_empty(), "no .astra/skills/ exists");
+        assert!(agent.is_empty(), "no .agent/skills/ exists");
         assert_eq!(claude.len(), 1);
         assert_eq!(claude[0], cc_skills);
+    }
+
+    #[test]
+    fn walk_up_finds_agent_skills() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let deep = dir.path().join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+
+        let agent_skills = dir.path().join(".agent").join("skills");
+        std::fs::create_dir_all(&agent_skills).unwrap();
+
+        let (astra, claude, agent) = walk_up_skill_paths(&deep);
+        assert!(astra.is_empty(), "no .astra/skills/ exists");
+        assert!(claude.is_empty(), "no .claude/skills/ exists");
+        assert_eq!(agent, vec![agent_skills]);
     }
 
     #[test]
@@ -1259,8 +1313,9 @@ Hooked body."#;
         std::fs::create_dir_all(&claude_root).unwrap();
         std::fs::create_dir_all(&claude_mid).unwrap();
 
-        let (astra, claude) = walk_up_skill_paths(&deep);
+        let (astra, claude, agent) = walk_up_skill_paths(&deep);
         assert_eq!(astra, vec![astra_root]);
+        assert!(agent.is_empty());
         assert_eq!(claude.len(), 2);
         assert_eq!(claude[0], claude_mid, "deeper .claude first");
         assert_eq!(claude[1], claude_root);
@@ -1282,7 +1337,7 @@ Hooked body."#;
         let outside = dir.path().join(".claude").join("skills");
         std::fs::create_dir_all(&outside).unwrap();
 
-        let (_astra, claude) = walk_up_skill_paths(&deep);
+        let (_astra, claude, _agent) = walk_up_skill_paths(&deep);
         assert!(claude.contains(&inside));
         assert!(
             !claude.contains(&outside),

@@ -618,7 +618,7 @@ Follow these steps:
                         eprintln!(
                             "{}",
                             format!(
-                                "  \u{2717} Skill directory not found for '{name}' (searched .astra/skills, .claude/skills, ~/.astra/skills, ~/.claude/skills)"
+                                "  \u{2717} Skill directory not found for '{name}' (searched .astra/skills, .claude/skills, .agent/skills, ~/.astra/skills, ~/.claude/skills, ~/.agent/skills)"
                             )
                             .yellow()
                         );
@@ -723,8 +723,8 @@ Follow these steps:
                 }
                 return Ok(());
             }
-            // Search all shared loader paths: project .astra/.claude skills
-            // and user-level .astra/.claude skills.
+            // Search all shared loader paths: project .astra/.claude/.agent
+            // skills and matching user-level skill roots.
             let search_paths = crate::skill_instructions::skill_search_paths();
             let found = search_paths.iter().find_map(|base| {
                 let dir = base.join(name);
@@ -830,14 +830,14 @@ Follow these steps:
             if !api_ok {
                 eprintln!(
                     "  {}",
-                    "Local view: unified catalog + on-disk paths (.astra/skills, .claude/skills, ~/.astra/skills, ~/.claude/skills)."
+                    "Local view: unified catalog + on-disk paths (.astra/skills, .claude/skills, .agent/skills, ~/.astra/skills, ~/.claude/skills, ~/.agent/skills)."
                         .dim()
                 );
                 let registry = &state.unified_skill_registry;
                 let mut manifests = registry.all_manifests();
                 if manifests.is_empty() {
                     eprintln!("  {}", "No skills discovered in catalog.".dim());
-                    eprintln!("  {}", "Use /skill new <name> to create one, or add SKILL.md files to .astra/skills/ or .claude/skills/.".dim());
+                    eprintln!("  {}", "Use /skill new <name> to create one, or add SKILL.md files to .astra/skills/, .claude/skills/, or .agent/skills/.".dim());
                     eprintln!();
                     return Ok(());
                 }

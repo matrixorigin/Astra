@@ -23,7 +23,7 @@ make dev-stop           # Stop all
 - `rust/crates/astra-cli/` — CLI, edge tools, plan executor, code intel
 - `rust/crates/astra-admin/` — admin CLI
 - `.claude/skills/` — curated Agent Skills for Claude-compatible agents
-- `.agent/skills/` — mirror of the curated Agent Skills for Agent-compatible runtimes
+- `.agent/skills/` — curated Agent Skills for Agent-compatible runtimes and Astra local discovery
 - `web/` — Next.js admin dashboard
 
 ## ⚠ Cargo workspace lives under `rust/`

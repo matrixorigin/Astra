@@ -317,15 +317,23 @@ async fn post_loop_memory_cleanup_with_limits(
     let Some(permit) = try_acquire_post_loop_memory_cleanup_permit(async_concurrency_limit) else {
         record_post_loop_memory_cleanup_dispatch_metrics(
             metrics_registry.as_ref(),
-            "async",
-            "dropped_full",
+            "inline",
+            "saturated",
         );
-        tracing::debug!(
+        tracing::warn!(
             session_id = %session_id,
             concurrency_limit = async_concurrency_limit,
-            "post-loop memory cleanup concurrency full; dropping best-effort external cleanup"
+            "post-loop memory cleanup concurrency full; running inline"
         );
-        reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
+        run_post_loop_memory_cleanup_work(
+            session_id,
+            session_facts,
+            extraction_service,
+            final_extract_request,
+            metrics_registry,
+            drain_timeout,
+        )
+        .await;
         return;
     };
     record_post_loop_memory_cleanup_dispatch_metrics(
@@ -3987,7 +3995,7 @@ fn build_shutdown_extraction_request(
                 as usize,
             current_tool_calls: state.total_tool_calls as usize,
             had_error: state.error_recovery.consecutive_same_error > 0,
-            had_user_correction: astra_turn_core::input_classifier::is_correction_signal(
+            had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(
                 &state.message,
             ),
             turn_number: state.max_turns.saturating_sub(state.remaining_turns) as u32,

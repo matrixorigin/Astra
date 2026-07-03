@@ -35,21 +35,40 @@ fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
 /// assistant turn. Acceptance fires when:
 ///
 /// - the message is non-empty (whitespace stripped), AND
-/// - it does not match the shared correction-signal classifier in
-///   `astra_turn_core::input_classifier::is_correction_signal`.
+/// - it is not a direct correction, reanchor, or explicit interruption.
 ///
-/// Routing through that shared classifier is mandatory: prior to this
-/// extraction the adaptive runtime path carried its own inlined keyword list
-/// that drifted from the canonical one (false positives on bare "not " and "wrong",
-/// missing matches for "i meant", "actually i", "wait,", etc.). Two parallel
-/// lists is the anti-pattern this consolidates away.
+/// Acceptance is intentionally conservative: a non-empty user message is not
+/// enough. If the message redirects the task or pauses the agent, recording
+/// `Acceptance` would contradict the user's latest control signal.
 #[must_use]
 pub(crate) fn should_emit_acceptance(message: &str) -> bool {
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return false;
     }
-    !astra_turn_core::input_classifier::is_correction_signal(trimmed)
+    if astra_turn_core::input_classifier::is_reanchor_signal(trimmed) {
+        return false;
+    }
+    !is_explicit_interruption(trimmed)
+}
+
+fn is_explicit_interruption(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    starts_with_control_word(&lower, "wait")
+        || starts_with_control_word(&lower, "stop")
+        || lower.contains("hold on")
+        || lower.contains("等等")
+        || lower.contains("先停")
+}
+
+fn starts_with_control_word(text: &str, word: &str) -> bool {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix(word) else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .is_none_or(|ch| ch.is_whitespace() || matches!(ch, ',' | '.' | ':' | ';' | '!' | '?'))
 }
 
 /// Record feedback signals based on the loop's outcome and accumulated state.
@@ -280,10 +299,12 @@ mod tests {
         for s in [
             "no, that's not what i meant",
             "actually, i wanted X",
+            "wait, can you show the logs first?",
             "wait, hold on",
             "i meant the other one",
             "to clarify, i need Y",
             "不对，我的意思是改这里",
+            "不是修修补补，要系统性解决",
             "等等，先停一下",
         ] {
             assert!(

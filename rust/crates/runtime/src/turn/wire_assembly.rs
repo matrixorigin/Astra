@@ -86,7 +86,7 @@ pub(crate) fn session_memory_entry_for_user_turn(
     user_content: &str,
 ) -> Option<astra_turn_core::context_sources::MemoryEntry> {
     let user_content = user_content.trim();
-    if astra_turn_core::input_classifier::is_correction_signal(user_content) {
+    if astra_turn_core::input_classifier::is_reanchor_signal(user_content) {
         return Some(session_memory_reanchor_entry(user_content, turn_number));
     }
     session_memory_entry_for_pipeline(content, turn_number)
@@ -99,9 +99,9 @@ fn session_memory_reanchor_entry(
     let clipped = truncate_reanchor_text(user_content, 500);
     let content = format!(
         "## Session Reanchor\n\
-         - The latest user correction supersedes previously injected session memory where they conflict.\n\
-         - Latest user correction: {clipped}\n\
-         - Treat older session state as stale unless it directly supports this correction."
+         - The latest user reanchor supersedes previously injected session memory where they conflict.\n\
+         - Latest user reanchor: {clipped}\n\
+         - Treat older session state as stale unless it directly supports this reanchor."
     );
     astra_turn_core::context_sources::MemoryEntry::new(&content)
         .with_source("session_memory.reanchor")
@@ -911,8 +911,23 @@ mod tests {
         )
         .expect("reanchor entry");
 
-        assert!(entry.content.contains("Latest user correction"));
+        assert!(entry.content.contains("Latest user reanchor"));
         assert!(entry.content.contains("server-side executor"));
+        assert!(!entry.content.contains("stale prior session memory"));
+        assert_eq!(entry.source.as_deref(), Some("session_memory.reanchor"));
+    }
+
+    #[test]
+    fn session_memory_entry_for_user_turn_reanchors_on_goal_redirect() {
+        let entry = session_memory_entry_for_user_turn(
+            Some("stale prior session memory"),
+            8,
+            "不是修修补补，要系统性解决",
+        )
+        .expect("reanchor entry");
+
+        assert!(entry.content.contains("Latest user reanchor"));
+        assert!(entry.content.contains("系统性解决"));
         assert!(!entry.content.contains("stale prior session memory"));
         assert_eq!(entry.source.as_deref(), Some("session_memory.reanchor"));
     }

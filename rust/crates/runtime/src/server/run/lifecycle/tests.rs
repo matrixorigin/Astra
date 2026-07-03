@@ -248,6 +248,36 @@ async fn post_loop_memory_cleanup_metrics_stay_low_cardinality() {
     );
 }
 
+#[tokio::test]
+async fn post_loop_memory_cleanup_runs_inline_when_async_pool_is_full() {
+    let _memoria = EnvVarGuard::remove("MEMORIA_MASTER_KEY");
+    let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+
+    post_loop_memory_cleanup_with_limits(
+        "session-inline",
+        &astra_turn_types::session_facts::SessionFacts::default(),
+        None,
+        None,
+        Some(registry.clone()),
+        0,
+        Duration::ZERO,
+    )
+    .await;
+
+    let rendered = registry.render_prometheus();
+    assert!(
+        rendered.contains(
+            "astra_post_loop_memory_cleanup_dispatches_total{mode=\"inline\",outcome=\"saturated\"} 1"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("astra_post_loop_memory_cleanup_workers_total{outcome=\"completed\"} 1"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("dropped_full"), "{rendered}");
+}
+
 fn test_session_task(
     id: &str,
     title: &str,

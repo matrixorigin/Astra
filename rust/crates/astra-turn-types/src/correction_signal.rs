@@ -87,6 +87,10 @@ fn is_english_reanchor_nudge(lower: &str) -> bool {
         "what i need is",
         "what i want is",
         "what i want",
+        "actually, i wanted",
+        "actually i wanted",
+        "actually, i want",
+        "actually i want",
         "i asked for",
         "i need you to",
         "i meant",
@@ -242,6 +246,10 @@ mod tests {
             classify_user_correction_signal(
                 "You misunderstood the goal; keep the session healthy long-term"
             ),
+            Some(UserCorrectionSignalKind::Reanchor)
+        );
+        assert_eq!(
+            classify_user_correction_signal("actually, i wanted the other implementation"),
             Some(UserCorrectionSignalKind::Reanchor)
         );
     }
