@@ -42,6 +42,7 @@
 //!     status        VARCHAR(16) DEFAULT 'pending', -- pending/claimed/acked/failed
 //!     claimed_by    VARCHAR(256),         -- consumer ID that claimed the message
 //!     claimed_at_ms BIGINT,               -- when the message was claimed
+//!     claim_token   VARCHAR(64),          -- unique token for one direct claim batch
 //!     attempt_count INT DEFAULT 0,        -- number of delivery attempts
 //!     created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 //!     INDEX idx_amq_direct    (to_run_id, to_agent_id, status, created_at, message_id),
@@ -142,6 +143,7 @@ pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
             status        VARCHAR(16) NOT NULL DEFAULT 'pending',
             claimed_by    VARCHAR(256),
             claimed_at_ms BIGINT,
+            claim_token   VARCHAR(64),
             attempt_count INT NOT NULL DEFAULT 0,
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_amq_direct    (to_run_id, to_agent_id, status, created_at, message_id),
@@ -150,6 +152,7 @@ pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    ensure_agent_message_queue_claim_token_column(pool).await?;
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_message_broadcast_delivery (
@@ -163,6 +166,28 @@ pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+async fn ensure_agent_message_queue_claim_token_column(
+    pool: &Pool<MySql>,
+) -> Result<(), sqlx::Error> {
+    let row = query(
+        "SELECT COUNT(*) AS cnt
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'agent_message_queue'
+           AND COLUMN_NAME = 'claim_token'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let existing: i64 = row.try_get("cnt")?;
+    if existing > 0 {
+        return Ok(());
+    }
+    query("ALTER TABLE agent_message_queue ADD COLUMN claim_token VARCHAR(64)")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -325,7 +350,7 @@ impl DatabaseTransport {
     ) -> Result<bool, MailboxError> {
         let result = query(
             "UPDATE agent_message_queue
-             SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL
+             SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
              WHERE message_id = ? AND status = 'claimed' AND claimed_by = ?",
         )
         .bind(message_id)
@@ -344,7 +369,7 @@ impl DatabaseTransport {
     ) -> Result<bool, MailboxError> {
         let result = query(
             "UPDATE agent_message_queue
-             SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+             SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
              WHERE message_id = ? AND status = 'claimed' AND claimed_by = ?",
         )
         .bind(message_id)
@@ -639,14 +664,17 @@ async fn poll_loop(
         // 1. Claim direct messages atomically (UPDATE then SELECT).
         //    This ensures no two consumers process the same direct message.
         let now_ms = chrono::Utc::now().timestamp_millis();
+        let claim_token = uuid::Uuid::new_v4().to_string();
         let claim_result = query(
             "UPDATE agent_message_queue
-             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = attempt_count + 1
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, claim_token = ?,
+                 attempt_count = attempt_count + 1
              WHERE to_run_id = ? AND to_agent_id = ? AND status = 'pending'
              ORDER BY created_at ASC, message_id ASC LIMIT ?",
         )
         .bind(&consumer_id)
         .bind(now_ms)
+        .bind(&claim_token)
         .bind(&addr.run_id)
         .bind(&addr.agent_id)
         .bind(POLL_BATCH_SIZE)
@@ -659,13 +687,13 @@ async fn poll_loop(
                 let fetch_result = query(
                     "SELECT message_id, payload_json FROM agent_message_queue
                      WHERE to_run_id = ? AND to_agent_id = ? AND status = 'claimed' AND claimed_by = ?
-                       AND claimed_at_ms = ?
+                       AND claim_token = ?
                      ORDER BY created_at ASC, message_id ASC LIMIT ?",
                 )
                 .bind(&addr.run_id)
                 .bind(&addr.agent_id)
                 .bind(&consumer_id)
-                .bind(now_ms)
+                .bind(&claim_token)
                 .bind(POLL_BATCH_SIZE)
                 .fetch_all(&pool)
                 .await;
@@ -806,7 +834,7 @@ async fn poll_loop(
                     if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
                         &pool,
                         &consumer_id,
-                        now_ms,
+                        &claim_token,
                         max_delivery_attempts,
                     )
                     .await
@@ -1037,7 +1065,7 @@ async fn mark_broadcast_failed_by_identity(
 ) -> Result<(), sqlx::Error> {
     query(
         "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE message_id = ? AND delegation_id = ? AND is_broadcast = TRUE AND status IN ('pending', 'claimed')",
     )
     .bind(message_id)
@@ -1054,7 +1082,7 @@ async fn mark_direct_acked(
 ) -> Result<(), sqlx::Error> {
     query(
         "UPDATE agent_message_queue
-         SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE message_id = ? AND is_broadcast = FALSE AND status = 'claimed' AND claimed_by = ?",
     )
     .bind(message_id)
@@ -1071,7 +1099,7 @@ async fn mark_direct_failed_by_message_id(
 ) -> Result<(), sqlx::Error> {
     query(
         "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE message_id = ? AND is_broadcast = FALSE AND status = 'claimed' AND claimed_by = ?",
     )
     .bind(message_id)
@@ -1283,7 +1311,7 @@ async fn reclaim_stale_in_pool(
 
     let reclaimed = query(
         "UPDATE agent_message_queue
-         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE status = 'claimed'
            AND claimed_at_ms < ?
            AND attempt_count < ?",
@@ -1296,7 +1324,7 @@ async fn reclaim_stale_in_pool(
 
     query(
         "UPDATE agent_message_queue
-           SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+           SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
            WHERE status = 'claimed'
              AND claimed_at_ms < ?
              AND attempt_count >= ?",
@@ -1326,7 +1354,7 @@ async fn release_claimed_for_consumer_in_pool(
 
     query(
         "UPDATE agent_message_queue
-         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE status = 'claimed'
            AND is_broadcast = FALSE
            AND claimed_by = ?
@@ -1340,7 +1368,7 @@ async fn release_claimed_for_consumer_in_pool(
 
     query(
         "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE status = 'claimed'
            AND is_broadcast = FALSE
            AND claimed_by = ?
@@ -1362,7 +1390,7 @@ async fn release_claimed_for_consumer_in_pool(
 async fn release_direct_claimed_batch_for_consumer_in_pool(
     pool: &Pool<MySql>,
     consumer_id: &str,
-    claimed_at_ms: i64,
+    claim_token: &str,
     max_delivery_attempts: u32,
 ) -> Result<(), MailboxError> {
     let mut tx = pool
@@ -1372,15 +1400,15 @@ async fn release_direct_claimed_batch_for_consumer_in_pool(
 
     query(
         "UPDATE agent_message_queue
-         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE status = 'claimed'
            AND is_broadcast = FALSE
            AND claimed_by = ?
-           AND claimed_at_ms = ?
+           AND claim_token = ?
            AND attempt_count < ?",
     )
     .bind(consumer_id)
-    .bind(claimed_at_ms)
+    .bind(claim_token)
     .bind(max_delivery_attempts as i64)
     .execute(&mut *tx)
     .await
@@ -1388,15 +1416,15 @@ async fn release_direct_claimed_batch_for_consumer_in_pool(
 
     query(
         "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE status = 'claimed'
            AND is_broadcast = FALSE
            AND claimed_by = ?
-           AND claimed_at_ms = ?
+           AND claim_token = ?
            AND attempt_count >= ?",
     )
     .bind(consumer_id)
-    .bind(claimed_at_ms)
+    .bind(claim_token)
     .bind(max_delivery_attempts as i64)
     .execute(&mut *tx)
     .await
@@ -1452,6 +1480,27 @@ mod tests {
         assert!(INITIAL_BACKOFF >= Duration::from_millis(100));
         assert!(MAX_BACKOFF <= Duration::from_secs(30));
         assert!(MAX_BACKOFF > INITIAL_BACKOFF);
+    }
+
+    #[test]
+    fn queue_schema_declares_direct_claim_token() {
+        let source = include_str!("db_transport.rs");
+        let ensure_body = source
+            .split("pub async fn ensure_schema")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn recreate_legacy_agent_message_queue_if_needed")
+                    .next()
+            })
+            .expect("ensure_schema body");
+        assert!(
+            ensure_body.contains("claim_token   VARCHAR(64)"),
+            "agent_message_queue must persist a unique direct claim batch token"
+        );
+        assert!(
+            ensure_body.contains("ensure_agent_message_queue_claim_token_column(pool).await"),
+            "schema setup must add claim_token when an existing queue table predates the column"
+        );
     }
 
     #[test]
@@ -1554,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_fetch_error_releases_only_current_claim_batch() {
+    fn direct_fetch_error_releases_only_current_tokenized_claim_batch() {
         let source = include_str!("db_transport.rs");
         let poll_body = source
             .split("async fn poll_loop(")
@@ -1563,8 +1612,12 @@ mod tests {
             .expect("poll_loop direct-claim body");
         assert!(
             poll_body.contains("release_direct_claimed_batch_for_consumer_in_pool")
-                && poll_body.contains("now_ms"),
-            "direct fetch error must release the just-claimed batch instead of waiting for visibility timeout"
+                && poll_body.contains("claim_token"),
+            "direct fetch error must release the just-claimed tokenized batch instead of waiting for visibility timeout"
+        );
+        assert!(
+            poll_body.contains("claim_token = ?"),
+            "direct claim fetch must use claim_token rather than claimed_at_ms as the batch discriminator"
         );
 
         let helper_body = source
@@ -1573,8 +1626,8 @@ mod tests {
             .and_then(|rest| rest.split("// ─── Tests").next())
             .expect("release direct claimed batch helper");
         assert!(
-            helper_body.contains("AND claimed_at_ms = ?"),
-            "direct fetch error release must be scoped to the current claimed_at_ms batch"
+            helper_body.contains("AND claim_token = ?"),
+            "direct fetch error release must be scoped to the current unique claim_token batch"
         );
         assert!(
             helper_body.contains("AND attempt_count < ?")
