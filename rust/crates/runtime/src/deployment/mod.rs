@@ -168,14 +168,16 @@ pub struct DeploymentProfile {
 // Pre-built profiles (product-configuration shortcut layer)
 // ---------------------------------------------------------------------------
 
-/// All tool names that a server deployment can provide.
+/// All server-service/control-plane tool names that a server deployment can
+/// provide without an explicit workspace/runtime execution provider.
 ///
 /// Ordered by category for readability.  Each tool name maps to the
 /// underlying handler registered in `server_tool_executor/tool_handlers.rs`.
 pub const SERVER_ALL_TOOLS: &[&str] = SERVER_BUILTIN_TOOL_NAMES;
 
 impl DeploymentProfile {
-    /// Standard server deployment with all built-in tools.
+    /// Standard server deployment with all server-service/control-plane
+    /// built-in tools.
     pub fn server_default() -> Self {
         Self {
             profile_name: "server-default".into(),
@@ -211,7 +213,7 @@ impl DeploymentProfile {
     /// Server deployment with **only** the given tools enabled.
     ///
     /// ```ignore
-    /// let profile = DeploymentProfile::server_with_only(&["bash", "read_file", "write_file"]);
+    /// let profile = DeploymentProfile::server_with_only(&["memory", "web_search", "agent"]);
     /// ```
     pub fn server_with_only(enabled: &[&str]) -> Self {
         let mut profile = Self::server_default();
@@ -335,7 +337,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_default_has_all_tools() {
+    fn server_default_has_all_server_builtin_tools() {
         let profile = DeploymentProfile::server_default();
         assert_eq!(profile.providers.len(), 1);
         let caps = &profile.providers[0].capabilities;
@@ -347,10 +349,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(names.contains(&"bash"));
         assert!(names.contains(&"web_search"));
         assert!(names.contains(&"memory"));
         assert!(names.contains(&"agent"));
+        assert!(names.contains(&"reflect"));
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"read_file"));
+        assert!(!names.contains(&"write_file"));
+        assert!(!names.contains(&"git"));
     }
 
     #[test]
@@ -366,14 +372,14 @@ mod tests {
             .collect();
         assert!(!names.contains(&"web_search"));
         assert!(!names.contains(&"web_fetch"));
-        assert!(names.contains(&"bash"));
         assert!(names.contains(&"memory"));
+        assert!(names.contains(&"agent"));
         assert_eq!(names.len(), SERVER_ALL_TOOLS.len() - 2);
     }
 
     #[test]
     fn server_with_only_keeps_specified() {
-        let profile = DeploymentProfile::server_with_only(&["bash", "read_file", "memory"]);
+        let profile = DeploymentProfile::server_with_only(&["memory", "web_search", "agent"]);
         let caps = &profile.providers[0].capabilities;
         let names: Vec<&str> = caps
             .iter()
@@ -383,11 +389,11 @@ mod tests {
             })
             .collect();
         assert_eq!(names.len(), 3);
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"read_file"));
         assert!(names.contains(&"memory"));
-        assert!(!names.contains(&"web_search"));
-        assert!(!names.contains(&"agent"));
+        assert!(names.contains(&"web_search"));
+        assert!(names.contains(&"agent"));
+        assert!(!names.contains(&"reflect"));
+        assert!(!names.contains(&"bash"));
     }
 
     #[test]

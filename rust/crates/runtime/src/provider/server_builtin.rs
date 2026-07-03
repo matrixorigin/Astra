@@ -14,56 +14,36 @@ use super::traits::{
 };
 use super::types::{ProviderKind, ToolCapability};
 
-/// Exact tools provided by the server builtin provider by default.
+/// Exact server-service/control-plane tools provided by the server builtin
+/// provider by default.
 ///
 /// This is intentionally a named-tool inventory rather than category
 /// capabilities: category matching is broad enough to include tools such as
-/// `lsp` and `find_definition` that are valid runtime tools but are not
-/// server-builtin handlers.
+/// `bash`, `read_file`, `lsp`, and `find_definition` that are valid runtime
+/// tools but require an explicit workspace/runtime execution provider.
 pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
-    // Shell
-    "bash",
-    // FileSystem
-    "read_file",
-    "write_file",
-    "str_replace",
-    "list_dir",
-    "grep",
-    "glob",
-    // VersionControl
-    "git",
-    // ExternalApi
+    // Server services
+    "memory",
+    "mo_query",
+    "rollback_database_snapshots",
+    "tool_search",
     "web_search",
     "web_fetch",
     "github",
-    "tool_search",
-    // StateManagement
-    "memory",
-    "session",
-    "task",
-    "mo_query",
-    "rollback_database_snapshots",
-    "rollback_file_edits",
-    "rollback_session_state",
-    // AgentDelegation
-    "agent",
-    "agent_fanout",
-    // User interaction
+    // Control plane
     "ask_user",
     "notify",
-    // Plan mode
+    "agent",
+    "agent_fanout",
+    "compress_context",
     "enter_plan_mode",
     "exit_plan_mode",
-    // Symbols / introspection
     "get_agent_info",
-    "symbols",
     "introspect",
-    // Context management
-    "compress_context",
-    // Artifact publishing
-    "publish_artifact",
-    // Programmatic scripting
-    "run_script",
+    "reflect",
+    "rollback_session_state",
+    "session",
+    "task",
 ];
 
 // ---------------------------------------------------------------------------
@@ -72,16 +52,19 @@ pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
 
 /// Provider for server-builtin tools.
 ///
-/// Declares all server-side capabilities (memory, task, session, agent, MCP,
-/// web fetch/search, github, symbols) and delegates execution to a
-/// `ServerToolRuntime` (backed by `ServerToolExecutor`).
+/// Declares only server-service/control-plane capabilities and delegates
+/// execution to a `ServerToolRuntime` (backed by `ServerToolExecutor`).
+///
+/// Workspace and process tools such as `bash`, `read_file`, `write_file`, and
+/// `git` are intentionally excluded. They require an explicit runtime/workspace
+/// provider such as edge, sandbox, or managed runtime.
 ///
 /// ## Tool filtering
 ///
-/// When `tools` is `Some(list)`, `capabilities()` returns only `Named`
-/// entries for those tools — enabling deployment profiles to control exactly
-/// which tools are available. When `None` (default), the provider declares the
-/// exact server-builtin inventory in [`SERVER_BUILTIN_TOOL_NAMES`].
+/// When `tools` is `Some(list)`, `capabilities()` returns only names that are
+/// also in [`SERVER_BUILTIN_TOOL_NAMES`]. This lets deployment profiles narrow
+/// the server service surface without reclassifying workspace/runtime tools as
+/// server builtin tools.
 pub struct ServerBuiltinProvider {
     /// Priority for routing (lower = preferred).
     priority: u8,
@@ -127,6 +110,7 @@ impl CapabilityProvider for ServerBuiltinProvider {
         match self.tools.as_deref() {
             Some(tools) => tools
                 .iter()
+                .filter(|tool| SERVER_BUILTIN_TOOL_NAMES.contains(&tool.as_str()))
                 .map(|tool| ToolCapability::Named(tool.clone()))
                 .collect(),
             None => SERVER_BUILTIN_TOOL_NAMES
@@ -161,8 +145,9 @@ impl CapabilityProvider for ServerBuiltinProvider {
     }
 
     async fn storage_accessible(&self) -> bool {
-        // Server process has access to the workspace directory.
-        true
+        // Server builtin capability does not imply workspace access. Workspace
+        // tools must be provided by an explicit runtime/workspace provider.
+        false
     }
 }
 
@@ -216,8 +201,11 @@ mod tests {
         let caps = provider.capabilities().await;
         assert!(!caps.is_empty());
         assert_eq!(caps.len(), SERVER_BUILTIN_TOOL_NAMES.len());
-        assert!(caps.contains(&ToolCapability::Named("symbols".into())));
-        assert!(!caps.contains(&ToolCapability::Named("lsp".into())));
+        assert!(caps.contains(&ToolCapability::Named("reflect".into())));
+        assert!(caps.contains(&ToolCapability::Named("web_search".into())));
+        assert!(!caps.contains(&ToolCapability::Named("bash".into())));
+        assert!(!caps.contains(&ToolCapability::Named("read_file".into())));
+        assert!(!caps.contains(&ToolCapability::Named("symbols".into())));
     }
 
     #[tokio::test]
@@ -245,13 +233,25 @@ mod tests {
         let provider = ServerBuiltinProvider::new(
             10,
             Arc::new(TestRuntime),
-            Some(vec!["bash".into(), "read_file".into()]),
+            Some(vec![
+                "bash".into(),
+                "read_file".into(),
+                "memory".into(),
+                "reflect".into(),
+            ]),
         );
         let caps = provider.capabilities().await;
         assert_eq!(caps.len(), 2);
-        assert!(caps.contains(&ToolCapability::Named("bash".into())));
-        assert!(caps.contains(&ToolCapability::Named("read_file".into())));
-        assert!(!caps.contains(&ToolCapability::Named("write_file".into())));
+        assert!(caps.contains(&ToolCapability::Named("memory".into())));
+        assert!(caps.contains(&ToolCapability::Named("reflect".into())));
+        assert!(!caps.contains(&ToolCapability::Named("bash".into())));
+        assert!(!caps.contains(&ToolCapability::Named("read_file".into())));
+    }
+
+    #[tokio::test]
+    async fn server_builtin_does_not_imply_workspace_access() {
+        let provider = ServerBuiltinProvider::new(10, Arc::new(TestRuntime), None);
+        assert!(!provider.storage_accessible().await);
     }
 
     #[tokio::test]

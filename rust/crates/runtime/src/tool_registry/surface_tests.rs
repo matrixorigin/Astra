@@ -154,6 +154,28 @@ fn server_builtin_inventory_is_public_schema_backed() {
             "server builtin inventory must not expose internal runtime tool: {name}"
         );
         assert!(
+            matches!(
+                spec.required.executor,
+                astra_runtime_env::RequiredExecutor::ControlPlane
+                    | astra_runtime_env::RequiredExecutor::ServiceExecutor
+            ),
+            "server builtin inventory must be server-owned, not runtime-executor: {name}"
+        );
+        assert_eq!(
+            spec.required.workspace,
+            astra_runtime_env::RequiredWorkspace::None,
+            "server builtin inventory must not imply workspace access: {name}"
+        );
+        assert!(
+            !spec.required.filesystem_read
+                && !spec.required.filesystem_write
+                && !spec.required.process_spawn
+                && !spec.required.shell
+                && !spec.required.git
+                && !spec.required.lsp,
+            "server builtin inventory must not include workspace/process effects: {name}"
+        );
+        assert!(
             schema_names.contains(name),
             "server builtin inventory must be schema-backed: {name}"
         );

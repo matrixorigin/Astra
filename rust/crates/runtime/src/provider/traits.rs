@@ -111,8 +111,8 @@ pub enum ProviderError {
 // ServerToolRuntime — server-local tool execution delegate
 // ---------------------------------------------------------------------------
 
-/// Runtime that can execute server-local tools (memory, task, session,
-/// symbols, web_search, web_fetch, github, introspect, agent, mcp).
+/// Runtime that can execute server-service/control-plane tools (memory, task,
+/// session, web_search, web_fetch, github, introspect, reflect, agent).
 ///
 /// ServerToolExecutor implements this so ServerBuiltinProvider can
 /// delegate builtin tool calls without knowing the full executor structure.

@@ -200,22 +200,22 @@ async fn cross_kind_priority_routing() {
 
     // ServerBuiltinProvider declares exact server-owned tools at priority 10.
     reg.register(
-        "server-sym",
+        "server-memory",
         Arc::new(ServerBuiltinProvider::new(10, Arc::new(DummyRuntime), None)),
     )
     .await
     .unwrap();
     // A second ServerBuiltinProvider at lower priority.
     reg.register(
-        "server-sym-preferred",
+        "server-memory-preferred",
         Arc::new(ServerBuiltinProvider::new(3, Arc::new(DummyRuntime), None)),
     )
     .await
     .unwrap();
 
     let request = ToolRequest {
-        capability: ToolCapability::Named("symbols".into()),
-        tool_name: "symbols".into(),
+        capability: ToolCapability::Named("memory".into()),
+        tool_name: "memory".into(),
         tool_call_id: "cross-kind-1".into(),
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::None,
@@ -309,7 +309,8 @@ async fn storage_unavailable_returns_not_capable() {
 async fn no_storage_request_matches_all() {
     let reg = CapabilityRegistry::new();
 
-    // ServerBuiltinProvider has named state-management tools + storage.
+    // ServerBuiltinProvider has named state-management tools, but no workspace
+    // storage authority.
     reg.register(
         "server",
         Arc::new(ServerBuiltinProvider::new(10, Arc::new(DummyRuntime), None)),
@@ -333,9 +334,10 @@ async fn no_storage_request_matches_all() {
     assert_eq!(resolved.kind(), ProviderKind::ServerBuiltin);
 }
 
-/// ServerBuiltinProvider has storage access and handles named agent tools.
+/// ServerBuiltinProvider handles named agent tools, but must not satisfy a
+/// workspace storage requirement.
 #[tokio::test]
-async fn server_builtin_storage_access_for_agent() {
+async fn server_builtin_rejects_storage_request_for_agent() {
     let reg = CapabilityRegistry::new();
     reg.register(
         "server",
@@ -360,8 +362,8 @@ async fn server_builtin_storage_access_for_agent() {
         session_id: "test-session".into(),
     };
 
-    let resolved = reg.resolve(&request).await.unwrap();
-    assert!(resolved.storage_accessible().await);
+    let result = reg.resolve(&request).await;
+    assert!(matches!(result, Err(ProviderError::NotCapable { .. })));
 }
 
 // ---------------------------------------------------------------------------
@@ -500,8 +502,8 @@ async fn isolation_none_available_returns_error() {
     .unwrap();
 
     let request = ToolRequest {
-        capability: ToolCapability::Named("symbols".into()),
-        tool_name: "symbols".into(),
+        capability: ToolCapability::Named("memory".into()),
+        tool_name: "memory".into(),
         tool_call_id: "iso-4".into(),
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::Sandbox,
@@ -706,7 +708,7 @@ async fn combined_storage_isolation_priority() {
 async fn combined_capability_match_but_isolation_excluded() {
     let reg = CapabilityRegistry::new();
 
-    // ServerBuiltinProvider: named symbols capability, isolation=None.
+    // ServerBuiltinProvider: named memory capability, isolation=None.
     reg.register(
         "server",
         Arc::new(ServerBuiltinProvider::new(10, Arc::new(DummyRuntime), None)),
@@ -715,8 +717,8 @@ async fn combined_capability_match_but_isolation_excluded() {
     .unwrap();
 
     let request = ToolRequest {
-        capability: ToolCapability::Named("symbols".into()),
-        tool_name: "symbols".into(),
+        capability: ToolCapability::Named("memory".into()),
+        tool_name: "memory".into(),
         tool_call_id: "combined-2".into(),
         parameters: serde_json::Value::Null,
         isolation_required: IsolationIntent::Process, // ServerBuiltin can't satisfy
