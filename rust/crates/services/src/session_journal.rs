@@ -19,6 +19,10 @@ use std::sync::{LazyLock, Mutex};
 
 use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
 
+use crate::interaction_contract::{
+    InteractionContract, InteractionIdentity, InteractionKind, approval_decision_status,
+    ask_user_response_status,
+};
 use crate::{OwnerScope, SessionArtifactStore};
 
 thread_local! {
@@ -1068,6 +1072,27 @@ pub struct ApprovalJournalDecision {
     pub tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_kind: Option<String>,
+}
+
+impl ApprovalJournalDecision {
+    pub fn interaction_contract(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+    ) -> Option<InteractionContract> {
+        let run_id = self.run_id.as_deref()?;
+        let identity =
+            InteractionIdentity::new(user_id, session_id, run_id, self.request_id.as_str());
+        if !identity.is_run_scoped() {
+            return None;
+        }
+        Some(InteractionContract::new(
+            InteractionKind::Approval,
+            identity,
+            approval_decision_status(&self.decision),
+            Some("session_journal.approval_decision".to_string()),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2150,6 +2175,27 @@ pub struct AskUserJournalResponse {
     pub run_id: Option<String>,
     pub status: String,
     pub answers: Option<serde_json::Value>,
+}
+
+impl AskUserJournalResponse {
+    pub fn interaction_contract(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+    ) -> Option<InteractionContract> {
+        let run_id = self.run_id.as_deref()?;
+        let identity =
+            InteractionIdentity::new(user_id, session_id, run_id, self.request_id.as_str());
+        if !identity.is_run_scoped() {
+            return None;
+        }
+        Some(InteractionContract::new(
+            InteractionKind::UserPrompt,
+            identity,
+            ask_user_response_status(&self.status),
+            Some("session_journal.ask_user_response".to_string()),
+        ))
+    }
 }
 
 pub fn find_latest_ask_user_response(
@@ -4663,6 +4709,9 @@ pub fn run_session_maintenance(
 #[cfg(test)]
 mod approval_tests {
     use super::*;
+    use crate::interaction_contract::{
+        InteractionDurableStore, InteractionKind, InteractionStatus,
+    };
 
     #[test]
     fn find_latest_approval_decision_reads_latest_matching_entry() {
@@ -4827,6 +4876,53 @@ mod approval_tests {
     }
 
     #[test]
+    fn approval_decision_projects_to_run_scoped_interaction_contract() {
+        let decision = ApprovalJournalDecision {
+            request_id: "req-contract".into(),
+            run_id: Some("run-contract".into()),
+            decision: "deny".into(),
+            reason: Some("not safe".into()),
+            tool_name: Some("bash".into()),
+            approval_kind: Some("explicit".into()),
+        };
+
+        let contract = decision
+            .interaction_contract("sess-contract", Some("user-contract"))
+            .expect("run-scoped approval decision should become an interaction contract");
+
+        assert_eq!(contract.kind, InteractionKind::Approval);
+        assert_eq!(
+            contract.durable_store,
+            InteractionDurableStore::SessionJournal
+        );
+        assert_eq!(contract.status, InteractionStatus::Resolved);
+        assert_eq!(contract.identity.user_id.as_deref(), Some("user-contract"));
+        assert_eq!(contract.identity.session_id, "sess-contract");
+        assert_eq!(contract.identity.run_id, "run-contract");
+        assert_eq!(contract.identity.request_id, "req-contract");
+        assert!(contract.is_wait_satisfied());
+    }
+
+    #[test]
+    fn approval_decision_without_run_id_is_not_a_cross_pod_contract() {
+        let decision = ApprovalJournalDecision {
+            request_id: "legacy-req".into(),
+            run_id: None,
+            decision: "allow".into(),
+            reason: None,
+            tool_name: None,
+            approval_kind: None,
+        };
+
+        assert!(
+            decision
+                .interaction_contract("sess-contract", Some("user-contract"))
+                .is_none(),
+            "legacy session/request-only decisions are not safe no-sticky interaction facts"
+        );
+    }
+
+    #[test]
     fn append_approval_decision_for_run_is_idempotent_and_conflict_safe() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
@@ -4924,6 +5020,32 @@ mod approval_tests {
             found.answers.unwrap()["answers"][0]["answers"][0].as_str(),
             Some("yes")
         );
+    }
+
+    #[test]
+    fn ask_user_response_projects_to_run_scoped_interaction_contract() {
+        let response = AskUserJournalResponse {
+            request_id: "ask-contract".into(),
+            run_id: Some("run-contract".into()),
+            status: "cancelled".into(),
+            answers: None,
+        };
+
+        let contract = response
+            .interaction_contract("sess-contract", Some("user-contract"))
+            .expect("run-scoped ask_user response should become an interaction contract");
+
+        assert_eq!(contract.kind, InteractionKind::UserPrompt);
+        assert_eq!(
+            contract.durable_store,
+            InteractionDurableStore::SessionJournal
+        );
+        assert_eq!(contract.status, InteractionStatus::Cancelled);
+        assert_eq!(contract.identity.user_id.as_deref(), Some("user-contract"));
+        assert_eq!(contract.identity.session_id, "sess-contract");
+        assert_eq!(contract.identity.run_id, "run-contract");
+        assert_eq!(contract.identity.request_id, "ask-contract");
+        assert!(contract.is_wait_satisfied());
     }
 
     #[test]

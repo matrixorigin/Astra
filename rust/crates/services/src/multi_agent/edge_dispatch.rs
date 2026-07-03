@@ -14,6 +14,7 @@ use sqlx::{MySql, Row};
 
 use super::metrics::{SharedMultiAgentMetrics, saturating_decrement};
 use crate::db_row::RowExt as EdgeDispatchDbRow;
+use crate::interaction_contract::{InteractionStatus, edge_dispatch_status};
 
 #[derive(Debug)]
 pub struct EdgeDispatchRow {
@@ -485,14 +486,16 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             match row {
                 Some(r) => {
                     let status: String = r.try_get("status").map_err(|e| e.to_string())?;
-                    match status.as_str() {
-                        "completed" => {
+                    let result_json = r
+                        .try_get::<Option<String>, _>("result_json")
+                        .map_err(|e| e.to_string())?;
+                    match edge_dispatch_status(&status, result_json.as_deref()) {
+                        InteractionStatus::Pending => {} // still pending or dispatched
+                        InteractionStatus::Resolved
+                        | InteractionStatus::Expired
+                        | InteractionStatus::Cancelled => {
                             return Ok(Some(decode_terminal_result_json(&r)?));
                         }
-                        "failed" => {
-                            return Ok(Some(decode_terminal_result_json(&r)?));
-                        }
-                        _ => {} // still pending or dispatched
                     }
                 }
                 None => return Ok(None), // request not found

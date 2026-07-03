@@ -168,7 +168,7 @@ pub fn edge_dispatch_status(status: &str, result_json: Option<&str>) -> Interact
         "cancelled" | "canceled" => InteractionStatus::Cancelled,
         "expired" => InteractionStatus::Expired,
         "failed" => edge_failed_status(result_json),
-        _ => InteractionStatus::Resolved,
+        _ => InteractionStatus::Pending,
     }
 }
 
@@ -298,6 +298,10 @@ mod tests {
                 Some(r#"{"status":"error","output":"edge executor failed"}"#)
             ),
             InteractionStatus::Resolved
+        );
+        assert_eq!(
+            edge_dispatch_status("unexpected_new_storage_state", None),
+            InteractionStatus::Pending
         );
     }
 
