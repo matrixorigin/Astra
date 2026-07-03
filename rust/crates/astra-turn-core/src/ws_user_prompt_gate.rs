@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::pipeline_metrics::MetricsRegistry;
+use astra_services::InteractionStatus;
 use astra_services::session_journal::{
     AskUserJournalResponse, JournalEvent, JournalWriter, find_latest_ask_user_response_for_run,
 };
@@ -186,25 +187,37 @@ fn decision_from_user_prompt_value(value: Value) -> AskUserDecision {
     }
 }
 
-fn decision_from_journal_response(response: AskUserJournalResponse) -> AskUserDecision {
+fn decision_from_journal_response(
+    response: AskUserJournalResponse,
+    session_id: &str,
+    user_id: &str,
+) -> Option<AskUserDecision> {
+    let Some(contract) = response.interaction_contract(session_id, Some(user_id)) else {
+        return Some(AskUserDecision::Error(
+            "Invalid user prompt journal response identity".into(),
+        ));
+    };
+    if contract.status == InteractionStatus::Pending {
+        return None;
+    }
     match response.status.as_str() {
         "submitted" => {
             let Some(answers) = response.answers else {
-                return AskUserDecision::Error(
+                return Some(AskUserDecision::Error(
                     "Invalid user prompt journal response: missing answers".into(),
-                );
+                ));
             };
             match serde_json::from_value::<AskUserAnswers>(answers) {
-                Ok(answers) => AskUserDecision::Submitted(answers),
-                Err(error) => {
-                    AskUserDecision::Error(format!("Invalid user prompt journal response: {error}"))
-                }
+                Ok(answers) => Some(AskUserDecision::Submitted(answers)),
+                Err(error) => Some(AskUserDecision::Error(format!(
+                    "Invalid user prompt journal response: {error}"
+                ))),
             }
         }
-        "cancelled" => AskUserDecision::Cancelled,
-        other => AskUserDecision::Error(format!(
+        "cancelled" => Some(AskUserDecision::Cancelled),
+        other => Some(AskUserDecision::Error(format!(
             "Invalid user prompt journal response status: {other}"
-        )),
+        ))),
     }
 }
 
@@ -293,10 +306,16 @@ async fn wait_user_prompt_response(
             last_journal_lookup = Some(std::time::Instant::now());
             match find_latest_ask_user_response_for_run(session_id, request_id, run_id) {
                 Ok(Some(response)) => {
-                    record_journal_lookup_metric("hit");
-                    let decision = decision_from_journal_response(response);
-                    record_wait_metric("journal", decision_outcome_label(&decision));
-                    return Some(decision);
+                    match decision_from_journal_response(response, session_id, user_id) {
+                        Some(decision) => {
+                            record_journal_lookup_metric("hit");
+                            record_wait_metric("journal", decision_outcome_label(&decision));
+                            return Some(decision);
+                        }
+                        None => {
+                            record_journal_lookup_metric("pending");
+                        }
+                    }
                 }
                 Ok(None) => {
                     record_journal_lookup_metric("miss");
@@ -613,6 +632,46 @@ mod tests {
         let decision = gate
             .request_questionnaire(
                 "req-cross-run",
+                &AskUserPrompt {
+                    context: None,
+                    questions: vec![astra_tools::AskUserQuestion {
+                        header: "Confirm".into(),
+                        question: "Continue?".into(),
+                        options: vec![],
+                        multi_select: false,
+                        allow_freeform: true,
+                    }],
+                    timeout_ms: Some(40),
+                },
+            )
+            .await;
+
+        assert_eq!(decision, AskUserDecision::Timeout);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_journal_response_does_not_satisfy_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-user-prompt").unwrap();
+        writer
+            .append(&JournalEvent::ask_user_response(
+                Some("sess-user-prompt"),
+                Some(3),
+                "req-pending-journal",
+                Some("run-user-prompt"),
+                "waiting",
+                None,
+            ))
+            .unwrap();
+
+        let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel::<Value>(1);
+        let gate = test_gate(ledger, tx, Duration::from_millis(40));
+
+        let decision = gate
+            .request_questionnaire(
+                "req-pending-journal",
                 &AskUserPrompt {
                     context: None,
                     questions: vec![astra_tools::AskUserQuestion {

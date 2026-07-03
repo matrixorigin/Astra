@@ -14,6 +14,7 @@ use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 
+use astra_services::InteractionStatus;
 use astra_services::session_journal::{
     ApprovalJournalDecision, JournalEvent, JournalWriter, find_latest_approval_decision_for_run,
 };
@@ -106,8 +107,23 @@ fn decision_from_approval_fields(decision: &str, reason: Option<String>) -> Appr
     }
 }
 
-fn decision_from_journal_approval(decision: ApprovalJournalDecision) -> ApprovalDecision {
-    decision_from_approval_fields(&decision.decision, decision.reason)
+fn decision_from_journal_approval(
+    decision: ApprovalJournalDecision,
+    context: &ApprovalJournalContext,
+) -> Option<ApprovalDecision> {
+    let contract = decision.interaction_contract(&context.session_id, None)?;
+    match contract.status {
+        InteractionStatus::Pending => None,
+        InteractionStatus::Expired | InteractionStatus::Cancelled => {
+            Some(ApprovalDecision::Denied {
+                reason: Some(format!("Approval {}", decision.decision)),
+            })
+        }
+        InteractionStatus::Resolved => Some(decision_from_approval_fields(
+            &decision.decision,
+            decision.reason,
+        )),
+    }
 }
 
 fn decision_from_approval_value(value: Value) -> ApprovalDecision {
@@ -190,7 +206,11 @@ async fn wait_approval_response(
                 request_id,
                 &context.run_id,
             ) {
-                Ok(Some(decision)) => return Some(decision_from_journal_approval(decision)),
+                Ok(Some(decision)) => {
+                    if let Some(decision) = decision_from_journal_approval(decision, context) {
+                        return Some(decision);
+                    }
+                }
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(

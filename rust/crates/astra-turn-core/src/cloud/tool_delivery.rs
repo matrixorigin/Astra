@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use astra_services::InteractionStatus;
 use astra_services::session_journal::{
     JournalEvent, JournalWriter, find_latest_approval_decision_for_run,
 };
@@ -350,17 +351,23 @@ async fn persist_approval_aux_event(
 }
 fn journal_decision_to_cloud_result(
     decision: astra_services::session_journal::ApprovalJournalDecision,
-) -> (CloudApprovalResult, Option<String>, Option<String>) {
+    context: &ApprovalAuditContext,
+) -> Option<(CloudApprovalResult, Option<String>, Option<String>)> {
+    let contract = decision.interaction_contract(&context.session_id, Some(&context.user_id))?;
     let decision_name = decision.decision.clone();
     let reason = decision.reason.clone();
-    let result = match decision_name.as_str() {
-        "allow" | "allow_session" => CloudApprovalResult::Allowed,
-        "deny" => CloudApprovalResult::Denied {
-            reason: reason.clone(),
+    let result = match contract.status {
+        InteractionStatus::Pending => return None,
+        InteractionStatus::Expired | InteractionStatus::Cancelled => CloudApprovalResult::Timeout,
+        InteractionStatus::Resolved => match decision_name.as_str() {
+            "allow" | "allow_session" => CloudApprovalResult::Allowed,
+            "deny" => CloudApprovalResult::Denied {
+                reason: reason.clone(),
+            },
+            _ => CloudApprovalResult::Malformed,
         },
-        _ => CloudApprovalResult::Malformed,
     };
-    (result, Some(decision_name), reason)
+    Some((result, Some(decision_name), reason))
 }
 
 /// After the bridge has yielded `build_approval_required_event`, waits on the approval ledger.
@@ -413,14 +420,16 @@ pub async fn wait_approval_ledger_for_tool(
             last_journal_lookup = Some(Instant::now());
             match find_latest_approval_decision_for_run(&context.session_id, id, &context.run_id) {
                 Ok(Some(decision)) => {
-                    let (result, decision_name, reason) =
-                        journal_decision_to_cloud_result(decision);
-                    break (
-                        result,
-                        decision_name,
-                        reason,
-                        Some(ApprovalOutcomeSource::Journal),
-                    );
+                    if let Some((result, decision_name, reason)) =
+                        journal_decision_to_cloud_result(decision, context)
+                    {
+                        break (
+                            result,
+                            decision_name,
+                            reason,
+                            Some(ApprovalOutcomeSource::Journal),
+                        );
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
