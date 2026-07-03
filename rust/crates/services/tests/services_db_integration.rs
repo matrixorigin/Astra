@@ -2618,6 +2618,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
                 min_turns: None,
                 sort: "created".into(),
                 order: "desc".into(),
+                after_sort_value: None,
+                after_session_id: None,
             },
         )
         .await
@@ -2725,6 +2727,8 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
                 min_turns: Some(3),
                 sort: "turns".into(),
                 order: "desc".into(),
+                after_sort_value: None,
+                after_session_id: None,
             },
         )
         .await
@@ -2746,6 +2750,8 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
                 min_turns: Some(5),
                 sort: "turns".into(),
                 order: "desc".into(),
+                after_sort_value: None,
+                after_session_id: None,
             },
         )
         .await

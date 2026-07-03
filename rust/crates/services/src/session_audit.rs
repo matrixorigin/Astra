@@ -460,10 +460,6 @@ fn audit_pagination_rows_to_skip(page: u32, per_page: u32, context: &str) -> Aud
         })
 }
 
-fn audit_pagination_offset(page: u32, per_page: u32, context: &str) -> AuditResult<u32> {
-    audit_pagination_rows_to_skip(page, per_page, context)
-}
-
 fn turn_list_fallback_turn(offset: u32, row_index: usize) -> AuditResult<u32> {
     let row_index = u32::try_from(row_index).map_err(|_| {
         internal_error(format!(
@@ -904,6 +900,7 @@ const TURN_LIST_TOTAL_SQL: &str = "SELECT COALESCE(MAX(turn_seq), COUNT(CASE WHE
      WHERE session_id = ? AND user_id = ?";
 
 const TURN_LIST_SEEK_CHUNK_LIMIT: u32 = 100;
+const AUDIT_SESSION_LIST_SEEK_CHUNK_LIMIT: u32 = 100;
 
 fn turn_list_cursor_from_params(params: &TurnListParams) -> AuditResult<Option<TurnListCursor>> {
     match (&params.after_created_at, &params.after_event_id) {
@@ -1024,6 +1021,268 @@ async fn fetch_turn_page_rows(
             .bind(&cursor.event_id);
     }
     q.bind(limit).fetch_all(pool).await.map_err(internal_error)
+}
+
+#[derive(Debug, Clone)]
+struct AuditSessionListQuery {
+    base_sql: String,
+    bind_values: Vec<String>,
+    having_bind_values: Vec<String>,
+    sort_expr: &'static str,
+    order_dir: &'static str,
+}
+
+fn audit_session_list_rows_to_skip(page: u32, per_page: u32) -> AuditResult<u32> {
+    audit_pagination_rows_to_skip(
+        page,
+        per_page.clamp(1, MAX_AUDIT_SESSIONS_PER_PAGE),
+        "list_sessions",
+    )
+}
+
+fn audit_session_list_cursor_from_params(
+    params: &AuditSessionListParams,
+) -> AuditResult<Option<AuditSessionListCursor>> {
+    match (&params.after_sort_value, &params.after_session_id) {
+        (Some(sort_value), Some(session_id)) => {
+            if sort_value.trim().is_empty() || session_id.trim().is_empty() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "after_sort_value and after_session_id must be non-empty",
+                ));
+            }
+            Ok(Some(AuditSessionListCursor {
+                sort_value: sort_value.clone(),
+                session_id: session_id.clone(),
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "after_sort_value and after_session_id must be provided together",
+        )),
+    }
+}
+
+fn audit_session_list_cursor_from_row(
+    row: &impl SessionAuditRow,
+    context: &str,
+) -> AuditResult<AuditSessionListCursor> {
+    Ok(AuditSessionListCursor {
+        sort_value: audit_row_string(row, context, "sort_cursor_value")?,
+        session_id: audit_row_string(row, context, "session_id")?,
+    })
+}
+
+fn audit_session_list_sort_expr(sort: &str) -> &'static str {
+    match sort {
+        "turns" => "turn_count",
+        "tokens" => "(tokens_in + tokens_out)",
+        "duration" => "duration_secs",
+        _ => "created_at",
+    }
+}
+
+fn build_audit_session_list_query(
+    user_id: &str,
+    params: &AuditSessionListParams,
+) -> AuditSessionListQuery {
+    let mut having_parts: Vec<String> = Vec::new();
+    let mut where_parts: Vec<String> = vec!["s.user_id = ?".into()];
+    let mut bind_values: Vec<String> = vec![user_id.into()];
+    let mut having_bind_values: Vec<String> = Vec::new();
+
+    if let Some(ref status) = params.status {
+        where_parts.push("s.status = ?".into());
+        bind_values.push(status.clone());
+    }
+    if let Some(ref since) = params.since {
+        where_parts.push("s.created_at >= ?".into());
+        bind_values.push(since.clone());
+    }
+    if let Some(ref until) = params.until {
+        where_parts.push("s.created_at <= ?".into());
+        bind_values.push(until.clone());
+    }
+    if let Some(min) = params.min_turns {
+        having_parts.push("turn_count >= ?".into());
+        having_bind_values.push(min.to_string());
+    }
+    if let Some(ref model) = params.model {
+        having_parts.push("SUM(CASE WHEN e.llm_model_used = ? THEN 1 ELSE 0 END) > 0".into());
+        having_bind_values.push(model.clone());
+    }
+
+    let where_clause = where_parts.join(" AND ");
+    let having_clause = if having_parts.is_empty() {
+        String::new()
+    } else {
+        format!("HAVING {}", having_parts.join(" AND "))
+    };
+    let base_sql = format!(
+        "SELECT \
+           s.session_id, s.status, s.created_at, s.ended_at, \
+           COALESCE(MAX(e.turn_seq), 0) AS turn_count, \
+           COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
+             THEN COALESCE(e.token_input, 0) ELSE 0 END), 0) AS tokens_in, \
+           COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
+             THEN COALESCE(e.token_output, 0) ELSE 0 END), 0) AS tokens_out, \
+           COUNT(CASE WHEN e.event_type IN ('tool_call', 'tool_error') THEN 1 END) AS tool_calls, \
+           COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_error') THEN 1 END) AS error_count, \
+           MIN(e.created_at) AS first_ts, \
+           MAX(e.created_at) AS last_ts, \
+           MAX(CASE WHEN e.llm_model_used IS NOT NULL AND e.llm_model_used != '' THEN e.llm_model_used END) AS model, \
+           TIMESTAMPDIFF(SECOND, s.created_at, COALESCE(s.ended_at, NOW())) AS duration_secs \
+         FROM agent_sessions s \
+         LEFT JOIN agent_events e ON e.session_id = s.session_id AND e.user_id = s.user_id \
+         WHERE {where_clause} \
+         GROUP BY s.session_id, s.status, s.created_at, s.ended_at \
+         {having_clause}"
+    );
+
+    AuditSessionListQuery {
+        base_sql,
+        bind_values,
+        having_bind_values,
+        sort_expr: audit_session_list_sort_expr(params.sort.as_str()),
+        order_dir: if params.order == "asc" { "ASC" } else { "DESC" },
+    }
+}
+
+fn audit_session_list_seek_clause(
+    query: &AuditSessionListQuery,
+    cursor: Option<&AuditSessionListCursor>,
+) -> String {
+    let Some(_) = cursor else {
+        return String::new();
+    };
+    let comparison = if query.order_dir == "ASC" { ">" } else { "<" };
+    format!(
+        "WHERE ({sort_expr} {comparison} ? OR ({sort_expr} = ? AND session_id {comparison} ?))",
+        sort_expr = query.sort_expr
+    )
+}
+
+async fn fetch_audit_session_cursor_rows(
+    pool: &Pool<MySql>,
+    query_parts: &AuditSessionListQuery,
+    cursor: Option<&AuditSessionListCursor>,
+    limit: u32,
+) -> AuditResult<Vec<sqlx::mysql::MySqlRow>> {
+    let seek_clause = audit_session_list_seek_clause(query_parts, cursor);
+    let sql = format!(
+        "SELECT session_id, CAST({sort_expr} AS CHAR) AS sort_cursor_value \
+         FROM ({base_sql}) session_rows \
+         {seek_clause} \
+         ORDER BY {sort_expr} {order_dir}, session_id {order_dir} \
+         LIMIT ?",
+        sort_expr = query_parts.sort_expr,
+        base_sql = query_parts.base_sql,
+        seek_clause = seek_clause,
+        order_dir = query_parts.order_dir
+    );
+    let mut q = query(&sql);
+    for v in &query_parts.bind_values {
+        q = q.bind(v);
+    }
+    for v in &query_parts.having_bind_values {
+        q = q.bind(v);
+    }
+    if let Some(cursor) = cursor {
+        q = q
+            .bind(&cursor.sort_value)
+            .bind(&cursor.sort_value)
+            .bind(&cursor.session_id);
+    }
+    q.bind(i64::from(limit))
+        .fetch_all(pool)
+        .await
+        .map_err(internal_error)
+}
+
+async fn audit_session_list_cursor_after_skipping(
+    pool: &Pool<MySql>,
+    query_parts: &AuditSessionListQuery,
+    mut rows_to_skip: u32,
+) -> AuditResult<Option<AuditSessionListCursor>> {
+    let mut cursor = None;
+    while rows_to_skip > 0 {
+        let limit = rows_to_skip.min(AUDIT_SESSION_LIST_SEEK_CHUNK_LIMIT);
+        let rows =
+            fetch_audit_session_cursor_rows(pool, query_parts, cursor.as_ref(), limit).await?;
+        if rows.is_empty() {
+            return Ok(cursor);
+        }
+        for row in &rows {
+            cursor = Some(audit_session_list_cursor_from_row(
+                row,
+                "audit_session_list_cursor",
+            )?);
+        }
+        rows_to_skip = rows_to_skip.saturating_sub(rows.len() as u32);
+        if rows.len() < limit as usize {
+            return Ok(cursor);
+        }
+    }
+    Ok(cursor)
+}
+
+async fn fetch_audit_session_page_rows(
+    pool: &Pool<MySql>,
+    query_parts: &AuditSessionListQuery,
+    cursor: Option<&AuditSessionListCursor>,
+    limit: u32,
+) -> AuditResult<Vec<sqlx::mysql::MySqlRow>> {
+    let seek_clause = audit_session_list_seek_clause(query_parts, cursor);
+    let sql = format!(
+        "SELECT session_rows.*, CAST({sort_expr} AS CHAR) AS sort_cursor_value \
+         FROM ({base_sql}) session_rows \
+         {seek_clause} \
+         ORDER BY {sort_expr} {order_dir}, session_id {order_dir} \
+         LIMIT ?",
+        sort_expr = query_parts.sort_expr,
+        base_sql = query_parts.base_sql,
+        seek_clause = seek_clause,
+        order_dir = query_parts.order_dir
+    );
+    let mut q = query(&sql);
+    for v in &query_parts.bind_values {
+        q = q.bind(v);
+    }
+    for v in &query_parts.having_bind_values {
+        q = q.bind(v);
+    }
+    if let Some(cursor) = cursor {
+        q = q
+            .bind(&cursor.sort_value)
+            .bind(&cursor.sort_value)
+            .bind(&cursor.session_id);
+    }
+    q.bind(i64::from(limit))
+        .fetch_all(pool)
+        .await
+        .map_err(internal_error)
+}
+
+async fn count_audit_session_list_rows(
+    pool: &Pool<MySql>,
+    query_parts: &AuditSessionListQuery,
+) -> AuditResult<u32> {
+    let sql = format!(
+        "SELECT COUNT(*) AS cnt FROM ({base_sql}) session_rows",
+        base_sql = query_parts.base_sql
+    );
+    let mut q = query(&sql);
+    for v in &query_parts.bind_values {
+        q = q.bind(v);
+    }
+    for v in &query_parts.having_bind_values {
+        q = q.bind(v);
+    }
+    q.fetch_one(pool)
+        .await
+        .map_err(internal_error)
+        .and_then(|row| audit_count_from_row(&row, "audit_session_list_count"))
 }
 
 // ── Response types ───────────────────────────────────────────────────────────
@@ -1514,6 +1773,14 @@ pub struct AuditSessionListResponse {
     pub total: u32,
     pub page: u32,
     pub per_page: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<AuditSessionListCursor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditSessionListCursor {
+    pub sort_value: String,
+    pub session_id: String,
 }
 
 /// Aggregate statistics across multiple sessions.
@@ -1742,6 +2009,8 @@ pub struct AuditSessionListParams {
     /// Sort direction: "desc" (default) or "asc".
     #[serde(default = "default_order")]
     pub order: String,
+    pub after_sort_value: Option<String>,
+    pub after_session_id: Option<String>,
 }
 
 /// Query parameters for cross-session stats endpoint.
@@ -2377,124 +2646,49 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let per_page = params.per_page.clamp(1, MAX_AUDIT_SESSIONS_PER_PAGE);
         let page = params.page.max(1);
-
-        // Build WHERE with all filters pushed into SQL (including min_turns and model)
-        // via a subquery that pre-aggregates event stats per session.
-        let mut having_parts: Vec<String> = Vec::new();
-        let mut where_parts: Vec<String> = vec!["s.user_id = ?".into()];
-        let mut bind_values: Vec<String> = vec![user_id.into()];
-        // Extra binds for the HAVING clause (appended after main binds)
-        let mut having_bind_values: Vec<String> = Vec::new();
-
-        if let Some(ref status) = params.status {
-            where_parts.push("s.status = ?".into());
-            bind_values.push(status.clone());
-        }
-        if let Some(ref since) = params.since {
-            where_parts.push("s.created_at >= ?".into());
-            bind_values.push(since.clone());
-        }
-        if let Some(ref until) = params.until {
-            where_parts.push("s.created_at <= ?".into());
-            bind_values.push(until.clone());
-        }
-        if let Some(min) = params.min_turns {
-            having_parts.push("turn_count >= ?".into());
-            having_bind_values.push(min.to_string());
-        }
-        if let Some(ref model) = params.model {
-            // "session ever used this model" — not MAX which picks lexicographic max
-            having_parts.push("SUM(CASE WHEN e.llm_model_used = ? THEN 1 ELSE 0 END) > 0".into());
-            having_bind_values.push(model.clone());
-        }
-
-        let where_clause = where_parts.join(" AND ");
-        let having_clause = if having_parts.is_empty() {
-            String::new()
+        let explicit_cursor = audit_session_list_cursor_from_params(params)?;
+        let rows_to_skip = if explicit_cursor.is_some() {
+            0
         } else {
-            format!("HAVING {}", having_parts.join(" AND "))
+            audit_session_list_rows_to_skip(page, per_page)?
         };
-
-        // Sort column (references aliases from the SELECT)
-        let sort_col = match params.sort.as_str() {
-            "turns" => "turn_count",
-            "tokens" => "tokens_in + tokens_out",
-            "duration" => "duration_secs",
-            _ => "s.created_at",
+        let query_parts = build_audit_session_list_query(user_id, params);
+        let derived_cursor = if explicit_cursor.is_none() {
+            audit_session_list_cursor_after_skipping(&pool, &query_parts, rows_to_skip).await?
+        } else {
+            None
         };
-        let order_dir = if params.order == "asc" { "ASC" } else { "DESC" };
-        let offset = audit_pagination_offset(page, per_page, "list_sessions")?;
-
-        // Single query: JOIN + GROUP BY to get stats, model, and counts in one pass.
-        // The CTE computes per-session aggregates; outer query handles pagination.
-        let data_sql = format!(
-            "SELECT \
-               s.session_id, s.status, s.created_at, s.ended_at, \
-               COALESCE(MAX(e.turn_seq), 0) AS turn_count, \
-               COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
-                 THEN COALESCE(e.token_input, 0) ELSE 0 END), 0) AS tokens_in, \
-               COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
-                 THEN COALESCE(e.token_output, 0) ELSE 0 END), 0) AS tokens_out, \
-               COUNT(CASE WHEN e.event_type IN ('tool_call', 'tool_error') THEN 1 END) AS tool_calls, \
-               COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_error') THEN 1 END) AS error_count, \
-               MIN(e.created_at) AS first_ts, \
-               MAX(e.created_at) AS last_ts, \
-               MAX(CASE WHEN e.llm_model_used IS NOT NULL AND e.llm_model_used != '' THEN e.llm_model_used END) AS model, \
-               TIMESTAMPDIFF(SECOND, s.created_at, COALESCE(s.ended_at, NOW())) AS duration_secs \
-             FROM agent_sessions s \
-             LEFT JOIN agent_events e ON e.session_id = s.session_id AND e.user_id = s.user_id \
-             WHERE {where_clause} \
-             GROUP BY s.session_id, s.status, s.created_at, s.ended_at \
-             {having_clause} \
-             ORDER BY {sort_col} {order_dir} \
-             LIMIT ? OFFSET ?"
-        );
-
-        let mut q = sqlx::query(&data_sql);
-        for v in &bind_values {
-            q = q.bind(v);
+        let cursor = explicit_cursor.as_ref().or(derived_cursor.as_ref());
+        let mut rows =
+            fetch_audit_session_page_rows(&pool, &query_parts, cursor, per_page.saturating_add(1))
+                .await?;
+        let has_more = rows.len() > per_page as usize;
+        if has_more {
+            rows.truncate(per_page as usize);
         }
-        for v in &having_bind_values {
-            q = q.bind(v);
-        }
-        q = q.bind(per_page as i64).bind(offset as i64);
-        let rows = q.fetch_all(&pool).await.map_err(internal_error)?;
+        let next_cursor = if has_more {
+            rows.last()
+                .map(|row| {
+                    audit_session_list_cursor_from_row(row, "audit_session_list_next_cursor")
+                })
+                .transpose()?
+        } else {
+            None
+        };
 
         let sessions: Vec<AuditSessionListItem> = rows
             .iter()
             .map(audit_session_list_item_from_row)
             .collect::<AuditResult<Vec<_>>>()?;
 
-        // Count total matching (same WHERE + HAVING, no LIMIT)
-        let count_sql = format!(
-            "SELECT COUNT(*) AS cnt FROM (\
-               SELECT s.session_id, \
-                 COALESCE(MAX(e.turn_seq), 0) AS turn_count \
-               FROM agent_sessions s \
-               LEFT JOIN agent_events e ON e.session_id = s.session_id AND e.user_id = s.user_id \
-               WHERE {where_clause} \
-               GROUP BY s.session_id \
-               {having_clause}\
-             ) sub"
-        );
-        let mut cq = sqlx::query(&count_sql);
-        for v in &bind_values {
-            cq = cq.bind(v);
-        }
-        for v in &having_bind_values {
-            cq = cq.bind(v);
-        }
-        let total = cq
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)
-            .and_then(|row| audit_count_from_row(&row, "audit_session_list_count"))?;
+        let total = count_audit_session_list_rows(&pool, &query_parts).await?;
 
         Ok(AuditSessionListResponse {
             sessions,
             total,
             page,
             per_page,
+            next_cursor,
         })
     }
 
@@ -3390,6 +3584,24 @@ mod tests {
     }
 
     #[test]
+    fn session_audit_session_list_uses_seek_pagination_not_sql_offset() {
+        let source = include_str!("session_audit.rs");
+        let impl_body = source
+            .split("impl SessionAuditService for DatabaseSessionAuditService")
+            .nth(1)
+            .expect("database audit service impl");
+        let list_sessions_body = impl_body
+            .split("async fn list_sessions")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn get_cross_session_stats").next())
+            .expect("list_sessions body");
+        assert!(!list_sessions_body.contains(" OFFSET "));
+        assert!(!list_sessions_body.contains("OFFSET ?"));
+        assert!(list_sessions_body.contains("audit_session_list_cursor_after_skipping"));
+        assert!(list_sessions_body.contains("fetch_audit_session_page_rows"));
+    }
+
+    #[test]
     fn audit_token_aggregates_use_core_token_events() {
         let source = include_str!("session_audit.rs");
         let impl_body = source
@@ -3406,11 +3618,11 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("async fn list_turns").next())
             .expect("session summary body");
-        let list_body = impl_body
-            .split("async fn list_sessions")
+        let list_query_body = source
+            .split("fn build_audit_session_list_query")
             .nth(1)
-            .and_then(|rest| rest.split("async fn get_cross_session_stats").next())
-            .expect("session list body");
+            .and_then(|rest| rest.split("fn audit_session_list_seek_clause").next())
+            .expect("session list query builder body");
         let stats_body = impl_body
             .split("async fn get_cross_session_stats")
             .nth(1)
@@ -3427,7 +3639,7 @@ mod tests {
             "audit turn cost samples should include llm_response token_usage rows"
         );
         assert!(
-            list_body.contains(
+            list_query_body.contains(
                 "e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL"
             ),
             "audit session list should aggregate only core token events"
@@ -4304,6 +4516,8 @@ mod tests {
         assert!(p.min_turns.is_none());
         assert_eq!(p.sort, "created");
         assert_eq!(p.order, "desc");
+        assert!(p.after_sort_value.is_none());
+        assert!(p.after_session_id.is_none());
     }
 
     #[test]
@@ -4321,17 +4535,57 @@ mod tests {
     }
 
     #[test]
+    fn session_list_cursor_params_must_be_complete_and_non_empty() {
+        let params = AuditSessionListParams {
+            page: 1,
+            per_page: 20,
+            status: None,
+            model: None,
+            since: None,
+            until: None,
+            min_turns: None,
+            sort: "created".into(),
+            order: "desc".into(),
+            after_sort_value: Some("2026-07-03 12:00:00".to_string()),
+            after_session_id: Some("session-1".to_string()),
+        };
+        assert_eq!(
+            audit_session_list_cursor_from_params(&params).expect("cursor params decode"),
+            Some(AuditSessionListCursor {
+                sort_value: "2026-07-03 12:00:00".to_string(),
+                session_id: "session-1".to_string(),
+            })
+        );
+
+        let missing_session_id = AuditSessionListParams {
+            after_session_id: None,
+            ..params.clone()
+        };
+        let (status, _) = audit_session_list_cursor_from_params(&missing_session_id)
+            .expect_err("missing cursor side should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let blank_sort_value = AuditSessionListParams {
+            after_sort_value: Some(" ".to_string()),
+            ..params
+        };
+        let (status, _) = audit_session_list_cursor_from_params(&blank_sort_value)
+            .expect_err("blank cursor side should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn audit_session_list_pagination_offset_checks_overflow() {
         assert_eq!(
-            audit_pagination_offset(0, 0, "list_sessions").expect("minimum pagination"),
+            audit_session_list_rows_to_skip(0, 0).expect("minimum pagination"),
             0
         );
         assert_eq!(
-            audit_pagination_offset(4, 20, "list_sessions").expect("normal pagination"),
+            audit_session_list_rows_to_skip(4, 20).expect("normal pagination"),
             60
         );
         assert_audit_internal_error_mentions(
-            audit_pagination_offset(u32::MAX, 100, "list_sessions"),
+            audit_session_list_rows_to_skip(u32::MAX, 100),
             "pagination offset overflow",
         );
     }
