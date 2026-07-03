@@ -389,7 +389,7 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
     out.trim_end().to_string()
 }
 
-pub(crate) fn turn_budget_label(s: &IntrospectSnapshot) -> String {
+pub fn turn_budget_label(s: &IntrospectSnapshot) -> String {
     if s.turn_budget_unlimited || (s.turns_completed == 0 && s.turns_remaining == 0) {
         format!("{}/∞", s.turns_completed)
     } else {
