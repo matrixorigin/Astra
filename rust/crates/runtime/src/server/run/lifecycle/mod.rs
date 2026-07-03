@@ -2464,7 +2464,7 @@ impl AgenticRunLifecycleService {
         if let Some(gateway_id) = selected_model.gateway.as_deref() {
             self.load_active_selected_model_gateway(gateway_id).await?;
         } else if provider_model_descriptor.is_some() {
-            Self::validate_provider_selected_model(request, selected_model)?;
+            Self::validate_provider_runtime_authorized(request)?;
         } else {
             self.validate_selected_native_model(&selected_model.model)
                 .await?;
@@ -2713,22 +2713,14 @@ impl AgenticRunLifecycleService {
         Ok(Some(model_gateway))
     }
 
-    fn validate_provider_selected_model(
+    fn validate_provider_runtime_authorized(
         request: &ChatRequestData,
-        selected_model: &SelectedModelRequest,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         if !request.provider_runtime_authorized {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "provider runtime descriptors require provider-authorized request authentication",
                 "external_runtime_context_required",
-            ));
-        }
-        if selected_model.id.as_deref().is_none() {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "provider-issued selected_model.id is required with capability_descriptors",
-                "selected_model_invalid",
             ));
         }
         Ok(())
@@ -10903,7 +10895,7 @@ mod tests {
         let mut request = test_request("hello");
         request.provider_runtime_authorized = true;
         request.selected_model = Some(SelectedModelRequest {
-            id: Some("model-qwen".to_string()),
+            id: None,
             model: "qwen3.7-max".to_string(),
             gateway: None,
         });

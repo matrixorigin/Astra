@@ -102,11 +102,6 @@ fn provider_model_gateway_invocation_from_payload(
         .ok_or_else(|| {
             "selected_model is required with capability_descriptors.model_gateway".to_string()
         })?;
-    if selected_model.get("id").and_then(Value::as_str).is_none() {
-        return Err(
-            "provider-issued selected_model.id is required with capability_descriptors".to_string(),
-        );
-    }
     let model = selected_model
         .get("model")
         .and_then(Value::as_str)
@@ -4963,8 +4958,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_model_gateway_invocation_requires_provider_model_id() {
-        let error = provider_model_gateway_invocation_from_payload(&json!({
+    fn provider_model_gateway_invocation_allows_missing_provider_model_id() {
+        let invocation = provider_model_gateway_invocation_from_payload(&json!({
             "selected_model": {"model": "qwen3.5-flash"},
             "runtime_auth": {"authorization": "Bearer runtime-grant"},
             "capability_descriptors": {
@@ -4973,9 +4968,10 @@ mod tests {
                 }
             }
         }))
-        .expect_err("provider model id is required");
+        .expect("valid provider runtime context")
+        .expect("provider model gateway invocation");
 
-        assert!(error.contains("selected_model.id"), "{error}");
+        assert_eq!(invocation.model, "qwen3.5-flash");
     }
 
     #[test]
