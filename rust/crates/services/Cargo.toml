@@ -44,7 +44,7 @@ dotenvy.workspace = true
 astra-core = { workspace = true, features = ["dev-defaults"] }
 filetime = "0.2"
 serde_json.workspace = true
-serial_test = "3"
+serial_test = { version = "3", features = ["file_locks"] }
 sqlx = { workspace = true, features = ["chrono"] }
 tempfile = "3"
 # `test-util` enables virtual-time `start_paused` so timeout/retry tests

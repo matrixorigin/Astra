@@ -6080,11 +6080,11 @@ mod tests {
             .collect::<Vec<_>>();
         let tied_ts = "2026-07-03 10:00:00.123456";
 
-        for run_id in &run_ids {
+        for (idx, run_id) in run_ids.iter().enumerate() {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
             let mut run = durable_run_record(run_id);
             run.user_id = user_id.clone();
-            run.session_id = format!("runs-it-cursor-session-{run_id}");
+            run.session_id = format!("runs-it-cursor-session-{idx}");
             run.status = STATUS_COMPLETED.into();
             store.insert_run(run).await.expect("insert cursor run");
             sqlx::query(

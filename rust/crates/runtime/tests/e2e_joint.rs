@@ -1232,9 +1232,10 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     ] {
         sqlx::query(
             "INSERT INTO session_state_item_events
-             (item_id, user_id, session_id, category, item_key, mutation, payload_json, created_at)
-             VALUES (?, ?, ?, 'approval_state', 'release-approval', 'apply_suggestion', ?, NOW(6))",
+             (event_id, item_id, user_id, session_id, category, item_key, mutation, payload_json, created_at)
+             VALUES (?, ?, ?, ?, 'approval_state', 'release-approval', 'apply_suggestion', ?, NOW(6))",
         )
+        .bind(id("state-event"))
         .bind(&approval_item)
         .bind(&user_id)
         .bind(&session_id)

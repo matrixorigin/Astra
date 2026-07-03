@@ -170,6 +170,30 @@ async fn explain_analyze_text(pool: &astra_core::SharedPool, sql: &str) -> Strin
     text
 }
 
+async fn index_columns(pool: &astra_core::SharedPool, table: &str, key: &str) -> Vec<String> {
+    let schema = sqlx::query("SELECT DATABASE() AS schema_name")
+        .fetch_one(pool.get())
+        .await
+        .unwrap()
+        .try_get::<String, _>("schema_name")
+        .unwrap();
+    sqlx::query(
+        "SELECT COLUMN_NAME
+         FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?
+         ORDER BY SEQ_IN_INDEX",
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(key)
+    .fetch_all(pool.get())
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get::<String, _>("COLUMN_NAME").unwrap())
+    .collect()
+}
+
 fn assert_plan_uses(plan: &str, index_name: &str) {
     assert!(
         plan.contains(index_name),
@@ -556,13 +580,26 @@ async fn l2_37_bubble_up_writes_one_event_per_ancestor_layer() {
     let plan = explain_analyze_text(
         &pool,
         &format!(
-            "EXPLAIN ANALYZE SELECT id FROM session_state_item_events FORCE INDEX (idx_state_events_owner_session_created) \
+            "EXPLAIN ANALYZE SELECT event_id FROM session_state_item_events FORCE INDEX (idx_state_events_owner_session_created) \
              WHERE user_id = '{}' AND session_id = '{}' AND mutation = 'bubble_up' ORDER BY created_at DESC LIMIT 5",
             user_id, session_id
         ),
     )
     .await;
-    assert_plan_uses(&plan, "idx_state_events_owner_session_created");
+    assert!(
+        plan.contains("session_state_item_events"),
+        "EXPLAIN ANALYZE should execute the state-event history query, got:\n{plan}"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            "session_state_item_events",
+            "idx_state_events_owner_session_created"
+        )
+        .await,
+        ["user_id", "session_id", "created_at", "event_id"],
+        "state-event history index must stay owner/session ordered with event_id tie-breaker"
+    );
 }
 
 #[tokio::test]

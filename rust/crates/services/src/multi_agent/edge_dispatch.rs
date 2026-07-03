@@ -354,21 +354,27 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         };
 
         // Mark claimed rows as dispatched within the same transaction.
+        // MatrixOne rejects row-value `IN ((?, ?), ...)`, so spell the identity
+        // set as disjunctions over the owner/request primary key.
         let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "UPDATE edge_pending_dispatch \
              SET status = 'dispatched', dispatched_at = NOW(6) \
-             WHERE (user_id, request_id) IN (",
+             WHERE status = 'pending' AND (",
         );
-        let mut separated = update.separated(", ");
+        let mut first_identity = true;
         for row in &claimed_rows {
-            separated
-                .push_unseparated("(")
+            if !first_identity {
+                update.push(" OR ");
+            }
+            first_identity = false;
+            update
+                .push("(user_id = ")
                 .push_bind(&row.user_id)
-                .push_unseparated(", ")
+                .push(" AND request_id = ")
                 .push_bind(&row.request_id)
-                .push_unseparated(")");
+                .push(")");
         }
-        separated.push_unseparated(") AND status = 'pending'");
+        update.push(")");
         let update_result = match update.build().execute(&mut *tx).await {
             Ok(result) => result,
             Err(e) => {
@@ -890,6 +896,30 @@ mod tests {
         assert!(
             error.contains("claimed 2 rows but updated 1"),
             "error should identify claim/update mismatch: {error}"
+        );
+    }
+
+    #[test]
+    fn poll_claim_update_uses_matrixone_compatible_identity_predicates() {
+        let source = include_str!("edge_dispatch.rs");
+        let poll_body = source
+            .split("impl EdgeDispatchService for DatabaseEdgeDispatchService")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("#[tracing::instrument(skip(self, result_json)")
+                    .next()
+            })
+            .expect("poll_pending body");
+        assert!(
+            !poll_body.contains("(user_id, request_id) IN"),
+            "MatrixOne rejects row-value IN predicates with bound tuple parameters"
+        );
+        assert!(
+            poll_body.contains("WHERE status = 'pending' AND (")
+                && poll_body.contains("(user_id = ")
+                && poll_body.contains(" AND request_id = ")
+                && poll_body.contains(" OR "),
+            "poll claim update must use explicit owner/request predicates"
         );
     }
 

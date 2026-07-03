@@ -1006,6 +1006,7 @@ pub async fn run_saas_approval_respond_success_path() {
             "decision": "allow",
             "reason": "saas e2e allow",
             "session_id": ctx.session_id,
+            "run_id": format!("run-saas-appr-{}", ctx.suffix),
             "tool_name": "write_file",
             "approval_kind": "standard"
         }),

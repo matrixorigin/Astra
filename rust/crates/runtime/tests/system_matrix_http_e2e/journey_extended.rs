@@ -255,7 +255,8 @@ pub async fn run_approval_respond_invalid_session_id_rejected() {
         json!({
             "request_id": format!("bad-session-{}", ctx.suffix),
             "decision": "allow",
-            "session_id": "../escape"
+            "session_id": "../escape",
+            "run_id": format!("bad-session-run-{}", ctx.suffix)
         }),
     )
     .await;
@@ -307,7 +308,9 @@ pub async fn run_edge_callback_http_boundary_failures() {
         None,
         json!({
             "request_id": format!("approval-unauth-{}", ctx.suffix),
-            "decision": "allow"
+            "decision": "allow",
+            "session_id": ctx.session_id,
+            "run_id": format!("approval-unauth-run-{}", ctx.suffix)
         }),
     )
     .await;
@@ -484,6 +487,7 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
 pub async fn run_duplicate_approval_response_is_idempotent() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
+    let run_id = format!("run-dup-appr-{}", ctx.suffix);
     for _ in 0..2 {
         let (status, body) = post_json(
             &ctx.app,
@@ -494,6 +498,7 @@ pub async fn run_duplicate_approval_response_is_idempotent() {
                 "decision": "allow",
                 "reason": "duplicate allow",
                 "session_id": ctx.session_id,
+                "run_id": run_id,
                 "tool_name": "write_file",
                 "approval_kind": "standard"
             }),

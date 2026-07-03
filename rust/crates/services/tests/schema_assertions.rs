@@ -929,15 +929,9 @@ async fn phase1_run_durability_schema_contract() {
         "run_checkpoints primary key must carry the owner boundary"
     );
     assert_eq!(
-        unique_key_columns(
-            &pool,
-            &schema,
-            "edge_pending_dispatch",
-            "uq_edge_dispatch_owner_request"
-        )
-        .await,
+        primary_key_columns(&pool, &schema, "edge_pending_dispatch").await,
         ["user_id", "request_id"],
-        "edge dispatch request ids must be unique only inside the owner boundary"
+        "edge dispatch request identity must be owner/request-bound at the physical key"
     );
     assert!(
         unique_key_columns(
@@ -2133,7 +2127,7 @@ async fn phase4_state_projection_schema_contract() {
             "idx_state_events_owner_session_created"
         )
         .await,
-        ["user_id", "session_id", "created_at", "id"],
+        ["user_id", "session_id", "created_at", "event_id"],
         "state event history scans must stay owner-bound"
     );
     assert!(

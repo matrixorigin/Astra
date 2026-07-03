@@ -211,17 +211,32 @@ async fn edge_dispatch_request_id_is_owner_scoped() {
     let agent_b = format!("ed-own-agent-b-{}", unique_suffix());
     let request_id = Uuid::new_v4().to_string();
 
-    let dispatch_a = svc
-        .insert_dispatch(&user_a, &agent_a, &request_id, r#"{"owner":"a"}"#)
+    svc.insert_dispatch(&user_a, &agent_a, &request_id, r#"{"owner":"a"}"#)
         .await
         .expect("insert user A dispatch");
-    let dispatch_b = svc
-        .insert_dispatch(&user_b, &agent_b, &request_id, r#"{"owner":"b"}"#)
+    svc.insert_dispatch(&user_b, &agent_b, &request_id, r#"{"owner":"b"}"#)
         .await
         .expect("insert user B dispatch with same request_id");
-    assert_ne!(
-        dispatch_a, dispatch_b,
-        "same request_id across owners must create distinct dispatch rows"
+    let owner_scope = sqlx::query(
+        "SELECT COUNT(*) AS row_count, COUNT(DISTINCT user_id) AS owner_count \
+         FROM edge_pending_dispatch \
+         WHERE request_id = ? AND user_id IN (?, ?)",
+    )
+    .bind(&request_id)
+    .bind(&user_a)
+    .bind(&user_b)
+    .fetch_one(pool.get())
+    .await
+    .expect("load owner-scoped dispatch rows");
+    assert_eq!(
+        owner_scope.try_get::<i64, _>("row_count").unwrap(),
+        2,
+        "same request_id across owners must create two dispatch rows"
+    );
+    assert_eq!(
+        owner_scope.try_get::<i64, _>("owner_count").unwrap(),
+        2,
+        "same request_id across owners must remain isolated by user_id"
     );
 
     let wrong_owner = svc

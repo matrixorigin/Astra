@@ -1,19 +1,20 @@
 mod common;
 
 use astra_services::{RetentionPolicy, cleanup_expired_data};
-use serial_test::serial;
+use serial_test::{file_serial, serial};
 use sqlx::{MySql, Pool, QueryBuilder};
 use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[file_serial(prompt_retention_db)]
 #[serial]
 async fn prompt_retention_prunes_inactive_parent_and_child_rows_only() {
     let shared_pool = common::setup_pool().await;
     let pool = shared_pool.get().clone();
     cleanup_prompt_retention_fixtures(&pool).await;
-
     let user_id = format!("prompt-retention-user-{}", Uuid::new_v4());
+    cleanup_user(&pool, &user_id).await;
     let ended_session = format!("prompt-retention-ended-{}", Uuid::new_v4());
     let active_session = format!("prompt-retention-active-{}", Uuid::new_v4());
     let running_session = format!("prompt-retention-running-{}", Uuid::new_v4());
@@ -120,13 +121,14 @@ async fn prompt_retention_prunes_inactive_parent_and_child_rows_only() {
 
 #[tokio::test]
 #[ignore = "requires live DB pressure run: run with ASTRA_TEST_DB_IT=1"]
+#[file_serial(prompt_retention_db)]
 #[serial]
 async fn prompt_retention_pressure_probe() {
     let shared_pool = common::setup_pool().await;
     let pool = shared_pool.get().clone();
     cleanup_prompt_retention_fixtures(&pool).await;
-
     let user_id = format!("prp-user-{}", Uuid::new_v4().simple());
+    cleanup_user(&pool, &user_id).await;
     let ended_session = format!("prp-end-{}", Uuid::new_v4().simple());
     let active_session = format!("prp-act-{}", Uuid::new_v4().simple());
     let fresh_session = format!("prp-fresh-{}", Uuid::new_v4().simple());

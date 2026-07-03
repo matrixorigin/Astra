@@ -993,6 +993,7 @@ pub async fn run_saas_approval_respond_deny_path() {
             "decision": "deny",
             "reason": "saas e2e deny",
             "session_id": ctx.session_id,
+            "run_id": format!("run-saas-deny-{}", ctx.suffix),
             "tool_name": "bash",
             "approval_kind": "standard"
         }),

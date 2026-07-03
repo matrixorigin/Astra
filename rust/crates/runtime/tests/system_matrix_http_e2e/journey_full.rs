@@ -808,7 +808,9 @@ pub async fn run_product_matrix_full_journey(
         json!({
             "request_id": "matrix-appr-1",
             "decision": "allow",
-            "reason": "e2e"
+            "reason": "e2e",
+            "session_id": session_id,
+            "run_id": format!("matrix-appr-run-{suffix}")
         }),
     )
     .await;

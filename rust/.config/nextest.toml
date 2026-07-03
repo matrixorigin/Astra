@@ -135,6 +135,12 @@ package(astra-plan) and binary(plan_repository_db_it)
 """
 test-group = "integration_e2e"
 
+# Retention pressure tests invoke production global cleanup and must not run
+# concurrently with another copy of their broad DB-maintenance path.
+[[profile.strict-online.overrides]]
+filter = "package(astra-services) and binary(prompt_retention_db_it)"
+test-group = "db_scoped_trim"
+
 # CI reuses the same filters; declared separately so CI config can
 # reference a stable profile name without coupling to local dev defaults.
 [[profile.strict-online-ci.overrides]]
@@ -150,3 +156,7 @@ package(astra-plan) and binary(plan_repository_db_it)
  or test(/migration_dedupe_removes_duplicate_attempt_tuples/)
 """
 test-group = "integration_e2e"
+
+[[profile.strict-online-ci.overrides]]
+filter = "package(astra-services) and binary(prompt_retention_db_it)"
+test-group = "db_scoped_trim"
