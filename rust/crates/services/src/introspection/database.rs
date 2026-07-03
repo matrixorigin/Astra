@@ -17,6 +17,7 @@ use super::{IntrospectionService, ServiceResult, SkillInfo, SkillsIntrospectionR
 
 const MAX_INTROSPECTION_USAGE_ROWS: i32 = 128;
 const ASK_USER_HISTORY_EVENT_LIMIT: i32 = 50;
+const CONTEXT_SNAPSHOT_SEEK_CHUNK_LIMIT: i64 = 100;
 
 #[derive(Clone, Debug)]
 pub struct DatabaseIntrospectionService {
@@ -441,6 +442,96 @@ fn context_trend_response_event_id_from_row(row: &impl IntrospectionRow) -> Serv
     )
 }
 
+#[derive(Debug, Clone)]
+struct ContextSnapshotCursor {
+    created_at: String,
+    context_capture_id: String,
+}
+
+fn context_snapshot_cursor_from_row(
+    row: &impl IntrospectionRow,
+    context: &str,
+) -> ServiceResult<ContextSnapshotCursor> {
+    Ok(ContextSnapshotCursor {
+        created_at: introspection_required_non_empty_string(row, context, "created_at")?,
+        context_capture_id: introspection_required_non_empty_string(
+            row,
+            context,
+            "context_capture_id",
+        )?,
+    })
+}
+
+async fn fetch_context_snapshot_cursor_rows(
+    pool: &sqlx::Pool<MySql>,
+    user_id: &str,
+    session_id: &str,
+    cursor: Option<&ContextSnapshotCursor>,
+    limit: i64,
+) -> ServiceResult<Vec<sqlx::mysql::MySqlRow>> {
+    let sql = if cursor.is_some() {
+        "SELECT cs.context_capture_id, CAST(cs.created_at AS CHAR) AS created_at \
+         FROM ctx_snapshots cs \
+         JOIN agent_events e \
+           ON e.event_id = cs.event_id \
+          AND e.session_id = cs.session_id \
+          AND e.user_id = ? \
+         WHERE cs.user_id = ? \
+           AND cs.session_id = ? \
+           AND (cs.created_at > ? OR (cs.created_at = ? AND cs.context_capture_id > ?)) \
+         ORDER BY cs.created_at ASC, cs.context_capture_id ASC \
+         LIMIT ?"
+    } else {
+        "SELECT cs.context_capture_id, CAST(cs.created_at AS CHAR) AS created_at \
+         FROM ctx_snapshots cs \
+         JOIN agent_events e \
+           ON e.event_id = cs.event_id \
+          AND e.session_id = cs.session_id \
+          AND e.user_id = ? \
+         WHERE cs.user_id = ? \
+           AND cs.session_id = ? \
+         ORDER BY cs.created_at ASC, cs.context_capture_id ASC \
+         LIMIT ?"
+    };
+    let mut q = query(sql).bind(user_id).bind(user_id).bind(session_id);
+    if let Some(cursor) = cursor {
+        q = q
+            .bind(&cursor.created_at)
+            .bind(&cursor.created_at)
+            .bind(&cursor.context_capture_id);
+    }
+    q.bind(limit).fetch_all(pool).await.map_err(internal_error)
+}
+
+async fn context_snapshot_cursor_after_skipping(
+    pool: &sqlx::Pool<MySql>,
+    user_id: &str,
+    session_id: &str,
+    mut rows_to_skip: i64,
+) -> ServiceResult<Option<ContextSnapshotCursor>> {
+    let mut cursor = None;
+    while rows_to_skip > 0 {
+        let limit = rows_to_skip.min(CONTEXT_SNAPSHOT_SEEK_CHUNK_LIMIT);
+        let rows =
+            fetch_context_snapshot_cursor_rows(pool, user_id, session_id, cursor.as_ref(), limit)
+                .await?;
+        if rows.is_empty() {
+            return Ok(cursor);
+        }
+        for row in &rows {
+            cursor = Some(context_snapshot_cursor_from_row(
+                row,
+                "context_snapshot_cursor",
+            )?);
+        }
+        rows_to_skip = rows_to_skip.saturating_sub(rows.len() as i64);
+        if rows.len() < limit as usize {
+            return Ok(cursor);
+        }
+    }
+    Ok(cursor)
+}
+
 fn optional_drift_preview_from_row(
     row: Option<&impl IntrospectionRow>,
     context: &str,
@@ -784,6 +875,12 @@ impl IntrospectionService for DatabaseIntrospectionService {
         }
 
         let actual_turn = if let Some(ti) = turn_index {
+            if ti < 1 {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "turn_index must be greater than or equal to 1",
+                ));
+            }
             if ti as i64 > total_turns {
                 return Err(error_response(
                     StatusCode::NOT_FOUND,
@@ -801,31 +898,87 @@ impl IntrospectionService for DatabaseIntrospectionService {
             ""
         };
 
-        let sql = format!(
-            "SELECT cs.context_capture_id, \
-                    IFNULL(CAST(cs.token_budget AS CHAR), '{{}}') AS token_budget, \
-                    cs.total_tokens, cs.assembly_time_ms, \
-                    IFNULL(CAST(cs.relevance_scores AS CHAR), '{{}}') AS relevance_scores, \
-                    cs.task_type, cs.llm_response_id{content_cols} \
-             FROM ctx_snapshots cs \
-             JOIN agent_events e \
-               ON e.event_id = cs.event_id \
-              AND e.session_id = cs.session_id \
-              AND e.user_id = ? \
-             WHERE cs.user_id = ? \
-             AND cs.session_id = ? \
-             ORDER BY cs.created_at ASC, cs.context_capture_id ASC \
-             LIMIT 1 OFFSET ?"
-        );
-
-        let row = query(&sql)
-            .bind(user_id)
-            .bind(user_id)
-            .bind(session_id)
-            .bind(actual_turn - 1)
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
+        let row = if turn_index.is_none() {
+            let sql = format!(
+                "SELECT cs.context_capture_id, \
+                        IFNULL(CAST(cs.token_budget AS CHAR), '{{}}') AS token_budget, \
+                        cs.total_tokens, cs.assembly_time_ms, \
+                        IFNULL(CAST(cs.relevance_scores AS CHAR), '{{}}') AS relevance_scores, \
+                        cs.task_type, cs.llm_response_id{content_cols} \
+                 FROM ctx_snapshots cs \
+                 JOIN agent_events e \
+                   ON e.event_id = cs.event_id \
+                  AND e.session_id = cs.session_id \
+                  AND e.user_id = ? \
+                 WHERE cs.user_id = ? \
+                 AND cs.session_id = ? \
+                 ORDER BY cs.created_at DESC, cs.context_capture_id DESC \
+                 LIMIT 1"
+            );
+            query(&sql)
+                .bind(user_id)
+                .bind(user_id)
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(internal_error)?
+        } else {
+            let cursor = if actual_turn > 1 {
+                context_snapshot_cursor_after_skipping(
+                    &pool,
+                    user_id,
+                    session_id,
+                    actual_turn.saturating_sub(1),
+                )
+                .await?
+            } else {
+                None
+            };
+            let sql = if cursor.is_some() {
+                format!(
+                    "SELECT cs.context_capture_id, \
+                            IFNULL(CAST(cs.token_budget AS CHAR), '{{}}') AS token_budget, \
+                            cs.total_tokens, cs.assembly_time_ms, \
+                            IFNULL(CAST(cs.relevance_scores AS CHAR), '{{}}') AS relevance_scores, \
+                            cs.task_type, cs.llm_response_id{content_cols} \
+                     FROM ctx_snapshots cs \
+                     JOIN agent_events e \
+                       ON e.event_id = cs.event_id \
+                      AND e.session_id = cs.session_id \
+                      AND e.user_id = ? \
+                     WHERE cs.user_id = ? \
+                       AND cs.session_id = ? \
+                       AND (cs.created_at > ? OR (cs.created_at = ? AND cs.context_capture_id > ?)) \
+                     ORDER BY cs.created_at ASC, cs.context_capture_id ASC \
+                     LIMIT 1"
+                )
+            } else {
+                format!(
+                    "SELECT cs.context_capture_id, \
+                            IFNULL(CAST(cs.token_budget AS CHAR), '{{}}') AS token_budget, \
+                            cs.total_tokens, cs.assembly_time_ms, \
+                            IFNULL(CAST(cs.relevance_scores AS CHAR), '{{}}') AS relevance_scores, \
+                            cs.task_type, cs.llm_response_id{content_cols} \
+                     FROM ctx_snapshots cs \
+                     JOIN agent_events e \
+                       ON e.event_id = cs.event_id \
+                      AND e.session_id = cs.session_id \
+                      AND e.user_id = ? \
+                     WHERE cs.user_id = ? \
+                       AND cs.session_id = ? \
+                     ORDER BY cs.created_at ASC, cs.context_capture_id ASC \
+                     LIMIT 1"
+                )
+            };
+            let mut q = query(&sql).bind(user_id).bind(user_id).bind(session_id);
+            if let Some(cursor) = cursor.as_ref() {
+                q = q
+                    .bind(&cursor.created_at)
+                    .bind(&cursor.created_at)
+                    .bind(&cursor.context_capture_id);
+            }
+            q.fetch_one(&pool).await.map_err(internal_error)?
+        };
 
         let snapshot = context_snapshot_core_from_row(&row)?;
         let task_type = snapshot.task_type.clone();
@@ -2976,6 +3129,15 @@ mod tests {
         assert!(
             body.contains("WHERE session_id = ? AND user_id = ? AND event_id = ?"),
             "current token usage must be loaded by the selected snapshot response id"
+        );
+        assert!(
+            !body.contains("OFFSET ?") && !body.contains(" OFFSET "),
+            "context snapshot selection must not use SQL OFFSET"
+        );
+        assert!(
+            body.contains("context_snapshot_cursor_after_skipping")
+                && body.contains("ORDER BY cs.created_at DESC, cs.context_capture_id DESC"),
+            "context snapshot selection should use keyset skip plus a latest-row fast path"
         );
         assert!(
             body.contains("anchor.event_id = ?") && body.contains("ORDER BY e.created_at DESC"),
