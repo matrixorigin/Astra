@@ -46,6 +46,7 @@ class DurableEventPressureProbeTests(unittest.TestCase):
         command = probe.build_command(args)
         self.assertEqual(command.name, "durable_event_pressure")
         self.assertEqual(command.env["ASTRA_DURABLE_EVENT_PRESSURE_RUNS"], "7")
+        self.assertEqual(command.env["ASTRA_DURABLE_EVENT_PRESSURE_PROBE"], "1")
         self.assertEqual(command.env["ASTRA_DURABLE_EVENT_PRESSURE_TEXT_DELTAS"], "1111")
         self.assertEqual(command.env["ASTRA_DURABLE_EVENT_PRESSURE_PROGRESS_ROWS"], "555")
         self.assertIn("durable_run_event_pressure_probe", command.command)

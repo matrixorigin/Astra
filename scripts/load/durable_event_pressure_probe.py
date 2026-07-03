@@ -91,6 +91,7 @@ def build_command(args: argparse.Namespace) -> ProbeCommand:
         "ASTRA_AUTO_CREATE_DATABASE": "1",
         "ASTRA_DATABASE_PREFIX": os.environ.get("ASTRA_DATABASE_PREFIX", ""),
         "ASTRA_DATABASE": database,
+        "ASTRA_DURABLE_EVENT_PRESSURE_PROBE": "1",
         "ASTRA_DURABLE_EVENT_PRESSURE_RUNS": str(runs),
         "ASTRA_DURABLE_EVENT_PRESSURE_TEXT_DELTAS": str(text_deltas),
         "ASTRA_DURABLE_EVENT_PRESSURE_PROGRESS_ROWS": str(progress_rows),

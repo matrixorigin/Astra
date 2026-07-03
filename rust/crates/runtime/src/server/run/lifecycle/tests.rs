@@ -21,6 +21,7 @@ use std::sync::Mutex as StdMutex;
 use uuid::Uuid;
 
 static LIFECYCLE_RUN_DB: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+const DURABLE_EVENT_PRESSURE_OPT_IN: &str = "ASTRA_DURABLE_EVENT_PRESSURE_PROBE";
 
 struct EnvVarGuard {
     key: &'static str,
@@ -1940,6 +1941,10 @@ fn durable_event_pressure_env_usize(name: &str, default: usize, min: usize) -> u
             .max(min),
         Err(_) => default.max(min),
     }
+}
+
+fn durable_event_pressure_opted_in() -> bool {
+    std::env::var(DURABLE_EVENT_PRESSURE_OPT_IN).as_deref() == Ok("1")
 }
 
 fn replay_event_type(event: &Value) -> Option<&str> {
@@ -6594,8 +6599,15 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
 }
 
 #[tokio::test]
-#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+#[ignore = "requires MatrixOne DB: ASTRA_TEST_DB_IT=1 and ASTRA_DURABLE_EVENT_PRESSURE_PROBE=1"]
 async fn durable_run_event_pressure_probe() {
+    if !durable_event_pressure_opted_in() {
+        eprintln!(
+            "DURABLE_EVENT_PRESSURE_SKIPPED set {DURABLE_EVENT_PRESSURE_OPT_IN}=1 or run make test-durable-event-pressure"
+        );
+        return;
+    }
+
     let pool = setup_lifecycle_run_db_it().await;
     let run_count = durable_event_pressure_env_usize("ASTRA_DURABLE_EVENT_PRESSURE_RUNS", 100, 1);
     let text_delta_count =

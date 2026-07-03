@@ -934,6 +934,7 @@ test-online:
 	ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 			--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+			-E 'not test(/durable_run_event_pressure_probe/)' \
 			|| FAILED="$$FAILED astra-runtime-ignored"; \
 	echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 	ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
