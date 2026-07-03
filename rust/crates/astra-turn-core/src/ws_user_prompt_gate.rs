@@ -197,11 +197,11 @@ fn decision_from_journal_response(
             "Invalid user prompt journal response identity".into(),
         ));
     };
-    if contract.status == InteractionStatus::Pending {
-        return None;
-    }
-    match response.status.as_str() {
-        "submitted" => {
+    match contract.status {
+        InteractionStatus::Pending => None,
+        InteractionStatus::Expired => Some(AskUserDecision::Timeout),
+        InteractionStatus::Cancelled => Some(AskUserDecision::Cancelled),
+        InteractionStatus::Resolved => {
             let Some(answers) = response.answers else {
                 return Some(AskUserDecision::Error(
                     "Invalid user prompt journal response: missing answers".into(),
@@ -214,10 +214,6 @@ fn decision_from_journal_response(
                 ))),
             }
         }
-        "cancelled" => Some(AskUserDecision::Cancelled),
-        other => Some(AskUserDecision::Error(format!(
-            "Invalid user prompt journal response status: {other}"
-        ))),
     }
 }
 
@@ -682,6 +678,46 @@ mod tests {
                         allow_freeform: true,
                     }],
                     timeout_ms: Some(40),
+                },
+            )
+            .await;
+
+        assert_eq!(decision, AskUserDecision::Timeout);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_journal_response_maps_to_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-user-prompt").unwrap();
+        writer
+            .append(&JournalEvent::ask_user_response(
+                Some("sess-user-prompt"),
+                Some(3),
+                "req-expired-journal",
+                Some("run-user-prompt"),
+                "expired",
+                None,
+            ))
+            .unwrap();
+
+        let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel::<Value>(1);
+        let gate = test_gate(ledger, tx, Duration::from_secs(5));
+
+        let decision = gate
+            .request_questionnaire(
+                "req-expired-journal",
+                &AskUserPrompt {
+                    context: None,
+                    questions: vec![astra_tools::AskUserQuestion {
+                        header: "Confirm".into(),
+                        question: "Continue?".into(),
+                        options: vec![],
+                        multi_select: false,
+                        allow_freeform: true,
+                    }],
+                    timeout_ms: Some(250),
                 },
             )
             .await;
