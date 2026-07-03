@@ -377,6 +377,7 @@ impl ToolHandler<ServerToolExecutor> for IntrospectToolHandler {
             args,
             &context.session_id,
             &context.introspect_snapshot,
+            context.journal_turn_index.load(Ordering::Acquire),
         ))
     }
 }
@@ -444,9 +445,14 @@ impl ToolHandler<ServerToolExecutor> for ReflectToolHandler {
                 if request.source_policy.allows_edge_local_artifacts() {
                     if let Ok(guard) = context.introspect_snapshot.read() {
                         if let Some(ref snapshot) = *guard {
+                            let mut snapshot = snapshot.clone();
+                            astra_turn_core::introspect::mark_snapshot_age(
+                                &mut snapshot,
+                                context.journal_turn_index.load(Ordering::Acquire),
+                            );
                             let local_summary =
                                 crate::turn::inspection_service::local_reflect_from_snapshot(
-                                    snapshot,
+                                    &snapshot,
                                     request.facet,
                                 );
                             return astra_tools::ToolResult::text(local_summary);

@@ -167,7 +167,7 @@ impl InspectionService<'_> {
                 let remaining = self.session.remaining_turns();
                 let max_budget = self.session.max_turns();
                 lines.push(format!(
-                    "live: pressure={:.0}% cache={:.0}% error_rate={:.0}% turns={}/{}",
+                    "live: pressure={:.0}% cache={:.0}% error_rate={:.0}% remaining_turns={}/{}",
                     pressure * 100.0,
                     cache * 100.0,
                     error_rate * 100.0,
@@ -368,6 +368,12 @@ pub fn local_reflect_from_snapshot(
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push("## Local Reflect Summary (snapshot fallback)".to_string());
+    if snapshot.snapshot_age_turns > 0 {
+        lines.push(format!(
+            "snapshot_age_turns={}",
+            snapshot.snapshot_age_turns
+        ));
+    }
 
     match facet {
         ObservationFacet::Session | ObservationFacet::Overview => {
@@ -563,6 +569,7 @@ mod tests {
             cache_hit_ratio: 0.88,
             turns_completed: 3,
             turns_remaining: 7,
+            snapshot_age_turns: 2,
             compaction_tier: "light".to_string(),
             alerts: vec!["test_alert".to_string()],
             circuit_breaker: Some(CircuitBreakerSnapshot {
@@ -577,6 +584,7 @@ mod tests {
         assert!(summary.contains("Local Reflect Summary"));
         assert!(summary.contains("pressure=42%"));
         assert!(summary.contains("cache=88%"));
+        assert!(summary.contains("snapshot_age_turns=2"));
         assert!(summary.contains("completed=3"));
         assert!(summary.contains("remaining=7"));
         assert!(summary.contains("compaction: light"));

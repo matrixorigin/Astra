@@ -11,7 +11,7 @@ use astra_core::{
     push_graph_node, truncate_graph_summary,
 };
 
-use super::{IntrospectRequest, IntrospectSnapshot, ObservationFacet};
+use super::{IntrospectRequest, IntrospectSnapshot, ObservationFacet, turn_budget_label};
 
 const RUNTIME_SNAPSHOT_REF: &str = "urn:astra:context:local:introspect:runtime_snapshot";
 
@@ -77,13 +77,13 @@ pub fn build_introspect_report(
         evidence_class: "observed_evidence".to_string(),
         source: "runtime.introspect_snapshot".to_string(),
         summary: format!(
-            "pressure={:.0}% cache={:.0}% turns={}/{} signals={} tool_failures={}",
+            "pressure={:.0}% cache={:.0}% turns={} signals={} tool_failures={}{}",
             snapshot.token_pressure * 100.0,
             snapshot.cache_hit_ratio * 100.0,
-            snapshot.turns_completed,
-            snapshot.turns_completed + snapshot.turns_remaining,
+            turn_budget_label(snapshot),
             snapshot.alerts.len(),
             snapshot.tool_errors.len(),
+            snapshot_age_suffix(snapshot),
         ),
         confidence: ObservationConfidence::evidence(0.75),
     }];
@@ -392,12 +392,19 @@ fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
             )
         }
         _ => format!(
-            "Runtime healthy - pressure {:.0}%, cache {:.0}%, turns {}/{}",
+            "Runtime healthy - pressure {:.0}%, cache {:.0}%, turns {}",
             snapshot.token_pressure * 100.0,
             snapshot.cache_hit_ratio * 100.0,
-            snapshot.turns_completed,
-            snapshot.turns_completed + snapshot.turns_remaining
+            turn_budget_label(snapshot),
         ),
+    }
+}
+
+fn snapshot_age_suffix(snapshot: &IntrospectSnapshot) -> String {
+    if snapshot.snapshot_age_turns == 0 {
+        String::new()
+    } else {
+        format!(" snapshot_age_turns={}", snapshot.snapshot_age_turns)
     }
 }
 
@@ -1027,6 +1034,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn report_evidence_preserves_unlimited_turn_budget_and_snapshot_age() {
+        let snapshot = IntrospectSnapshot {
+            turns_completed: 3,
+            turns_remaining: 0,
+            turn_budget_unlimited: true,
+            snapshot_age_turns: 2,
+            ..Default::default()
+        };
+
+        let report = build_introspect_report(&snapshot, &IntrospectRequest::default());
+        assert!(
+            report.summary.contains("turns 3/∞"),
+            "summary should not render 3/0 or 3/3: {}",
+            report.summary
+        );
+        let evidence_summary = &report.evidence[0].summary;
+        assert!(
+            evidence_summary.contains("turns=3/∞"),
+            "evidence should preserve unlimited turn budget: {evidence_summary}"
+        );
+        assert!(
+            evidence_summary.contains("snapshot_age_turns=2"),
+            "evidence should expose staleness: {evidence_summary}"
+        );
+    }
+
     // ── graph_slice tests ──
 
     #[test]
@@ -1038,7 +1072,7 @@ mod tests {
             ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
             evidence_class: "observed_evidence".into(),
             source: "runtime.introspect_snapshot".into(),
-            summary: "pressure=0% cache=0% turns=0/0 signals=0 tool_failures=0".into(),
+            summary: "pressure=0% cache=0% turns=0/∞ signals=0 tool_failures=0".into(),
             confidence: ObservationConfidence::evidence(0.75),
         }];
         let action_hints = Vec::new();
@@ -1085,7 +1119,7 @@ mod tests {
             ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
             evidence_class: "observed_evidence".into(),
             source: "runtime.introspect_snapshot".into(),
-            summary: "pressure=0% cache=0% turns=0/0 signals=0 tool_failures=1".into(),
+            summary: "pressure=0% cache=0% turns=0/∞ signals=0 tool_failures=1".into(),
             confidence: ObservationConfidence::evidence(0.75),
         }];
         let action_hints = Vec::new();

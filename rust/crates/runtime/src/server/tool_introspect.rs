@@ -6,6 +6,7 @@ pub(crate) fn handle_introspect(
     args: &Value,
     session_id: &str,
     snapshot: &RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>,
+    current_session_turn: u32,
 ) -> String {
     let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
     let snapshot = snapshot
@@ -19,7 +20,13 @@ pub(crate) fn handle_introspect(
         })
         .clone();
 
-    let snapshot = snapshot.unwrap_or_default();
+    let snapshot = match snapshot {
+        Some(mut snapshot) => {
+            astra_turn_core::introspect::mark_snapshot_age(&mut snapshot, current_session_turn);
+            snapshot
+        }
+        None => astra_turn_core::introspect::IntrospectSnapshot::default(),
+    };
     astra_turn_core::introspect::render_introspect_request(&snapshot, &request)
 }
 
@@ -49,10 +56,31 @@ mod tests {
             &serde_json::json!({"depth": "diagnostic"}),
             "session-1",
             &snapshot,
+            1,
         );
 
         assert!(out.contains("## Step Latency"), "got: {out}");
         assert!(out.contains("model_wait"), "got: {out}");
         assert!(out.contains("8000"), "got: {out}");
+    }
+
+    #[test]
+    fn summary_marks_stale_snapshot_from_current_turn() {
+        let snapshot = RwLock::new(Some(astra_turn_core::introspect::IntrospectSnapshot {
+            turns_completed: 2,
+            turns_remaining: 0,
+            turn_budget_unlimited: true,
+            ..Default::default()
+        }));
+
+        let out = handle_introspect(
+            &serde_json::json!({"depth": "summary"}),
+            "session-1",
+            &snapshot,
+            5,
+        );
+
+        assert!(out.contains("Turns: 2/∞"), "got: {out}");
+        assert!(out.contains("Snapshot age: 3 turn(s)"), "got: {out}");
     }
 }

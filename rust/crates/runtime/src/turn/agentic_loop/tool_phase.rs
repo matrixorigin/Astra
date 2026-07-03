@@ -2073,6 +2073,26 @@ mod tests {
     }
 
     #[test]
+    fn introspect_snapshot_uses_session_turn_not_llm_round_count() {
+        let mut state = make_state();
+        state.session_turn = 7;
+        state.llm_rounds_completed = 42;
+        state.remaining_turns = 0;
+
+        let snapshot = build_introspect_snapshot(&state, String::new(), None);
+
+        assert_eq!(
+            snapshot.turns_completed, 7,
+            "introspect turn count must match the user/session turn, not LLM API rounds"
+        );
+        assert!(
+            snapshot.turn_budget_unlimited,
+            "remaining_turns=0 must be explicit unlimited metadata in the snapshot"
+        );
+        assert_eq!(snapshot.snapshot_age_turns, 0);
+    }
+
+    #[test]
     fn recent_file_cache_tracks_only_read_file_results() {
         let mut reads = Vec::new();
         record_recent_read_file_path(&mut reads, "str_replace", &json!({"path": "src/lib.rs"}), 1);

@@ -15,6 +15,14 @@ use astra_core::{ObservationDepth, ObservationFacet};
 pub use observation::{IntrospectReport, build_introspect_report};
 pub use request::{IntrospectDepth, IntrospectFormat, IntrospectRequest};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 /// Input snapshot provided by the runtime to the introspect renderer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IntrospectSnapshot {
@@ -27,6 +35,16 @@ pub struct IntrospectSnapshot {
     pub cache_hit_ratio: f64,
     pub turns_completed: u32,
     pub turns_remaining: u32,
+    /// Explicit budget semantics for hosts where `turns_remaining == 0` means
+    /// unbounded rather than exhausted. Renderers must use this field instead
+    /// of inferring unlimited/exhausted from the numeric value alone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub turn_budget_unlimited: bool,
+    /// Number of user/session turns elapsed since this snapshot was captured.
+    /// Live snapshots use 0; holders that serve older snapshots can increment
+    /// this before rendering.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub snapshot_age_turns: u32,
     pub compaction_tier: String,
     pub alerts: Vec<String>,
     pub tool_health: Vec<ToolHealthEntry>,
@@ -288,14 +306,16 @@ fn render_introspect(snapshot: &IntrospectSnapshot, depth: IntrospectTextDepth) 
 
 fn render_hint(s: &IntrospectSnapshot) -> String {
     let mut out = format!(
-        "pressure={:.0}% cache={:.0}% turns={}/{} alerts={} tier={}",
+        "pressure={:.0}% cache={:.0}% turns={} alerts={} tier={}",
         s.token_pressure * 100.0,
         s.cache_hit_ratio * 100.0,
-        s.turns_completed,
-        s.turns_completed + s.turns_remaining,
+        turn_budget_label(s),
         s.alerts.len(),
         s.compaction_tier,
     );
+    if s.snapshot_age_turns > 0 {
+        out.push_str(&format!(" snapshot_age_turns={}", s.snapshot_age_turns));
+    }
     if let Some(model) = s.current_model.as_deref() {
         out.push_str(" model=");
         out.push_str(model);
@@ -307,12 +327,11 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "## Session Health\n\
-         Pressure: {:.0}% | Cache: {:.0}% | Turns: {}/{} | Tier: {}\n\
+         Pressure: {:.0}% | Cache: {:.0}% | Turns: {} | Tier: {}\n\
          Tokens: {}in + {}out ({}cached_read, {}cached_create)\n",
         s.token_pressure * 100.0,
         s.cache_hit_ratio * 100.0,
-        s.turns_completed,
-        s.turns_completed + s.turns_remaining,
+        turn_budget_label(s),
         s.compaction_tier,
         s.total_input_tokens,
         s.total_output_tokens,
@@ -323,6 +342,9 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
         out.push_str("Current model: ");
         out.push_str(model);
         out.push('\n');
+    }
+    if s.snapshot_age_turns > 0 {
+        out.push_str(&format!("Snapshot age: {} turn(s)\n", s.snapshot_age_turns));
     }
     if s.context_window_tokens > 0 {
         out.push_str(&format!(
@@ -365,6 +387,23 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
         out.push('\n');
     }
     out.trim_end().to_string()
+}
+
+pub(crate) fn turn_budget_label(s: &IntrospectSnapshot) -> String {
+    if s.turn_budget_unlimited || (s.turns_completed == 0 && s.turns_remaining == 0) {
+        format!("{}/∞", s.turns_completed)
+    } else {
+        format!(
+            "{}/{}",
+            s.turns_completed,
+            s.turns_completed.saturating_add(s.turns_remaining)
+        )
+    }
+}
+
+pub fn mark_snapshot_age(snapshot: &mut IntrospectSnapshot, current_session_turn: u32) {
+    let age = current_session_turn.saturating_sub(snapshot.turns_completed);
+    snapshot.snapshot_age_turns = snapshot.snapshot_age_turns.max(age);
 }
 
 fn render_full(s: &IntrospectSnapshot) -> String {
@@ -764,6 +803,8 @@ mod tests {
             cache_hit_ratio: 0.65,
             turns_completed: 8,
             turns_remaining: 12,
+            turn_budget_unlimited: false,
+            snapshot_age_turns: 0,
             compaction_tier: "Normal".into(),
             alerts: vec![
                 "cache_regression: hit rate dropped 20% in 3 turns".into(),
@@ -1109,12 +1150,51 @@ mod tests {
     fn empty_snapshot_renders_stable_empty_state_contract() {
         let empty = IntrospectSnapshot::default();
         let hint = render_introspect(&empty, IntrospectTextDepth::Hint);
-        assert_eq!(hint, "pressure=0% cache=0% turns=0/0 alerts=0 tier=");
+        assert_eq!(hint, "pressure=0% cache=0% turns=0/∞ alerts=0 tier=");
         let full = render_introspect(&empty, IntrospectTextDepth::Full);
         assert!(full.contains("## Session Health"));
-        assert!(full.contains("Pressure: 0% | Cache: 0% | Turns: 0/0 | Tier:"));
+        assert!(full.contains("Pressure: 0% | Cache: 0% | Turns: 0/∞ | Tier:"));
         assert!(!full.contains("## Tool Health"));
         assert!(!full.contains("Current model:"));
+    }
+
+    #[test]
+    fn unlimited_turn_budget_renders_infinity_instead_of_zero_total() {
+        let snap = IntrospectSnapshot {
+            turns_completed: 3,
+            turns_remaining: 0,
+            turn_budget_unlimited: true,
+            ..Default::default()
+        };
+
+        let hint = render_introspect(&snap, IntrospectTextDepth::Hint);
+        assert!(hint.contains("turns=3/∞"), "got: {hint}");
+
+        let summary = render_introspect(&snap, IntrospectTextDepth::Summary);
+        assert!(
+            summary.contains("Turns: 3/∞"),
+            "summary should preserve unlimited semantics: {summary}"
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_renders_age_marker() {
+        let snap = IntrospectSnapshot {
+            snapshot_age_turns: 2,
+            ..Default::default()
+        };
+
+        let hint = render_introspect(&snap, IntrospectTextDepth::Hint);
+        assert!(
+            hint.contains("snapshot_age_turns=2"),
+            "hint should surface staleness: {hint}"
+        );
+
+        let summary = render_introspect(&snap, IntrospectTextDepth::Summary);
+        assert!(
+            summary.contains("Snapshot age: 2 turn(s)"),
+            "summary should surface staleness: {summary}"
+        );
     }
 
     #[test]

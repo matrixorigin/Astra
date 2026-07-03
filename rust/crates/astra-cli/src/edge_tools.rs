@@ -3601,7 +3601,17 @@ impl ToolExecutor {
         // Fall back to a zero-state snapshot on the first turn (before the
         // host has had a chance to populate one) so the model always gets
         // structured output instead of an opaque "first turn" string.
-        let mut snap = snapshot.unwrap_or_default();
+        let mut snap = match snapshot {
+            Some(mut snapshot) => {
+                astra_turn_core::introspect::mark_snapshot_age(
+                    &mut snapshot,
+                    self.journal_turn_index
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
+                snapshot
+            }
+            None => astra_turn_core::introspect::IntrospectSnapshot::default(),
+        };
         if snap.current_model.is_none() {
             snap.current_model = self.current_model();
         }
@@ -7239,6 +7249,25 @@ mod tests {
         assert!(out.contains("Turns: 5/15"), "got: {out}");
         assert!(out.contains("12345in"), "got: {out}");
         assert!(out.contains("resume pending"), "got: {out}");
+    }
+
+    #[test]
+    fn introspect_marks_stale_snapshot_from_current_turn() {
+        let executor = test_executor();
+        executor
+            .journal_turn_index
+            .store(9, std::sync::atomic::Ordering::Release);
+        executor.update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
+            turns_completed: 7,
+            turns_remaining: 0,
+            turn_budget_unlimited: true,
+            ..Default::default()
+        });
+
+        let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
+
+        assert!(out.contains("Turns: 7/∞"), "got: {out}");
+        assert!(out.contains("Snapshot age: 2 turn(s)"), "got: {out}");
     }
 
     #[test]
