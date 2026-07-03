@@ -1318,6 +1318,23 @@ fn build_run_display_projection(
     }
 }
 
+fn usage_projection_patch_hash(
+    run_id: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    tool_calls: u32,
+) -> String {
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "usage_patch": {
+            "total_prompt_tokens": prompt_tokens,
+            "total_completion_tokens": completion_tokens,
+            "total_tool_calls": tool_calls,
+        },
+    });
+    sha256_hex(payload.to_string().as_bytes())
+}
+
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
@@ -2316,6 +2333,37 @@ impl DatabaseRunStateStore {
         Ok(())
     }
 
+    async fn patch_run_projection_usage_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        tool_calls: u32,
+    ) -> DbStoreResult<u64> {
+        let projection_hash =
+            usage_projection_patch_hash(run_id, prompt_tokens, completion_tokens, tool_calls);
+        let result = sqlx::query(
+            "UPDATE run_display_projections
+             SET total_prompt_tokens = ?,
+                 total_completion_tokens = ?,
+                 total_tool_calls = ?,
+                 projection_hash = ?,
+                 updated_at = NOW(6)
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(prompt_tokens as i64)
+        .bind(completion_tokens as i64)
+        .bind(tool_calls as i64)
+        .bind(&projection_hash)
+        .bind(user_id)
+        .bind(run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("patch_run_projection_usage", run_id, source))?;
+        Ok(result.rows_affected())
+    }
+
     async fn sync_projection_for_user(
         &self,
         user_id: &str,
@@ -3294,9 +3342,39 @@ impl RunStateStore for DatabaseRunStateStore {
         .await
         .map_err(|source| db_error("update_run_usage", run_id, source).to_string())?;
         if result.rows_affected() > 0 {
-            self.sync_projection_for_user(user_id, run_id, None, None)
+            match self
+                .patch_run_projection_usage_for_user(
+                    user_id,
+                    run_id,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                )
                 .await
-                .map_err(|e| e.to_string())?;
+            {
+                Ok(0) => {
+                    if let Err(error) = self
+                        .sync_projection_for_user(user_id, run_id, None, None)
+                        .await
+                    {
+                        tracing::warn!(
+                            user_id,
+                            run_id,
+                            error = %error,
+                            "run usage committed but display projection repair failed"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        user_id,
+                        run_id,
+                        error = %error,
+                        "run usage committed but display projection usage patch failed"
+                    );
+                }
+            }
         }
         Ok(result.rows_affected() > 0)
     }
@@ -5430,6 +5508,16 @@ mod tests {
     }
 
     #[test]
+    fn usage_projection_patch_hash_changes_with_usage_totals() {
+        let base = usage_projection_patch_hash("run-1", 10, 4, 2);
+        assert_eq!(base, usage_projection_patch_hash("run-1", 10, 4, 2));
+        assert_ne!(base, usage_projection_patch_hash("run-1", 11, 4, 2));
+        assert_ne!(base, usage_projection_patch_hash("run-1", 10, 5, 2));
+        assert_ne!(base, usage_projection_patch_hash("run-1", 10, 4, 3));
+        assert_ne!(base, usage_projection_patch_hash("run-2", 10, 4, 2));
+    }
+
+    #[test]
     fn tool_preview_contract_row_decode_preserves_values_and_fails_loudly() {
         let (tool_name, contract) = decode_tool_preview_contract_row(&FakeRunStateRow::complete())
             .expect("preview contract decodes");
@@ -6967,6 +7055,25 @@ mod tests {
             .update_run_usage(&user_id, &run_id, 10, 4, 2)
             .await
             .expect("update usage");
+        let usage_projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load projection after usage patch")
+            .expect("projection should exist after usage patch");
+        assert_eq!(usage_projection.status, STATUS_FAILED);
+        assert_eq!(usage_projection.error_message.as_deref(), Some("boom"));
+        assert_eq!(usage_projection.projection_event_idx, 1);
+        assert_eq!(
+            usage_projection.latest_event_type.as_deref(),
+            Some("run_finished")
+        );
+        assert_eq!(
+            usage_projection.latest_checkpoint_version.as_deref(),
+            Some("checkpoint_v2")
+        );
+        assert_eq!(usage_projection.total_prompt_tokens, 10);
+        assert_eq!(usage_projection.total_completion_tokens, 4);
+        assert_eq!(usage_projection.total_tool_calls, 2);
 
         let loaded = store
             .load_run(&user_id, &run_id)
