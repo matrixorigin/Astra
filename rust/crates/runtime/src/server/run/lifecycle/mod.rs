@@ -849,12 +849,26 @@ fn flush_turn_observability(state: &mut AgenticLoopState, session_id: &str, inte
         return;
     }
     let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) else {
+        tracing::warn!(
+            session_id,
+            "flush_turn_observability: failed to create journal writer"
+        );
         return;
     };
     if interrupted {
-        let _ = buf.flush_interrupted(&writer);
-    } else {
-        let _ = buf.flush(&writer);
+        if let Err(e) = buf.flush_interrupted(&writer) {
+            tracing::warn!(
+                session_id,
+                error = %e,
+                "flush_turn_observability: flush_interrupted failed"
+            );
+        }
+    } else if let Err(e) = buf.flush(&writer) {
+        tracing::warn!(
+            session_id,
+            error = %e,
+            "flush_turn_observability: flush failed"
+        );
     }
 }
 

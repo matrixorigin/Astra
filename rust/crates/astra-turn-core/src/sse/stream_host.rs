@@ -215,6 +215,7 @@ pub trait SseStreamHost: Send {
     /// `display_label` is the rich preview string suitable for UI.
     /// Implementations should prefer `display_label` for output and
     /// fall back to `detail` when absent.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_approval(
         &mut self,
         request_id: &str,

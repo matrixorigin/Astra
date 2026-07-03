@@ -2793,7 +2793,7 @@ impl DatabaseRunStateStore {
 }
 
 fn run_owner_lease_renewal_interval(lease_ttl: Duration) -> Duration {
-    let interval_ms = (lease_ttl.as_millis().max(1) / 3).max(1).min(15_000);
+    let interval_ms = (lease_ttl.as_millis().max(1) / 3).clamp(1, 15_000);
     Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX))
 }
 

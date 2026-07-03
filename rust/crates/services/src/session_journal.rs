@@ -3374,6 +3374,7 @@ impl JournalEvent {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn approval_decision_for_run(
         session_id: Option<&str>,
         turn: Option<u32>,

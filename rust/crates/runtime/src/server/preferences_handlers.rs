@@ -54,11 +54,11 @@ fn build_sync_service(
 }
 
 async fn drain_flusher(
-    svc: MatrixOneSyncService,
+    _svc: MatrixOneSyncService,
     flusher: astra_services::state_sync::AuditFlusherHandle,
 ) {
-    drop(svc);
-    drop(flusher.writer);
+    // SyncAuditWriter is a unit struct with no Drop impl, so we just drop it implicitly
+    // by letting it go out of scope after shutdown.
     flusher.shutdown.cancel();
     if let Err(e) =
         tokio::time::timeout(std::time::Duration::from_secs(5), flusher.join_handle).await

@@ -479,7 +479,13 @@ impl PostLoopPersistContext {
                 error = %error,
                 "post-loop: detail events tx failed, rolling back MO transaction"
             );
-            let _ = tx.rollback().await;
+            if let Err(rb_err) = tx.rollback().await {
+                tracing::error!(
+                    session_id = %self.session_id,
+                    error = %rb_err,
+                    "post-loop: rollback failed after detail events tx failure"
+                );
+            }
             return Err(msg);
         }
 
@@ -1253,7 +1259,12 @@ pub(crate) async fn persist_session_transcript_items(
             "server-loop",
             "failed to persist transcript items for session {session_id}: {error}"
         );
-        let _ = tx.rollback().await;
+        if let Err(rb_err) = tx.rollback().await {
+            astra_core::agent_error!(
+                "server-loop",
+                "failed to rollback after transcript items failure for session {session_id}: {rb_err}"
+            );
+        }
         return;
     }
     if let Err(error) = tx.commit().await {

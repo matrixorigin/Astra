@@ -513,7 +513,7 @@ impl NumericInterval {
             0.0
         };
         let lower = if lower.is_finite() {
-            lower.max(0.0).min(point)
+            lower.clamp(0.0, point)
         } else {
             0.0
         };
