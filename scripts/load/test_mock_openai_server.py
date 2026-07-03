@@ -147,6 +147,29 @@ class MockOpenAiServerTests(unittest.TestCase):
         self.assertGreaterEqual(mock.CapacityMockOpenAiServer.request_queue_size, 512)
         self.assertTrue(mock.CapacityMockOpenAiServer.daemon_threads)
 
+    def test_default_nofile_target_matches_capacity_probe_needs(self) -> None:
+        args = mock.build_parser().parse_args([])
+        self.assertGreaterEqual(args.nofile_target, 4096)
+
+    def test_raise_nofile_limit_raises_soft_limit_when_possible(self) -> None:
+        class FakeResource:
+            RLIMIT_NOFILE = object()
+            RLIM_INFINITY = -1
+
+            def __init__(self) -> None:
+                self.limit = (256, 8192)
+
+            def getrlimit(self, _name: object) -> tuple[int, int]:
+                return self.limit
+
+            def setrlimit(self, _name: object, limit: tuple[int, int]) -> None:
+                self.limit = limit
+
+        fake = FakeResource()
+        soft, hard = mock.raise_nofile_limit(4096, quiet=True, resource_module=fake)
+        self.assertEqual((soft, hard), (4096, 8192))
+        self.assertEqual(fake.limit, (4096, 8192))
+
 
 if __name__ == "__main__":
     unittest.main()

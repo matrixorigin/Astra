@@ -1335,6 +1335,27 @@ fn usage_projection_patch_hash(
     sha256_hex(payload.to_string().as_bytes())
 }
 
+fn status_projection_patch_hash(
+    run_id: &str,
+    status: &str,
+    waiting_for: Option<&str>,
+    error_message: Option<&str>,
+    projection_event_idx: i64,
+    latest_event_type: Option<&str>,
+) -> String {
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "status_patch": {
+            "status": status,
+            "waiting_for": waiting_for,
+            "error_message": error_message,
+            "projection_event_idx": projection_event_idx,
+            "latest_event_type": latest_event_type,
+        },
+    });
+    sha256_hex(payload.to_string().as_bytes())
+}
+
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
@@ -2364,6 +2385,98 @@ impl DatabaseRunStateStore {
         Ok(result.rows_affected())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn patch_run_projection_status_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        projection_event_idx: i64,
+        latest_event_type: Option<&str>,
+    ) -> DbStoreResult<u64> {
+        let projection_hash = status_projection_patch_hash(
+            run_id,
+            status,
+            waiting_for,
+            error_message,
+            projection_event_idx,
+            latest_event_type,
+        );
+        let result = sqlx::query(
+            "UPDATE run_display_projections
+             SET status = ?,
+                 waiting_for = ?,
+                 error_message = ?,
+                 projection_event_idx = ?,
+                 latest_event_type = COALESCE(?, latest_event_type),
+                 projection_hash = ?,
+                 updated_at = NOW(6)
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(status)
+        .bind(waiting_for)
+        .bind(error_message)
+        .bind(projection_event_idx)
+        .bind(latest_event_type)
+        .bind(&projection_hash)
+        .bind(user_id)
+        .bind(run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("patch_run_projection_status", run_id, source))?;
+        Ok(result.rows_affected())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn patch_or_repair_run_projection_status_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        projection_event_idx: i64,
+        latest_event_type: Option<&str>,
+    ) {
+        match self
+            .patch_run_projection_status_for_user(
+                user_id,
+                run_id,
+                status,
+                waiting_for,
+                error_message,
+                projection_event_idx,
+                latest_event_type,
+            )
+            .await
+        {
+            Ok(0) => {
+                if let Err(error) = self
+                    .sync_projection_for_user(user_id, run_id, latest_event_type, None)
+                    .await
+                {
+                    tracing::warn!(
+                        user_id,
+                        run_id,
+                        error = %error,
+                        "run transition committed but display projection repair failed"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    error = %error,
+                    "run transition committed but display projection status patch failed"
+                );
+            }
+        }
+    }
+
     async fn sync_projection_for_user(
         &self,
         user_id: &str,
@@ -3107,17 +3220,16 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("transition_run_status_with_event_commit", run_id, source).to_string()
         })?;
 
-        if let Err(error) = self
-            .sync_projection_for_user(user_id, run_id, Some(&event_row.event_type), None)
-            .await
-        {
-            tracing::warn!(
-                user_id,
-                run_id,
-                error = %error,
-                "run transition committed but display projection refresh failed"
-            );
-        }
+        self.patch_or_repair_run_projection_status_for_user(
+            user_id,
+            run_id,
+            status,
+            waiting_for,
+            error_message,
+            event_row.event_idx,
+            Some(&event_row.event_type),
+        )
+        .await;
         Ok(true)
     }
 
@@ -3301,22 +3413,16 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("transition_run_status_with_events_commit", run_id, source).to_string()
         })?;
 
-        if let Err(error) = self
-            .sync_projection_for_user(
-                user_id,
-                run_id,
-                event_rows.last().map(|event| event.event_type.as_str()),
-                None,
-            )
-            .await
-        {
-            tracing::warn!(
-                user_id,
-                run_id,
-                error = %error,
-                "run transition committed but display projection refresh failed"
-            );
-        }
+        self.patch_or_repair_run_projection_status_for_user(
+            user_id,
+            run_id,
+            status,
+            waiting_for,
+            error_message,
+            next_last_event_idx,
+            event_rows.last().map(|event| event.event_type.as_str()),
+        )
+        .await;
         Ok(true)
     }
 
@@ -5515,6 +5621,66 @@ mod tests {
         assert_ne!(base, usage_projection_patch_hash("run-1", 10, 5, 2));
         assert_ne!(base, usage_projection_patch_hash("run-1", 10, 4, 3));
         assert_ne!(base, usage_projection_patch_hash("run-2", 10, 4, 2));
+    }
+
+    #[test]
+    fn status_projection_patch_hash_changes_with_transition_fields() {
+        let base = status_projection_patch_hash(
+            "run-1",
+            STATUS_FAILED,
+            None,
+            Some("boom"),
+            2,
+            Some("run_finished"),
+        );
+        assert_eq!(
+            base,
+            status_projection_patch_hash(
+                "run-1",
+                STATUS_FAILED,
+                None,
+                Some("boom"),
+                2,
+                Some("run_finished")
+            )
+        );
+        assert_ne!(
+            base,
+            status_projection_patch_hash(
+                "run-1",
+                STATUS_COMPLETED,
+                None,
+                Some("boom"),
+                2,
+                Some("run_finished")
+            )
+        );
+        assert_ne!(
+            base,
+            status_projection_patch_hash(
+                "run-1",
+                STATUS_FAILED,
+                Some("tool_approval"),
+                Some("boom"),
+                2,
+                Some("run_finished")
+            )
+        );
+        assert_ne!(
+            base,
+            status_projection_patch_hash(
+                "run-1",
+                STATUS_FAILED,
+                None,
+                Some("boom"),
+                3,
+                Some("run_finished")
+            )
+        );
+        assert_ne!(
+            base,
+            status_projection_patch_hash("run-1", STATUS_FAILED, None, Some("boom"), 2, None)
+        );
     }
 
     #[test]

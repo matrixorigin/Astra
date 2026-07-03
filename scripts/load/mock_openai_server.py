@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 
 
 COMPLETIONS_PATHS = {"/chat/completions", "/v1/chat/completions"}
+DEFAULT_NOFILE_TARGET = 4096
 
 
 class CapacityMockOpenAiServer(ThreadingHTTPServer):
@@ -330,7 +331,34 @@ def write_text(handler: BaseHTTPRequestHandler, status: HTTPStatus, text: str, c
     handler.wfile.write(body)
 
 
+def raise_nofile_limit(
+    target: int,
+    *,
+    quiet: bool,
+    resource_module: Any | None = None,
+) -> tuple[int | None, int | None]:
+    if target <= 0:
+        return None, None
+    try:
+        if resource_module is None:
+            import resource as resource_module  # type: ignore[no-redef]
+
+        soft, hard = resource_module.getrlimit(resource_module.RLIMIT_NOFILE)
+        desired = max(soft, target)
+        if hard != resource_module.RLIM_INFINITY:
+            desired = min(desired, hard)
+        if desired > soft:
+            resource_module.setrlimit(resource_module.RLIMIT_NOFILE, (desired, hard))
+            soft = desired
+        return int(soft), int(hard)
+    except Exception as exc:  # noqa: BLE001
+        if not quiet:
+            print(f"warning: failed to raise nofile limit: {exc}", file=sys.stderr)
+        return None, None
+
+
 def serve(args: argparse.Namespace) -> int:
+    nofile_soft, nofile_hard = raise_nofile_limit(args.nofile_target, quiet=args.quiet)
     config = MockConfig(
         model_name=args.model_name,
         response_content=args.response_content,
@@ -358,6 +386,8 @@ def serve(args: argparse.Namespace) -> int:
                     "chat_completions_url": f"{base_url}/chat/completions",
                     "model_name": config.model_name,
                     "model_yaml": args.write_model_yaml,
+                    "nofile_soft": nofile_soft,
+                    "nofile_hard": nofile_hard,
                     "status": config.status,
                 },
                 indent=2,
@@ -398,6 +428,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--error-code", default="mock_openai_error")
     parser.add_argument("--error-message", default="mock OpenAI-compatible error")
     parser.add_argument("--write-model-yaml")
+    parser.add_argument(
+        "--nofile-target",
+        type=int,
+        default=DEFAULT_NOFILE_TARGET,
+        help="raise soft file-descriptor limit to at least this value when possible; use 0 to disable",
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -413,6 +449,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--status must be a valid HTTP status")
     if not args.model_name.strip():
         raise ValueError("--model-name must be non-empty")
+    if args.nofile_target < 0:
+        raise ValueError("--nofile-target must be non-negative")
 
 
 def main(argv: list[str] | None = None) -> int:
