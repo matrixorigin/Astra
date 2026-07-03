@@ -172,6 +172,9 @@ pub fn server_runtime_tool_schemas(
         capabilities,
         &astra_tools::schemas::all_tool_schemas(),
     );
+    if !capabilities.has(astra_turn_core::capability::Capability::ReflectService) {
+        schemas.retain(|s| tool_schema_name(s) != Some("reflect"));
+    }
     retain_server_executable_schemas(&mut schemas);
     #[cfg(unix)]
     {
@@ -221,6 +224,9 @@ pub fn cli_remote_tool_schemas(
     }
     let mut schemas =
         astra_turn_core::tool_surface::resolve(CapabilitySurface::CliRemote, capabilities, &pool);
+    if !capabilities.has(astra_turn_core::capability::Capability::ReflectService) {
+        schemas.retain(|s| tool_schema_name(s) != Some("reflect"));
+    }
     retain_server_executable_schemas(&mut schemas);
     #[cfg(unix)]
     {

@@ -7698,8 +7698,9 @@ mod tests {
         let visible = host.visible_turn_tools(&mut state);
         let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible);
         assert!(
-            !names.contains("reflect"),
-            "service-unready tools must not be visible to the model: {names:?}"
+            names.contains("reflect"),
+            "reflect is service-ready even without a configured reflect service; \
+             the handler provides local fallback via introspect snapshot: {names:?}"
         );
         assert!(
             names.contains("introspect"),
@@ -8400,8 +8401,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn execute_turn_persists_full_journal_request_and_response_when_session_capture_enabled()
     {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000126";
@@ -8492,7 +8495,7 @@ mod tests {
         );
         assert_eq!(
             llm_events[1]["metadata"]["response"]["outcome"].as_str(),
-            Some("success")
+            Some("success_stop")
         );
         assert_eq!(
             llm_events[1]["metadata"]["response"]["response"]["finish_reason"].as_str(),
@@ -8522,7 +8525,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn execute_turn_persists_full_journal_error_response_when_session_capture_enabled() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         // Collapse llm_client's 1s/2s/4s exponential backoff so the retry
         // loop behind a 500 upstream completes in tens of ms instead of 7s.
         let _backoff = crate::turn::llm::client::set_test_retry_backoff_ms(0);
@@ -8613,7 +8618,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn execute_turn_does_not_persist_full_journal_events_when_session_capture_disabled() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000128";

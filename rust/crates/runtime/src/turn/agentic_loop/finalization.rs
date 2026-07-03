@@ -2289,6 +2289,7 @@ mod tests {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.current_session_id = Some(sid.clone());
+        state.context_manifest_user_id = Some("test-user".into());
         state.error_recovery.consecutive_same_error = 0;
         state
             .messages
