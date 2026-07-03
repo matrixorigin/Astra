@@ -13,7 +13,10 @@ scripts/
 ├── load/
 │   ├── cleanup_pressure_probe.py
 │   ├── durable_event_pressure_probe.py
-│   └── multi_cli_capacity_probe.py
+│   ├── extract_slow_sql.py
+│   ├── mock_openai_server.py
+│   ├── multi_cli_capacity_probe.py
+│   └── db_capacity_report.py
 ├── schema/
 │   └── schema_inventory.py
 ├── setup/
@@ -52,6 +55,26 @@ the standard probe body, or provide a `--body-template` that includes
 python3 scripts/load/multi_cli_capacity_probe.py --profile 100-cli --model qwen3.7-max --register-users --require-metrics
 python3 scripts/load/multi_cli_capacity_probe.py --profile 500-cli --model qwen3.7-max --token-file tokens.json --require-distinct-users --require-metrics
 ```
+
+For runtime capacity gates, prefer mock LLM for large concurrency so provider
+RPM/TPM does not hide runtime, DB, SSE, or control-plane behavior:
+
+```sh
+python3 scripts/load/mock_openai_server.py --port 18080 --model-name capacity-mock --write-model-yaml tmp/capacity-mock-model.yaml
+python3 scripts/load/multi_cli_capacity_probe.py --profile 500-cli --model capacity-mock --register-users --require-distinct-users --require-metrics --require-error-codes-for-failures --require-no-critical-ingestion-drops --require-no-run-control-errors --require-no-durable-event-errors --require-no-edge-dispatch-errors --output-dir tmp/capacity-probe/mock-strict-500
+```
+
+After a probe, extract the matching API log window and generate a DB verdict:
+
+```sh
+python3 scripts/load/extract_slow_sql.py --log api_server.log --start 2026-07-03T08:08:20.654Z --end 2026-07-03T08:10:06.434Z --output-dir tmp/capacity-probe/mock-strict-500
+python3 scripts/load/db_capacity_report.py --probe-summary tmp/capacity-probe/mock-strict-500/summary.json --slow-sql-summary tmp/capacity-probe/mock-strict-500/slow-sql-summary.json --format markdown
+```
+
+`db_capacity_report.py` deliberately separates provider/harness failures,
+admission limits, DB pressure, and DB saturation. Do not treat slow SQL count
+alone as proof that production DB capacity is insufficient; a production claim
+also needs multi-pod or staging/prod MatrixOne metrics.
 
 ### `scripts/load/cleanup_pressure_probe.py`
 Runs ignored live MatrixOne cleanup pressure probes for the current retention
