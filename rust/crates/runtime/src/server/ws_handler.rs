@@ -1581,6 +1581,7 @@ impl RunStreamPollCadence {
         }
     }
 
+    #[cfg(test)]
     fn interval(self) -> Duration {
         self.current_interval
     }
