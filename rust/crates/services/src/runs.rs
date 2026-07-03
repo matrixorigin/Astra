@@ -679,7 +679,6 @@ pub struct RunListRecord {
     pub runs: Vec<RunStatusRecord>,
     pub total: Option<i64>,
     pub limit: u32,
-    pub offset: u32,
     pub next_cursor: Option<RunListCursor>,
 }
 

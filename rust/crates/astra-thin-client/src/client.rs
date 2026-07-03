@@ -1233,14 +1233,22 @@ impl ThinClient {
         &self,
         bearer_override: Option<&str>,
         limit: u32,
-        offset: u32,
+        after_updated_at: Option<&str>,
+        after_run_id: Option<&str>,
     ) -> Result<Value, ThinClientError> {
         let url = self.url(paths::RUNS)?;
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(after_updated_at) = after_updated_at {
+            query.push(("after_updated_at", after_updated_at.to_string()));
+        }
+        if let Some(after_run_id) = after_run_id {
+            query.push(("after_run_id", after_run_id.to_string()));
+        }
         let resp = self
             .http
             .get(url)
             .headers(self.auth_headers_for(bearer_override))
-            .query(&[("limit", limit), ("offset", offset)])
+            .query(&query)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1970,20 +1978,32 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/runs"))
             .and(query_param("limit", "25"))
-            .and(query_param("offset", "5"))
+            .and(query_param(
+                "after_updated_at",
+                "2024-01-02T00:00:00.000000",
+            ))
+            .and(query_param("after_run_id", "run-0"))
             .and(header("authorization", "Bearer tok"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "runs": [{"run_id": "run-1", "status": "running"}],
-                "total": 1,
+                "total": null,
                 "limit": 25,
-                "offset": 5
+                "next_cursor": {"updated_at": "2024-01-01T00:00:00.000000", "run_id": "run-1"}
             })))
             .mount(&srv)
             .await;
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
-        let v = client.list_runs(Some("tok"), 25, 5).await.unwrap();
-        assert_eq!(v["total"], 1);
+        let v = client
+            .list_runs(
+                Some("tok"),
+                25,
+                Some("2024-01-02T00:00:00.000000"),
+                Some("run-0"),
+            )
+            .await
+            .unwrap();
+        assert!(v["total"].is_null());
         assert_eq!(v["runs"][0]["run_id"], "run-1");
     }
 

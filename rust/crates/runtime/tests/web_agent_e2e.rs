@@ -3541,11 +3541,11 @@ async fn get_run_stream(app: &Router, run_id: &str, last_index: u32) -> (StatusC
     (status, events)
 }
 
-/// GET /runs?limit=N&offset=M — list runs.
-async fn list_runs(app: &Router, limit: u32, offset: u32) -> (StatusCode, Value) {
+/// GET /runs?limit=N — list runs using cursor pagination.
+async fn list_runs(app: &Router, limit: u32) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/runs?limit={limit}&offset={offset}"))
+        .uri(format!("/runs?limit={limit}"))
         .header("authorization", TOKEN)
         .body(Body::empty())
         .unwrap();
@@ -3746,7 +3746,7 @@ async fn a2_transition_running_to_cancelled() {
     let _tool_req = wait_for_sse(&mut rx, "tool_request", 5).await;
 
     // We need to cancel — but first we need the run_id. We'll list runs to find it.
-    let (_, list_body) = list_runs(&app, 10, 0).await;
+    let (_, list_body) = list_runs(&app, 10).await;
     let runs = list_body["runs"].as_array().expect("runs array");
     assert!(!runs.is_empty(), "should have at least one run");
     let running = runs
@@ -3991,7 +3991,7 @@ async fn a4_ledger_empty_after_cancelled_run() {
     wait_for_sse(&mut rx, "tool_request", 5).await;
 
     // Find running run and cancel it.
-    let (_, list_body) = list_runs(&app, 10, 0).await;
+    let (_, list_body) = list_runs(&app, 10).await;
     let runs = list_body["runs"].as_array().expect("runs array");
     let running = runs
         .iter()
@@ -4211,7 +4211,7 @@ async fn a6_list_runs_shows_completed_runs() {
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
     poll_run_status(&app, &run_id, "completed", 5).await;
 
-    let (status, body) = list_runs(&app, 50, 0).await;
+    let (status, body) = list_runs(&app, 50).await;
     assert_eq!(status, StatusCode::OK);
 
     let runs = body["runs"].as_array().expect("runs array");

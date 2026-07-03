@@ -426,7 +426,6 @@ impl RunLifecycleService for JointRunLifecycle {
             runs: Vec::new(),
             total: None,
             limit,
-            offset: 0,
             next_cursor: None,
         })
     }

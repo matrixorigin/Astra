@@ -7476,7 +7476,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runs: page,
             total: durable_page.total,
             limit,
-            offset: 0,
             next_cursor: durable_page.next_cursor,
         })
     }

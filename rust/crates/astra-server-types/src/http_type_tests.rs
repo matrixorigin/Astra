@@ -75,7 +75,6 @@ fn deserialization_applies_defaults() {
     // RunListQuery
     let q: RunListQuery = serde_json::from_str("{}").unwrap();
     assert_eq!(q.limit, 50);
-    assert_eq!(q.offset, 0);
     assert!(q.after_updated_at.is_none());
     assert!(q.after_run_id.is_none());
 
@@ -421,16 +420,12 @@ fn run_list_query_cursor_requires_complete_seek_key() {
         StatusCode::BAD_REQUEST
     );
 
-    let mixed_with_offset: RunListQuery = serde_json::from_value(json!({
+    let offset_query = serde_json::from_value::<RunListQuery>(json!({
         "offset": 10,
         "after_updated_at": "2024-01-02T00:00:00.000000",
         "after_run_id": "run-5"
-    }))
-    .unwrap();
-    assert_eq!(
-        mixed_with_offset.cursor().unwrap_err().0,
-        StatusCode::BAD_REQUEST
-    );
+    }));
+    assert!(offset_query.is_err(), "legacy offset must not deserialize");
 }
 
 #[test]
@@ -993,7 +988,6 @@ fn run_list_record_to_response_preserves_optional_total_and_cursor() {
         }],
         total: None,
         limit: 20,
-        offset: 0,
         next_cursor: Some(RunListCursor {
             updated_at: "2024-01-02T00:00:00.000000".into(),
             run_id: "run-1".into(),
@@ -1004,7 +998,6 @@ fn run_list_record_to_response_preserves_optional_total_and_cursor() {
     assert_eq!(resp.runs.len(), 1);
     assert_eq!(resp.total, None);
     assert_eq!(resp.limit, 20);
-    assert_eq!(resp.offset, 0);
     assert_eq!(
         resp.next_cursor
             .as_ref()
@@ -1014,6 +1007,7 @@ fn run_list_record_to_response_preserves_optional_total_and_cursor() {
 
     let v = serde_json::to_value(&resp).unwrap();
     assert!(v["total"].is_null());
+    assert!(v.get("offset").is_none());
     assert_eq!(v["next_cursor"]["run_id"], "run-1");
 }
 

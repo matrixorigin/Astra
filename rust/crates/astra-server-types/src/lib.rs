@@ -452,11 +452,10 @@ pub struct RunMutationResponse {
 
 #[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RunListQuery {
     #[serde(default = "default_run_list_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub offset: u32,
     pub after_updated_at: Option<String>,
     pub after_run_id: Option<String>,
 }
@@ -467,12 +466,6 @@ impl RunListQuery {
         match (&self.after_updated_at, &self.after_run_id) {
             (None, None) => Ok(None),
             (Some(updated_at), Some(run_id)) => {
-                if self.offset != 0 {
-                    return Err(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "run list cursor cannot be combined with offset",
-                    ));
-                }
                 let cursor = RunListCursor {
                     updated_at: updated_at.clone(),
                     run_id: run_id.clone(),
@@ -497,7 +490,6 @@ pub struct RunListResponse {
     pub runs: Vec<RunStatusResponse>,
     pub total: Option<i64>,
     pub limit: u32,
-    pub offset: u32,
     pub next_cursor: Option<RunListCursor>,
 }
 
@@ -1179,7 +1171,6 @@ impl From<RunListRecord> for RunListResponse {
                 .collect(),
             total: value.total,
             limit: value.limit,
-            offset: value.offset,
             next_cursor: value.next_cursor,
         }
     }

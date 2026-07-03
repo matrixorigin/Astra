@@ -379,7 +379,6 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
             runs: Vec::new(),
             total: None,
             limit,
-            offset: 0,
             next_cursor: None,
         })
     }

@@ -435,12 +435,6 @@ pub(crate) async fn list_runs_handler(
     Query(query): Query<RunListQuery>,
 ) -> Result<Json<RunListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    if query.offset != 0 {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "run list offset pagination is no longer supported; use after_updated_at and after_run_id",
-        ));
-    }
     let cursor = query.cursor()?;
     let runs = state
         .execution
@@ -527,7 +521,8 @@ mod tests {
     use axum::{
         Json,
         body::{self, Body},
-        http::{HeaderMap, Request, StatusCode},
+        extract::Query,
+        http::{HeaderMap, Request, StatusCode, Uri},
     };
     use serde_json::json;
     use tokio::sync::Mutex as TokioMutex;
@@ -706,8 +701,8 @@ mod tests {
             .expect("list_runs_handler body should be present");
 
         assert!(
-            body.contains("query.offset != 0"),
-            "HTTP run list must reject legacy offset pagination"
+            !body.contains("offset"),
+            "HTTP run list handler must not carry legacy offset pagination"
         );
         assert!(
             body.contains(".list_runs_cursor("),
@@ -715,8 +710,25 @@ mod tests {
         );
         assert!(
             !body.contains(".list_runs("),
-            "HTTP run list must not call the legacy COUNT/OFFSET path"
+            "HTTP run list must not call the legacy count path"
         );
+    }
+
+    #[test]
+    fn run_list_query_rejects_legacy_offset_param() {
+        let legacy_uri: Uri = "/runs?limit=10&offset=5".parse().unwrap();
+        assert!(
+            Query::<RunListQuery>::try_from_uri(&legacy_uri).is_err(),
+            "legacy run-list offset query must fail instead of silently returning page one"
+        );
+
+        let cursor_uri: Uri =
+            "/runs?limit=10&after_updated_at=2024-01-02T00:00:00.000000&after_run_id=run-5"
+                .parse()
+                .unwrap();
+        let Query(query) =
+            Query::<RunListQuery>::try_from_uri(&cursor_uri).expect("cursor query should decode");
+        assert!(query.cursor().unwrap().is_some());
     }
 
     #[test]
