@@ -18,9 +18,9 @@ use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
     SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
-    SessionRecord, SessionService, SessionUpdateRequestData, TurnHookDbPersistPlan,
-    TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnToolEventPersistPlan,
-    TurnToolEventWriter, build_app,
+    SessionRecord, SessionService, SessionUpdateRequestData, TurnAuxiliaryEventRecord,
+    TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
+    TurnObserverWorker, TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
 };
 use astra_services::skills::{
     SkillInfoRecord, SkillListCursor, SkillListItem, SkillListRecord, SkillPublishRequestData,
@@ -248,6 +248,16 @@ impl TurnToolEventWriter for RecordingToolEventWriter {
     }
 }
 
+#[derive(Clone, Debug)]
+struct NoopAuxiliaryEventWriter;
+
+#[async_trait]
+impl TurnAuxiliaryEventWriter for NoopAuxiliaryEventWriter {
+    async fn persist_events(&self, _events: Vec<TurnAuxiliaryEventRecord>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 struct TestSkillService;
 
 #[async_trait]
@@ -435,7 +445,8 @@ fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>)
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger.clone(),
     )
-    .with_model_service(Arc::new(TestModelService));
+    .with_model_service(Arc::new(TestModelService))
+    .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
     (build_app(state), ledger)
@@ -465,7 +476,8 @@ fn build_test_app_with_hooks() -> (
     .with_model_service(Arc::new(TestModelService))
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
-    .with_tool_event_writer(tool_event_writer.clone());
+    .with_tool_event_writer(tool_event_writer.clone())
+    .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
     (
@@ -500,7 +512,8 @@ fn build_test_app_with_hooks_and_skills() -> (
     .with_skill_service(Arc::new(TestSkillService))
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
-    .with_tool_event_writer(tool_event_writer.clone());
+    .with_tool_event_writer(tool_event_writer.clone())
+    .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
     (
@@ -590,11 +603,40 @@ async fn post_tool_result(
     app.clone().oneshot(req).await.unwrap().status()
 }
 
+#[derive(Debug, Clone)]
+struct ApprovalIdentity {
+    session_id: String,
+    run_id: String,
+}
+
+async fn wait_for_approval_identity(rx: &mut mpsc::UnboundedReceiver<Value>) -> ApprovalIdentity {
+    let session_info = wait_for_sse(rx, "session_info", 5).await;
+    ApprovalIdentity {
+        session_id: session_info
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session_info.session_id")
+            .to_string(),
+        run_id: session_info
+            .get("run_id")
+            .and_then(Value::as_str)
+            .expect("session_info.run_id")
+            .to_string(),
+    }
+}
+
 /// POST /approval/respond
-async fn post_approval_respond(app: &Router, request_id: &str, decision: &str) -> StatusCode {
+async fn post_approval_respond(
+    app: &Router,
+    identity: &ApprovalIdentity,
+    request_id: &str,
+    decision: &str,
+) -> StatusCode {
     let body = json!({
         "request_id": request_id,
         "decision": decision,
+        "session_id": identity.session_id,
+        "run_id": identity.run_id,
     });
     let req = Request::builder()
         .method("POST")
@@ -955,6 +997,7 @@ async fn execute_mock_tool_turn(
 ) -> Vec<Value> {
     let resp = chat_stream_start(app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+    let approval_identity = wait_for_approval_identity(&mut rx).await;
 
     for step in steps {
         if step.requires_approval {
@@ -966,7 +1009,8 @@ async fn execute_mock_tool_turn(
                 case_name,
                 step.request_id
             );
-            let status = post_approval_respond(app, step.request_id, "allow").await;
+            let status =
+                post_approval_respond(app, &approval_identity, step.request_id, "allow").await;
             assert_eq!(status, StatusCode::OK, "{}: approval accepted", case_name);
         }
 
@@ -2400,8 +2444,9 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Wait for the approval_required SSE, then approve, then post tool result.
+    let approval_identity = wait_for_approval_identity(&mut rx).await;
     wait_for_sse(&mut rx, "approval_required", 5).await;
-    let st = post_approval_respond(&app, "tc-approve-1", "allow").await;
+    let st = post_approval_respond(&app, &approval_identity, "tc-approve-1", "allow").await;
     assert_eq!(st, 200, "approval POST failed");
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
@@ -2497,6 +2542,7 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
+    let approval_identity = wait_for_approval_identity(&mut rx).await;
     let approval = wait_for_sse(&mut rx, "approval_batch_required", 5).await;
     let approval_ids: Vec<_> = approval["requests"]
         .as_array()
@@ -2515,9 +2561,9 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
     let st = post_tool_result(&app, "tc-read-first", "read-ok", "ok").await;
     assert_eq!(st, 200, "read-only tool result POST failed");
 
-    let st = post_approval_respond(&app, "tc-write-a", "allow").await;
+    let st = post_approval_respond(&app, &approval_identity, "tc-write-a", "allow").await;
     assert_eq!(st, 200, "first approval POST failed");
-    let st = post_approval_respond(&app, "tc-write-b", "allow").await;
+    let st = post_approval_respond(&app, &approval_identity, "tc-write-b", "allow").await;
     assert_eq!(st, 200, "second approval POST failed");
 
     let write_request_a = wait_for_sse(&mut rx, "tool_request", 5).await;
@@ -2603,8 +2649,9 @@ async fn approval_denied_skips_tool_and_continues() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Deny the approval.
+    let approval_identity = wait_for_approval_identity(&mut rx).await;
     wait_for_sse(&mut rx, "approval_required", 5).await;
-    let st = post_approval_respond(&app, "tc-deny-1", "deny").await;
+    let st = post_approval_respond(&app, &approval_identity, "tc-deny-1", "deny").await;
     assert_eq!(st, 200, "approval deny POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -2951,7 +2998,11 @@ async fn approval_for_unknown_request_id_does_not_crash() {
     init_env();
     let (app, _) = build_test_app();
 
-    let st = post_approval_respond(&app, "nonexistent-approval-id", "allow").await;
+    let identity = ApprovalIdentity {
+        session_id: "web-e2e-unknown-approval-session".to_string(),
+        run_id: "web-e2e-unknown-approval-run".to_string(),
+    };
+    let st = post_approval_respond(&app, &identity, "nonexistent-approval-id", "allow").await;
     assert_eq!(st, 200);
 }
 
@@ -3465,8 +3516,15 @@ async fn approval_allow_session_approves_tool() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
+    let approval_identity = wait_for_approval_identity(&mut rx).await;
     wait_for_sse(&mut rx, "approval_required", 5).await;
-    let st = post_approval_respond(&app, "tc-session-approve", "allow_session").await;
+    let st = post_approval_respond(
+        &app,
+        &approval_identity,
+        "tc-session-approve",
+        "allow_session",
+    )
+    .await;
     assert_eq!(st, 200);
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
@@ -3884,26 +3942,43 @@ async fn a3_event_replay_matches_sse_stream_content() {
     let (sse_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
     poll_run_status(&app, &run_id, "completed", 5).await;
 
-    let (_, replay_events) = get_run_stream(&app, &run_id, 0).await;
+    let (status, replay_events) = get_run_stream(&app, &run_id, 0).await;
+    assert_eq!(status, StatusCode::OK);
 
-    // Find text_delta in SSE events.
-    let sse_text: Vec<&str> = sse_events
+    // Live transport exposes incremental text_delta events; durable replay
+    // intentionally stores the terminal text_done event instead of every delta.
+    let sse_text = sse_events
         .iter()
         .filter(|e| e["type"].as_str() == Some("text_delta"))
-        .filter_map(|e| e["content"].as_str().or(e["text"].as_str()))
-        .collect();
+        .filter_map(|e| {
+            e.get("content")
+                .and_then(Value::as_str)
+                .or_else(|| e.get("text").and_then(Value::as_str))
+        })
+        .fold(String::new(), |mut acc, chunk| {
+            acc.push_str(chunk);
+            acc
+        });
 
-    // Find text_delta in replay events.
-    let replay_text: Vec<&str> = replay_events
+    let replay_text: Vec<String> = replay_events
         .iter()
-        .filter(|e| e["type"].as_str() == Some("text_delta"))
-        .filter_map(|e| e["content"].as_str().or(e["text"].as_str()))
+        .filter(|e| {
+            e.get("type").and_then(Value::as_str) == Some("text_done")
+                || e.get("event_type").and_then(Value::as_str) == Some("text_done")
+        })
+        .filter_map(|e| {
+            e.get("full_text")
+                .and_then(Value::as_str)
+                .or_else(|| e.pointer("/data/full_text").and_then(Value::as_str))
+        })
+        .map(ToOwned::to_owned)
         .collect();
 
-    assert!(!sse_text.is_empty(), "SSE should have text_delta events");
+    assert!(!sse_text.is_empty(), "SSE should have text_delta content");
     assert_eq!(
-        sse_text, replay_text,
-        "replay text_delta content should match SSE stream"
+        replay_text,
+        vec![sse_text.clone()],
+        "durable replay text_done should match the live SSE text content"
     );
 }
 
