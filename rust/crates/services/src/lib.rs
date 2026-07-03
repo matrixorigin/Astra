@@ -241,9 +241,8 @@ pub use multi_agent::{
     UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
 };
 pub use pagination::{
-    MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,
-    MAX_MARKETPLACE_SEARCH_OFFSET, clamp_admin_audit_limit, clamp_api_list_pagination,
-    clamp_marketplace_search_offset,
+    MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, clamp_admin_audit_limit,
+    clamp_api_list_pagination,
 };
 pub use personal_skills::{
     ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore, InstallUserSkill,

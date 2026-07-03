@@ -38,11 +38,11 @@ use astra_services::{
     DatabaseSessionArtifactStore, DatabaseSessionService, DatabaseSkillService,
     DatabaseStateProjectionStore, DecisionCreateRequestData, DecisionListFilter, DecisionService,
     DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
-    IntrospectionService, MAX_API_LIST_LIMIT, MAX_MARKETPLACE_SEARCH_OFFSET, MarketplaceService,
-    MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService,
-    ReplayService, RetrievalStage, SessionArtifactJsonStore, SessionArtifactStore,
-    SessionArtifactStoreError, SessionListFilter, SessionService, SkillSearchQuery, SkillService,
-    SnapshotCreateRequestData, SnapshotListFilter,
+    IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService, MarketplaceStatsService,
+    MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService, ReplayService,
+    RetrievalStage, SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
+    SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
+    SnapshotListFilter,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -936,11 +936,14 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
             category: None,
             trust_tier: None,
             limit: Some(5),
-            offset: Some(u32::MAX),
+            after_ranking_score: None,
+            after_skill_name: None,
+            after_version: None,
         })
         .await
         .expect("search_ranked");
-    assert_eq!(sr.offset, MAX_MARKETPLACE_SEARCH_OFFSET);
+    assert_eq!(sr.limit, 5);
+    assert!(sr.total.is_none());
 
     cleanup_session_bundle(
         &pool,

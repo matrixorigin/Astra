@@ -1081,11 +1081,17 @@ Follow these steps:
                     >(&text)
                     {
                         Ok(resp) => {
+                            let more = if resp.next_cursor.is_some() {
+                                ", more available"
+                            } else {
+                                ""
+                            };
                             eprintln!(
-                                "\n  {} '{}' ({} results)",
+                                "\n  {} '{}' (showing {}{})",
                                 "Marketplace search:".dim(),
                                 query_str.magenta(),
-                                resp.total
+                                resp.results.len(),
+                                more
                             );
                             eprintln!("{}", "\u{2500}".repeat(78).dim());
 
@@ -2017,7 +2023,6 @@ mod tests {
                 }],
                 "total": 1,
                 "limit": 20,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2040,7 +2045,6 @@ mod tests {
                 "results": [],
                 "total": 0,
                 "limit": 10,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2063,7 +2067,6 @@ mod tests {
                 "results": [],
                 "total": 0,
                 "limit": 20,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2111,7 +2114,6 @@ mod tests {
                 }],
                 "total": 1,
                 "limit": 15,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2139,7 +2141,6 @@ mod tests {
                 }],
                 "total": 1,
                 "limit": 50,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2161,7 +2162,6 @@ mod tests {
                 "installations": [],
                 "total": 0,
                 "limit": 50,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2251,12 +2251,11 @@ mod tests {
                 }],
                 "total": 3,
                 "limit": 50,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
                 .and(path("/marketplace/search"))
-                .and(query_param("name", "my-skill"))
+                .and(query_param("query", "my-skill"))
                 .and(query_param("limit", "50"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
                 .expect(1)
@@ -2275,7 +2274,6 @@ mod tests {
                 "results": [],
                 "total": 0,
                 "limit": 1,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -3057,7 +3055,7 @@ async fn fetch_marketplace_version(
     tok: &str,
 ) -> Option<String> {
     let query_pairs = vec![
-        ("name", skill_name.to_string()),
+        ("query", skill_name.to_string()),
         ("limit", "50".to_string()),
     ];
     match api
@@ -3563,10 +3561,16 @@ async fn browse_marketplace(
                                 desc
                             );
                         }
+                        let more = if resp.next_cursor.is_some() {
+                            " (more available)"
+                        } else {
+                            ""
+                        };
                         eprintln!(
-                            "\n  {} {} total",
+                            "\n  {} {}{}",
                             "Showing".dim(),
-                            resp.total.to_string().dim()
+                            resp.results.len().to_string().dim(),
+                            more.dim()
                         );
                     }
                 }

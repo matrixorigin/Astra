@@ -47,7 +47,9 @@ async fn database_marketplace_stats_rejects_corrupt_required_fields() {
             category: None,
             trust_tier: None,
             limit: Some(10),
-            offset: Some(0),
+            after_ranking_score: None,
+            after_skill_name: None,
+            after_version: None,
         })
         .await
         .expect("search valid marketplace row");
@@ -73,7 +75,9 @@ async fn database_marketplace_stats_rejects_corrupt_required_fields() {
             category: None,
             trust_tier: None,
             limit: Some(10),
-            offset: Some(0),
+            after_ranking_score: None,
+            after_skill_name: None,
+            after_version: None,
         })
         .await
         .expect_err("empty persisted skill version must fail loudly");

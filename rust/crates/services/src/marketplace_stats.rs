@@ -10,8 +10,6 @@ use sqlx::{Row, query};
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
-use crate::pagination::clamp_marketplace_search_offset;
-
 // ── Data types ───────────────────────────────────────────────────────────────
 
 /// Anonymous quality report submitted by a user.
@@ -66,16 +64,51 @@ pub struct SkillSearchQuery {
     /// Filter by trust tier.
     pub trust_tier: Option<String>,
     pub limit: Option<u32>,
-    pub offset: Option<u32>,
+    pub after_ranking_score: Option<f64>,
+    pub after_skill_name: Option<String>,
+    pub after_version: Option<String>,
+}
+
+impl SkillSearchQuery {
+    pub fn cursor(&self) -> Result<Option<SkillSearchCursor>, (StatusCode, Json<ErrorResponse>)> {
+        match (
+            self.after_ranking_score,
+            self.after_skill_name.as_deref(),
+            self.after_version.as_deref(),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(ranking_score), Some(skill_name), Some(version)) => {
+                validate_skill_search_cursor(SkillSearchCursor {
+                    ranking_score,
+                    skill_name: skill_name.to_string(),
+                    version: version.to_string(),
+                })
+                .map(Some)
+            }
+            _ => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "skill search cursor requires after_ranking_score, after_skill_name, and after_version",
+            )),
+        }
+    }
 }
 
 /// Response for search results.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkillSearchResponse {
     pub results: Vec<SkillSearchResult>,
-    pub total: i64,
+    #[serde(default)]
+    pub total: Option<i64>,
     pub limit: u32,
-    pub offset: u32,
+    #[serde(default)]
+    pub next_cursor: Option<SkillSearchCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkillSearchCursor {
+    pub ranking_score: f64,
+    pub skill_name: String,
+    pub version: String,
 }
 
 const MAX_SEARCH_RESULTS: u32 = 100;
@@ -146,6 +179,50 @@ impl DatabaseMarketplaceStatsService {
 
 fn aggregate_metric_id(skill_name: &str) -> String {
     format!("skill-metric-aggregate-{skill_name}")
+}
+
+fn validate_skill_search_limit(limit: Option<u32>) -> u32 {
+    limit
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .clamp(1, MAX_SEARCH_RESULTS)
+}
+
+fn skill_search_query_limit(limit: u32) -> i64 {
+    i64::from(validate_skill_search_limit(Some(limit))) + 1
+}
+
+fn validate_skill_search_cursor(
+    cursor: SkillSearchCursor,
+) -> Result<SkillSearchCursor, (StatusCode, Json<ErrorResponse>)> {
+    if !cursor.ranking_score.is_finite() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "skill search cursor after_ranking_score must be finite",
+        ));
+    }
+    let skill_name = cursor.skill_name.trim().to_string();
+    let version = cursor.version.trim().to_string();
+    if skill_name.is_empty() || version.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "skill search cursor skill name and version must be non-empty",
+        ));
+    }
+    Ok(SkillSearchCursor {
+        ranking_score: cursor.ranking_score,
+        skill_name,
+        version,
+    })
+}
+
+fn skill_search_cursor_from_result(
+    result: &SkillSearchResult,
+) -> Result<SkillSearchCursor, (StatusCode, Json<ErrorResponse>)> {
+    validate_skill_search_cursor(SkillSearchCursor {
+        ranking_score: result.ranking_score,
+        skill_name: result.skill_name.clone(),
+        version: result.version.clone(),
+    })
 }
 
 fn row_value<T>(
@@ -292,11 +369,8 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
     ) -> Result<SkillSearchResponse, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let limit = search
-            .limit
-            .unwrap_or(DEFAULT_SEARCH_LIMIT)
-            .min(MAX_SEARCH_RESULTS);
-        let offset = clamp_marketplace_search_offset(search.offset.unwrap_or(0));
+        let limit = validate_skill_search_limit(search.limit);
+        let cursor = search.cursor()?;
 
         // Build dynamic WHERE clauses
         let mut conditions = Vec::new();
@@ -316,12 +390,6 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
             conditions.push("ms.trust_tier = ?".to_string());
             binds.push(tier.clone());
         }
-
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
 
         // Ranking formula (computed in SQL):
         // score = 0.35 * quality + 0.25 * popularity + 0.20 * freshness + 0.15 * trust + 0.05 * compat
@@ -345,6 +413,21 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
                 ELSE 0.2 END \
             + 0.05 * COALESCE(ms.compatibility_score, 0.5)";
 
+        if cursor.is_some() {
+            conditions.push(format!(
+                "(({ranking_sql}) < ? \
+                 OR (({ranking_sql}) = ? \
+                   AND (sr.skill_name > ? \
+                     OR (sr.skill_name = ? AND sr.version > ?))))"
+            ));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
         let sql = format!(
             "SELECT sr.skill_name, sr.version, sr.description, \
              ms.publisher_id, ms.trust_tier, sr.category, \
@@ -356,32 +439,24 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
              LEFT JOIN skill_metrics ms \
                ON sr.skill_name = ms.skill_name AND ms.metric_type = '{SKILL_METRIC_TYPE_AGGREGATE}' \
              {where_clause} \
-             ORDER BY ranking_score DESC \
-             LIMIT ? OFFSET ?"
+             ORDER BY ranking_score DESC, sr.skill_name ASC, sr.version ASC \
+             LIMIT ?"
         );
-
-        // Count total
-        let count_sql = format!(
-            "SELECT COUNT(*) AS cnt FROM skills_registry sr \
-             LEFT JOIN skill_metrics ms \
-               ON sr.skill_name = ms.skill_name AND ms.metric_type = '{SKILL_METRIC_TYPE_AGGREGATE}' \
-             {where_clause}"
-        );
-
-        // Build and execute count query
-        let mut count_q = query(&count_sql);
-        for b in &binds {
-            count_q = count_q.bind(b);
-        }
-        let count_row = count_q.fetch_one(&pool).await.map_err(internal_error)?;
-        let total: i64 = row_value(&count_row, "marketplace_search", "cnt")?;
 
         // Build and execute search query
         let mut search_q = query(&sql);
         for b in &binds {
             search_q = search_q.bind(b);
         }
-        search_q = search_q.bind(limit).bind(offset);
+        if let Some(cursor) = &cursor {
+            search_q = search_q
+                .bind(cursor.ranking_score)
+                .bind(cursor.ranking_score)
+                .bind(&cursor.skill_name)
+                .bind(&cursor.skill_name)
+                .bind(&cursor.version);
+        }
+        search_q = search_q.bind(skill_search_query_limit(limit));
 
         let rows = search_q.fetch_all(&pool).await.map_err(internal_error)?;
 
@@ -389,12 +464,24 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         for row in rows {
             results.push(marketplace_search_result_from_row(row)?);
         }
+        let has_more = results.len() > limit as usize;
+        if has_more {
+            results.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            results
+                .last()
+                .map(skill_search_cursor_from_result)
+                .transpose()?
+        } else {
+            None
+        };
 
         Ok(SkillSearchResponse {
             results,
-            total,
+            total: None,
             limit,
-            offset,
+            next_cursor,
         })
     }
 
@@ -478,9 +565,9 @@ impl MarketplaceStatsService for NoopMarketplaceStatsService {
     ) -> Result<SkillSearchResponse, (StatusCode, Json<ErrorResponse>)> {
         Ok(SkillSearchResponse {
             results: Vec::new(),
-            total: 0,
+            total: None,
             limit: 0,
-            offset: 0,
+            next_cursor: None,
         })
     }
 
@@ -495,7 +582,6 @@ impl MarketplaceStatsService for NoopMarketplaceStatsService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pagination::{MAX_MARKETPLACE_SEARCH_OFFSET, clamp_marketplace_search_offset};
 
     #[test]
     fn skill_search_query_default_all_none() {
@@ -504,7 +590,7 @@ mod tests {
         assert!(q.category.is_none());
         assert!(q.trust_tier.is_none());
         assert!(q.limit.is_none());
-        assert!(q.offset.is_none());
+        assert!(q.cursor().unwrap().is_none());
     }
 
     #[test]
@@ -513,6 +599,39 @@ mod tests {
         assert_eq!(q.query.as_deref(), Some("test"));
         assert_eq!(q.limit, Some(10));
         assert!(q.category.is_none());
+    }
+
+    #[test]
+    fn skill_search_query_requires_complete_cursor() {
+        let q: SkillSearchQuery =
+            serde_json::from_str(r#"{"after_ranking_score":0.7,"after_skill_name":"alpha"}"#)
+                .unwrap();
+        let (status, body) = q.cursor().unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.detail,
+            "skill search cursor requires after_ranking_score, after_skill_name, and after_version"
+        );
+    }
+
+    #[test]
+    fn skill_search_cursor_rejects_invalid_inputs() {
+        let ok = validate_skill_search_cursor(SkillSearchCursor {
+            ranking_score: 0.7,
+            skill_name: " alpha ".to_string(),
+            version: " 1.0 ".to_string(),
+        })
+        .unwrap();
+        assert_eq!(ok.skill_name, "alpha");
+        assert_eq!(ok.version, "1.0");
+
+        let err = validate_skill_search_cursor(SkillSearchCursor {
+            ranking_score: f64::INFINITY,
+            skill_name: "alpha".to_string(),
+            version: "1.0".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -538,18 +657,38 @@ mod tests {
 
     #[test]
     fn skill_search_limit_clamps_to_max_results() {
-        // Verify the clamp logic: any user-supplied limit is capped at MAX_SEARCH_RESULTS.
-        let user_limit: u32 = 999_999;
-        let clamped = user_limit.min(super::MAX_SEARCH_RESULTS);
-        assert_eq!(clamped, super::MAX_SEARCH_RESULTS);
+        assert_eq!(validate_skill_search_limit(Some(0)), 1);
+        assert_eq!(validate_skill_search_limit(Some(10)), 10);
+        assert_eq!(
+            validate_skill_search_limit(Some(u32::MAX)),
+            super::MAX_SEARCH_RESULTS
+        );
+        assert_eq!(skill_search_query_limit(super::MAX_SEARCH_RESULTS), 101);
     }
 
     #[test]
-    fn skill_search_offset_uses_shared_clamp() {
-        assert_eq!(
-            clamp_marketplace_search_offset(u32::MAX),
-            MAX_MARKETPLACE_SEARCH_OFFSET
+    fn skill_search_hot_path_does_not_count_or_offset_rows() {
+        let body = include_str!("marketplace_stats.rs")
+            .split("impl MarketplaceStatsService for DatabaseMarketplaceStatsService")
+            .nth(1)
+            .expect("database marketplace stats service impl")
+            .split("async fn search_ranked(")
+            .nth(1)
+            .expect("database search_ranked body")
+            .split("async fn refresh_aggregation(")
+            .next()
+            .expect("database search_ranked body end");
+        let upper = body.to_ascii_uppercase();
+        assert!(
+            !body.contains("COUNT(*)"),
+            "marketplace search uses seek pagination and must not count skills_registry"
         );
+        assert_eq!(
+            upper.find(" OFFSET "),
+            None,
+            "marketplace search must not use OFFSET"
+        );
+        assert!(body.contains("ORDER BY ranking_score DESC, sr.skill_name ASC, sr.version ASC"));
     }
 
     #[test]

@@ -351,8 +351,7 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(st_mst, StatusCode::OK, "marketplace skill stats: {mst_j}");
     assert_eq!(mst_j["skill_name"].as_str(), Some(mkt_probe_skill.as_str()));
 
-    let (st_msearch, ms_j) =
-        get_json(app, "/marketplace/search?limit=10&offset=0", None, &[]).await;
+    let (st_msearch, ms_j) = get_json(app, "/marketplace/search?limit=10", None, &[]).await;
     assert_eq!(st_msearch, StatusCode::OK, "marketplace search: {ms_j}");
     assert!(ms_j["results"].is_array(), "search results: {ms_j}");
 
