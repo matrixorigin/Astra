@@ -447,8 +447,10 @@ mod tests {
             normalized.ends_with("LIMIT ?"),
             "CSL truncate must be batch bounded"
         );
-        assert!(CSL_TRUNCATE_BATCH_LIMIT > 0);
-        assert!(CSL_TRUNCATE_BATCH_LIMIT <= 10_000);
+        const {
+            assert!(CSL_TRUNCATE_BATCH_LIMIT > 0);
+            assert!(CSL_TRUNCATE_BATCH_LIMIT <= 10_000);
+        };
     }
 
     #[test]

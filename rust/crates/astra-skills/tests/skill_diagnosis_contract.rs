@@ -16,7 +16,7 @@
 //!   • blocks with malformed JSON (→ None)
 //!   • oversized fields (→ truncated to caps, parser still returns Some)
 
-use astra_skills::auto_invoke::{SkillDiagnosis, SKILL_DIAGNOSIS_SCHEMA_VERSION};
+use astra_skills::auto_invoke::{SKILL_DIAGNOSIS_SCHEMA_VERSION, SkillDiagnosis};
 
 // ─── Happy path ────────────────────────────────────────────────────────────
 

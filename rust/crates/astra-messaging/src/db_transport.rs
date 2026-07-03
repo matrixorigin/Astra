@@ -1480,18 +1480,22 @@ mod tests {
         // Poll interval
         assert_eq!(DEFAULT_POLL_INTERVAL, Duration::from_millis(100));
         assert_eq!(POLL_BATCH_SIZE, 100);
-        assert!(QUEUE_CLEANUP_BATCH_LIMIT >= POLL_BATCH_SIZE);
-        assert!(QUEUE_CLEANUP_BATCH_LIMIT <= 10_000);
-        assert!(BROADCAST_DELIVERY_CLEANUP_BATCH_LIMIT <= 10_000);
+        const {
+            assert!(QUEUE_CLEANUP_BATCH_LIMIT >= POLL_BATCH_SIZE);
+            assert!(QUEUE_CLEANUP_BATCH_LIMIT <= 10_000);
+            assert!(BROADCAST_DELIVERY_CLEANUP_BATCH_LIMIT <= 10_000);
+        };
         // Cleanup
         assert_eq!(DEFAULT_CLEANUP_INTERVAL, Duration::from_secs(300));
         assert_eq!(DEFAULT_MAX_AGE, Duration::from_secs(3600));
         // Backoff
         let threshold: u32 = CRITICAL_FAILURE_THRESHOLD;
         assert!(threshold >= 10);
-        assert!(INITIAL_BACKOFF >= Duration::from_millis(100));
-        assert!(MAX_BACKOFF <= Duration::from_secs(30));
-        assert!(MAX_BACKOFF > INITIAL_BACKOFF);
+        let initial_backoff = INITIAL_BACKOFF;
+        let max_backoff = MAX_BACKOFF;
+        assert!(initial_backoff >= Duration::from_millis(100));
+        assert!(max_backoff <= Duration::from_secs(30));
+        assert!(max_backoff > initial_backoff);
     }
 
     #[test]

@@ -143,35 +143,41 @@ async fn prompt_retention_pressure_probe() {
     let insert_started = std::time::Instant::now();
     insert_prompt_fixtures_bulk(
         &pool,
-        &user_id,
-        &ended_session,
-        None,
-        0,
-        delete_rows,
-        "delete",
-        PromptFixtureAge::Expired,
+        PromptFixtureBulk {
+            user_id: &user_id,
+            session_id: &ended_session,
+            run_id: None,
+            start_turn: 0,
+            count: delete_rows,
+            label: "delete",
+            age: PromptFixtureAge::Expired,
+        },
     )
     .await;
     insert_prompt_fixtures_bulk(
         &pool,
-        &user_id,
-        &active_session,
-        None,
-        delete_rows,
-        keep_rows,
-        "keep",
-        PromptFixtureAge::Expired,
+        PromptFixtureBulk {
+            user_id: &user_id,
+            session_id: &active_session,
+            run_id: None,
+            start_turn: delete_rows,
+            count: keep_rows,
+            label: "keep",
+            age: PromptFixtureAge::Expired,
+        },
     )
     .await;
     insert_prompt_fixtures_bulk(
         &pool,
-        &user_id,
-        &fresh_session,
-        None,
-        delete_rows + keep_rows,
-        fresh_rows,
-        "fresh",
-        PromptFixtureAge::Fresh,
+        PromptFixtureBulk {
+            user_id: &user_id,
+            session_id: &fresh_session,
+            run_id: None,
+            start_turn: delete_rows + keep_rows,
+            count: fresh_rows,
+            label: "fresh",
+            age: PromptFixtureAge::Fresh,
+        },
     )
     .await;
     let insert_ms = insert_started.elapsed().as_millis();
@@ -360,21 +366,22 @@ async fn insert_prompt_fixture(
     request_id
 }
 
-async fn insert_prompt_fixtures_bulk(
-    pool: &Pool<MySql>,
-    user_id: &str,
-    session_id: &str,
-    run_id: Option<&str>,
+struct PromptFixtureBulk<'a> {
+    user_id: &'a str,
+    session_id: &'a str,
+    run_id: Option<&'a str>,
     start_turn: i64,
     count: i64,
-    label: &str,
+    label: &'a str,
     age: PromptFixtureAge,
-) {
-    let request_ids = (0..count)
-        .map(|_| format!("promptreq-{label}-{}", Uuid::new_v4().simple()))
+}
+
+async fn insert_prompt_fixtures_bulk(pool: &Pool<MySql>, fixture: PromptFixtureBulk<'_>) {
+    let request_ids = (0..fixture.count)
+        .map(|_| format!("promptreq-{}-{}", fixture.label, Uuid::new_v4().simple()))
         .collect::<Vec<_>>();
     for (chunk_index, chunk) in request_ids.chunks(500).enumerate() {
-        let chunk_base = start_turn + (chunk_index * 500) as i64;
+        let chunk_base = fixture.start_turn + (chunk_index * 500) as i64;
         let mut requests = QueryBuilder::<MySql>::new(
             "INSERT INTO prompt_request_records
              (request_id, session_id, user_id, run_id, turn, round, attempt, source,
@@ -384,9 +391,9 @@ async fn insert_prompt_fixtures_bulk(
         requests.push_values(chunk.iter().enumerate(), |mut row, (index, request_id)| {
             let turn = chunk_base + index as i64;
             row.push_bind(request_id)
-                .push_bind(session_id)
-                .push_bind(user_id)
-                .push_bind(run_id)
+                .push_bind(fixture.session_id)
+                .push_bind(fixture.user_id)
+                .push_bind(fixture.run_id)
                 .push_bind(turn)
                 .push_bind(0_i32)
                 .push_bind(0_i32)
@@ -399,8 +406,8 @@ async fn insert_prompt_fixtures_bulk(
                 .push_bind(Option::<&str>::None)
                 .push_bind(format!("{turn:064x}"))
                 .push_bind("{}")
-                .push(age.created_at_sql())
-                .push(age.created_at_unix_ms_sql());
+                .push(fixture.age.created_at_sql())
+                .push(fixture.age.created_at_unix_ms_sql());
         });
         requests
             .build()
@@ -415,8 +422,8 @@ async fn insert_prompt_fixtures_bulk(
         );
         deltas.push_values(chunk.iter().enumerate(), |mut row, (index, request_id)| {
             let turn = chunk_base + index as i64;
-            row.push_bind(user_id)
-                .push_bind(session_id)
+            row.push_bind(fixture.user_id)
+                .push_bind(fixture.session_id)
                 .push_bind(request_id)
                 .push_bind(0_i32)
                 .push_bind("message:0:user")
@@ -426,7 +433,7 @@ async fn insert_prompt_fixtures_bulk(
                 .push_bind(format!("chunk-{request_id}"))
                 .push_bind(format!("{:064x}", turn + 1_000_000))
                 .push_bind(Option::<&str>::None)
-                .push(age.created_at_sql());
+                .push(fixture.age.created_at_sql());
         });
         deltas
             .build()

@@ -1601,7 +1601,7 @@ mod tests {
     #[tokio::test]
     async fn owner_lease_heartbeat_renews_until_guard_drops() {
         let store = Arc::new(
-            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::BeforeCommit)
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
                 .with_owner_lease_heartbeat(Duration::from_millis(5)),
         );
         let engine = RunEngine::new(store.clone());
@@ -1630,10 +1630,10 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum BatchTransitionFailureMode {
-        BeforeCommit,
-        AfterCommit,
-        StatusOnlyAfterCommit,
-        ConcurrentCancelAfterCommit,
+        FailBeforeStoreWrite,
+        FailAfterStoreWrite,
+        FailAfterStatusWrite,
+        ConcurrentCancelWins,
     }
 
     struct FlakyBatchTransitionStore {
@@ -1775,10 +1775,10 @@ mod tests {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             if self.should_fail_this_attempt() {
                 match self.mode {
-                    BatchTransitionFailureMode::BeforeCommit => {
+                    BatchTransitionFailureMode::FailBeforeStoreWrite => {
                         return Err("transient EOF before commit".to_string());
                     }
-                    BatchTransitionFailureMode::AfterCommit => {
+                    BatchTransitionFailureMode::FailAfterStoreWrite => {
                         self.inner
                             .update_run_status_with_events_if_current(
                                 user_id,
@@ -1792,7 +1792,7 @@ mod tests {
                             .await?;
                         return Err("transient EOF after commit".to_string());
                     }
-                    BatchTransitionFailureMode::StatusOnlyAfterCommit => {
+                    BatchTransitionFailureMode::FailAfterStatusWrite => {
                         self.inner
                             .update_run_status_if_current(
                                 user_id,
@@ -1805,7 +1805,7 @@ mod tests {
                             .await?;
                         return Err("transient EOF after status-only commit".to_string());
                     }
-                    BatchTransitionFailureMode::ConcurrentCancelAfterCommit => {
+                    BatchTransitionFailureMode::ConcurrentCancelWins => {
                         self.inner
                             .update_run_status_with_events_if_current(
                                 user_id,
@@ -2359,7 +2359,7 @@ mod tests {
     async fn terminal_transition_retries_transient_error_before_commit() {
         let store = Arc::new(FlakyBatchTransitionStore::new(
             1,
-            BatchTransitionFailureMode::BeforeCommit,
+            BatchTransitionFailureMode::FailBeforeStoreWrite,
         ));
         let engine = RunEngine::new(store.clone());
         engine
@@ -2408,7 +2408,7 @@ mod tests {
     async fn terminal_transition_reconciles_commit_after_unknown_error() {
         let store = Arc::new(FlakyBatchTransitionStore::new(
             1,
-            BatchTransitionFailureMode::AfterCommit,
+            BatchTransitionFailureMode::FailAfterStoreWrite,
         ));
         let engine = RunEngine::new(store.clone());
         engine
@@ -2458,7 +2458,7 @@ mod tests {
     async fn terminal_transition_repairs_missing_events_after_status_only_unknown_error() {
         let store = Arc::new(FlakyBatchTransitionStore::new(
             1,
-            BatchTransitionFailureMode::StatusOnlyAfterCommit,
+            BatchTransitionFailureMode::FailAfterStatusWrite,
         ));
         let engine = RunEngine::new(store.clone());
         engine
@@ -2533,7 +2533,7 @@ mod tests {
     async fn terminal_transition_retry_does_not_override_concurrent_cancel() {
         let store = Arc::new(FlakyBatchTransitionStore::new(
             1,
-            BatchTransitionFailureMode::ConcurrentCancelAfterCommit,
+            BatchTransitionFailureMode::ConcurrentCancelWins,
         ));
         let engine = RunEngine::new(store.clone());
         engine
@@ -3296,7 +3296,7 @@ mod tests {
     async fn recover_active_runs_uses_store_recoverable_active_query() {
         let store = Arc::new(FlakyBatchTransitionStore::new(
             0,
-            BatchTransitionFailureMode::BeforeCommit,
+            BatchTransitionFailureMode::FailBeforeStoreWrite,
         ));
         let engine = RunEngine::new(store.clone());
         engine

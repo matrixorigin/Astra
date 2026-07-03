@@ -1074,8 +1074,10 @@ mod tests {
                 statement.label
             );
         }
-        assert!(SESSION_DELETE_BATCH_LIMIT > 0);
-        assert!(SESSION_DELETE_BATCH_LIMIT <= 10_000);
+        const {
+            assert!(SESSION_DELETE_BATCH_LIMIT > 0);
+            assert!(SESSION_DELETE_BATCH_LIMIT <= 10_000);
+        };
     }
 
     #[test]
