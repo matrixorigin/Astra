@@ -1055,6 +1055,11 @@ pub struct ServerAgenticLoopHost {
     /// path before the first `sync_valid_tools_to_visible` call; stable
     /// for the rest of the session.
     admissible_extras: Vec<String>,
+    /// Final deferred names for the current wire surface after visible-tool
+    /// overlap and runtime binding filters. Validator reads this instead of
+    /// the raw edge-profile declaration so unavailable tools disappear rather
+    /// than becoming "not yet activated" walls.
+    current_deferred_tool_names: HashSet<String>,
     /// `true` when tools were auto-populated from astra-tools (no CLI connected).
     server_side_tools: bool,
     /// `true` when the connected client can answer ask_user prompts.
@@ -1490,15 +1495,7 @@ impl ServerAgenticLoopHostBuilder {
                     .map(String::from)
             })
             .collect();
-        let admissible_extras = if server_side_tools
-            && matches!(schema_workspace.kind, WorkspaceBindingKind::EdgeWorkspace)
-            && matches!(schema_executor.kind, ExecutorBindingKind::EdgeAgent)
-            && !matches!(schema_executor.status, ExecutorStatus::Online)
-        {
-            hidden_execution_boundary_tool_names(&edge_tools)
-        } else {
-            Vec::new()
-        };
+        let admissible_extras = Vec::new();
         valid_tools.extend(admissible_extras.iter().cloned());
 
         let always_load_tool_names: HashSet<String> = self
@@ -1534,6 +1531,7 @@ impl ServerAgenticLoopHostBuilder {
             edge_profile: self.edge_profile,
             valid_tools,
             admissible_extras,
+            current_deferred_tool_names: HashSet::new(),
             server_side_tools,
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
@@ -3017,10 +3015,11 @@ impl ServerAgenticLoopHost {
             state.server_tool_executor.as_deref(),
         );
         if let Some(executor) = state.server_tool_executor.as_deref() {
-            executor.set_current_activatable_tool_names(activatable_deferred_tool_names);
+            executor.set_current_activatable_tool_names(activatable_deferred_tool_names.clone());
             executor.set_current_searchable_tool_schemas(wire_tools);
             extras.extend(executor.activated_deferred_tool_names());
         }
+        self.current_deferred_tool_names = activatable_deferred_tool_names;
         self.valid_tools = self.admissible_tool_names_for_surface(wire_tools, &extras);
     }
 
@@ -4540,10 +4539,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn deferred_tool_names(&self) -> HashSet<String> {
-        self.deferred_tool_names_from_edge_profile_for_model(
-            self.resolved_model_name.as_deref(),
-            self.resolved_context_window,
-        )
+        self.current_deferred_tool_names.clone()
     }
 
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
@@ -5088,28 +5084,6 @@ fn normalize_usage_to_canonical(
         }
     }
     raw.clone()
-}
-
-fn hidden_execution_boundary_tool_names(visible_tools: &[Value]) -> Vec<String> {
-    let visible: HashSet<String> = visible_tools
-        .iter()
-        .filter_map(tool_schema_name)
-        .map(str::to_string)
-        .collect();
-    astra_runtime_env::ToolRegistry::builtins()
-        .iter()
-        .filter(|spec| {
-            matches!(
-                spec.required.executor,
-                astra_runtime_env::RequiredExecutor::RuntimeExecutor
-            ) || !matches!(
-                spec.required.workspace,
-                astra_runtime_env::RequiredWorkspace::None
-            )
-        })
-        .map(|spec| spec.name.clone())
-        .filter(|name| !visible.contains(name))
-        .collect()
 }
 
 fn edge_tool_delivery_timed_out(
@@ -6054,6 +6028,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn deferred_manifest_filters_workspace_tools_without_runtime_binding() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            json!(["bash"]),
+        );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            json!("<deferred-tools>\nbash\n</deferred-tools>"),
+        );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            json!(200_000),
+        );
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_profile(edge_profile)
+        .build();
+        host.resolved_model_name = Some("test-model".to_string());
+        host.resolved_context_window = Some(200_000);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "test-user".into(),
+                "test-session".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let visible = host.visible_turn_tools(&mut state);
+        let visible_names = schema_names(&visible);
+        assert!(!visible_names.contains("bash"));
+        assert!(
+            !executor
+                .current_activatable_tool_names_snapshot()
+                .contains("bash"),
+            "unavailable deferred workspace tools must not be activatable"
+        );
+        assert!(
+            !<ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
+                .contains("bash"),
+            "validator must see the filtered deferred set, not raw edge-profile names"
+        );
+
+        let result = executor
+            .execute_with_metadata("tool_search", &json!({"query": "select:bash"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not rediscover unavailable workspace tools: {}",
+            result.output
+        );
+    }
+
     #[test]
     fn builder_filters_edge_tools_through_runtime_binding() {
         let host = ServerAgenticLoopHostBuilder::new(
@@ -6182,12 +6224,8 @@ mod tests {
                 "{hidden} must be hidden while the edge runtime is offline"
             );
             assert!(
-                host.valid_tool_names().contains(hidden),
-                "{hidden} should be admitted while hidden so stale calls can report executor_offline"
-            );
-            assert!(
-                host.admissible_extras.contains(&hidden.to_string()),
-                "{hidden} should remain boundary-admissible so stale calls can report executor_offline"
+                !host.valid_tool_names().contains(hidden),
+                "{hidden} must not be admitted while hidden; unavailable tools should disappear from the model surface"
             );
         }
     }

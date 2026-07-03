@@ -1,9 +1,10 @@
 //! Server-side tool executor for web agent sessions.
 //!
-//! When a web user connects without a CLI edge agent, the server executes
-//! tools directly using the shared `astra-tools` library. This module
-//! provides the `ServerToolExecutor` that wraps tool execution with:
-//! - Per-session workspace isolation (sandbox)
+//! By default the server exposes only server-service and control-plane tools.
+//! Workspace/process execution, such as bash, file mutation, git, or test
+//! runners, requires an explicit workspace/executor binding. When such a
+//! binding is present this module wraps execution with:
+//! - Per-session workspace isolation for server sandbox bindings
 //! - Per-session file journals with rollback support
 //! - Circuit-breaker for external services (Memoria)
 //!
@@ -64,8 +65,8 @@ use crate::server::tool_transport::{
     TOOL_ERROR_KIND_CAPABILITY_DENIED, TOOL_ERROR_KIND_EXECUTOR_OFFLINE,
     TOOL_ERROR_KIND_TOOL_TIMEOUT, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
     TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH, ToolExecutionRequest, ToolExecutionService,
-    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
-    capability_filtered_server_tool_schemas,
+    ToolPolicySnapshot, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
+    binding_event_fields, capability_filtered_server_tool_schemas,
 };
 use crate::server::tool_work_surface_events::{
     WorkSurfaceEventEmitter, binding_snapshot_events, task_board_snapshot_event,
@@ -328,7 +329,7 @@ impl ServerToolExecutor {
             agent_binding_mcp: None,
             agent_tool_context: None,
             work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
-            execution_binding: ExecutionBindingState::server_sandbox(&workspace_root),
+            execution_binding: ExecutionBindingState::none(),
             capabilities,
             enforce_server_tool_capabilities: false,
             server_builtin_tools_enabled: true,
@@ -723,6 +724,10 @@ impl ServerToolExecutor {
             };
         }
 
+        if !self.runtime_environment_allows_tool(name) {
+            return ToolAdmission::MissingRuntimeBinding;
+        }
+
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
             return if self.tool_engine.contains(name) || self.plugin_schema_has_name(name) {
                 ToolAdmission::Ready
@@ -750,9 +755,30 @@ impl ServerToolExecutor {
         ToolAdmission::Ready
     }
 
+    fn runtime_environment_allows_tool(&self, name: &str) -> bool {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        if registry.get(name).is_none() {
+            return true;
+        }
+        let binding = crate::server::tool_binding_projection::runtime_environment_binding_for_parts(
+            name,
+            self.execution_binding.workspace(),
+            self.execution_binding.executor(),
+            self.execution_binding.runtime().cloned(),
+            &ToolPolicySnapshot::default(),
+            &registry,
+        );
+        astra_runtime_env::CapabilityResolver
+            .check_tool_call(&registry, name, &json!({}), &binding.capabilities)
+            .is_ok()
+    }
+
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
         if name.starts_with("mcp__") {
             return self.mcp_tool_has_runtime_binding(name);
+        }
+        if !self.runtime_environment_allows_tool(name) {
+            return false;
         }
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
             return self.tool_engine.contains(name) || self.plugin_schema_has_name(name);
@@ -1455,6 +1481,45 @@ mod tests {
                 budget_result: Default::default(),
             })
         }
+    }
+
+    #[test]
+    fn new_executor_defaults_to_control_plane_without_workspace_runtime() {
+        let dir = TempDir::new().unwrap();
+        let exec = ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+
+        let fields = exec.binding_event_fields();
+        assert_eq!(
+            fields
+                .get("workspace")
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str),
+            Some("none")
+        );
+        assert_eq!(
+            fields
+                .get("executor")
+                .and_then(|value| value.get("executor_id"))
+                .and_then(Value::as_str),
+            Some("server-control-plane")
+        );
+        assert_eq!(
+            fields.get("transport").and_then(Value::as_str),
+            Some("server_local")
+        );
+
+        let names = schema_name_set(exec.tool_schemas());
+        assert!(names.contains("tool_search"));
+        assert!(names.contains("memory"));
+        assert!(!names.contains("bash"));
+        assert!(!names.contains("read_file"));
+        assert!(!exec.supports_server_tool_name("bash"));
     }
 
     #[test]
@@ -2391,12 +2456,16 @@ esac
 
     fn test_executor() -> (ServerToolExecutor, TempDir) {
         let dir = TempDir::new().unwrap();
-        let exec = ServerToolExecutor::new(
+        let mut exec = ServerToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             "test-session".into(),
             None,
             None,
+        );
+        exec.set_execution_bindings(
+            WorkspaceBinding::server_sandbox(dir.path()),
+            ExecutorBinding::server_local(),
         );
         (exec, dir)
     }
@@ -4260,6 +4329,42 @@ esac
             "select:github must resolve on server path; got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn default_tool_search_does_not_resolve_workspace_runtime_tools() {
+        let dir = TempDir::new().unwrap();
+        let exec = ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+
+        for missing in ["bash", "read_file", "git"] {
+            let result = exec
+                .execute_with_metadata(
+                    "tool_search",
+                    &json!({"query": format!("select:{missing}")}),
+                )
+                .await;
+            let parsed: Value = serde_json::from_str(&result.output).unwrap();
+            assert!(
+                parsed["matches"].as_array().unwrap().is_empty(),
+                "{missing} must not resolve without a workspace/runtime binding; got: {}",
+                result.output
+            );
+            assert!(
+                parsed["missing"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value.as_str() == Some(missing)),
+                "{missing} must be reported missing from the current search pool; got: {}",
+                result.output
+            );
+        }
     }
 
     #[tokio::test]

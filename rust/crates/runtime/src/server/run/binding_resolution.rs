@@ -26,7 +26,7 @@ pub(crate) fn resolve_request_execution_bindings(
 
 pub(crate) fn request_uses_server_workspace(
     request: &astra_services::runs::ChatRequestData,
-    has_edge_tools: bool,
+    _has_edge_tools: bool,
 ) -> bool {
     match request
         .workspace_binding
@@ -34,8 +34,7 @@ pub(crate) fn request_uses_server_workspace(
         .map(|binding| binding.kind)
     {
         Some(astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox) => true,
-        Some(_) => false,
-        None => !has_edge_tools,
+        Some(_) | None => false,
     }
 }
 
@@ -61,7 +60,7 @@ fn resolve_request_execution_bindings_from_request(
     let workspace = match request.workspace_binding.as_ref() {
         Some(binding) => workspace_binding_from_request(binding, server_workspace)?,
         None => match server_workspace {
-            Some(server_workspace) => WorkspaceBinding::server_sandbox(server_workspace),
+            Some(_) => WorkspaceBinding::none(),
             None if has_edge_tools => {
                 return Some(execution_bindings_for_legacy_edge_tools(
                     edge_profile.unwrap_or(&Map::new()),
@@ -374,17 +373,16 @@ fn workspace_binding_from_request(
                     .unwrap_or(FallbackPolicy::Disabled),
             })
         }
-        astra_services::runs::WorkspaceBindingRequestKind::None => Some(WorkspaceBinding {
-            kind: WorkspaceBindingKind::None,
-            display_name: non_empty_string(binding.display_name.as_deref())
-                .unwrap_or_else(|| "No workspace".to_string()),
-            cwd: None,
-            authority: WorkspaceAuthority::None,
-            fallback_policy: binding
-                .fallback_policy
-                .map(fallback_policy_from_request)
-                .unwrap_or(FallbackPolicy::Disabled),
-        }),
+        astra_services::runs::WorkspaceBindingRequestKind::None => {
+            let mut workspace = WorkspaceBinding::none();
+            if let Some(display_name) = non_empty_string(binding.display_name.as_deref()) {
+                workspace.display_name = display_name;
+            }
+            if let Some(fallback_policy) = binding.fallback_policy {
+                workspace.fallback_policy = fallback_policy_from_request(fallback_policy);
+            }
+            Some(workspace)
+        }
     }
 }
 
@@ -665,11 +663,30 @@ mod tests {
     }
 
     #[test]
-    fn request_uses_server_workspace_only_when_no_edge_workspace_is_available() {
+    fn request_uses_server_workspace_only_for_explicit_server_sandbox() {
         let request = test_request("hello");
 
-        assert!(request_uses_server_workspace(&request, false));
+        assert!(!request_uses_server_workspace(&request, false));
         assert!(!request_uses_server_workspace(&request, true));
+    }
+
+    #[test]
+    fn default_request_uses_no_workspace_even_when_server_workspace_exists() {
+        let request = test_request("web-only control plane");
+
+        let (workspace, executor) =
+            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::None);
+        assert_eq!(workspace.display_name, "No workspace");
+        assert_eq!(workspace.cwd, None);
+        assert_eq!(workspace.authority, WorkspaceAuthority::None);
+        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
+        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
+        assert_eq!(executor.executor_id, "server-control-plane");
+        assert_eq!(executor.display_name, "Server control plane");
+        assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
+        assert_eq!(executor.status, ExecutorStatus::Online);
     }
 
     #[test]

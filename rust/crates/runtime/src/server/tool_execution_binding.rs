@@ -23,6 +23,16 @@ pub struct WorkspaceBinding {
 }
 
 impl WorkspaceBinding {
+    pub fn none() -> Self {
+        Self {
+            kind: WorkspaceBindingKind::None,
+            display_name: "No workspace".to_string(),
+            cwd: None,
+            authority: WorkspaceAuthority::None,
+            fallback_policy: FallbackPolicy::Disabled,
+        }
+    }
+
     pub fn server_sandbox(root: impl AsRef<Path>) -> Self {
         Self {
             kind: WorkspaceBindingKind::ServerSandbox,
@@ -209,6 +219,16 @@ pub(crate) struct ExecutionBindingState {
 }
 
 impl ExecutionBindingState {
+    pub(crate) fn none() -> Self {
+        Self {
+            workspace: WorkspaceBinding::none(),
+            workspace_record: None,
+            executor: ExecutorBinding::server_control_plane(),
+            runtime: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn server_sandbox(root: impl AsRef<Path>) -> Self {
         Self {
             workspace: WorkspaceBinding::server_sandbox(root),

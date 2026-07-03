@@ -4571,8 +4571,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runs.insert(run_id.clone(), run_state);
         }
 
-        // Provision workspace early so build_initial_state and durable
-        // run_started metadata use the same execution boundary.
+        // Provision explicit workspace bindings early so build_initial_state
+        // and durable run_started metadata use the same execution boundary.
         let cloud_workspace_record = match self
             .provision_cloud_workspace_record(&user_id, &session_id, &request, &run_id)
             .await
@@ -5416,8 +5416,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
         );
 
-        // Provision workspace early for web-agent mode (no edge tools) so
-        // build_initial_state loads stop hooks from the provisioned directory.
+        // Provision explicit workspace bindings early so build_initial_state
+        // and durable run_started metadata use the same execution boundary.
         let cloud_workspace_record = self
             .provision_cloud_workspace_record(&user_id, &session_id, &request, &run_id)
             .await?;

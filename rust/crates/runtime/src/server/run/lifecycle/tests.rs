@@ -3335,7 +3335,7 @@ fn request_execution_bindings_use_actual_server_workspace_for_server_sandbox() {
 fn server_workspace_binding_decision_respects_explicit_binding_and_edge_tools() {
     let mut request = test_request("hello");
 
-    assert!(request_uses_server_workspace(&request, false));
+    assert!(!request_uses_server_workspace(&request, false));
     assert!(!request_uses_server_workspace(&request, true));
 
     request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
