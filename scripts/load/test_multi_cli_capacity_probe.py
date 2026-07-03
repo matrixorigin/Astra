@@ -190,6 +190,9 @@ class CapacityProbeTests(unittest.TestCase):
                 metrics_interval_secs=5.0,
                 max_control_plane_polls_per_worker_per_sec=8.0,
                 max_edge_dispatch_errors_per_sec=None,
+                require_no_run_control_errors=False,
+                require_no_durable_event_errors=False,
+                require_no_edge_dispatch_errors=False,
                 skip_nofile_check=False,
                 dry_run=dry_run,
             )
@@ -214,6 +217,9 @@ class CapacityProbeTests(unittest.TestCase):
             metrics_interval_secs=5.0,
             max_control_plane_polls_per_worker_per_sec=-1.0,
             max_edge_dispatch_errors_per_sec=None,
+            require_no_run_control_errors=False,
+            require_no_durable_event_errors=False,
+            require_no_edge_dispatch_errors=False,
             skip_nofile_check=True,
             dry_run=False,
         )
@@ -361,6 +367,56 @@ class CapacityProbeTests(unittest.TestCase):
             run_control["errors_by_operation_class"]["user_input_poll:missing"],
             {"last": 4.0, "delta": 4.0},
         )
+
+    def test_summarize_metrics_file_reports_durable_run_event_error_deltas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "unix_ms": 1_000,
+                                "http_status": 200,
+                                "metrics": {
+                                    'astra_durable_run_event_batches_total{path="streaming_terminal",outcome="planned",compacted="false"}': 10.0,
+                                    'astra_durable_run_event_batches_total{path="streaming_terminal",outcome="error",compacted="false"}': 1.0,
+                                    'astra_durable_run_event_rows_total{path="streaming_terminal",outcome="error",compacted="false"}': 2.0,
+                                    'astra_durable_run_event_bytes_total{path="streaming_terminal",outcome="error",compacted="false"}': 128.0,
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "unix_ms": 3_000,
+                                "http_status": 200,
+                                "metrics": {
+                                    'astra_durable_run_event_batches_total{path="streaming_terminal",outcome="planned",compacted="false"}': 15.0,
+                                    'astra_durable_run_event_batches_total{path="streaming_terminal",outcome="error",compacted="false"}': 3.0,
+                                    'astra_durable_run_event_rows_total{path="streaming_terminal",outcome="error",compacted="false"}': 6.0,
+                                    'astra_durable_run_event_bytes_total{path="streaming_terminal",outcome="error",compacted="false"}': 384.0,
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = probe.summarize_metrics_file(path)
+
+        durable = summary["durable_run_events"]
+        self.assertEqual(durable["batches_last_total"], 18.0)
+        self.assertEqual(durable["batches_delta_total"], 7.0)
+        self.assertEqual(
+            durable["batches_by_path_outcome_compacted"]["streaming_terminal:error:false"],
+            {"last": 3.0, "delta": 2.0},
+        )
+        self.assertEqual(durable["error_batches_delta_total"], 2.0)
+        self.assertEqual(durable["error_batches_per_sec"], 1.0)
+        self.assertEqual(durable["error_rows_delta_total"], 4.0)
+        self.assertEqual(durable["error_bytes_delta_total"], 256.0)
 
     def test_summarize_metrics_file_reports_run_recovery_deltas(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -542,17 +598,25 @@ class CapacityProbeTests(unittest.TestCase):
         args = argparse.Namespace(
             max_control_plane_polls_per_worker_per_sec=1.5,
             max_edge_dispatch_errors_per_sec=0.5,
+            require_no_run_control_errors=True,
+            require_no_durable_event_errors=True,
+            require_no_edge_dispatch_errors=True,
         )
         metrics_summary = {
             "control_plane": {"poll_attempts_per_worker_per_sec": 2.0},
-            "edge_dispatch": {"error_events_per_sec": 1.0},
+            "run_control": {"errors_delta_total": 3.0},
+            "durable_run_events": {"error_batches_delta_total": 2.0},
+            "edge_dispatch": {"error_events_per_sec": 1.0, "error_events_delta_total": 4.0},
         }
 
         self.assertEqual(
             probe.evaluate_capacity_contracts(args, metrics_summary),
             [
                 "control_plane_poll_attempts_per_worker_per_sec:2>1.5",
+                "run_control_errors:3",
+                "durable_run_event_error_batches:2",
                 "edge_dispatch_error_events_per_sec:1>0.5",
+                "edge_dispatch_error_events:4",
             ],
         )
 
@@ -560,9 +624,14 @@ class CapacityProbeTests(unittest.TestCase):
         args = argparse.Namespace(
             max_control_plane_polls_per_worker_per_sec=None,
             max_edge_dispatch_errors_per_sec=None,
+            require_no_run_control_errors=False,
+            require_no_durable_event_errors=False,
+            require_no_edge_dispatch_errors=False,
         )
         metrics_summary = {
             "control_plane": {"poll_attempts_per_worker_per_sec": 100.0},
+            "run_control": {"errors_delta_total": 10.0},
+            "durable_run_events": {"error_batches_delta_total": 10.0},
             "edge_dispatch": {"error_events_per_sec": 10.0},
         }
 

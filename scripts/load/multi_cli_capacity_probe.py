@@ -607,6 +607,9 @@ RUN_RECOVERY_SCANS_METRIC = "astra_run_recovery_scans_total"
 RUN_RECOVERY_RUNS_METRIC = "astra_run_recovery_runs_total"
 WS_RUN_STREAM_ATTEMPTS_METRIC = "astra_ws_run_stream_poll_attempts_total"
 WS_RUN_STREAM_ERRORS_METRIC = "astra_ws_run_stream_poll_errors_total"
+DURABLE_RUN_EVENT_BATCHES_METRIC = "astra_durable_run_event_batches_total"
+DURABLE_RUN_EVENT_ROWS_METRIC = "astra_durable_run_event_rows_total"
+DURABLE_RUN_EVENT_BYTES_METRIC = "astra_durable_run_event_bytes_total"
 EDGE_DISPATCH_GAUGE_KEYS = {
     "queue_depth": "astra_edge_dispatch_queue_depth",
     "pending_rows": "astra_edge_dispatch_pending_rows",
@@ -940,6 +943,9 @@ async def run_probe(args: argparse.Namespace) -> int:
                     "require_metrics": args.require_metrics,
                     "require_error_codes_for_failures": args.require_error_codes_for_failures,
                     "require_no_critical_ingestion_drops": args.require_no_critical_ingestion_drops,
+                    "require_no_run_control_errors": args.require_no_run_control_errors,
+                    "require_no_durable_event_errors": args.require_no_durable_event_errors,
+                    "require_no_edge_dispatch_errors": args.require_no_edge_dispatch_errors,
                     "max_control_plane_polls_per_worker_per_sec": (
                         args.max_control_plane_polls_per_worker_per_sec
                     ),
@@ -1128,6 +1134,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
             "last_metric_count": 0,
             "last_metric_names": [],
             "event_ingestion": summarize_event_ingestion_metrics({}),
+            "durable_run_events": summarize_durable_run_event_metrics({}, {}, None),
             "run_control": summarize_run_control_metrics({}, {}, None),
             "run_recovery": summarize_run_recovery_metrics({}, {}, None),
             "ws_run_stream": summarize_ws_run_stream_metrics({}, {}, None),
@@ -1171,6 +1178,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
         if isinstance(first_unix_ms, int) and isinstance(last_unix_ms, int)
         else None
     )
+    durable_run_events = summarize_durable_run_event_metrics(first_metrics, last_metrics, elapsed_ms)
     run_control = summarize_run_control_metrics(first_metrics, last_metrics, elapsed_ms)
     run_recovery = summarize_run_recovery_metrics(first_metrics, last_metrics, elapsed_ms)
     ws_run_stream = summarize_ws_run_stream_metrics(first_metrics, last_metrics, elapsed_ms)
@@ -1185,6 +1193,7 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
         "last_metric_count": len(last_metrics),
         "last_metric_names": sorted(last_metrics)[:50],
         "event_ingestion": summarize_event_ingestion_metrics(last_metrics),
+        "durable_run_events": durable_run_events,
         "run_control": run_control,
         "run_recovery": run_recovery,
         "ws_run_stream": ws_run_stream,
@@ -1218,7 +1227,7 @@ def summarize_counter_family(
     first_metrics: dict[str, float],
     last_metrics: dict[str, float],
     metric_name: str,
-    label_fields: tuple[str, str],
+    label_fields: tuple[str, ...],
 ) -> tuple[float | None, float | None, dict[str, dict[str, float | None]]]:
     keys = sorted(
         key
@@ -1253,6 +1262,23 @@ def summarize_counter_family(
     )
 
 
+def counter_group_delta_total(
+    counters: dict[str, dict[str, float | None]],
+    predicate: Any,
+) -> float | None:
+    saw = False
+    total = 0.0
+    for key, values in counters.items():
+        if not predicate(key):
+            continue
+        delta = values.get("delta")
+        if delta is None:
+            continue
+        saw = True
+        total += delta
+    return total if saw else None
+
+
 def rate_per_sec(delta: float | None, elapsed_ms: int | None) -> float | None:
     if delta is None or not elapsed_ms or elapsed_ms <= 0:
         return None
@@ -1283,6 +1309,54 @@ def summarize_named_counter_metrics(
             "per_sec": rate_per_sec(delta, elapsed_ms),
         }
     return summary
+
+
+def summarize_durable_run_event_metrics(
+    first_metrics: dict[str, float],
+    last_metrics: dict[str, float],
+    elapsed_ms: int | None,
+) -> dict[str, Any]:
+    batch_last, batch_delta, batches = summarize_counter_family(
+        first_metrics,
+        last_metrics,
+        DURABLE_RUN_EVENT_BATCHES_METRIC,
+        ("path", "outcome", "compacted"),
+    )
+    row_last, row_delta, rows = summarize_counter_family(
+        first_metrics,
+        last_metrics,
+        DURABLE_RUN_EVENT_ROWS_METRIC,
+        ("path", "outcome", "compacted"),
+    )
+    byte_last, byte_delta, bytes_ = summarize_counter_family(
+        first_metrics,
+        last_metrics,
+        DURABLE_RUN_EVENT_BYTES_METRIC,
+        ("path", "outcome", "compacted"),
+    )
+
+    def is_error(label_key: str) -> bool:
+        parts = label_key.split(":")
+        return len(parts) >= 2 and parts[1] == "error"
+
+    error_batches_delta = counter_group_delta_total(batches, is_error)
+    error_rows_delta = counter_group_delta_total(rows, is_error)
+    error_bytes_delta = counter_group_delta_total(bytes_, is_error)
+    return {
+        "batches_last_total": batch_last,
+        "batches_delta_total": batch_delta,
+        "batches_by_path_outcome_compacted": batches,
+        "rows_last_total": row_last,
+        "rows_delta_total": row_delta,
+        "rows_by_path_outcome_compacted": rows,
+        "bytes_last_total": byte_last,
+        "bytes_delta_total": byte_delta,
+        "bytes_by_path_outcome_compacted": bytes_,
+        "error_batches_delta_total": error_batches_delta,
+        "error_batches_per_sec": rate_per_sec(error_batches_delta, elapsed_ms),
+        "error_rows_delta_total": error_rows_delta,
+        "error_bytes_delta_total": error_bytes_delta,
+    }
 
 
 def summarize_run_control_metrics(
@@ -1444,12 +1518,31 @@ def evaluate_capacity_contracts(
                 f"{observed:g}>{limit:g}"
             )
 
+    run_control = metrics_summary.get("run_control", {})
+    if isinstance(run_control, dict) and args.require_no_run_control_errors:
+        observed = run_control.get("errors_delta_total")
+        if observed is not None and observed > 0:
+            violations.append(f"run_control_errors:{observed:g}")
+
+    durable_run_events = metrics_summary.get("durable_run_events", {})
+    if isinstance(durable_run_events, dict) and args.require_no_durable_event_errors:
+        observed = durable_run_events.get("error_batches_delta_total")
+        if observed is not None and observed > 0:
+            violations.append(f"durable_run_event_error_batches:{observed:g}")
+
     edge_dispatch = metrics_summary.get("edge_dispatch", {})
     if isinstance(edge_dispatch, dict):
         observed = edge_dispatch.get("error_events_per_sec")
         limit = args.max_edge_dispatch_errors_per_sec
         if observed is not None and limit is not None and observed > limit:
             violations.append(f"edge_dispatch_error_events_per_sec:{observed:g}>{limit:g}")
+        observed_delta = edge_dispatch.get("error_events_delta_total")
+        if (
+            args.require_no_edge_dispatch_errors
+            and observed_delta is not None
+            and observed_delta > 0
+        ):
+            violations.append(f"edge_dispatch_error_events:{observed_delta:g}")
 
     return violations
 
@@ -1583,6 +1676,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-no-critical-ingestion-drops",
         action="store_true",
         help="fail if /metrics reports any critical agent_events ingestion drop before worker acceptance",
+    )
+    parser.add_argument(
+        "--require-no-run-control-errors",
+        action="store_true",
+        help="fail if /metrics reports run control poll store/missing errors during the probe window",
+    )
+    parser.add_argument(
+        "--require-no-durable-event-errors",
+        action="store_true",
+        help="fail if /metrics reports durable terminal run event persistence errors",
+    )
+    parser.add_argument(
+        "--require-no-edge-dispatch-errors",
+        action="store_true",
+        help="fail if /metrics reports edge dispatch delivery/cleanup/backlog scrape errors",
     )
     parser.add_argument(
         "--max-control-plane-polls-per-worker-per-sec",
