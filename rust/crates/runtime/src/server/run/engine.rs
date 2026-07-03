@@ -1236,16 +1236,6 @@ impl RunEngine {
         }
     }
 
-    /// List runs for a user (delegates to store).
-    pub async fn list_user_runs(
-        &self,
-        user_id: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<(Vec<DurableRunRecord>, i64), String> {
-        self.store.list_user_runs(user_id, limit, offset).await
-    }
-
     /// List runs for a user using seek pagination.
     pub async fn list_user_runs_cursor(
         &self,
@@ -1900,15 +1890,6 @@ mod tests {
                 .await
         }
 
-        async fn list_user_runs(
-            &self,
-            user_id: &str,
-            limit: u32,
-            offset: u32,
-        ) -> Result<(Vec<DurableRunRecord>, i64), String> {
-            self.inner.list_user_runs(user_id, limit, offset).await
-        }
-
         async fn list_user_runs_cursor(
             &self,
             user_id: &str,
@@ -2102,12 +2083,12 @@ mod tests {
             Err("store unavailable".into())
         }
 
-        async fn list_user_runs(
+        async fn list_user_runs_cursor(
             &self,
             _user_id: &str,
             _limit: u32,
-            _offset: u32,
-        ) -> Result<(Vec<DurableRunRecord>, i64), String> {
+            _cursor: Option<RunListCursor>,
+        ) -> Result<DurableRunListPage, String> {
             Err("store unavailable".into())
         }
 
@@ -3225,7 +3206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_user_runs_pagination() {
+    async fn list_user_runs_cursor_pagination() {
         let engine = test_engine();
         for i in 0..5 {
             engine
@@ -3237,11 +3218,20 @@ mod tests {
             .start_run("run-other", "user-2", "sess-other")
             .await
             .unwrap();
-        let (runs, total) = engine.list_user_runs("user-1", 2, 0).await.unwrap();
-        assert_eq!(total, 5);
+        let first = engine
+            .list_user_runs_cursor("user-1", 2, None)
+            .await
+            .unwrap();
+        let runs = first.runs;
         assert_eq!(runs.len(), 2);
-        let (runs2, _) = engine.list_user_runs("user-1", 10, 3).await.unwrap();
-        assert_eq!(runs2.len(), 2);
+        assert!(first.next_cursor.is_some());
+        assert_eq!(first.total, None);
+        let runs2 = engine
+            .list_user_runs_cursor("user-1", 10, first.next_cursor)
+            .await
+            .unwrap()
+            .runs;
+        assert_eq!(runs2.len(), 3);
     }
 
     #[tokio::test]

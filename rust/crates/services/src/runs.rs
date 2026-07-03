@@ -109,27 +109,12 @@ pub trait RunLifecycleService: Send + Sync {
         ))
     }
 
-    async fn list_runs(
-        &self,
-        user_id: String,
-        limit: u32,
-        offset: u32,
-    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)>;
-
     async fn list_runs_cursor(
         &self,
         user_id: String,
         limit: u32,
         cursor: Option<RunListCursor>,
-    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
-        if cursor.is_some() {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "run list cursor not supported",
-            ));
-        }
-        self.list_runs(user_id, limit, 0).await
-    }
+    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)>;
 
     /// Pause an active run. Default: NOT_IMPLEMENTED.
     async fn pause_run(
@@ -1054,14 +1039,6 @@ pub trait RunStateStore: Send + Sync {
         self.append_events_batch(user_id, run_id, &[event]).await
     }
 
-    /// List runs for a user with pagination.
-    async fn list_user_runs(
-        &self,
-        user_id: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<(Vec<DurableRunRecord>, i64), String>;
-
     /// List runs with seek pagination. This path intentionally does not compute
     /// an exact total; callers should use `next_cursor`/short page semantics.
     async fn list_user_runs_cursor(
@@ -1762,33 +1739,6 @@ impl RunStateStore for InMemoryRunStateStore {
                 .await;
         }
         Ok(())
-    }
-
-    async fn list_user_runs(
-        &self,
-        user_id: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<(Vec<DurableRunRecord>, i64), String> {
-        let runs = self.runs.read().await;
-        let mut user_runs: Vec<_> = runs
-            .values()
-            .filter(|r| r.user_id == user_id)
-            .cloned()
-            .collect();
-        user_runs.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then_with(|| b.created_at.cmp(&a.created_at))
-                .then_with(|| b.run_id.cmp(&a.run_id))
-        });
-        let total = user_runs.len() as i64;
-        let page = user_runs
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
-        Ok((page, total))
     }
 
     async fn list_user_runs_cursor(
@@ -3538,38 +3488,6 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|e| e.to_string())
     }
 
-    async fn list_user_runs(
-        &self,
-        user_id: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<(Vec<DurableRunRecord>, i64), String> {
-        let total_row = sqlx::query("SELECT COUNT(*) AS total FROM agent_runs WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_one(self.pool.get())
-            .await
-            .map_err(|source| db_error("count_user_runs", user_id, source).to_string())?;
-        let total = run_row_non_negative_i64(&total_row, "count_user_runs", "agent_runs", "total")
-            .map_err(|e| e.to_string())?;
-        let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
-             WHERE user_id = ?{RUN_LIST_ORDER_SQL} LIMIT ? OFFSET ?"
-        );
-        let rows = sqlx::query(&sql)
-            .bind(user_id)
-            .bind(limit as i64)
-            .bind(offset as i64)
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|source| db_error("list_user_runs", user_id, source).to_string())?;
-        let runs = rows
-            .into_iter()
-            .map(run_record_from_row)
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|e| e.to_string())?;
-        Ok((runs, total))
-    }
-
     async fn list_user_runs_cursor(
         &self,
         user_id: &str,
@@ -4929,11 +4847,11 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         ))
     }
 
-    async fn list_runs(
+    async fn list_runs_cursor(
         &self,
         _user_id: String,
         _limit: u32,
-        _offset: u32,
+        _cursor: Option<RunListCursor>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,

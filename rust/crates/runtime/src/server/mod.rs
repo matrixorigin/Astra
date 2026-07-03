@@ -619,11 +619,11 @@ mod tests {
             unreachable!("cancel_run is not used in shutdown tests")
         }
 
-        async fn list_runs(
+        async fn list_runs_cursor(
             &self,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::runs::RunListCursor>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!("list_runs is not used in shutdown tests")
         }

@@ -1396,11 +1396,11 @@ mod chat_stream_bridge_fallback_tests {
             unreachable!()
         }
 
-        async fn list_runs(
+        async fn list_runs_cursor(
             &self,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::runs::RunListCursor>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1463,11 +1463,11 @@ mod chat_stream_bridge_fallback_tests {
             unreachable!()
         }
 
-        async fn list_runs(
+        async fn list_runs_cursor(
             &self,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::runs::RunListCursor>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1527,11 +1527,11 @@ mod chat_stream_bridge_fallback_tests {
             unreachable!()
         }
 
-        async fn list_runs(
+        async fn list_runs_cursor(
             &self,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::runs::RunListCursor>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1586,11 +1586,11 @@ mod chat_stream_bridge_fallback_tests {
             unreachable!()
         }
 
-        async fn list_runs(
+        async fn list_runs_cursor(
             &self,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::runs::RunListCursor>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1648,11 +1648,11 @@ mod chat_stream_bridge_fallback_tests {
             unreachable!()
         }
 
-        async fn list_runs(
+        async fn list_runs_cursor(
             &self,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::runs::RunListCursor>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1723,11 +1723,11 @@ mod chat_stream_bridge_fallback_tests {
             unreachable!()
         }
 
-        async fn list_runs(
+        async fn list_runs_cursor(
             &self,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::runs::RunListCursor>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1790,11 +1790,11 @@ mod chat_stream_bridge_fallback_tests {
             unreachable!()
         }
 
-        async fn list_runs(
+        async fn list_runs_cursor(
             &self,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::runs::RunListCursor>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }

@@ -7467,36 +7467,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         Ok(cancelled)
     }
 
-    async fn list_runs(
-        &self,
-        user_id: String,
-        limit: u32,
-        offset: u32,
-    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
-        let (limit, offset) = astra_services::pagination::clamp_api_list_pagination(limit, offset);
-        let (durable_runs, total) = self
-            .run_engine
-            .list_user_runs(&user_id, limit, offset)
-            .await
-            .map_err(|error| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to list durable run state: {error}"),
-                )
-            })?;
-        let page = durable_runs
-            .iter()
-            .map(Self::durable_status_record)
-            .collect();
-        Ok(RunListRecord {
-            runs: page,
-            total: Some(total),
-            limit,
-            offset,
-            next_cursor: None,
-        })
-    }
-
     async fn list_runs_cursor(
         &self,
         user_id: String,
@@ -10468,13 +10438,15 @@ mod tests {
                 .await
         }
 
-        async fn list_user_runs(
+        async fn list_user_runs_cursor(
             &self,
             user_id: &str,
             limit: u32,
-            offset: u32,
-        ) -> Result<(Vec<DurableRunRecord>, i64), String> {
-            self.inner.list_user_runs(user_id, limit, offset).await
+            cursor: Option<RunListCursor>,
+        ) -> Result<astra_services::runs::DurableRunListPage, String> {
+            self.inner
+                .list_user_runs_cursor(user_id, limit, cursor)
+                .await
         }
 
         async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
@@ -13976,8 +13948,8 @@ mod tests {
     #[tokio::test]
     async fn list_runs_empty_initially() {
         let svc = test_service();
-        let result = ok(svc.list_runs("user-1".into(), 10, 0).await);
-        assert_eq!(result.total, Some(0));
+        let result = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+        assert_eq!(result.total, None);
         assert!(result.runs.is_empty());
     }
 
@@ -13987,8 +13959,8 @@ mod tests {
         let u1_a = ok(svc.create_run("user-1".into(), test_request("a")).await);
         let u2_b = ok(svc.create_run("user-2".into(), test_request("b")).await);
         let u1_c = ok(svc.create_run("user-1".into(), test_request("c")).await);
-        let for_u1 = ok(svc.list_runs("user-1".into(), 10, 0).await);
-        assert_eq!(for_u1.total, Some(2));
+        let for_u1 = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+        assert_eq!(for_u1.total, None);
         let ids: std::collections::HashSet<_> =
             for_u1.runs.iter().map(|r| r.run_id.as_str()).collect();
         assert!(ids.contains(u1_a.run_id.as_str()));
@@ -14007,26 +13979,33 @@ mod tests {
                 .all(|run| run.executor.as_ref().unwrap()["kind"] == "server_local")
         );
 
-        let for_u2 = ok(svc.list_runs("user-2".into(), 10, 0).await);
-        assert_eq!(for_u2.total, Some(1));
+        let for_u2 = ok(svc.list_runs_cursor("user-2".into(), 10, None).await);
+        assert_eq!(for_u2.total, None);
         assert_eq!(for_u2.runs[0].run_id, u2_b.run_id);
     }
 
     #[tokio::test]
-    async fn list_runs_pagination() {
+    async fn list_runs_cursor_pagination() {
         let svc = test_service();
         for i in 0..5 {
             ok(svc
                 .create_run("user-1".into(), test_request(&format!("msg {i}")))
                 .await);
         }
-        let page1 = ok(svc.list_runs("user-1".into(), 2, 0).await);
+        let page1 = ok(svc.list_runs_cursor("user-1".into(), 2, None).await);
         assert_eq!(page1.runs.len(), 2);
-        assert_eq!(page1.total, Some(5));
-        let page2 = ok(svc.list_runs("user-1".into(), 2, 2).await);
+        assert_eq!(page1.total, None);
+        assert!(page1.next_cursor.is_some());
+        let page2 = ok(svc
+            .list_runs_cursor("user-1".into(), 2, page1.next_cursor)
+            .await);
         assert_eq!(page2.runs.len(), 2);
-        let page3 = ok(svc.list_runs("user-1".into(), 2, 4).await);
+        assert!(page2.next_cursor.is_some());
+        let page3 = ok(svc
+            .list_runs_cursor("user-1".into(), 2, page2.next_cursor)
+            .await);
         assert_eq!(page3.runs.len(), 1);
+        assert!(page3.next_cursor.is_none());
     }
 
     #[tokio::test]
@@ -14064,26 +14043,28 @@ mod tests {
         let older = ok(svc.create_run("user-1".into(), test_request("older")).await);
         let newer = ok(svc.create_run("user-1".into(), test_request("newer")).await);
 
-        let initial = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        let initial = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
         assert_eq!(initial.runs[0].run_id, newer.run_id);
 
         ok(svc.pause_run(older.run_id.clone(), "user-1".into()).await);
 
-        let after_update = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        let after_update = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
         assert_eq!(
             after_update.runs[0].run_id, older.run_id,
-            "list_runs should surface the most recently updated run first"
+            "list_runs_cursor should surface the most recently updated run first"
         );
     }
 
-    /// P2-B: list_runs must clamp pagination params like other list endpoints.
+    /// P2-B: list_runs_cursor must clamp pagination params like other list endpoints.
     #[tokio::test]
-    async fn list_runs_clamps_pagination() {
+    async fn list_runs_cursor_clamps_pagination() {
         let svc = test_service();
-        // Absurdly large limit/offset must not panic or produce unbounded queries
-        let result = ok(svc.list_runs("user-clamp".into(), u32::MAX, u32::MAX).await);
+        // Absurdly large limit must not panic or produce unbounded queries.
+        let result = ok(svc
+            .list_runs_cursor("user-clamp".into(), u32::MAX, None)
+            .await);
         assert_eq!(result.runs.len(), 0);
-        // Verify the returned limit/offset are clamped
+        // Verify the returned limit is clamped.
         assert!(
             result.limit <= astra_services::pagination::MAX_API_LIST_LIMIT,
             "limit must be clamped to MAX_API_LIST_LIMIT"
@@ -16262,9 +16243,9 @@ mod tests {
 
         svc.runs.write().await.remove(&first.run_id);
 
-        let runs = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
         let run_ids: Vec<_> = runs.runs.iter().map(|run| run.run_id.as_str()).collect();
-        assert_eq!(runs.total, Some(2));
+        assert_eq!(runs.total, None);
         assert!(run_ids.contains(&first.run_id.as_str()));
         assert!(run_ids.contains(&second.run_id.as_str()));
     }
@@ -16697,12 +16678,14 @@ mod tests {
             "pre-spawn admission failure must not leak progress channel receivers"
         );
 
-        let (runs, total) = svc
+        let page = svc
             .run_engine
-            .list_user_runs("user-1", 10, 0)
+            .list_user_runs_cursor("user-1", 10, None)
             .await
             .unwrap();
-        assert_eq!(total, 1);
+        let runs = page.runs;
+        assert_eq!(page.total, None);
+        assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, STATUS_FAILED);
         assert_eq!(runs[0].error_code.as_deref(), Some("run_admission_closed"));
     }
@@ -16725,12 +16708,14 @@ mod tests {
         assert!(svc.user_prompt_channels.lock().await.is_empty());
         assert!(svc.progress_channels.lock().await.is_empty());
 
-        let (runs, total) = svc
+        let page = svc
             .run_engine
-            .list_user_runs("user-1", 10, 0)
+            .list_user_runs_cursor("user-1", 10, None)
             .await
             .unwrap();
-        assert_eq!(total, 1);
+        let runs = page.runs;
+        assert_eq!(page.total, None);
+        assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, STATUS_FAILED);
         assert_eq!(runs[0].error_code.as_deref(), Some("run_admission_closed"));
     }
@@ -16846,10 +16831,10 @@ mod tests {
         );
     }
 
-    /// P1-F: list_runs pagination must be deterministic — all runs appear
+    /// P1-F: list_runs_cursor pagination must be deterministic — all runs appear
     /// exactly once across pages, with no duplicates or missing entries.
     #[tokio::test]
-    async fn list_runs_pagination_is_deterministic() {
+    async fn list_runs_cursor_pagination_is_deterministic() {
         let svc = test_service();
         for i in 0..5 {
             ok(svc
@@ -16858,11 +16843,15 @@ mod tests {
         }
         // Collect all run_ids across 3 pages
         let mut all_ids = Vec::new();
-        let page1 = ok(svc.list_runs("user-pg".into(), 2, 0).await);
+        let page1 = ok(svc.list_runs_cursor("user-pg".into(), 2, None).await);
         all_ids.extend(page1.runs.iter().map(|r| r.run_id.clone()));
-        let page2 = ok(svc.list_runs("user-pg".into(), 2, 2).await);
+        let page2 = ok(svc
+            .list_runs_cursor("user-pg".into(), 2, page1.next_cursor)
+            .await);
         all_ids.extend(page2.runs.iter().map(|r| r.run_id.clone()));
-        let page3 = ok(svc.list_runs("user-pg".into(), 2, 4).await);
+        let page3 = ok(svc
+            .list_runs_cursor("user-pg".into(), 2, page2.next_cursor)
+            .await);
         all_ids.extend(page3.runs.iter().map(|r| r.run_id.clone()));
 
         assert_eq!(all_ids.len(), 5, "all 5 runs must appear across pages");
