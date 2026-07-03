@@ -157,7 +157,7 @@ pub async fn list_server_visible_skills(
 
     Ok(SkillListRecord {
         skills: page,
-        total,
+        total: Some(total),
         limit,
         next_cursor,
     })
@@ -300,7 +300,7 @@ async fn list_database_skill_items(
         let page_len = page.skills.len() as u32;
         cursor = page.next_cursor.clone();
         skills.extend(page.skills);
-        if page_len < limit || cursor.is_none() || skills.len() as i64 >= page.total {
+        if page_len < limit || cursor.is_none() {
             break;
         }
     }

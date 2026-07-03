@@ -130,7 +130,7 @@ impl SkillProvider for DatabaseSkillProvider {
             }));
 
             cursor = result.next_cursor.clone();
-            if page_len < limit || cursor.is_none() || manifests.len() as i64 >= result.total {
+            if page_len < limit || cursor.is_none() {
                 break;
             }
         }
@@ -261,7 +261,7 @@ mod tests {
             };
             Ok(SkillListRecord {
                 skills,
-                total: self.skills.len() as i64,
+                total: Some(self.skills.len() as i64),
                 limit,
                 next_cursor,
             })

@@ -392,7 +392,7 @@ impl SkillProvider for RemoteSkillCatalogProvider {
                 category: item.category,
                 ..Default::default()
             }));
-            if page_len < limit || cursor.is_none() || manifests.len() as i64 >= page.total {
+            if page_len < limit || cursor.is_none() {
                 break;
             }
         }

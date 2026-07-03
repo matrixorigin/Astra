@@ -12761,7 +12761,7 @@ mod tests {
                 if cursor.is_some() {
                     return Ok(SkillListRecord {
                         skills: Vec::new(),
-                        total: 1,
+                        total: Some(1),
                         limit,
                         next_cursor: None,
                     });
@@ -12777,7 +12777,7 @@ mod tests {
                         category: Some("integration".to_string()),
                         created_at: None,
                     }],
-                    total: 1,
+                    total: Some(1),
                     limit,
                     next_cursor: None,
                 })

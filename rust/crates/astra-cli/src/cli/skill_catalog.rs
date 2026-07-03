@@ -125,9 +125,9 @@ pub(crate) fn list_skill_record_from_registry(
 
     SkillListRecord {
         skills,
-        total,
-        // Echo the *applied* cap, not the user's request, so callers paginating
-        // via `total / limit` don't loop forever expecting an oversized page.
+        total: Some(total),
+        // Echo the *applied* cap, not the user's request, so cursor callers
+        // can reason about whether a short page means end-of-list.
         limit: effective_limit,
         next_cursor,
     }
@@ -317,7 +317,7 @@ mod tests {
 
         let record = list_skill_record_from_registry(&registry, &filter, 50, 0);
 
-        assert_eq!(record.total, 1);
+        assert_eq!(record.total, Some(1));
         assert_eq!(record.skills.len(), 1);
         assert_eq!(record.skills[0].skill_name, "server-only");
         assert_eq!(record.skills[0].source.as_deref(), Some("database"));
@@ -340,7 +340,7 @@ mod tests {
 
         let record = list_skill_record_from_registry(&registry, &filter, 50, 0);
 
-        assert_eq!(record.total, 1);
+        assert_eq!(record.total, Some(1));
         assert_eq!(record.skills[0].skill_name, "review-changes");
     }
 
@@ -387,10 +387,11 @@ mod tests {
         );
         assert_eq!(
             record.limit, SKILL_CATALOG_MAX_LIMIT,
-            "echo the applied limit so paginating callers don't loop"
+            "echo the applied limit so cursor callers can trust short pages"
         );
         assert_eq!(
-            record.total, 1000,
+            record.total,
+            Some(1000),
             "total must reflect every match, not the cap"
         );
     }

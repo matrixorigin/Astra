@@ -41,7 +41,7 @@ pub struct SkillRecord {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillListRecord {
     pub skills: Vec<SkillListItem>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
     pub next_cursor: Option<SkillListCursor>,
 }
@@ -432,15 +432,6 @@ impl SkillService for DatabaseSkillService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let limit = validate_skill_list_limit(limit);
 
-        let count_sql =
-            format!("SELECT COUNT(*) AS cnt FROM skills_registry WHERE {VISIBLE_SKILL_PREDICATE}",);
-        let count_row = query(&count_sql)
-            .bind(&user_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
-        let total: i64 = count_row.try_get("cnt").map_err(internal_error)?;
-
         let list_sql = if cursor.is_some() {
             format!(
                 "SELECT {SKILL_REGISTRY_LIST_SELECT} FROM skills_registry \
@@ -487,7 +478,7 @@ impl SkillService for DatabaseSkillService {
 
         Ok(SkillListRecord {
             skills,
-            total,
+            total: None,
             limit,
             next_cursor,
         })
@@ -1194,6 +1185,24 @@ mod tests {
         );
         assert!(SKILL_LIST_ORDER_SQL.contains("skill_name ASC"));
         assert!(SKILL_LIST_CURSOR_SQL.contains("skill_id > ?"));
+    }
+
+    #[test]
+    fn skill_list_hot_path_does_not_count_rows() {
+        let body = include_str!("skills.rs")
+            .split("impl SkillService for DatabaseSkillService")
+            .nth(1)
+            .expect("database skill service impl")
+            .split("async fn list_skills(")
+            .nth(1)
+            .expect("database list_skills body")
+            .split("async fn get_skill(")
+            .next()
+            .expect("database list_skills body end");
+        assert!(
+            !body.contains("COUNT(*)"),
+            "skill list uses seek pagination and must not count skills_registry"
+        );
     }
 
     #[test]

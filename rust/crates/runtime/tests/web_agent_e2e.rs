@@ -261,7 +261,7 @@ impl SkillService for TestSkillService {
         if cursor.is_some() {
             return Ok(SkillListRecord {
                 skills: Vec::new(),
-                total: 1,
+                total: Some(1),
                 limit,
                 next_cursor: None,
             });
@@ -278,7 +278,7 @@ impl SkillService for TestSkillService {
                 category: Some("testing".to_string()),
                 created_at: None,
             }],
-            total: 1,
+            total: Some(1),
             limit,
             next_cursor: None,
         })
