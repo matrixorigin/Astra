@@ -1,0 +1,29 @@
+{
+  "name": "astra_dev",
+  "version": "1.0.0",
+  "description": "Programmatic Astra engineering workflow for task intake, ownership mapping, edit execution, failure triage, and targeted verification.",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "task": {
+        "type": "string",
+        "description": "Bug, feature, refactor, or diagnostic task to perform"
+      },
+      "files": {
+        "type": "string",
+        "description": "Optional comma-separated focus files or crates"
+      }
+    }
+  },
+  "examples": [
+    {
+      "input": { "task": "Update runtime lifecycle capability handling" },
+      "description": "Map owner, preserve current diff intent, and select focused gates"
+    },
+    {
+      "input": { "task": "Optimize local skills" },
+      "description": "Use the skills invariant and docs-only verification gate"
+    }
+  ]
+}

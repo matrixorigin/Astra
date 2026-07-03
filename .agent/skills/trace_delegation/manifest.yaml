@@ -1,0 +1,10 @@
+name: trace-delegation
+version: "1.0.0"
+description: "Trace current Astra delegation engine events, sub-run hierarchy, retries, pause/resume, cancellation, and aggregation."
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob

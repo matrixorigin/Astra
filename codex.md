@@ -22,7 +22,8 @@ make dev-stop           # Stop all
 - `rust/crates/runtime/` — Axum HTTP server, contract tests in `tests/`
 - `rust/crates/astra-cli/` — CLI, edge tools, plan executor, code intel
 - `rust/crates/astra-cli/` — CLI (admin subcommands under `src/admin_cli/`)
-- `skills/` — Agent Skills (SKILL.md format, see `skills/README.md`)
+- `.claude/skills/` — curated Agent Skills for Claude-compatible agents
+- `.agent/skills/` — mirror of the curated Agent Skills for Agent-compatible runtimes
 - `web/` — Next.js admin dashboard
 
 ## Rust Conventions
@@ -85,15 +86,16 @@ All persisted state must form a coherent, navigable chain for debugging and anal
 - For DB tests: create unique data per test, clean up after
 - E2E tests must verify DB state directly (SELECT after mutation), not just trust HTTP responses
 
-## Built-in Skills (read `skills/<name>/SKILL.md` for full instructions)
+## Built-in Skills (read `.claude/skills/<name>/SKILL.md` for full instructions)
 
 When the user asks you to perform any of the following tasks, read the corresponding SKILL.md file first and follow its phased workflow:
 
-- **Review code changes**: `skills/review_changes/SKILL.md` — code review with symbol-level impact analysis.
-- **Review code (test quality)**: `skills/review_code/SKILL.md` — unhappy paths, E2E with DB assertions.
-- **Verify task completion**: `skills/verify_task/SKILL.md` — build/test/lint checks, delivery report.
-- **Analyze session**: `skills/analyze_session/SKILL.md` — diagnose session issues.
-- **Evaluate session**: `skills/evaluate_session/SKILL.md` — performance metrics and optimization.
-- **Optimize prompt**: `skills/optimize_prompt/SKILL.md` — reduce context bloat.
-- **Audit cloud sync**: `skills/audit_cloud_sync/SKILL.md` — edge-cloud sync integrity.
-- **Trace delegation**: `skills/trace_delegation/SKILL.md` — multi-agent delegation flows.
+- **Astra development**: `.claude/skills/astra-dev/SKILL.md` — ownership map, invariants, and targeted verification.
+- **Review code changes**: `.claude/skills/review_changes/SKILL.md` — code review with symbol-level impact analysis.
+- **Review code (test quality)**: `.claude/skills/review_code/SKILL.md` — unhappy paths, E2E with DB assertions.
+- **Unhappy path audit**: `.claude/skills/unhappy_path_audit/SKILL.md` — reachability-first failure-path audit.
+- **Verify task completion**: `.claude/skills/verify_task/SKILL.md` — build/test/lint checks, delivery report.
+- **Analyze session**: `.claude/skills/analyze_session/SKILL.md` — diagnose session issues.
+- **Optimize prompt**: `.claude/skills/optimize_prompt/SKILL.md` — reduce context bloat.
+- **Audit cloud sync**: `.claude/skills/audit_cloud_sync/SKILL.md` — edge-cloud sync integrity.
+- **Trace delegation**: `.claude/skills/trace_delegation/SKILL.md` — current delegation engine and sub-run tracing.

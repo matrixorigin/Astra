@@ -1,0 +1,30 @@
+{
+  "name": "review_changes",
+  "version": "1.0.0",
+  "description": "Findings-first review of diffs, commits, branches, and PR diffs.",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "staged, unstaged, branch:<name>, commit:<sha>, commits:<N>, pr:<number>, or omitted"
+      },
+      "focus": {
+        "type": "string",
+        "enum": ["bugs", "security", "logic", "api", "tests", "all"],
+        "description": "Review focus"
+      }
+    }
+  },
+  "examples": [
+    {
+      "input": { "focus": "all" },
+      "description": "Review all uncommitted changes"
+    },
+    {
+      "input": { "target": "commits:3" },
+      "description": "Review the latest three commits after fetching every full diff"
+    }
+  ]
+}

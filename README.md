@@ -139,7 +139,8 @@ rust/crates/
   astra-cli/   single CLI, admin commands, plan executor, code intel
 deployment/
   all-in-one/  Docker Compose (deps + app)
-skills/        Agent skill definitions
+.claude/skills/ Agent skill definitions for Claude-compatible agents
+.agent/skills/  Mirror for Agent-compatible runtimes
 web/           Next.js admin dashboard
 ```
 

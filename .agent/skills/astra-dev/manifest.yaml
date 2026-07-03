@@ -1,0 +1,11 @@
+name: astra-dev
+version: "1.0.0"
+description: "Programmatic Astra engineering workflow: task intake, ownership, intent preservation, execution loop, failure triage, and targeted verification."
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob
+  - git

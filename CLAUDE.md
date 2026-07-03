@@ -122,8 +122,8 @@ rust/             # Cargo workspace (24+ crates)
   crates/astra-thin-client/  stateless HTTP+SSE client for thin-client protocol
 packages/sdk/     @astra/sdk (TypeScript) — Mode A in-process, Mode B remote E2E
 web/              Next.js admin dashboard
-skills/           Agent Skills (SKILL.md format) — single source of truth
-                  Symlinked from .claude/skills and .cursor/skills.
+.claude/skills/   Agent Skills for Claude-compatible agents
+.agent/skills/    Agent Skills mirror for Agent-compatible runtimes
 deployment/all-in-one/  docker-compose for MatrixOne + Memoria + API
 docs/             quickstart/, guides/, reference/, design/, implementation/, testing/
 fixtures/         contract JSON fixtures
@@ -140,19 +140,22 @@ Stack:
 
 ## Skills
 
-`skills/<name>/SKILL.md` are first-class workflows agents follow when invoked. Read the SKILL.md _before_ starting the corresponding task — each enforces a phased workflow:
+`.claude/skills/<name>/SKILL.md` are first-class workflows agents follow when invoked.
+`.agent/skills/` carries the same curated set for Agent-compatible runtimes. Read the
+SKILL.md _before_ starting the corresponding task — each enforces a focused workflow:
 
+- `astra-dev` — Astra-specific engineering workflow, ownership map, targeted verification
 - `review_changes` — context-aware code review with symbol-level impact analysis
 - `review_code` — test-quality focus: unhappy paths, error scenarios, E2E with real DB assertions
 - `verify_task` — build/test/lint checks → delivery report
-- `batch_parallel` — git-worktree-based parallel execution
 - `analyze_session` — diagnose astra session issues (token waste, stalls, loops)
 - `optimize_prompt` — reduce LLM context bloat
 - `audit_cloud_sync` — edge↔cloud sync integrity
 - `trace_delegation` — multi-agent delegation flows
-- `github_*` — PR/CI/issue flows
+- `unhappy_path_audit` — reachability-first failure-path audit
 
-Skill discovery order (high → low): `{ancestor}/.astra/skills/` → `{ancestor}/.claude/skills/` → `{cwd}/skills/` → user globals. Higher priority wins on name collision.
+Project-local skills intentionally live under `.claude/skills/` and `.agent/skills/`.
+The legacy root `skills/` tree is not used in this repository.
 
 ## Conventions (Beyond `.claude/CLAUDE.md`)
 

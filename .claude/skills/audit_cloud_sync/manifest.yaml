@@ -1,0 +1,10 @@
+name: audit-cloud-sync
+version: "1.0.0"
+description: "Audit current Astra edge/cloud sync evidence: local journals/checkpoints versus MatrixOne projections, restore paths, tasks, skills, and preferences."
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob

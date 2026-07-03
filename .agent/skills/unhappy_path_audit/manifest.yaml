@@ -1,0 +1,11 @@
+name: unhappy-path-audit
+version: "1.0.0"
+description: "Reachability-first unhappy-path audit: dead paths, error propagation, state consistency, resource leaks, hung waits, and OOM accumulation."
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob
+  - git
