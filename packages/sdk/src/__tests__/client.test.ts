@@ -499,7 +499,6 @@ describe("AstraClient — Runs", () => {
       ],
       total: null,
       limit: 50,
-      offset: 0,
       next_cursor: null,
     });
     const r = await createClient().listRuns();
@@ -520,7 +519,6 @@ describe("AstraClient — Runs", () => {
       runs: [],
       total: null,
       limit: 2,
-      offset: 0,
       next_cursor: {
         updated_at: "2026-06-29T08:00:00.000000",
         run_id: "run-2",

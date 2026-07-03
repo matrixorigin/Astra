@@ -978,7 +978,7 @@ export type RuntimeSessionUpdateBody = {
 
 export type RuntimeSessionListParams = {
   limit?: number;
-  cursor?: RuntimeSessionListCursor | null;
+  cursor?: RuntimeSessionListCursor;
 };
 
 export type RuntimeTranscriptItemResponse = {
@@ -1223,14 +1223,13 @@ export type RunListCursor = {
 
 export type RunListParams = {
   limit?: number;
-  cursor?: RunListCursor | null;
+  cursor?: RunListCursor;
 };
 
 export type RunListResponse = {
   runs: RunStatus[];
   total: number | null;
   limit: number;
-  offset: number;
   nextCursor?: RunListCursor | null;
 };
 

@@ -1852,7 +1852,7 @@ async function listAllBackendRuns(
   ownerUserId: string,
 ): Promise<RunStatus[]> {
   const runs: RunStatus[] = [];
-  let cursor: RunListResponse["nextCursor"] | null | undefined;
+  let cursor: NonNullable<RunListResponse["nextCursor"]> | undefined;
 
   for (;;) {
     let parsed: RunListResponse;
@@ -1875,7 +1875,7 @@ async function listAllBackendRuns(
       typeof parsed.limit === "number" && parsed.limit > 0
         ? parsed.limit
         : RUN_SYNC_PAGE_SIZE;
-    cursor = parsed.nextCursor;
+    cursor = parsed.nextCursor ?? undefined;
 
     if (page.length === 0 || page.length < responseLimit || !cursor) {
       break;
@@ -1890,7 +1890,7 @@ async function listAllBackendSessions(
   ownerUserId: string,
 ): Promise<RuntimeSessionResponse[]> {
   const sessions: RuntimeSessionResponse[] = [];
-  let cursor: RuntimeSessionListCursor | null | undefined;
+  let cursor: RuntimeSessionListCursor | undefined;
 
   for (;;) {
     let parsed: RuntimeSessionListResponse;

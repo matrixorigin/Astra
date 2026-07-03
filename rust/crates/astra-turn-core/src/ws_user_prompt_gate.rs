@@ -282,7 +282,7 @@ async fn wait_user_prompt_response(
     request_id: &str,
     timeout: Duration,
 ) -> Option<AskUserDecision> {
-    let key = user_prompt_callback_key(user_id, request_id);
+    let key = user_prompt_callback_key(user_id, session_id, run_id, request_id);
     let started = std::time::Instant::now();
     let mut last_journal_lookup: Option<std::time::Instant> = None;
     loop {
@@ -365,7 +365,8 @@ impl AskUserGate for WebSocketUserPromptGate {
         );
         record_journal_write_metric("prompted", if prompt_write_ok { "ok" } else { "error" });
 
-        let key = user_prompt_callback_key(&self.user_id, request_id);
+        let key =
+            user_prompt_callback_key(&self.user_id, &self.session_id, &self.run_id, request_id);
         let timeout = prompt
             .timeout_ms
             .map(Duration::from_millis)
@@ -430,7 +431,12 @@ mod tests {
             );
             assert_eq!(req["prompt"]["questions"].as_array().unwrap().len(), 1);
 
-            let key = user_prompt_callback_key("u1", req["request_id"].as_str().unwrap());
+            let key = user_prompt_callback_key(
+                "u1",
+                req["session_id"].as_str().unwrap(),
+                req["run_id"].as_str().unwrap(),
+                req["request_id"].as_str().unwrap(),
+            );
             let mut g = ledger_bg.lock().await;
             g.insert(
                 key,
@@ -517,7 +523,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn timeout_cleanup_removes_late_response_from_ledger() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
-        let key = user_prompt_callback_key("u1", "req-late");
+        let key = user_prompt_callback_key("u1", "sess-user-prompt", "run-user-prompt", "req-late");
         ledger
             .lock()
             .await
@@ -643,6 +649,56 @@ mod tests {
             .await;
 
         assert_eq!(decision, AskUserDecision::Timeout);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ledger_response_from_other_run_does_not_satisfy_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        let wrong_key = user_prompt_callback_key(
+            "u1",
+            "sess-user-prompt",
+            "other-run",
+            "req-cross-run-ledger",
+        );
+        ledger.lock().await.insert(
+            wrong_key.clone(),
+            json!({
+                "answers": {
+                    "answers": [{
+                        "question": "Continue?",
+                        "answers": ["wrong"],
+                        "multi_select": false
+                    }]
+                }
+            }),
+        );
+        let (tx, _rx) = mpsc::channel::<Value>(1);
+        let gate = test_gate(ledger.clone(), tx, Duration::from_millis(40));
+
+        let decision = gate
+            .request_questionnaire(
+                "req-cross-run-ledger",
+                &AskUserPrompt {
+                    context: None,
+                    questions: vec![astra_tools::AskUserQuestion {
+                        header: "Confirm".into(),
+                        question: "Continue?".into(),
+                        options: vec![],
+                        multi_select: false,
+                        allow_freeform: true,
+                    }],
+                    timeout_ms: Some(40),
+                },
+            )
+            .await;
+
+        assert_eq!(decision, AskUserDecision::Timeout);
+        assert!(
+            ledger.lock().await.contains_key(&wrong_key),
+            "wrong-run ledger entry must not be consumed by this waiter"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -797,7 +853,12 @@ mod tests {
         let ledger_bg = ledger.clone();
         tokio::spawn(async move {
             let req = rx.recv().await.unwrap();
-            let key = user_prompt_callback_key("u1", req["request_id"].as_str().unwrap());
+            let key = user_prompt_callback_key(
+                "u1",
+                req["session_id"].as_str().unwrap(),
+                req["run_id"].as_str().unwrap(),
+                req["request_id"].as_str().unwrap(),
+            );
             let mut g = ledger_bg.lock().await;
             g.insert(key, json!({"cancelled": true}));
         });

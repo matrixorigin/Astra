@@ -330,7 +330,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const submitRunInput = vi.fn().mockResolvedValue({
       runId: 'run-recovered',
@@ -430,7 +429,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const getSessionTranscript = vi.fn().mockResolvedValue({
       items: [],
@@ -491,7 +489,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const cancelRun = vi.fn().mockResolvedValue(undefined);
 
@@ -803,7 +800,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const getSessionTranscript = vi.fn().mockResolvedValue({
       items: [],
@@ -885,7 +881,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const getSessionTranscript = vi.fn().mockResolvedValue({
       items: [],
@@ -959,7 +954,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const resumeRun = vi.fn().mockResolvedValue(undefined);
 

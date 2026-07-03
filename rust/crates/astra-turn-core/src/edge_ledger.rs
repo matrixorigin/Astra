@@ -204,8 +204,13 @@ pub fn approval_callback_key(user_id: &str, request_id: &str) -> String {
 }
 
 #[inline]
-pub fn user_prompt_callback_key(user_id: &str, request_id: &str) -> String {
-    format!("{user_id}:user_prompt:{request_id}")
+pub fn user_prompt_callback_key(
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    request_id: &str,
+) -> String {
+    format!("{user_id}:user_prompt:{session_id}:{run_id}:{request_id}")
 }
 
 /// Record metadata when a new entry is inserted into the ledger by
@@ -794,7 +799,7 @@ mod tests {
         let user_a_tool = tool_callback_key("user-a", request_id);
         let user_b_tool = tool_callback_key("user-b", request_id);
         let user_a_approval = approval_callback_key("user-a", request_id);
-        let user_a_prompt = user_prompt_callback_key("user-a", request_id);
+        let user_a_prompt = user_prompt_callback_key("user-a", "session-a", "run-a", request_id);
 
         let keys: std::collections::HashSet<_> = [
             user_a_tool.as_str(),
@@ -813,7 +818,10 @@ mod tests {
         assert_eq!(user_a_tool, "user-a:tool:same-request");
         assert_eq!(user_b_tool, "user-b:tool:same-request");
         assert_eq!(user_a_approval, "user-a:approval:same-request");
-        assert_eq!(user_a_prompt, "user-a:user_prompt:same-request");
+        assert_eq!(
+            user_a_prompt,
+            "user-a:user_prompt:session-a:run-a:same-request"
+        );
     }
 
     #[test]

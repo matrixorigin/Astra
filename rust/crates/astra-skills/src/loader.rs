@@ -476,9 +476,8 @@ pub fn discover_skills_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
 ///
 /// 1. Walk-up from cwd: `{ancestor}/.astra/skills/` for each ancestor
 /// 2. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor
-/// 3. `{cwd}/skills/`         — project-level
-/// 4. `~/.astra/skills/`      — user-level global skills
-/// 5. `~/.claude/skills/`     — user-level Agent Skills compatibility path
+/// 3. `~/.astra/skills/`      — user-level global skills
+/// 4. `~/.claude/skills/`     — user-level Agent Skills compatibility path
 ///
 /// Walk-up discovery traverses from `cwd` upward to the filesystem root,
 /// collecting skill directories. Astra's SKILL.md format is compatible with
@@ -494,7 +493,6 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
     let mut paths = vec![
         PathBuf::from(".astra/skills"),
         PathBuf::from(".claude/skills"),
-        PathBuf::from("skills"),
     ];
     if let Some(home) = home {
         for global in home_skill_search_paths_from(&home) {
@@ -520,9 +518,6 @@ pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> 
     let (astra, claude) = walk_up_skill_paths_from(cwd, home);
     paths.extend(astra);
     paths.extend(claude);
-    // Legacy: skills/ in cwd only (not walked up).
-    // Kept for ecosystem compatibility (CC framework).
-    paths.push(cwd.join("skills"));
 
     if let Some(home) = home {
         for global in home_skill_search_paths_from(home) {
@@ -998,7 +993,6 @@ Hooked body."#;
             home.join(".claude").join("skills"),
             project.join(".astra").join("skills"),
             project.join(".claude").join("skills"),
-            cwd.join("skills"),
         ] {
             std::fs::create_dir_all(dir).unwrap();
         }
@@ -1014,8 +1008,8 @@ Hooked body."#;
             "CLI discovery must see project-local .claude skills: {cli_paths:?}"
         );
         assert!(
-            cli_paths.contains(&cwd.join("skills")),
-            "CLI discovery must preserve cwd/skills lookup: {cli_paths:?}"
+            !cli_paths.contains(&cwd.join("skills")),
+            "CLI discovery must not include the removed legacy cwd/skills tree: {cli_paths:?}"
         );
         assert!(
             cli_paths.contains(&home.join(".astra").join("skills"))

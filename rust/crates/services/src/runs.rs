@@ -5959,6 +5959,86 @@ mod tests {
         assert_eq!(without_total.total, None);
     }
 
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_list_user_runs_cursor_seek_paginates_tied_updated_at_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-cursor-user-{}", Uuid::new_v4());
+        let prefix = format!("runs-it-cursor-run-{}", Uuid::new_v4());
+        let run_ids = (0..5)
+            .map(|idx| format!("{prefix}-{idx}"))
+            .collect::<Vec<_>>();
+        let tied_ts = "2026-07-03 10:00:00.123456";
+
+        for run_id in &run_ids {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+            let mut run = durable_run_record(run_id);
+            run.user_id = user_id.clone();
+            run.session_id = format!("runs-it-cursor-session-{run_id}");
+            run.status = STATUS_COMPLETED.into();
+            store.insert_run(run).await.expect("insert cursor run");
+            sqlx::query(
+                "UPDATE agent_runs SET created_at = ?, updated_at = ? \
+                 WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(tied_ts)
+            .bind(tied_ts)
+            .bind(&user_id)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .expect("force tied run timestamp");
+        }
+
+        let first = store
+            .list_user_runs_cursor(&user_id, 2, None)
+            .await
+            .expect("first cursor page");
+        assert_eq!(
+            first
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![run_ids[4].as_str(), run_ids[3].as_str()]
+        );
+        let first_cursor = first.next_cursor.expect("first page cursor");
+        assert_eq!(first_cursor.run_id, run_ids[3]);
+
+        let second = store
+            .list_user_runs_cursor(&user_id, 2, Some(first_cursor))
+            .await
+            .expect("second cursor page");
+        assert_eq!(
+            second
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![run_ids[2].as_str(), run_ids[1].as_str()]
+        );
+        let second_cursor = second.next_cursor.expect("second page cursor");
+        assert_eq!(second_cursor.run_id, run_ids[1]);
+
+        let third = store
+            .list_user_runs_cursor(&user_id, 2, Some(second_cursor))
+            .await
+            .expect("third cursor page");
+        assert_eq!(
+            third
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![run_ids[0].as_str()]
+        );
+        assert!(third.next_cursor.is_none());
+
+        for run_id in &run_ids {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+    }
+
     #[test]
     fn run_list_sql_contract_uses_seek_cursor_not_offset() {
         let order_sql = RUN_LIST_ORDER_SQL.to_ascii_uppercase();

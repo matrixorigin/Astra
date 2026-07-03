@@ -11,7 +11,7 @@ use super::version::{Dependency, Version};
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillSourceKind {
-    /// Local filesystem (`SKILL.md` in `.astra/skills/`, `skills/`, `~/.astra/skills/`).
+    /// Local filesystem (`SKILL.md` in `.astra/skills/`, `.claude/skills/`, or HOME skill dirs).
     #[default]
     Local,
     /// Compiled into the binary.

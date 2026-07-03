@@ -19,8 +19,8 @@ pub struct LocalSkillProvider {
 impl LocalSkillProvider {
     /// Create with standard CLI search paths.
     ///
-    /// This includes project walk-up paths (`.astra/skills/`, `.claude/skills/`,
-    /// and `skills/`) plus user-level HOME paths. Use this for standalone CLI
+    /// This includes project walk-up paths (`.astra/skills/`, `.claude/skills/`)
+    /// plus user-level HOME paths. Use this for standalone CLI
     /// execution, where project-local skills are part of the local workspace.
     pub fn standard() -> Self {
         Self {

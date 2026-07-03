@@ -201,8 +201,6 @@ pub(super) enum WsClientMessage {
     #[serde(rename = "user_prompt")]
     UserPrompt {
         request_id: String,
-        session_id: String,
-        run_id: String,
         #[serde(default)]
         answers: Option<AskUserAnswers>,
         #[serde(default)]
@@ -640,8 +638,6 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                             }
                             Ok(WsClientMessage::UserPrompt {
                                 request_id,
-                                session_id,
-                                run_id,
                                 answers,
                                 cancelled,
                             }) => {
@@ -649,8 +645,6 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     state,
                                     &conn,
                                     &request_id,
-                                    &session_id,
-                                    &run_id,
                                     answers,
                                     cancelled,
                                 )
@@ -1193,16 +1187,40 @@ async fn handle_user_prompt_response(
     state: &AppState,
     conn: &WsConnection,
     request_id: &str,
-    session_id: &str,
-    run_id: &str,
     answers: Option<AskUserAnswers>,
     cancelled: bool,
 ) {
     use astra_services::session_journal::{JournalEvent, JournalWriter, validate_session_id};
     use astra_turn_core::edge_ledger::user_prompt_callback_key;
 
-    let key = user_prompt_callback_key(&conn.principal.user.user_id, request_id);
     let registry = state.metrics_registry();
+    let (session_id, run_id) = match (conn.session_id.as_deref(), conn.active_run_id.as_deref()) {
+        (Some(session_id), Some(run_id)) if !run_id.trim().is_empty() => (session_id, run_id),
+        (Some(_), Some(_)) => {
+            crate::server::interaction_metrics::record_ask_user_journal_write(
+                registry.as_ref(),
+                "response",
+                "invalid_run",
+            );
+            crate::server::interaction_metrics::record_ask_user_ledger_insert(
+                registry.as_ref(),
+                "invalid_context",
+            );
+            return;
+        }
+        _ => {
+            crate::server::interaction_metrics::record_ask_user_journal_write(
+                registry.as_ref(),
+                "response",
+                "skipped_no_context",
+            );
+            crate::server::interaction_metrics::record_ask_user_ledger_insert(
+                registry.as_ref(),
+                "skipped_no_context",
+            );
+            return;
+        }
+    };
     if let Err(error) = validate_session_id(session_id) {
         tracing::warn!(
             target: "astra_runtime::ws_callback",
@@ -1217,13 +1235,26 @@ async fn handle_user_prompt_response(
             "response",
             "invalid_session",
         );
+        crate::server::interaction_metrics::record_ask_user_ledger_insert(
+            registry.as_ref(),
+            "invalid_session",
+        );
+        return;
     } else {
+        if !cancelled && answers.is_none() {
+            crate::server::interaction_metrics::record_ask_user_journal_write(
+                registry.as_ref(),
+                "response",
+                "missing_answers",
+            );
+            crate::server::interaction_metrics::record_ask_user_ledger_insert(
+                registry.as_ref(),
+                "invalid_payload",
+            );
+            return;
+        }
         let status = if cancelled { "cancelled" } else { "submitted" };
-        let mut write_outcome = if !cancelled && answers.is_none() {
-            "missing_answers"
-        } else {
-            "ok"
-        };
+        let mut write_outcome = "ok";
         let answers_json = match answers.as_ref() {
             Some(answers) => match serde_json::to_value(answers) {
                 Ok(value) => Some(value),
@@ -1275,6 +1306,8 @@ async fn handle_user_prompt_response(
             }
         }
     }
+    let key =
+        user_prompt_callback_key(&conn.principal.user.user_id, session_id, run_id, request_id);
     let value = if cancelled {
         serde_json::json!({ "cancelled": true })
     } else {
@@ -1736,8 +1769,6 @@ async fn stream_run_over_websocket(
                             }
                             Ok(WsClientMessage::UserPrompt {
                                 request_id,
-                                session_id,
-                                run_id,
                                 answers,
                                 cancelled,
                             }) => {
@@ -1745,8 +1776,6 @@ async fn stream_run_over_websocket(
                                     state,
                                     conn,
                                     &request_id,
-                                    &session_id,
-                                    &run_id,
                                     answers,
                                     cancelled,
                                 )
@@ -4778,19 +4807,15 @@ mod tests {
 
     #[test]
     fn parse_user_prompt_response() {
-        let json = r#"{"type":"user_prompt","request_id":"req-3","session_id":"sess-1","run_id":"run-1","answers":{"answers":[{"question":"Continue?","answers":["custom"],"multi_select":false}]}}"#;
+        let json = r#"{"type":"user_prompt","request_id":"req-3","answers":{"answers":[{"question":"Continue?","answers":["custom"],"multi_select":false}]}}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::UserPrompt {
                 request_id,
-                session_id,
-                run_id,
                 answers,
                 cancelled,
             } => {
                 assert_eq!(request_id, "req-3");
-                assert_eq!(session_id, "sess-1");
-                assert_eq!(run_id, "run-1");
                 assert!(!cancelled);
                 assert_eq!(
                     answers.unwrap().answers[0].answers,
@@ -5086,7 +5111,7 @@ mod tests {
             r#"{"type":"message","content":"hello","selected_model":{"model":"gpt-5.4"}}"#,
             r#"{"type":"cancel_run","run_id":"r1"}"#,
             r#"{"type":"tool_approval","request_id":"req-1","approved":true}"#,
-            r#"{"type":"user_prompt","request_id":"req-2","session_id":"sess-1","run_id":"run-1","answers":{"answers":[{"question":"Continue?","answers":["yes"],"multi_select":false}]}}"#,
+            r#"{"type":"user_prompt","request_id":"req-2","answers":{"answers":[{"question":"Continue?","answers":["yes"],"multi_select":false}]}}"#,
             r#"{"type":"ping"}"#,
         ];
         for json in &inputs {
@@ -5116,17 +5141,14 @@ mod tests {
 
     #[test]
     fn user_prompt_requires_request_id() {
-        let json = r#"{"type":"user_prompt","session_id":"sess-1","run_id":"run-1","answers":{"answers":[]}}"#;
+        let json = r#"{"type":"user_prompt","answers":{"answers":[]}}"#;
         assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
     }
 
     #[test]
-    fn user_prompt_requires_session_id_and_run_id() {
-        let missing_session = r#"{"type":"user_prompt","request_id":"req-2","run_id":"run-1","answers":{"answers":[]}}"#;
-        assert!(serde_json::from_str::<WsClientMessage>(missing_session).is_err());
-
-        let missing_run = r#"{"type":"user_prompt","request_id":"req-2","session_id":"sess-1","answers":{"answers":[]}}"#;
-        assert!(serde_json::from_str::<WsClientMessage>(missing_run).is_err());
+    fn user_prompt_rejects_client_supplied_session_and_run_identity() {
+        let json = r#"{"type":"user_prompt","request_id":"req-2","session_id":"sess-1","run_id":"run-1","answers":{"answers":[]}}"#;
+        assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5307,8 +5329,6 @@ mod tests {
             &state,
             &conn,
             "req-ws-journal",
-            "sess-ws-journal",
-            "run-ws-journal",
             Some(answers.clone()),
             false,
         )
@@ -5329,7 +5349,12 @@ mod tests {
         assert_eq!(durable_answers, answers);
 
         let ledger = state.edge_callback_ledger.lock().await;
-        let key = astra_turn_core::edge_ledger::user_prompt_callback_key("u1", "req-ws-journal");
+        let key = astra_turn_core::edge_ledger::user_prompt_callback_key(
+            "u1",
+            "sess-ws-journal",
+            "run-ws-journal",
+            "req-ws-journal",
+        );
         assert_eq!(
             serde_json::from_value::<AskUserAnswers>(
                 ledger
@@ -5352,6 +5377,105 @@ mod tests {
         assert!(
             metrics
                 .contains("astra_interaction_ask_user_ledger_insert_total{outcome=\"inserted\"} 1"),
+            "{metrics}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_prompt_response_missing_answers_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let conn = WsConnection {
+            principal: AuthPrincipal::internal(test_user()),
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-ws-missing-answers".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-ws-missing-answers".into()),
+            bridge_prepared_run_id: None,
+        };
+
+        handle_user_prompt_response(&state, &conn, "req-ws-missing-answers", None, false).await;
+
+        assert!(
+            state.edge_callback_ledger.lock().await.is_empty(),
+            "invalid ask_user responses must not wake waiters"
+        );
+        assert!(
+            astra_services::session_journal::find_latest_ask_user_response_for_run(
+                "sess-ws-missing-answers",
+                "req-ws-missing-answers",
+                "run-ws-missing-answers",
+            )
+            .unwrap()
+            .is_none(),
+            "invalid ask_user responses must not become durable"
+        );
+        let metrics = state.metrics_registry().render_prometheus();
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_journal_write_total{event=\"response\",outcome=\"missing_answers\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_ledger_insert_total{outcome=\"invalid_payload\"} 1"
+            ),
+            "{metrics}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_prompt_response_without_connection_context_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let conn = WsConnection {
+            principal: AuthPrincipal::internal(test_user()),
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-ws-no-context".into()),
+            pending_session_id: None,
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        };
+
+        handle_user_prompt_response(
+            &state,
+            &conn,
+            "req-ws-no-context",
+            Some(AskUserAnswers { answers: vec![] }),
+            false,
+        )
+        .await;
+
+        assert!(
+            state.edge_callback_ledger.lock().await.is_empty(),
+            "ask_user responses without an active run must not wake any waiter"
+        );
+        assert!(
+            astra_services::session_journal::find_latest_ask_user_response_for_run(
+                "sess-ws-no-context",
+                "req-ws-no-context",
+                "run-ws-no-context",
+            )
+            .unwrap()
+            .is_none(),
+            "ask_user responses without active run context must not become durable"
+        );
+        let metrics = state.metrics_registry().render_prometheus();
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_journal_write_total{event=\"response\",outcome=\"skipped_no_context\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_ledger_insert_total{outcome=\"skipped_no_context\"} 1"
+            ),
             "{metrics}"
         );
     }
@@ -5384,15 +5508,17 @@ mod tests {
             &callback_state,
             &conn,
             "req-ws-no-sticky",
-            "sess-ws-no-sticky",
-            "run-ws-no-sticky",
             Some(answers.clone()),
             false,
         )
         .await;
 
-        let callback_key =
-            astra_turn_core::edge_ledger::user_prompt_callback_key("u1", "req-ws-no-sticky");
+        let callback_key = astra_turn_core::edge_ledger::user_prompt_callback_key(
+            "u1",
+            "sess-ws-no-sticky",
+            "run-ws-no-sticky",
+            "req-ws-no-sticky",
+        );
         assert!(
             callback_state
                 .edge_callback_ledger

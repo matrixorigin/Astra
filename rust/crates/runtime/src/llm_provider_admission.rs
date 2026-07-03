@@ -121,6 +121,15 @@ WHERE bucket_key = ?
   AND token_count + ? <= ?
 "#;
 
+const RELEASE_WINDOW_SLOT_SQL: &str = r#"
+UPDATE llm_provider_admission_windows
+SET request_count = CASE WHEN request_count > 0 THEN request_count - 1 ELSE 0 END,
+    token_count = CASE WHEN token_count > ? THEN token_count - ? ELSE 0 END,
+    updated_at = CURRENT_TIMESTAMP(6)
+WHERE bucket_key = ?
+  AND window_start_ms = ?
+"#;
+
 const SELECT_WINDOW_COUNTS_SQL: &str = r#"
 SELECT request_count, token_count
 FROM llm_provider_admission_windows
@@ -776,13 +785,6 @@ async fn db_fixed_window_admit(
     let window_start_ms = fixed_window_start_ms(now_ms, config.window_ms);
     let bucket_key = bucket_key(provider);
     let estimated_tokens_i64 = i64::try_from(estimated_tokens).unwrap_or(i64::MAX);
-    if let Some(retry_after_ms) = claim_rpm_pacing(shared_pool, &bucket_key, config, now_ms).await?
-    {
-        return Ok(FixedWindowAdmission::Rejected {
-            retry_after_ms,
-            limit: ProviderAdmissionLimit::Rpm,
-        });
-    }
     let previous_window_start_ms = previous_window_start_ms(window_start_ms, config.window_ms);
     let previous_counts =
         fetch_window_counts(shared_pool, &bucket_key, previous_window_start_ms).await?;
@@ -843,7 +845,32 @@ async fn db_fixed_window_admit(
     .map_err(database_error)?;
 
     if result.rows_affected() == 1 {
-        Ok(FixedWindowAdmission::Admitted)
+        match claim_rpm_pacing(shared_pool, &bucket_key, config, now_ms).await {
+            Ok(Some(retry_after_ms)) => {
+                release_window_slot(
+                    shared_pool,
+                    &bucket_key,
+                    window_start_ms,
+                    estimated_tokens_i64,
+                )
+                .await?;
+                Ok(FixedWindowAdmission::Rejected {
+                    retry_after_ms,
+                    limit: ProviderAdmissionLimit::Rpm,
+                })
+            }
+            Ok(None) => Ok(FixedWindowAdmission::Admitted),
+            Err(error) => {
+                release_window_slot(
+                    shared_pool,
+                    &bucket_key,
+                    window_start_ms,
+                    estimated_tokens_i64,
+                )
+                .await?;
+                Err(error)
+            }
+        }
     } else {
         let limit = detect_rejected_limit(
             shared_pool,
@@ -859,6 +886,23 @@ async fn db_fixed_window_admit(
             limit,
         })
     }
+}
+
+async fn release_window_slot(
+    shared_pool: &SharedPool,
+    bucket_key: &str,
+    window_start_ms: i64,
+    estimated_tokens_i64: i64,
+) -> Result<(), ClassifiedError> {
+    sqlx::query(RELEASE_WINDOW_SLOT_SQL)
+        .bind(estimated_tokens_i64)
+        .bind(estimated_tokens_i64)
+        .bind(bucket_key)
+        .bind(window_start_ms)
+        .execute(shared_pool.get())
+        .await
+        .map_err(database_error)?;
+    Ok(())
 }
 
 async fn detect_rejected_limit(
@@ -1254,8 +1298,34 @@ mod tests {
         assert!(CLAIM_WINDOW_SLOT_TPM_SQL.contains("token_count + ? <= ?"));
         assert!(CLAIM_WINDOW_SLOT_RPM_TPM_SQL.contains("request_count < ?"));
         assert!(CLAIM_WINDOW_SLOT_RPM_TPM_SQL.contains("token_count + ? <= ?"));
+        assert!(RELEASE_WINDOW_SLOT_SQL.contains("request_count - 1"));
+        assert!(RELEASE_WINDOW_SLOT_SQL.contains("token_count - ?"));
         assert!(CLEANUP_WINDOWS_SQL.contains("DELETE FROM llm_provider_admission_windows"));
         assert!(CLEANUP_WINDOWS_SQL.contains("window_start_ms < ?"));
+    }
+
+    #[test]
+    fn db_fixed_window_admission_does_not_claim_pacing_before_window_slot() {
+        let source = include_str!("llm_provider_admission.rs");
+        let body = source
+            .split("async fn db_fixed_window_admit")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn release_window_slot").next())
+            .expect("db_fixed_window_admit body");
+        let rows_affected = body
+            .find("if result.rows_affected() == 1")
+            .expect("window claim result branch");
+        let pacing = body
+            .find("claim_rpm_pacing")
+            .expect("pacing claim should still run for admitted window slots");
+        assert!(
+            pacing > rows_affected,
+            "RPM pacing must not be claimed before TPM/window admission is known"
+        );
+        assert!(
+            body.contains("release_window_slot"),
+            "pacing rejects/errors after a window claim must release the claimed slot"
+        );
     }
 
     #[test]

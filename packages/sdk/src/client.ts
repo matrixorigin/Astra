@@ -144,7 +144,6 @@ type RunListWire = {
   runs: RunStatusWire[];
   total?: number | null;
   limit: number;
-  offset: number;
   next_cursor?: RunListCursorWire | null;
 };
 
@@ -192,7 +191,6 @@ function normalizeRunList(w: RunListWire): RunListResponse {
     runs: w.runs.map(normalizeRunStatus),
     total: w.total ?? null,
     limit: w.limit,
-    offset: w.offset,
     nextCursor: normalizeRunListCursor(w.next_cursor),
   };
 }

@@ -67,7 +67,6 @@ function runtimeRunList(runs: unknown[]) {
     runs,
     total: runs.length,
     limit: 200,
-    offset: 0,
   };
 }
 
