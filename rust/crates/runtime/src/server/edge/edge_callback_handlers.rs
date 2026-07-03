@@ -252,7 +252,6 @@ pub(crate) async fn post_approval_respond_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
-    let key = approval_callback_key(&user.user_id, &body.request_id);
     let registry = state.metrics_registry();
     let run_id = body.run_id.trim();
     if run_id.is_empty() {
@@ -262,133 +261,127 @@ pub(crate) async fn post_approval_respond_handler(
         );
         return Err(error_response(StatusCode::BAD_REQUEST, "run_id required"));
     }
-    if let Some(session_id) = body.session_id.as_deref() {
-        if let Err(error) = validate_session_id(session_id) {
-            crate::server::interaction_metrics::record_approval_journal_write(
-                registry.as_ref(),
-                "invalid_session",
-            );
-            return Err(error_response(StatusCode::BAD_REQUEST, error));
-        }
-        let decision = match &body.decision {
-            astra_thin_client::ApprovalDecision::Allow => "allow",
-            astra_thin_client::ApprovalDecision::Deny => "deny",
-            astra_thin_client::ApprovalDecision::AllowSession => "allow_session",
-        };
-        let approval_kind = body.approval_kind.as_ref().map(|kind| match kind {
-            astra_thin_client::ApprovalKind::Standard => "standard",
-            astra_thin_client::ApprovalKind::Explicit => "explicit",
-        });
-        let approval_turn =
-            match astra_services::session_journal::find_latest_approval_required_for_run(
-                session_id,
-                &body.request_id,
-                run_id,
-            ) {
-                Ok(Some(request)) => {
-                    crate::server::interaction_metrics::record_approval_journal_lookup(
-                        registry.as_ref(),
-                        "required",
-                        "hit",
-                    );
-                    request.turn
-                }
-                Ok(None) => {
-                    crate::server::interaction_metrics::record_approval_journal_lookup(
-                        registry.as_ref(),
-                        "required",
-                        "miss",
-                    );
-                    None
-                }
-                Err(e) => {
-                    crate::server::interaction_metrics::record_approval_journal_lookup(
-                        registry.as_ref(),
-                        "required",
-                        "error",
-                    );
-                    tracing::warn!(
-                        target: "astra_runtime::edge_callback",
-                        session_id = %session_id,
-                        run_id = %run_id,
-                        request_id = %body.request_id,
-                        error = %e,
-                        "approval journal lookup failed, treating as no prior request"
-                    );
-                    None
-                }
-            };
-        match append_approval_decision_for_run_if_absent(
-            session_id,
-            approval_turn,
-            &body.request_id,
-            run_id,
-            body.tool_name.as_deref(),
-            approval_kind,
-            decision,
-            body.reason.as_deref(),
-        ) {
-            Ok(ApprovalDecisionAppendOutcome::Appended) => {
-                crate::server::interaction_metrics::record_approval_journal_lookup(
-                    registry.as_ref(),
-                    "decision",
-                    "miss",
-                );
-                crate::server::interaction_metrics::record_approval_journal_write(
-                    registry.as_ref(),
-                    "ok",
-                );
-            }
-            Ok(ApprovalDecisionAppendOutcome::Idempotent) => {
-                crate::server::interaction_metrics::record_approval_journal_lookup(
-                    registry.as_ref(),
-                    "decision",
-                    "hit",
-                );
-                crate::server::interaction_metrics::record_approval_journal_write(
-                    registry.as_ref(),
-                    "idempotent",
-                );
-            }
-            Ok(ApprovalDecisionAppendOutcome::Conflict(existing)) => {
-                crate::server::interaction_metrics::record_approval_journal_lookup(
-                    registry.as_ref(),
-                    "decision",
-                    "hit",
-                );
-                crate::server::interaction_metrics::record_approval_journal_write(
-                    registry.as_ref(),
-                    "conflict",
-                );
-                return Err(error_response(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "approval decision already recorded for request {} run {} as {}",
-                        existing.request_id, run_id, existing.decision
-                    ),
-                ));
-            }
-            Err(error) => {
-                crate::server::interaction_metrics::record_approval_journal_lookup(
-                    registry.as_ref(),
-                    "decision",
-                    "error",
-                );
-                crate::server::interaction_metrics::record_approval_journal_write(
-                    registry.as_ref(),
-                    "error",
-                );
-                return Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("approval journal append failed: {error}"),
-                ));
-            }
-        }
-    } else {
+    let session_id = body.session_id.trim();
+    if let Err(error) = validate_session_id(session_id) {
         crate::server::interaction_metrics::record_approval_journal_write(
             registry.as_ref(),
-            "skipped_no_session",
+            "invalid_session",
         );
+        return Err(error_response(StatusCode::BAD_REQUEST, error));
+    }
+    let key = approval_callback_key(&user.user_id, session_id, run_id, &body.request_id);
+    let decision = match &body.decision {
+        astra_thin_client::ApprovalDecision::Allow => "allow",
+        astra_thin_client::ApprovalDecision::Deny => "deny",
+        astra_thin_client::ApprovalDecision::AllowSession => "allow_session",
+    };
+    let approval_kind = body.approval_kind.as_ref().map(|kind| match kind {
+        astra_thin_client::ApprovalKind::Standard => "standard",
+        astra_thin_client::ApprovalKind::Explicit => "explicit",
+    });
+    let approval_turn = match astra_services::session_journal::find_latest_approval_required_for_run(
+        session_id,
+        &body.request_id,
+        run_id,
+    ) {
+        Ok(Some(request)) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "hit",
+            );
+            request.turn
+        }
+        Ok(None) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "miss",
+            );
+            None
+        }
+        Err(e) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "error",
+            );
+            tracing::warn!(
+                target: "astra_runtime::edge_callback",
+                session_id = %session_id,
+                run_id = %run_id,
+                request_id = %body.request_id,
+                error = %e,
+                "approval journal lookup failed, treating as no prior request"
+            );
+            None
+        }
+    };
+    match append_approval_decision_for_run_if_absent(
+        session_id,
+        approval_turn,
+        &body.request_id,
+        run_id,
+        body.tool_name.as_deref(),
+        approval_kind,
+        decision,
+        body.reason.as_deref(),
+    ) {
+        Ok(ApprovalDecisionAppendOutcome::Appended) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "miss",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "ok",
+            );
+        }
+        Ok(ApprovalDecisionAppendOutcome::Idempotent) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "hit",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "idempotent",
+            );
+        }
+        Ok(ApprovalDecisionAppendOutcome::Conflict(existing)) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "hit",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "conflict",
+            );
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "approval decision already recorded for request {} run {} as {}",
+                    existing.request_id, run_id, existing.decision
+                ),
+            ));
+        }
+        Err(error) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "error",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "error",
+            );
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("approval journal append failed: {error}"),
+            ));
+        }
     }
     let ledger_value = serde_json::json!({
         "kind": "approval_respond",
@@ -405,16 +398,11 @@ pub(crate) async fn post_approval_respond_handler(
         let mut lock = state.edge_callback_ledger.lock().await;
         let new_key = !lock.contains_key(&key);
         let ledger_full = lock.len() >= LEDGER_MAX_ENTRIES;
-        match insert_approval_ledger_entry(
-            &mut lock,
-            key.clone(),
-            ledger_value,
-            body.session_id.is_some(),
-        ) {
+        match insert_approval_ledger_entry(&mut lock, key.clone(), ledger_value, true) {
             Ok(enqueued) => {
                 let outcome = if enqueued {
                     "inserted"
-                } else if new_key && ledger_full && body.session_id.is_some() {
+                } else if new_key && ledger_full {
                     "durable_fallback"
                 } else {
                     "idempotent_replay"
@@ -1003,7 +991,7 @@ mod edge_callback_insert_tests {
                 request_id: "req-approval-journal".into(),
                 decision: astra_thin_client::ApprovalDecision::Allow,
                 reason: Some("approved in another pod".into()),
-                session_id: Some("sess-approval-journal".into()),
+                session_id: "sess-approval-journal".into(),
                 run_id: "run-approval-journal".into(),
                 tool_name: Some("write_file".into()),
                 approval_kind: Some(astra_thin_client::ApprovalKind::Explicit),
@@ -1033,6 +1021,8 @@ mod edge_callback_insert_tests {
         assert!(
             !ledger.contains_key(&astra_turn_core::edge_ledger::approval_callback_key(
                 "u-approval",
+                "sess-approval-journal",
+                "run-approval-journal",
                 "req-approval-journal"
             )),
             "full local ledger should not be required after durable approval persistence"
@@ -1129,7 +1119,7 @@ mod edge_callback_insert_tests {
                 request_id: "req-empty-run".into(),
                 decision: astra_thin_client::ApprovalDecision::Allow,
                 reason: None,
-                session_id: Some("sess-empty-run".into()),
+                session_id: "sess-empty-run".into(),
                 run_id: String::new(),
                 tool_name: Some("write_file".into()),
                 approval_kind: Some(astra_thin_client::ApprovalKind::Explicit),

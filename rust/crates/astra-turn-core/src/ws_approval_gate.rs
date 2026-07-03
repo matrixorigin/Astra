@@ -183,11 +183,11 @@ fn append_approval_required_journal_event(
 async fn wait_approval_response(
     ledger: &Arc<TokioMutex<HashMap<String, Value>>>,
     user_id: &str,
-    journal_context: Option<&ApprovalJournalContext>,
+    context: &ApprovalJournalContext,
     request_id: &str,
     timeout: Duration,
 ) -> Option<ApprovalDecision> {
-    let key = approval_callback_key(user_id, request_id);
+    let key = approval_callback_key(user_id, &context.session_id, &context.run_id, request_id);
     let started = std::time::Instant::now();
     let mut last_journal_lookup: Option<std::time::Instant> = None;
     loop {
@@ -195,10 +195,9 @@ async fn wait_approval_response(
             return Some(decision_from_approval_value(value));
         }
 
-        if let Some(context) = journal_context
-            && last_journal_lookup
-                .map(|last| last.elapsed() >= APPROVAL_JOURNAL_POLL_INTERVAL)
-                .unwrap_or(true)
+        if last_journal_lookup
+            .map(|last| last.elapsed() >= APPROVAL_JOURNAL_POLL_INTERVAL)
+            .unwrap_or(true)
         {
             last_journal_lookup = Some(std::time::Instant::now());
             match find_latest_approval_decision_for_run(
@@ -241,13 +240,19 @@ impl ToolApprovalGate for WebSocketApprovalGate {
         tool_name: &str,
         args: &Value,
     ) -> ApprovalDecision {
+        let Some(context) = self.journal_context.as_ref() else {
+            return ApprovalDecision::Denied {
+                reason: Some("approval requires session/run context".into()),
+            };
+        };
+
         // Send outbound request to WS handler via channel as JSON.
         let request = serde_json::json!({
             "request_id": request_id,
             "tool": tool_name,
             "args": args,
-            "session_id": self.journal_context.as_ref().map(|context| &context.session_id),
-            "run_id": self.journal_context.as_ref().map(|context| &context.run_id),
+            "session_id": &context.session_id,
+            "run_id": &context.run_id,
         });
 
         if self.request_tx.send(request).await.is_err() {
@@ -256,16 +261,19 @@ impl ToolApprovalGate for WebSocketApprovalGate {
                 reason: Some("WebSocket connection closed".into()),
             };
         }
-        if let Some(context) = self.journal_context.as_ref() {
-            let _ = append_approval_required_journal_event(context, request_id, tool_name);
-        }
+        let _ = append_approval_required_journal_event(context, request_id, tool_name);
 
         // Wait for the client's response via the same-pod ledger or durable journal.
-        let key = approval_callback_key(&self.user_id, request_id);
+        let key = approval_callback_key(
+            &self.user_id,
+            &context.session_id,
+            &context.run_id,
+            request_id,
+        );
         let outcome = wait_approval_response(
             &self.edge_callback_ledger,
             &self.user_id,
-            self.journal_context.as_ref(),
+            context,
             request_id,
             self.timeout,
         )
@@ -314,7 +322,11 @@ mod tests {
     ) -> WebSocketApprovalGate {
         WebSocketApprovalGate {
             user_id: "u1".into(),
-            journal_context: None,
+            journal_context: Some(ApprovalJournalContext {
+                session_id: "sess-approval".into(),
+                run_id: "run-approval".into(),
+                turn: Some(7),
+            }),
             edge_callback_ledger: ledger,
             request_tx: tx,
             timeout,
@@ -354,7 +366,12 @@ mod tests {
             assert_eq!(req["tool"].as_str().unwrap(), "bash");
 
             // Insert approval response into ledger.
-            let key = approval_callback_key("u1", req["request_id"].as_str().unwrap());
+            let key = approval_callback_key(
+                "u1",
+                req["session_id"].as_str().unwrap(),
+                req["run_id"].as_str().unwrap(),
+                req["request_id"].as_str().unwrap(),
+            );
             let mut g = ledger_bg.lock().await;
             g.insert(key, json!({"approved": true}));
         });
@@ -375,7 +392,12 @@ mod tests {
         let ledger_bg = ledger.clone();
         tokio::spawn(async move {
             let req = rx.recv().await.unwrap();
-            let key = approval_callback_key("u1", req["request_id"].as_str().unwrap());
+            let key = approval_callback_key(
+                "u1",
+                req["session_id"].as_str().unwrap(),
+                req["run_id"].as_str().unwrap(),
+                req["request_id"].as_str().unwrap(),
+            );
             let mut g = ledger_bg.lock().await;
             g.insert(key, json!({"approved": false, "reason": "too risky"}));
         });
@@ -421,7 +443,12 @@ mod tests {
             let req = rx.recv().await.unwrap();
             // Sleep long enough that the gate has already timed out.
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let key = approval_callback_key("u1", req["request_id"].as_str().unwrap());
+            let key = approval_callback_key(
+                "u1",
+                req["session_id"].as_str().unwrap(),
+                req["run_id"].as_str().unwrap(),
+                req["request_id"].as_str().unwrap(),
+            );
             ledger_bg
                 .lock()
                 .await
@@ -459,7 +486,7 @@ mod tests {
 
         // The cleanup branch in request_approval should have removed the
         // matching ledger key.
-        let key = approval_callback_key("u1", "req-late");
+        let key = approval_callback_key("u1", "sess-approval", "run-approval", "req-late");
         let lock = ledger.lock().await;
         assert!(
             !lock.contains_key(&key),
@@ -485,10 +512,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_without_run_context_fails_closed() {
+        let ledger = Arc::new(TokioMutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel::<Value>(1);
+        let gate = WebSocketApprovalGate::new("u1".into(), ledger, tx);
+
+        let decision = gate
+            .request_approval("req-no-context", "bash", &json!({}))
+            .await;
+
+        match decision {
+            ApprovalDecision::Denied { reason } => {
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("approval requires session/run context")
+                );
+            }
+            _ => panic!("expected Denied"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "approval request without run context must not be sent"
+        );
+    }
+
+    #[tokio::test]
     async fn wrapped_approval_respond_value_is_supported() {
         let ledger = Arc::new(TokioMutex::new(HashMap::new()));
         let (tx, _rx) = mpsc::channel::<Value>(1);
-        let key = approval_callback_key("u1", "req-http-shaped");
+        let key = approval_callback_key("u1", "sess-approval", "run-approval", "req-http-shaped");
         ledger.lock().await.insert(
             key,
             json!({
@@ -497,6 +549,7 @@ mod tests {
                     "request_id": "req-http-shaped",
                     "decision": "deny",
                     "reason": "blocked",
+                    "session_id": "sess-approval",
                     "run_id": "run-approval"
                 }
             }),

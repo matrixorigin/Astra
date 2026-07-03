@@ -470,6 +470,42 @@ describe("AstraClient — Runs", () => {
     expect(url).toContain("recent_limit=25");
   });
 
+  test("repairRunProjection posts to repair endpoint", async () => {
+    globalThis.fetch = mockFetch(200, {
+      repaired: true,
+      projection: {
+        run_id: "r1",
+        session_id: "s1",
+        status: "running",
+        run_event_high_watermark: 7,
+        projection_event_idx: 7,
+        projection_updated_at: "2026-06-10T00:00:00.000Z",
+        projection_hash: "hash",
+        total_prompt_tokens: 1,
+        total_completion_tokens: 2,
+        total_tool_calls: 3,
+        observability: {
+          has_durable_projection: true,
+          observability_available: true,
+          projection_lag_events: 0,
+          prompt_request_count: 0,
+        },
+        recent_events: [],
+      },
+    });
+
+    const repaired = await createClient().repairRunProjection("r1", {
+      recentLimit: 10,
+    });
+
+    expect(repaired.repaired).toBe(true);
+    expect(repaired.projection.projection_event_idx).toBe(7);
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[0]).toContain("/chat/runs/r1/projection/repair");
+    expect(call[0]).toContain("recent_limit=10");
+    expect(call[1].method).toBe("POST");
+  });
+
   test("listRuns normalizes snake_case runs", async () => {
     globalThis.fetch = mockFetch(200, {
       runs: [

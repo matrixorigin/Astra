@@ -31,6 +31,7 @@ import type {
   RunListCursor,
   RunListParams,
   RunListResponse,
+  RunProjectionRepairResponse,
   RunProjectionResponse,
   RunStatus,
   RuntimeChatResponse,
@@ -97,6 +98,7 @@ import {
   chatRunPath,
   chatRunPausePath,
   chatRunProjectionPath,
+  chatRunProjectionRepairPath,
   chatRunResumePath,
   chatRunStreamPath,
   chatSessionDecisionTracePath,
@@ -797,6 +799,23 @@ export class AstraClient {
     });
     return this.fetch<RunProjectionResponse>(
       `${chatRunProjectionPath(runId)}${q}`,
+    );
+  }
+
+  /**
+   * Rebuild the durable projection for a run from authoritative facts.
+   */
+  async repairRunProjection(
+    runId: string,
+    opts?: { recentLimit?: number },
+  ): Promise<RunProjectionRepairResponse> {
+    const q = buildQueryString({
+      ...(opts?.recentLimit !== undefined
+        ? { recent_limit: opts.recentLimit }
+        : {}),
+    });
+    return this.post<RunProjectionRepairResponse>(
+      `${chatRunProjectionRepairPath(runId)}${q}`,
     );
   }
 

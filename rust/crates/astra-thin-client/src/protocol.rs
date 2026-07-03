@@ -228,8 +228,7 @@ pub struct ApprovalRespondRequest {
     pub decision: ApprovalDecision,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub session_id: String,
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
@@ -760,12 +759,12 @@ mod tests {
     }
 
     #[test]
-    fn approval_respond_request_roundtrip_preserves_optional_context() {
+    fn approval_respond_request_roundtrip_preserves_context() {
         let req = ApprovalRespondRequest {
             request_id: "ap-1".into(),
             decision: ApprovalDecision::Allow,
             reason: Some("looks good".into()),
-            session_id: Some("sess-1".into()),
+            session_id: "sess-1".into(),
             run_id: "run-1".into(),
             tool_name: Some("write_file".into()),
             approval_kind: Some(ApprovalKind::Standard),
@@ -776,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_respond_request_requires_run_id() {
+    fn approval_respond_request_requires_session_and_run_id() {
         let json = serde_json::json!({
             "request_id": "ap-legacy",
             "decision": "deny",
@@ -786,18 +785,14 @@ mod tests {
     }
 
     #[test]
-    fn approval_respond_request_allows_missing_optional_context_except_run_id() {
+    fn approval_respond_request_rejects_missing_session_id() {
         let json = serde_json::json!({
             "request_id": "ap-minimal",
             "decision": "deny",
             "reason": "no",
             "run_id": "run-minimal"
         });
-        let back: ApprovalRespondRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(back.session_id, None);
-        assert_eq!(back.run_id, "run-minimal");
-        assert_eq!(back.tool_name, None);
-        assert_eq!(back.approval_kind, None);
+        assert!(serde_json::from_value::<ApprovalRespondRequest>(json).is_err());
     }
 
     #[test]

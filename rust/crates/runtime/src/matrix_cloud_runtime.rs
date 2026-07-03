@@ -359,7 +359,11 @@ impl MatrixCloudRuntime {
         let Some(sender) = guard.as_ref() else {
             return;
         };
-        let events = match IngestionEvent::expand_journal_event(event, user_id) {
+        let events = match IngestionEvent::expand_journal_event_with_redact(
+            event,
+            user_id,
+            self.ingestion_config.redact_content,
+        ) {
             Ok(events) => events,
             Err(error) => {
                 tracing::warn!(

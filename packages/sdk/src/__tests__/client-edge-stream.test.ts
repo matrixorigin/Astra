@@ -114,11 +114,21 @@ describe('AstraClient — thin edge / approval / task lease', () => {
   it('postApprovalRespond posts to /approval/respond with JSON', async () => {
     globalThis.fetch = okFetch();
     const c = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
-    await c.postApprovalRespond({ request_id: 'r1', decision: 'allow' });
+    await c.postApprovalRespond({
+      request_id: 'r1',
+      decision: 'allow',
+      session_id: 's1',
+      run_id: 'run1',
+    });
     const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(String(call[0]).endsWith(PATH_APPROVAL_RESPOND)).toBe(true);
     expect((call[1] as { method: string }).method).toBe('POST');
-    expect(JSON.parse((call[1] as { body: string }).body as string)).toEqual({ request_id: 'r1', decision: 'allow' });
+    expect(JSON.parse((call[1] as { body: string }).body as string)).toEqual({
+      request_id: 'r1',
+      decision: 'allow',
+      session_id: 's1',
+      run_id: 'run1',
+    });
   });
 
   it('registerEdge POST /agents/edge and optional X-Astra-Edge-Id', async () => {

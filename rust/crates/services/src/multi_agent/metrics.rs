@@ -97,9 +97,9 @@ pub struct MultiAgentMetrics {
     pub dispatch_pending_rows: AtomicU64,
     /// Current DB-backed dispatched/in-flight row count, refreshed during `/metrics`.
     pub dispatch_dispatched_rows: AtomicU64,
-    /// Oldest pending row age in milliseconds, refreshed during `/metrics`.
+    /// Oldest pending row age in milliseconds, refreshed by the runtime background task.
     pub dispatch_oldest_pending_age_ms: AtomicU64,
-    /// Oldest dispatched row age in milliseconds, refreshed during `/metrics`.
+    /// Oldest dispatched row age in milliseconds, refreshed by the runtime background task.
     pub dispatch_oldest_dispatched_age_ms: AtomicU64,
     /// Total dispatch rows claimed by edge WS pollers.
     pub dispatch_claimed_total: AtomicU64,
@@ -115,7 +115,7 @@ pub struct MultiAgentMetrics {
     pub dispatch_cleanup_deleted_total: AtomicU64,
     /// Total wait_result calls that reached timeout without a terminal result.
     pub dispatch_wait_result_timeouts_total: AtomicU64,
-    /// Total backlog scrape failures while rendering `/metrics`.
+    /// Total backlog refresh failures.
     pub dispatch_backlog_scrape_errors_total: AtomicU64,
     /// Time from dispatch creation to edge WS claim.
     pub dispatch_claim_wait_latency: LatencyTracker,

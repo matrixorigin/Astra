@@ -5164,6 +5164,18 @@ mod tests {
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
     }
 
+    struct NoopAuxiliaryEventWriter;
+
+    #[async_trait::async_trait]
+    impl astra_turn_core::contracts::TurnAuxiliaryEventWriter for NoopAuxiliaryEventWriter {
+        async fn persist_events(
+            &self,
+            _events: Vec<astra_turn_core::contracts::TurnAuxiliaryEventRecord>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     fn approval_allow_entry(request_id: &str) -> Value {
         json!({
             "kind": "approval_respond",
@@ -5171,12 +5183,32 @@ mod tests {
                 request_id: request_id.to_string(),
                 decision: astra_thin_client::ApprovalDecision::Allow,
                 reason: None,
-                session_id: Some("test-session".to_string()),
+                session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 tool_name: None,
                 approval_kind: None,
             }
         })
+    }
+
+    fn test_approval_key(user_id: &str, request_id: &str) -> String {
+        approval_callback_key(user_id, "test-session", "test-run", request_id)
+    }
+
+    fn test_approval_audit_context(
+        user_id: &str,
+    ) -> astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
+        astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
+            user_id: user_id.to_string(),
+            session_id: "test-session".to_string(),
+            run_id: "test-run".to_string(),
+            turn: 1,
+            agent_id: None,
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: "test-approval-chain".to_string(),
+            auxiliary_event_writer: Arc::new(NoopAuxiliaryEventWriter),
+        }
     }
 
     struct StaticWaitResultEdgeDispatch {
@@ -6984,6 +7016,7 @@ mod tests {
             "s-batch".to_string(),
         )
         .build();
+        host.set_approval_audit_context(test_approval_audit_context("u-batch"));
         // Register write_file as a valid tool so the edge ledger delivery path admits it.
         host.install_runtime_tool_schemas(vec![json!({
             "type": "function",
@@ -7011,11 +7044,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
-                approval_callback_key("u-batch", "w1"),
+                test_approval_key("u-batch", "w1"),
                 approval_allow_entry("w1"),
             );
             guard.insert(
-                approval_callback_key("u-batch", "w2"),
+                test_approval_key("u-batch", "w2"),
                 approval_allow_entry("w2"),
             );
             drop(guard);
@@ -7218,6 +7251,7 @@ mod tests {
                 }
             }),
         ]);
+        host.set_approval_audit_context(test_approval_audit_context("u-mixed"));
         let ledger = host.edge_callback_ledger.clone();
         let tool_calls = vec![
             json!({
@@ -7250,7 +7284,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                approval_callback_key("u-mixed", "w1"),
+                test_approval_key("u-mixed", "w1"),
                 approval_allow_entry("w1"),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7265,7 +7299,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                approval_callback_key("u-mixed", "w2"),
+                test_approval_key("u-mixed", "w2"),
                 approval_allow_entry("w2"),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;

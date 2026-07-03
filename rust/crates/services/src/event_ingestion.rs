@@ -26,6 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
@@ -102,16 +103,21 @@ impl IngestionConfig {
 /// Replace raw user content with a deterministic privacy marker.
 ///
 /// The marker has the form `<redacted: len=N sha=HHHHHHHHHHHHHHHH>` where
-/// the suffix is a non-cryptographic 64-bit hash. It is used only for
-/// dedup/debugging when `IngestionConfig.redact_content` is enabled — not as
-/// a security primitive — so [`std::collections::hash_map::DefaultHasher`]
-/// is acceptable.
+/// the suffix is a stable SHA-256 prefix. It is used only for dedup/debugging
+/// when `IngestionConfig.redact_content` is enabled.
 pub fn redacted_content_marker(raw: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    raw.hash(&mut h);
-    format!("<redacted: len={} sha={:016x}>", raw.len(), h.finish())
+    let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+    format!("<redacted: len={} sha={}>", raw.len(), &digest[..16])
+}
+
+fn stable_event_id(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"astra-event-ingestion-v1");
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("evt-{:x}", hasher.finalize())
 }
 
 /// A journal event prepared for cloud ingestion.
@@ -310,20 +316,20 @@ impl IngestionEvent {
             })?
             .to_string();
 
-        // Deterministic event_id: hash of (session_id, turn, event_type, ts)
-        // This makes re-ingestion idempotent via INSERT IGNORE
-        let event_id = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            session_id.hash(&mut hasher);
-            event.turn.hash(&mut hasher);
-            format!("{:?}", event.event_type).hash(&mut hasher);
-            event.ts.hash(&mut hasher);
-            format!("evt-{:016x}", hasher.finish())
-        };
+        // Stable storage id: hash of (session_id, turn, event_type, ts).
+        // This makes re-ingestion idempotent via INSERT IGNORE across Rust
+        // versions and process boundaries.
+        let turn = event.turn.map(|turn| turn.to_string()).unwrap_or_default();
+        let event_type_name = format!("{:?}", event.event_type);
+        let event_id = stable_event_id(&[
+            "journal",
+            &session_id,
+            &turn,
+            &event_type_name,
+            event.ts.as_str(),
+        ]);
 
-        let event_type = format!("{:?}", event.event_type)
+        let event_type = event_type_name
             .chars()
             .flat_map(|c| {
                 if c.is_uppercase() {
@@ -413,18 +419,9 @@ impl IngestionEvent {
                 let Some(tool_name) = normalize_optional_name(Some(tc.name.clone())) else {
                     continue;
                 };
-                // Deterministic event_id: hash of (session_id, turn, tool_call, index)
-                let tc_event_id = {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    session_id.hash(&mut hasher);
-                    event.turn.hash(&mut hasher);
-                    "tool_call".hash(&mut hasher);
-                    i.hash(&mut hasher);
-                    tool_name.hash(&mut hasher);
-                    format!("evt-{:016x}", hasher.finish())
-                };
+                let index = i.to_string();
+                let tc_event_id =
+                    stable_event_id(&["tool_call", &main_event_id, &index, &tool_name]);
 
                 let raw_content = if tc.ok {
                     format!("{} completed in {}ms", tool_name, tc.ms)

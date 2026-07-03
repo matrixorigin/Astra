@@ -3689,6 +3689,20 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         detail: Option<&str>,
         display_label: Option<&str>,
     ) -> EdgeApprovalResult {
+        let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
+            return EdgeApprovalResult {
+                request_id: request_id.to_string(),
+                decision: "deny".to_string(),
+                reason: Some("approval requires session_id".to_string()),
+            };
+        };
+        let Some(run_id) = run_id.filter(|value| !value.trim().is_empty()) else {
+            return EdgeApprovalResult {
+                request_id: request_id.to_string(),
+                decision: "deny".to_string(),
+                reason: Some("approval requires run_id".to_string()),
+            };
+        };
         // `resolve_cloud_approval` writes to stderr only. Never bump `lines_written` here:
         // that counter drives stdout `MoveUp` when clearing streamed text before the first
         // tool line; mixing in stderr line counts caused a large blank gap after prompts.
@@ -3718,8 +3732,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             request_id: request_id.to_string(),
             decision,
             reason: None,
-            session_id: session_id.map(ToString::to_string),
-            run_id: run_id.unwrap_or_default().to_string(),
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
             tool_name: Some(tool.to_string()),
             approval_kind: Some(approval_kind),
         };
@@ -3740,6 +3754,26 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if requests.is_empty() {
             return Vec::new();
         }
+        let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
+            return requests
+                .iter()
+                .map(|request| EdgeApprovalResult {
+                    request_id: request.request_id.clone(),
+                    decision: "deny".to_string(),
+                    reason: Some("approval requires session_id".to_string()),
+                })
+                .collect();
+        };
+        let Some(run_id) = run_id.filter(|value| !value.trim().is_empty()) else {
+            return requests
+                .iter()
+                .map(|request| EdgeApprovalResult {
+                    request_id: request.request_id.clone(),
+                    decision: "deny".to_string(),
+                    reason: Some("approval requires run_id".to_string()),
+                })
+                .collect();
+        };
 
         self.render.stop_tool_stderr_running();
         self.render.stop_tool_stdout_anim();
@@ -3777,8 +3811,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 request_id: request.request_id.clone(),
                 decision,
                 reason: None,
-                session_id: session_id.map(ToString::to_string),
-                run_id: run_id.unwrap_or_default().to_string(),
+                session_id: session_id.to_string(),
+                run_id: run_id.to_string(),
                 tool_name: Some(request.tool.clone()),
                 approval_kind: Some(request.approval_kind),
             };

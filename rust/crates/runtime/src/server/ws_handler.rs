@@ -1016,157 +1016,159 @@ async fn handle_tool_approval(
         approval_ledger_value(approved, decision.reason.clone())
     }
 
-    let key = approval_callback_key(&conn.principal.user.user_id, request_id);
+    let registry = state.metrics_registry();
+    let Some(session_id) = conn.session_id.as_deref() else {
+        crate::server::interaction_metrics::record_approval_journal_write(
+            registry.as_ref(),
+            "skipped_no_context",
+        );
+        return;
+    };
+    let Some(run_id) = conn
+        .active_run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|run_id| !run_id.is_empty())
+    else {
+        crate::server::interaction_metrics::record_approval_journal_write(
+            registry.as_ref(),
+            "invalid_run",
+        );
+        return;
+    };
+    if let Err(error) = validate_session_id(session_id) {
+        tracing::warn!(
+            target: "astra_runtime::ws_callback",
+            user_id = %conn.principal.user.user_id,
+            request_id = %request_id,
+            session_id = %session_id,
+            error = %error,
+            "refusing approval response with invalid session_id"
+        );
+        crate::server::interaction_metrics::record_approval_journal_write(
+            registry.as_ref(),
+            "invalid_session",
+        );
+        return;
+    }
+
+    let key = approval_callback_key(&conn.principal.user.user_id, session_id, run_id, request_id);
     let mut value = approval_ledger_value(approved, reason.clone());
     let decision = if approved { "allow" } else { "deny" };
-    let registry = state.metrics_registry();
-
-    match (conn.session_id.as_deref(), conn.active_run_id.as_deref()) {
-        (Some(session_id), Some(run_id)) if !run_id.trim().is_empty() => {
-            if let Err(error) = validate_session_id(session_id) {
-                tracing::warn!(
-                    target: "astra_runtime::ws_callback",
-                    user_id = %conn.principal.user.user_id,
-                    request_id = %request_id,
-                    session_id = %session_id,
-                    error = %error,
-                    "refusing durable approval journal write for invalid session_id"
-                );
-                crate::server::interaction_metrics::record_approval_journal_write(
-                    registry.as_ref(),
-                    "invalid_session",
-                );
-            } else {
-                let required =
-                    match find_latest_approval_required_for_run(session_id, request_id, run_id) {
-                        Ok(Some(request)) => {
-                            crate::server::interaction_metrics::record_approval_journal_lookup(
-                                registry.as_ref(),
-                                "required",
-                                "hit",
-                            );
-                            Some(request)
-                        }
-                        Ok(None) => {
-                            crate::server::interaction_metrics::record_approval_journal_lookup(
-                                registry.as_ref(),
-                                "required",
-                                "miss",
-                            );
-                            None
-                        }
-                        Err(error) => {
-                            crate::server::interaction_metrics::record_approval_journal_lookup(
-                                registry.as_ref(),
-                                "required",
-                                "error",
-                            );
-                            tracing::warn!(
-                                target: "astra_runtime::ws_callback",
-                                user_id = %conn.principal.user.user_id,
-                                session_id = %session_id,
-                                run_id = %run_id,
-                                request_id = %request_id,
-                                error = %error,
-                                "approval journal required lookup failed"
-                            );
-                            None
-                        }
-                    };
-                let approval_turn = required.as_ref().and_then(|request| request.turn);
-                let tool_name = required
-                    .as_ref()
-                    .and_then(|request| request.tool_name.as_deref());
-                let approval_kind = required
-                    .as_ref()
-                    .and_then(|request| request.approval_kind.as_deref());
-                match append_approval_decision_for_run_if_absent(
-                    session_id,
-                    approval_turn,
-                    request_id,
-                    run_id,
-                    tool_name,
-                    approval_kind,
-                    decision,
-                    reason.as_deref(),
-                ) {
-                    Ok(ApprovalDecisionAppendOutcome::Appended) => {
-                        crate::server::interaction_metrics::record_approval_journal_lookup(
-                            registry.as_ref(),
-                            "decision",
-                            "miss",
-                        );
-                        crate::server::interaction_metrics::record_approval_journal_write(
-                            registry.as_ref(),
-                            "ok",
-                        );
-                    }
-                    Ok(ApprovalDecisionAppendOutcome::Idempotent) => {
-                        crate::server::interaction_metrics::record_approval_journal_lookup(
-                            registry.as_ref(),
-                            "decision",
-                            "hit",
-                        );
-                        crate::server::interaction_metrics::record_approval_journal_write(
-                            registry.as_ref(),
-                            "idempotent",
-                        );
-                    }
-                    Ok(ApprovalDecisionAppendOutcome::Conflict(existing)) => {
-                        crate::server::interaction_metrics::record_approval_journal_lookup(
-                            registry.as_ref(),
-                            "decision",
-                            "hit",
-                        );
-                        crate::server::interaction_metrics::record_approval_journal_write(
-                            registry.as_ref(),
-                            "conflict",
-                        );
-                        tracing::warn!(
-                            target: "astra_runtime::ws_callback",
-                            user_id = %conn.principal.user.user_id,
-                            session_id = %session_id,
-                            run_id = %run_id,
-                            request_id = %request_id,
-                            existing_decision = %existing.decision,
-                            incoming_decision = %decision,
-                            "approval decision already durable; preserving existing decision for local ledger"
-                        );
-                        value = approval_ledger_value_from_journal(&existing);
-                    }
-                    Err(error) => {
-                        crate::server::interaction_metrics::record_approval_journal_lookup(
-                            registry.as_ref(),
-                            "decision",
-                            "error",
-                        );
-                        crate::server::interaction_metrics::record_approval_journal_write(
-                            registry.as_ref(),
-                            "error",
-                        );
-                        tracing::warn!(
-                            target: "astra_runtime::ws_callback",
-                            user_id = %conn.principal.user.user_id,
-                            session_id = %session_id,
-                            run_id = %run_id,
-                            request_id = %request_id,
-                            error = %error,
-                            "failed to persist approval decision journal event"
-                        );
-                    }
-                }
-            }
+    let required = match find_latest_approval_required_for_run(session_id, request_id, run_id) {
+        Ok(Some(request)) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "hit",
+            );
+            Some(request)
         }
-        (Some(_), Some(_)) => {
+        Ok(None) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "miss",
+            );
+            None
+        }
+        Err(error) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "error",
+            );
+            tracing::warn!(
+                target: "astra_runtime::ws_callback",
+                user_id = %conn.principal.user.user_id,
+                session_id = %session_id,
+                run_id = %run_id,
+                request_id = %request_id,
+                error = %error,
+                "approval journal required lookup failed"
+            );
+            None
+        }
+    };
+    let approval_turn = required.as_ref().and_then(|request| request.turn);
+    let tool_name = required
+        .as_ref()
+        .and_then(|request| request.tool_name.as_deref());
+    let approval_kind = required
+        .as_ref()
+        .and_then(|request| request.approval_kind.as_deref());
+    match append_approval_decision_for_run_if_absent(
+        session_id,
+        approval_turn,
+        request_id,
+        run_id,
+        tool_name,
+        approval_kind,
+        decision,
+        reason.as_deref(),
+    ) {
+        Ok(ApprovalDecisionAppendOutcome::Appended) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "miss",
+            );
             crate::server::interaction_metrics::record_approval_journal_write(
                 registry.as_ref(),
-                "invalid_run",
+                "ok",
             );
         }
-        _ => {
+        Ok(ApprovalDecisionAppendOutcome::Idempotent) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "hit",
+            );
             crate::server::interaction_metrics::record_approval_journal_write(
                 registry.as_ref(),
-                "skipped_no_context",
+                "idempotent",
+            );
+        }
+        Ok(ApprovalDecisionAppendOutcome::Conflict(existing)) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "hit",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "conflict",
+            );
+            tracing::warn!(
+                target: "astra_runtime::ws_callback",
+                user_id = %conn.principal.user.user_id,
+                session_id = %session_id,
+                run_id = %run_id,
+                request_id = %request_id,
+                existing_decision = %existing.decision,
+                incoming_decision = %decision,
+                "approval decision already durable; preserving existing decision for local ledger"
+            );
+            value = approval_ledger_value_from_journal(&existing);
+        }
+        Err(error) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "error",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "error",
+            );
+            tracing::warn!(
+                target: "astra_runtime::ws_callback",
+                user_id = %conn.principal.user.user_id,
+                session_id = %session_id,
+                run_id = %run_id,
+                request_id = %request_id,
+                error = %error,
+                "failed to persist approval decision journal event"
             );
         }
     }
@@ -5204,7 +5206,12 @@ mod tests {
         assert_eq!(decision.approval_kind.as_deref(), Some("standard"));
 
         let ledger = state.edge_callback_ledger.lock().await;
-        let key = astra_turn_core::edge_ledger::approval_callback_key("u1", "req-approval-ws");
+        let key = astra_turn_core::edge_ledger::approval_callback_key(
+            "u1",
+            "sess-approval-ws",
+            "run-approval-ws",
+            "req-approval-ws",
+        );
         assert_eq!(
             ledger.get(&key),
             Some(&serde_json::json!({
@@ -5257,8 +5264,12 @@ mod tests {
         )
         .await;
 
-        let callback_key =
-            astra_turn_core::edge_ledger::approval_callback_key("u1", "req-approval-no-sticky");
+        let callback_key = astra_turn_core::edge_ledger::approval_callback_key(
+            "u1",
+            "sess-approval-no-sticky",
+            "run-approval-no-sticky",
+            "req-approval-no-sticky",
+        );
         assert!(
             callback_state
                 .edge_callback_ledger

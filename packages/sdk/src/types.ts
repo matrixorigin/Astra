@@ -910,6 +910,11 @@ export type RunProjectionResponse = {
   recent_events: Array<StreamEvent | Record<string, unknown>>;
 };
 
+export type RunProjectionRepairResponse = {
+  repaired: boolean;
+  projection: RunProjectionResponse;
+};
+
 export type RunInputRequestBody = {
   idempotencyKey: string;
   input?: unknown;
@@ -1363,7 +1368,8 @@ export type ApprovalRespondRequestBody = {
   request_id: string;
   decision: ApprovalDecision;
   reason?: string;
-  session_id?: string;
+  session_id: string;
+  run_id: string;
   tool_name?: string;
   approval_kind?: ApprovalKind;
 };

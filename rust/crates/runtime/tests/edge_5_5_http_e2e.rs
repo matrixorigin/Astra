@@ -8,7 +8,8 @@ use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
     turn::cloud_tool_delivery::{
-        ApprovalAuditContext, deliver_tool_calls_through_edge_ledger, wait_approval_ledger_for_tool,
+        ApprovalAuditContext, deliver_tool_calls_through_edge_ledger_with_approval_audit,
+        wait_approval_ledger_for_tool,
     },
     turn::edge_ledger::{
         LEDGER_MAX_ENTRIES, approval_callback_key, take_ledger_entry, tool_callback_key,
@@ -116,6 +117,20 @@ impl TurnAuxiliaryEventWriter for RecordingAuxiliaryEventWriter {
     }
 }
 
+fn approval_audit(session_id: &str, run_id: &str) -> ApprovalAuditContext {
+    ApprovalAuditContext {
+        user_id: "e2e-user".to_string(),
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        turn: 3,
+        agent_id: None,
+        parent_event_id: None,
+        parent_event_ids: Vec::new(),
+        causal_chain_id: format!("chain-{run_id}"),
+        auxiliary_event_writer: Arc::new(RecordingAuxiliaryEventWriter::default()),
+    }
+}
+
 fn e2e_app() -> (
     Router,
     Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
@@ -187,11 +202,16 @@ async fn post_tools_result_populates_ledger_then_take_consumes() {
 #[tokio::test]
 async fn post_approval_respond_populates_ledger_then_take_consumes() {
     let (app, ledger) = e2e_app();
-    let key = approval_callback_key("e2e-user", "ap-9");
+    let key = approval_callback_key("e2e-user", "sess-ledger", "run-ledger", "ap-9");
     let (st, j) = post_json(
         app.clone(),
         "/approval/respond",
-        json!({"request_id": "ap-9", "decision": "allow", "run_id": "run-ledger"}),
+        json!({
+            "request_id": "ap-9",
+            "decision": "allow",
+            "session_id": "sess-ledger",
+            "run_id": "run-ledger"
+        }),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -215,7 +235,7 @@ async fn post_approval_respond_journals_when_ledger_is_full() {
         }
     }
 
-    let key = approval_callback_key("e2e-user", "ap-overflow");
+    let key = approval_callback_key("e2e-user", "sess-approval", "run-approval", "ap-overflow");
     let (st, j) = post_json(
         app.clone(),
         "/approval/respond",
@@ -274,7 +294,12 @@ async fn approval_callback_on_other_appstate_replays_from_journal_without_sticky
         callback_ledger
             .lock()
             .await
-            .contains_key(&approval_callback_key("e2e-user", "ap-no-sticky")),
+            .contains_key(&approval_callback_key(
+                "e2e-user",
+                "sess-no-sticky",
+                "run-no-sticky",
+                "ap-no-sticky"
+            )),
         "callback pod may keep its same-pod fast-path ledger entry"
     );
     assert!(
@@ -403,7 +428,12 @@ fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
         "concurrent duplicate approvals should record one approval decision"
     );
 
-    let key = approval_callback_key("e2e-user", "ap-concurrent-dup");
+    let key = approval_callback_key(
+        "e2e-user",
+        "sess-concurrent-dup",
+        "run-concurrent-dup",
+        "ap-concurrent-dup",
+    );
     assert!(ledger.blocking_lock().contains_key(&key));
 }
 
@@ -454,7 +484,7 @@ async fn distinct_payload_duplicate_approval_second_is_409_conflict() {
         "distinct-payload duplicate must return 409: {j2:?}"
     );
 
-    let key = approval_callback_key("e2e-user", "ap-conflict");
+    let key = approval_callback_key("e2e-user", "sess-conflict", "run-conflict", "ap-conflict");
     let stored = ledger
         .lock()
         .await
@@ -497,12 +527,18 @@ async fn post_tool_result_rejects_when_ledger_is_full() {
 #[tokio::test]
 async fn http_handler_payload_matches_delivery_parser() {
     let (app, ledger) = e2e_app();
-    post_json(
+    let (status, body) = post_json(
         app.clone(),
         "/approval/respond",
-        json!({"request_id": "w-chain", "decision": "allow", "run_id": "run-chain"}),
+        json!({
+            "request_id": "w-chain",
+            "decision": "allow",
+            "session_id": "sess-chain",
+            "run_id": "run-chain"
+        }),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
     let tc = json!({
         "id": "w-chain",
         "type": "function",
@@ -518,9 +554,15 @@ async fn http_handler_payload_matches_delivery_parser() {
             );
         }
     });
-    let d =
-        deliver_tool_calls_through_edge_ledger(&ledger, "e2e-user", &[tc], Duration::from_secs(2))
-            .await;
+    let audit = approval_audit("sess-chain", "run-chain");
+    let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(
+        &ledger,
+        "e2e-user",
+        &[tc],
+        Duration::from_secs(2),
+        Some(&audit),
+    )
+    .await;
     let approval = d
         .sse_maps
         .iter()
@@ -547,12 +589,18 @@ async fn http_handler_payload_matches_delivery_parser() {
 async fn http_handler_payload_supports_batched_approval_delivery() {
     let (app, ledger) = e2e_app();
     for request_id in ["w-batch-1", "w-batch-2"] {
-        post_json(
+        let (status, body) = post_json(
             app.clone(),
             "/approval/respond",
-            json!({"request_id": request_id, "decision": "allow", "run_id": "run-batch"}),
+            json!({
+                "request_id": request_id,
+                "decision": "allow",
+                "session_id": "sess-batch",
+                "run_id": "run-batch"
+            }),
         )
         .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
     }
     tokio::spawn({
         let ledger = ledger.clone();
@@ -581,9 +629,15 @@ async fn http_handler_payload_supports_batched_approval_delivery() {
             "function": {"name": "write_file", "arguments": r#"{"path":"b.rs","content":"2"}"#}
         }),
     ];
-    let d =
-        deliver_tool_calls_through_edge_ledger(&ledger, "e2e-user", &tcs, Duration::from_secs(2))
-            .await;
+    let audit = approval_audit("sess-batch", "run-batch");
+    let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(
+        &ledger,
+        "e2e-user",
+        &tcs,
+        Duration::from_secs(2),
+        Some(&audit),
+    )
+    .await;
 
     assert!(
         d.sse_maps

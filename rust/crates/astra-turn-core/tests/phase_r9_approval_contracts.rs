@@ -1,7 +1,7 @@
 //! Phase-R9 adversarial contract pins for approval-side behavior.
 //!
 //! Locks in:
-//!   * `approval_callback_key` format (no session_id component)
+//!   * `approval_callback_key` format (session/run scoped)
 //!   * `persist_denied_tool_result` tool_call_id + shape
 //!   * `DenialTracker` consecutive-denial ceiling
 //!
@@ -15,24 +15,22 @@ use astra_turn_core::approval_fingerprint::{
 };
 use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key};
 
-/// Pin: `approval_callback_key` format is EXACTLY `"{user}:approval:{req}"`
-/// — it intentionally does NOT carry a session_id component. A future
-/// reviewer wanting per-session isolation will hit this test and see the
-/// gap documented here.
+/// Pin: `approval_callback_key` format is EXACTLY
+/// `"{user}:approval:{session}:{run}:{req}"`.
 #[test]
-fn approval_callback_key_has_no_session_id_exact_format_pin() {
+fn approval_callback_key_is_session_and_run_scoped() {
     assert_eq!(
-        approval_callback_key("user-42", "req-abc"),
-        "user-42:approval:req-abc"
+        approval_callback_key("user-42", "sess-9", "run-7", "req-abc"),
+        "user-42:approval:sess-9:run-7:req-abc"
     );
-    assert_eq!(approval_callback_key("", ""), ":approval:");
+    assert_eq!(approval_callback_key("", "", "", ""), ":approval:::");
     // Crossed with tool_callback_key to double-check namespace separator.
     assert_eq!(
         tool_callback_key("user-42", "req-abc"),
         "user-42:tool:req-abc"
     );
     assert_ne!(
-        approval_callback_key("user-42", "req-abc"),
+        approval_callback_key("user-42", "sess-9", "run-7", "req-abc"),
         tool_callback_key("user-42", "req-abc"),
         "approval and tool ledger namespaces must never collide"
     );

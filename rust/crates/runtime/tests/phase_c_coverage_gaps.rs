@@ -200,8 +200,11 @@ async fn concurrent_disjoint_approval_requests_do_not_cross_contaminate() {
     let ledger: Arc<TokioMutex<HashMap<String, serde_json::Value>>> =
         Arc::new(TokioMutex::new(HashMap::new()));
     let (tx, mut rx) = mpsc::channel::<Value>(1);
-    let gate = Arc::new(WebSocketApprovalGate::new(
+    let gate = Arc::new(WebSocketApprovalGate::new_with_journal_context(
         "user-concurrent".into(),
+        "sess-concurrent".into(),
+        "run-concurrent".into(),
+        Some(1),
         ledger.clone(),
         tx,
     ));
@@ -217,10 +220,14 @@ async fn concurrent_disjoint_approval_requests_do_not_cross_contaminate() {
         // Fulfil request B first with Approved, then request A with Denied.
         let key_b = approval_callback_key(
             "user-concurrent",
+            req_b["session_id"].as_str().expect("req_b session"),
+            req_b["run_id"].as_str().expect("req_b run"),
             req_b["request_id"].as_str().expect("req_b id"),
         );
         let key_a = approval_callback_key(
             "user-concurrent",
+            req_a["session_id"].as_str().expect("req_a session"),
+            req_a["run_id"].as_str().expect("req_a run"),
             req_a["request_id"].as_str().expect("req_a id"),
         );
         {
