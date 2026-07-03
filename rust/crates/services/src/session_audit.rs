@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::query;
+use sqlx::{MySql, Pool, query};
 
 use crate::cost_ledger::{CostLedger, CostLedgerEntry};
 use crate::db_row::RowExt as RuntimePromotionAuditRow;
@@ -113,6 +113,27 @@ fn audit_row_u32(row: &impl SessionAuditRow, context: &str, column: &str) -> Aud
             format!("expected non-negative u32-compatible value, got {value}"),
         )
     })
+}
+
+fn audit_row_optional_u32(
+    row: &impl SessionAuditRow,
+    context: &str,
+    column: &str,
+) -> AuditResult<Option<u32>> {
+    let value = row
+        .optional_i64_column(column)
+        .map_err(|error| audit_decode_error(context, column, error))?;
+    value
+        .map(|value| {
+            u32::try_from(value).map_err(|_| {
+                audit_decode_error(
+                    context,
+                    column,
+                    format!("expected non-negative u32-compatible value, got {value}"),
+                )
+            })
+        })
+        .transpose()
 }
 
 fn audit_row_u64(row: &impl SessionAuditRow, context: &str, column: &str) -> AuditResult<u64> {
@@ -428,7 +449,7 @@ fn audit_metadata_string_vec_field(
     })
 }
 
-fn audit_pagination_offset(page: u32, per_page: u32, context: &str) -> AuditResult<u32> {
+fn audit_pagination_rows_to_skip(page: u32, per_page: u32, context: &str) -> AuditResult<u32> {
     page.max(1)
         .checked_sub(1)
         .and_then(|page_index| page_index.checked_mul(per_page.max(1)))
@@ -437,6 +458,10 @@ fn audit_pagination_offset(page: u32, per_page: u32, context: &str) -> AuditResu
                 "session audit {context} pagination offset overflow"
             ))
         })
+}
+
+fn audit_pagination_offset(page: u32, per_page: u32, context: &str) -> AuditResult<u32> {
+    audit_pagination_rows_to_skip(page, per_page, context)
 }
 
 fn turn_list_fallback_turn(offset: u32, row_index: usize) -> AuditResult<u32> {
@@ -455,8 +480,8 @@ fn turn_list_fallback_turn(offset: u32, row_index: usize) -> AuditResult<u32> {
         })
 }
 
-fn turn_list_offset(page: u32, per_page: u32) -> AuditResult<u32> {
-    audit_pagination_offset(page, per_page.clamp(1, 100), "list_turns")
+fn turn_list_rows_to_skip(page: u32, per_page: u32) -> AuditResult<u32> {
+    audit_pagination_rows_to_skip(page, per_page.clamp(1, 100), "list_turns")
 }
 
 fn turn_summary_from_row(
@@ -476,6 +501,8 @@ fn turn_summary_from_row(
     let model = audit_row_optional_string(row, "turn_list_row", "llm_model_used")?;
     let created_at = audit_row_string(row, "turn_list_row", "created_at")?;
 
+    let fallback_turn =
+        audit_row_optional_u32(row, "turn_list_row", "turn_seq")?.unwrap_or(fallback_turn);
     let turn = audit_metadata_u32_field(&metadata, "turn_list_row", "turn", fallback_turn)?;
     let tool_calls = extract_tool_calls_from_metadata(&metadata);
     let has_error = metadata
@@ -876,6 +903,129 @@ mod agent_events_content_cap {
 const TURN_LIST_TOTAL_SQL: &str = "SELECT COALESCE(MAX(turn_seq), COUNT(CASE WHEN event_type = 'user_query' THEN 1 END), 0) AS cnt FROM agent_events \
      WHERE session_id = ? AND user_id = ?";
 
+const TURN_LIST_SEEK_CHUNK_LIMIT: u32 = 100;
+
+fn turn_list_cursor_from_params(params: &TurnListParams) -> AuditResult<Option<TurnListCursor>> {
+    match (&params.after_created_at, &params.after_event_id) {
+        (Some(created_at), Some(event_id)) => {
+            if created_at.trim().is_empty() || event_id.trim().is_empty() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "after_created_at and after_event_id must be non-empty",
+                ));
+            }
+            Ok(Some(TurnListCursor {
+                created_at: created_at.clone(),
+                event_id: event_id.clone(),
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "after_created_at and after_event_id must be provided together",
+        )),
+    }
+}
+
+fn turn_list_cursor_from_row(
+    row: &impl SessionAuditRow,
+    context: &str,
+) -> AuditResult<TurnListCursor> {
+    Ok(TurnListCursor {
+        created_at: audit_row_string(row, context, "created_at")?,
+        event_id: audit_row_string(row, context, "event_id")?,
+    })
+}
+
+async fn fetch_turn_cursor_rows(
+    pool: &Pool<MySql>,
+    session_id: &str,
+    user_id: &str,
+    cursor: Option<&TurnListCursor>,
+    limit: u32,
+) -> AuditResult<Vec<sqlx::mysql::MySqlRow>> {
+    let sql = if cursor.is_some() {
+        "SELECT event_id, CAST(created_at AS CHAR) AS created_at \
+         FROM agent_events \
+         WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
+           AND (created_at > ? OR (created_at = ? AND event_id > ?)) \
+         ORDER BY created_at ASC, event_id ASC \
+         LIMIT ?"
+    } else {
+        "SELECT event_id, CAST(created_at AS CHAR) AS created_at \
+         FROM agent_events \
+         WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
+         ORDER BY created_at ASC, event_id ASC \
+         LIMIT ?"
+    };
+    let mut q = query(sql).bind(session_id).bind(user_id);
+    if let Some(cursor) = cursor {
+        q = q
+            .bind(&cursor.created_at)
+            .bind(&cursor.created_at)
+            .bind(&cursor.event_id);
+    }
+    q.bind(limit).fetch_all(pool).await.map_err(internal_error)
+}
+
+async fn turn_list_cursor_after_skipping(
+    pool: &Pool<MySql>,
+    session_id: &str,
+    user_id: &str,
+    mut rows_to_skip: u32,
+) -> AuditResult<Option<TurnListCursor>> {
+    let mut cursor = None;
+    while rows_to_skip > 0 {
+        let limit = rows_to_skip.min(TURN_LIST_SEEK_CHUNK_LIMIT);
+        let rows =
+            fetch_turn_cursor_rows(pool, session_id, user_id, cursor.as_ref(), limit).await?;
+        if rows.is_empty() {
+            return Ok(cursor);
+        }
+        for row in &rows {
+            cursor = Some(turn_list_cursor_from_row(row, "turn_list_cursor")?);
+        }
+        rows_to_skip = rows_to_skip.saturating_sub(rows.len() as u32);
+        if rows.len() < limit as usize {
+            return Ok(cursor);
+        }
+    }
+    Ok(cursor)
+}
+
+async fn fetch_turn_page_rows(
+    pool: &Pool<MySql>,
+    session_id: &str,
+    user_id: &str,
+    cursor: Option<&TurnListCursor>,
+    limit: u32,
+) -> AuditResult<Vec<sqlx::mysql::MySqlRow>> {
+    let turn_sql = format!(
+        "SELECT event_id, turn_seq, \
+         SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
+         CAST(token_usage AS CHAR) AS token_usage, llm_model_used, \
+         COALESCE(CAST(metadata AS CHAR), '{{}}') AS metadata, CAST(created_at AS CHAR) AS created_at \
+         FROM agent_events \
+         WHERE session_id = ? AND user_id = ? AND event_type = 'user_query'{} \
+         ORDER BY created_at ASC, event_id ASC \
+         LIMIT ?",
+        agent_events_content_cap::TURN_LIST_PREVIEW,
+        if cursor.is_some() {
+            " AND (created_at > ? OR (created_at = ? AND event_id > ?))"
+        } else {
+            ""
+        }
+    );
+    let mut q = query(&turn_sql).bind(session_id).bind(user_id);
+    if let Some(cursor) = cursor {
+        q = q
+            .bind(&cursor.created_at)
+            .bind(&cursor.created_at)
+            .bind(&cursor.event_id);
+    }
+    q.bind(limit).fetch_all(pool).await.map_err(internal_error)
+}
+
 // ── Response types ───────────────────────────────────────────────────────────
 
 /// High-level session audit summary.
@@ -941,6 +1091,14 @@ pub struct TurnListResponse {
     pub total: u32,
     pub page: u32,
     pub per_page: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<TurnListCursor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnListCursor {
+    pub created_at: String,
+    pub event_id: String,
 }
 
 /// A single context-assembly trace entry surfaced via the audit API.
@@ -1557,6 +1715,8 @@ pub struct TurnListParams {
     pub page: u32,
     #[serde(default = "default_per_page")]
     pub per_page: u32,
+    pub after_created_at: Option<String>,
+    pub after_event_id: Option<String>,
 }
 
 /// Query parameters for session list endpoint.
@@ -1893,7 +2053,12 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         let page = params.page.max(1);
         let per_page = params.per_page.clamp(1, 100);
-        let offset = turn_list_offset(page, per_page)?;
+        let explicit_cursor = turn_list_cursor_from_params(params)?;
+        let rows_to_skip = if explicit_cursor.is_some() {
+            0
+        } else {
+            turn_list_rows_to_skip(page, per_page)?
+        };
 
         let count_row = query(TURN_LIST_TOTAL_SQL)
             .bind(session_id)
@@ -1903,31 +2068,37 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .map_err(internal_error)?;
         let total = audit_row_u32(&count_row, "turn_list_count", "cnt")?;
 
-        // Fetch turn events with pagination (cap content in SQL — matches preview length)
-        let turn_sql = format!(
-            "SELECT SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
-             CAST(token_usage AS CHAR) AS token_usage, llm_model_used, \
-             COALESCE(CAST(metadata AS CHAR), '{{}}') AS metadata, CAST(created_at AS CHAR) AS created_at \
-             FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
-             ORDER BY created_at ASC \
-             LIMIT ? OFFSET ?",
-            agent_events_content_cap::TURN_LIST_PREVIEW
-        );
-        let rows = query(&turn_sql)
-            .bind(session_id)
-            .bind(user_id)
-            .bind(per_page)
-            .bind(offset)
-            .fetch_all(&pool)
-            .await
-            .map_err(internal_error)?;
+        let derived_cursor = if explicit_cursor.is_none() {
+            turn_list_cursor_after_skipping(&pool, session_id, user_id, rows_to_skip).await?
+        } else {
+            None
+        };
+        let cursor = explicit_cursor.as_ref().or(derived_cursor.as_ref());
+        let mut rows = fetch_turn_page_rows(
+            &pool,
+            session_id,
+            user_id,
+            cursor,
+            per_page.saturating_add(1),
+        )
+        .await?;
+        let has_more = rows.len() > per_page as usize;
+        if has_more {
+            rows.truncate(per_page as usize);
+        }
+        let next_cursor = if has_more {
+            rows.last()
+                .map(|row| turn_list_cursor_from_row(row, "turn_list_next_cursor"))
+                .transpose()?
+        } else {
+            None
+        };
 
         let turns: Vec<TurnSummary> = rows
             .iter()
             .enumerate()
             .map(|(i, row)| {
-                let fallback_turn = turn_list_fallback_turn(offset, i)?;
+                let fallback_turn = turn_list_fallback_turn(rows_to_skip, i)?;
                 turn_summary_from_row(row, fallback_turn)
             })
             .collect::<AuditResult<Vec<_>>>()?;
@@ -1937,6 +2108,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             total,
             page,
             per_page,
+            next_cursor,
         })
     }
 
@@ -1950,23 +2122,53 @@ impl SessionAuditService for DatabaseSessionAuditService {
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
 
-        // Find the turn event by position (LIMIT/OFFSET) — turns are ordered by created_at.
-        // This avoids fetching the full event content for every turn in the session.
-        let offset = turn.saturating_sub(1);
+        let turn = turn.max(1);
         let row = query(
             "SELECT event_id, content, CAST(token_usage AS CHAR) AS token_usage, \
              llm_model_used, COALESCE(CAST(metadata AS CHAR), '{}') AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
-             ORDER BY created_at ASC \
-             LIMIT 1 OFFSET ?",
+             WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' AND turn_seq = ? \
+             ORDER BY created_at ASC, event_id ASC \
+             LIMIT 1",
         )
         .bind(session_id)
         .bind(user_id)
-        .bind(offset)
+        .bind(turn)
         .fetch_optional(&pool)
         .await
         .map_err(internal_error)?;
+
+        let row = if row.is_some() {
+            row
+        } else {
+            let rows_to_skip = turn.saturating_sub(1);
+            let cursor =
+                turn_list_cursor_after_skipping(&pool, session_id, user_id, rows_to_skip).await?;
+            let sql = if cursor.is_some() {
+                "SELECT event_id, content, CAST(token_usage AS CHAR) AS token_usage, \
+                 llm_model_used, COALESCE(CAST(metadata AS CHAR), '{}') AS metadata, CAST(created_at AS CHAR) AS created_at \
+                 FROM agent_events \
+                 WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
+                   AND (created_at > ? OR (created_at = ? AND event_id > ?)) \
+                 ORDER BY created_at ASC, event_id ASC \
+                 LIMIT 1"
+            } else {
+                "SELECT event_id, content, CAST(token_usage AS CHAR) AS token_usage, \
+                 llm_model_used, COALESCE(CAST(metadata AS CHAR), '{}') AS metadata, CAST(created_at AS CHAR) AS created_at \
+                 FROM agent_events \
+                 WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
+                 ORDER BY created_at ASC, event_id ASC \
+                 LIMIT 1"
+            };
+            let mut q = query(sql).bind(session_id).bind(user_id);
+            if let Some(cursor) = cursor.as_ref() {
+                q = q
+                    .bind(&cursor.created_at)
+                    .bind(&cursor.created_at)
+                    .bind(&cursor.event_id);
+            }
+            q.fetch_optional(&pool).await.map_err(internal_error)?
+        };
 
         let row = row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Turn not found"))?;
         let parent = turn_detail_parent_from_row(&row)?;
@@ -2795,6 +2997,7 @@ mod tests {
         mismatched_tool_counts: bool,
         metadata: &'static str,
         token_usage: Option<&'static str>,
+        turn_seq: Option<i64>,
         model: Option<&'static str>,
         pricing_json: Option<&'static str>,
     }
@@ -2841,6 +3044,7 @@ mod tests {
                 token_usage: Some(
                     r#"{"input_tokens": 10, "cached_input_tokens": 2, "cache_creation_tokens": 0, "output_tokens": 5, "total_tokens": 17}"#,
                 ),
+                turn_seq: Some(42),
                 model: Some("gpt-5"),
                 pricing_json: Some(r#"{"prompt": 2.0, "completion": 8.0, "cache_read": 0.5}"#),
             }
@@ -2891,6 +3095,13 @@ mod tests {
         fn with_token_usage(token_usage: &'static str) -> Self {
             Self {
                 token_usage: Some(token_usage),
+                ..Self::complete()
+            }
+        }
+
+        fn without_turn_seq() -> Self {
+            Self {
+                turn_seq: None,
                 ..Self::complete()
             }
         }
@@ -3028,6 +3239,14 @@ mod tests {
             })
         }
 
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            Ok(match column {
+                "turn_seq" => self.turn_seq,
+                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            })
+        }
+
         fn f64_column(&self, column: &str) -> Result<f64, sqlx::Error> {
             self.fail_if_needed(column)?;
             if self.negative_column == Some(column) {
@@ -3145,6 +3364,32 @@ mod tests {
     }
 
     #[test]
+    fn session_audit_turn_queries_use_seek_pagination_not_sql_offset() {
+        let source = include_str!("session_audit.rs");
+        let impl_body = source
+            .split("impl SessionAuditService for DatabaseSessionAuditService")
+            .nth(1)
+            .expect("database audit service impl");
+        let list_turns_body = impl_body
+            .split("async fn list_turns")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn get_turn_detail").next())
+            .expect("list_turns body");
+        let detail_body = impl_body
+            .split("async fn get_turn_detail")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn list_context_traces").next())
+            .expect("get_turn_detail body");
+        assert!(!list_turns_body.contains(" OFFSET "));
+        assert!(!list_turns_body.contains("OFFSET ?"));
+        assert!(!detail_body.contains(" OFFSET "));
+        assert!(!detail_body.contains("OFFSET ?"));
+        assert!(list_turns_body.contains("turn_list_cursor_after_skipping"));
+        assert!(detail_body.contains("turn_seq = ?"));
+        assert!(detail_body.contains("turn_list_cursor_after_skipping"));
+    }
+
+    #[test]
     fn audit_token_aggregates_use_core_token_events() {
         let source = include_str!("session_audit.rs");
         let impl_body = source
@@ -3197,11 +3442,14 @@ mod tests {
 
     #[test]
     fn session_audit_turn_list_pagination_offset_checks_overflow() {
-        assert_eq!(turn_list_offset(0, 0).expect("minimum pagination"), 0);
-        assert_eq!(turn_list_offset(3, 25).expect("normal pagination"), 50);
+        assert_eq!(turn_list_rows_to_skip(0, 0).expect("minimum pagination"), 0);
+        assert_eq!(
+            turn_list_rows_to_skip(3, 25).expect("normal pagination"),
+            50
+        );
 
         assert_audit_internal_error_mentions(
-            turn_list_offset(u32::MAX, 100),
+            turn_list_rows_to_skip(u32::MAX, 100),
             "pagination offset overflow",
         );
     }
@@ -3224,9 +3472,19 @@ mod tests {
             &FakeSessionAuditRow::with_metadata(r#"{"duration_ms": 11}"#),
             7,
         )
-        .expect("turn row without metadata turn uses fallback");
-        assert_eq!(fallback_turn.turn, 7);
+        .expect("turn row without metadata turn uses turn_seq fallback");
+        assert_eq!(fallback_turn.turn, 42);
         assert_eq!(fallback_turn.duration_ms, 11);
+
+        let legacy_fallback_turn = turn_summary_from_row(
+            &FakeSessionAuditRow {
+                metadata: r#"{"duration_ms": 11}"#,
+                ..FakeSessionAuditRow::without_turn_seq()
+            },
+            7,
+        )
+        .expect("legacy turn row without turn_seq uses computed fallback");
+        assert_eq!(legacy_fallback_turn.turn, 7);
 
         assert_audit_internal_error_mentions(
             turn_summary_from_row(&FakeSessionAuditRow::fail_on("content"), 7),
@@ -3964,6 +4222,41 @@ mod tests {
         let p: TurnListParams = serde_json::from_str("{}").unwrap();
         assert_eq!(p.page, 1);
         assert_eq!(p.per_page, 20);
+        assert!(p.after_created_at.is_none());
+        assert!(p.after_event_id.is_none());
+    }
+
+    #[test]
+    fn turn_list_cursor_params_must_be_complete_and_non_empty() {
+        let params = TurnListParams {
+            page: 1,
+            per_page: 20,
+            after_created_at: Some("2026-07-03 12:00:00".to_string()),
+            after_event_id: Some("event-1".to_string()),
+        };
+        assert_eq!(
+            turn_list_cursor_from_params(&params).expect("cursor params decode"),
+            Some(TurnListCursor {
+                created_at: "2026-07-03 12:00:00".to_string(),
+                event_id: "event-1".to_string(),
+            })
+        );
+
+        let missing_event_id = TurnListParams {
+            after_event_id: None,
+            ..params.clone()
+        };
+        let (status, _) = turn_list_cursor_from_params(&missing_event_id)
+            .expect_err("missing cursor side should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let blank_created_at = TurnListParams {
+            after_created_at: Some(" ".to_string()),
+            ..params
+        };
+        let (status, _) = turn_list_cursor_from_params(&blank_created_at)
+            .expect_err("blank cursor side should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
