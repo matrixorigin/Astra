@@ -220,6 +220,28 @@ test('reasoning segment completion stays in thinking state while streaming', asy
   await expect(page.getByText(/^Thought/)).not.toBeVisible();
 });
 
+test('thinking transcript allows manual scrollback while streaming', async ({ page }) => {
+  await mockChatApis(page, {
+    activeRunStatus: 'running',
+    streamDelayMs: 20_000,
+  });
+  await page.goto('/e2e/chat-view?status=running&long=1&reasoning=segmentdone');
+
+  const scroller = page.getByTestId('chat-scroll-container');
+  await expect(page.getByText(/Thinking \d+s/).first()).toBeVisible();
+  await scroller.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  const bottomScrollTop = await scroller.evaluate((element) => element.scrollTop);
+
+  await scroller.hover();
+  await page.mouse.wheel(0, -700);
+
+  await expect.poll(async () => scroller.evaluate((element) => element.scrollTop)).toBeLessThan(
+    bottomScrollTop,
+  );
+});
+
 test('activity panel shows live work without main-chat metric chips', async ({ page }) => {
   await mockChatApis(page, {
     activeRunStatus: 'running',

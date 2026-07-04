@@ -65,6 +65,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   // ── scrolling ──────────────────────────────────────────────────────────────
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
+  const touchStartYRef = useRef<number | null>(null);
   const pendingStartedRef = useRef<string | null>(null);
 
   // ── misc ───────────────────────────────────────────────────────────────────
@@ -331,11 +332,26 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         <div
           ref={scrollRef}
           data-testid="chat-scroll-container"
+          onWheel={(event) => {
+            if (event.deltaY < 0) {
+              pinnedRef.current = false;
+            }
+          }}
+          onTouchStart={(event) => {
+            touchStartYRef.current = event.touches[0]?.clientY ?? null;
+          }}
+          onTouchMove={(event) => {
+            const startY = touchStartYRef.current;
+            const currentY = event.touches[0]?.clientY;
+            if (startY !== null && currentY !== undefined && currentY > startY) {
+              pinnedRef.current = false;
+            }
+          }}
           onScroll={(event) => {
             const target = event.currentTarget;
             pinnedRef.current = isChatScrolledToBottom(target);
           }}
-          className="min-h-0 flex-1 overscroll-contain overflow-y-auto scroll-smooth"
+          className="min-h-0 flex-1 overscroll-contain overflow-y-auto"
         >
           <div className="mx-auto w-full max-w-[860px] px-7 pb-44 pt-10">
             {detail.messages.map((message, index) => (

@@ -209,6 +209,36 @@ function makeDetail(
   };
 }
 
+function mockAnimationFrameQueue() {
+  const callbacks = new Map<number, FrameRequestCallback>();
+  let nextId = 1;
+  const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+  const originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+  globalThis.requestAnimationFrame = vi.fn((callback) => {
+    const id = nextId;
+    nextId += 1;
+    callbacks.set(id, callback);
+    return id;
+  });
+  globalThis.cancelAnimationFrame = vi.fn((id) => {
+    callbacks.delete(id);
+  });
+  return {
+    flushNext() {
+      const [id, callback] = [...callbacks.entries()][0] ?? [];
+      if (id === undefined || callback === undefined) {
+        throw new Error("No animation frame is queued.");
+      }
+      callbacks.delete(id);
+      callback(0);
+    },
+    restore() {
+      globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+      globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+    },
+  };
+}
+
 describe("ChatView deferred-input unhappy paths", () => {
   beforeEach(() => {
     composerPayload = {
@@ -1322,6 +1352,153 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     await waitFor(() => {
       expect(scrollTo).toHaveBeenCalledWith({ top: 1000 });
+    });
+  });
+
+  it("does not auto-scroll streaming updates over upward scroll intent", async () => {
+    const scrollTo = vi.fn();
+    let streamHandlers: Parameters<typeof streamExistingChatRun>[2] | undefined;
+    mockStreamExistingChatRun.mockImplementation(
+      (_chatId, _runId, handlers) => {
+        streamHandlers = handlers;
+        return new Promise<string>(() => {});
+      },
+    );
+
+    render(
+      <ChatView
+        initial={{
+          ...makeDetail({
+            runId: "run-123",
+            status: "running",
+            waitingFor: null,
+            assistantMessageId: "assistant-streaming",
+          }),
+          messages: [
+            {
+              id: "user-1",
+              role: "user",
+              content: "older question",
+              createdAt: "2026-06-07T00:00:00.000Z",
+              status: "complete",
+            },
+            {
+              id: "assistant-streaming",
+              role: "assistant",
+              content: "",
+              reasoning: "Initial reasoning",
+              reasoningStatus: "streaming",
+              createdAt: "2026-06-07T00:00:01.000Z",
+              status: "streaming",
+            },
+          ],
+        }}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(streamHandlers).toBeDefined();
+    });
+    expect(mockStreamExistingChatRun).toHaveBeenCalledWith(
+      "chat-123",
+      "run-123",
+      expect.any(Object),
+      expect.objectContaining({ assistantMessageId: "assistant-streaming" }),
+    );
+
+    const scroller = screen.getByTestId("chat-scroll-container");
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 2000 },
+      scrollTop: { configurable: true, value: 1500 },
+      clientHeight: { configurable: true, value: 500 },
+      scrollTo: { configurable: true, value: scrollTo },
+    });
+    fireEvent.wheel(scroller, { deltaY: -120 });
+    scrollTo.mockClear();
+
+    const animationFrames = mockAnimationFrameQueue();
+    try {
+      act(() => {
+        streamHandlers?.onText?.("Streaming text update");
+        animationFrames.flushNext();
+      });
+    } finally {
+      animationFrames.restore();
+    }
+
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("continues auto-scrolling streaming updates while pinned to the bottom", async () => {
+    const scrollTo = vi.fn();
+    let streamHandlers: Parameters<typeof streamExistingChatRun>[2] | undefined;
+    mockStreamExistingChatRun.mockImplementation(
+      (_chatId, _runId, handlers) => {
+        streamHandlers = handlers;
+        return new Promise<string>(() => {});
+      },
+    );
+
+    render(
+      <ChatView
+        initial={{
+          ...makeDetail({
+            runId: "run-123",
+            status: "running",
+            waitingFor: null,
+            assistantMessageId: "assistant-streaming",
+          }),
+          messages: [
+            {
+              id: "assistant-streaming",
+              role: "assistant",
+              content: "",
+              reasoning: "Initial reasoning",
+              reasoningStatus: "streaming",
+              createdAt: "2026-06-07T00:00:01.000Z",
+              status: "streaming",
+            },
+          ],
+        }}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(streamHandlers).toBeDefined();
+    });
+    expect(mockStreamExistingChatRun).toHaveBeenCalledWith(
+      "chat-123",
+      "run-123",
+      expect.any(Object),
+      expect.objectContaining({ assistantMessageId: "assistant-streaming" }),
+    );
+
+    const scroller = screen.getByTestId("chat-scroll-container");
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 2000 },
+      scrollTop: { configurable: true, value: 1500 },
+      clientHeight: { configurable: true, value: 500 },
+      scrollTo: { configurable: true, value: scrollTo },
+    });
+    fireEvent.scroll(scroller);
+    scrollTo.mockClear();
+
+    const animationFrames = mockAnimationFrameQueue();
+    try {
+      act(() => {
+        streamHandlers?.onText?.("Streaming text update");
+        animationFrames.flushNext();
+      });
+    } finally {
+      animationFrames.restore();
+    }
+
+    await waitFor(() => {
+      expect(screen.getByText("Streaming text update")).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(scrollTo).toHaveBeenCalledWith({ top: 2000 });
     });
   });
 

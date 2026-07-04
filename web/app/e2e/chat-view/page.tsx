@@ -26,10 +26,15 @@ export default async function E2eChatViewPage({
 
   const { status = 'running', long, reasoning } = await searchParams;
   const baseMessages = long === '1'
-    ? Array.from({ length: 30 }, (_, index) => ({
+    ? Array.from({ length: 48 }, (_, index) => ({
         id: `message-existing-${index}`,
         role: 'user' as const,
-        content: `Existing message ${index + 1}\n\nThis message adds enough height for real browser scroll behavior.`,
+        content: `Existing message ${index + 1}
+
+This message adds enough height for real browser scroll behavior.
+It intentionally spans multiple lines so scroll tests do not depend on viewport size.
+The chat should remain readable while the assistant is still thinking.
+Manual scrollback must not be pulled back to the newest message.`,
         createdAt: '2026-06-07T00:00:00.000Z',
         status: 'complete' as const,
       }))
@@ -82,5 +87,9 @@ export default async function E2eChatViewPage({
     activeRun: activeRunForStatus(status),
   };
 
-  return <ChatView initial={detail} />;
+  return (
+    <main className="h-screen">
+      <ChatView initial={detail} />
+    </main>
+  );
 }
