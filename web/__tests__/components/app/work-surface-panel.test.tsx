@@ -188,7 +188,7 @@ describe("WorkSurfacePanel", () => {
     expect(screen.getAllByText("read_file").length).toBeGreaterThan(0);
   });
 
-  it("orders subagent cards by most recent update and opens the latest details", async () => {
+  it("keeps subagent card order stable while opening latest details", async () => {
     const loadAgentRun = vi.fn().mockResolvedValue({
       runId: "run-new",
       sessionId: "session-1",
@@ -261,13 +261,15 @@ describe("WorkSurfacePanel", () => {
       />,
     );
 
-    const latest = await screen.findByText("Latest review");
     const older = screen.getByText("Older investigation");
+    const latest = await screen.findByText("Latest review");
     expect(
-      latest.compareDocumentPosition(older) & Node.DOCUMENT_POSITION_FOLLOWING,
+      older.compareDocumentPosition(latest) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("latest card live output").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("latest card live output").length,
+    ).toBeGreaterThan(0);
     expect(screen.getByText("Runtime")).toBeInTheDocument();
     expect(screen.getAllByText("MacBook Pro").length).toBeGreaterThan(0);
     expect(screen.getByText("Files")).toBeInTheDocument();
@@ -366,7 +368,9 @@ describe("WorkSurfacePanel", () => {
         "This request needs a file or command environment. Connect one or choose a sandbox, then retry.",
       ),
     ).toBeInTheDocument();
-    expect(screen.getByText("Orchestrator-managed executor")).toBeInTheDocument();
+    expect(
+      screen.getByText("Orchestrator-managed executor"),
+    ).toBeInTheDocument();
     expect(screen.getByText("/checkout/repo")).toBeInTheDocument();
   });
 

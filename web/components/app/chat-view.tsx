@@ -41,6 +41,8 @@ import {
 import {
   ACTIVE_AGENT_SURFACE_STATUSES,
   createEmptyWorkSurface,
+  type AgentSurfaceItem,
+  type SessionTask,
 } from "@/lib/work-surface";
 import { useToast } from "@/components/ui/toast";
 
@@ -96,6 +98,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     runControlBusy,
     composerDisabled,
     composerPlaceholder,
+    activeRunLabel,
     taskBoardIntervention,
   } = deriveChatRunUiState({
     activeRun: detail.activeRun,
@@ -133,7 +136,12 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const startStream = stream.startStream;
 
   // ── ui state derived from work surface ─────────────────────────────────────
-  const showRunStatusPanel = Boolean(detail.activeRun?.runId && canResumeRun);
+  const showRunStatusPanel = Boolean(
+    detail.activeRun?.runId &&
+      (canResumeRun ||
+        activeRunStatus === "blocked" ||
+        activeRunStatus === "waiting"),
+  );
   const openTaskCount = workSurface.tasks.filter(
     (task) => !isTerminalTaskStatus(task.status),
   ).length;
@@ -336,7 +344,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   // ── render ─────────────────────────────────────────────────────────────────
   return (
     <div className="astra-chat-view relative flex h-full min-h-0 overflow-hidden bg-bg">
-      <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
+      <div className="astra-chat-main relative flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
         <header className="relative z-10 flex min-h-[58px] shrink-0 items-center gap-4 border-b border-border/60 bg-bg/85 px-7 backdrop-blur">
           <Link
             href={
@@ -415,10 +423,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               </div>
             ))}
             {showConversationActivityStrip ? (
-              <ConversationActivityStrip
-                taskCount={openTaskCount}
-                agentCount={workSurface.agents.length}
-                activeAgentCount={activeAgentCount}
+              <ConversationWorkCard
+                tasks={workSurface.tasks}
+                agents={workSurface.agents}
                 toolCount={workSurface.tools.length}
                 activeToolCount={activeToolCount}
                 agentAttentionCount={agentAttentionCount}
@@ -508,6 +515,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                         <p className="font-medium text-text">
                           {taskBoardIntervention
                             ? "Task needs direction"
+                            : activeRunStatus === "blocked" ||
+                                activeRunStatus === "waiting"
+                              ? activeRunLabel
                             : activeRunStatus === "paused"
                               ? "Run paused"
                               : activeRunBlocksNewInput
@@ -517,6 +527,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                         <p className="mt-1 leading-5">
                           {taskBoardIntervention
                             ? "Open the task board or continue the run when you are ready."
+                            : activeRunStatus === "blocked"
+                              ? "Resolve the required environment or stop this run before changing direction."
+                              : activeRunStatus === "waiting"
+                                ? "Astra is waiting for an external action before continuing."
                             : activeRunStatus === "paused"
                               ? "Continue this run or close it before changing direction."
                               : activeRunBlocksNewInput
@@ -605,10 +619,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   );
 }
 
-function ConversationActivityStrip({
-  taskCount,
-  agentCount,
-  activeAgentCount,
+function ConversationWorkCard({
+  tasks,
+  agents,
   toolCount,
   activeToolCount,
   agentAttentionCount,
@@ -617,9 +630,8 @@ function ConversationActivityStrip({
   active,
   onOpen,
 }: {
-  taskCount: number;
-  agentCount: number;
-  activeAgentCount: number;
+  tasks: SessionTask[];
+  agents: AgentSurfaceItem[];
   toolCount: number;
   activeToolCount: number;
   agentAttentionCount: number;
@@ -628,6 +640,17 @@ function ConversationActivityStrip({
   active: boolean;
   onOpen: (tab: WorkSurfaceTab) => void;
 }) {
+  const openTasks = tasks.filter((task) => !isTerminalTaskStatus(task.status));
+  const activeAgents = agents.filter((agent) =>
+    ACTIVE_AGENT_SURFACE_STATUSES.has(agent.status.toLowerCase()),
+  );
+  const attentionAgents = agents.filter((agent) =>
+    ["failed", "interrupted", "cancelled", "waiting"].includes(
+      agent.status.toLowerCase(),
+    ),
+  );
+  const primaryTask = openTasks[0] ?? tasks[0];
+  const primaryAgent = attentionAgents[0] ?? activeAgents[0] ?? agents[0];
   const needsAttention =
     taskBoardIntervention || agentAttentionCount > 0 || toolAttentionCount > 0;
   const title = taskBoardIntervention
@@ -650,15 +673,16 @@ function ConversationActivityStrip({
       tab: "tasks",
       icon: ClipboardList,
       label: "Tasks",
-      count: taskCount,
-      attention: taskBoardIntervention ? taskCount : 0,
+      count: tasks.length,
+      activeCount: openTasks.length,
+      attention: taskBoardIntervention ? openTasks.length || tasks.length : 0,
     },
     {
       tab: "agents",
       icon: Bot,
       label: "Agents",
-      count: agentCount,
-      activeCount: activeAgentCount,
+      count: agents.length,
+      activeCount: activeAgents.length,
       attention: agentAttentionCount,
     },
     {
@@ -678,48 +702,151 @@ function ConversationActivityStrip({
       return `${count} ${action.label.toLowerCase()}`;
     })
     .join(" · ");
+  const rows = [
+    primaryTask
+      ? {
+          key: "tasks",
+          tab: "tasks" as WorkSurfaceTab,
+          icon: ClipboardList,
+          title: primaryTask.title,
+          meta:
+            taskBoardIntervention && openTasks.length > 1
+              ? `${openTasks.length} open tasks`
+              : statusLabel(primaryTask.status),
+          status: taskBoardIntervention
+            ? "Needs direction"
+            : statusLabel(primaryTask.status),
+          attention: taskBoardIntervention,
+        }
+      : null,
+    primaryAgent
+      ? {
+          key: "agents",
+          tab: "agents" as WorkSurfaceTab,
+          icon: Bot,
+          title:
+            primaryAgent.description || primaryAgent.agentType || "Subagent",
+          meta:
+            activeAgents.length > 1
+              ? `${activeAgents.length} active agents`
+              : primaryAgent.agentType
+                ? statusLabel(primaryAgent.agentType)
+                : undefined,
+          status: statusLabel(primaryAgent.status),
+          attention: attentionAgents.length > 0,
+        }
+      : null,
+  ].filter((row): row is NonNullable<typeof row> => Boolean(row));
 
   return (
-    <div className="my-3 flex justify-center" aria-label="Background work">
+    <section className="my-3 flex justify-center" aria-label="Background work">
       <div
         className={
           needsAttention
-            ? "inline-flex max-w-full flex-wrap items-center gap-1.5 rounded-full border border-danger/20 bg-danger/5 px-2.5 py-1.5 text-xs shadow-sm"
-            : "inline-flex max-w-full flex-wrap items-center gap-1.5 rounded-full border border-border/70 bg-surface/85 px-2.5 py-1.5 text-xs shadow-sm"
+            ? "w-full max-w-[680px] rounded-card border border-danger/20 bg-danger/5 p-3 shadow-sm"
+            : "w-full max-w-[680px] rounded-card border border-border/70 bg-surface/85 p-3 shadow-sm"
         }
       >
-        <span
-          className={
-            needsAttention
-              ? "inline-flex items-center gap-1.5 font-medium text-danger"
-              : "inline-flex items-center gap-1.5 font-medium text-text-secondary"
-          }
-        >
-          <Activity
+        <div className="flex min-w-0 items-center justify-between gap-3">
+          <div
             className={
-              active && !needsAttention ? "size-3.5 animate-pulse" : "size-3.5"
+              needsAttention
+                ? "inline-flex min-w-0 items-center gap-1.5 text-sm font-medium text-danger"
+                : "inline-flex min-w-0 items-center gap-1.5 text-sm font-medium text-text-secondary"
             }
-          />
-          {title}
-        </span>
-        {summary ? (
-          <span className="max-w-[18rem] truncate text-text-muted">
-            {summary}
-          </span>
-        ) : null}
-        {actions.length ? (
-          <span className="inline-flex flex-wrap items-center gap-1">
-            {actions.map((action) => (
-              <ConversationActivityAction
-                key={action.tab}
-                {...action}
-                onOpen={onOpen}
+          >
+            <Activity
+              className={
+                active && !needsAttention
+                  ? "size-4 shrink-0 animate-pulse"
+                  : "size-4 shrink-0"
+              }
+            />
+            <span className="shrink-0">{title}</span>
+            {summary ? (
+              <span className="truncate text-xs font-normal text-text-muted">
+                {summary}
+              </span>
+            ) : null}
+          </div>
+          {actions.length ? (
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
+              {actions.map((action) => (
+                <ConversationActivityAction
+                  key={action.tab}
+                  {...action}
+                  onOpen={onOpen}
+                />
+              ))}
+            </div>
+          ) : null}
+        </div>
+        {rows.length ? (
+          <div className="mt-2 divide-y divide-border/60 overflow-hidden rounded-[8px] border border-border/60 bg-bg/70">
+            {rows.map((row) => (
+              <ConversationWorkRow
+                key={row.key}
+                icon={row.icon}
+                title={row.title}
+                meta={row.meta}
+                status={row.status}
+                attention={row.attention}
+                onOpen={() => onOpen(row.tab)}
               />
             ))}
-          </span>
+          </div>
         ) : null}
       </div>
-    </div>
+    </section>
+  );
+}
+
+function ConversationWorkRow({
+  icon: Icon,
+  title,
+  meta,
+  status,
+  attention,
+  onOpen,
+}: {
+  icon: LucideIcon;
+  title: string;
+  meta?: string;
+  status: string;
+  attention: boolean;
+  onOpen: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="flex w-full min-w-0 items-center gap-2 px-2.5 py-2 text-left transition-colors hover:bg-surface-muted/70"
+    >
+      <Icon
+        className={
+          attention
+            ? "size-4 shrink-0 text-danger"
+            : "size-4 shrink-0 text-accent"
+        }
+      />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-text">
+          {title}
+        </span>
+        {meta ? (
+          <span className="block truncate text-xs text-text-muted">{meta}</span>
+        ) : null}
+      </span>
+      <span
+        className={
+          attention
+            ? "shrink-0 rounded-full bg-danger/10 px-2 py-0.5 text-[11px] font-medium text-danger"
+            : "shrink-0 rounded-full bg-surface-muted px-2 py-0.5 text-[11px] font-medium text-text-muted"
+        }
+      >
+        {status}
+      </span>
+    </button>
   );
 }
 
@@ -777,4 +904,8 @@ function isTerminalTaskStatus(status: string) {
     "skipped",
     "archived",
   ].includes(status.toLowerCase());
+}
+
+function statusLabel(status: string) {
+  return status.replace(/[_-]+/g, " ");
 }

@@ -5,7 +5,6 @@ import { projectRunWaitingState } from "@/lib/run-status-messages";
 import {
   blockedWaitingFor,
   eventMessage,
-  explicitEventMessage,
   isRunBlockedEvent,
 } from "@/lib/api/stream-event-helpers";
 import type {
@@ -359,12 +358,7 @@ function applyStreamEvent(
       typeof event.run_id === "string" && event.run_id.trim()
         ? event.run_id
         : state.runId;
-    const message = eventMessage(event, "");
     state.paused = true;
-    if (!state.rawText.trim() && message) {
-      state.rawText = message;
-      applyAssistantText(state.rawText, state, handlers);
-    }
     if (runId) {
       state.runId = runId;
       handlers.onRunUpdated?.(
@@ -387,12 +381,7 @@ function applyStreamEvent(
     const projection = projectRunWaitingState(
       event as { waiting_for?: string; reason?: string; error_kind?: string },
     );
-    const message = explicitEventMessage(event);
     state.paused = true;
-    if (!state.rawText.trim() && message) {
-      state.rawText = message;
-      applyAssistantText(state.rawText, state, handlers);
-    }
     if (runId) {
       state.runId = runId;
       handlers.onRunUpdated?.(
@@ -459,11 +448,6 @@ function applyStreamEvent(
   if (type === "run_interrupted") {
     handlers.onWorkSurfaceEvent?.(event);
     state.paused = true;
-    const message = eventMessage(event, "");
-    if (!state.rawText.trim() && message) {
-      state.rawText = message;
-      applyAssistantText(state.rawText, state, handlers);
-    }
     if (typeof event.run_id === "string") {
       state.runId = event.run_id;
       handlers.onRunUpdated?.(

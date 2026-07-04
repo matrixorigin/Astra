@@ -554,7 +554,7 @@ describe('work surface reducer', () => {
     });
   });
 
-  it('marks active tool and agent cards interrupted when a run pauses from interruption', () => {
+  it('does not mark active tool cards failed when a run pauses from interruption', () => {
     let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
       type: 'run_started',
       run_id: 'run-1',
@@ -586,11 +586,11 @@ describe('work surface reducer', () => {
     expect(state.runStatus).toBe('paused');
     expect(state.tools[0]).toMatchObject({
       callId: 'call-running',
-      status: 'error',
-      errorKind: 'budget_exhausted',
-      result: 'Run paused before this tool emitted a final transport result.',
+      status: 'skipped',
+      result: 'No final tool event was observed before the run paused.',
       finishedAt: 1_801_000_000_000,
     });
+    expect(state.tools[0]?.errorKind).toBeUndefined();
     expect(state.agents[0]).toMatchObject({
       agentId: 'agent-running',
       status: 'interrupted',
@@ -598,6 +598,46 @@ describe('work surface reducer', () => {
       resultSummary: 'Budget exhausted. You can continue.',
       updatedAt: 1_801_000_000_000,
     });
+  });
+
+  it('keeps completed tool cards successful when a later run interruption arrives', () => {
+    let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'run_started',
+      run_id: 'run-1',
+      session_id: 'session-1',
+    });
+    state = applyWorkSurfaceEvent(state, {
+      type: 'tool_call_start',
+      call_id: 'call-weather',
+      tool: 'web_fetch',
+      timestamp: 1_801_000_000_000,
+    });
+    state = applyWorkSurfaceEvent(state, {
+      type: 'tool_call_end',
+      call_id: 'call-weather',
+      tool: 'web_fetch',
+      success: true,
+      result: '上海今日小雨，33°C / 25°C。',
+      timestamp: 1_801_000_001_000,
+    });
+
+    state = applyWorkSurfaceEvent(state, {
+      type: 'run_interrupted',
+      run_id: 'run-1',
+      kind: 'empty_completion',
+      resumable: true,
+      timestamp: 1_801_000_002_000,
+    });
+
+    expect(state.runStatus).toBe('paused');
+    expect(state.tools[0]).toMatchObject({
+      callId: 'call-weather',
+      tool: 'web_fetch',
+      status: 'done',
+      result: '上海今日小雨，33°C / 25°C。',
+      finishedAt: 1_801_000_001_000,
+    });
+    expect(state.tools[0]?.errorKind).toBeUndefined();
   });
 
   it('treats hydrated terminal run status as authoritative when run_finished is outside the event window', () => {

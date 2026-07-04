@@ -429,8 +429,12 @@ a {
 .astra-chat-view {
   --body-size: 15px;
   --body-line: 1.78;
-  --chat-reasoning-size: 13px;
+  --chat-reasoning-size: 13.5px;
   --chat-user-message-size: 15px;
+}
+
+.astra-chat-main {
+  container-type: inline-size;
 }
 
 .astra-chat-view [data-composer-input="true"] {
@@ -448,6 +452,26 @@ a {
 .astra-chat-view .astra-chat-user-message,
 .astra-chat-view .astra-chat-user-message p {
   font-size: var(--chat-user-message-size);
+}
+
+.astra-reasoning-panel {
+  font-family: var(--font-ui);
+}
+
+.astra-reasoning-summary-streaming {
+  animation: astraThinkingTextShimmer 2.4s ease-in-out infinite;
+  background: linear-gradient(
+    90deg,
+    rgb(var(--color-text-secondary)) 0%,
+    rgb(var(--color-text-secondary)) 30%,
+    rgb(var(--color-accent)) 52%,
+    rgb(var(--color-text-secondary)) 74%,
+    rgb(var(--color-text-secondary)) 100%
+  );
+  background-clip: text;
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
 /* Focus ring for keyboard navigation */
@@ -471,6 +495,13 @@ textarea {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .astra-reasoning-summary-streaming {
+    animation: none !important;
+    background: none;
+    color: rgb(var(--color-text-secondary));
+    -webkit-text-fill-color: currentColor;
+  }
+
   *,
   *::before,
   *::after {
@@ -503,6 +534,16 @@ textarea {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes astraThinkingTextShimmer {
+  0% {
+    background-position: 140% 50%;
+  }
+
+  100% {
+    background-position: -80% 50%;
   }
 }
 
@@ -759,16 +800,16 @@ textarea {
   grid-template-columns: minmax(0, 1fr);
   gap: 0.625rem;
   min-width: 0;
-  color: rgb(var(--color-text-secondary));
+  color: rgb(var(--color-text-secondary) / 0.92);
   font-family: var(--font-ui);
-  font-size: 13px;
+  font-size: var(--chat-reasoning-size);
   font-weight: 400;
   font-feature-settings:
     "kern" 1,
     "liga" 1,
     "calt" 1;
   letter-spacing: 0;
-  line-height: 1.6;
+  line-height: 1.65;
   -webkit-text-stroke: 0;
   text-autospace: ideograph-alpha ideograph-numeric;
   text-spacing-trim: trim-start;
@@ -995,6 +1036,12 @@ textarea {
 }
 
 @media (max-width: 900px) {
+  .astra-dot-nav {
+    display: none;
+  }
+}
+
+@container (max-width: 940px) {
   .astra-dot-nav {
     display: none;
   }

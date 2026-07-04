@@ -4743,9 +4743,8 @@ fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() 
 
     assert_eq!(status, RunStatus::Paused);
     assert!(
-        error
-            .as_deref()
-            .is_some_and(|msg| msg.to_ascii_lowercase().contains("budget"))
+        error.is_none(),
+        "resumable interruption should be structured paused state, not a run error: {error:?}"
     );
     assert_eq!(events[0]["event_type"], "text_done");
     assert_eq!(events[0]["data"]["partial"], true);
@@ -4965,8 +4964,12 @@ async fn get_run_status_returns_state() {
     assert_eq!(status.run_id, run.run_id);
     assert_eq!(status.status, "running");
     assert_eq!(status.events_count, 1);
-    assert_eq!(status.workspace.as_ref().unwrap()["kind"], "server_sandbox");
+    assert_eq!(status.workspace.as_ref().unwrap()["kind"], "none");
     assert_eq!(status.executor.as_ref().unwrap()["kind"], "server_local");
+    assert_eq!(
+        status.executor.as_ref().unwrap()["executor_id"],
+        "server-control-plane"
+    );
     assert_eq!(status.transport.as_deref(), Some("server_local"));
     assert_eq!(status.fallback_policy.as_deref(), Some("disabled"));
 }
@@ -5036,20 +5039,15 @@ async fn create_run_persists_interaction_mode_into_run_started_event() {
     assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
     assert_eq!(durable.events[0]["data"]["suppressed_loop_nudges"], true);
     assert_eq!(durable.events[0]["data"]["interactive_client"], true);
-    assert_eq!(
-        durable.events[0]["data"]["workspace"]["kind"],
-        "server_sandbox"
-    );
-    assert!(
-        durable.events[0]["data"]["workspace"]["cwd"]
-            .as_str()
-            .is_some_and(|cwd| cwd.contains("astra-workspaces")),
-        "{:?}",
-        durable.events[0]
-    );
+    assert_eq!(durable.events[0]["data"]["workspace"]["kind"], "none");
+    assert!(durable.events[0]["data"]["workspace"]["cwd"].is_null());
     assert_eq!(
         durable.events[0]["data"]["executor"]["kind"],
         "server_local"
+    );
+    assert_eq!(
+        durable.events[0]["data"]["executor"]["executor_id"],
+        "server-control-plane"
     );
     assert_eq!(durable.events[0]["data"]["transport"], "server_local");
     assert_eq!(durable.events[0]["data"]["fallback_policy"], "disabled");
@@ -5374,13 +5372,19 @@ async fn list_runs_filters_by_user() {
         for_u1
             .runs
             .iter()
-            .all(|run| run.workspace.as_ref().unwrap()["kind"] == "server_sandbox")
+            .all(|run| run.workspace.as_ref().unwrap()["kind"] == "none")
     );
     assert!(
         for_u1
             .runs
             .iter()
             .all(|run| run.executor.as_ref().unwrap()["kind"] == "server_local")
+    );
+    assert!(
+        for_u1
+            .runs
+            .iter()
+            .all(|run| run.executor.as_ref().unwrap()["executor_id"] == "server-control-plane")
     );
 
     let for_u2 = ok(svc.list_runs_cursor("user-2".into(), 10, None).await);

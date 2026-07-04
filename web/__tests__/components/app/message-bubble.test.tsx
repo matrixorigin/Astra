@@ -1,4 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { renderToString } from "react-dom/server";
 import { MessageBubble } from "@/components/app/message-bubble";
 import type { ChatMessage } from "@/lib/api/types";
 
@@ -39,6 +40,12 @@ function assistantMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
 describe("MessageBubble", () => {
   beforeEach(() => {
     HTMLElement.prototype.scrollTo = vi.fn();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: vi.fn().mockResolvedValue(undefined),
+      },
+    });
   });
 
   it("shows only the typing indicator while a response has no visible content yet", () => {
@@ -52,7 +59,20 @@ describe("MessageBubble", () => {
     expect(screen.queryByText("Preparing response...")).not.toBeInTheDocument();
   });
 
-  it("shows the reasoning panel once reasoning content is available", () => {
+  it("does not render settled empty assistant messages", () => {
+    const { container } = render(
+      <MessageBubble
+        message={assistantMessage({
+          status: "complete",
+          reasoningStatus: undefined,
+        })}
+      />,
+    );
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("shows the reasoning panel once reasoning content is available", async () => {
     render(
       <MessageBubble
         message={assistantMessage({
@@ -61,7 +81,9 @@ describe("MessageBubble", () => {
       />,
     );
 
-    expect(screen.getByText(/^Thinking \d+s$/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText(/^Thinking \d+s$/)).toBeInTheDocument();
+    });
     expect(
       screen.getAllByText("Checking the execution boundary.").length,
     ).toBeGreaterThan(0);
@@ -87,9 +109,43 @@ describe("MessageBubble", () => {
 
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByText("Done")).not.toBeInTheDocument();
   });
 
-  it("keeps thinking copy while the assistant message is still streaming", () => {
+  it("copies completed assistant text and does not expose unwired actions", async () => {
+    render(
+      <MessageBubble
+        message={assistantMessage({
+          content: "Final answer.",
+          reasoningStatus: undefined,
+          status: "complete",
+        })}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Regenerate response" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Good response" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Bad response" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy response" }));
+
+    await waitFor(() => {
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+        "Final answer.",
+      );
+    });
+    expect(
+      screen.getByRole("button", { name: "Response copied" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps thinking copy while the assistant message is still streaming", async () => {
     render(
       <MessageBubble
         message={assistantMessage({
@@ -100,7 +156,23 @@ describe("MessageBubble", () => {
       />,
     );
 
-    expect(screen.getByText(/^Thinking \d+s$/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText(/^Thinking \d+s$/)).toBeInTheDocument();
+    });
     expect(screen.queryByText(/^Thought/)).not.toBeInTheDocument();
+  });
+
+  it("does not render live elapsed time into streaming reasoning SSR markup", () => {
+    const html = renderToString(
+      <MessageBubble
+        message={assistantMessage({
+          reasoning: "Checking the execution boundary.",
+          createdAt: "2026-06-11T00:00:00.000Z",
+        })}
+      />,
+    );
+
+    expect(html).toContain("Thinking");
+    expect(html).not.toMatch(/Thinking \d+s/);
   });
 });

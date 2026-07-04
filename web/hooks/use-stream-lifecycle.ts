@@ -520,8 +520,10 @@ export function useStreamLifecycle(
           onPaused: (content) => {
             assistantPatcher.flushNow();
             assistantPatcher.patchNow({
-              content,
-              status: "streaming",
+              ...(content ? { content } : {}),
+              completedAt: new Date().toISOString(),
+              reasoningStatus: "complete",
+              status: "complete",
             });
           },
         },
@@ -852,8 +854,10 @@ export function useStreamLifecycle(
           onPaused: (content) => {
             assistantPatcher.flushNow();
             assistantPatcher.patchNow({
-              content,
-              status: "streaming",
+              ...(content ? { content } : {}),
+              completedAt: new Date().toISOString(),
+              reasoningStatus: "complete",
+              status: "complete",
             });
           },
         });
@@ -1056,8 +1060,10 @@ export function useStreamLifecycle(
             onPaused: (content) => {
               assistantPatcher.flushNow();
               assistantPatcher.patchNow({
-                content,
-                status: "streaming",
+                ...(content ? { content } : {}),
+                completedAt: new Date().toISOString(),
+                reasoningStatus: "complete",
+                status: "complete",
               });
             },
           },
@@ -1432,8 +1438,10 @@ export function useStreamLifecycle(
             onPaused: (content) => {
               assistantPatcher.flushNow();
               assistantPatcher.patchNow({
-                content,
-                status: "streaming",
+                ...(content ? { content } : {}),
+                completedAt: new Date().toISOString(),
+                reasoningStatus: "complete",
+                status: "complete",
               });
             },
           },

@@ -10,7 +10,6 @@ import {
 } from "@/lib/api/web-store";
 import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
 import {
-  runWaitingStatusMessage,
   extractBlockedReason,
   projectRunWaitingState,
 } from "@/lib/run-status-messages";
@@ -62,16 +61,6 @@ export function eventMessage(event: StreamEvent, fallback: string): string {
     }
   }
   return fallback;
-}
-
-export function explicitEventMessage(event: StreamEvent): string {
-  for (const key of ["message", "error", "user_message"] as const) {
-    const value = (event as Record<string, unknown>)[key];
-    if (typeof value === "string" && value.trim()) {
-      return value;
-    }
-  }
-  return "";
 }
 
 export function isRunBlockedEvent(type: string): boolean {
@@ -188,15 +177,6 @@ export function applyStreamEvent(
       // RunBlockedEvent carries no run_id field; keep whatever runId is already known
       const runId = state.runId;
       const waitingFor = blockedWaitingFor(event);
-      const message =
-        explicitEventMessage(event) || runWaitingStatusMessage(waitingFor, true);
-      if (
-        !state.assistantRawText.trim() &&
-        !state.assistantText.trim() &&
-        message
-      ) {
-        applyAssistantText(message, "streaming");
-      }
       if (runId) {
         state.runId = runId;
         setActiveRun({
@@ -215,16 +195,6 @@ export function applyStreamEvent(
           : state.runId;
       const projection = projectRunWaitingState(event);
       state.runLifecycle = projection.status;
-      const message =
-        explicitEventMessage(event) ||
-        runWaitingStatusMessage(projection.waitingFor, projection.blocked);
-      if (
-        !state.assistantRawText.trim() &&
-        !state.assistantText.trim() &&
-        message
-      ) {
-        applyAssistantText(message, "streaming");
-      }
       if (runId) {
         state.runId = runId;
         setActiveRun({
@@ -294,16 +264,8 @@ export function applyStreamEvent(
 
     case "run_interrupted": {
       if (typeof event.run_id !== "string") break;
-      const message = eventMessage(event, "");
       state.runLifecycle = "paused";
       state.runId = event.run_id;
-      if (
-        !state.assistantRawText.trim() &&
-        !state.assistantText.trim() &&
-        message
-      ) {
-        applyAssistantText(message, "streaming");
-      }
       const waitingFor =
         typeof (event as RunInterruptedEvent).waiting_for === "string"
           ? (event as RunInterruptedEvent).waiting_for!
@@ -400,6 +362,7 @@ export function applyStreamEvent(
       }
       if (status === "paused" || status === "interrupted") {
         state.runLifecycle = "paused";
+        state.lastStatus = "complete";
         if (typeof event.run_id === "string") {
           const waitingFor =
             typeof (event as RunFinishedEvent).waiting_for === "string"
@@ -418,8 +381,8 @@ export function applyStreamEvent(
           {
             content: state.assistantText,
             reasoning: state.reasoningText || undefined,
-            reasoningStatus: state.reasoningText ? "streaming" : undefined,
-            status: "streaming",
+            reasoningStatus: state.reasoningText ? "complete" : undefined,
+            status: "complete",
           },
         );
         break;

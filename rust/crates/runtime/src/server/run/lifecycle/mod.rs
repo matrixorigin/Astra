@@ -2317,7 +2317,8 @@ impl AgenticRunLifecycleService {
                 Ok(AgenticLoopOutcome::Completed) => {
                     if let Some(interruption) = loop_state.interruption.as_ref() {
                         let task_board_snapshot = loop_state.hooks.task_board_snapshot.clone();
-                        let task_board_unfinished = task_board_snapshot.has_unfinished_tasks();
+                        let task_board_unfinished =
+                            task_board_snapshot.has_completion_blocking_tasks();
                         let waiting_for = if task_board_unfinished {
                             Some("task_board_intervention".to_string())
                         } else if matches!(
@@ -2372,6 +2373,9 @@ impl AgenticRunLifecycleService {
                         finished["interruption_kind"] =
                             Value::String(interruption.kind.label().to_string());
                         finished["resumable"] = Value::Bool(interruption.kind.is_resumable());
+                        if let Some(waiting_for) = waiting_for.as_ref() {
+                            finished["waiting_for"] = Value::String(waiting_for.clone());
+                        }
                         events.push(json!({
                             "event_type": "run_finished",
                             "data": finished,
@@ -4787,14 +4791,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     ExecutionBindingSnapshot::inferred(workspace, executor)
                 })
             });
-        let tool_runtime_workspace = if let Some(workspace) = cloud_workspace.clone() {
+        let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
+        let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
+        {
             Some(workspace)
-        } else if let Some(workspace) = server_workspace.clone() {
-            Some(workspace)
+        } else if !agent_binding_mode || requires_runtime_mcp_executor {
+            match self.provision_server_workspace(&session_id) {
+                Ok(workspace) => Some(workspace),
+                Err(error) => {
+                    self.runs.write().await.remove(&run_id);
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
-        let _ = (server_side_tool_catalog, requires_runtime_mcp_executor);
+        let _ = server_side_tool_catalog;
 
         if let Err(error) = self
             .persist_run_start(
@@ -4944,7 +4956,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // such as `agent`. For edge-bound runs this workspace is only an
         // internal runtime scratch dir; execution routing still follows the
         // explicit workspace/executor binding and cannot silently fall back.
-        if let Some(workspace) = tool_runtime_workspace {
+        if let Some(workspace) = server_tool_executor_workspace {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = match astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
@@ -5616,21 +5628,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     ExecutionBindingSnapshot::inferred(workspace, executor)
                 })
             });
-        let stream_agent_spawner = self
-            .server_agent_spawner_for_session(&session_id)
-            .await
-            .spawner;
-        let tool_runtime_workspace = if let Some(workspace) = cloud_workspace.clone() {
-            Some(workspace)
-        } else if let Some(workspace) = server_workspace.clone() {
-            Some(workspace)
-        } else if (server_side_tool_catalog || requires_runtime_mcp_executor)
-            && execution_bindings.is_some()
+        let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
+        let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
         {
+            Some(workspace)
+        } else if !agent_binding_mode || requires_runtime_mcp_executor {
             Some(self.provision_server_workspace(&session_id)?)
         } else {
             None
         };
+        let _ = server_side_tool_catalog;
+        let stream_agent_spawner = self
+            .server_agent_spawner_for_session(&session_id)
+            .await
+            .spawner;
 
         // Create bounded live channels. If a client cannot keep up, the host
         // detaches that live stream without cancelling the server-side run.
@@ -5879,7 +5890,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // server tool catalog. For edge-bound runs this uses an internal
         // scratch workspace only; the visible binding still routes local-code
         // tools to edge or blocks when edge is unavailable.
-        if let Some(workspace) = tool_runtime_workspace {
+        if let Some(workspace) = server_tool_executor_workspace {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = match astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),

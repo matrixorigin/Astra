@@ -31,16 +31,18 @@ async fn server_without_excludes_tools() {
     let names = tool_names(&profile);
     assert!(!names.iter().any(|n| n == "web_search"));
     assert!(!names.iter().any(|n| n == "web_fetch"));
-    // Other tools still present
-    assert!(names.iter().any(|n| n == "bash"));
+    assert!(names.iter().any(|n| n == "memory"));
+    assert!(!names.iter().any(|n| n == "bash"));
 }
 
 #[tokio::test]
 async fn server_with_only_restricts_tools() {
-    let profile = DeploymentProfile::server_with_only(&["bash", "read_file"]);
+    let profile = DeploymentProfile::server_with_only(&["memory", "web_fetch"]);
     let names = tool_names(&profile);
-    assert!(names.iter().any(|n| n == "bash"));
-    assert!(names.iter().any(|n| n == "read_file"));
+    assert!(names.iter().any(|n| n == "memory"));
+    assert!(names.iter().any(|n| n == "web_fetch"));
     assert!(!names.iter().any(|n| n == "web_search"));
+    assert!(!names.iter().any(|n| n == "bash"));
+    assert!(!names.iter().any(|n| n == "read_file"));
     assert!(!names.iter().any(|n| n == "grep"));
 }

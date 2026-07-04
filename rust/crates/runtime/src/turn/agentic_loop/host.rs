@@ -1264,6 +1264,11 @@ impl TaskBoardSnapshot {
     }
 
     #[must_use]
+    pub fn has_completion_blocking_tasks(&self) -> bool {
+        self.in_progress_count > 0 || self.paused_count > 0 || self.blocked_count > 0
+    }
+
+    #[must_use]
     pub fn has_any_tracked_tasks(&self) -> bool {
         self.tracked_count > 0
     }
@@ -3586,6 +3591,7 @@ pub(crate) mod tests {
             ]
         );
         assert!(snapshot.has_unfinished_tasks());
+        assert!(snapshot.has_completion_blocking_tasks());
         assert!(!snapshot.all_tracked_tasks_completed());
         assert!(snapshot.short_summary().contains("task(s) remain"));
         assert_eq!(
@@ -3672,6 +3678,11 @@ pub(crate) mod tests {
             snapshot.active_tasks,
             vec!["task-1 waiting [pending]".to_string()]
         );
+        assert!(snapshot.has_unfinished_tasks());
+        assert!(
+            !snapshot.has_completion_blocking_tasks(),
+            "pending-only task board is backlog, not an active completion blocker"
+        );
         assert!(!snapshot.all_tracked_tasks_completed());
     }
 
@@ -3696,6 +3707,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.tracked_count, 1);
         assert_eq!(snapshot.completed_count, 1);
         assert!(!snapshot.has_unfinished_tasks());
+        assert!(!snapshot.has_completion_blocking_tasks());
         assert!(snapshot.all_tracked_tasks_completed());
     }
 
@@ -3720,6 +3732,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.tracked_count, 1);
         assert_eq!(snapshot.paused_count, 1);
         assert!(snapshot.has_unfinished_tasks());
+        assert!(snapshot.has_completion_blocking_tasks());
         assert!(!snapshot.all_tracked_tasks_completed());
         assert_eq!(snapshot.status_count_summary(), "1 paused task(s) remain");
     }

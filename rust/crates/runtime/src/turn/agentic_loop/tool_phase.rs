@@ -2596,6 +2596,10 @@ esac
             None,
             None,
         );
+        executor.set_execution_bindings(
+            crate::server::tool_execution_binding::WorkspaceBinding::server_sandbox(dir.path()),
+            crate::server::tool_execution_binding::ExecutorBinding::server_local(),
+        );
         let session = std::sync::Arc::new(std::sync::RwLock::new(
             crate::observability::ObservabilitySession::new_simple(session_id),
         ));
@@ -2605,19 +2609,31 @@ esac
         (executor, session)
     }
 
+    fn server_executor_for_test_workspace(
+        workspace: &std::path::Path,
+        session_id: &str,
+    ) -> crate::server::server_tool_executor::ServerToolExecutor {
+        let mut executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+            workspace.to_path_buf(),
+            "test-user".into(),
+            session_id.to_string(),
+            None,
+            None,
+        );
+        executor.set_execution_bindings(
+            crate::server::tool_execution_binding::WorkspaceBinding::server_sandbox(workspace),
+            crate::server::tool_execution_binding::ExecutorBinding::server_local(),
+        );
+        executor
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_commits_successful_turn() {
         let journal_dir = tempfile::TempDir::new().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
-        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            session_id.clone(),
-            None,
-            None,
-        );
+        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
         executor.set_turn_index(5);
 
         let active = open_server_rollback_boundary(
@@ -2706,13 +2722,7 @@ esac
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
-        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            session_id.clone(),
-            None,
-            None,
-        );
+        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
         executor.set_turn_index(7);
 
         let active = open_server_rollback_boundary(
@@ -2780,13 +2790,7 @@ esac
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-multi-edit-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
-        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            session_id.clone(),
-            None,
-            None,
-        );
+        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
         executor.set_turn_index(15);
 
         let active = open_server_rollback_boundary(
@@ -2880,13 +2884,7 @@ esac
             .unwrap();
         std::fs::write(dir.path().join("tracked.txt"), "after").unwrap();
 
-        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            session_id.clone(),
-            None,
-            None,
-        );
+        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
         executor.set_turn_index(8);
 
         let active = open_server_rollback_boundary(
@@ -3070,13 +3068,7 @@ esac
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-scope-readonly-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
-        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            session_id.clone(),
-            None,
-            None,
-        );
+        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
         executor.set_turn_index(13);
 
         let active = open_server_rollback_boundary(
@@ -3139,13 +3131,7 @@ esac
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-scope-multi-readonly-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
-        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            session_id.clone(),
-            None,
-            None,
-        );
+        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
         executor.set_turn_index(14);
 
         let active = open_server_rollback_boundary(

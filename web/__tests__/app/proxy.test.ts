@@ -8,11 +8,13 @@ function request(path: string) {
 }
 
 describe("web proxy auth boundary", () => {
-  it("allows edge status probing without web auth cookies", () => {
+  it("keeps edge status protected without web auth cookies", async () => {
     const response = proxy(request("/api/edges/status"));
 
-    expect(response.status).toBe(200);
-    expect(response.headers.get("x-middleware-next")).toBe("1");
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({
+      error: "Authentication required.",
+    });
   });
 
   it("keeps other API routes protected without web auth cookies", async () => {

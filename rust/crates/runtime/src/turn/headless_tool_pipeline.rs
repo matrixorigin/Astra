@@ -93,6 +93,13 @@ fn edge_result_runtime_environment_denial(execution: &HeadlessResolvedExecution)
     if !execution.is_edge_tool {
         return None;
     }
+    if execution
+        .tool_result_fields
+        .as_ref()
+        .is_some_and(|fields| fields.get("blocked").and_then(Value::as_bool) == Some(true))
+    {
+        return None;
+    }
     let Some(fields) = execution.tool_result_fields.as_ref() else {
         return Some(format!(
             "Error: edge runtime capability denied for tool '{}': runtime_environment_advertisement_required",
@@ -591,6 +598,24 @@ mod tests {
             EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD.to_string(),
             serde_json::to_value(advertisement).expect("serialize advertisement"),
         )])
+    }
+
+    fn server_executor_for_test_workspace(
+        workspace: &std::path::Path,
+        session_id: &str,
+    ) -> crate::server::server_tool_executor::ServerToolExecutor {
+        let mut executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+            workspace.to_path_buf(),
+            "test-user".into(),
+            session_id.to_string(),
+            None,
+            None,
+        );
+        executor.set_execution_bindings(
+            crate::server::tool_execution_binding::WorkspaceBinding::server_sandbox(workspace),
+            crate::server::tool_execution_binding::ExecutorBinding::server_local(),
+        );
+        executor
     }
 
     struct PipelineHarness {
@@ -1760,13 +1785,7 @@ mod tests {
     async fn server_fallback_sets_turn_index_for_current_turn_rollback() {
         let mut harness = PipelineHarness::new();
         let dir = tempfile::TempDir::new().unwrap();
-        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline =
             harness.pipeline_with_server_executor_for_session_turn(3, 7, Some(&server_exec));
         let args = json!({"path": "turn.txt", "content": "hello"});
@@ -1813,13 +1832,7 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
-        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline = harness.pipeline_with_server_executor(3, Some(&server_exec));
         let args = json!({"action": "commit", "message": "initial"});
         let permitted = PermittedExecution {
@@ -1863,13 +1876,7 @@ mod tests {
             "0123456789abcdef\n".repeat(6_000),
         )
         .unwrap();
-        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline = harness.pipeline_with_server_executor(2, Some(&server_exec));
         let args = json!({"path": "large.txt"});
         let permitted = PermittedExecution {
@@ -1904,13 +1911,7 @@ mod tests {
     async fn server_fallback_surfaces_bash_timeout_partial_output() {
         let mut harness = PipelineHarness::new();
         let dir = tempfile::TempDir::new().unwrap();
-        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline = harness.pipeline_with_server_executor(4, Some(&server_exec));
         let args = json!({
             "command": "printf 'start\\n'; sleep 1; printf 'done\\n'",
@@ -2026,13 +2027,7 @@ mod tests {
         harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
         harness.deferred_tool_names = HashSet::from(["memory".to_string()]);
         let dir = tempfile::TempDir::new().unwrap();
-        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         server_exec.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
 
         let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
@@ -2118,13 +2113,7 @@ mod tests {
         harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
         harness.deferred_tool_names = HashSet::new();
         let dir = tempfile::TempDir::new().unwrap();
-        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         server_exec.set_current_activatable_tool_names(HashSet::from(["github".to_string()]));
 
         let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
@@ -2197,13 +2186,7 @@ mod tests {
         harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
         harness.deferred_tool_names = HashSet::from(["github".to_string()]);
         let dir = tempfile::TempDir::new().unwrap();
-        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         server_exec.set_current_activatable_tool_names(HashSet::new());
 
         let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
@@ -2591,13 +2574,7 @@ mod tests {
             "function": { "name": missing_tool, "arguments": "{}" }
         }));
         let dir = tempfile::TempDir::new().unwrap();
-        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
 
         // validate_slot should pass (outline is in valid_tool_names).
@@ -2858,13 +2835,7 @@ mod tests {
             .unwrap();
         std::fs::write(dir.path().join("tracked.txt"), "before\nafter\n").unwrap();
 
-        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
 
         harness.tool_calls.push(json!({
             "id": "call-git-diff-stat",
@@ -2943,13 +2914,7 @@ mod tests {
             "function": { "name": missing_tool, "arguments": "{}" }
         }));
         let dir = tempfile::TempDir::new().unwrap();
-        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
 
         let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
@@ -3382,13 +3347,7 @@ mod tests {
                 .map(|h| h.total_calls)
                 .unwrap_or(0);
             let dir = tempfile::TempDir::new().unwrap();
-            let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
-                dir.path().to_path_buf(),
-                "test-user".into(),
-                "test-session".into(),
-                None,
-                None,
-            );
+            let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
             let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
 
             match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {

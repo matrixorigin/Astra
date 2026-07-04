@@ -2517,10 +2517,12 @@ mod tests {
             id.len(),
             crate::storage::AGENT_EVENT_ID_LEN
         );
-        assert!(
-            crate::storage::AGENT_EVENT_ID_LEN > 64,
-            "agent_events.event_id must not regress to VARCHAR(64)"
-        );
+        const {
+            assert!(
+                crate::storage::AGENT_EVENT_ID_LEN > 64,
+                "agent_events.event_id must not regress to VARCHAR(64)"
+            );
+        }
     }
 
     #[test]

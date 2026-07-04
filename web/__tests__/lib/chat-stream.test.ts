@@ -170,11 +170,9 @@ describe('streamChatMessage cancellation semantics', () => {
         onWorkSurfaceEvent,
         onText,
       }),
-    ).resolves.toBe('Budget exhausted. You can continue.');
+    ).resolves.toBe('');
 
-    expect(onText).toHaveBeenLastCalledWith(
-      'Budget exhausted. You can continue.',
-    );
+    expect(onText).not.toHaveBeenCalled();
     expect(onRunUpdated).toHaveBeenLastCalledWith(
       expect.objectContaining({
         runId: 'run-123',
@@ -192,9 +190,7 @@ describe('streamChatMessage cancellation semantics', () => {
         status: 'paused',
       }),
     );
-    expect(onPaused).toHaveBeenCalledWith(
-      'Budget exhausted. You can continue.',
-    );
+    expect(onPaused).toHaveBeenCalledWith('');
     expect(onRunFinished).not.toHaveBeenCalled();
     expect(onDone).not.toHaveBeenCalled();
   });
@@ -223,11 +219,9 @@ describe('streamChatMessage cancellation semantics', () => {
         onWorkSurfaceEvent,
         onText,
       }),
-    ).resolves.toBe('Edge executor MacBook Pro is offline.');
+    ).resolves.toBe('');
 
-    expect(onText).toHaveBeenLastCalledWith(
-      'Edge executor MacBook Pro is offline.',
-    );
+    expect(onText).not.toHaveBeenCalled();
     expect(onRunUpdated).toHaveBeenLastCalledWith(
       expect.objectContaining({
         runId: 'run-123',
@@ -241,9 +235,7 @@ describe('streamChatMessage cancellation semantics', () => {
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'run_waiting' }),
     );
-    expect(onPaused).toHaveBeenCalledWith(
-      'Edge executor MacBook Pro is offline.',
-    );
+    expect(onPaused).toHaveBeenCalledWith('');
     expect(onDone).not.toHaveBeenCalled();
   });
 
@@ -310,11 +302,9 @@ describe('streamChatMessage cancellation semantics', () => {
         onWorkSurfaceEvent,
         onText,
       }),
-    ).resolves.toBe('Server fallback is disabled for this workspace.');
+    ).resolves.toBe('');
 
-    expect(onText).toHaveBeenLastCalledWith(
-      'Server fallback is disabled for this workspace.',
-    );
+    expect(onText).not.toHaveBeenCalled();
     expect(onRunUpdated).toHaveBeenLastCalledWith(
       expect.objectContaining({
         runId: 'run-123',
@@ -325,9 +315,7 @@ describe('streamChatMessage cancellation semantics', () => {
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'run_blocked' }),
     );
-    expect(onPaused).toHaveBeenCalledWith(
-      'Server fallback is disabled for this workspace.',
-    );
+    expect(onPaused).toHaveBeenCalledWith('');
     expect(onDone).not.toHaveBeenCalled();
   });
 

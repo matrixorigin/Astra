@@ -751,8 +751,9 @@ async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
             panic!("server dynamic spawn should stream child output into agent_live_event: {serialized}")
         });
     assert!(
-        live_output["workspace"]["kind"].as_str() == Some("server_sandbox")
+        live_output["workspace"]["kind"].as_str() == Some("none")
             && live_output["executor"]["kind"].as_str() == Some("server_local")
+            && live_output["executor"]["executor_id"].as_str() == Some("server-control-plane")
             && live_output["transport"].as_str() == Some("server_local"),
         "server dynamic spawn should stream child output into agent_live_event: {serialized}"
     );
@@ -768,16 +769,24 @@ async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
         !spawned.is_empty(),
         "server dynamic spawn should emit agent_spawned progress: {serialized}"
     );
-    assert_eq!(spawned[0]["workspace"]["kind"], "server_sandbox");
+    assert_eq!(spawned[0]["workspace"]["kind"], "none");
     assert_eq!(spawned[0]["executor"]["kind"], "server_local");
+    assert_eq!(
+        spawned[0]["executor"]["executor_id"],
+        "server-control-plane"
+    );
     assert_eq!(spawned[0]["transport"], "server_local");
     let completed = find_event_type(&events, "agent_completed");
     assert!(
         !completed.is_empty(),
         "server dynamic spawn should emit agent_completed progress: {serialized}"
     );
-    assert_eq!(completed[0]["workspace"]["kind"], "server_sandbox");
+    assert_eq!(completed[0]["workspace"]["kind"], "none");
     assert_eq!(completed[0]["executor"]["kind"], "server_local");
+    assert_eq!(
+        completed[0]["executor"]["executor_id"],
+        "server-control-plane"
+    );
 
     let (replay_status, replay_events) = get_run_stream(&app, &run_id, 0).await;
     assert_eq!(replay_status, StatusCode::OK);
@@ -3663,8 +3672,12 @@ async fn a1_run_status_all_fields_text_only() {
         events_count > 0,
         "events_count should be > 0, got {events_count}"
     );
-    assert_eq!(body["workspace"]["kind"].as_str(), Some("server_sandbox"));
+    assert_eq!(body["workspace"]["kind"].as_str(), Some("none"));
     assert_eq!(body["executor"]["kind"].as_str(), Some("server_local"));
+    assert_eq!(
+        body["executor"]["executor_id"].as_str(),
+        Some("server-control-plane")
+    );
     assert_eq!(body["transport"].as_str(), Some("server_local"));
     assert_eq!(body["fallback_policy"].as_str(), Some("disabled"));
 }

@@ -324,7 +324,7 @@ fn unfinished_task_board_snapshot(state: &AgenticLoopState) -> Option<&TaskBoard
     state
         .hooks
         .task_board_snapshot
-        .has_unfinished_tasks()
+        .has_completion_blocking_tasks()
         .then_some(&state.hooks.task_board_snapshot)
 }
 
@@ -2672,7 +2672,10 @@ fn build_circuit_breaker_signal(
             .take(state.max_tools_per_turn as usize)
             .any(tool_record_is_workspace_mutation)
     };
-    let task_completed = !state.hooks.task_board_snapshot.has_unfinished_tasks()
+    let task_completed = !state
+        .hooks
+        .task_board_snapshot
+        .has_completion_blocking_tasks()
         && latest_round_records
             .iter()
             .any(|record| tool_record_is_git_commit_action(record));
@@ -4617,7 +4620,7 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_signal_does_not_mark_completion_when_tasks_remain() {
+    fn circuit_breaker_signal_does_not_mark_completion_when_active_tasks_remain() {
         let mut state = make_state();
         state.llm_rounds_completed = 4;
         state.hooks.task_board_snapshot =
@@ -4627,7 +4630,7 @@ mod tests {
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
-                    status: astra_tools::task_mgmt::SessionTaskStatusKind::Pending,
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                     subtasks: Vec::new(),
                     created_at: "2025-01-01T00:00:00Z".to_string(),
                     updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -4658,6 +4661,44 @@ mod tests {
             "unfinished task-board work must suppress completion soft-stop"
         );
         assert!(signal.produced_mutation);
+    }
+
+    #[test]
+    fn circuit_breaker_signal_allows_completion_with_pending_backlog_only() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 4;
+        state.hooks.task_board_snapshot =
+            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
+                astra_tools::task_mgmt::SessionTask {
+                    archived_at: None,
+                    id: "task-1".to_string(),
+                    title: "optional follow-up".to_string(),
+                    description: None,
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::Pending,
+                    subtasks: Vec::new(),
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                    updated_at: "2025-01-01T00:00:00Z".to_string(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                },
+            ]);
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "git".into(),
+            ok: true,
+            round: Some(3),
+            args_full: Some(r#"{"action":"commit","message":"finish"}"#.into()),
+            ..Default::default()
+        });
+
+        let signal = build_circuit_breaker_signal(&state);
+
+        assert!(
+            signal.task_completed,
+            "pending-only task board is backlog and must not suppress completion"
+        );
     }
 
     #[tokio::test]
@@ -4759,8 +4800,8 @@ mod tests {
     /// per turn so a model that ignores the corrective doesn't churn the
     /// global round budget. After the gate fires once, the next text-only
     /// completion should fall through to terminal rendering, where
-    /// `ensure_terminal_text` rewrites the answer with structured stop +
-    /// remaining-task context (covered by the finalization tests).
+    /// `ensure_terminal_text` records structured task-board state without
+    /// rewriting assistant text (covered by the finalization tests).
     #[tokio::test]
     async fn unfinished_task_board_gate_is_one_shot_per_turn() {
         let mut host = StubbornTextOnlyHost::new(vec![
@@ -4795,10 +4836,13 @@ mod tests {
             host.current_turn, 2,
             "exactly two turns should run: one before the gate, one after the corrective"
         );
+        assert_eq!(
+            state.final_text, "Still done.",
+            "task-board control state must not be rewritten into assistant prose"
+        );
         assert!(
-            state.final_text.contains("task-board work remains open"),
-            "terminal text should surface the unfinished-work record, got: {}",
-            state.final_text
+            state.interruption.is_some(),
+            "unfinished active task-board work should still record structured interruption state"
         );
         let unfinished_notices = host
             .emitted_lines

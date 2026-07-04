@@ -664,9 +664,9 @@ function AgentBoard({
   if (!agents.length) {
     return <EmptySurface loading={loading} label="No subagent activity yet" />;
   }
-  const sorted = [...agents].sort(
-    (left, right) => right.updatedAt - left.updatedAt,
-  );
+  // Preserve projection order while live events stream in. Sorting by
+  // updatedAt makes concurrently running agent cards jump on every event.
+  const sorted = agents;
   return (
     <div className="space-y-2.5">
       {sorted.map((agent) => (
@@ -821,9 +821,6 @@ function AgentCard({
               {summary}
             </p>
           ) : null}
-          <p className="mt-2 truncate font-mono text-[10px] text-text-muted/80">
-            {agent.agentId}
-          </p>
         </div>
       </button>
       {selected ? (
@@ -873,9 +870,6 @@ function AgentDetails({
   const updated = new Date(agent.updatedAt);
   const active = isAgentActive(agent.status);
   const ids = [
-    ["Agent", agent.agentId],
-    ["Run", agent.runId],
-    ["Parent", agent.parentRunId],
     ["Files", workspaceMetaValue(agent.workspace)],
     ["Runtime", executorMetaValue(agent.executor, agent.workspace)],
   ].filter((entry): entry is [string, string] => Boolean(entry[1]));
@@ -1004,10 +998,10 @@ function AgentTranscriptCard({
 }) {
   const [open, setOpen] = useState(active);
   return (
-    <div className="mb-2 overflow-hidden rounded-[8px] border border-border/60 bg-bg shadow-[0_1px_2px_rgba(28,25,23,0.03)]">
+    <div className="mb-2">
       <button
         type="button"
-        className="group flex w-full min-w-0 items-center gap-2 px-2.5 py-2 text-left transition hover:bg-surface-muted/50"
+        className="group -ml-1 flex w-full min-w-0 items-center gap-2 rounded-[6px] px-1 py-1 text-left transition hover:text-text"
         aria-expanded={open}
         aria-label={`${transcript.label}: ${transcript.preview}`}
         onClick={() => setOpen((value) => !value)}
@@ -1035,7 +1029,7 @@ function AgentTranscriptCard({
         )}
       >
         <div className="min-h-0 overflow-hidden">
-          <div className="max-h-44 overflow-y-auto border-t border-border/50 bg-surface/35 px-3 py-2.5 text-xs leading-5 text-text-secondary">
+          <div className="ml-[5px] max-h-44 overflow-y-auto border-l border-border/70 py-1.5 pl-3 pr-1 text-xs leading-5 text-text-secondary">
             <p className="whitespace-pre-wrap break-words font-normal">
               {transcript.detail}
             </p>

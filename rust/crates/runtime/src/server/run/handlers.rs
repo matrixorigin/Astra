@@ -863,21 +863,30 @@ mod tests {
     fn transform_stream_run_events_for_client_preserves_task_board_intervention() {
         let transformed = transform_stream_run_events_for_client(
             "run-123",
-            vec![json!({
-                "event_type": "run_interrupted",
-                "data": {
-                    "kind": "empty_completion",
-                    "resumable": true,
-                    "waiting_for": "task_board_intervention",
-                    "user_message": "Task-board work remains open.",
-                    "task_board": {
-                        "summary": "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
-                        "in_progress_count": 1,
-                        "active_tasks": ["task-2 Investigate [in_progress]"]
+            vec![
+                json!({
+                    "event_type": "run_interrupted",
+                    "data": {
+                        "kind": "empty_completion",
+                        "resumable": true,
+                        "waiting_for": "task_board_intervention",
+                        "user_message": "Task-board work remains open.",
+                        "task_board": {
+                            "summary": "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
+                            "in_progress_count": 1,
+                            "active_tasks": ["task-2 Investigate [in_progress]"]
+                        }
+                    },
+                    "index": 10
+                }),
+                json!({
+                    "event_type": "run_finished",
+                    "data": {
+                        "interrupted": true,
+                        "waiting_for": "task_board_intervention"
                     }
-                },
-                "index": 10
-            })],
+                }),
+            ],
         );
 
         assert_eq!(
@@ -896,6 +905,16 @@ mod tests {
                     "active_tasks": ["task-2 Investigate [in_progress]"]
                 },
                 "index": 10
+            })
+        );
+        assert_eq!(
+            transformed[1],
+            json!({
+                "type": "run_finished",
+                "run_id": "run-123",
+                "status": "paused",
+                "interrupted": true,
+                "waiting_for": "task_board_intervention"
             })
         );
     }

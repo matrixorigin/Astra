@@ -4829,6 +4829,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     "interrupted",
                     "interruption_kind",
                     "resumable",
+                    "waiting_for",
                 ] {
                     insert_if_present(obj, &data, key);
                 }
@@ -6315,13 +6316,20 @@ mod tests {
 
         let finished = transform_run_event_for_client(make_event(
             "run_finished",
-            json!({"run_id": "run-1", "status": "failed", "error": "boom", "error_code": "network"}),
+            json!({
+                "run_id": "run-1",
+                "status": "paused",
+                "error": "boom",
+                "error_code": "network",
+                "waiting_for": "task_board_intervention"
+            }),
         ));
         assert_eq!(finished["type"], "run_finished");
         assert_eq!(finished["run_id"], "run-1");
-        assert_eq!(finished["status"], "failed");
+        assert_eq!(finished["status"], "paused");
         assert_eq!(finished["error"], "boom");
         assert_eq!(finished["error_code"], "network");
+        assert_eq!(finished["waiting_for"], "task_board_intervention");
 
         let waiting = transform_run_event_for_client(make_event(
             "run_waiting",

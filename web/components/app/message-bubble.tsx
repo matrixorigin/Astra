@@ -6,9 +6,6 @@ import {
   Copy,
   Download,
   Loader,
-  RefreshCcw,
-  ThumbsDown,
-  ThumbsUp,
 } from "lucide-react";
 import {
   Children,
@@ -27,6 +24,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { SkillMentionText } from "@/components/app/skill-mention-text";
 import { IconButton } from "@/components/ui/icon-button";
+import { useToast } from "@/components/ui/toast";
 import { splitThinkingTags } from "@/lib/api/chats";
 import type { ChatArtifactRef, ChatMessage } from "@/lib/api/types";
 import { cn } from "@/lib/utils/cn";
@@ -182,6 +180,44 @@ export const MessageBubble = memo(function MessageBubble({
   const showReasoning = !isUser && (hasReasoning || reasoningStreaming);
   const isStreamingEmpty =
     message.status === "streaming" && !content.trim() && !hasReasoning;
+  const artifacts = message.artifacts ?? [];
+  const hasArtifacts = artifacts.length > 0;
+  const isSettledEmptyAssistant =
+    !isUser &&
+    message.status !== "streaming" &&
+    !content.trim() &&
+    !hasReasoning &&
+    !hasArtifacts;
+  const { addToast } = useToast();
+  const [copied, setCopied] = useState(false);
+  const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copyResetRef.current) {
+        clearTimeout(copyResetRef.current);
+      }
+    },
+    [],
+  );
+
+  const copyResponse = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard API is unavailable.");
+      }
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      addToast("Copied response.", "info", 1600);
+      if (copyResetRef.current) {
+        clearTimeout(copyResetRef.current);
+      }
+      copyResetRef.current = setTimeout(() => setCopied(false), 1600);
+    } catch {
+      addToast("Unable to copy this response.", "error");
+    }
+  };
+
   if (isUser) {
     return (
       <article className="flex justify-end py-4">
@@ -194,6 +230,9 @@ export const MessageBubble = memo(function MessageBubble({
         </div>
       </article>
     );
+  }
+  if (isSettledEmptyAssistant) {
+    return null;
   }
 
   return (
@@ -216,32 +255,17 @@ export const MessageBubble = memo(function MessageBubble({
       ) : (
         <MarkdownContent content={content} />
       )}
-      {message.artifacts?.length ? (
-        <ArtifactList artifacts={message.artifacts} />
-      ) : null}
+      {hasArtifacts ? <ArtifactList artifacts={artifacts} /> : null}
       {message.status !== "streaming" ? (
         <div className="mt-3 flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
           <IconButton
-            icon={Copy}
-            label="Copy response"
+            icon={copied ? CheckCircle2 : Copy}
+            label={copied ? "Response copied" : "Copy response"}
             className="size-8"
-            onClick={() => navigator.clipboard?.writeText(content)}
-          />
-          <IconButton
-            icon={RefreshCcw}
-            label="Regenerate response"
-            className="size-8"
-            disabled
-          />
-          <IconButton
-            icon={ThumbsUp}
-            label="Good response"
-            className="size-8"
-          />
-          <IconButton
-            icon={ThumbsDown}
-            label="Bad response"
-            className="size-8"
+            active={copied}
+            onClick={() => {
+              void copyResponse();
+            }}
           />
         </div>
       ) : null}
@@ -519,7 +543,7 @@ function ReasoningPanel({
   }, [open, reasoning, streaming]);
 
   return (
-    <div className="mb-4 font-[var(--font-ui)]">
+    <div className="astra-reasoning-panel mb-4 max-w-[min(100%,44rem)] text-text-muted">
       <button
         type="button"
         onClick={() => {
@@ -527,15 +551,22 @@ function ReasoningPanel({
           setOpen((value) => !value);
         }}
         aria-expanded={open}
-        className="group inline-flex max-w-full items-center gap-2 rounded-full border border-border/70 bg-surface/80 px-3 py-1.5 text-left text-[13px] font-medium leading-5 text-text-secondary shadow-[0_1px_2px_rgba(28,25,23,0.04)] transition-colors hover:border-border hover:bg-surface hover:text-text"
+        className="group -ml-1 inline-flex max-w-full items-center gap-2 rounded-control px-1 py-1 text-left text-[13px] font-medium leading-5 text-text-secondary transition-colors hover:text-text"
       >
         {streaming ? (
-          <Loader className="size-3.5 shrink-0 animate-spin text-accent" />
+          <Loader className="size-3.5 shrink-0 animate-spin text-text-muted" />
         ) : (
           <CheckCircle2 className="size-3.5 shrink-0 text-text-muted" />
         )}
-        <span className="shrink-0">{summary}</span>
-        <span className="min-w-0 max-w-[min(34rem,70vw)] truncate font-normal text-text-muted">
+        <span
+          className={cn(
+            "astra-reasoning-summary shrink-0",
+            streaming && "astra-reasoning-summary-streaming",
+          )}
+        >
+          {summary}
+        </span>
+        <span className="min-w-0 max-w-[min(34rem,70vw)] truncate font-normal text-text-muted/90">
           {preview}
         </span>
         <ChevronDown
@@ -558,7 +589,7 @@ function ReasoningPanel({
           <div
             ref={bodyRef}
             className={cn(
-              "mt-2 rounded-[8px] border border-border/70 bg-surface/60 px-3.5 py-3 shadow-[0_1px_2px_rgba(28,25,23,0.03)]",
+              "ml-[6px] mt-1 border-l border-border/70 py-2 pl-4 pr-1",
               open &&
                 (streaming
                   ? "max-h-56 overflow-y-auto"
@@ -572,12 +603,6 @@ function ReasoningPanel({
                   content={block}
                 />
               ))}
-              {!streaming ? (
-                <div className="flex items-center gap-1.5 pt-1 text-xs text-text-muted">
-                  <CheckCircle2 className="size-3.5" strokeWidth={1.8} />
-                  <span>Done</span>
-                </div>
-              ) : null}
             </div>
           </div>
         </div>
@@ -625,17 +650,22 @@ function useReasoningElapsed(
   completedAt: string | null | undefined,
   streaming: boolean,
 ) {
-  const [now, setNow] = useState(() => Date.now());
+  const [now, setNow] = useState<number | null>(null);
 
   useEffect(() => {
     if (!streaming) {
+      setNow(null);
       return;
     }
+    setNow(Date.now());
     const interval = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(interval);
   }, [streaming]);
 
   const startMs = parseTimestampMs(startedAt);
+  if (streaming && now === null) {
+    return null;
+  }
   const endMs = streaming ? now : parseTimestampMs(completedAt);
   if (startMs === null || endMs === null || endMs < startMs) {
     return null;
