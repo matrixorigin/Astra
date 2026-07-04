@@ -15,6 +15,9 @@
   },
   "dependencies": {
     "@astra/sdk": "file:../packages/sdk",
+    "@floating-ui/core": "1.7.5",
+    "@floating-ui/dom": "1.7.5",
+    "@floating-ui/react-dom": "2.1.7",
     "@radix-ui/react-dialog": "^1.1.16",
     "@radix-ui/react-dropdown-menu": "^2.1.17",
     "@radix-ui/react-popover": "^1.1.16",
