@@ -1131,6 +1131,8 @@ fn no_workspace_binding_resolves_to_control_plane_tool_surface_only() {
 
     assert!(binding.tool_surface.contains("ask_user"));
     assert!(binding.tool_surface.contains("tool_search"));
+    assert!(binding.tool_surface.contains("enter_plan_mode"));
+    assert!(binding.tool_surface.contains("exit_plan_mode"));
     for tool in [
         "bash",
         "read_file",

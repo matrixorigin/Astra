@@ -464,7 +464,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         if self.perm_manager.mode() == crate::cli::permission_manager::PermissionMode::Plan {
             state.push_volatile(
                 astra_runtime::turn::agentic_loop::host::VolatileKind::PlanModeMarker,
-                "[mode=plan] You are in read-only plan mode. Investigate with read-only tools (read_file, grep, glob, web_fetch, …); mutating tools are intentionally absent from the schema. When the plan is ready call `exit_plan_mode(plan=\"<markdown>\")` so the user can approve and choose an execution mode. Do not attempt edits or shell mutations in this mode.",
+                "[mode=plan] You are in read-only plan mode. Investigate only with read tools already visible in the current turn; mutating tools are intentionally absent from the schema. When the plan is ready call `exit_plan_mode(plan=\"<markdown>\")` so the user can approve and choose an execution mode. Do not attempt edits or shell mutations in this mode.",
             );
 
             // Plan-mode nudge: if the previous turn produced a

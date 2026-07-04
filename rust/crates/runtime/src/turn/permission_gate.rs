@@ -220,8 +220,8 @@ pub async fn check_tool_permission_in_plan_mode(
         return PermissionCheckResult::Denied {
             reason: format!(
                 "tool '{tool_name}' is blocked while plan mode is active. \
-                 Plan mode is a read-only authoring phase — explore the codebase \
-                 with read tools (read_file, grep, glob, list_dir, symbols), then \
+                 Plan mode is a read-only authoring phase — use only read tools \
+                 already visible in the current turn, then \
                  call `exit_plan_mode(plan='...', approved=true)` to exit and \
                  unlock writes."
             ),
@@ -844,8 +844,9 @@ mod tests {
     // While the session is in plan mode (active_plan_id != None), all
     // mutating tools (str_replace, write_file, bash, git commit, etc.)
     // must be denied at the gate with a redirect to `exit_plan_mode`.
-    // Read-only tools (read_file, grep, glob, list_dir) stay allowed so
-    // the model can still explore the codebase to write a good plan.
+    // Read-only tools stay allowed when they are already part of the current
+    // tool surface, so the model can still use existing evidence to write a
+    // good plan. Plan mode never grants a workspace or new read tools.
     //
     // reference-agent references: plan-mode write block enforces "DO NOT
     // write or edit any files yet. This is a read-only exploration and

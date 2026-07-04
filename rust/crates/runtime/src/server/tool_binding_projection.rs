@@ -395,6 +395,8 @@ mod tests {
                 schema("ask_user"),
                 schema("skill"),
                 schema("tool_search"),
+                schema("enter_plan_mode"),
+                schema("exit_plan_mode"),
                 schema("bash"),
             ],
             &no_workspace(),
@@ -405,6 +407,8 @@ mod tests {
         assert!(names.contains("ask_user"));
         assert!(names.contains("skill"));
         assert!(names.contains("tool_search"));
+        assert!(names.contains("enter_plan_mode"));
+        assert!(names.contains("exit_plan_mode"));
         assert!(!names.contains("bash"));
     }
 

@@ -647,7 +647,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and history. Actions: config(path+value), sleep, history_page, history_search, history_around. Use dedicated tools for file rollback (`rollback_file_edits`), session-state rollback (`rollback_session_state`), context compression (`compress_context`), plan mode (`enter_plan_mode`/`exit_plan_mode`), and user questions (`ask_user`).",
+                "description": "Session lifecycle and history. Actions: config(path+value), sleep, history_page, history_search, history_around. Use dedicated tools, when visible in the current tool surface, for file rollback (`rollback_file_edits`), session-state rollback (`rollback_session_state`), context compression (`compress_context`), plan lifecycle (`enter_plan_mode`/`exit_plan_mode`), and user questions (`ask_user`).",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -762,7 +762,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          `spawn` is foreground by contract: it blocks until the sub-agent's final result is ready, and the sub-agent's tool calls stream back inline. Backgrounding is user-controlled from the UI with Ctrl+B while the live agent is running; do not pass a background flag in tool arguments.\n\n\
          ## Parallel sub-agent fan-out\n\
          Use `agent_fanout(action='start', target_count=N, slots=[...])` to run a fixed-size parallel group atomically. It waits for slot results and returns them in the same tool call unless the user backgrounds the live run with Ctrl+B. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result. Do not simulate fan-out with an `agents:[...]` payload on `agent`.\n\
-         For plan lifecycle, call `enter_plan_mode` / `exit_plan_mode` directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
+         For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
          Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. `agent` launches one child; `agent_fanout` launches a fixed parallel group.
 
          ## agent vs shell work vs task
@@ -1175,14 +1175,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
         // — the reference agent's dedicated `EnterPlanMode` tool is the
         // reference. While in plan mode, write tools (str_replace,
         // write_file, bash, git commit, …) are denied at the
-        // permission gate; read tools stay available for codebase
-        // exploration. Exit via `exit_plan_mode` — that's the only
-        // unlock path.
+        // permission gate; already-visible read tools stay available.
+        // Exit via `exit_plan_mode` — that's the only unlock path.
         json!({
             "type": "function",
             "function": {
                 "name": "enter_plan_mode",
-                "description": "Enter plan mode for non-trivial work that needs design before code. While in plan mode you can ONLY read the codebase (read_file, grep, glob, list_dir, symbols, web_fetch). Edits, shell commands, and git mutations are blocked at the permission gate — author the plan, then call `exit_plan_mode` with the markdown for user approval.\n\
+                "description": "Enter plan mode for non-trivial work that needs design before code. While in plan mode, mutating tools are blocked at the permission gate and only already-visible read/control tools remain usable. Author the plan, then call `exit_plan_mode` with the markdown for user approval.\n\
         \n\
         ## When to Use This Tool\n\
         Use plan mode when user alignment before edits materially reduces risk:\n\
@@ -1193,7 +1192,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         \n\
         When you enter plan mode:\n\
         1. Edits are blocked by design.\n\
-        2. Explore with read tools and identify existing patterns to follow.\n\
+        2. Explore only with read tools that are already visible in the current turn, and identify existing patterns to follow.\n\
         3. Produce executable leaf steps: each step should map to one concrete artifact, API surface, or validation target.\n\
         4. Avoid umbrella steps like \"build the whole system\" when code, API, UI, and verification are separate outcomes.\n\
         5. Call `exit_plan_mode(plan='<markdown>')` to submit the plan for user approval. Approval is produced by the UI/control plane, not by model-supplied tool arguments.\n\
@@ -1202,7 +1201,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
         Do not enter plan mode when normal execution is clearer:\n\
         - Single-line / few-line fixes (typos, obvious bugs).\n\
         - User gave specific step-by-step instructions — just do them.\n\
-        - Pure research / read-only exploration with no implementation step (use `agent` with explore type instead).\n\
+        - The required read tools are not visible; answer from conversation context or say the capability is unavailable instead.\n\
+        - Pure research / read-only exploration with no implementation step (use `agent` with explore type instead when that tool is visible).\n\
         - The work is < 3 files and the approach is obvious.\n\
         \n\
         Important: `exit_plan_mode` is the ONLY way to leave plan mode. Do not use `ask_user` to ask \"is the plan ready?\" — `exit_plan_mode` itself surfaces the plan for approval.",
@@ -1810,6 +1810,19 @@ mod tests {
         assert!(
             plan_desc.contains("## When to Use") && plan_desc.contains("## When NOT to Use"),
             "plan tool UX guidance should remain semantic and example-driven: {plan_desc}"
+        );
+        assert!(
+            plan_desc.contains("already-visible read/control tools"),
+            "plan schema should anchor plan-mode exploration to the current tool surface: {plan_desc}"
+        );
+        assert!(
+            !plan_desc.contains("does not grant new tools")
+                && !plan_desc.contains("filesystem/shell tools"),
+            "plan schema should not spend prompt budget explaining missing tool providers: {plan_desc}"
+        );
+        assert!(
+            !plan_desc.contains("you can ONLY read the codebase (read_file"),
+            "plan schema must not promise specific read tools are present: {plan_desc}"
         );
         assert!(
             !plan_desc.contains("ACTIVATION RULE"),
