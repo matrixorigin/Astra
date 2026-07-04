@@ -973,6 +973,7 @@ fn status_icon(status: &AgentStatus) -> &'static str {
         AgentStatus::Running { .. } => "🔄",
         AgentStatus::Idle => "💤",
         AgentStatus::Completed { .. } => "✅",
+        AgentStatus::Interrupted { .. } => "⚠️",
         AgentStatus::Failed { .. } => "❌",
         AgentStatus::Waiting { .. } => "⏸",
         AgentStatus::Cancelled { .. } => "🛑",
@@ -991,6 +992,21 @@ fn format_status(status: &AgentStatus) -> String {
                 result.clone()
             };
             format!("completed: {preview}")
+        }
+        AgentStatus::Interrupted {
+            partial_result,
+            finish_reason,
+        } => {
+            let preview = if partial_result.chars().count() > 50 {
+                format!("{}...", partial_result.chars().take(50).collect::<String>())
+            } else {
+                partial_result.clone()
+            };
+            if preview.trim().is_empty() {
+                format!("interrupted: {finish_reason}")
+            } else {
+                format!("interrupted ({finish_reason}): {preview}")
+            }
         }
         AgentStatus::Failed { error, .. } => format!("failed: {error}"),
         AgentStatus::Waiting { reason } => format!("waiting: {reason}"),
@@ -1022,7 +1038,10 @@ pub(crate) fn format_duration(d: std::time::Duration) -> String {
 fn is_terminal_agent_status(status: &AgentStatus) -> bool {
     matches!(
         status,
-        AgentStatus::Completed { .. } | AgentStatus::Failed { .. } | AgentStatus::Cancelled { .. }
+        AgentStatus::Completed { .. }
+            | AgentStatus::Interrupted { .. }
+            | AgentStatus::Failed { .. }
+            | AgentStatus::Cancelled { .. }
     )
 }
 
@@ -1149,6 +1168,7 @@ fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
         AgentFanoutSlotStatus::SpawnAccepted | AgentFanoutSlotStatus::Running => "running",
         AgentFanoutSlotStatus::SpawnRejected => "spawn rejected",
         AgentFanoutSlotStatus::Completed => "completed",
+        AgentFanoutSlotStatus::Interrupted => "interrupted",
         AgentFanoutSlotStatus::Failed => "failed",
         AgentFanoutSlotStatus::CancelledByUser => "stopped by user",
         AgentFanoutSlotStatus::CancelledByParentBudget => "cancelled by parent budget",

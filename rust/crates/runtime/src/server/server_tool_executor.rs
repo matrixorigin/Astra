@@ -1946,7 +1946,10 @@ mod tests {
             .await;
 
         assert!(!result.is_error, "{result:?}");
-        assert!(result.output.contains("## Session Health"), "{result:?}");
+        assert!(
+            result.output.contains("## Current Runtime Snapshot"),
+            "{result:?}"
+        );
         assert!(
             result
                 .metadata

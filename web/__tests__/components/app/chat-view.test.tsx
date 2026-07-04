@@ -748,7 +748,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
   });
 
-  it("keeps activity details available without main-chat metric links", async () => {
+  it("opens background task, agent, and tool activity from the chat timeline", async () => {
     const user = userEvent.setup();
     mockGetChatWorkSurface.mockResolvedValue({
       sessionId: "chat-123",
@@ -811,17 +811,20 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     render(<ChatView initial={makeDetail()} />);
 
+    expect(await screen.findByLabelText("Background work")).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /Open agents activity/i }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: /Open tasks activity/i }),
+    ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /Open tasks activity/i }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: /Open agents activity/i }),
+    ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /Open tools activity/i }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: /Open tools activity/i }),
+    ).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Tools" }));
+    await user.click(
+      screen.getByRole("button", { name: /Open tools activity/i }),
+    );
     expect(await screen.findAllByText("Needs attention")).not.toHaveLength(0);
     expect(
       await screen.findAllByText("Environment unavailable"),
@@ -838,11 +841,13 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(screen.getAllByText("disabled").length).toBeGreaterThan(0);
     expect(
       screen.getAllByText(
-        "Execution connection disconnected. Reconnect it before retrying.",
+      "Execution connection disconnected. Reconnect it before retrying.",
       ).length,
     ).toBeGreaterThan(0);
 
-    await user.click(screen.getByRole("button", { name: /Agents/ }));
+    await user.click(
+      screen.getByRole("button", { name: /Open agents activity/i }),
+    );
     expect(await screen.findAllByText("No blockers")).not.toHaveLength(0);
     expect(await screen.findAllByText("Live activity")).not.toHaveLength(0);
     await waitFor(() => {
@@ -1534,9 +1539,10 @@ describe("ChatView deferred-input unhappy paths", () => {
       />,
     );
 
+    expect(screen.getByText("Run paused")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Astra is paused. Resume to continue or stop this run.",
+        "Continue this run or close it before changing direction.",
       ),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Resume" })).toBeInTheDocument();

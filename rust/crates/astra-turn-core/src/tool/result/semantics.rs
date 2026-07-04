@@ -18,10 +18,27 @@ fn json_tool_result_is_error(result_str: &str) -> bool {
         }
         if let Some(status) = v.get("status").and_then(|s| s.as_str()) {
             return match status.trim().to_ascii_lowercase().as_str() {
-                "completed" | "complete" | "ok" | "success" | "succeeded" | "passed" | "done"
-                | "skipped" | "launched" | "pending" | "queued" | "in_progress" | "running"
-                | "still_running" | "processing" | "starting" | "waiting" | "waiting_for_input"
-                | "interrupted" => false,
+                "completed"
+                | "complete"
+                | "ok"
+                | "success"
+                | "succeeded"
+                | "passed"
+                | "done"
+                | "skipped"
+                | "launched"
+                | "pending"
+                | "queued"
+                | "in_progress"
+                | "running"
+                | "still_running"
+                | "processing"
+                | "starting"
+                | "waiting"
+                | "waiting_for_input"
+                | "interrupted"
+                | "incomplete"
+                | "completed_with_issues" => false,
                 "failed" | "partial_failure" | "denied" | "cancelled" | "canceled" | "timeout"
                 | "timed_out" => true,
                 _ => true,

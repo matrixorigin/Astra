@@ -67,6 +67,9 @@ export function compactComposerPlaceholder(placeholder: string) {
   if (trimmed.startsWith('Paused')) {
     return 'Paused...';
   }
+  if (trimmed.startsWith('Task needs direction')) {
+    return 'Task needs direction...';
+  }
   if (trimmed.startsWith('Stopping')) {
     return 'Stopping...';
   }

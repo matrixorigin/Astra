@@ -114,6 +114,7 @@ pub enum AgentFanoutSlotStatus {
     SpawnRejected,
     Running,
     Completed,
+    Interrupted,
     Failed,
     CancelledByUser,
     CancelledByParentBudget,
@@ -129,6 +130,7 @@ impl AgentFanoutSlotStatus {
             Self::SpawnRejected => "spawn_rejected",
             Self::Running => "running",
             Self::Completed => "completed",
+            Self::Interrupted => "interrupted",
             Self::Failed => "failed",
             Self::CancelledByUser => "cancelled_by_user",
             Self::CancelledByParentBudget => "cancelled_by_parent_budget",
@@ -145,6 +147,7 @@ pub struct AgentFanoutSummary {
     pub active: usize,
     pub terminal: usize,
     pub completed: usize,
+    pub interrupted: usize,
     pub failed: usize,
     pub cancelled_by_user: usize,
     pub cancelled_by_parent_budget: usize,
@@ -432,6 +435,9 @@ fn adjust_summary_for_status(
     }
     match status {
         AgentFanoutSlotStatus::Completed => adjust_summary_value(&mut summary.completed, delta),
+        AgentFanoutSlotStatus::Interrupted => {
+            adjust_summary_value(&mut summary.interrupted, delta);
+        }
         AgentFanoutSlotStatus::Failed => adjust_summary_value(&mut summary.failed, delta),
         AgentFanoutSlotStatus::CancelledByUser => {
             adjust_summary_value(&mut summary.cancelled_by_user, delta);
@@ -454,6 +460,7 @@ impl AgentFanoutSlotStatus {
         matches!(
             self,
             Self::Completed
+                | Self::Interrupted
                 | Self::Failed
                 | Self::CancelledByUser
                 | Self::CancelledByParentBudget
@@ -485,6 +492,9 @@ fn summary_sentence_parts(label: &str, summary: AgentFanoutSummary) -> Vec<Strin
     let mut parts = Vec::new();
     if summary.completed > 0 {
         parts.push(format_count(summary.completed, "completed"));
+    }
+    if summary.interrupted > 0 {
+        parts.push(format_count(summary.interrupted, "interrupted"));
     }
     if summary.cancelled_by_user > 0 {
         parts.push(format_count(summary.cancelled_by_user, "stopped by user"));

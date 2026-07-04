@@ -28,7 +28,10 @@
 use crate::turn::runtime_policy::TuningPolicy;
 use astra_core::ObservationFacet;
 use astra_core::observation::{TuningJob, TuningSignalType};
-use astra_turn_core::introspect::{CircuitBreakerSnapshot, IntrospectSnapshot, turn_budget_label};
+use astra_turn_core::introspect::{
+    CircuitBreakerSnapshot, IntrospectSnapshot, prompt_cache_fresh_input_tokens,
+    prompt_cache_read_share_pct, turn_budget_label,
+};
 
 use super::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
 
@@ -167,7 +170,7 @@ impl InspectionService<'_> {
                 let remaining = self.session.remaining_turns();
                 let max_budget = self.session.max_turns();
                 lines.push(format!(
-                    "live: pressure={:.0}% cache={:.0}% error_rate={:.0}% remaining_turns={}/{}",
+                    "live: pressure={:.0}% prompt_cache_read_share={:.0}% prompt_cache_scope=current_runtime_snapshot error_rate={:.0}% remaining_turns={}/{}",
                     pressure * 100.0,
                     cache * 100.0,
                     error_rate * 100.0,
@@ -378,11 +381,18 @@ pub fn local_reflect_from_snapshot(
     match facet {
         ObservationFacet::Session | ObservationFacet::Overview => {
             let pressure = snapshot.token_pressure;
-            let cache = snapshot.cache_hit_ratio;
             lines.push(format!(
-                "live: pressure={:.0}% cache={:.0}%",
+                "live: pressure={:.0}% prompt_cache_read_share={:.0}% prompt_cache_scope=current_runtime_snapshot",
                 pressure * 100.0,
-                cache * 100.0,
+                prompt_cache_read_share_pct(snapshot),
+            ));
+            lines.push(format!(
+                "prompt_tokens: input_total={} fresh={} cached_read={} cache_create={} output={}",
+                snapshot.total_input_tokens,
+                prompt_cache_fresh_input_tokens(snapshot),
+                snapshot.cache_read_tokens,
+                snapshot.cache_creation_tokens,
+                snapshot.total_output_tokens,
             ));
             lines.push(format!("turns: {}", turn_budget_label(snapshot)));
             lines.push(format!("compaction: {}", snapshot.compaction_tier));
@@ -580,7 +590,9 @@ mod tests {
         let summary = local_reflect_from_snapshot(&snapshot, ObservationFacet::Session);
         assert!(summary.contains("Local Reflect Summary"));
         assert!(summary.contains("pressure=42%"));
-        assert!(summary.contains("cache=88%"));
+        assert!(summary.contains("prompt_cache_read_share=88%"));
+        assert!(summary.contains("prompt_cache_scope=current_runtime_snapshot"));
+        assert!(!summary.contains("cache=88%"));
         assert!(summary.contains("snapshot_age_turns=2"));
         assert!(summary.contains("turns: 3/10"));
         assert!(summary.contains("compaction: light"));

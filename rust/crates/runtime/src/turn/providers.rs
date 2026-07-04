@@ -9,7 +9,7 @@
 //!
 //! | Trait | Responsibility |
 //! |-------|----------------|
-//! | `LiveRuntimeProvider` | Real-time token pressure, cache hit ratio, error rate, budget |
+//! | `LiveRuntimeProvider` | Real-time token pressure, prompt-cache read share, error rate, budget |
 //! | `ObservationProvider` | Journal facts, trends, entry counts |
 //! | `SessionStateProvider` | Task board completion, phase, circuit breaker |
 //!
@@ -29,7 +29,8 @@ pub trait LiveRuntimeProvider: Send + Sync {
     /// Returns 0.0 when the budget is unlimited (max_turns == 0).
     fn token_pressure(&self) -> f64;
 
-    /// Ratio of cache reads to total input tokens, 0.0–1.0.
+    /// Ratio of prompt-cache reads to total input tokens for the current live
+    /// runtime snapshot, 0.0–1.0. This is not a durable session aggregate.
     /// Returns 0.0 when no input tokens have been consumed.
     fn cache_hit_ratio(&self) -> f64;
 

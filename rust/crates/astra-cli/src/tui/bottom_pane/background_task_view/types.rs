@@ -54,6 +54,7 @@ impl BackgroundTaskKind {
 pub(crate) enum BackgroundTaskStatus {
     Pending,
     WaitingForInput,
+    Interrupted,
     Failed,
     Running,
     Killed,
@@ -66,6 +67,7 @@ impl BackgroundTaskStatus {
         match value {
             "pending" => Self::Pending,
             "waiting_for_input" => Self::WaitingForInput,
+            "interrupted" => Self::Interrupted,
             "failed" => Self::Failed,
             "running" => Self::Running,
             "killed" => Self::Killed,
@@ -79,6 +81,7 @@ impl BackgroundTaskStatus {
         match self {
             Self::Pending => "pending",
             Self::WaitingForInput => "waiting_for_input",
+            Self::Interrupted => "interrupted",
             Self::Failed => "failed",
             Self::Running => "running",
             Self::Killed => "killed",
@@ -91,6 +94,7 @@ impl BackgroundTaskStatus {
         match self {
             Self::Pending => "pending",
             Self::WaitingForInput => "needs input",
+            Self::Interrupted => "interrupted",
             Self::Failed => "failed",
             Self::Running => "running",
             Self::Killed => "stopped",
@@ -103,6 +107,7 @@ impl BackgroundTaskStatus {
         match self {
             Self::Pending => Color::Blue,
             Self::WaitingForInput => Color::Yellow,
+            Self::Interrupted => Color::Yellow,
             Self::Failed => Color::Red,
             Self::Running => Color::Cyan,
             Self::Completed => Color::Green,
@@ -116,7 +121,7 @@ impl BackgroundTaskStatus {
 
     pub(crate) fn attention_rank(self) -> u8 {
         match self {
-            Self::WaitingForInput | Self::Failed => 0,
+            Self::WaitingForInput | Self::Interrupted | Self::Failed => 0,
             Self::Running | Self::Pending => 1,
             Self::Killed => 2,
             Self::Completed => 3,
@@ -128,6 +133,7 @@ impl BackgroundTaskStatus {
         match self {
             Self::Pending => "Pending · no output yet",
             Self::WaitingForInput => "Waiting for input · no output yet",
+            Self::Interrupted => "Interrupted with no output",
             Self::Running => "No output yet · still running",
             Self::Completed => "Completed with no output",
             Self::Failed => "Failed with no output",

@@ -240,10 +240,11 @@ impl Default for SpawnAgentInput {
 /// Resolve the effective turn budget given an explicit `max_turns`,
 /// an optional `complexity` hint, and the agent-type default. Rules:
 ///
-///  * `max_turns=Some(n)` → always wins (explicit beats hint).
-///  * `complexity=Some("light")` → `max(10, default / 2)`.
-///  * `complexity=Some("normal")` / None → default.
-///  * `complexity=Some("deep")` / `"thorough"` → `2 × default`.
+///  * the agent-type default is the floor for every spawned child;
+///  * `max_turns=Some(n)` may raise the budget but may not make the
+///    child too small to be useful;
+///  * `complexity=Some("light")` / `"normal"` / None → default;
+///  * `complexity=Some("deep")` / `"thorough"` → `2 × default`;
 ///  * Unknown complexity strings fall back to default + a
 ///    `tracing::debug!` so operators can spot typos.
 ///
@@ -255,19 +256,16 @@ pub fn resolve_turn_budget(
     complexity: Option<&str>,
     default_max_turns: u32,
 ) -> u32 {
+    let default_max_turns = default_max_turns.max(1);
     if let Some(n) = explicit_max_turns {
-        return n;
+        return n.max(default_max_turns);
     }
     match complexity
         .map(str::trim)
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        // `light` caps at 10 turns but never raises a smaller
-        // agent-type default to 10 (i.e. min-of-two). Short tasks
-        // don't need more than ~10 even when the type's default is
-        // 30+.
-        Some("light") | Some("short") | Some("quick") => default_max_turns.min(10),
+        Some("light") | Some("short") | Some("quick") => default_max_turns,
         Some("normal") | Some("default") | None | Some("") => default_max_turns,
         Some("deep") | Some("thorough") | Some("heavy") => default_max_turns.saturating_mul(2),
         Some(other) => {
@@ -286,17 +284,15 @@ mod budget_resolve_tests {
     use super::resolve_turn_budget;
 
     #[test]
-    fn explicit_max_turns_wins_over_complexity() {
-        assert_eq!(resolve_turn_budget(Some(7), Some("deep"), 20), 7);
+    fn explicit_max_turns_can_raise_but_not_shrink_default() {
+        assert_eq!(resolve_turn_budget(Some(40), Some("deep"), 20), 40);
+        assert_eq!(resolve_turn_budget(Some(7), Some("deep"), 20), 20);
     }
 
     #[test]
-    fn complexity_light_caps_to_10() {
-        // Default > 10: cap to 10.
-        assert_eq!(resolve_turn_budget(None, Some("light"), 20), 10);
-        assert_eq!(resolve_turn_budget(None, Some("light"), 60), 10);
-        // Default < 10: keep the lower default (a small agent type
-        // knows its own budget; light shouldn't inflate it).
+    fn complexity_light_uses_agent_default() {
+        assert_eq!(resolve_turn_budget(None, Some("light"), 20), 20);
+        assert_eq!(resolve_turn_budget(None, Some("light"), 60), 60);
         assert_eq!(resolve_turn_budget(None, Some("light"), 4), 4);
         assert_eq!(resolve_turn_budget(None, Some("light"), 8), 8);
     }

@@ -32,6 +32,11 @@ pub struct IntrospectSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_model: Option<String>,
     pub token_pressure: f64,
+    /// Prompt-cache read share for this live runtime snapshot:
+    /// `cache_read_tokens / total_input_tokens`.
+    ///
+    /// This is not a durable session-wide aggregate unless the producer
+    /// explicitly populated the snapshot from a session aggregate.
     pub cache_hit_ratio: f64,
     pub turns_completed: u32,
     pub turns_remaining: u32,
@@ -55,6 +60,8 @@ pub struct IntrospectSnapshot {
     /// began.
     #[serde(default)]
     pub lifecycle_summary: String,
+    /// Provider-reported input token total for this snapshot. This includes
+    /// fresh input tokens, cached-read input tokens, and cache-creation tokens.
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -306,9 +313,12 @@ fn render_introspect(snapshot: &IntrospectSnapshot, depth: IntrospectTextDepth) 
 
 fn render_hint(s: &IntrospectSnapshot) -> String {
     let mut out = format!(
-        "pressure={:.0}% cache={:.0}% turns={} alerts={} tier={}",
+        "pressure={:.0}% prompt_cache_read_share={:.0}% prompt_cache_scope=current_runtime_snapshot input_total={} cached_read={} cache_create={} turns={} alerts={} tier={}",
         s.token_pressure * 100.0,
-        s.cache_hit_ratio * 100.0,
+        prompt_cache_read_share_pct(s),
+        s.total_input_tokens,
+        s.cache_read_tokens,
+        s.cache_creation_tokens,
         turn_budget_label(s),
         s.alerts.len(),
         s.compaction_tier,
@@ -326,17 +336,19 @@ fn render_hint(s: &IntrospectSnapshot) -> String {
 fn render_summary(s: &IntrospectSnapshot) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "## Session Health\n\
-         Pressure: {:.0}% | Cache: {:.0}% | Turns: {} | Tier: {}\n\
-         Tokens: {}in + {}out ({}cached_read, {}cached_create)\n",
+        "## Current Runtime Snapshot\n\
+         Scope: current live runtime snapshot; prompt-cache values are not durable session-wide aggregates.\n\
+         Pressure: {:.0}% | Prompt cache read share: {:.0}% | Turns: {} | Tier: {}\n\
+         Prompt tokens: input_total={} fresh={} cached_read={} cache_create={} | Output tokens: {}\n",
         s.token_pressure * 100.0,
-        s.cache_hit_ratio * 100.0,
+        prompt_cache_read_share_pct(s),
         turn_budget_label(s),
         s.compaction_tier,
         s.total_input_tokens,
-        s.total_output_tokens,
+        prompt_cache_fresh_input_tokens(s),
         s.cache_read_tokens,
         s.cache_creation_tokens,
+        s.total_output_tokens,
     ));
     if let Some(model) = s.current_model.as_deref() {
         out.push_str("Current model: ");
@@ -404,6 +416,16 @@ pub fn turn_budget_label(s: &IntrospectSnapshot) -> String {
 pub fn mark_snapshot_age(snapshot: &mut IntrospectSnapshot, current_session_turn: u32) {
     let age = current_session_turn.saturating_sub(snapshot.turns_completed);
     snapshot.snapshot_age_turns = snapshot.snapshot_age_turns.max(age);
+}
+
+pub fn prompt_cache_read_share_pct(s: &IntrospectSnapshot) -> f64 {
+    s.cache_hit_ratio * 100.0
+}
+
+pub fn prompt_cache_fresh_input_tokens(s: &IntrospectSnapshot) -> u64 {
+    s.total_input_tokens
+        .saturating_sub(s.cache_read_tokens)
+        .saturating_sub(s.cache_creation_tokens)
 }
 
 fn render_full(s: &IntrospectSnapshot) -> String {
@@ -479,20 +501,28 @@ pub fn render_recent_rounds(s: &IntrospectSnapshot) -> String {
         ));
     }
     // Summary stats so the LLM gets a one-liner without re-totalling.
-    let total_in: u64 = s.recent_rounds.iter().map(|r| r.prompt_tokens).sum();
+    let total_fresh: u64 = s.recent_rounds.iter().map(|r| r.prompt_tokens).sum();
     let total_cached: u64 = s.recent_rounds.iter().map(|r| r.cache_read_tokens).sum();
-    let billable: u64 = total_in + total_cached;
-    let pct = if billable > 0 {
-        (total_cached as f64 / billable as f64) * 100.0
+    let total_created: u64 = s
+        .recent_rounds
+        .iter()
+        .map(|r| r.cache_creation_tokens)
+        .sum();
+    let input_total: u64 = total_fresh
+        .saturating_add(total_cached)
+        .saturating_add(total_created);
+    let pct = if input_total > 0 {
+        (total_cached as f64 / input_total as f64) * 100.0
     } else {
         0.0
     };
     out.push_str(&format!(
-        "\nRing: {} rounds, cache_hit={:.0}% ({}/{} billable).\n",
+        "\nRing: {} rounds, prompt_cache_read_share={:.0}% (cached_read={}/input_total={}, cache_create={}).\n",
         s.recent_rounds.len(),
         pct,
         total_cached,
-        billable,
+        input_total,
+        total_created,
     ));
     out
 }
@@ -869,7 +899,12 @@ mod tests {
             "hint must be a single line: {output}"
         );
         assert!(output.contains("pressure=72%"));
-        assert!(output.contains("cache=65%"));
+        assert!(output.contains("prompt_cache_read_share=65%"));
+        assert!(output.contains("prompt_cache_scope=current_runtime_snapshot"));
+        assert!(output.contains("input_total=145000"));
+        assert!(output.contains("cached_read=95000"));
+        assert!(output.contains("cache_create=8000"));
+        assert!(!output.contains("cache=65%"));
         assert!(output.contains("turns=8/20"));
         assert!(output.contains("alerts=2"));
         assert!(output.contains("model=deepseek-v4-pro-official(thinking:high)"));
@@ -878,7 +913,13 @@ mod tests {
     #[test]
     fn summary_includes_key_metrics_and_top_alerts() {
         let output = render_introspect(&sample_snapshot(), IntrospectTextDepth::Summary);
-        assert!(output.contains("## Session Health"));
+        assert!(output.contains("## Current Runtime Snapshot"));
+        assert!(output.contains("Scope: current live runtime snapshot"));
+        assert!(output.contains("Prompt cache read share: 65%"));
+        assert!(output.contains(
+            "Prompt tokens: input_total=145000 fresh=42000 cached_read=95000 cache_create=8000"
+        ));
+        assert!(!output.contains("Cache: 65%"));
         assert!(output.contains("cache_regression"));
         assert!(output.contains("Current model: deepseek-v4-pro-official(thinking:high)"));
         assert!(output.contains("Provider context window: 1000000 tokens"));
@@ -1150,10 +1191,14 @@ mod tests {
     fn empty_snapshot_renders_stable_empty_state_contract() {
         let empty = IntrospectSnapshot::default();
         let hint = render_introspect(&empty, IntrospectTextDepth::Hint);
-        assert_eq!(hint, "pressure=0% cache=0% turns=0/∞ alerts=0 tier=");
+        assert_eq!(
+            hint,
+            "pressure=0% prompt_cache_read_share=0% prompt_cache_scope=current_runtime_snapshot input_total=0 cached_read=0 cache_create=0 turns=0/∞ alerts=0 tier="
+        );
         let full = render_introspect(&empty, IntrospectTextDepth::Full);
-        assert!(full.contains("## Session Health"));
-        assert!(full.contains("Pressure: 0% | Cache: 0% | Turns: 0/∞ | Tier:"));
+        assert!(full.contains("## Current Runtime Snapshot"));
+        assert!(full.contains("Pressure: 0% | Prompt cache read share: 0% | Turns: 0/∞ | Tier:"));
+        assert!(!full.contains("Cache: 0%"));
         assert!(!full.contains("## Tool Health"));
         assert!(!full.contains("Current model:"));
     }
@@ -1254,9 +1299,11 @@ mod tests {
         assert!(out.contains("t3_r0"));
         assert!(out.contains("t3_r1"));
         assert!(out.contains("bash,read_file"));
-        // Summary line has cache-hit percentage.
+        // Summary line has scoped prompt-cache read share.
         assert!(out.contains("Ring: 2 rounds"));
-        assert!(out.contains("cache_hit"));
+        assert!(out.contains("prompt_cache_read_share"));
+        assert!(out.contains("cached_read=14300/input_total=14600"));
+        assert!(!out.contains("cache_hit="));
     }
 
     #[test]
@@ -1362,7 +1409,7 @@ mod tests {
             first_seen_round: Some(0),
         }];
         let out = render_all(&snap);
-        assert!(out.contains("## Session Health"));
+        assert!(out.contains("## Current Runtime Snapshot"));
         assert!(out.contains("## Recent Rounds"));
         assert!(out.contains("## Volatile Lane"));
         assert!(out.contains("## Stall / Loop-Guard"));

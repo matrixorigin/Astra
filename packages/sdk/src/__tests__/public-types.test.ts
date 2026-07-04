@@ -67,6 +67,11 @@ describe('public SDK types', () => {
       run_id: 'run-1',
       waiting_for: 'user_resume',
       resumable: true,
+      task_board: {
+        summary: '1 in-progress task',
+        in_progress_count: 1,
+        active_tasks: ['task-1 Review [in_progress]'],
+      },
     };
     const failedAgent: AgentFailedEvent = {
       type: 'agent_failed',

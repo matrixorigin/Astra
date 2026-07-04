@@ -116,13 +116,15 @@ impl BackgroundTaskCounts {
                     BackgroundTaskKind::Monitor => counts.monitors += 1,
                 },
                 BackgroundTaskStatus::WaitingForInput => counts.waiting += 1,
-                BackgroundTaskStatus::Failed => match row.kind {
-                    BackgroundTaskKind::Shell => counts.failed_shells += 1,
-                    BackgroundTaskKind::LocalAgent => counts.failed_local_agents += 1,
-                    BackgroundTaskKind::CloudSession => counts.failed_cloud_sessions += 1,
-                    BackgroundTaskKind::MainSession => counts.failed_main_sessions += 1,
-                    BackgroundTaskKind::Monitor => counts.failed_monitors += 1,
-                },
+                BackgroundTaskStatus::Interrupted | BackgroundTaskStatus::Failed => {
+                    match row.kind {
+                        BackgroundTaskKind::Shell => counts.failed_shells += 1,
+                        BackgroundTaskKind::LocalAgent => counts.failed_local_agents += 1,
+                        BackgroundTaskKind::CloudSession => counts.failed_cloud_sessions += 1,
+                        BackgroundTaskKind::MainSession => counts.failed_main_sessions += 1,
+                        BackgroundTaskKind::Monitor => counts.failed_monitors += 1,
+                    }
+                }
                 BackgroundTaskStatus::Unavailable => match row.kind {
                     BackgroundTaskKind::Shell => counts.unavailable_shells += 1,
                     BackgroundTaskKind::LocalAgent => counts.unavailable_local_agents += 1,
@@ -183,7 +185,8 @@ impl BackgroundTaskFanoutSummary {
                 crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Completed => {
                     group.done += 1;
                 }
-                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Failed => {
+                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Interrupted
+                | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Failed => {
                     group.failed += 1;
                 }
                 crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Killed => {

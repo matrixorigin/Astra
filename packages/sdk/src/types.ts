@@ -118,6 +118,18 @@ export type RunInterruptedEvent = {
   message?: string;
   waiting_for?: string | null;
   resumable?: boolean;
+  task_board?: RunInterruptedTaskBoardSummary;
+};
+
+export type RunInterruptedTaskBoardSummary = {
+  summary?: string;
+  tracked_count?: number;
+  pending_count?: number;
+  in_progress_count?: number;
+  paused_count?: number;
+  blocked_count?: number;
+  terminal_non_success_count?: number;
+  active_tasks?: string[];
 };
 
 export type TextDeltaEvent = {

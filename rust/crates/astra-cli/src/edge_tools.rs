@@ -7122,7 +7122,7 @@ mod tests {
         let executor = test_executor();
         let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
         assert!(
-            out.contains("Session Health"),
+            out.contains("Current Runtime Snapshot"),
             "expected structured output, got: {out}"
         );
         assert!(
@@ -7247,7 +7247,7 @@ mod tests {
         });
         let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
         assert!(out.contains("Turns: 5/15"), "got: {out}");
-        assert!(out.contains("12345in"), "got: {out}");
+        assert!(out.contains("input_total=12345"), "got: {out}");
         assert!(out.contains("resume pending"), "got: {out}");
     }
 
@@ -7408,11 +7408,11 @@ mod tests {
 
     #[test]
     fn introspect_depth_summary_session_is_default_behavior() {
-        // Without facet the tool still shows Session Health unchanged.
+        // Without facet the tool still shows the current runtime snapshot.
         let executor = test_executor();
         let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
         assert!(
-            out.contains("Session Health"),
+            out.contains("Current Runtime Snapshot"),
             "default facet must preserve session output, got: {out}",
         );
     }

@@ -26,11 +26,26 @@ impl ToolResultStatusKind {
     pub fn from_status_str(status: &str) -> Self {
         let normalized = status.trim().to_lowercase();
         match normalized.as_str() {
-            "completed" | "complete" | "ok" | "success" | "succeeded" | "passed" | "done"
-            | "launched" | "pending" | "queued" | "in_progress" | "running" | "still_running"
-            | "processing" | "starting" | "waiting" | "waiting_for_input" | "interrupted" => {
-                Self::Completed
-            }
+            "completed"
+            | "complete"
+            | "ok"
+            | "success"
+            | "succeeded"
+            | "passed"
+            | "done"
+            | "launched"
+            | "pending"
+            | "queued"
+            | "in_progress"
+            | "running"
+            | "still_running"
+            | "processing"
+            | "starting"
+            | "waiting"
+            | "waiting_for_input"
+            | "interrupted"
+            | "incomplete"
+            | "completed_with_issues" => Self::Completed,
             "skipped" => Self::Skipped,
             _ => Self::Failed,
         }
@@ -88,6 +103,8 @@ mod tests {
             "waiting",
             "running",
             "interrupted",
+            "incomplete",
+            "completed_with_issues",
         ] {
             let kind = ToolResultStatusKind::from_status_str(status);
             assert_eq!(

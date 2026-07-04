@@ -105,7 +105,22 @@ describe('deriveChatRunUiState', () => {
     expect(ui.canResumeRun).toBe(true);
     expect(ui.canStopRun).toBe(true);
     expect(ui.composerDisabled).toBe(true);
-    expect(ui.composerPlaceholder).toBe('Paused. Resume or stop to continue.');
+    expect(ui.composerPlaceholder).toBe('Paused. Continue or close this run.');
+    expect(ui.taskBoardIntervention).toBe(false);
+  });
+
+  it('uses task-board language for task intervention pauses', () => {
+    const ui = deriveChatRunUiState({
+      ...base,
+      activeRun: waitingRun('paused', 'task_board_intervention'),
+    });
+
+    expect(ui.canResumeRun).toBe(true);
+    expect(ui.canStopRun).toBe(true);
+    expect(ui.composerDisabled).toBe(true);
+    expect(ui.composerPlaceholder).toBe('Task needs direction before continuing.');
+    expect(ui.activeRunLabel).toBe('Task Needs Direction');
+    expect(ui.taskBoardIntervention).toBe(true);
   });
 
   it('labels archived idle chats without disabling the composer decision itself', () => {

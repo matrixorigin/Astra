@@ -363,6 +363,10 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
             result,
             finish_reason,
         } => render_completed_agent_result(agent_id, result, finish_reason.as_deref()),
+        AgentStatus::Interrupted {
+            partial_result,
+            finish_reason,
+        } => render_completed_agent_result(agent_id, partial_result, Some(finish_reason)),
         AgentStatus::Failed {
             error,
             finish_reason,

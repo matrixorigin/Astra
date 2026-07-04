@@ -11,7 +11,10 @@ use astra_core::{
     push_graph_node, truncate_graph_summary,
 };
 
-use super::{IntrospectRequest, IntrospectSnapshot, ObservationFacet, turn_budget_label};
+use super::{
+    IntrospectRequest, IntrospectSnapshot, ObservationFacet, prompt_cache_read_share_pct,
+    turn_budget_label,
+};
 
 const RUNTIME_SNAPSHOT_REF: &str = "urn:astra:context:local:introspect:runtime_snapshot";
 
@@ -77,9 +80,12 @@ pub fn build_introspect_report(
         evidence_class: "observed_evidence".to_string(),
         source: "runtime.introspect_snapshot".to_string(),
         summary: format!(
-            "pressure={:.0}% cache={:.0}% turns={} signals={} tool_failures={}{}",
+            "pressure={:.0}% prompt_cache_read_share={:.0}% prompt_cache_scope=current_runtime_snapshot input_total={} cached_read={} cache_create={} turns={} signals={} tool_failures={}{}",
             snapshot.token_pressure * 100.0,
-            snapshot.cache_hit_ratio * 100.0,
+            prompt_cache_read_share_pct(snapshot),
+            snapshot.total_input_tokens,
+            snapshot.cache_read_tokens,
+            snapshot.cache_creation_tokens,
             turn_budget_label(snapshot),
             snapshot.alerts.len(),
             snapshot.tool_errors.len(),
@@ -392,9 +398,9 @@ fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
             )
         }
         _ => format!(
-            "Runtime healthy - pressure {:.0}%, cache {:.0}%, turns {}",
+            "Runtime snapshot healthy - pressure {:.0}%, prompt_cache_read_share {:.0}% (scope=current_runtime_snapshot), turns {}",
             snapshot.token_pressure * 100.0,
-            snapshot.cache_hit_ratio * 100.0,
+            prompt_cache_read_share_pct(snapshot),
             turn_budget_label(snapshot),
         ),
     }
@@ -1072,7 +1078,7 @@ mod tests {
             ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
             evidence_class: "observed_evidence".into(),
             source: "runtime.introspect_snapshot".into(),
-            summary: "pressure=0% cache=0% turns=0/∞ signals=0 tool_failures=0".into(),
+            summary: "pressure=0% prompt_cache_read_share=0% prompt_cache_scope=current_runtime_snapshot input_total=0 cached_read=0 cache_create=0 turns=0/∞ signals=0 tool_failures=0".into(),
             confidence: ObservationConfidence::evidence(0.75),
         }];
         let action_hints = Vec::new();
@@ -1119,7 +1125,7 @@ mod tests {
             ref_id: "urn:astra:context:local:introspect:runtime_snapshot".into(),
             evidence_class: "observed_evidence".into(),
             source: "runtime.introspect_snapshot".into(),
-            summary: "pressure=0% cache=0% turns=0/∞ signals=0 tool_failures=1".into(),
+            summary: "pressure=0% prompt_cache_read_share=0% prompt_cache_scope=current_runtime_snapshot input_total=0 cached_read=0 cache_create=0 turns=0/∞ signals=0 tool_failures=1".into(),
             confidence: ObservationConfidence::evidence(0.75),
         }];
         let action_hints = Vec::new();

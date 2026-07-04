@@ -1124,6 +1124,9 @@ async fn render_agent_fanout_results(
     if summary.failed > 0 {
         obj.insert("failed".into(), json!(summary.failed));
     }
+    if summary.interrupted > 0 {
+        obj.insert("interrupted".into(), json!(summary.interrupted));
+    }
     if summary.cancelled_by_user > 0 {
         obj.insert("cancelled_by_user".into(), json!(summary.cancelled_by_user));
     }
@@ -1146,6 +1149,7 @@ async fn render_agent_fanout_results(
     // to retry failed slots. The fanout group is a fixed-size contract;
     // retries inflate the group and corrupt accounting.
     let has_failures = summary.failed > 0
+        || summary.interrupted > 0
         || summary.spawn_rejected > 0
         || summary.timed_out > 0
         || summary.cancelled_by_user > 0
@@ -1154,7 +1158,7 @@ async fn render_agent_fanout_results(
         obj.insert(
             "instruction".into(),
             json!(
-            "Do NOT retry, respawn, or spawn additional agents to replace failed/cancelled slots. \
+            "Do NOT retry, respawn, or spawn additional agents to replace failed/interrupted/cancelled slots. \
              The fanout group has a fixed target_count and adding agents corrupts accounting. \
              Work with the results you have, or ask the user how to proceed."
         ),
@@ -1363,7 +1367,9 @@ fn fanout_effective_max_turns(
         .agent_type
         .as_deref()
         .or_else(|| defaults.and_then(|d| d.agent_type.as_deref()))
-        .map(str::trim);
+        .map(str::trim)
+        .filter(|agent_type| !agent_type.is_empty())
+        .unwrap_or("general-purpose");
     let complexity = slot
         .complexity
         .as_deref()
@@ -1371,18 +1377,14 @@ fn fanout_effective_max_turns(
         .map(str::trim)
         .map(str::to_ascii_lowercase);
 
-    let is_light = matches!(complexity.as_deref(), Some("light" | "short" | "quick"));
-    if is_light {
-        return requested;
-    }
-
     let is_deep = matches!(complexity.as_deref(), Some("deep" | "thorough" | "heavy"));
-    let is_code_review = agent_type == Some("code-review");
-    let min_turns = if is_deep || is_code_review {
+    let is_code_review = agent_type == "code-review";
+    let agent_default = builtin_agent_default_max_turns(agent_type);
+    let min_turns = agent_default.or(if is_deep || is_code_review {
         Some(FANOUT_CODE_REVIEW_MIN_TURNS)
     } else {
         None
-    };
+    });
 
     match (requested, min_turns, is_deep) {
         (Some(requested), Some(min_turns), _) => Some(requested.max(min_turns)),
@@ -1392,13 +1394,20 @@ fn fanout_effective_max_turns(
     }
 }
 
+fn builtin_agent_default_max_turns(agent_type: &str) -> Option<u32> {
+    astra_turn_core::orchestration_builtin_agents::get_builtin_agent_types()
+        .into_iter()
+        .find(|definition| definition.agent_type == agent_type)
+        .map(|definition| definition.max_turns)
+}
+
 /// Detect whether the effective `max_turns` diverged from what the caller
 /// requested, and if so, produce a human-readable transparency notice.
 ///
 /// First principles: a silent budget override breaks the caller's mental model
-/// of cost. When we inflate `max_turns` past the request (code-review/deep
-/// minimum), the caller must be told — both to preserve trust and to let them
-/// opt out by setting `complexity: "light"`.
+/// of cost. When we raise a too-small request to the agent-type floor, the
+/// caller must be told so the parent agent can report the actual execution
+/// shape instead of pretending the smaller budget was used.
 fn fanout_budget_adjustment_notice(input: &AgentFanoutStartInput) -> Option<String> {
     let defaults = input.defaults.as_ref();
     let mut adjustments: Vec<String> = Vec::new();
@@ -1423,8 +1432,7 @@ fn fanout_budget_adjustment_notice(input: &AgentFanoutStartInput) -> Option<Stri
         None
     } else {
         Some(format!(
-            "Budget adjusted — code-review/deep agent minimum enforced ({}). \
-             Set complexity=\"light\" to honor the original max_turns.",
+            "Budget adjusted — agent-type minimum turn budget enforced ({}).",
             adjustments.join("; ")
         ))
     }
@@ -1487,6 +1495,7 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
         "active": summary.active,
         "terminal": summary.terminal,
         "completed": summary.completed,
+        "interrupted": summary.interrupted,
         "failed": summary.failed,
         "cancelled_by_user": summary.cancelled_by_user,
         "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
@@ -1516,16 +1525,16 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
 
 fn fanout_get_results_status_label(group: &AgentFanoutGroupProjection) -> &'static str {
     let summary = group.summary();
-    if summary.spawn_rejected > 0 {
-        "failed_to_start"
-    } else if summary.cancelled_by_parent_budget > 0 {
-        "interrupted"
-    } else if summary.failed > 0 || summary.timed_out > 0 {
-        "failed"
-    } else if summary.active > 0 {
+    if summary.active > 0 {
         "incomplete"
-    } else if summary.cancelled_by_user > 0 {
-        "finished"
+    } else if summary.spawn_rejected > 0
+        || summary.cancelled_by_parent_budget > 0
+        || summary.failed > 0
+        || summary.timed_out > 0
+        || summary.interrupted > 0
+        || summary.cancelled_by_user > 0
+    {
+        "completed_with_issues"
     } else {
         "completed"
     }
@@ -1538,6 +1547,7 @@ fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
         AgentFanoutSlotStatus::SpawnRejected => "spawn_rejected",
         AgentFanoutSlotStatus::Running => "running",
         AgentFanoutSlotStatus::Completed => "completed",
+        AgentFanoutSlotStatus::Interrupted => "interrupted",
         AgentFanoutSlotStatus::Failed => "failed",
         AgentFanoutSlotStatus::CancelledByUser => "cancelled_by_user",
         AgentFanoutSlotStatus::CancelledByParentBudget => "cancelled_by_parent_budget",
@@ -1821,11 +1831,14 @@ fn attach_fanout_to_agent_result(
             "active": summary.active,
             "terminal": summary.terminal,
             "completed": summary.completed,
+            "interrupted": summary.interrupted,
             "failed": summary.failed,
             "cancelled_by_user": summary.cancelled_by_user,
             "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+            "timed_out": summary.timed_out,
             "spawn_rejected": summary.spawn_rejected,
             "collected": summary.collected,
+            "uncollected": summary.uncollected,
         }),
     );
     serde_json::to_string(&value).unwrap_or(rendered)
@@ -2014,6 +2027,7 @@ mod tests {
     struct CapturingModelExecutor {
         captured_model: Mutex<Option<String>>,
         captured_execution_metadata: Mutex<Option<Value>>,
+        captured_max_turns: Mutex<Option<u32>>,
         spawn_count: Mutex<usize>,
     }
 
@@ -2022,6 +2036,7 @@ mod tests {
             Self {
                 captured_model: Mutex::new(None),
                 captured_execution_metadata: Mutex::new(None),
+                captured_max_turns: Mutex::new(None),
                 spawn_count: Mutex::new(0),
             }
         }
@@ -2032,6 +2047,10 @@ mod tests {
 
         fn take_captured_execution_metadata(&self) -> Option<Value> {
             self.captured_execution_metadata.lock().unwrap().take()
+        }
+
+        fn take_captured_max_turns(&self) -> Option<u32> {
+            self.captured_max_turns.lock().unwrap().take()
         }
 
         fn spawn_count(&self) -> usize {
@@ -2045,6 +2064,7 @@ mod tests {
             *self.spawn_count.lock().unwrap() += 1;
             *self.captured_model.lock().unwrap() = config.model.clone();
             *self.captured_execution_metadata.lock().unwrap() = config.execution_metadata.clone();
+            *self.captured_max_turns.lock().unwrap() = Some(config.max_turns);
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
@@ -2221,6 +2241,29 @@ mod tests {
         assert_eq!(
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_floors_too_small_turn_budget_to_agent_default() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let args = json!({
+            "description": "Investigate failures",
+            "prompt": "Inspect the failing fanout run and report the root cause.",
+            "agent_type": "general-purpose",
+            "max_turns": 10,
+            "complexity": "light"
+        });
+
+        let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
+
+        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        assert_eq!(
+            executor.take_captured_max_turns(),
+            Some(60),
+            "general-purpose children must not inherit a model-supplied 10-turn cap"
         );
     }
 
@@ -2757,6 +2800,50 @@ mod tests {
         assert_eq!(args["max_turns"], 30);
     }
 
+    #[test]
+    fn fanout_slot_spawn_args_floor_general_purpose_budget_to_agent_default() {
+        let input = AgentFanoutStartInput {
+            _action: Some("start".into()),
+            _tool_call_id: None,
+            group_id: Some("investigate-1".into()),
+            title: Some("investigation fanout".into()),
+            target_count: 2,
+            slots: Vec::new(),
+            defaults: Some(AgentFanoutDefaults {
+                agent_type: Some("general-purpose".into()),
+                max_turns: Some(10),
+                complexity: Some("light".into()),
+                ..Default::default()
+            }),
+        };
+        let slot = AgentFanoutStartSlot {
+            slot_id: Some("runtime".into()),
+            description: "Investigate runtime".into(),
+            prompt: "Investigate runtime failures".into(),
+            agent_type: None,
+            model: None,
+            max_turns: None,
+            max_output_tokens: None,
+            complexity: None,
+            isolated: None,
+            allowed_tools: None,
+        };
+
+        let args = fanout_slot_spawn_args(
+            &input,
+            slot,
+            "investigate-1",
+            "investigation fanout",
+            2,
+            0,
+            None,
+        );
+
+        assert_eq!(args["agent_type"], "general-purpose");
+        assert_eq!(args["complexity"], "light");
+        assert_eq!(args["max_turns"], 60);
+    }
+
     #[tokio::test]
     async fn agent_fanout_get_results_collects_all_slots() {
         let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
@@ -3111,7 +3198,7 @@ mod tests {
         .await;
         let value: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(value["status"], "failed_to_start");
+        assert_eq!(value["status"], "completed_with_issues");
         assert_eq!(value["results"].as_array().unwrap().len(), 2);
         assert_eq!(value["results"][0]["slot_index"], 0);
         assert_eq!(value["results"][0]["status"], "spawn_rejected");
@@ -3152,7 +3239,7 @@ mod tests {
         .await;
         let value: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(value["status"], "failed");
+        assert_eq!(value["status"], "completed_with_issues");
         assert_eq!(value["results"].as_array().unwrap().len(), 1);
         assert_eq!(value["results"][0]["slot_index"], 0);
         assert_eq!(value["results"][0]["result"]["status"], "failed");
@@ -3319,7 +3406,7 @@ mod tests {
         .await;
         let value: Value = serde_json::from_str(&result).unwrap();
 
-        assert_eq!(value["status"], "finished");
+        assert_eq!(value["status"], "completed_with_issues");
         assert_eq!(value["cancelled_by_user"], 1);
     }
 
@@ -3329,7 +3416,7 @@ mod tests {
         spawn_rejected.record_spawn_rejected(0, "quota").unwrap();
         assert_eq!(
             fanout_get_results_status_label(&spawn_rejected),
-            "failed_to_start"
+            "completed_with_issues"
         );
 
         let mut failed = AgentFanoutGroupProjection::new("review-2", "Review", 1);
@@ -3341,7 +3428,10 @@ mod tests {
                 Some("child failed".into()),
             )
             .unwrap();
-        assert_eq!(fanout_get_results_status_label(&failed), "failed");
+        assert_eq!(
+            fanout_get_results_status_label(&failed),
+            "completed_with_issues"
+        );
 
         let mut stopped_by_user = AgentFanoutGroupProjection::new("review-3", "Review", 1);
         stopped_by_user
@@ -3356,7 +3446,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             fanout_get_results_status_label(&stopped_by_user),
-            "finished"
+            "completed_with_issues"
         );
     }
 
@@ -3448,6 +3538,22 @@ mod tests {
                 .as_array()
                 .is_some_and(|causes| causes.iter().any(|cause| cause == "parent_budget")),
             "{value}"
+        );
+
+        let collected = handle_agent_fanout_tool(
+            &json!({
+                "action": "get_results",
+                "group_id": value["group_id"].as_str().unwrap()
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let collected_value: Value = serde_json::from_str(&collected).unwrap();
+        assert_eq!(collected_value["status"], "completed_with_issues");
+        assert_eq!(collected_value["cancelled_by_parent_budget"], 1);
+        assert_eq!(
+            collected_value["results"][0]["result"]["status"],
+            "interrupted"
         );
     }
 
@@ -3622,12 +3728,13 @@ mod tests {
 
         assert_eq!(value["finish_reason"], "empty_completion");
         assert_eq!(value["fanout"]["target_count"], 3);
-        assert_eq!(value["fanout"]["failed"], 1);
+        assert_eq!(value["fanout"]["failed"], 0);
+        assert_eq!(value["fanout"]["interrupted"], 1);
         assert_eq!(value["fanout"]["cancelled_by_parent_budget"], 0);
         assert!(
             value["fanout"]["summary"]
                 .as_str()
-                .is_some_and(|summary| summary.contains("1 failed")
+                .is_some_and(|summary| summary.contains("1 interrupted")
                     && !summary.contains("cancelled by parent budget")),
             "{value}"
         );

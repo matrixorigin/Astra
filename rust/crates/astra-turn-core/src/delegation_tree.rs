@@ -134,6 +134,9 @@ impl AgentTreeNode {
             AgentStatus::Idle => ("◯", "idle".to_string()),
             AgentStatus::Waiting { reason } => ("◌", format!("waiting: {reason}")),
             AgentStatus::Completed { .. } => ("✓", "done".to_string()),
+            AgentStatus::Interrupted { finish_reason, .. } => {
+                ("◌", format!("interrupted: {finish_reason}"))
+            }
             AgentStatus::Failed { .. } => ("✗", "failed".to_string()),
             AgentStatus::Cancelled { .. } => ("⊘", "cancelled".to_string()),
         };
@@ -216,7 +219,9 @@ fn count_statuses(nodes: &[AgentTreeNode]) -> (usize, usize, usize) {
         match &node.status {
             AgentStatus::Running { .. } | AgentStatus::Initializing => running += 1,
             AgentStatus::Completed { .. } => completed += 1,
-            AgentStatus::Failed { .. } | AgentStatus::Waiting { .. } => failed += 1,
+            AgentStatus::Interrupted { .. }
+            | AgentStatus::Failed { .. }
+            | AgentStatus::Waiting { .. } => failed += 1,
             _ => {}
         }
 

@@ -1,7 +1,12 @@
 "use client";
 
 import {
+  Activity,
+  Bot,
+  ClipboardList,
   MoreVertical,
+  Wrench,
+  type LucideIcon,
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -34,6 +39,7 @@ import {
   shouldAutoScrollChat,
 } from "@/lib/chat-scroll-state";
 import {
+  ACTIVE_AGENT_SURFACE_STATUSES,
   createEmptyWorkSurface,
 } from "@/lib/work-surface";
 import { useToast } from "@/components/ui/toast";
@@ -61,6 +67,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     ),
   );
   const [workSurfaceTab, setWorkSurfaceTab] = useState<WorkSurfaceTab>("tasks");
+  const [workSurfaceOpenSignal, setWorkSurfaceOpenSignal] = useState(0);
 
   // ── scrolling ──────────────────────────────────────────────────────────────
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -89,6 +96,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     runControlBusy,
     composerDisabled,
     composerPlaceholder,
+    taskBoardIntervention,
   } = deriveChatRunUiState({
     activeRun: detail.activeRun,
     archived: isArchived,
@@ -126,6 +134,29 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
 
   // ── ui state derived from work surface ─────────────────────────────────────
   const showRunStatusPanel = Boolean(detail.activeRun?.runId && canResumeRun);
+  const openTaskCount = workSurface.tasks.filter(
+    (task) => !isTerminalTaskStatus(task.status),
+  ).length;
+  const activeAgentCount = workSurface.agents.filter((agent) =>
+    ACTIVE_AGENT_SURFACE_STATUSES.has(agent.status.toLowerCase()),
+  ).length;
+  const agentAttentionCount = workSurface.agents.filter((agent) =>
+    ["failed", "interrupted", "cancelled", "waiting"].includes(
+      agent.status.toLowerCase(),
+    ),
+  ).length;
+  const activeToolCount = workSurface.tools.filter(
+    (tool) =>
+      !tool.finishedAt &&
+      !["success", "error", "cancelled"].includes(tool.status),
+  ).length;
+  const toolAttentionCount = workSurface.tools.filter(
+    (tool) => tool.blocked || tool.status === "error",
+  ).length;
+  const openWorkSurface = (tab: WorkSurfaceTab) => {
+    setWorkSurfaceTab(tab);
+    setWorkSurfaceOpenSignal((value) => value + 1);
+  };
   const activeRunIsVisibleActivity = Boolean(
     detail.activeRun?.runId &&
     activeRunStatus &&
@@ -134,6 +165,25 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const workSurfaceActiveRun = activeRunIsVisibleActivity
     ? detail.activeRun
     : undefined;
+  const showConversationActivityStrip =
+    workSurface.hydrated &&
+    (activeRunIsVisibleActivity ||
+      taskBoardIntervention ||
+      openTaskCount > 0 ||
+      agentAttentionCount > 0 ||
+      toolAttentionCount > 0) &&
+    (workSurface.tasks.length > 0 ||
+      workSurface.agents.length > 0 ||
+      workSurface.tools.length > 0);
+  const conversationActivityKey = showConversationActivityStrip
+    ? [
+        openTaskCount,
+        workSurface.agents.length,
+        workSurface.tools.length,
+        agentAttentionCount,
+        toolAttentionCount,
+      ].join(":")
+    : "";
 
   // ── effects ────────────────────────────────────────────────────────────────
 
@@ -219,6 +269,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     latestMessage?.content,
     latestMessage?.reasoning,
     latestMessage?.artifacts?.length,
+    conversationActivityKey,
   ]);
 
   // Process pending turn
@@ -343,7 +394,11 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           onTouchMove={(event) => {
             const startY = touchStartYRef.current;
             const currentY = event.touches[0]?.clientY;
-            if (startY !== null && currentY !== undefined && currentY > startY) {
+            if (
+              startY !== null &&
+              currentY !== undefined &&
+              currentY > startY
+            ) {
               pinnedRef.current = false;
             }
           }}
@@ -359,6 +414,20 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                 <MessageBubble message={message} />
               </div>
             ))}
+            {showConversationActivityStrip ? (
+              <ConversationActivityStrip
+                taskCount={openTaskCount}
+                agentCount={workSurface.agents.length}
+                activeAgentCount={activeAgentCount}
+                toolCount={workSurface.tools.length}
+                activeToolCount={activeToolCount}
+                agentAttentionCount={agentAttentionCount}
+                toolAttentionCount={toolAttentionCount}
+                taskBoardIntervention={taskBoardIntervention}
+                active={activeRunIsVisibleActivity}
+                onOpen={openWorkSurface}
+              />
+            ) : null}
           </div>
         </div>
         <ChatDotNavigator
@@ -433,39 +502,78 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                   }}
                 />
                 {showRunStatusPanel ? (
-                  <div className="mt-3 flex items-center justify-between gap-3 rounded-[16px] border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
-                    <p>
-                      {activeRunStatus === "paused"
-                        ? "Astra is paused. Resume to continue or stop this run."
-                        : activeRunBlocksNewInput
-                          ? "Astra is busy. Stop it or wait before sending a new message."
-                          : "Stopping..."}
-                    </p>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {canResumeRun ? (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            void stream.resumeActiveRun();
-                          }}
-                          disabled={runControlBusy}
-                          className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {resumingRun ? "Resuming..." : "Resume"}
-                        </button>
-                      ) : null}
-                      {canStopRun ? (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            void stream.stopActiveRun();
-                          }}
-                          disabled={runControlBusy}
-                          className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {stoppingRun ? "Stopping..." : "Stop"}
-                        </button>
-                      ) : null}
+                  <div className="mt-3 rounded-card border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="font-medium text-text">
+                          {taskBoardIntervention
+                            ? "Task needs direction"
+                            : activeRunStatus === "paused"
+                              ? "Run paused"
+                              : activeRunBlocksNewInput
+                                ? "Run in progress"
+                                : "Stopping"}
+                        </p>
+                        <p className="mt-1 leading-5">
+                          {taskBoardIntervention
+                            ? "Open the task board or continue the run when you are ready."
+                            : activeRunStatus === "paused"
+                              ? "Continue this run or close it before changing direction."
+                              : activeRunBlocksNewInput
+                                ? "Wait for the current run or stop it before sending a new message."
+                                : "The stop request is being applied."}
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        {taskBoardIntervention ? (
+                          <button
+                            type="button"
+                            onClick={() => openWorkSurface("tasks")}
+                            className="inline-flex items-center gap-1.5 rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted"
+                          >
+                            <ClipboardList className="size-4" />
+                            Tasks
+                          </button>
+                        ) : null}
+                        {agentAttentionCount > 0 ? (
+                          <button
+                            type="button"
+                            onClick={() => openWorkSurface("agents")}
+                            className="inline-flex items-center gap-1.5 rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted"
+                          >
+                            <Bot className="size-4" />
+                            Agents
+                          </button>
+                        ) : null}
+                        {canResumeRun ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void stream.resumeActiveRun();
+                            }}
+                            disabled={runControlBusy}
+                            className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {resumingRun
+                              ? "Continuing..."
+                              : taskBoardIntervention
+                                ? "Continue"
+                                : "Resume"}
+                          </button>
+                        ) : null}
+                        {canStopRun ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void stream.stopActiveRun();
+                            }}
+                            disabled={runControlBusy}
+                            className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {stoppingRun ? "Stopping..." : "Stop"}
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
                   </div>
                 ) : null}
@@ -491,7 +599,182 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           void stream.hydrateWorkSurfaceForChat();
         }}
         onLoadAgentRun={stream.loadAgentRunProjection}
+        openSignal={workSurfaceOpenSignal}
       />
     </div>
   );
+}
+
+function ConversationActivityStrip({
+  taskCount,
+  agentCount,
+  activeAgentCount,
+  toolCount,
+  activeToolCount,
+  agentAttentionCount,
+  toolAttentionCount,
+  taskBoardIntervention,
+  active,
+  onOpen,
+}: {
+  taskCount: number;
+  agentCount: number;
+  activeAgentCount: number;
+  toolCount: number;
+  activeToolCount: number;
+  agentAttentionCount: number;
+  toolAttentionCount: number;
+  taskBoardIntervention: boolean;
+  active: boolean;
+  onOpen: (tab: WorkSurfaceTab) => void;
+}) {
+  const needsAttention =
+    taskBoardIntervention || agentAttentionCount > 0 || toolAttentionCount > 0;
+  const title = taskBoardIntervention
+    ? "Needs direction"
+    : needsAttention
+      ? "Needs attention"
+      : active
+        ? "Working"
+        : "Activity";
+  type ConversationActivityDescriptor = {
+    tab: WorkSurfaceTab;
+    icon: LucideIcon;
+    label: string;
+    count: number;
+    activeCount?: number;
+    attention?: number;
+  };
+  const actionCandidates: ConversationActivityDescriptor[] = [
+    {
+      tab: "tasks",
+      icon: ClipboardList,
+      label: "Tasks",
+      count: taskCount,
+      attention: taskBoardIntervention ? taskCount : 0,
+    },
+    {
+      tab: "agents",
+      icon: Bot,
+      label: "Agents",
+      count: agentCount,
+      activeCount: activeAgentCount,
+      attention: agentAttentionCount,
+    },
+    {
+      tab: "tools",
+      icon: Wrench,
+      label: "Tools",
+      count: toolCount,
+      activeCount: activeToolCount,
+      attention: toolAttentionCount,
+    },
+  ];
+  const actions = actionCandidates.filter((action) => action.count > 0);
+  const summary = actions
+    .map((action) => {
+      const activeCount = action.activeCount ?? action.count;
+      const count = activeCount > 0 ? activeCount : action.count;
+      return `${count} ${action.label.toLowerCase()}`;
+    })
+    .join(" · ");
+
+  return (
+    <div className="my-3 flex justify-center" aria-label="Background work">
+      <div
+        className={
+          needsAttention
+            ? "inline-flex max-w-full flex-wrap items-center gap-1.5 rounded-full border border-danger/20 bg-danger/5 px-2.5 py-1.5 text-xs shadow-sm"
+            : "inline-flex max-w-full flex-wrap items-center gap-1.5 rounded-full border border-border/70 bg-surface/85 px-2.5 py-1.5 text-xs shadow-sm"
+        }
+      >
+        <span
+          className={
+            needsAttention
+              ? "inline-flex items-center gap-1.5 font-medium text-danger"
+              : "inline-flex items-center gap-1.5 font-medium text-text-secondary"
+          }
+        >
+          <Activity
+            className={
+              active && !needsAttention ? "size-3.5 animate-pulse" : "size-3.5"
+            }
+          />
+          {title}
+        </span>
+        {summary ? (
+          <span className="max-w-[18rem] truncate text-text-muted">
+            {summary}
+          </span>
+        ) : null}
+        {actions.length ? (
+          <span className="inline-flex flex-wrap items-center gap-1">
+            {actions.map((action) => (
+              <ConversationActivityAction
+                key={action.tab}
+                {...action}
+                onOpen={onOpen}
+              />
+            ))}
+          </span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ConversationActivityAction({
+  tab,
+  icon: Icon,
+  label,
+  count,
+  attention,
+  onOpen,
+}: {
+  tab: WorkSurfaceTab;
+  icon: LucideIcon;
+  label: string;
+  count: number;
+  attention?: number;
+  onOpen: (tab: WorkSurfaceTab) => void;
+}) {
+  const badge = attention && attention > 0 ? attention : count;
+  const hasAttention = Boolean(attention && attention > 0);
+  return (
+    <button
+      type="button"
+      aria-label={`Open ${label.toLowerCase()} activity`}
+      onClick={() => onOpen(tab)}
+      className={
+        hasAttention
+          ? "inline-flex h-7 items-center gap-1 rounded-full border border-danger/20 bg-bg px-2 text-xs font-medium text-danger transition-colors hover:bg-danger/10"
+          : "inline-flex h-7 items-center gap-1 rounded-full border border-border/70 bg-bg px-2 text-xs font-medium text-text-secondary transition-colors hover:bg-surface-muted"
+      }
+    >
+      <Icon className="size-3.5" />
+      <span>{label}</span>
+      <span
+        className={
+          hasAttention
+            ? "tabular-nums text-danger"
+            : "tabular-nums text-text-muted"
+        }
+      >
+        {badge}
+      </span>
+    </button>
+  );
+}
+
+function isTerminalTaskStatus(status: string) {
+  return [
+    "completed",
+    "complete",
+    "done",
+    "cancelled",
+    "canceled",
+    "failed",
+    "skipped",
+    "archived",
+  ].includes(status.toLowerCase());
 }

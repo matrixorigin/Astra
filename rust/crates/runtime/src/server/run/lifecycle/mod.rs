@@ -2316,7 +2316,43 @@ impl AgenticRunLifecycleService {
             match loop_outcome {
                 Ok(AgenticLoopOutcome::Completed) => {
                     if let Some(interruption) = loop_state.interruption.as_ref() {
-                        let interruption_json = interruption.to_json();
+                        let task_board_snapshot = loop_state.hooks.task_board_snapshot.clone();
+                        let task_board_unfinished = task_board_snapshot.has_unfinished_tasks();
+                        let waiting_for = if task_board_unfinished {
+                            Some("task_board_intervention".to_string())
+                        } else if matches!(
+                            interruption.resume_action,
+                            astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
+                                | astra_turn_core::interruption::ResumeAction::StartNewSession
+                        ) {
+                            Some("user_intervention".to_string())
+                        } else {
+                            None
+                        };
+                        let mut interruption_json = interruption.to_json();
+                        if let Some(obj) = interruption_json.as_object_mut() {
+                            if let Some(waiting_for) = waiting_for.as_ref() {
+                                obj.insert(
+                                    "waiting_for".to_string(),
+                                    Value::String(waiting_for.clone()),
+                                );
+                            }
+                            if task_board_unfinished {
+                                obj.insert(
+                                    "task_board".to_string(),
+                                    json!({
+                                        "summary": task_board_snapshot.short_summary(),
+                                        "tracked_count": task_board_snapshot.tracked_count,
+                                        "pending_count": task_board_snapshot.pending_count,
+                                        "in_progress_count": task_board_snapshot.in_progress_count,
+                                        "paused_count": task_board_snapshot.paused_count,
+                                        "blocked_count": task_board_snapshot.blocked_count,
+                                        "terminal_non_success_count": task_board_snapshot.terminal_non_success_count,
+                                        "active_tasks": task_board_snapshot.active_tasks,
+                                    }),
+                                );
+                            }
+                        }
                         if !loop_state.final_text.is_empty() {
                             events.push(json!({
                                 "event_type": "text_done",
@@ -2340,7 +2376,7 @@ impl AgenticRunLifecycleService {
                             "event_type": "run_finished",
                             "data": finished,
                         }));
-                        (RunStatus::Paused, Some(interruption.user_message.clone()))
+                        (RunStatus::Paused, waiting_for)
                     } else {
                         if !loop_state.final_text.is_empty() {
                             events.push(json!({

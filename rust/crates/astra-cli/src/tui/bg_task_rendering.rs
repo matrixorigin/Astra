@@ -260,6 +260,14 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
             Some(result.clone()).filter(|result| !result.trim().is_empty()),
             finish_reason.clone(),
         ),
+        AgentStatus::Interrupted {
+            partial_result,
+            finish_reason,
+        } => (
+            BackgroundTaskStatus::Interrupted,
+            Some(partial_result.clone()).filter(|result| !result.trim().is_empty()),
+            Some(finish_reason.clone()),
+        ),
         AgentStatus::Failed {
             error,
             finish_reason,
@@ -888,6 +896,7 @@ pub(crate) fn render_background_task_rows_xml(
     rows.sort_by_key(|row| {
         let attention_rank = match row.status {
             crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::WaitingForInput
+            | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Interrupted
             | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Failed => 0,
             crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Running
             | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Pending => 1,

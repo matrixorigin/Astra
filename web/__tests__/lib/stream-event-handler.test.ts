@@ -452,6 +452,48 @@ describe("applyStreamEvent", () => {
     );
   });
 
+  it("preserves task-board intervention waiting state from interrupted runs", () => {
+    const state = makeState();
+
+    applyStreamEvent(
+      {
+        type: "run_interrupted",
+        run_id: "run-task",
+        kind: "empty_completion",
+        resumable: true,
+        waiting_for: "task_board_intervention",
+        message: "Task-board work remains open.",
+        task_board: {
+          summary: "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
+          in_progress_count: 1,
+          active_tasks: ["task-2 Investigate [in_progress]"],
+        },
+      },
+      ctx,
+      state,
+    );
+
+    expect(state.runLifecycle).toBe("paused");
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-task",
+        status: "paused",
+        waitingFor: "task_board_intervention",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "Task-board work remains open.",
+        status: "streaming",
+      }),
+    );
+  });
+
   it("clears reasoning that only came from previous thinking tags", () => {
     const state = makeState();
 

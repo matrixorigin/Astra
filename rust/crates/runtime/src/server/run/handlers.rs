@@ -860,6 +860,47 @@ mod tests {
     }
 
     #[test]
+    fn transform_stream_run_events_for_client_preserves_task_board_intervention() {
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![json!({
+                "event_type": "run_interrupted",
+                "data": {
+                    "kind": "empty_completion",
+                    "resumable": true,
+                    "waiting_for": "task_board_intervention",
+                    "user_message": "Task-board work remains open.",
+                    "task_board": {
+                        "summary": "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
+                        "in_progress_count": 1,
+                        "active_tasks": ["task-2 Investigate [in_progress]"]
+                    }
+                },
+                "index": 10
+            })],
+        );
+
+        assert_eq!(
+            transformed[0],
+            json!({
+                "type": "run_interrupted",
+                "run_id": "run-123",
+                "kind": "empty_completion",
+                "resumable": true,
+                "waiting_for": "task_board_intervention",
+                "user_message": "Task-board work remains open.",
+                "message": "Task-board work remains open.",
+                "task_board": {
+                    "summary": "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
+                    "in_progress_count": 1,
+                    "active_tasks": ["task-2 Investigate [in_progress]"]
+                },
+                "index": 10
+            })
+        );
+    }
+
+    #[test]
     fn transform_stream_run_events_for_client_injects_run_id_into_run_started() {
         let transformed = transform_stream_run_events_for_client(
             "run-123",

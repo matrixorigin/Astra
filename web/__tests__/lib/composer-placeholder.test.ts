@@ -10,7 +10,10 @@ describe('compactComposerPlaceholder', () => {
   });
 
   it('uses short visual copy for paused and stopping runs', () => {
-    expect(compactComposerPlaceholder('Paused. Resume or stop to continue.')).toBe('Paused...');
+    expect(compactComposerPlaceholder('Paused. Continue or close this run.')).toBe('Paused...');
+    expect(compactComposerPlaceholder('Task needs direction before continuing.')).toBe(
+      'Task needs direction...',
+    );
     expect(compactComposerPlaceholder('Stopping...')).toBe('Stopping...');
   });
 

@@ -100,6 +100,10 @@ pub(crate) fn render_list(
         .iter()
         .filter(|row| row.status == BackgroundTaskStatus::Failed)
         .count();
+    let interrupted = rows
+        .iter()
+        .filter(|row| row.status == BackgroundTaskStatus::Interrupted)
+        .count();
     let header = if rows.is_empty() {
         "  Background tasks".to_string()
     } else {
@@ -112,6 +116,9 @@ pub(crate) fn render_list(
         }
         if failed > 0 {
             parts.push(format!("{failed} failed"));
+        }
+        if interrupted > 0 {
+            parts.push(format!("{interrupted} interrupted"));
         }
         format!("  Background tasks · {}", parts.join(" · "))
     };

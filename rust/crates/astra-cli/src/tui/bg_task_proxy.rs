@@ -82,6 +82,14 @@ pub(crate) fn local_agent_status_projection(
             Some(result.clone()).filter(|result| !result.trim().is_empty()),
             finish_reason.clone(),
         ),
+        AgentStatus::Interrupted {
+            partial_result,
+            finish_reason,
+        } => (
+            "interrupted",
+            Some(partial_result.clone()).filter(|result| !result.trim().is_empty()),
+            Some(finish_reason.clone()),
+        ),
         AgentStatus::Failed {
             error,
             finish_reason,
@@ -407,6 +415,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
             ("waiting_for_input", format!("Agent is waiting: {reason}"))
         }
         AgentStatus::Completed { result, .. } => ("completed", result.clone()),
+        AgentStatus::Interrupted { partial_result, .. } => ("interrupted", partial_result.clone()),
         AgentStatus::Failed { error, .. } => ("failed", error.clone()),
         AgentStatus::Cancelled { reason, .. } => ("killed", reason.clone()),
     };

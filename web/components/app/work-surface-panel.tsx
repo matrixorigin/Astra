@@ -701,33 +701,32 @@ function AgentCard({
   const progress =
     agent.turn && agent.maxTurns
       ? Math.min(100, Math.round((agent.turn / agent.maxTurns) * 100))
-      : active
-        ? 35
-        : agent.status === "completed"
-          ? 100
-          : 0;
+      : undefined;
   const summary = agent.resultSummary ?? agent.error ?? agent.reason;
   const latestEvent = agent.events?.[agent.events.length - 1];
+  const title = agent.description || agent.agentType || "Subagent";
+  const metaItems = agentCompactMeta(agent);
   return (
     <section
       className={cn(
-        "rounded-card border bg-bg shadow-sm transition-colors",
+        "overflow-hidden rounded-card border bg-bg shadow-sm transition-colors",
+        selected ? "ring-1 ring-accent/25" : "",
         active
-          ? "border-accent/35 bg-accent/5"
+          ? "border-accent/30"
           : failed
-            ? "border-danger/25 bg-danger/5"
+            ? "border-danger/25"
             : "border-border/70",
       )}
     >
       <button
         type="button"
-        className="flex w-full items-start gap-3 p-3 text-left"
+        className="group flex w-full items-start gap-3 p-3 text-left transition-colors hover:bg-surface/70"
         onClick={onSelect}
         aria-expanded={selected}
       >
         <div
           className={cn(
-            "flex size-9 shrink-0 items-center justify-center rounded-control border",
+            "mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full border",
             active
               ? "border-accent/25 bg-accent/10 text-accent"
               : failed
@@ -741,86 +740,90 @@ function AgentCard({
             <Bot className="size-4" />
           )}
         </div>
-        <div className="min-w-0 flex-1 space-y-2">
-          <div className="flex items-start gap-2">
-            <div className="min-w-0 flex-1">
-              <h3 className="truncate text-sm font-semibold text-text">
-                {agent.agentType ?? agent.agentId}
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-start gap-2">
+            <div className="min-w-0 flex-1 space-y-1">
+              <h3 className="line-clamp-2 text-sm font-semibold leading-5 text-text">
+                {title}
               </h3>
-              <p className="mt-0.5 truncate font-mono text-[11px] text-text-muted">
-                {agent.agentId}
-              </p>
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-text-muted">
+                {agent.agentType ? (
+                  <span>{statusLabel(agent.agentType)}</span>
+                ) : null}
+                {metaItems.map((item) => (
+                  <span key={item} className="min-w-0 max-w-full truncate">
+                    {item}
+                  </span>
+                ))}
+              </div>
             </div>
-            <StatusPill status={agent.status} active={active} />
+            <div className="flex shrink-0 items-center gap-1.5">
+              <StatusPill status={agent.status} active={active} />
+              <ChevronRight
+                className={cn(
+                  "size-4 text-text-muted transition-transform",
+                  selected ? "rotate-90" : "group-hover:translate-x-0.5",
+                )}
+              />
+            </div>
           </div>
-          {agent.description ? (
-            <p className="line-clamp-2 text-xs leading-5 text-text-secondary">
-              {agent.description}
-            </p>
+          {latestEvent ? (
+            <div className="mt-2 flex min-w-0 items-center gap-1.5 rounded-[6px] bg-surface-muted/70 px-2 py-1.5 text-xs text-text-secondary">
+              {active ? <MiniLiveDots className="shrink-0" /> : null}
+              <span
+                className={cn(
+                  "shrink-0 text-[11px] font-medium",
+                  failed
+                    ? "text-danger"
+                    : active
+                      ? "text-accent"
+                      : "text-text-muted",
+                )}
+              >
+                {latestEvent.tone === "danger" ? "Issue" : "Latest"}
+              </span>
+              <span className="min-w-0 flex-1 truncate">
+                {latestEvent.label}
+              </span>
+            </div>
+          ) : active ? (
+            <div className="mt-2 flex min-w-0 items-center gap-1.5 rounded-[6px] bg-surface-muted/70 px-2 py-1.5 text-xs text-text-muted">
+              <MiniLiveDots className="shrink-0" />
+              <span>
+                {agent.toolName
+                  ? `Running ${agent.toolName}`
+                  : "Waiting for subagent progress"}
+              </span>
+            </div>
           ) : null}
-          <AgentExecutionMeta agent={agent} />
-          <div className="h-1.5 overflow-hidden rounded-full bg-surface-muted">
-            <div
-              className={cn(
-                "h-full rounded-full transition-all duration-500",
-                failed
-                  ? "bg-danger"
-                  : agent.status === "completed"
-                    ? "bg-success"
-                    : "bg-accent",
-              )}
-              style={{ width: `${Math.max(active ? 8 : 0, progress)}%` }}
-            />
-          </div>
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-text-muted">
-            {latestEvent ? (
-              <span className="inline-flex min-w-0 max-w-full items-center gap-1 text-accent">
-                {active ? <MiniLiveDots /> : null}
-                <span className="truncate">{latestEvent.label}</span>
-              </span>
-            ) : null}
-            {agent.turn ? (
-              <span>
-                Turn {agent.turn}
-                {agent.maxTurns ? `/${agent.maxTurns}` : ""}
-              </span>
-            ) : null}
-            {agent.toolName ? (
-              <span className="inline-flex items-center gap-1">
-                <Wrench className="size-3" />
-                {agent.toolName}
-              </span>
-            ) : null}
-            {agent.totalToolCalls ? (
-              <span>{agent.totalToolCalls} tools</span>
-            ) : null}
-            {agent.totalPromptTokens || agent.totalCompletionTokens ? (
-              <span>
-                {(agent.totalPromptTokens ?? 0) +
-                  (agent.totalCompletionTokens ?? 0)}{" "}
-                tokens
-              </span>
-            ) : null}
-            {agent.durationMs ? (
-              <span>{formatDuration(agent.durationMs)}</span>
-            ) : null}
-          </div>
+          {progress !== undefined ? (
+            <div className="mt-2 h-1 overflow-hidden rounded-full bg-surface-muted">
+              <div
+                className={cn(
+                  "h-full rounded-full transition-all duration-500",
+                  failed
+                    ? "bg-danger"
+                    : agent.status === "completed"
+                      ? "bg-success"
+                      : "bg-accent",
+                )}
+                style={{ width: `${Math.max(active ? 8 : 0, progress)}%` }}
+              />
+            </div>
+          ) : null}
           {summary ? (
             <p
               className={cn(
-                "line-clamp-3 text-xs leading-5",
+                "mt-2 line-clamp-2 text-xs leading-5",
                 failed ? "text-danger" : "text-text-muted",
               )}
             >
               {summary}
             </p>
-          ) : active ? (
-            <p className="text-xs leading-5 text-text-muted">
-              {agent.toolName
-                ? `Running ${agent.toolName}`
-                : "Waiting for subagent progress"}
-            </p>
           ) : null}
+          <p className="mt-2 truncate font-mono text-[10px] text-text-muted/80">
+            {agent.agentId}
+          </p>
         </div>
       </button>
       {selected ? (
@@ -828,6 +831,34 @@ function AgentCard({
       ) : null}
     </section>
   );
+}
+
+function agentCompactMeta(agent: AgentSurfaceItem) {
+  const items: string[] = [];
+  if (agent.turn) {
+    items.push(
+      `Turn ${agent.turn}${agent.maxTurns ? `/${agent.maxTurns}` : ""}`,
+    );
+  }
+  if (agent.toolName) {
+    items.push(agent.toolName);
+  }
+  if (agent.totalToolCalls) {
+    items.push(`${agent.totalToolCalls} tools`);
+  }
+  if (agent.totalPromptTokens || agent.totalCompletionTokens) {
+    items.push(
+      `${(agent.totalPromptTokens ?? 0) + (agent.totalCompletionTokens ?? 0)} tokens`,
+    );
+  }
+  if (agent.durationMs) {
+    items.push(formatDuration(agent.durationMs));
+  }
+  const runtime = executorMetaValue(agent.executor, agent.workspace);
+  if (runtime) {
+    items.push(runtime);
+  }
+  return items;
 }
 
 function AgentDetails({
@@ -1874,7 +1905,9 @@ function workspaceMetaValue(workspace: WorkspaceBindingLike) {
   if (!workspace || workspace.kind === "none") {
     return undefined;
   }
-  return workspace.cwd ?? workspace.display_name ?? workspaceDisplayName(workspace);
+  return (
+    workspace.cwd ?? workspace.display_name ?? workspaceDisplayName(workspace)
+  );
 }
 
 function executorMetaValue(
@@ -1887,7 +1920,10 @@ function executorMetaValue(
   if (executor.display_name === "Astra") {
     return undefined;
   }
-  if (executor.kind === "server_local" && (!workspace || workspace.kind === "none")) {
+  if (
+    executor.kind === "server_local" &&
+    (!workspace || workspace.kind === "none")
+  ) {
     return undefined;
   }
   return executorDisplayName(executor);

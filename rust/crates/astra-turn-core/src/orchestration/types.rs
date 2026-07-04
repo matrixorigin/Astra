@@ -9,11 +9,6 @@ use super::fanout_group::AgentFanoutSlotIdentity;
 
 /// Current status of a spawned agent.
 ///
-/// `Completed` is reused for every terminal state where progress
-/// was preserved, including budget-exhaustion early-exit paths that
-/// the loop reports as resumable interruptions. Callers that need to
-/// distinguish task completion from interruption should read
-/// `finish_reason`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentStatus {
     Initializing,
@@ -25,6 +20,10 @@ pub enum AgentStatus {
         result: String,
         #[allow(dead_code)]
         finish_reason: Option<String>,
+    },
+    Interrupted {
+        partial_result: String,
+        finish_reason: String,
     },
     Failed {
         error: String,
@@ -53,7 +52,10 @@ impl AgentStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled { .. }
+            Self::Completed { .. }
+                | Self::Interrupted { .. }
+                | Self::Failed { .. }
+                | Self::Cancelled { .. }
         )
     }
 

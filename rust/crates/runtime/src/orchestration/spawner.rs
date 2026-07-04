@@ -140,9 +140,13 @@ fn spawn_run_result_to_agent_status(run_result: &SpawnRunResult) -> AgentStatus 
         SpawnRunStatusKind::Waiting => AgentStatus::Waiting {
             reason: run_result.output.clone().unwrap_or_default(),
         },
-        SpawnRunStatusKind::Completed | SpawnRunStatusKind::Interrupted => AgentStatus::Completed {
+        SpawnRunStatusKind::Completed => AgentStatus::Completed {
             result: run_result.output.clone().unwrap_or_default(),
             finish_reason: Some(run_result.finish_reason.clone()),
+        },
+        SpawnRunStatusKind::Interrupted => AgentStatus::Interrupted {
+            partial_result: run_result.output.clone().unwrap_or_default(),
+            finish_reason: run_result.finish_reason.clone(),
         },
     }
 }
@@ -162,13 +166,19 @@ fn fanout_slot_status_from_agent_status(
                 .unwrap_or("normal");
             if reason == "normal" {
                 (AgentFanoutSlotStatus::Completed, None)
-            } else if is_parent_budget_finish_reason(reason) {
+            } else {
+                (AgentFanoutSlotStatus::Failed, Some(reason.to_string()))
+            }
+        }
+        AgentStatus::Interrupted { finish_reason, .. } => {
+            let reason = finish_reason.trim();
+            if is_parent_budget_finish_reason(reason) {
                 (
                     AgentFanoutSlotStatus::CancelledByParentBudget,
                     Some(reason.to_string()),
                 )
             } else {
-                (AgentFanoutSlotStatus::Failed, Some(reason.to_string()))
+                (AgentFanoutSlotStatus::Interrupted, Some(reason.to_string()))
             }
         }
         AgentStatus::Failed {
@@ -319,6 +329,22 @@ pub(crate) fn agent_status_to_progress_event(
                     duration_ms,
                 })
             }
+        }
+        AgentStatus::Interrupted {
+            partial_result,
+            finish_reason,
+        } => {
+            let duration_ms = started_at
+                .elapsed()
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Some(ProgressEventType::Interrupted {
+                reason: finish_reason.clone(),
+                partial_summary: partial_result.clone(),
+                total_tool_calls: metrics.tool_calls,
+                total_tokens: (metrics.prompt_tokens, metrics.completion_tokens),
+                duration_ms,
+            })
         }
         AgentStatus::Failed { error, .. } => Some(ProgressEventType::Failed {
             error: error.clone(),
@@ -1208,6 +1234,7 @@ impl DynamicAgentSpawner {
             return;
         };
         let (status, reason) = fanout_slot_status_from_agent_status(&state.status);
+        let terminal_reason_label = reason.as_deref().unwrap_or("").to_string();
         let mut groups = self.fanout_groups.write().await;
         let Some(group) = groups.get_mut(&identity.group_id) else {
             tracing::warn!(
@@ -1231,6 +1258,20 @@ impl DynamicAgentSpawner {
         }
         let active_after = group.summary().active;
         group.touch();
+        tracing::info!(
+            target: "fanout",
+            group_id = %identity.group_id,
+            slot_index = identity.slot_index,
+            slot_id = identity.slot_id.as_deref().unwrap_or(""),
+            agent_id = %state.agent_id,
+            child_run_id = %state.run_id,
+            canonical_agent_status = %Self::agent_status_trace_label(&state.status),
+            fanout_slot_status = %status.as_str(),
+            terminal_reason = %terminal_reason_label,
+            active_before,
+            active_after,
+            "fanout slot reached terminal state"
+        );
         drop(groups);
         self.adjust_cached_active_fanout_slots(active_before, active_after);
     }
@@ -2344,6 +2385,7 @@ impl DynamicAgentSpawner {
             AgentStatus::Idle => "idle",
             AgentStatus::Waiting { .. } => "waiting",
             AgentStatus::Completed { .. } => "completed",
+            AgentStatus::Interrupted { .. } => "interrupted",
             AgentStatus::Failed { .. } => "failed",
             AgentStatus::Cancelled { .. } => "cancelled",
         }
@@ -3135,11 +3177,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_status_to_progress_event_keeps_interrupted_completion_distinct() {
+    fn agent_status_to_progress_event_emits_interrupted_terminal_status() {
         let event = agent_status_to_progress_event(
-            &AgentStatus::Completed {
-                result: "partial".to_string(),
-                finish_reason: Some("budget_exhausted".to_string()),
+            &AgentStatus::Interrupted {
+                partial_result: "partial".to_string(),
+                finish_reason: "budget_exhausted".to_string(),
             },
             &SpawnedAgentMetrics {
                 tool_calls: 2,
@@ -3149,7 +3191,7 @@ mod tests {
             },
             SystemTime::now(),
         )
-        .expect("completed status should emit progress");
+        .expect("interrupted status should emit progress");
 
         assert!(matches!(
             event,
@@ -3531,7 +3573,10 @@ mod tests {
         };
         assert!(matches!(
             spawn_run_result_to_agent_status(&interrupted),
-            AgentStatus::Completed { .. }
+            AgentStatus::Interrupted {
+                ref partial_result,
+                ref finish_reason,
+            } if partial_result == "partial" && finish_reason == "budget_exhausted"
         ));
         assert!(matches!(
             spawn_run_result_to_sync_output("a1".into(), interrupted.clone(), 12),
@@ -3597,23 +3642,23 @@ mod tests {
 
     #[test]
     fn fanout_slot_status_counts_only_budget_interruptions_as_parent_budget_cancel() {
-        let budget_interrupted = AgentStatus::Completed {
-            result: "partial review".to_string(),
-            finish_reason: Some("budget_exhausted".to_string()),
+        let budget_interrupted = AgentStatus::Interrupted {
+            partial_result: "partial review".to_string(),
+            finish_reason: "budget_exhausted".to_string(),
         };
         let (status, reason) = fanout_slot_status_from_agent_status(&budget_interrupted);
         assert_eq!(status, AgentFanoutSlotStatus::CancelledByParentBudget);
         assert_eq!(reason.as_deref(), Some("budget_exhausted"));
 
-        let empty_completion = AgentStatus::Completed {
-            result: String::new(),
-            finish_reason: Some("empty_completion".to_string()),
+        let empty_completion = AgentStatus::Interrupted {
+            partial_result: String::new(),
+            finish_reason: "empty_completion".to_string(),
         };
         let (status, reason) = fanout_slot_status_from_agent_status(&empty_completion);
         assert_eq!(
             status,
-            AgentFanoutSlotStatus::Failed,
-            "non-budget interrupted completions are failed slots, not parent-budget cancellations"
+            AgentFanoutSlotStatus::Interrupted,
+            "non-budget interrupted child runs are first-class interrupted slots, not completed or failed"
         );
         assert_eq!(reason.as_deref(), Some("empty_completion"));
     }
@@ -3901,7 +3946,13 @@ mod tests {
             .wait_for_agent(&agent_id, Duration::from_secs(1))
             .await
             .expect("background agent should complete");
-        assert!(matches!(status, AgentStatus::Completed { .. }));
+        assert!(matches!(
+            status,
+            AgentStatus::Interrupted {
+                partial_result,
+                finish_reason
+            } if partial_result == "partial" && finish_reason == "budget_exhausted"
+        ));
 
         let journal_path = astra_services::session_journal::journal_file_path("sess-123");
         let journal = std::fs::read_to_string(journal_path).unwrap();
