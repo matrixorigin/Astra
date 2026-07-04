@@ -30,22 +30,22 @@ type EdgeSelection = Extract<WorkspaceSelection, { kind: "edge_workspace" }>;
 // ─── binding factories ──────────────────────────────────────────────
 
 describe("defaultWorkspaceBinding", () => {
-  it("returns server_sandbox binding", () => {
+  it("returns no-workspace binding", () => {
     expect(defaultWorkspaceBinding()).toEqual({
-      kind: "server_sandbox",
-      display_name: "Server sandbox",
-      authority: "read_write",
+      kind: "none",
+      display_name: "No workspace",
+      authority: "none",
       fallback_policy: "disabled",
     });
   });
 });
 
 describe("defaultExecutorBinding", () => {
-  it("returns server_local executor binding", () => {
+  it("returns server control-plane executor binding", () => {
     expect(defaultExecutorBinding()).toEqual({
       kind: "server_local",
-      executor_id: "server-local",
-      display_name: "Server sandbox",
+      executor_id: "server-control-plane",
+      display_name: "Server control plane",
       transport: "server_local",
       status: "online",
     });
@@ -474,27 +474,18 @@ describe("validateWorkspaceAuthority", () => {
     expect(validateWorkspaceAuthority("hello world", null)).toBeNull();
   });
 
-  it("returns workspace_required when selection is null and intent is local", () => {
-    const err = validateWorkspaceAuthority(
-      "run git status",
-      null,
-    ) as WorkspaceAuthorityError;
-    expect(err.code).toBe("workspace_required");
+  it("does not reject local intent without workspace selection", () => {
+    expect(validateWorkspaceAuthority("run git status", null)).toBeNull();
   });
 
-  it("returns workspace_required when selection is undefined", () => {
-    const err = validateWorkspaceAuthority(
-      "cargo build",
-      undefined,
-    ) as WorkspaceAuthorityError;
-    expect(err.code).toBe("workspace_required");
+  it("does not reject local intent with undefined selection", () => {
+    expect(validateWorkspaceAuthority("cargo build", undefined)).toBeNull();
   });
 
-  it("returns workspace_local_code_on_server_sandbox for server sandbox", () => {
-    const err = validateWorkspaceAuthority("npm test", {
+  it("does not reject local intent on explicit server sandbox", () => {
+    expect(validateWorkspaceAuthority("npm test", {
       kind: "server_sandbox",
-    }) as WorkspaceAuthorityError;
-    expect(err.code).toBe("workspace_local_code_on_server_sandbox");
+    })).toBeNull();
   });
 
   it("returns null for valid edge workspace with local intent and no foreign paths", () => {
@@ -543,10 +534,11 @@ describe("validateWorkspaceAuthority", () => {
 // ─── resolveWorkspaceBindings ───────────────────────────────────────
 
 describe("resolveWorkspaceBindings", () => {
-  it("returns default bindings for null selection", () => {
+  it("returns no-workspace bindings for null selection", () => {
     const result = resolveWorkspaceBindings(null);
-    expect(result.workspaceBinding.kind).toBe("server_sandbox");
+    expect(result.workspaceBinding.kind).toBe("none");
     expect(result.executorBinding.kind).toBe("server_local");
+    expect(result.executorBinding.executor_id).toBe("server-control-plane");
     expect(result.edgeProfile).toBeUndefined();
   });
 

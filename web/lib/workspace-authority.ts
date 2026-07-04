@@ -2,18 +2,15 @@ import type { WorkspaceBinding, ExecutorBinding } from "@astra/sdk";
 import type { WorkspaceSelection } from "@/lib/api/types";
 
 export type WorkspaceAuthorityError = {
-  code:
-    | "workspace_required"
-    | "workspace_local_code_on_server_sandbox"
-    | "workspace_path_mismatch";
+  code: "workspace_path_mismatch";
   message: string;
 };
 
 export function defaultWorkspaceBinding(): WorkspaceBinding {
   return {
-    kind: "server_sandbox",
-    display_name: "Server sandbox",
-    authority: "read_write",
+    kind: "none",
+    display_name: "No workspace",
+    authority: "none",
     fallback_policy: "disabled",
   };
 }
@@ -21,8 +18,8 @@ export function defaultWorkspaceBinding(): WorkspaceBinding {
 export function defaultExecutorBinding(): ExecutorBinding {
   return {
     kind: "server_local",
-    executor_id: "server-local",
-    display_name: "Server sandbox",
+    executor_id: "server-control-plane",
+    display_name: "Server control plane",
     transport: "server_local",
     status: "online",
   };
@@ -48,6 +45,25 @@ export function edgeExecutorBinding(
     executor_id: selection.edgeAgentId,
     display_name: selection.displayName ?? selection.edgeAgentId,
     transport: "edge_ws",
+    status: "online",
+  };
+}
+
+export function serverSandboxWorkspaceBinding(): WorkspaceBinding {
+  return {
+    kind: "server_sandbox",
+    display_name: "Server sandbox",
+    authority: "read_write",
+    fallback_policy: "disabled",
+  };
+}
+
+export function serverSandboxExecutorBinding(): ExecutorBinding {
+  return {
+    kind: "server_local",
+    executor_id: "server-local",
+    display_name: "Server sandbox",
+    transport: "server_local",
     status: "online",
   };
 }
@@ -308,19 +324,8 @@ export function validateWorkspaceAuthority(
   if (!localCodeIntent(message)) {
     return null;
   }
-  if (!selection) {
-    return {
-      code: "workspace_required",
-      message:
-        "Select a connected edge workspace in the Workspace bar, then retry this local-code request.",
-    };
-  }
-  if (selection.kind === "server_sandbox") {
-    return {
-      code: "workspace_local_code_on_server_sandbox",
-      message:
-        "This prompt refers to local code, but Server sandbox cannot access your local paths. Select a connected edge workspace in the Workspace bar, then retry.",
-    };
+  if (!selection || selection.kind === "server_sandbox") {
+    return null;
   }
   const pathMentions = extractLocalPathMentions(message);
   const foreignPath = pathMentions.find(
@@ -344,6 +349,13 @@ export function resolveWorkspaceBindings(selection: WorkspaceSelection | null) {
         cwd: selection.cwd,
         edge_agent_id: selection.edgeAgentId,
       },
+    };
+  }
+  if (selection?.kind === "server_sandbox") {
+    return {
+      workspaceBinding: serverSandboxWorkspaceBinding(),
+      executorBinding: serverSandboxExecutorBinding(),
+      edgeProfile: undefined,
     };
   }
   return {

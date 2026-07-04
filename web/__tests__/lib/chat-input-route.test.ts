@@ -92,24 +92,20 @@ describe("chat deferred input route workspace authority", () => {
     } as never);
   });
 
-  it("rejects local-code deferred input without workspace authority", async () => {
+  it("queues local-code deferred input without workspace authority", async () => {
     mockGetChatHydrated.mockResolvedValue(activeChat() as never);
     const { POST } = await import("@/app/api/chats/[chatId]/input/route");
 
     const response = await POST(
-      postInput({ content: "review ~/github/astra" }),
+      postInput({ content: "review ~/project" }),
       { params: Promise.resolve({ chatId: "chat-1" }) },
     );
 
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_required",
-      error: expect.stringContaining("Select a connected edge workspace"),
-    });
-    expect(mockQueueDeferredRunInput).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(mockQueueDeferredRunInput).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects local-code deferred input on server sandbox", async () => {
+  it("queues local-code deferred input on server sandbox", async () => {
     mockGetChatHydrated.mockResolvedValue(
       activeChat({ kind: "server_sandbox" }) as never,
     );
@@ -120,12 +116,8 @@ describe("chat deferred input route workspace authority", () => {
       { params: Promise.resolve({ chatId: "chat-1" }) },
     );
 
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_local_code_on_server_sandbox",
-      error: expect.stringContaining("Server sandbox cannot access"),
-    });
-    expect(mockQueueDeferredRunInput).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(mockQueueDeferredRunInput).toHaveBeenCalledTimes(1);
   });
 
   it("rejects attempts to change workspace with deferred input", async () => {
@@ -134,7 +126,7 @@ describe("chat deferred input route workspace authority", () => {
         kind: "edge_workspace",
         edgeAgentId: "edge-a",
         displayName: "MacBook",
-        cwd: "/Users/xupeng/github/astra",
+        cwd: "/Users/test/astra",
       }) as never,
     );
     const { POST } = await import("@/app/api/chats/[chatId]/input/route");

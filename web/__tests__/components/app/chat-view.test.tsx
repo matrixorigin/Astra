@@ -302,13 +302,13 @@ describe("ChatView deferred-input unhappy paths", () => {
   it("shows workspace selection errors directly in the assistant message", async () => {
     const user = userEvent.setup();
     const message =
-      "This prompt refers to local code, but Server sandbox cannot access your local paths. Select a connected edge workspace in the Workspace bar, then retry.";
+      "The selected edge workspace is /workspace/astra, but the prompt references /workspace/other. Select an edge workspace that owns that path, then retry.";
     composerPayload = {
-      text: "review this repo",
+      text: "review /workspace/other",
       options: composerPayload.options,
     };
     mockStreamChatMessage.mockRejectedValue(
-      new WebApiError(409, message, "workspace_local_code_on_server_sandbox"),
+      new WebApiError(409, message, "workspace_path_mismatch"),
     );
 
     render(<ChatView initial={makeDetail(null)} />);
@@ -496,7 +496,7 @@ describe("ChatView deferred-input unhappy paths", () => {
         kind: "edge_workspace",
         edgeAgentId: "edge-1",
         displayName: "MacBook Pro",
-        cwd: "/Users/xupeng/github/astra",
+        cwd: "/Users/test/astra",
       }),
     );
     mockGetEdgeStatus.mockResolvedValue({
@@ -504,7 +504,7 @@ describe("ChatView deferred-input unhappy paths", () => {
         {
           edge_agent_id: "edge-1",
           hostname: "MacBook Pro",
-          workspace_dir: "/Users/xupeng/github/astra",
+          workspace_dir: "/Users/test/astra",
           connected_secs: 10,
         },
       ],
@@ -523,7 +523,7 @@ describe("ChatView deferred-input unhappy paths", () => {
             kind: "edge_workspace",
             edgeAgentId: "edge-1",
             displayName: "MacBook Pro",
-            cwd: "/Users/xupeng/github/astra",
+            cwd: "/Users/test/astra",
           },
         }),
         expect.any(Object),
@@ -560,14 +560,14 @@ describe("ChatView deferred-input unhappy paths", () => {
       kind: "edge_workspace" as const,
       edgeAgentId: "edge-1",
       displayName: "MacBook Pro",
-      cwd: "/Users/xupeng/github/astra",
+      cwd: "/Users/test/astra",
     };
     mockGetEdgeStatus.mockResolvedValue({
       edges: [
         {
           edge_agent_id: "edge-1",
           hostname: "MacBook Pro",
-          workspace_dir: "/Users/xupeng/github/astra",
+          workspace_dir: "/Users/test/astra",
           connected_secs: 10,
         },
       ],
@@ -602,14 +602,14 @@ describe("ChatView deferred-input unhappy paths", () => {
       kind: "edge_workspace" as const,
       edgeAgentId: "edge-1",
       displayName: "MacBook Pro",
-      cwd: "/Users/xupeng/github/astra",
+      cwd: "/Users/test/astra",
     };
     mockGetEdgeStatus.mockResolvedValue({
       edges: [
         {
           edge_agent_id: "edge-1",
           hostname: "MacBook Pro",
-          workspace_dir: "/Users/xupeng/github/astra",
+          workspace_dir: "/Users/test/astra",
           connected_secs: 10,
         },
       ],
@@ -622,7 +622,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     render(<ChatView initial={makeDetail(null)} />);
 
     await user.click(
-      await screen.findByTitle("MacBook Pro · /Users/xupeng/github/astra"),
+      await screen.findByTitle("MacBook Pro · /Users/test/astra"),
     );
 
     await waitFor(() => {
@@ -642,7 +642,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       kind: "edge_workspace" as const,
       edgeAgentId: "edge-1",
       displayName: "MacBook Pro",
-      cwd: "/Users/xupeng/github/astra",
+      cwd: "/Users/test/astra",
     };
     mockGetEdgeStatus.mockResolvedValue({ edges: [] });
     mockUpdateChatWorkspaceSelection.mockResolvedValue({
@@ -661,7 +661,7 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     expect(
       await screen.findByRole("status", {
-        name: "Selected edge workspace is offline: MacBook Pro · /Users/xupeng/github/astra",
+        name: "Selected edge workspace is offline: MacBook Pro · /Users/test/astra",
       }),
     ).toBeInTheDocument();
 
@@ -848,7 +848,7 @@ describe("ChatView deferred-input unhappy paths", () => {
           workspace: {
             kind: "edge_workspace",
             display_name: "MacBook Pro",
-            cwd: "/Users/xupeng/github/astra",
+            cwd: "/Users/test/astra",
             authority: "read_write",
             fallback_policy: "disabled",
           },
@@ -895,7 +895,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(screen.getAllByText("MacBook Pro").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Workspace").length).toBeGreaterThan(0);
     expect(
-      screen.getAllByText("/Users/xupeng/github/astra").length,
+      screen.getAllByText("/Users/test/astra").length,
     ).toBeGreaterThan(0);
     expect(screen.getAllByText("Transport").length).toBeGreaterThan(0);
     expect(screen.getAllByText("edge ws").length).toBeGreaterThan(0);

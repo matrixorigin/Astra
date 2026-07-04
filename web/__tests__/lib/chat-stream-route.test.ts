@@ -132,7 +132,7 @@ async function waitUntil(predicate: () => boolean) {
 const connectedEdge = {
   edge_agent_id: "edge-1",
   hostname: "MacBook Pro",
-  workspace_dir: "/Users/xupeng/github/astra",
+  workspace_dir: "/Users/test/astra",
   connected_secs: 12,
 };
 
@@ -606,14 +606,17 @@ describe("chat stream route proxy cancellation", () => {
     resolveFetch({ ok: true, body: makeBackendStream().body });
   });
 
-  it("rejects local code prompts without workspace authority before creating stream messages", async () => {
+  it("streams local-code prompts without workspace as chat-only control-plane turns", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendStream();
+    const runtime = makeRuntimeWithEdgeStatus(backend);
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
         method: "POST",
         body: JSON.stringify({
-          content: "review ~/github/astra",
+          content: "review ~/project",
           options: {
             model: "sonnet-4.6-adaptive",
             webSearch: false,
@@ -625,17 +628,44 @@ describe("chat stream route proxy cancellation", () => {
       { params: Promise.resolve({ chatId: "chat-1" }) },
     );
 
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_required",
-      error: expect.stringContaining("Select a connected edge workspace"),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const first = await reader!.read();
+    const text = new TextDecoder().decode(first.value);
+    expect(text).toContain('"type":"local_messages"');
+
+    await waitUntil(() => runtime.fetchResponse.mock.calls.length > 0);
+    const fetchCalls = runtime.fetchResponse.mock.calls as unknown as Array<
+      [unknown, { json?: Record<string, unknown> }]
+    >;
+    expect(fetchCalls[0]?.[1].json).toEqual(
+      expect.objectContaining({
+        workspace_binding: {
+          kind: "none",
+          display_name: "No workspace",
+          authority: "none",
+          fallback_policy: "disabled",
+        },
+        executor_binding: {
+          kind: "server_local",
+          executor_id: "server-control-plane",
+          display_name: "Server control plane",
+          transport: "server_local",
+          status: "online",
+        },
+      }),
+    );
+    expect(runtime.get).not.toHaveBeenCalled();
+
+    await reader?.cancel();
   });
 
-  it("rejects local code prompts when server sandbox is explicitly selected", async () => {
+  it("streams local-code prompts when server sandbox is explicitly selected", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendStream();
+    const runtime = makeRuntimeWithEdgeStatus(backend);
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
 
     const response = await POST(
       new Request("http://web.test/api/chats/chat-1/stream", {
@@ -654,13 +684,33 @@ describe("chat stream route proxy cancellation", () => {
       { params: Promise.resolve({ chatId: "chat-1" }) },
     );
 
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      code: "workspace_local_code_on_server_sandbox",
-      error: expect.stringContaining("Server sandbox cannot access"),
-    });
-    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
-    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    await waitUntil(() => runtime.fetchResponse.mock.calls.length > 0);
+    const fetchCalls = runtime.fetchResponse.mock.calls as unknown as Array<
+      [unknown, { json?: Record<string, unknown> }]
+    >;
+    expect(fetchCalls[0]?.[1].json).toEqual(
+      expect.objectContaining({
+        workspace_binding: {
+          kind: "server_sandbox",
+          display_name: "Server sandbox",
+          authority: "read_write",
+          fallback_policy: "disabled",
+        },
+        executor_binding: {
+          kind: "server_local",
+          executor_id: "server-local",
+          display_name: "Server sandbox",
+          transport: "server_local",
+          status: "online",
+        },
+      }),
+    );
+    expect(runtime.get).not.toHaveBeenCalled();
+
+    await reader?.cancel();
   });
 
   it("forwards selected edge workspace bindings after returning local SSE", async () => {
@@ -673,12 +723,12 @@ describe("chat stream route proxy cancellation", () => {
       new Request("http://web.test/api/chats/chat-1/stream", {
         method: "POST",
         body: JSON.stringify({
-          content: "review /Users/xupeng/github/astra/src/lib.rs",
+          content: "review /Users/test/astra/src/lib.rs",
           workspace: {
             kind: "edge_workspace",
             edgeAgentId: "edge-1",
             displayName: "MacBook Pro",
-            cwd: "/Users/xupeng/github/astra",
+            cwd: "/Users/test/astra",
           },
           options: {
             model: "sonnet-4.6-adaptive",
@@ -709,7 +759,7 @@ describe("chat stream route proxy cancellation", () => {
         workspace_binding: {
           kind: "edge_workspace",
           display_name: "MacBook Pro",
-          cwd: "/Users/xupeng/github/astra",
+          cwd: "/Users/test/astra",
           authority: "read_write",
           fallback_policy: "disabled",
         },
@@ -722,7 +772,7 @@ describe("chat stream route proxy cancellation", () => {
         },
         context: expect.objectContaining({
           edge_profile: {
-            cwd: "/Users/xupeng/github/astra",
+            cwd: "/Users/test/astra",
             edge_agent_id: "edge-1",
             active_skills: ["rust"],
           },
@@ -747,12 +797,12 @@ describe("chat stream route proxy cancellation", () => {
       new Request("http://web.test/api/chats/chat-1/stream", {
         method: "POST",
         body: JSON.stringify({
-          content: "review /Users/xupeng/github/astra/src/lib.rs",
+          content: "review /Users/test/astra/src/lib.rs",
           workspace: {
             kind: "edge_workspace",
             edgeAgentId: "edge-1",
             displayName: "MacBook Pro",
-            cwd: "/Users/xupeng/github/astra",
+            cwd: "/Users/test/astra",
           },
           options: {
             model: "sonnet-4.6-adaptive",
@@ -935,7 +985,7 @@ describe("chat stream route proxy cancellation", () => {
       kind: "edge_workspace" as const,
       edgeAgentId: "edge-1",
       displayName: "MacBook Pro",
-      cwd: "/Users/xupeng/github/astra",
+      cwd: "/Users/test/astra",
     };
     mockGetChat.mockReturnValue({
       chat: {
@@ -1003,7 +1053,7 @@ describe("chat stream route proxy cancellation", () => {
         selected_model: { id: "model-backend", model: "backend-model" },
         workspace_binding: expect.objectContaining({
           kind: "edge_workspace",
-          cwd: "/Users/xupeng/github/astra",
+          cwd: "/Users/test/astra",
         }),
         executor_binding: expect.objectContaining({
           kind: "edge_agent",
