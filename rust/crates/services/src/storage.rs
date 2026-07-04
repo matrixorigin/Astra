@@ -17,6 +17,13 @@ const CAUSAL_EDGE_KIND: &str = "causal";
 /// All `agent_id`, `edge_agent_id`, `holder_agent_id`, and `parent_agent_id`
 /// columns MUST use this width for consistency and join compatibility.
 pub const AGENT_ID_LEN: usize = 255;
+/// Width for application event identifiers and references.
+///
+/// Journal ingestion uses `evt-` plus a full SHA-256 digest (68 chars), and
+/// several runtime paths use UUID-like event ids. Keep the schema wider than
+/// the current longest generated id so evidence/trace writes do not fail after
+/// the run has already started.
+pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 pub(crate) fn rows_affected_to_i64(rows: u64, context: &str) -> Result<i64, sqlx::Error> {
@@ -32,15 +39,15 @@ const AGENT_EVENTS_OWNER_SESSION_TURN_INDEX_ALTER_SQL: &str = "ALTER TABLE agent
 fn agent_events_create_sql() -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS agent_events (
-            event_id VARCHAR(64) NOT NULL,
+            event_id VARCHAR({AGENT_EVENT_ID_LEN}) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(64) NOT NULL,
             agent_id VARCHAR(255) NULL,
             agent_version VARCHAR(32) NULL,
             event_type VARCHAR(64) NOT NULL,
             content LONGTEXT NULL,
-            parent_event_id VARCHAR(64) NULL,
-            causal_chain_id VARCHAR(64) NULL,
+            parent_event_id VARCHAR({AGENT_EVENT_ID_LEN}) NULL,
+            causal_chain_id VARCHAR({AGENT_EVENT_ID_LEN}) NULL,
             run_id VARCHAR(64) NULL,
             parent_run_id VARCHAR(64) NULL,
             turn_id VARCHAR(64) NULL,
@@ -1128,7 +1135,7 @@ pub async fn ensure_core_schema(
             title VARCHAR(255) NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'active',
             event_count BIGINT NOT NULL DEFAULT 0,
-            last_event_id VARCHAR(64) NULL,
+            last_event_id VARCHAR(128) NULL,
             summary_status VARCHAR(20) NULL,
             summary_job_id VARCHAR(64) NULL,
             vector_db_snapshot_id VARCHAR(64) NULL,
@@ -1160,9 +1167,27 @@ pub async fn ensure_core_schema(
         "ALTER TABLE agent_sessions ADD PRIMARY KEY (user_id, session_id)",
     )
     .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "agent_sessions",
+        &[("last_event_id", AGENT_EVENT_ID_LEN as u64)],
+    )
+    .await?;
 
     let agent_events_sql = agent_events_create_sql();
     query(&agent_events_sql).execute(&pool).await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "agent_events",
+        &[
+            ("event_id", AGENT_EVENT_ID_LEN as u64),
+            ("parent_event_id", AGENT_EVENT_ID_LEN as u64),
+            ("causal_chain_id", AGENT_EVENT_ID_LEN as u64),
+        ],
+    )
+    .await?;
     ensure_primary_key_shape(
         &pool,
         &settings.database,
@@ -1261,7 +1286,7 @@ pub async fn ensure_core_schema(
             status VARCHAR(32) NOT NULL,
             execution_mode VARCHAR(32) NOT NULL DEFAULT 'web_agent',
             trigger_type VARCHAR(64) NULL,
-            trigger_event_id VARCHAR(64) NULL,
+            trigger_event_id VARCHAR(128) NULL,
             waiting_for VARCHAR(64) NULL,
             owner_pod_id VARCHAR(128) NULL,
             owner_lease_expires_at DATETIME(6) NULL,
@@ -1308,6 +1333,13 @@ pub async fn ensure_core_schema(
         "agent_runs",
         &["user_id", "run_id"],
         "ALTER TABLE agent_runs ADD PRIMARY KEY (user_id, run_id)",
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "agent_runs",
+        &[("trigger_event_id", AGENT_EVENT_ID_LEN as u64)],
     )
     .await?;
     for removed_index in [
@@ -2843,8 +2875,8 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS agent_event_edges (
             user_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
-            child_event_id VARCHAR(64) NOT NULL,
-            parent_event_id VARCHAR(64) NOT NULL,
+            child_event_id VARCHAR(128) NOT NULL,
+            parent_event_id VARCHAR(128) NOT NULL,
             relation_kind VARCHAR(32) NOT NULL DEFAULT 'causal',
             parent_order INT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -2855,6 +2887,16 @@ pub async fn ensure_core_schema(
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "agent_event_edges",
+        &[
+            ("child_event_id", AGENT_EVENT_ID_LEN as u64),
+            ("parent_event_id", AGENT_EVENT_ID_LEN as u64),
+        ],
+    )
     .await?;
 
     // Harness diagnostic snapshots — separated from agent_events to avoid
@@ -3062,7 +3104,7 @@ pub async fn ensure_core_schema(
             context_capture_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            event_id VARCHAR(64) NOT NULL,
+            event_id VARCHAR(128) NOT NULL,
             context_data JSON NULL,
             llm_request_id VARCHAR(64) NULL,
             llm_response_id VARCHAR(64) NULL,
@@ -3078,6 +3120,13 @@ pub async fn ensure_core_schema(
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "ctx_snapshots",
+        &[("event_id", AGENT_EVENT_ID_LEN as u64)],
+    )
     .await?;
     for removed_index in [
         "idx_ctx_snapshots_session_created",
@@ -3113,7 +3162,7 @@ pub async fn ensure_core_schema(
             decision_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            event_id VARCHAR(64) NULL,
+            event_id VARCHAR(128) NULL,
             context_capture_id VARCHAR(64) NULL,
             decision_type VARCHAR(64) NOT NULL,
             decision_output JSON NULL,
@@ -3126,6 +3175,13 @@ pub async fn ensure_core_schema(
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "ctx_decision_audits",
+        &[("event_id", AGENT_EVENT_ID_LEN as u64)],
+    )
     .await?;
     for removed_index in [
         "idx_ctx_decisions_session_type_created",
@@ -5607,6 +5663,18 @@ mod tests {
             "agent_events must not use global event_id identity"
         );
         assert!(
+            create_sql.contains("event_id VARCHAR(128) NOT NULL"),
+            "agent_events must fit full content-addressed ingestion event ids"
+        );
+        assert!(
+            create_sql.contains("parent_event_id VARCHAR(128) NULL"),
+            "agent_events parent references must fit full event ids"
+        );
+        assert!(
+            create_sql.contains("causal_chain_id VARCHAR(128) NULL"),
+            "agent_events causal chains often reuse full event ids"
+        );
+        assert!(
             create_sql.contains(AGENT_EVENTS_OWNER_SESSION_TURN_INDEX_DECL),
             "agent_events must index the session-turn inference path in CREATE TABLE"
         );
@@ -5628,8 +5696,8 @@ mod tests {
         for expected in [
             "user_id VARCHAR(64) NOT NULL",
             "session_id VARCHAR(128) NOT NULL",
-            "child_event_id VARCHAR(64) NOT NULL",
-            "parent_event_id VARCHAR(64) NOT NULL",
+            "child_event_id VARCHAR(128) NOT NULL",
+            "parent_event_id VARCHAR(128) NOT NULL",
             "PRIMARY KEY (user_id, child_event_id, parent_event_id, relation_kind)",
             "idx_agent_event_edges_owner_session_child (user_id, session_id, child_event_id)",
         ] {

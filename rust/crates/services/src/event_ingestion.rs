@@ -2500,6 +2500,30 @@ mod tests {
     }
 
     #[test]
+    fn generated_event_ids_fit_agent_events_schema_width() {
+        let event = make_turn_event();
+        let id = IngestionEvent::from_journal_event(&event, "u1")
+            .expect("valid journal event")
+            .event_id;
+
+        assert_eq!(
+            id.len(),
+            68,
+            "journal ingestion ids are `evt-` plus a full SHA-256 digest"
+        );
+        assert!(
+            id.len() <= crate::storage::AGENT_EVENT_ID_LEN,
+            "generated event_id length {} exceeds agent_events schema width {}",
+            id.len(),
+            crate::storage::AGENT_EVENT_ID_LEN
+        );
+        assert!(
+            crate::storage::AGENT_EVENT_ID_LEN > 64,
+            "agent_events.event_id must not regress to VARCHAR(64)"
+        );
+    }
+
+    #[test]
     fn event_id_distinguishes_same_timestamp_rounds() {
         let mut first = make_turn_event();
         first.event_type = crate::session_journal::JournalEventType::LlmRound;

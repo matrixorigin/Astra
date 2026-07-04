@@ -714,6 +714,13 @@ async fn phase1_run_durability_schema_contract() {
         ["user_id", "event_id"],
         "agent_events identity must be owner-bound so cross-tenant event ids do not collide"
     );
+    for column in ["event_id", "parent_event_id", "causal_chain_id"] {
+        assert_eq!(
+            column_character_maximum_length(&pool, &schema, "agent_events", column).await,
+            Some(128),
+            "agent_events.{column} must fit content-addressed event ids"
+        );
+    }
     assert_eq!(
         index_columns(&pool, &schema, "agent_events", "idx_agent_events_trace").await,
         ["user_id", "session_id", "turn_id", "created_at"],
@@ -827,6 +834,13 @@ async fn phase1_run_durability_schema_contract() {
         ],
         "event edge identity must be owner-bound"
     );
+    for column in ["child_event_id", "parent_event_id"] {
+        assert_eq!(
+            column_character_maximum_length(&pool, &schema, "agent_event_edges", column).await,
+            Some(128),
+            "agent_event_edges.{column} must fit content-addressed event ids"
+        );
+    }
     assert_eq!(
         index_columns(
             &pool,
@@ -879,6 +893,11 @@ async fn phase1_run_durability_schema_contract() {
             "agent_sessions missing {expected}"
         );
     }
+    assert_eq!(
+        column_character_maximum_length(&pool, &schema, "agent_sessions", "last_event_id").await,
+        Some(128),
+        "agent_sessions.last_event_id must fit content-addressed event ids"
+    );
     assert_eq!(
         index_columns(
             &pool,
@@ -961,6 +980,11 @@ async fn phase1_run_durability_schema_contract() {
             "agent_runs missing {expected}"
         );
     }
+    assert_eq!(
+        column_character_maximum_length(&pool, &schema, "agent_runs", "trigger_event_id").await,
+        Some(128),
+        "agent_runs.trigger_event_id must fit content-addressed event ids"
+    );
 
     // The original assertion relied on `SHOW CREATE TABLE` preserving
     // CHECK constraints — true for MySQL 8.0+ but NOT for MatrixOne
@@ -1331,6 +1355,11 @@ async fn phase2_web_hydration_schema_contract() {
             .any(|column| column == "user_id"),
         "ctx_snapshots must carry physical owner scope"
     );
+    assert_eq!(
+        column_character_maximum_length(&pool, &schema, "ctx_snapshots", "event_id").await,
+        Some(128),
+        "ctx_snapshots.event_id must fit content-addressed event ids"
+    );
     assert!(
         column_default(&pool, &schema, "ctx_snapshots", "user_id")
             .await
@@ -1365,6 +1394,11 @@ async fn phase2_web_hydration_schema_contract() {
             .iter()
             .any(|column| column == "user_id"),
         "ctx_decision_audits must carry physical owner scope"
+    );
+    assert_eq!(
+        column_character_maximum_length(&pool, &schema, "ctx_decision_audits", "event_id").await,
+        Some(128),
+        "ctx_decision_audits.event_id must fit content-addressed event ids"
     );
     assert!(
         column_default(&pool, &schema, "ctx_decision_audits", "user_id")
