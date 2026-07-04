@@ -35,6 +35,53 @@ is_web_process() {
     [[ "$cmd" == *"node"* && "$cmd" == *"next/dist/bin/next"* && "$cmd" == *" dev"* ]]
 }
 
+web_parent_process_for_port() {
+    local listener ppid
+    for listener in $(web_port_listener_pids "$WEB_PORT"); do
+        ppid=$(ps -p "$listener" -o ppid= 2>/dev/null | tr -d '[:space:]' || true)
+        if [ -n "$ppid" ] && is_web_process "$ppid"; then
+            printf '%s\n' "$ppid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+start_detached() {
+    if command -v setsid >/dev/null 2>&1; then
+        (
+            cd "$WEB_DIR"
+            setsid "$@" >> "$LOG_FILE" 2>&1 &
+            echo $!
+        ) > "$PID_FILE.tmp"
+        DETACHED_PID="$(cat "$PID_FILE.tmp")"
+        rm -f "$PID_FILE.tmp"
+    elif command -v screen >/dev/null 2>&1; then
+        # macOS does not ship setsid(1). A plain background nohup process can
+        # still be tied to the launching process group in agent/IDE shells, so
+        # use screen when available to create an actually detached web server.
+        screen -dmS "astra-web-$WEB_PORT" bash -lc \
+            'cd "$1"; log_file="$2"; shift 2; exec "$@" >> "$log_file" 2>&1' \
+            bash "$WEB_DIR" "$LOG_FILE" "$@"
+        DETACHED_PID=""
+        for _ in {1..40}; do
+            DETACHED_PID="$(web_parent_process_for_port || true)"
+            if [ -n "$DETACHED_PID" ] && kill -0 "$DETACHED_PID" 2>/dev/null; then
+                return
+            fi
+            sleep 0.25
+        done
+    else
+        (
+            cd "$WEB_DIR"
+            nohup "$@" >> "$LOG_FILE" 2>&1 &
+            echo $!
+        ) > "$PID_FILE.tmp"
+        DETACHED_PID="$(cat "$PID_FILE.tmp")"
+        rm -f "$PID_FILE.tmp"
+    fi
+}
+
 if [ -f "$PID_FILE" ]; then
     PID="$(cat "$PID_FILE")"
     if kill -0 "$PID" 2>/dev/null && is_web_process "$PID"; then
@@ -77,6 +124,16 @@ fi
 mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
 rm -f "$PID_FILE"
 
+for webpack_cache_dir in \
+    "$WEB_DIR/$NEXT_DIST_DIR/cache/webpack" \
+    "$WEB_DIR/$NEXT_DIST_DIR/dev/cache/webpack"
+do
+    if [ -d "$webpack_cache_dir" ]; then
+        echo "Clearing stale Next.js webpack dev cache: $webpack_cache_dir"
+        rm -rf "$webpack_cache_dir"
+    fi
+done
+
 {
     echo ""
     echo "=== astra web dev start $(date) ==="
@@ -86,15 +143,18 @@ rm -f "$PID_FILE"
     echo "ASTRA_NEXT_DIST_DIR=$NEXT_DIST_DIR"
 } >> "$LOG_FILE"
 
-nohup env \
+start_detached env \
     ASTRA_API_URL="$API_URL" \
     ASTRA_NEXT_DIST_DIR="$NEXT_DIST_DIR" \
     PORT="$WEB_PORT" \
-    bash -lc 'cd "$1"; shift; exec "$@"' bash "$WEB_DIR" \
-	node "$NEXT_BIN" dev --webpack --hostname "$WEB_HOST" --port "$WEB_PORT" \
-    </dev/null \
-    >> "$LOG_FILE" 2>&1 &
-PID=$!
+    node "$NEXT_BIN" dev --turbopack --hostname "$WEB_HOST" --port "$WEB_PORT"
+PID="$DETACHED_PID"
+if [ -z "$PID" ]; then
+    rm -f "$PID_FILE"
+    echo "❌ Web UI failed to start"
+    echo "   View error log: tail -50 $LOG_FILE"
+    exit 1
+fi
 echo "$PID" > "$PID_FILE"
 
 for i in {1..40}; do
