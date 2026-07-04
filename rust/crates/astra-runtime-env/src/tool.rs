@@ -282,6 +282,9 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         project_read("grep", ToolLoadPolicy::AlwaysLoad),
         project_read("glob", ToolLoadPolicy::AlwaysLoad),
         project_read("symbols", ToolLoadPolicy::Deferred),
+        // Reads an image file from the workspace and renders it to the terminal
+        // via img2sixel. Opt-in — an agent calls it after producing an image.
+        project_read("display_sixel", ToolLoadPolicy::Deferred),
         project_write("write_file", ToolLoadPolicy::AlwaysLoad),
         project_write("str_replace", ToolLoadPolicy::AlwaysLoad),
         project_write("delete_file", ToolLoadPolicy::Internal),

@@ -27,10 +27,12 @@
 //!
 //! # Pre-conditions
 //! 1. `img2sixel` must be on PATH.
-//! 2. The terminal must understand sixel graphics. We do not probe for this —
-//!    reliable detection requires a DA1 round-trip that is impractical here and
-//!    the previous heuristics produced false positives. The tool is opt-in (an
-//!    agent calls it after producing an image), so we simply attempt to render.
+//! 2. The terminal must understand sixel graphics. Capability is probed once at
+//!    TUI startup with a DA1 round-trip (see [`probe_sixel_support`]) and cached
+//!    ([`set_sixel_supported`] / [`cached_sixel_support`]); when the cached result
+//!    says unsupported, `display_sixel` reports "not displayed" instead of opening
+//!    a blank modal. If the capability was never probed (e.g. headless/scripting,
+//!    where stdout is the real terminal) the tool simply attempts to render.
 
 use std::io::Write;
 use std::path::Path;

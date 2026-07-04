@@ -171,7 +171,7 @@ impl ReopenTarget {
 /// and forces a full repaint once the user presses Enter to dismiss it.
 async fn render_pending_sixel_images(guard: &mut TerminalGuard) {
     for bytes in astra_tools::display_sixel::take_pending_sixel() {
-        let _ = guard
+        if let Err(err) = guard
             .with_restored(|| async move {
                 use std::io::Write as _;
                 let mut out = std::io::stdout();
@@ -186,7 +186,14 @@ async fn render_pending_sixel_images(guard: &mut TerminalGuard) {
                 let mut line = String::new();
                 let _ = std::io::stdin().read_line(&mut line);
             })
-            .await;
+            .await
+        {
+            // Restoring raw mode / bracketed paste / repaint failed. The TUI may
+            // be left in a degraded state; surface it in traces rather than
+            // swallowing it, and stop blitting the remaining queued images.
+            tracing::warn!(error = %err, "failed to display queued sixel image; skipping rest");
+            break;
+        }
     }
 }
 
