@@ -606,7 +606,7 @@ describe("chat stream route proxy cancellation", () => {
     resolveFetch({ ok: true, body: makeBackendStream().body });
   });
 
-  it("streams local-code prompts without workspace as chat-only control-plane turns", async () => {
+  it("streams prompts without an explicit environment as default Astra turns", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
     const runtime = makeRuntimeWithEdgeStatus(backend);
@@ -643,14 +643,14 @@ describe("chat stream route proxy cancellation", () => {
       expect.objectContaining({
         workspace_binding: {
           kind: "none",
-          display_name: "No workspace",
+          display_name: "Astra",
           authority: "none",
           fallback_policy: "disabled",
         },
         executor_binding: {
           kind: "server_local",
           executor_id: "server-control-plane",
-          display_name: "Server control plane",
+          display_name: "Astra",
           transport: "server_local",
           status: "online",
         },

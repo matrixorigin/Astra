@@ -292,7 +292,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     render(<ChatView initial={makeDetail()} />);
 
     expect(
-      screen.getByRole("button", { name: "Server sandbox" }),
+      screen.getByRole("button", { name: "Sandbox" }),
     ).toBeDisabled();
     expect(
       screen.getByRole("button", { name: "Submit composer" }),
@@ -302,7 +302,7 @@ describe("ChatView deferred-input unhappy paths", () => {
   it("shows workspace selection errors directly in the assistant message", async () => {
     const user = userEvent.setup();
     const message =
-      "The selected edge workspace is /workspace/astra, but the prompt references /workspace/other. Select an edge workspace that owns that path, then retry.";
+      "The referenced path is outside the selected file environment: /workspace/other. Choose the environment that contains it or use a path inside the current one.";
     composerPayload = {
       text: "review /workspace/other",
       options: composerPayload.options,
@@ -537,10 +537,10 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     render(<ChatView initial={makeDetail(null)} />);
 
-    expect(screen.getByText("Chat only")).toBeInTheDocument();
-    expect(screen.getByText("No code workspace")).toBeInTheDocument();
+    expect(screen.getByText("Run in")).toBeInTheDocument();
+    expect(screen.getByText("Astra")).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Server sandbox" }));
+    await user.click(screen.getByRole("button", { name: "Sandbox" }));
     await user.click(screen.getByRole("button", { name: "Submit composer" }));
 
     await waitFor(() => {
@@ -661,12 +661,12 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     expect(
       await screen.findByRole("status", {
-        name: "Selected edge workspace is offline: MacBook Pro · /Users/test/astra",
+        name: "Selected environment is unavailable: MacBook Pro · /Users/test/astra",
       }),
     ).toBeInTheDocument();
 
     await user.click(
-      screen.getByRole("button", { name: "Use server sandbox" }),
+      screen.getByRole("button", { name: "Use sandbox" }),
     );
 
     await waitFor(() => {
@@ -873,43 +873,43 @@ describe("ChatView deferred-input unhappy paths", () => {
     await waitFor(() => {
       expect(
         screen.getByRole("button", {
-          name: "Open agents work surface, 1 item",
+          name: "Open agents activity, 1 item",
         }),
       ).toBeInTheDocument();
     });
     expect(
-      screen.getByRole("button", { name: "Open tasks work surface, 1 active" }),
+      screen.getByRole("button", { name: "Open tasks activity, 1 active" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Open tools work surface, 1 item" }),
+      screen.getByRole("button", { name: "Open tools activity, 1 item" }),
     ).toBeInTheDocument();
 
     await user.click(
-      screen.getByRole("button", { name: "Open tools work surface, 1 item" }),
+      screen.getByRole("button", { name: "Open tools activity, 1 item" }),
     );
     expect(await screen.findAllByText("Needs attention")).not.toHaveLength(0);
     expect(
-      await screen.findAllByText("Edge transport disconnected"),
+      await screen.findAllByText("Environment unavailable"),
     ).not.toHaveLength(0);
-    expect(screen.getAllByText("Executor").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Runtime").length).toBeGreaterThan(0);
     expect(screen.getAllByText("MacBook Pro").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Workspace").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Files").length).toBeGreaterThan(0);
     expect(
       screen.getAllByText("/Users/test/astra").length,
     ).toBeGreaterThan(0);
-    expect(screen.getAllByText("Transport").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Connection").length).toBeGreaterThan(0);
     expect(screen.getAllByText("edge ws").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Fallback").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Policy").length).toBeGreaterThan(0);
     expect(screen.getAllByText("disabled").length).toBeGreaterThan(0);
     expect(
       screen.getAllByText(
-        "Transport disconnected. Reconnect edge before retrying.",
+        "Execution connection disconnected. Reconnect it before retrying.",
       ).length,
     ).toBeGreaterThan(0);
 
     await user.click(
       screen.getByRole("button", {
-        name: "Open agents work surface, 1 item",
+        name: "Open agents activity, 1 item",
       }),
     );
     expect(await screen.findAllByText("No blockers")).not.toHaveLength(0);
@@ -957,7 +957,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       />,
     );
 
-    expect(screen.getAllByText("Follow-up Queued").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Message Queued").length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "Submit composer" }));
 
@@ -1063,7 +1063,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(
       screen.getByRole("button", { name: "Submit composer" }),
     ).toBeDisabled();
-    expect(screen.getByText("Stopping")).toBeInTheDocument();
+    expect(screen.getAllByText("Stopping").length).toBeGreaterThan(0);
 
     resolveStop({});
     await waitFor(() => {
@@ -1128,7 +1128,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     await waitFor(() => {
       expect(screen.queryByText("Stopping")).not.toBeInTheDocument();
     });
-    expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Thinking").length).toBeGreaterThan(0);
     expect(screen.getByText("working...")).toBeInTheDocument();
     expect(screen.queryByText(/Stopped\./)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Stop run" })).not.toBeDisabled();
@@ -1178,7 +1178,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       });
       expect(mockGetChat).toHaveBeenCalledWith("chat-123");
       expect(screen.queryByText("Stopping")).not.toBeInTheDocument();
-      expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("Thinking").length).toBeGreaterThan(0);
       expect(screen.getByText("working...")).toBeInTheDocument();
       expect(screen.queryByText(/Stopped\./)).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Stop run" })).not.toBeDisabled();
@@ -1232,7 +1232,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(screen.queryByText("Completed")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", {
-        name: /Open agents work surface/i,
+        name: /Open agents activity/i,
       }),
     ).not.toBeInTheDocument();
 
@@ -1289,7 +1289,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       />,
     );
 
-    expect(screen.getByText("Blocked: Executor Offline")).toBeInTheDocument();
+    expect(screen.getByText("Environment Offline")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Submit composer" }),
     ).toBeEnabled();
@@ -1458,7 +1458,7 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     expect(
       screen.getByText(
-        "This run is paused. Resume to continue or Stop to cancel it.",
+        "Astra is paused. Resume to continue or stop this run.",
       ),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Resume" })).toBeInTheDocument();

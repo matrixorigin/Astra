@@ -273,8 +273,8 @@ export function WorkSurfacePanel({
           onClick={toggleWorkSurface}
           aria-label={
             collapsed
-              ? "Expand work surface (Ctrl+T)"
-              : "Collapse work surface (Ctrl+T)"
+              ? "Expand activity panel (Ctrl+T)"
+              : "Collapse activity panel (Ctrl+T)"
           }
         >
           <ChevronRight
@@ -285,7 +285,7 @@ export function WorkSurfacePanel({
           <div className="flex items-center gap-2">
             <ClipboardList className="size-4 text-accent" />
             <h2 className="truncate text-sm font-semibold text-text">
-              Work Surface
+              Activity
             </h2>
             <span className="ml-auto hidden rounded-control border border-border/40 px-2 py-0.5 text-[11px] text-text-muted lg:inline-flex">
               Ctrl+T
@@ -295,7 +295,7 @@ export function WorkSurfacePanel({
             {visibleRunStatus
               ? runStatusHeadline(visibleRunStatus)
               : state.hydrated
-                ? "Session projection"
+                ? "Session activity"
                 : "Waiting for session"}
           </p>
         </div>
@@ -303,7 +303,7 @@ export function WorkSurfacePanel({
           type="button"
           className="inline-flex size-8 items-center justify-center rounded-control text-text-muted transition hover:bg-surface-muted hover:text-text"
           onClick={onRefresh}
-          aria-label="Refresh work surface"
+          aria-label="Refresh activity"
         >
           <RotateCw className={cn("size-4", state.loading && "animate-spin")} />
         </button>
@@ -311,13 +311,12 @@ export function WorkSurfacePanel({
           type="button"
           className="inline-flex size-8 items-center justify-center rounded-control text-text-muted transition hover:bg-surface-muted hover:text-text lg:hidden"
           onClick={() => setMobileOpen(false)}
-          aria-label="Close work surface"
+          aria-label="Close activity"
         >
           <X className="size-4" />
         </button>
       </div>
 
-      <BindingStrip state={state} />
       <RunBlockedBanner blocked={state.blocked} />
 
       <div className="flex shrink-0 border-b border-border/70 px-2 py-2">
@@ -400,7 +399,7 @@ export function WorkSurfacePanel({
         onClick={() => setMobileOpen(true)}
       >
         <ClipboardList className="size-4" />
-        Work
+        Activity
       </button>
       <aside
         className={cn(
@@ -413,11 +412,11 @@ export function WorkSurfacePanel({
             type="button"
             className="flex h-full w-full flex-col items-center gap-3 py-4 text-text-muted transition hover:bg-surface-muted/60 hover:text-text"
             onClick={toggleWorkSurface}
-            aria-label="Expand work surface (Ctrl+T)"
+            aria-label="Expand activity panel (Ctrl+T)"
           >
             <ClipboardList className="size-5" />
             <span className="[writing-mode:vertical-rl] text-xs font-medium">
-              Work
+              Activity
             </span>
             <span className="text-[11px] text-text-muted">Ctrl+T</span>
           </button>
@@ -430,7 +429,7 @@ export function WorkSurfacePanel({
           <button
             type="button"
             className="absolute inset-0 bg-black/20"
-            aria-label="Close work surface"
+            aria-label="Close activity"
             onClick={() => setMobileOpen(false)}
           />
           <aside className="absolute inset-y-0 right-0 flex w-[min(100vw,390px)] flex-col border-l border-border bg-surface shadow-2xl">
@@ -846,16 +845,8 @@ function AgentDetails({
     ["Agent", agent.agentId],
     ["Run", agent.runId],
     ["Parent", agent.parentRunId],
-    [
-      "Workspace",
-      agent.workspace
-        ? (agent.workspace.cwd ?? workspaceDisplayName(agent.workspace))
-        : undefined,
-    ],
-    [
-      "Executor",
-      agent.executor ? executorDisplayName(agent.executor) : undefined,
-    ],
+    ["Files", workspaceMetaValue(agent.workspace)],
+    ["Runtime", executorMetaValue(agent.executor, agent.workspace)],
   ].filter((entry): entry is [string, string] => Boolean(entry[1]));
   return (
     <div className="border-t border-border/60 px-3 pb-3 pt-2">
@@ -908,11 +899,11 @@ function AgentDetails({
 
 function AgentExecutionMeta({ agent }: { agent: AgentSurfaceItem }) {
   const items = [
-    agent.executor ? executorDisplayName(agent.executor) : undefined,
-    agent.workspace?.cwd,
-    agent.transport ? `transport ${statusLabel(agent.transport)}` : undefined,
+    executorMetaValue(agent.executor, agent.workspace),
+    workspaceMetaValue(agent.workspace),
+    agent.transport ? `connection ${statusLabel(agent.transport)}` : undefined,
     agent.fallbackPolicy
-      ? `fallback ${statusLabel(agent.fallbackPolicy)}`
+      ? `policy ${statusLabel(agent.fallbackPolicy)}`
       : undefined,
   ].filter((item): item is string => Boolean(item));
   if (!items.length) {
@@ -1061,34 +1052,36 @@ function AgentRunBindingSummary({
     rawEx && typeof rawEx === "object" && !Array.isArray(rawEx)
       ? (rawEx as Partial<ExecutorBinding>)
       : null;
+  const files = workspaceMetaValue(workspace);
+  const runtime = executorMetaValue(executor, workspace);
   if (
-    !workspace &&
-    !executor &&
+    !files &&
+    !runtime &&
     !projection.transport &&
     !projection.fallbackPolicy
   ) {
     return null;
   }
   const items = [
-    executor
+    runtime
       ? {
-          label: "Executor",
-          value: executorDisplayName(executor),
+          label: "Runtime",
+          value: runtime,
           detail: executorDetail(executor),
         }
       : null,
-    workspace
+    files
       ? {
-          label: "Workspace",
-          value: workspaceDisplayName(workspace),
-          detail: workspace.cwd ?? workspace.authority ?? undefined,
+          label: "Files",
+          value: files,
+          detail: workspace?.cwd ?? workspace?.authority ?? undefined,
         }
       : null,
     projection.transport
-      ? { label: "Transport", value: statusLabel(projection.transport) }
+      ? { label: "Connection", value: statusLabel(projection.transport) }
       : null,
     projection.fallbackPolicy
-      ? { label: "Fallback", value: statusLabel(projection.fallbackPolicy) }
+      ? { label: "Policy", value: statusLabel(projection.fallbackPolicy) }
       : null,
   ].filter(Boolean) as Array<{
     label: string;
@@ -1199,28 +1192,6 @@ function MiniLiveDots({ className }: { className?: string }) {
   );
 }
 
-function BindingStrip({ state }: { state: WorkSurfaceState }) {
-  const workspace = state.workspace;
-  const executor = state.executor;
-  if (!workspace && !executor) {
-    return null;
-  }
-  return (
-    <div className="grid shrink-0 gap-2 border-b border-border/70 px-4 py-3 text-xs md:grid-cols-2">
-      <BindingItem
-        label="Workspace"
-        value={workspaceDisplayName(workspace)}
-        detail={workspace?.cwd ?? workspace?.authority}
-      />
-      <BindingItem
-        label="Executor"
-        value={executorDisplayName(executor)}
-        detail={executorDetail(executor)}
-      />
-    </div>
-  );
-}
-
 function RunBlockedBanner({
   blocked,
 }: {
@@ -1229,17 +1200,16 @@ function RunBlockedBanner({
   if (!blocked) {
     return null;
   }
-  const executor = executorDisplayName(blocked.executor);
-  const workspace =
-    blocked.workspace?.cwd ?? workspaceDisplayName(blocked.workspace);
+  const runtime = executorMetaValue(blocked.executor, blocked.workspace);
+  const files = workspaceMetaValue(blocked.workspace);
   const fallback = blocked.fallbackPolicy
-    ? `Fallback ${statusLabel(blocked.fallbackPolicy)}`
+    ? `policy ${statusLabel(blocked.fallbackPolicy)}`
     : undefined;
   const details = [
-    executor,
-    workspace,
+    runtime,
+    files,
     blocked.transport
-      ? `transport ${statusLabel(blocked.transport)}`
+      ? `connection ${statusLabel(blocked.transport)}`
       : undefined,
     fallback,
   ].filter((item): item is string => Boolean(item));
@@ -1263,30 +1233,6 @@ function RunBlockedBanner({
           ) : null}
         </div>
       </div>
-    </div>
-  );
-}
-
-function BindingItem({
-  label,
-  value,
-  detail,
-}: {
-  label: string;
-  value: string;
-  detail?: string | null;
-}) {
-  return (
-    <div className="min-w-0">
-      <div className="text-[10px] font-semibold uppercase text-text-muted">
-        {label}
-      </div>
-      <div className="mt-0.5 truncate font-medium text-text">{value}</div>
-      {detail ? (
-        <div className="mt-0.5 truncate font-mono text-[11px] text-text-muted">
-          {detail}
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -1318,6 +1264,7 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
   const cancelled = tool.status === "cancelled";
   const skipped = tool.status === "skipped";
   const finishedAt = tool.finishedAt ?? tool.startedAt;
+  const displayResult = toolResultForDisplay(tool);
   return (
     <section className="relative pl-9">
       <div
@@ -1377,10 +1324,10 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
             {tool.arguments ? (
               <StructuredPayload label="Args" value={tool.arguments} />
             ) : null}
-            {tool.result ? (
+            {displayResult ? (
               <StructuredPayload
                 label="Result"
-                value={tool.result}
+                value={displayResult}
                 tone={failed ? "danger" : "muted"}
               />
             ) : running ? (
@@ -1391,6 +1338,22 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
       </div>
     </section>
   );
+}
+
+function toolResultForDisplay(tool: ToolSurfaceItem) {
+  if (!tool.result) {
+    return undefined;
+  }
+  switch (tool.errorKind) {
+    case "executor_offline":
+    case "transport_disconnected":
+    case "fallback_disabled":
+    case "workspace_executor_unavailable":
+    case "workspace_path_mismatch":
+      return undefined;
+    default:
+      return tool.result;
+  }
 }
 
 function toolActivitySort(left: ToolSurfaceItem, right: ToolSurfaceItem) {
@@ -1415,22 +1378,23 @@ function ToolExecutionMeta({ tool }: { tool: ToolSurfaceItem }) {
     value: string;
     tone?: "default" | "danger";
   }> = [];
-  if (tool.executor) {
+  const runtime = executorMetaValue(tool.executor, tool.workspace);
+  if (runtime) {
     items.push({
-      label: "Executor",
-      value: executorDisplayName(tool.executor),
-      tone: tool.executor.status === "offline" ? "danger" : "default",
+      label: "Runtime",
+      value: runtime,
+      tone: tool.executor?.status === "offline" ? "danger" : "default",
     });
   }
-  const workspace = tool.workspace?.cwd ?? workspaceDisplayName(tool.workspace);
-  if (tool.workspace) {
-    items.push({ label: "Workspace", value: workspace });
+  const files = workspaceMetaValue(tool.workspace);
+  if (files) {
+    items.push({ label: "Files", value: files });
   }
   if (tool.transport) {
-    items.push({ label: "Transport", value: statusLabel(tool.transport) });
+    items.push({ label: "Connection", value: statusLabel(tool.transport) });
   }
   if (tool.fallbackPolicy) {
-    items.push({ label: "Fallback", value: statusLabel(tool.fallbackPolicy) });
+    items.push({ label: "Policy", value: statusLabel(tool.fallbackPolicy) });
   }
   if (tool.route) {
     items.push({ label: "Route", value: statusLabel(tool.route) });
@@ -1441,7 +1405,7 @@ function ToolExecutionMeta({ tool }: { tool: ToolSurfaceItem }) {
   if (tool.errorKind) {
     items.push({
       label: "Reason",
-      value: statusLabel(tool.errorKind),
+      value: toolReasonLabel(tool.errorKind),
       tone: tool.errorKind === "cancelled" ? "default" : "danger",
     });
   }
@@ -1516,10 +1480,10 @@ function ToolFailureNotice({ tool }: { tool: ToolSurfaceItem }) {
 
 function toolFailureMessage(tool: ToolSurfaceItem) {
   if (tool.errorKind === "executor_offline") {
-    return "Executor offline. Reconnect the edge executor or choose another workspace.";
+    return "Execution environment offline. Reconnect it or choose another environment.";
   }
   if (tool.errorKind === "transport_disconnected") {
-    return "Transport disconnected. Reconnect edge before retrying.";
+    return "Execution connection disconnected. Reconnect it before retrying.";
   }
   if (tool.errorKind === "approval_timeout") {
     return "Approval timed out. Review pending approvals and retry.";
@@ -1528,15 +1492,29 @@ function toolFailureMessage(tool: ToolSurfaceItem) {
     return "Tool timed out. Retry or narrow the command.";
   }
   if (tool.errorKind === "fallback_disabled") {
-    return "Fallback disabled. This run will not execute local-code tools on the server.";
+    return "This request needs a file or command environment. Connect one or choose a sandbox, then retry.";
   }
   if (tool.errorKind === "workspace_executor_unavailable") {
-    return "Workspace executor unavailable. Choose Server sandbox or a connected edge workspace.";
+    return "This request needs a file or command environment. Connect one or choose a sandbox, then retry.";
   }
   if (tool.blocked) {
-    return "Tool blocked. Resolve the executor or workspace issue before retrying.";
+    return "Tool blocked. Resolve the execution environment before retrying.";
   }
   return undefined;
+}
+
+function toolReasonLabel(reason: string) {
+  switch (reason) {
+    case "workspace_executor_unavailable":
+    case "fallback_disabled":
+    case "workspace_path_mismatch":
+      return "Needs file environment";
+    case "executor_offline":
+    case "transport_disconnected":
+      return "Environment unavailable";
+    default:
+      return statusLabel(reason);
+  }
 }
 
 function StructuredPayload({
@@ -1653,7 +1631,7 @@ function EmptySurface({ loading, label }: { loading: boolean; label: string }) {
       ) : (
         <Pause className="size-5" />
       )}
-      <p>{loading ? "Loading work surface" : label}</p>
+      <p>{loading ? "Loading activity" : label}</p>
     </div>
   );
 }
@@ -1808,21 +1786,61 @@ function statusLabel(status: string) {
 }
 
 function runStatusHeadline(status: string) {
-  const label = statusLabel(status).trim();
-  return label ? label.charAt(0).toUpperCase() + label.slice(1) : "Active";
+  const normalized = status.trim().toLowerCase();
+  switch (normalized) {
+    case "running":
+      return "Thinking";
+    case "input-queued":
+      return "Message queued";
+    case "waiting":
+      return "Waiting";
+    case "blocked":
+      return "Needs attention";
+    case "paused":
+      return "Paused";
+    case "cancelling":
+      return "Stopping";
+    default: {
+      const label = statusLabel(status).trim();
+      return label ? label.charAt(0).toUpperCase() + label.slice(1) : "Active";
+    }
+  }
+}
+
+function workspaceMetaValue(workspace: WorkspaceBindingLike) {
+  if (!workspace || workspace.kind === "none") {
+    return undefined;
+  }
+  return workspace.cwd ?? workspace.display_name ?? workspaceDisplayName(workspace);
+}
+
+function executorMetaValue(
+  executor: ExecutorBindingLike,
+  workspace?: WorkspaceBindingLike,
+) {
+  if (!executor || executor.executor_id === "server-control-plane") {
+    return undefined;
+  }
+  if (executor.display_name === "Astra") {
+    return undefined;
+  }
+  if (executor.kind === "server_local" && (!workspace || workspace.kind === "none")) {
+    return undefined;
+  }
+  return executorDisplayName(executor);
 }
 
 function workspaceDisplayName(workspace: WorkspaceBindingLike) {
   return (
     workspace?.display_name ??
-    (workspace?.kind ? statusLabel(workspace.kind) : "Workspace pending")
+    (workspace?.kind ? statusLabel(workspace.kind) : "Files pending")
   );
 }
 
 function executorDisplayName(executor: ExecutorBindingLike) {
   return (
     executor?.display_name ??
-    (executor?.kind ? statusLabel(executor.kind) : "Executor pending")
+    (executor?.kind ? statusLabel(executor.kind) : "Runtime pending")
   );
 }
 

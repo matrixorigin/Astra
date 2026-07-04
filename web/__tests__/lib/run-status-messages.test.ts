@@ -7,15 +7,15 @@ import {
 describe("run status messages", () => {
   it("maps execution-boundary waiting reasons to readable assistant feedback", () => {
     expect(runWaitingStatusMessage("executor_offline", true)).toBe(
-      "Run paused because the selected executor is offline. Reconnect it or choose another workspace.",
+      "Run paused because the execution environment is offline. Reconnect it or choose another environment.",
     );
     expect(runWaitingStatusMessage("fallback_disabled", true)).toBe(
-      "Run paused because server fallback is disabled for this workspace.",
+      "Run paused because this request needs a file or command environment. Connect one or choose a sandbox, then retry.",
     );
     expect(
       runWaitingStatusMessage("workspace_executor_unavailable", true),
     ).toBe(
-      "Run paused because the selected workspace is not connected to an available executor. Choose Server sandbox or a connected edge workspace.",
+      "Run paused because this request needs a file or command environment. Connect one or choose a sandbox, then retry.",
     );
   });
 
@@ -48,13 +48,13 @@ describe("run status messages", () => {
 
   it("maps blocked reasons to actionable work-surface messages", () => {
     expect(blockedRunMessage("transport_disconnected")).toBe(
-      "Tool transport disconnected. Reconnect the selected executor or retry after transport recovers.",
+      "Execution connection disconnected. Reconnect it or retry after it recovers.",
     );
     expect(blockedRunMessage("workspace_path_mismatch")).toBe(
-      "The selected workspace does not own the referenced local path. Choose a matching edge workspace or use paths inside the bound workspace.",
+      "The referenced path is outside the selected file environment. Choose the environment that contains it or use a path inside the current one.",
     );
     expect(blockedRunMessage("workspace_executor_unavailable")).toBe(
-      "The selected workspace is not connected to an available executor transport. Choose Server sandbox or a connected edge workspace.",
+      "This request needs a file or command environment. Connect one or choose a sandbox, then retry.",
     );
   });
 });

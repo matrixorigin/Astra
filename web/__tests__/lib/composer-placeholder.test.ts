@@ -6,18 +6,18 @@ describe('compactComposerPlaceholder', () => {
   });
 
   it('uses short visual copy for deferred input on narrow screens', () => {
-    expect(compactComposerPlaceholder('Queue a follow-up for the next execution boundary...')).toBe('Queue follow-up...');
+    expect(compactComposerPlaceholder('Message Astra while it works...')).toBe('Message Astra...');
   });
 
   it('uses short visual copy for paused and stopping runs', () => {
-    expect(compactComposerPlaceholder('Run paused. Resume or stop it to continue.')).toBe('Run paused...');
-    expect(compactComposerPlaceholder('Stopping current run...')).toBe('Stopping...');
+    expect(compactComposerPlaceholder('Paused. Resume or stop to continue.')).toBe('Paused...');
+    expect(compactComposerPlaceholder('Stopping...')).toBe('Stopping...');
   });
 
   it('uses short visual copy for unknown non-terminal statuses', () => {
     expect(
-      compactComposerPlaceholder('Run status is initializing-provider. Stop it or refresh before sending.'),
-    ).toBe('Run status blocked...');
+      compactComposerPlaceholder('Astra is busy. Stop it or wait to continue.'),
+    ).toBe('Astra is busy...');
   });
 
   it('caps arbitrary long placeholder copy', () => {

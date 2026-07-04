@@ -118,14 +118,11 @@ function WorkspaceSelector({
 
   return (
     <div className="mb-2 flex flex-wrap items-center gap-2 rounded-[14px] border border-border/70 bg-surface/95 px-3 py-2 text-xs text-text-muted shadow-[0_0.15rem_0.8rem_rgba(28,25,23,0.05)]">
-      <span className="font-medium text-text">Workspace</span>
+      <span className="font-medium text-text">Run in</span>
       {!explicit || !selection ? (
         <span className="inline-flex min-w-0 items-center gap-1.5 rounded-full bg-bg px-2.5 py-1.5 font-medium text-text-secondary">
           <MessageSquare className="size-3.5 shrink-0 text-text-muted" />
-          <span className="truncate">Chat only</span>
-          <span className="hidden border-l border-border pl-1.5 font-normal text-text-muted sm:inline">
-            No code workspace
-          </span>
+          <span className="truncate">Astra</span>
         </span>
       ) : null}
       <button
@@ -140,7 +137,7 @@ function WorkspaceSelector({
         ].join(" ")}
       >
         <HardDrive className="size-3.5 shrink-0" />
-        <span className="truncate">Server sandbox</span>
+        <span className="truncate">Sandbox</span>
       </button>
       {edgeOptions.map((edge) => {
         const selected =
@@ -194,25 +191,22 @@ function WorkspaceSelector({
           void onRefresh();
         }}
         className="inline-flex size-7 items-center justify-center rounded-full bg-bg text-text-muted transition hover:bg-surface-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent/30 disabled:cursor-wait disabled:opacity-60"
-        aria-label="Refresh edge workspaces"
-        title="Refresh edge workspaces"
+        aria-label="Refresh environments"
+        title="Refresh environments"
       >
         <RefreshCw
           className={["size-3.5", loading ? "animate-spin" : ""].join(" ")}
         />
       </button>
-      {edgeOptions.length === 0 && !loading ? (
-        <span className="text-text-muted">No edge workspaces online</span>
-      ) : null}
       {selectedEdgeMissing ? (
         <div
           className="flex min-w-0 max-w-full flex-wrap items-center gap-2 rounded-[10px] border border-warning/30 bg-warning/10 px-2.5 py-1.5 text-warning"
           role="status"
-          aria-label={`Selected edge workspace is offline: ${selectedOfflineLabel}`}
+          aria-label={`Selected environment is unavailable: ${selectedOfflineLabel}`}
         >
           <AlertTriangle className="size-3.5 shrink-0" />
           <span className="min-w-0 max-w-[min(28rem,100%)] truncate">
-            Edge offline · {selectedOfflineLabel}
+            Environment unavailable · {selectedOfflineLabel}
           </span>
           <button
             type="button"
@@ -220,7 +214,7 @@ function WorkspaceSelector({
             onClick={() => onSelect({ kind: "server_sandbox" })}
             className="rounded-full bg-bg px-2 py-0.5 font-medium text-text transition hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Use server sandbox
+            Use sandbox
           </button>
         </div>
       ) : null}
@@ -314,7 +308,7 @@ function RunActivityMetric({
       type="button"
       className="inline-flex min-w-0 items-center gap-1.5 rounded-full bg-bg px-2.5 py-1 font-medium text-text-secondary transition hover:bg-surface-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent/30"
       onClick={onClick}
-      aria-label={`Open ${label.toLowerCase()} work surface, ${value.value} ${pluralUnit}`}
+      aria-label={`Open ${label.toLowerCase()} activity, ${value.value} ${pluralUnit}`}
       title={title}
     >
       <Icon className="size-3.5 text-text-muted" />
@@ -446,7 +440,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     stoppingRun || activeRunStatus === "cancelling"
       ? "Stopping"
       : startingRun
-        ? "Starting run"
+        ? "Thinking"
         : activeRunLabel;
   const workspaceSelectorDisabled = Boolean(
     startingRun ||
@@ -768,10 +762,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                   <div className="mt-3 flex items-center justify-between gap-3 rounded-[16px] border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
                     <p>
                       {activeRunStatus === "paused"
-                        ? "This run is paused. Resume to continue or Stop to cancel it."
+                        ? "Astra is paused. Resume to continue or stop this run."
                         : activeRunBlocksNewInput
-                          ? `Run status is ${activeRunStatus}. Stop it or refresh before sending new input.`
-                          : "Stopping current run"}
+                          ? "Astra is busy. Stop it or wait before sending a new message."
+                          : "Stopping..."}
                     </p>
                     <div className="flex shrink-0 items-center gap-2">
                       {canResumeRun ? (

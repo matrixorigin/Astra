@@ -144,7 +144,7 @@ export async function GET(
         error:
           error instanceof Error
             ? error.message
-            : "Failed to load work surface.",
+            : "Failed to load activity.",
       },
       { status: 502 },
     );

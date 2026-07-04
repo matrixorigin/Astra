@@ -130,10 +130,10 @@ export function useWorkspaceSelection(params: UseWorkspaceSelectionParams) {
           storeWorkspaceSelectionState(detail.chat.id, previous);
           previousWorkspaceRef.current = previous;
           addToast(
-            `Workspace was not updated. ${
+            `Environment was not updated. ${
               error instanceof Error
                 ? error.message
-                : "Failed to persist workspace selection."
+                : "Failed to save the selected environment."
             }`,
             "warning",
           );
@@ -152,7 +152,7 @@ export function useWorkspaceSelection(params: UseWorkspaceSelectionParams) {
       setEdgeWorkspacesError(
         error instanceof Error
           ? error.message
-          : "Failed to load edge workspaces.",
+          : "Failed to load environments.",
       );
     } finally {
       setEdgeWorkspacesLoading(false);

@@ -413,7 +413,7 @@ export function useStreamLifecycle(
             current,
             error instanceof Error
               ? error.message
-              : "Failed to load work surface.",
+              : "Failed to load activity.",
           ),
         );
       }

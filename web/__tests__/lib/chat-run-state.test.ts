@@ -35,7 +35,7 @@ describe('deriveChatRunUiState', () => {
 
       expect(ui.canQueueDeferredInput).toBe(true);
       expect(ui.composerDisabled).toBe(false);
-      expect(ui.composerPlaceholder).toBe('Queue a follow-up for the next execution boundary...');
+      expect(ui.composerPlaceholder).toBe('Message Astra while it works...');
     }
   });
 
@@ -57,7 +57,7 @@ describe('deriveChatRunUiState', () => {
     expect(ui.activeRunBlocksNewInput).toBe(true);
     expect(ui.composerDisabled).toBe(true);
     expect(ui.composerPlaceholder).toBe(
-      'Run status is initializing-provider. Stop it or refresh before sending.',
+      'Astra is busy. Stop it or wait to continue.',
     );
     expect(ui.activeRunLabel).toBe('Initializing Provider');
   });
@@ -68,7 +68,7 @@ describe('deriveChatRunUiState', () => {
       activeRun: waitingRun('blocked', 'executor_offline'),
     });
 
-    expect(ui.activeRunLabel).toBe('Blocked: Executor Offline');
+    expect(ui.activeRunLabel).toBe('Environment Offline');
   });
 
   it('labels ordinary waits separately from blocked executor states', () => {
@@ -77,7 +77,7 @@ describe('deriveChatRunUiState', () => {
       activeRun: waitingRun('waiting', 'tool_approval'),
     });
 
-    expect(ui.activeRunLabel).toBe('Waiting: Tool Approval');
+    expect(ui.activeRunLabel).toBe('Waiting for Approval');
   });
 
   it('disables composer consistently while any run-control mutation is in flight', () => {
@@ -105,7 +105,7 @@ describe('deriveChatRunUiState', () => {
     expect(ui.canResumeRun).toBe(true);
     expect(ui.canStopRun).toBe(true);
     expect(ui.composerDisabled).toBe(true);
-    expect(ui.composerPlaceholder).toBe('Run paused. Resume or stop it to continue.');
+    expect(ui.composerPlaceholder).toBe('Paused. Resume or stop to continue.');
   });
 
   it('labels archived idle chats without disabling the composer decision itself', () => {

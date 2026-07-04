@@ -9,7 +9,7 @@ export type WorkspaceAuthorityError = {
 export function defaultWorkspaceBinding(): WorkspaceBinding {
   return {
     kind: "none",
-    display_name: "No workspace",
+    display_name: "Astra",
     authority: "none",
     fallback_policy: "disabled",
   };
@@ -19,7 +19,7 @@ export function defaultExecutorBinding(): ExecutorBinding {
   return {
     kind: "server_local",
     executor_id: "server-control-plane",
-    display_name: "Server control plane",
+    display_name: "Astra",
     transport: "server_local",
     status: "online",
   };
@@ -334,7 +334,7 @@ export function validateWorkspaceAuthority(
   if (foreignPath) {
     return {
       code: "workspace_path_mismatch",
-      message: `The selected edge workspace is ${selection.cwd}, but the prompt references ${foreignPath}. Select an edge workspace that owns that path, then retry.`,
+      message: `The referenced path is outside the selected file environment: ${foreignPath}. Choose the environment that contains it or use a path inside the current one.`,
     };
   }
   return null;

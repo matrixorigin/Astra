@@ -255,7 +255,7 @@ describe("applyStreamEvent", () => {
       "assistant-1",
       expect.objectContaining({
         content:
-          "Run paused because the selected executor is offline. Reconnect it or choose another workspace.",
+          "Run paused because the execution environment is offline. Reconnect it or choose another environment.",
         status: "streaming",
       }),
     );
@@ -291,7 +291,7 @@ describe("applyStreamEvent", () => {
       "assistant-1",
       expect.objectContaining({
         content:
-          "Run paused because the selected workspace is not connected to an available executor. Choose Server sandbox or a connected edge workspace.",
+          "Run paused because this request needs a file or command environment. Connect one or choose a sandbox, then retry.",
         status: "streaming",
       }),
     );
@@ -362,7 +362,7 @@ describe("applyStreamEvent", () => {
       "assistant-1",
       expect.objectContaining({
         content:
-          "Run paused because server fallback is disabled for this workspace.",
+          "Run paused because this request needs a file or command environment. Connect one or choose a sandbox, then retry.",
         status: "streaming",
       }),
     );

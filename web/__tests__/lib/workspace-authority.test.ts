@@ -30,10 +30,10 @@ type EdgeSelection = Extract<WorkspaceSelection, { kind: "edge_workspace" }>;
 // ─── binding factories ──────────────────────────────────────────────
 
 describe("defaultWorkspaceBinding", () => {
-  it("returns no-workspace binding", () => {
+  it("returns default Astra binding without exposing an absent workspace", () => {
     expect(defaultWorkspaceBinding()).toEqual({
       kind: "none",
-      display_name: "No workspace",
+      display_name: "Astra",
       authority: "none",
       fallback_policy: "disabled",
     });
@@ -41,11 +41,11 @@ describe("defaultWorkspaceBinding", () => {
 });
 
 describe("defaultExecutorBinding", () => {
-  it("returns server control-plane executor binding", () => {
+  it("returns default Astra control-plane executor binding", () => {
     expect(defaultExecutorBinding()).toEqual({
       kind: "server_local",
       executor_id: "server-control-plane",
-      display_name: "Server control plane",
+      display_name: "Astra",
       transport: "server_local",
       status: "online",
     });

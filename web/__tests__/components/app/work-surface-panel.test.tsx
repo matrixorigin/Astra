@@ -40,7 +40,7 @@ describe("WorkSurfacePanel", () => {
       />,
     );
 
-    expect(screen.getByText("Running")).toBeInTheDocument();
+    expect(screen.getByText("Thinking")).toBeInTheDocument();
     expect(screen.queryByText("Run running")).not.toBeInTheDocument();
   });
 
@@ -268,13 +268,15 @@ describe("WorkSurfacePanel", () => {
     ).toBeTruthy();
     expect(screen.getByText("Live output")).toBeInTheDocument();
     expect(screen.getAllByText("latest card live output").length).toBeGreaterThan(0);
-    expect(screen.getByText("Executor")).toBeInTheDocument();
+    expect(screen.getByText("Runtime")).toBeInTheDocument();
     expect(screen.getAllByText("MacBook Pro").length).toBeGreaterThan(0);
-    expect(screen.getByText("Workspace")).toBeInTheDocument();
-    expect(screen.getByText("/Users/xupeng/github/astra")).toBeInTheDocument();
-    expect(screen.getByText("Transport")).toBeInTheDocument();
+    expect(screen.getByText("Files")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("/Users/xupeng/github/astra").length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText("Connection")).toBeInTheDocument();
     expect(screen.getByText("edge ws")).toBeInTheDocument();
-    expect(screen.getByText("Fallback")).toBeInTheDocument();
+    expect(screen.getByText("Policy")).toBeInTheDocument();
     expect(screen.getByText("disabled")).toBeInTheDocument();
     await waitFor(() => {
       expect(loadAgentRun).toHaveBeenCalledWith("run-new");
@@ -358,10 +360,10 @@ describe("WorkSurfacePanel", () => {
       />,
     );
 
-    expect(screen.getByText("workspace executor unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Needs file environment")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Workspace executor unavailable. Choose Server sandbox or a connected edge workspace.",
+        "This request needs a file or command environment. Connect one or choose a sandbox, then retry.",
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("Orchestrator-managed executor")).toBeInTheDocument();

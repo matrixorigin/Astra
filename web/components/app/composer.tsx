@@ -61,17 +61,17 @@ function uniqueSkillNames(skills: string[]) {
 
 export function compactComposerPlaceholder(placeholder: string) {
   const trimmed = placeholder.trim();
-  if (trimmed.startsWith('Queue a follow-up')) {
-    return 'Queue follow-up...';
+  if (trimmed.startsWith('Message Astra while')) {
+    return 'Message Astra...';
   }
-  if (trimmed.startsWith('Run paused')) {
-    return 'Run paused...';
+  if (trimmed.startsWith('Paused')) {
+    return 'Paused...';
   }
-  if (trimmed.startsWith('Stopping current run')) {
+  if (trimmed.startsWith('Stopping')) {
     return 'Stopping...';
   }
-  if (trimmed.startsWith('Run status is')) {
-    return 'Run status blocked...';
+  if (trimmed.startsWith('Astra is busy')) {
+    return 'Astra is busy...';
   }
   if (trimmed.length <= COMPACT_PLACEHOLDER_MAX_CHARS) {
     return trimmed;

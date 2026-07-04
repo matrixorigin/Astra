@@ -1277,11 +1277,14 @@ function blockedStateFromEvent(
   executor?: ExecutorBinding,
 ): RunBlockedState {
   const reason = blockedReasonFromEvent(event) ?? "blocked";
-  const message =
+  const rawMessage =
     stringField(event, "message") ??
     stringField(event, "error") ??
-    stringifyMaybe(event.result) ??
-    blockedRunMessage(reason);
+    stringifyMaybe(event.result);
+  const message =
+    ACTIONABLE_BLOCKING_ERROR_KINDS.has(reason)
+      ? blockedRunMessage(reason)
+      : (rawMessage ?? blockedRunMessage(reason));
   return {
     reason,
     message,
