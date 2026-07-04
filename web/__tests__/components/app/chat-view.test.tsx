@@ -22,7 +22,6 @@ import {
   streamChatMessage,
   streamExistingChatRun,
   updateChatModel,
-  updateChatWorkspaceSelection,
 } from "@/lib/api/chats";
 
 const pushMock = vi.fn();
@@ -167,7 +166,6 @@ vi.mock("@/lib/api/chats", () => ({
   streamChatMessage: vi.fn(),
   streamExistingChatRun: vi.fn(),
   updateChatModel: vi.fn(),
-  updateChatWorkspaceSelection: vi.fn(),
 }));
 
 const mockGetEdgeStatus = vi.mocked(getEdgeStatus);
@@ -180,7 +178,6 @@ const mockStopChatRun = vi.mocked(stopChatRun);
 const mockStreamChatMessage = vi.mocked(streamChatMessage);
 const mockStreamExistingChatRun = vi.mocked(streamExistingChatRun);
 const mockUpdateChatModel = vi.mocked(updateChatModel);
-const mockUpdateChatWorkspaceSelection = vi.mocked(updateChatWorkspaceSelection);
 
 const defaultActiveRun: NonNullable<ChatDetail["activeRun"]> = {
   runId: "run-123",
@@ -247,8 +244,6 @@ describe("ChatView deferred-input unhappy paths", () => {
     mockStreamExistingChatRun.mockReset();
     mockStreamExistingChatRun.mockResolvedValue("");
     mockUpdateChatModel.mockReset();
-    mockUpdateChatWorkspaceSelection.mockReset();
-    mockUpdateChatWorkspaceSelection.mockResolvedValue(makeDetail(null));
     window.localStorage.clear();
     window.alert = vi.fn();
     HTMLElement.prototype.scrollTo = vi.fn();
@@ -285,15 +280,13 @@ describe("ChatView deferred-input unhappy paths", () => {
     ).toBeInTheDocument();
   });
 
-  it("locks workspace selection while an active run can still queue input", () => {
+  it("keeps environment controls hidden while an active run can still queue input", () => {
     mockGetChatWorkSurface.mockImplementation(() => new Promise(() => {}));
     mockGetEdgeStatus.mockImplementation(() => new Promise(() => {}));
 
     render(<ChatView initial={makeDetail()} />);
 
-    expect(
-      screen.getByRole("button", { name: "Sandbox" }),
-    ).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Sandbox" })).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Submit composer" }),
     ).not.toBeDisabled();
@@ -531,24 +524,23 @@ describe("ChatView deferred-input unhappy paths", () => {
     });
   });
 
-  it("sends server sandbox only after explicit workspace selection", async () => {
+  it("does not expose environment controls in the main composer", async () => {
     const user = userEvent.setup();
-    mockStreamChatMessage.mockResolvedValue("server answer");
+    mockGetEdgeStatus.mockRejectedValue(new WebApiError(404, "Not Found"));
+    mockStreamChatMessage.mockResolvedValue("default answer");
 
     render(<ChatView initial={makeDetail(null)} />);
 
-    expect(screen.getByText("Run in")).toBeInTheDocument();
-    expect(screen.getByText("Astra")).toBeInTheDocument();
+    expect(screen.queryByText("Run in")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sandbox" })).not.toBeInTheDocument();
+    expect(screen.queryByText("404 Not Found")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Sandbox" }));
     await user.click(screen.getByRole("button", { name: "Submit composer" }));
 
     await waitFor(() => {
       expect(mockStreamChatMessage).toHaveBeenCalledWith(
         "chat-123",
-        expect.objectContaining({
-          workspace: { kind: "server_sandbox" },
-        }),
+        expect.not.objectContaining({ workspace: expect.anything() }),
         expect.any(Object),
       );
     });
@@ -592,87 +584,6 @@ describe("ChatView deferred-input unhappy paths", () => {
           workspace: edgeWorkspace,
         }),
         expect.any(Object),
-      );
-    });
-  });
-
-  it("persists workspace selector changes on the chat", async () => {
-    const user = userEvent.setup();
-    const edgeWorkspace = {
-      kind: "edge_workspace" as const,
-      edgeAgentId: "edge-1",
-      displayName: "MacBook Pro",
-      cwd: "/Users/test/astra",
-    };
-    mockGetEdgeStatus.mockResolvedValue({
-      edges: [
-        {
-          edge_agent_id: "edge-1",
-          hostname: "MacBook Pro",
-          workspace_dir: "/Users/test/astra",
-          connected_secs: 10,
-        },
-      ],
-    });
-    mockUpdateChatWorkspaceSelection.mockResolvedValue({
-      ...makeDetail(null),
-      workspaceSelection: edgeWorkspace,
-    });
-
-    render(<ChatView initial={makeDetail(null)} />);
-
-    await user.click(
-      await screen.findByTitle("MacBook Pro · /Users/test/astra"),
-    );
-
-    await waitFor(() => {
-      expect(mockUpdateChatWorkspaceSelection).toHaveBeenCalledWith(
-        "chat-123",
-        edgeWorkspace,
-      );
-    });
-    expect(
-      window.localStorage.getItem("astra.web.workspaceSelection.chat-123"),
-    ).toContain("edge_workspace");
-  });
-
-  it("shows selected edge workspace as offline and can switch back to server sandbox", async () => {
-    const user = userEvent.setup();
-    const edgeWorkspace = {
-      kind: "edge_workspace" as const,
-      edgeAgentId: "edge-1",
-      displayName: "MacBook Pro",
-      cwd: "/Users/test/astra",
-    };
-    mockGetEdgeStatus.mockResolvedValue({ edges: [] });
-    mockUpdateChatWorkspaceSelection.mockResolvedValue({
-      ...makeDetail(null),
-      workspaceSelection: { kind: "server_sandbox" },
-    });
-
-    render(
-      <ChatView
-        initial={{
-          ...makeDetail(null),
-          workspaceSelection: edgeWorkspace,
-        }}
-      />,
-    );
-
-    expect(
-      await screen.findByRole("status", {
-        name: "Selected environment is unavailable: MacBook Pro · /Users/test/astra",
-      }),
-    ).toBeInTheDocument();
-
-    await user.click(
-      screen.getByRole("button", { name: "Use sandbox" }),
-    );
-
-    await waitFor(() => {
-      expect(mockUpdateChatWorkspaceSelection).toHaveBeenCalledWith(
-        "chat-123",
-        { kind: "server_sandbox" },
       );
     });
   });
@@ -807,7 +718,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(mockQueueChatRunInput).not.toHaveBeenCalled();
   });
 
-  it("keeps run activity links useful after tools fail and agents finish", async () => {
+  it("keeps activity details available without main-chat metric links", async () => {
     const user = userEvent.setup();
     mockGetChatWorkSurface.mockResolvedValue({
       sessionId: "chat-123",
@@ -870,23 +781,17 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     render(<ChatView initial={makeDetail()} />);
 
-    await waitFor(() => {
-      expect(
-        screen.getByRole("button", {
-          name: "Open agents activity, 1 item",
-        }),
-      ).toBeInTheDocument();
-    });
     expect(
-      screen.getByRole("button", { name: "Open tasks activity, 1 active" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: /Open agents activity/i }),
+    ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Open tools activity, 1 item" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: /Open tasks activity/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Open tools activity/i }),
+    ).not.toBeInTheDocument();
 
-    await user.click(
-      screen.getByRole("button", { name: "Open tools activity, 1 item" }),
-    );
+    await user.click(screen.getByRole("button", { name: "Tools" }));
     expect(await screen.findAllByText("Needs attention")).not.toHaveLength(0);
     expect(
       await screen.findAllByText("Environment unavailable"),
@@ -907,11 +812,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       ).length,
     ).toBeGreaterThan(0);
 
-    await user.click(
-      screen.getByRole("button", {
-        name: "Open agents activity, 1 item",
-      }),
-    );
+    await user.click(screen.getByRole("button", { name: /Agents/ }));
     expect(await screen.findAllByText("No blockers")).not.toHaveLength(0);
     expect(await screen.findAllByText("Live activity")).not.toHaveLength(0);
     await waitFor(() => {
@@ -957,7 +858,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       />,
     );
 
-    expect(screen.getAllByText("Message Queued").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Message queued").length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "Submit composer" }));
 
@@ -1267,7 +1168,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       />,
     );
 
-    expect(screen.getByText("Initializing Provider")).toBeInTheDocument();
+    expect(screen.getByText("Initializing provider")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Submit composer" }),
     ).toBeDisabled();
@@ -1278,7 +1179,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(mockStreamChatMessage).not.toHaveBeenCalled();
   });
 
-  it("shows blocked active runs in the main composer surface and reattaches", async () => {
+  it("keeps blocked active runs visible in activity and reattaches", async () => {
     render(
       <ChatView
         initial={makeDetail({
@@ -1289,7 +1190,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       />,
     );
 
-    expect(screen.getByText("Environment Offline")).toBeInTheDocument();
+    expect(screen.getByText("Needs attention")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Submit composer" }),
     ).toBeEnabled();

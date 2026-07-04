@@ -266,7 +266,7 @@ describe("WorkSurfacePanel", () => {
     expect(
       latest.compareDocumentPosition(older) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(screen.getByText("Live output")).toBeInTheDocument();
+    expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
     expect(screen.getAllByText("latest card live output").length).toBeGreaterThan(0);
     expect(screen.getByText("Runtime")).toBeInTheDocument();
     expect(screen.getAllByText("MacBook Pro").length).toBeGreaterThan(0);
@@ -411,7 +411,7 @@ describe("WorkSurfacePanel", () => {
       />,
     );
 
-    expect(await screen.findByText("Live output")).toBeInTheDocument();
+    await screen.findAllByText("Output");
     expect(
       screen.getAllByText("child review result: no critical issues").length,
     ).toBeGreaterThan(0);

@@ -88,6 +88,8 @@
   --right-panel-width: 360px;
   --font-sans: "Newsreader", "FZ PingXian YaSong", "PingFang SC", serif;
   --font-serif: var(--font-sans);
+  --font-ui: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --font-mono: "Inconsolata", "SF Mono", "Menlo", ui-monospace, monospace;
   --body-font: var(--font-sans);
   --body-size: 17px;
@@ -427,7 +429,7 @@ a {
 .astra-chat-view {
   --body-size: 15px;
   --body-line: 1.78;
-  --chat-reasoning-size: 14px;
+  --chat-reasoning-size: 13px;
   --chat-user-message-size: 15px;
 }
 
@@ -755,23 +757,22 @@ textarea {
 .astra-reasoning-markdown {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 0.85rem;
+  gap: 0.625rem;
   min-width: 0;
-  color: rgb(var(--color-text));
-  font-family: var(--font-sans);
-  font-size: 17px;
+  color: rgb(var(--color-text-secondary));
+  font-family: var(--font-ui);
+  font-size: 13px;
   font-weight: 400;
   font-feature-settings:
     "kern" 1,
     "liga" 1,
     "calt" 1;
-  font-variation-settings: "opsz" 9;
-  letter-spacing: 0.03em;
-  line-height: 1.78;
+  letter-spacing: 0;
+  line-height: 1.6;
   -webkit-text-stroke: 0;
   text-autospace: ideograph-alpha ideograph-numeric;
   text-spacing-trim: trim-start;
-  opacity: 0.92;
+  opacity: 1;
 }
 
 .astra-reasoning-markdown > * {
@@ -786,7 +787,6 @@ textarea {
 .astra-reasoning-markdown strong {
   color: rgb(var(--color-text));
   font-weight: 600;
-  font-variation-settings: "opsz" 9;
 }
 
 .astra-reasoning-markdown ul,

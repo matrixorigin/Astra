@@ -3,7 +3,6 @@
 import {
   CheckCircle2,
   ChevronDown,
-  Clock3,
   Copy,
   Download,
   Loader,
@@ -205,7 +204,12 @@ export const MessageBubble = memo(function MessageBubble({
         </div>
       ) : null}
       {showReasoning ? (
-        <ReasoningPanel reasoning={reasoning} streaming={reasoningStreaming} />
+        <ReasoningPanel
+          reasoning={reasoning}
+          streaming={reasoningStreaming}
+          startedAt={message.createdAt}
+          completedAt={message.completedAt}
+        />
       ) : null}
       {isStreamingEmpty ? (
         <AssistantTypingIndicator />
@@ -477,21 +481,29 @@ function formatBytes(value?: number | null) {
 function ReasoningPanel({
   reasoning,
   streaming,
+  startedAt,
+  completedAt,
 }: {
   reasoning: string;
   streaming: boolean;
+  startedAt: string;
+  completedAt?: string | null;
 }) {
   const [open, setOpen] = useState(streaming);
   const userToggledRef = useRef(false);
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  const summary = streaming
-    ? "Thinking"
-    : reasoning.trim()
-      ? firstLine(reasoning)
-      : "Done";
+  const elapsed = useReasoningElapsed(startedAt, completedAt, streaming);
   const body =
     reasoning.trim() || (streaming ? "Preparing response..." : "Done");
   const blocks = splitReasoningBlocks(body);
+  const summary = streaming
+    ? elapsed
+      ? `Thinking ${elapsed}`
+      : "Thinking"
+    : elapsed
+      ? `Thought ${elapsed}`
+      : "Thought";
+  const preview = firstLine(body);
 
   useEffect(() => {
     if (userToggledRef.current) {
@@ -507,7 +519,7 @@ function ReasoningPanel({
   }, [open, reasoning, streaming]);
 
   return (
-    <div className="mb-5 font-sans">
+    <div className="mb-4 font-[var(--font-ui)]">
       <button
         type="button"
         onClick={() => {
@@ -515,23 +527,20 @@ function ReasoningPanel({
           setOpen((value) => !value);
         }}
         aria-expanded={open}
-        className="inline-flex max-w-full items-center gap-2 py-1 text-left text-[15px] leading-6 font-bold text-text-secondary transition-colors hover:text-text"
+        className="group inline-flex max-w-full items-center gap-2 rounded-full border border-border/70 bg-surface/80 px-3 py-1.5 text-left text-[13px] font-medium leading-5 text-text-secondary shadow-[0_1px_2px_rgba(28,25,23,0.04)] transition-colors hover:border-border hover:bg-surface hover:text-text"
       >
         {streaming ? (
-          <Loader className="size-4 shrink-0 animate-spin text-warning" />
-        ) : null}
-        <span
-          className={cn(
-            "truncate",
-            streaming &&
-              "bg-gradient-to-r from-text-secondary via-accent to-text bg-clip-text text-transparent",
-          )}
-        >
-          {summary}
+          <Loader className="size-3.5 shrink-0 animate-spin text-accent" />
+        ) : (
+          <CheckCircle2 className="size-3.5 shrink-0 text-text-muted" />
+        )}
+        <span className="shrink-0">{summary}</span>
+        <span className="min-w-0 max-w-[min(34rem,70vw)] truncate font-normal text-text-muted">
+          {preview}
         </span>
         <ChevronDown
           className={cn(
-            "size-4 shrink-0 transition-transform duration-200",
+            "size-3.5 shrink-0 text-text-muted transition-transform duration-200 group-hover:text-text-secondary",
             open && "rotate-180",
           )}
         />
@@ -549,32 +558,24 @@ function ReasoningPanel({
           <div
             ref={bodyRef}
             className={cn(
-              "mt-3 pr-2",
+              "mt-2 rounded-[8px] border border-border/70 bg-surface/60 px-3.5 py-3 shadow-[0_1px_2px_rgba(28,25,23,0.03)]",
               open &&
                 (streaming
                   ? "max-h-56 overflow-y-auto"
-                  : "max-h-[360px] overflow-y-auto"),
+                  : "max-h-[320px] overflow-y-auto"),
             )}
           >
-            <div className="space-y-0">
+            <div className="space-y-2">
               {blocks.map((block, index) => (
                 <ReasoningStep
                   key={`${index}-${block.slice(0, 32)}`}
                   content={block}
-                  isLast={index === blocks.length - 1 && streaming}
                 />
               ))}
               {!streaming ? (
-                <div className="grid grid-cols-[24px_minmax(0,1fr)] gap-3">
-                  <div className="flex justify-center">
-                    <CheckCircle2
-                      className="mt-0.5 size-5 text-text-muted"
-                      strokeWidth={1.8}
-                    />
-                  </div>
-                  <div className="pb-1 text-[16px] leading-6 text-text-secondary">
-                    Done
-                  </div>
+                <div className="flex items-center gap-1.5 pt-1 text-xs text-text-muted">
+                  <CheckCircle2 className="size-3.5" strokeWidth={1.8} />
+                  <span>Done</span>
                 </div>
               ) : null}
             </div>
@@ -587,44 +588,59 @@ function ReasoningPanel({
 
 function ReasoningStep({
   content,
-  isLast,
 }: {
   content: string;
-  isLast: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const shouldClamp = content.length > 520 || content.split(/\r?\n/).length > 7;
 
   return (
-    <div className="grid grid-cols-[24px_minmax(0,1fr)] gap-3">
-      <div className="flex flex-col items-center">
-        <Clock3 className="mt-0.5 size-5 text-text-muted" strokeWidth={1.8} />
-        {!isLast ? <div className="mt-2 w-px flex-1 bg-border" /> : null}
-      </div>
-      <div className="min-w-0 pb-5">
-        <div
-          className={cn(
-            "relative min-w-0 overflow-hidden",
-            shouldClamp && !expanded && "max-h-[8.25rem]",
-          )}
-        >
-          <ReasoningMarkdown content={content} />
-          {shouldClamp && !expanded ? (
-            <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-b from-transparent to-bg" />
-          ) : null}
-        </div>
-        {shouldClamp ? (
-          <button
-            type="button"
-            onClick={() => setExpanded((value) => !value)}
-            className="mt-1 text-[14px] leading-5 text-text-muted transition-colors hover:text-text-secondary"
-          >
-            {expanded ? "Show less" : "Show more"}
-          </button>
+    <div className="min-w-0">
+      <div
+        className={cn(
+          "relative min-w-0 overflow-hidden",
+          shouldClamp && !expanded && "max-h-[8.25rem]",
+        )}
+      >
+        <ReasoningMarkdown content={content} />
+        {shouldClamp && !expanded ? (
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-b from-transparent to-bg" />
         ) : null}
       </div>
+      {shouldClamp ? (
+        <button
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+          className="mt-1 text-[14px] leading-5 text-text-muted transition-colors hover:text-text-secondary"
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      ) : null}
     </div>
   );
+}
+
+function useReasoningElapsed(
+  startedAt: string,
+  completedAt: string | null | undefined,
+  streaming: boolean,
+) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!streaming) {
+      return;
+    }
+    const interval = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [streaming]);
+
+  const startMs = parseTimestampMs(startedAt);
+  const endMs = streaming ? now : parseTimestampMs(completedAt);
+  if (startMs === null || endMs === null || endMs < startMs) {
+    return null;
+  }
+  return formatElapsedDuration(endMs - startMs);
 }
 
 function ReasoningMarkdown({ content }: { content: string }) {
@@ -691,6 +707,29 @@ function firstLine(text: string) {
     return "Done";
   }
   return line.length > 56 ? `${line.slice(0, 53)}...` : line;
+}
+
+function parseTimestampMs(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function formatElapsedDuration(durationMs: number) {
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) {
+    return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
 }
 
 function splitReasoningBlocks(text: string) {

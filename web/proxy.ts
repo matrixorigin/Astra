@@ -5,6 +5,7 @@ const PUBLIC_PAGE_PATHS = new Set(['/', '/login', '/register']);
 
 const PUBLIC_API_PATHS = new Set([
   '/api/runtime-config',
+  '/api/edges/status',
   '/api/runtime-auth/login',
   '/api/runtime-auth/logout',
   '/api/runtime-auth/refresh',

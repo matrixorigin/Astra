@@ -18,14 +18,14 @@ function activeRunForStatus(status: string | null): ChatDetail['activeRun'] {
 export default async function E2eChatViewPage({
   searchParams,
 }: {
-  searchParams: Promise<{ status?: string; long?: string }>;
+  searchParams: Promise<{ status?: string; long?: string; reasoning?: string }>;
 }) {
   if (process.env.ASTRA_ENABLE_E2E_PAGES !== '1') {
     notFound();
   }
 
-  const { status = 'running', long } = await searchParams;
-  const messages = long === '1'
+  const { status = 'running', long, reasoning } = await searchParams;
+  const baseMessages = long === '1'
     ? Array.from({ length: 30 }, (_, index) => ({
         id: `message-existing-${index}`,
         role: 'user' as const,
@@ -40,6 +40,30 @@ export default async function E2eChatViewPage({
         createdAt: '2026-06-07T00:00:00.000Z',
         status: 'complete' as const,
       }];
+  const messages = reasoning
+    ? [
+        ...baseMessages,
+        {
+          id: 'message-reasoning',
+          role: 'assistant' as const,
+          content:
+            reasoning === 'streaming'
+              ? ''
+              : 'The connection path is now simplified.',
+          reasoning:
+            'Checking the runtime boundary and pruning environment controls from the main chat surface.',
+          reasoningStatus:
+            reasoning === 'streaming' ? ('streaming' as const) : ('complete' as const),
+          createdAt: new Date(Date.now() - 20_000).toISOString(),
+          completedAt:
+            reasoning === 'streaming'
+              ? null
+              : new Date().toISOString(),
+          status:
+            reasoning === 'streaming' ? ('streaming' as const) : ('complete' as const),
+        },
+      ]
+    : baseMessages;
   const detail: ChatDetail = {
     chat: {
       id: 'chat-e2e',

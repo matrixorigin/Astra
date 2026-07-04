@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { MessageBubble } from "@/components/app/message-bubble";
 import type { ChatMessage } from "@/lib/api/types";
 
@@ -28,7 +28,7 @@ function assistantMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
     id: "assistant-1",
     role: "assistant",
     content: "",
-    createdAt: "2026-06-11T00:00:00.000Z",
+    createdAt: new Date().toISOString(),
     status: "streaming",
     reasoning: "",
     reasoningStatus: "streaming",
@@ -61,9 +61,31 @@ describe("MessageBubble", () => {
       />,
     );
 
-    expect(screen.getByText("Thinking")).toBeInTheDocument();
+    expect(screen.getByText(/^Thinking \d+s$/)).toBeInTheDocument();
     expect(
-      screen.getByText("Checking the execution boundary."),
-    ).toBeInTheDocument();
+      screen.getAllByText("Checking the execution boundary.").length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("uses stable collapsed copy for completed reasoning", () => {
+    render(
+      <MessageBubble
+        message={assistantMessage({
+          reasoning: "Checking the execution boundary.",
+          reasoningStatus: "complete",
+          status: "complete",
+          createdAt: "2026-06-11T00:00:00.000Z",
+          completedAt: "2026-06-11T00:00:12.000Z",
+        })}
+      />,
+    );
+
+    const toggle = screen.getByRole("button", {
+      name: /Thought 12s/,
+    });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
   });
 });

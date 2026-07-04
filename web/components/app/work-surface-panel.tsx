@@ -927,7 +927,14 @@ function AgentLiveEvents({
   events: NonNullable<AgentSurfaceItem["events"]>;
   active: boolean;
 }) {
-  const recent = [...events].slice(-8).reverse();
+  const recent = events
+    .filter(
+      (event) =>
+        event.type !== "agent_live_event:output_delta" &&
+        event.type !== "agent_live_event:thinking_delta",
+    )
+    .slice(-8)
+    .reverse();
   const transcript = agentLiveTranscript(events);
   return (
     <div className="rounded-[8px] border border-border/60 bg-surface/50 p-2.5">
@@ -939,14 +946,7 @@ function AgentLiveEvents({
         {active ? <MiniLiveDots className="shrink-0" /> : null}
       </div>
       {transcript ? (
-        <div className="mb-2 rounded-[7px] border border-border/60 bg-bg px-2.5 py-2">
-          <div className="mb-1 text-[10px] font-semibold uppercase text-text-muted">
-            {transcript.label}
-          </div>
-          <div className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-text">
-            {transcript.detail}
-          </div>
-        </div>
+        <AgentTranscriptCard transcript={transcript} active={active} />
       ) : null}
       {recent.length ? (
         <div className="space-y-2">
@@ -964,7 +964,67 @@ function AgentLiveEvents({
   );
 }
 
-function agentLiveTranscript(events: NonNullable<AgentSurfaceItem["events"]>) {
+function AgentTranscriptCard({
+  transcript,
+  active,
+}: {
+  transcript: AgentLiveTranscript;
+  active: boolean;
+}) {
+  const [open, setOpen] = useState(active);
+  return (
+    <div className="mb-2 overflow-hidden rounded-[8px] border border-border/60 bg-bg shadow-[0_1px_2px_rgba(28,25,23,0.03)]">
+      <button
+        type="button"
+        className="group flex w-full min-w-0 items-center gap-2 px-2.5 py-2 text-left transition hover:bg-surface-muted/50"
+        aria-expanded={open}
+        aria-label={`${transcript.label}: ${transcript.preview}`}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className="inline-flex shrink-0 items-center gap-1.5 text-[11px] font-semibold text-text-secondary">
+          {active && transcript.kind === "thinking" ? (
+            <span className="size-1.5 animate-pulse rounded-full bg-accent" />
+          ) : null}
+          {transcript.label}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-[11px] leading-4 text-text-muted">
+          {transcript.preview}
+        </span>
+        <ChevronRight
+          className={cn(
+            "size-3.5 shrink-0 text-text-muted transition-transform group-hover:text-text-secondary",
+            open && "rotate-90",
+          )}
+        />
+      </button>
+      <div
+        className={cn(
+          "grid transition-[grid-template-rows] duration-200 ease-out",
+          open ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
+        )}
+      >
+        <div className="min-h-0 overflow-hidden">
+          <div className="max-h-44 overflow-y-auto border-t border-border/50 bg-surface/35 px-3 py-2.5 text-xs leading-5 text-text-secondary">
+            <p className="whitespace-pre-wrap break-words font-normal">
+              {transcript.detail}
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type AgentLiveTranscript = {
+  kind: "thinking" | "output";
+  label: string;
+  preview: string;
+  detail: string;
+};
+
+function agentLiveTranscript(
+  events: NonNullable<AgentSurfaceItem["events"]>,
+): AgentLiveTranscript | null {
   const textEvents = events.filter(
     (event) =>
       event.detail &&
@@ -975,16 +1035,19 @@ function agentLiveTranscript(events: NonNullable<AgentSurfaceItem["events"]>) {
     return null;
   }
   const latest = textEvents[textEvents.length - 1];
-  const label =
-    latest.type === "agent_live_event:thinking_delta"
-      ? "Thinking preview"
-      : "Live output";
+  const kind: AgentLiveTranscript["kind"] =
+    latest.type === "agent_live_event:thinking_delta" ? "thinking" : "output";
   const detail = textEvents
     .map((event) => event.detail)
     .filter((detail): detail is string => Boolean(detail))
     .join("\n")
     .slice(-4000);
-  return { label, detail };
+  return {
+    kind,
+    label: kind === "thinking" ? "Thinking" : "Output",
+    preview: firstNonEmptyLine(detail),
+    detail,
+  };
 }
 
 function AgentRunProjection({
@@ -1864,6 +1927,14 @@ function formatEventTime(timestamp: number) {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+function firstNonEmptyLine(text: string) {
+  const line = text.trim().split(/\r?\n/).find(Boolean) ?? "";
+  if (!line) {
+    return "No details yet";
+  }
+  return line.length > 96 ? `${line.slice(0, 93)}...` : line;
 }
 
 function eventType(event: Record<string, unknown>) {

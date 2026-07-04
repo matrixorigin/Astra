@@ -201,6 +201,7 @@ function stoppedAssistantMessageController(
         ? `${currentMessage.content}${currentMessage.content.endsWith("\n") ? "" : "\n"}\nStopped.`
         : "Stopped.";
       currentMessage.status = "complete";
+      currentMessage.completedAt = nowIso();
       currentMessage.reasoningStatus = "complete";
       currentChat.lastMessageAt = nowIso();
       currentChat.lastMessagePreview = currentMessage.content;

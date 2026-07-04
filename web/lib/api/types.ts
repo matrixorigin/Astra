@@ -111,6 +111,7 @@ export type ChatMessage = {
   attachments?: AttachmentRef[];
   artifacts?: ChatArtifactRef[];
   createdAt: string;
+  completedAt?: string | null;
   status?: MessageStatus;
 };
 

@@ -7,7 +7,7 @@ export default defineConfig({
     timeout: 5_000,
   },
   use: {
-    baseURL: 'http://127.0.0.1:3101',
+    baseURL: 'http://127.0.0.1:3536',
     trace: 'on-first-retry',
   },
   projects: [
@@ -27,12 +27,12 @@ export default defineConfig({
   ],
   webServer: {
     command: 'npm run dev',
-    url: 'http://127.0.0.1:3101/e2e/chat-view',
+    url: 'http://127.0.0.1:3536/e2e/chat-view',
     reuseExistingServer: !process.env.CI,
     env: {
       ASTRA_ENABLE_E2E_PAGES: '1',
       ASTRA_WEB_HOST: '127.0.0.1',
-      ASTRA_WEB_PORT: '3101',
+      ASTRA_WEB_PORT: '3536',
     },
     timeout: 120_000,
   },

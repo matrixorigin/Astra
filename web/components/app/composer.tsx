@@ -479,6 +479,7 @@ export function Composer({
           ref={editorRef}
           data-composer-input="true"
           contentEditable={!disabled && !submitting}
+          suppressHydrationWarning
           suppressContentEditableWarning
           role="textbox"
           aria-label={placeholder}
