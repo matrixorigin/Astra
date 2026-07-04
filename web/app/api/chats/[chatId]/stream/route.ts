@@ -417,7 +417,7 @@ function proxyRunStream(params: {
                 chatId,
                 assistantMessageId,
                 {
-                  content: state.assistantText,
+                  content: state.assistantText || state.statusFeedbackText || "",
                   reasoning: state.reasoningText || undefined,
                   reasoningStatus: state.reasoningText
                     ? "streaming"

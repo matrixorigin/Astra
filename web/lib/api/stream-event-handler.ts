@@ -26,6 +26,7 @@ export interface StreamEventState {
   assistantText: string;
   assistantRawText: string;
   reasoningText: string;
+  statusFeedbackText?: string;
   reasoningFromThinkingTags?: boolean;
   lastStatus: "streaming" | "complete" | "failed";
   protocolError: boolean;
@@ -61,6 +62,16 @@ export function eventMessage(event: StreamEvent, fallback: string): string {
     }
   }
   return fallback;
+}
+
+function eventStatusFeedback(event: StreamEvent): string | undefined {
+  for (const key of ["message", "error", "user_message"] as const) {
+    const value = (event as Record<string, unknown>)[key];
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 export function isRunBlockedEvent(type: string): boolean {
@@ -174,6 +185,7 @@ export function applyStreamEvent(
 
     case "run_blocked": {
       state.runLifecycle = "blocked";
+      state.statusFeedbackText = eventStatusFeedback(event);
       // RunBlockedEvent carries no run_id field; keep whatever runId is already known
       const runId = state.runId;
       const waitingFor = blockedWaitingFor(event);
@@ -195,6 +207,9 @@ export function applyStreamEvent(
           : state.runId;
       const projection = projectRunWaitingState(event);
       state.runLifecycle = projection.status;
+      if (projection.status === "blocked") {
+        state.statusFeedbackText = eventStatusFeedback(event);
+      }
       if (runId) {
         state.runId = runId;
         setActiveRun({
