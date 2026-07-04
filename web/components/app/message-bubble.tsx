@@ -175,10 +175,10 @@ export const MessageBubble = memo(function MessageBubble({
   const content = orphanStreamingReasoning ? "" : rawContent;
   const reasoning = orphanStreamingReasoning ? rawContent : rawReasoning;
   const hasReasoning = Boolean(reasoning.trim());
+  const assistantStillStreaming = message.status === "streaming";
   const reasoningStreaming =
-    (message.reasoningStatus === "streaming" && hasReasoning) ||
-    splitContent.reasoningOpen ||
-    orphanStreamingReasoning;
+    assistantStillStreaming &&
+    (hasReasoning || splitContent.reasoningOpen || orphanStreamingReasoning);
   const showReasoning = !isUser && (hasReasoning || reasoningStreaming);
   const isStreamingEmpty =
     message.status === "streaming" && !content.trim() && !hasReasoning;

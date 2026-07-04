@@ -88,4 +88,19 @@ describe("MessageBubble", () => {
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
   });
+
+  it("keeps thinking copy while the assistant message is still streaming", () => {
+    render(
+      <MessageBubble
+        message={assistantMessage({
+          reasoning: "Finished one internal reasoning segment.",
+          reasoningStatus: "complete",
+          status: "streaming",
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/^Thinking \d+s$/)).toBeInTheDocument();
+    expect(screen.queryByText(/^Thought/)).not.toBeInTheDocument();
+  });
 });

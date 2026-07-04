@@ -212,6 +212,14 @@ test('empty streaming assistant shows main-chat typing feedback', async ({ page 
   await expect(page.getByText('Thinking', { exact: true }).first()).toBeVisible();
 });
 
+test('reasoning segment completion stays in thinking state while streaming', async ({ page }) => {
+  await mockChatApis(page);
+  await page.goto('/e2e/chat-view?status=idle&reasoning=segmentdone');
+
+  await expect(page.getByText(/Thinking \d+s/).first()).toBeVisible();
+  await expect(page.getByText(/^Thought/)).not.toBeVisible();
+});
+
 test('activity panel shows live work without main-chat metric chips', async ({ page }) => {
   await mockChatApis(page, {
     activeRunStatus: 'running',

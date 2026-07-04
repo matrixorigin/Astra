@@ -53,14 +53,18 @@ export default async function E2eChatViewPage({
           reasoning:
             'Checking the runtime boundary and pruning environment controls from the main chat surface.',
           reasoningStatus:
-            reasoning === 'streaming' ? ('streaming' as const) : ('complete' as const),
+            reasoning === 'streaming'
+              ? ('streaming' as const)
+              : ('complete' as const),
           createdAt: new Date(Date.now() - 20_000).toISOString(),
           completedAt:
-            reasoning === 'streaming'
+            reasoning === 'streaming' || reasoning === 'segmentdone'
               ? null
               : new Date().toISOString(),
           status:
-            reasoning === 'streaming' ? ('streaming' as const) : ('complete' as const),
+            reasoning === 'streaming' || reasoning === 'segmentdone'
+              ? ('streaming' as const)
+              : ('complete' as const),
         },
       ]
     : baseMessages;
