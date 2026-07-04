@@ -1831,38 +1831,44 @@ impl AgenticRunLifecycleService {
         };
         mgr.set_trace_id(run_id.to_string());
 
-        let mut restored_messages = Vec::new();
+        let restored_messages;
 
+        let mut csl_reusable = true;
         match mgr.load().await {
             Ok(Some(mat)) => {
                 restored_messages = mat.messages;
                 restore_session_state_compact(mat.session_state, loop_state);
             }
             Ok(None) => {
-                self.record_runtime_retrieval_degrade(
-                    user_id,
-                    session_id,
-                    run_id,
-                    RetrievalStage::Structured,
-                    "timeout",
-                )
-                .await;
-                self.record_runtime_retrieval_degrade(
-                    user_id,
-                    session_id,
-                    run_id,
-                    RetrievalStage::Fts,
-                    "empty",
-                )
-                .await;
-                self.record_runtime_retrieval_degrade(
-                    user_id,
-                    session_id,
-                    run_id,
-                    RetrievalStage::Vector,
-                    "stale",
-                )
-                .await;
+                restored_messages = self
+                    .restore_transcript_prompt_messages(user_id, session_id, run_id, "csl_empty")
+                    .await;
+                if restored_messages.is_empty() {
+                    self.record_runtime_retrieval_degrade(
+                        user_id,
+                        session_id,
+                        run_id,
+                        RetrievalStage::Structured,
+                        "timeout",
+                    )
+                    .await;
+                    self.record_runtime_retrieval_degrade(
+                        user_id,
+                        session_id,
+                        run_id,
+                        RetrievalStage::Fts,
+                        "empty",
+                    )
+                    .await;
+                    self.record_runtime_retrieval_degrade(
+                        user_id,
+                        session_id,
+                        run_id,
+                        RetrievalStage::Vector,
+                        "stale",
+                    )
+                    .await;
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -1878,18 +1884,135 @@ impl AgenticRunLifecycleService {
                     "timeout",
                 )
                 .await;
+                restored_messages = self
+                    .restore_transcript_prompt_messages(
+                        user_id,
+                        session_id,
+                        run_id,
+                        "csl_load_failed",
+                    )
+                    .await;
+                csl_reusable = matches!(
+                    e,
+                    astra_turn_core::conversation_log::CslStoreError::Serde(_)
+                        | astra_turn_core::conversation_log::CslStoreError::Materialize(_)
+                );
+                if csl_reusable && let Err(reset_error) = mgr.reset().await {
+                    tracing::warn!(
+                        session_id,
+                        run_id,
+                        error = %reset_error,
+                        "CSL reset failed after corrupted log; transcript fallback will not persist CSL this turn"
+                    );
+                    csl_reusable = false;
+                }
             }
         }
 
-        if !restored_messages.is_empty() {
-            if !loop_state.messages.is_empty() {
-                restored_messages.push(loop_state.messages.remove(0));
+        let turn_start_message_count =
+            Self::restore_csl_messages_into_loop_state(restored_messages, loop_state);
+        if !csl_reusable {
+            return None;
+        }
+        mgr.mark_turn_start(turn_start_message_count);
+        Some(mgr)
+    }
+
+    async fn restore_transcript_prompt_messages(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        reason: &'static str,
+    ) -> Vec<Value> {
+        let Some(pool) = self.shared_pool.as_ref() else {
+            return Vec::new();
+        };
+        let rows = match sqlx::query(
+            "SELECT role, content FROM session_transcript_items \
+             WHERE session_id = ? AND user_id = ? ORDER BY item_seq",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_all(pool.get())
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    run_id,
+                    reason,
+                    error = %error,
+                    "transcript prompt-history restore failed"
+                );
+                return Vec::new();
             }
+        };
+
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let role = match row.try_get::<String, _>("role") {
+                Ok(role) => role,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        run_id,
+                        reason,
+                        error = %error,
+                        "transcript prompt-history restore skipped row with invalid role"
+                    );
+                    continue;
+                }
+            };
+            if !matches!(role.as_str(), "user" | "assistant" | "system") {
+                continue;
+            }
+            let content = match row.try_get::<String, _>("content") {
+                Ok(content) => content,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        run_id,
+                        reason,
+                        error = %error,
+                        "transcript prompt-history restore skipped row with invalid content"
+                    );
+                    continue;
+                }
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            messages.push(json!({
+                "role": role,
+                "content": content,
+            }));
+        }
+
+        let messages = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(messages);
+        if !messages.is_empty() {
+            tracing::warn!(
+                session_id,
+                run_id,
+                reason,
+                message_count = messages.len(),
+                "restored prompt history from transcript because CSL was unavailable"
+            );
+        }
+        messages
+    }
+
+    fn restore_csl_messages_into_loop_state(
+        mut restored_messages: Vec<Value>,
+        loop_state: &mut AgenticLoopState,
+    ) -> usize {
+        let turn_start_message_count = restored_messages.len();
+        if !restored_messages.is_empty() {
+            restored_messages.append(&mut loop_state.messages);
             loop_state.messages = restored_messages;
         }
-
-        mgr.mark_turn_start(loop_state.messages.len());
-        Some(mgr)
+        turn_start_message_count
     }
 
     async fn record_runtime_retrieval_degrade(

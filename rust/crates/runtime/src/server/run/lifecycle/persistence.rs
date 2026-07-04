@@ -788,7 +788,7 @@ pub(crate) fn format_task_board_resume_hint(tasks: &[SessionTask]) -> Option<Str
     ))
 }
 
-fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
+pub(crate) fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
     let mut messages = state.messages.clone();
     let final_text = state.final_text.trim();
     if !final_text.is_empty() {
