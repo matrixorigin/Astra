@@ -74,7 +74,11 @@ mod tests {
             );
         }
 
-        for command in ["touch plan.txt", "git push origin main", "rm -rf /tmp/stale"] {
+        for command in [
+            "touch plan.txt",
+            "git push origin main",
+            "rm -rf /tmp/stale",
+        ] {
             assert!(
                 is_plan_mode_blocked_tool("bash", &json!({"command": command})),
                 "mutating bash command must be blocked in plan mode: {command}"
@@ -125,7 +129,10 @@ mod tests {
             ("exit_plan_mode", json!({"plan": "1. inspect"})),
             ("task", json!({"action": "list"})),
             ("task", json!({"action": "get", "task_id": "t1"})),
-            ("memory", json!({"action": "recall", "query": "plan context"})),
+            (
+                "memory",
+                json!({"action": "recall", "query": "plan context"}),
+            ),
         ] {
             assert!(
                 !is_plan_mode_blocked_tool(tool, &args),

@@ -7310,9 +7310,7 @@ esac
             "mutating bash must be blocked during authoring, got: {result}"
         );
 
-        let result = exec
-            .execute("bash", &json!({"command": "ls"}))
-            .await;
+        let result = exec.execute("bash", &json!({"command": "ls"})).await;
         assert!(
             !result.contains("blocked while plan mode is active"),
             "read-only bash must remain available during authoring, got: {result}"

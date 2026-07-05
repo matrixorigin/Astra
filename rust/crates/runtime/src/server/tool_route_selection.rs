@@ -173,7 +173,10 @@ pub(crate) fn edge_bound_route_is_offline_for_binding(
             routing_decision_for_binding(tool_name, workspace_kind, executor_transport, registry),
             ToolExecutionRouteKind::EdgeBound
         )
-        && matches!(executor_status, ExecutorStatus::Offline | ExecutorStatus::Unknown)
+        && matches!(
+            executor_status,
+            ExecutorStatus::Offline | ExecutorStatus::Unknown
+        )
 }
 
 pub(crate) fn should_deliver_edge_bound_tools_via_client_ledger_for_binding(
@@ -188,7 +191,10 @@ pub(crate) fn should_deliver_edge_bound_tools_via_client_ledger_for_binding(
         return false;
     }
     if runtime_tools_route_to_edge_provider(workspace_kind, executor_kind, executor_transport)
-        && matches!(executor_status, ExecutorStatus::Offline | ExecutorStatus::Unknown)
+        && matches!(
+            executor_status,
+            ExecutorStatus::Offline | ExecutorStatus::Unknown
+        )
     {
         return true;
     }
@@ -295,46 +301,56 @@ mod tests {
             &registry(),
         ));
 
-        assert!(!should_deliver_edge_bound_tools_via_client_ledger_for_binding(
-            WorkspaceBindingKind::EdgeWorkspace,
-            ExecutorBindingKind::EdgeAgent,
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Offline,
-            true,
-            false,
-        ));
-        assert!(should_deliver_edge_bound_tools_via_client_ledger_for_binding(
-            WorkspaceBindingKind::EdgeWorkspace,
-            ExecutorBindingKind::EdgeAgent,
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Offline,
-            true,
-            true,
-        ));
-        assert!(!should_deliver_edge_bound_tools_via_client_ledger_for_binding(
-            WorkspaceBindingKind::EdgeWorkspace,
-            ExecutorBindingKind::EdgeAgent,
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Online,
-            true,
-            true,
-        ));
-        assert!(should_deliver_edge_bound_tools_via_client_ledger_for_binding(
-            WorkspaceBindingKind::EdgeWorkspace,
-            ExecutorBindingKind::EdgeAgent,
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Online,
-            false,
-            true,
-        ));
-        assert!(should_deliver_edge_bound_tools_via_client_ledger_for_binding(
-            WorkspaceBindingKind::EdgeWorkspace,
-            ExecutorBindingKind::EdgeAgent,
-            ToolTransportKind::EdgeLedger,
-            ExecutorStatus::Online,
-            true,
-            true,
-        ));
+        assert!(
+            !should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+                WorkspaceBindingKind::EdgeWorkspace,
+                ExecutorBindingKind::EdgeAgent,
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Offline,
+                true,
+                false,
+            )
+        );
+        assert!(
+            should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+                WorkspaceBindingKind::EdgeWorkspace,
+                ExecutorBindingKind::EdgeAgent,
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Offline,
+                true,
+                true,
+            )
+        );
+        assert!(
+            !should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+                WorkspaceBindingKind::EdgeWorkspace,
+                ExecutorBindingKind::EdgeAgent,
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+                true,
+                true,
+            )
+        );
+        assert!(
+            should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+                WorkspaceBindingKind::EdgeWorkspace,
+                ExecutorBindingKind::EdgeAgent,
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+                false,
+                true,
+            )
+        );
+        assert!(
+            should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+                WorkspaceBindingKind::EdgeWorkspace,
+                ExecutorBindingKind::EdgeAgent,
+                ToolTransportKind::EdgeLedger,
+                ExecutorStatus::Online,
+                true,
+                true,
+            )
+        );
     }
 
     #[test]

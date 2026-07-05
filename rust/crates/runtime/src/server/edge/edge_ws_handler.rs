@@ -618,7 +618,10 @@ mod inflight_dispatch_tracker_tests {
         assert!(tracker.track(dispatch("req-1")).await.is_ok());
 
         assert_eq!(
-            tracker.remove("req-1").await.map(|dispatch| dispatch.request_id),
+            tracker
+                .remove("req-1")
+                .await
+                .map(|dispatch| dispatch.request_id),
             Some("req-1".to_string())
         );
         assert!(tracker.remove("req-1").await.is_none());
@@ -951,7 +954,12 @@ mod tests {
     async fn inflight_tracker_lifecycle_covers_send_fail_deliver_and_disconnect_drain() {
         let tracker = InflightEdgeDispatchTracker::default();
 
-        assert!(tracker.track(inflight_dispatch("send-failed")).await.is_ok());
+        assert!(
+            tracker
+                .track(inflight_dispatch("send-failed"))
+                .await
+                .is_ok()
+        );
         let removed = tracker.remove("send-failed").await;
         assert!(
             removed.is_some(),

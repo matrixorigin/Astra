@@ -1069,9 +1069,7 @@ async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
         "read_file must return the file contents. Got: {result}"
     );
 
-    let result = executor
-        .execute("bash", &json!({"command": "ls"}))
-        .await;
+    let result = executor.execute("bash", &json!({"command": "ls"})).await;
 
     assert!(
         !result.contains("blocked while plan mode is active"),

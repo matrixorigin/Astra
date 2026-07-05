@@ -6094,7 +6094,13 @@ mod tests {
             names.contains("bash"),
             "edge-declared runtime tools should remain visible"
         );
-        for server_owned in ["tool_search", "web_search", "memory", "introspect", "reflect"] {
+        for server_owned in [
+            "tool_search",
+            "web_search",
+            "memory",
+            "introspect",
+            "reflect",
+        ] {
             assert!(
                 !names.contains(server_owned),
                 "{server_owned} must not leak from the server catalog when server-owned tools are disabled"
