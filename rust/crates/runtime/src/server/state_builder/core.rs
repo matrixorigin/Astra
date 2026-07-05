@@ -212,7 +212,7 @@ pub(super) fn install_execution_services(
         state.edge_connection_pool.clone(),
         Arc::clone(&edge_dispatch_service),
         Arc::clone(&edge_registry_service),
-        &load_deployment_disabled_tools(),
+        &load_deployment_disabled_tool_offers(),
     );
     state
         .with_task_service(Arc::new(MatrixOneTaskService::from_shared(shared_pool)))
@@ -229,21 +229,21 @@ fn build_shared_tool_execution_service(
     edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     edge_dispatch_service: Arc<dyn EdgeDispatchService>,
     edge_registry_service: Arc<dyn EdgeRegistryService>,
-    disabled_tools: &[String],
+    disabled_tool_offers: &[String],
 ) -> ToolExecutionService {
     let mut builder = ToolExecutionService::builder()
         .edge_connection_pool(edge_connection_pool)
         .edge_dispatch_service(edge_dispatch_service)
         .edge_registry_service(edge_registry_service);
-    if !disabled_tools.is_empty() {
-        builder = builder.initial_disabled_tools(disabled_tools);
+    if !disabled_tool_offers.is_empty() {
+        builder = builder.initial_disabled_tool_offers(disabled_tool_offers);
     }
     builder.build()
 }
 
-fn load_deployment_disabled_tools() -> Vec<String> {
+fn load_deployment_disabled_tool_offers() -> Vec<String> {
     astra_core::ServerConfig::load()
-        .map(|config| config.deployment.disabled_tools)
+        .map(|config| config.deployment.disabled_tool_offers)
         .unwrap_or_default()
 }
 

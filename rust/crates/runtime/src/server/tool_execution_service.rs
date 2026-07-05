@@ -5,7 +5,7 @@ use serde_json::Map;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use super::tool_admission::{disabled_tool_policy_applies, resolve_tool_admission_for_binding};
+use super::tool_admission::resolve_tool_admission_for_binding;
 use super::tool_edge_transport::execute_edge_bound;
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy, ToolExecutionRequest,
@@ -36,7 +36,7 @@ pub struct ToolExecutionServiceBuilder {
     gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
     sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
-    disabled_tools: Arc<RwLock<HashSet<String>>>,
+    disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
 }
 
 impl ToolExecutionServiceBuilder {
@@ -86,12 +86,12 @@ impl ToolExecutionServiceBuilder {
         self
     }
 
-    pub fn initial_disabled_tools(mut self, tools: &[String]) -> Self {
+    pub fn initial_disabled_tool_offers(mut self, tools: &[String]) -> Self {
         let mut set = HashSet::new();
         for t in tools {
             set.insert(t.clone());
         }
-        self.disabled_tools = Arc::new(RwLock::new(set));
+        self.disabled_tool_offers = Arc::new(RwLock::new(set));
         self
     }
 
@@ -104,7 +104,7 @@ impl ToolExecutionServiceBuilder {
             gateway_relay_transport: self.gateway_relay_transport,
             sandbox_resident_agent_transport: self.sandbox_resident_agent_transport,
             tool_registry: self.tool_registry,
-            disabled_tools: self.disabled_tools,
+            disabled_tool_offers: self.disabled_tool_offers,
         }
     }
 }
@@ -117,8 +117,8 @@ pub struct ToolExecutionService {
     gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
     sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
-    /// Runtime-disabled tools (admin API). Checked before dispatch.
-    disabled_tools: Arc<RwLock<HashSet<String>>>,
+    /// Runtime-disabled tool offers (admin API/config). Checked before dispatch.
+    disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
 }
 
 impl ToolExecutionService {
@@ -146,28 +146,36 @@ impl Default for ToolExecutionService {
 }
 
 impl ToolExecutionService {
-    pub async fn disable_tool(&self, name: &str) -> bool {
-        self.disabled_tools.write().await.insert(name.to_string())
+    pub async fn disable_tool_offer(&self, name: &str) -> bool {
+        self.disabled_tool_offers
+            .write()
+            .await
+            .insert(name.to_string())
     }
 
-    /// Enable a previously disabled tool at runtime (returns true if it was disabled).
-    pub async fn enable_tool(&self, name: &str) -> bool {
-        self.disabled_tools.write().await.remove(name)
+    /// Enable a previously disabled tool offer at runtime (returns true if it was disabled).
+    pub async fn enable_tool_offer(&self, name: &str) -> bool {
+        self.disabled_tool_offers.write().await.remove(name)
     }
 
-    /// List currently disabled tools.
-    pub async fn disabled_tools(&self) -> Vec<String> {
-        self.disabled_tools.read().await.iter().cloned().collect()
+    /// List currently disabled tool offers.
+    pub async fn disabled_tool_offers(&self) -> Vec<String> {
+        self.disabled_tool_offers
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect()
     }
 
-    pub fn disabled_tools_handle(&self) -> Arc<RwLock<HashSet<String>>> {
-        Arc::clone(&self.disabled_tools)
+    pub fn disabled_tool_offers_handle(&self) -> Arc<RwLock<HashSet<String>>> {
+        Arc::clone(&self.disabled_tool_offers)
     }
 
     /// Check whether a tool is currently disabled.
     #[allow(dead_code)]
-    pub(crate) async fn is_tool_disabled(&self, name: &str) -> bool {
-        self.disabled_tools.read().await.contains(name)
+    pub(crate) async fn is_tool_offer_disabled(&self, name: &str) -> bool {
+        self.disabled_tool_offers.read().await.contains(name)
     }
 
     pub fn tool_registry(&self) -> &astra_runtime_env::ToolRegistry {
@@ -297,26 +305,36 @@ impl ToolExecutionService {
             }
         };
 
-        // ── Runtime disabled-tools check (admin API / config) ──
-        let disabled_applies_to_route =
-            disabled_tool_policy_applies(&transport_request.tool_name, route, &self.tool_registry);
-        if disabled_applies_to_route
-            && self
-                .disabled_tools
-                .read()
-                .await
-                .contains(&transport_request.tool_name)
-        {
+        // ── Runtime disabled-offer check (admin API / config) ──
+        let admission = resolve_tool_admission_for_binding(
+            &transport_request.tool_name,
+            &[],
+            &transport_request.workspace,
+            &transport_request.executor,
+            transport_request.runtime.as_ref(),
+            &self.tool_registry,
+        );
+        let disabled_offer_id = self.disabled_tool_offers.read().await;
+        if admission.disabled_by_offer_ids(&disabled_offer_id) {
+            let offer_id = admission
+                .selected_offer_id()
+                .unwrap_or("unknown")
+                .to_string();
+            drop(disabled_offer_id);
             let mut meta = serde_json::Map::new();
             meta.insert("tool_disabled".to_string(), serde_json::Value::Bool(true));
             meta.insert(
                 "tool_name".to_string(),
                 serde_json::Value::String(transport_request.tool_name.clone()),
             );
+            meta.insert(
+                "tool_offer_id".to_string(),
+                serde_json::Value::String(offer_id.clone()),
+            );
             return astra_tools::ToolResult {
                 output: format!(
-                    "Tool `{}` is currently disabled by the server administrator.",
-                    transport_request.tool_name
+                    "Tool offer `{}` is currently disabled by the server administrator.",
+                    offer_id
                 ),
                 metadata: Some(meta),
                 is_error: true,
@@ -515,71 +533,80 @@ fn no_workspace() -> WorkspaceBinding {
 mod tests {
     use super::*;
 
-    // ── Runtime disabled_tools unit tests ───────────────────────────────
+    // ── Runtime disabled_tool_offers unit tests ───────────────────────────────
 
     #[tokio::test]
-    async fn disable_tool_adds_to_set() {
+    async fn disable_tool_offer_adds_to_set() {
         let svc = ToolExecutionService::new_for_test();
-        assert!(svc.disable_tool("web_search").await);
+        assert!(svc.disable_tool_offer("web_search@server-builtin").await);
         // Disabling again should return false (already disabled).
-        assert!(!svc.disable_tool("web_search").await);
+        assert!(!svc.disable_tool_offer("web_search@server-builtin").await);
     }
 
     #[tokio::test]
-    async fn enable_tool_removes_from_set() {
+    async fn enable_tool_offer_removes_from_set() {
         let svc = ToolExecutionService::new_for_test();
-        svc.disable_tool("web_search").await;
-        assert!(svc.enable_tool("web_search").await);
+        svc.disable_tool_offer("web_search@server-builtin").await;
+        assert!(svc.enable_tool_offer("web_search@server-builtin").await);
         // Enabling again should return false (not disabled).
-        assert!(!svc.enable_tool("web_search").await);
+        assert!(!svc.enable_tool_offer("web_search@server-builtin").await);
     }
 
     #[tokio::test]
-    async fn disabled_tools_list_matches_state() {
+    async fn disabled_tool_offers_list_matches_state() {
         let svc = ToolExecutionService::new_for_test();
-        svc.disable_tool("web_fetch").await;
-        svc.disable_tool("web_search").await;
-        let list = svc.disabled_tools().await;
+        svc.disable_tool_offer("web_fetch@server-builtin").await;
+        svc.disable_tool_offer("web_search@server-builtin").await;
+        let list = svc.disabled_tool_offers().await;
         assert_eq!(list.len(), 2);
-        assert!(list.contains(&"web_fetch".to_string()));
-        assert!(list.contains(&"web_search".to_string()));
+        assert!(list.contains(&"web_fetch@server-builtin".to_string()));
+        assert!(list.contains(&"web_search@server-builtin".to_string()));
     }
 
     #[tokio::test]
-    async fn disabled_tools_empty_by_default() {
+    async fn disabled_tool_offers_empty_by_default() {
         let svc = ToolExecutionService::new_for_test();
-        assert!(svc.disabled_tools().await.is_empty());
+        assert!(svc.disabled_tool_offers().await.is_empty());
     }
 
     #[tokio::test]
-    async fn is_tool_disabled_reflects_state() {
+    async fn is_tool_offer_disabled_reflects_state() {
         let svc = ToolExecutionService::new_for_test();
-        assert!(!svc.is_tool_disabled("web_search").await);
-        svc.disable_tool("web_search").await;
-        assert!(svc.is_tool_disabled("web_search").await);
-        svc.enable_tool("web_search").await;
-        assert!(!svc.is_tool_disabled("web_search").await);
+        assert!(
+            !svc.is_tool_offer_disabled("web_search@server-builtin")
+                .await
+        );
+        svc.disable_tool_offer("web_search@server-builtin").await;
+        assert!(
+            svc.is_tool_offer_disabled("web_search@server-builtin")
+                .await
+        );
+        svc.enable_tool_offer("web_search@server-builtin").await;
+        assert!(
+            !svc.is_tool_offer_disabled("web_search@server-builtin")
+                .await
+        );
     }
 
     #[tokio::test]
     async fn enable_nonexistent_is_noop() {
         let svc = ToolExecutionService::new_for_test();
-        assert!(!svc.enable_tool("nonexistent").await);
+        assert!(!svc.enable_tool_offer("nonexistent").await);
     }
 
-    /// Verifies that `disable_tool` / `disabled_tools` work correctly
+    /// Verifies that `disable_tool_offer` / `disabled_tool_offers` work correctly
     /// in an async context without deadlocks.
     #[tokio::test]
-    async fn set_initial_disabled_tools_from_async_context() {
+    async fn set_initial_disabled_tool_offers_from_async_context() {
         let svc = ToolExecutionService::new_for_test();
-        assert!(svc.disabled_tools().await.is_empty());
+        assert!(svc.disabled_tool_offers().await.is_empty());
 
-        svc.disable_tool("web_fetch").await;
-        svc.disable_tool("web_search").await;
+        svc.disable_tool_offer("web_fetch@server-builtin").await;
+        svc.disable_tool_offer("web_search@server-builtin").await;
 
-        let list = svc.disabled_tools().await;
+        let list = svc.disabled_tool_offers().await;
         assert_eq!(list.len(), 2);
-        assert!(list.contains(&"web_fetch".to_string()));
-        assert!(list.contains(&"web_search".to_string()));
+        assert!(list.contains(&"web_fetch@server-builtin".to_string()));
+        assert!(list.contains(&"web_search@server-builtin".to_string()));
     }
 }

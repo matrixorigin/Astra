@@ -1184,9 +1184,9 @@ pub struct ServerAgenticLoopHost {
     /// `CaptureRequest.tool_schemas` for per-tool drift attribution.
     /// Updated by `execute_turn` each round.
     last_turn_tool_schemas: Vec<Value>,
-    /// Shared handle to the runtime-disabled tools (admin API). Used to
-    /// exclude admin-disabled tools from the LLM tool surface.
-    disabled_tools: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Shared handle to the runtime-disabled tool offers (admin API). Used to
+    /// exclude admin-disabled tool offers from the LLM tool surface.
+    disabled_tool_offers: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Optional LLM-based turn intent judge. When set, every turn first asks
     /// the judge to classify the user's message. Judge failure is non-fatal:
     /// the turn proceeds without explicit semantic intent.
@@ -1240,8 +1240,8 @@ pub struct ServerAgenticLoopHostBuilder {
     shared_dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Optional fork-prefix store for parent-turn capture (G2).
     prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
-    /// Shared handle to the runtime-disabled tools (admin API).
-    disabled_tools: Option<Arc<tokio::sync::RwLock<HashSet<String>>>>,
+    /// Shared handle to the runtime-disabled tool offers (admin API).
+    disabled_tool_offers: Option<Arc<tokio::sync::RwLock<HashSet<String>>>>,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -1286,7 +1286,7 @@ impl ServerAgenticLoopHostBuilder {
             #[cfg(feature = "bridge-e2e-hooks")]
             shared_dedup_state: None,
             prefix_store: None,
-            disabled_tools: None,
+            disabled_tool_offers: None,
         }
     }
 
@@ -1625,8 +1625,8 @@ impl ServerAgenticLoopHostBuilder {
             }),
             prefix_store: self.prefix_store,
             last_turn_tool_schemas: Vec::new(),
-            disabled_tools: self
-                .disabled_tools
+            disabled_tool_offers: self
+                .disabled_tool_offers
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashSet::new()))),
             turn_intent_judge: None,
         }
@@ -1640,13 +1640,13 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    /// Share the runtime-disabled-tools set with the host so the LLM tool
-    /// surface excludes admin-disabled tools.
-    pub fn with_disabled_tools(
+    /// Share the runtime-disabled tool-offer set with the host so the LLM tool
+    /// surface excludes admin-disabled tool offers.
+    pub fn with_disabled_tool_offers(
         mut self,
         handle: Arc<tokio::sync::RwLock<HashSet<String>>>,
     ) -> Self {
-        self.disabled_tools = Some(handle);
+        self.disabled_tool_offers = Some(handle);
         self
     }
 }
@@ -3402,7 +3402,7 @@ impl ServerAgenticLoopHost {
 
     fn runtime_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
         let disabled: HashSet<String> = self
-            .disabled_tools
+            .disabled_tool_offers
             .try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
@@ -3417,10 +3417,9 @@ impl ServerAgenticLoopHost {
             })
             .filter(|name| {
                 let admission = self.admission_for_current_binding(name, &registry);
-                let disabled_on_current_route =
-                    disabled.contains(name) && admission.admin_disabled_applies();
+                let disabled_on_current_offer = admission.disabled_by_offer_ids(&disabled);
                 !crate::turn::agentic::tool_interception::runtime_allows_tool(state, name)
-                    || disabled_on_current_route
+                    || disabled_on_current_offer
             })
             .collect()
     }
@@ -8659,7 +8658,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_turn_tools_excludes_disabled_tools() {
+    fn visible_turn_tools_excludes_disabled_tool_offers() {
         let edge_tools = vec![
             json!({
                 "type": "function",
@@ -8679,7 +8678,7 @@ mod tests {
             }),
         ];
 
-        let disabled: HashSet<String> = ["bash".to_string()].into_iter().collect();
+        let disabled: HashSet<String> = ["bash@edge-1".to_string()].into_iter().collect();
         let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
 
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -8691,7 +8690,7 @@ mod tests {
         .with_server_tool_catalog_enabled(false)
         .with_edge_tools(edge_tools)
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_disabled_tools(disabled_handle)
+        .with_disabled_tool_offers(disabled_handle)
         .build();
 
         let mut state = create_test_state();
@@ -8712,7 +8711,7 @@ mod tests {
 
     #[test]
     fn visible_turn_tools_excludes_disabled_edge_tools_with_default_server_catalog() {
-        let disabled: HashSet<String> = ["bash".to_string()].into_iter().collect();
+        let disabled: HashSet<String> = ["bash@edge-1".to_string()].into_iter().collect();
         let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
 
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -8723,7 +8722,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_disabled_tools(disabled_handle)
+        .with_disabled_tool_offers(disabled_handle)
         .build();
 
         let mut state = create_test_state();
@@ -8740,7 +8739,9 @@ mod tests {
 
     #[test]
     fn disabled_shared_network_tool_is_route_scoped_in_visible_surface() {
-        let disabled: HashSet<String> = ["web_fetch".to_string()].into_iter().collect();
+        let disabled: HashSet<String> = ["web_fetch@server-builtin".to_string()]
+            .into_iter()
+            .collect();
         let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
 
         let mut server_only = ServerAgenticLoopHostBuilder::new(
@@ -8749,13 +8750,13 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
-        .with_disabled_tools(disabled_handle.clone())
+        .with_disabled_tool_offers(disabled_handle.clone())
         .build();
         let mut server_state = create_test_state();
         let server_names = schema_names(&server_only.visible_turn_tools(&mut server_state));
         assert!(
             !server_names.contains("web_fetch"),
-            "server disabled_tools must hide server-routed web_fetch"
+            "server disabled_tool_offers must hide server-routed web_fetch"
         );
         assert!(
             server_names.contains("web_search"),
@@ -8770,13 +8771,13 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_disabled_tools(disabled_handle)
+        .with_disabled_tool_offers(disabled_handle)
         .build();
         let mut edge_state = create_test_state();
         let edge_names = schema_names(&edge_selected.visible_turn_tools(&mut edge_state));
         assert!(
             edge_names.contains("web_fetch"),
-            "server disabled_tools must not hide edge-routed web_fetch"
+            "server disabled_tool_offers must not hide edge-routed web_fetch"
         );
         assert!(edge_names.contains("bash"));
         assert!(edge_names.contains("read_file"));

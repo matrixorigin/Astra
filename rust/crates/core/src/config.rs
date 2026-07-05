@@ -85,27 +85,27 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct DeploymentConfig {
-    /// Tools disabled at deployment time (checked before dispatch).
-    pub disabled_tools: Vec<String>,
+    /// Tool offers disabled at deployment time (checked before dispatch).
+    pub disabled_tool_offers: Vec<String>,
 }
 
 impl DeploymentConfig {
     fn merge_from(&mut self, other: &Self) {
-        if !other.disabled_tools.is_empty() {
-            self.disabled_tools = other.disabled_tools.clone();
+        if !other.disabled_tool_offers.is_empty() {
+            self.disabled_tool_offers = other.disabled_tool_offers.clone();
         }
     }
 
     /// Apply environment variable overrides for deployment-level settings.
     pub(crate) fn apply_env_overrides(&mut self) {
-        if let Ok(val) = std::env::var("ASTRA_DISABLED_TOOLS") {
+        if let Ok(val) = std::env::var("ASTRA_DISABLED_TOOL_OFFERS") {
             let tools: Vec<String> = val
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
             if !tools.is_empty() {
-                self.disabled_tools = tools;
+                self.disabled_tool_offers = tools;
             }
         }
     }
@@ -685,8 +685,8 @@ pub struct AppSettings {
     pub token_encryption_key: Option<String>,
     pub external_auth_providers: Vec<ExternalAuthProviderConfig>,
     pub database_bootstrap_catalog: String,
-    /// Tools disabled at deployment time (deployment.toml → server.toml → env).
-    pub disabled_tools: Vec<String>,
+    /// Tool offers disabled at deployment time (deployment.toml -> server.toml -> env).
+    pub disabled_tool_offers: Vec<String>,
 }
 
 impl fmt::Debug for AppSettings {
@@ -749,7 +749,7 @@ impl AppSettings {
             }
         };
         let mut settings = Self::from_lookup(lookup)?;
-        settings.disabled_tools = sc.deployment.disabled_tools.clone();
+        settings.disabled_tool_offers = sc.deployment.disabled_tool_offers.clone();
         settings.external_auth_providers = sc.auth.external_providers.clone();
         Ok(settings)
     }
@@ -757,11 +757,11 @@ impl AppSettings {
     pub fn from_map(values: &HashMap<String, String>) -> Result<Self, ConfigError> {
         Self::from_lookup(|key| values.get(key).cloned())
     }
-    fn disabled_tools_from_lookup<F>(lookup: &F) -> Vec<String>
+    fn disabled_tool_offers_from_lookup<F>(lookup: &F) -> Vec<String>
     where
         F: Fn(&str) -> Option<String>,
     {
-        lookup("ASTRA_DISABLED_TOOLS")
+        lookup("ASTRA_DISABLED_TOOL_OFFERS")
             .map(|s| {
                 s.split(',')
                     .map(|t| t.trim().to_string())
@@ -833,7 +833,7 @@ impl AppSettings {
             )?,
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
             external_auth_providers: Vec::new(),
-            disabled_tools: Self::disabled_tools_from_lookup(&lookup),
+            disabled_tool_offers: Self::disabled_tool_offers_from_lookup(&lookup),
         })
     }
 }
@@ -1984,32 +1984,32 @@ auth_mode = "legacy"
     }
 
     #[test]
-    fn deployment_disabled_tools_from_toml() {
+    fn deployment_disabled_tool_offers_from_toml() {
         let toml_str = r#"
             [deployment]
-            disabled_tools = ["tool_a", "tool_b"]
+            disabled_tool_offers = ["tool_a@server", "tool_b@edge-1"]
             "#;
         let config = ServerConfig::parse(toml_str).unwrap();
         assert_eq!(
-            config.deployment.disabled_tools,
-            vec!["tool_a".to_string(), "tool_b".to_string()]
+            config.deployment.disabled_tool_offers,
+            vec!["tool_a@server".to_string(), "tool_b@edge-1".to_string()]
         );
     }
 
     #[test]
-    fn deployment_disabled_tools_from_env() {
+    fn deployment_disabled_tool_offers_from_env() {
         temp_env::with_var(
-            "ASTRA_DISABLED_TOOLS",
-            Some("tool_x, tool_y, tool_z"),
+            "ASTRA_DISABLED_TOOL_OFFERS",
+            Some("tool_x@server, tool_y@edge-1, tool_z@mcp"),
             || {
                 let mut config = ServerConfig::default();
                 config.apply_env_overrides();
                 assert_eq!(
-                    config.deployment.disabled_tools,
+                    config.deployment.disabled_tool_offers,
                     vec![
-                        "tool_x".to_string(),
-                        "tool_y".to_string(),
-                        "tool_z".to_string()
+                        "tool_x@server".to_string(),
+                        "tool_y@edge-1".to_string(),
+                        "tool_z@mcp".to_string()
                     ]
                 );
             },
@@ -2017,28 +2017,36 @@ auth_mode = "legacy"
     }
 
     #[test]
-    fn deployment_disabled_tools_empty_env_noop() {
-        temp_env::with_var("ASTRA_DISABLED_TOOLS", Some(""), || {
+    fn deployment_disabled_tool_offers_empty_env_noop() {
+        temp_env::with_var("ASTRA_DISABLED_TOOL_OFFERS", Some(""), || {
             let mut config = ServerConfig::default();
-            config.deployment.disabled_tools = vec!["from_toml".to_string()];
+            config.deployment.disabled_tool_offers = vec!["from_toml@server".to_string()];
             config.apply_env_overrides();
             // Empty env value should not overwrite TOML value
             assert_eq!(
-                config.deployment.disabled_tools,
-                vec!["from_toml".to_string()]
+                config.deployment.disabled_tool_offers,
+                vec!["from_toml@server".to_string()]
             );
         });
     }
 
     #[test]
-    fn deployment_disabled_tools_env_trims_whitespace() {
-        temp_env::with_var("ASTRA_DISABLED_TOOLS", Some("  a , b ,  c  "), || {
-            let mut config = ServerConfig::default();
-            config.apply_env_overrides();
-            assert_eq!(
-                config.deployment.disabled_tools,
-                vec!["a".to_string(), "b".to_string(), "c".to_string()]
-            );
-        });
+    fn deployment_disabled_tool_offers_env_trims_whitespace() {
+        temp_env::with_var(
+            "ASTRA_DISABLED_TOOL_OFFERS",
+            Some("  a@server , b@edge ,  c@mcp  "),
+            || {
+                let mut config = ServerConfig::default();
+                config.apply_env_overrides();
+                assert_eq!(
+                    config.deployment.disabled_tool_offers,
+                    vec![
+                        "a@server".to_string(),
+                        "b@edge".to_string(),
+                        "c@mcp".to_string()
+                    ]
+                );
+            },
+        );
     }
 }

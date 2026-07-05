@@ -199,7 +199,7 @@ pub struct AppState {
     pub resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
     /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
     pub edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
-    /// Shared ToolExecutionService for admin-controllable disabled_tools.
+    /// Shared ToolExecutionService for admin-controllable disabled_tool_offers.
     /// All executors share a clone of this service so admin API changes
     /// take effect immediately on in-flight sessions.
     pub tool_execution_service: ToolExecutionService,

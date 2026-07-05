@@ -270,20 +270,20 @@ pub(super) async fn admin_cleanup_handler(
 
 #[derive(serde::Deserialize)]
 pub(super) struct DisableToolRequest {
-    tool_name: String,
+    offer_id: String,
 }
 
-/// GET /admin/tools/disabled — list all runtime-disabled tools.
-pub(super) async fn admin_list_disabled_tools_handler(
+/// GET /admin/tool-offers/disabled — list all runtime-disabled tool offers.
+pub(super) async fn admin_list_disabled_tool_offers_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
     state.admin.authorizer.require_admin(&headers).await?;
-    let tools = state.tool_execution_service.disabled_tools().await;
+    let tools = state.tool_execution_service.disabled_tool_offers().await;
     Ok(Json(tools))
 }
 
-/// PUT /admin/tools/disabled — disable a tool at runtime.
+/// PUT /admin/tool-offers/disabled — disable a concrete tool offer at runtime.
 pub(super) async fn admin_disable_tool_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -292,24 +292,27 @@ pub(super) async fn admin_disable_tool_handler(
     state.admin.authorizer.require_admin(&headers).await?;
     let added = state
         .tool_execution_service
-        .disable_tool(&body.tool_name)
+        .disable_tool_offer(&body.offer_id)
         .await;
     Ok(Json(serde_json::json!({
-        "tool_name": body.tool_name,
+        "offer_id": body.offer_id,
         "was_added": added,
     })))
 }
 
-/// DELETE /admin/tools/disabled/{tool_name} — re-enable a tool at runtime.
+/// DELETE /admin/tool-offers/disabled/{offer_id} — re-enable a tool offer at runtime.
 pub(super) async fn admin_enable_tool_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(tool_name): Path<String>,
+    Path(offer_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     state.admin.authorizer.require_admin(&headers).await?;
-    let removed = state.tool_execution_service.enable_tool(&tool_name).await;
+    let removed = state
+        .tool_execution_service
+        .enable_tool_offer(&offer_id)
+        .await;
     Ok(Json(serde_json::json!({
-        "tool_name": tool_name,
+        "offer_id": offer_id,
         "was_removed": removed,
     })))
 }

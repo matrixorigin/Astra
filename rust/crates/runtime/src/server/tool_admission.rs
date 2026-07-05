@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use astra_runtime_env::{
     CapacityProvider, CapacityProviderDeclaration, CapacityProviderStatus, CapacityProviderType,
 };
@@ -58,7 +60,6 @@ pub(crate) struct ToolAdmissionDecision {
     pub candidates: Vec<ToolOfferCandidate>,
     pub route: ToolExecutionRouteKind,
     pub hidden_reason: Option<ToolHiddenReason>,
-    execution_class: ToolExecutionClass,
 }
 
 impl ToolAdmissionDecision {
@@ -66,40 +67,15 @@ impl ToolAdmissionDecision {
         self.route
     }
 
-    pub(crate) fn admin_disabled_applies(&self) -> bool {
-        disabled_tool_policy_applies_for_class(self.execution_class, self.route)
+    pub(crate) fn selected_offer_id(&self) -> Option<&str> {
+        self.selected_offer
+            .as_ref()
+            .map(|offer| offer.offer_id.as_str())
     }
-}
 
-pub(crate) fn route_uses_server_admin_disabled_scope(route: ToolExecutionRouteKind) -> bool {
-    matches!(
-        route,
-        ToolExecutionRouteKind::ServerLocal
-            | ToolExecutionRouteKind::ServerControlPlane
-            | ToolExecutionRouteKind::ServerRuntime
-            | ToolExecutionRouteKind::RequestScopedMcp
-    )
-}
-
-pub(crate) fn disabled_tool_policy_applies(
-    tool_name: &str,
-    route: ToolExecutionRouteKind,
-    registry: &astra_runtime_env::ToolRegistry,
-) -> bool {
-    disabled_tool_policy_applies_for_class(tool_execution_class(tool_name, registry), route)
-}
-
-fn disabled_tool_policy_applies_for_class(
-    class: ToolExecutionClass,
-    route: ToolExecutionRouteKind,
-) -> bool {
-    match class {
-        ToolExecutionClass::SharedServiceOrRuntime => route_uses_server_admin_disabled_scope(route),
-        ToolExecutionClass::RuntimeExecutor => true,
-        ToolExecutionClass::ServerControlPlane
-        | ToolExecutionClass::ServerService
-        | ToolExecutionClass::RequestScopedMcp => route_uses_server_admin_disabled_scope(route),
-        ToolExecutionClass::TurnPipelineIntercept | ToolExecutionClass::Unknown => false,
+    pub(crate) fn disabled_by_offer_ids(&self, disabled_offer_ids: &HashSet<String>) -> bool {
+        self.selected_offer_id()
+            .is_some_and(|offer_id| disabled_offer_ids.contains(offer_id))
     }
 }
 
@@ -195,7 +171,6 @@ pub(crate) fn resolve_tool_admission_for_providers(
         candidates,
         route,
         hidden_reason,
-        execution_class: class,
     }
 }
 
@@ -440,7 +415,10 @@ mod tests {
         let offer = decision.selected_offer.as_ref().expect("selected offer");
         assert_eq!(offer.provider_type, CapacityProviderType::ServerService);
         assert_eq!(offer.provider_id, "server-builtin");
-        assert!(decision.admin_disabled_applies());
+        assert_eq!(
+            decision.selected_offer_id(),
+            Some("web_fetch@server-builtin")
+        );
         assert_eq!(decision.candidates.len(), 1);
         assert_eq!(
             decision.candidates[0].offer.offer_id,
@@ -478,7 +456,7 @@ mod tests {
         let offer = decision.selected_offer.as_ref().expect("selected offer");
         assert_eq!(offer.provider_type, CapacityProviderType::EdgeCapacity);
         assert_eq!(offer.provider_id, "edge-macpro");
-        assert!(!decision.admin_disabled_applies());
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
         assert_eq!(decision.candidates.len(), 2);
         let edge_candidate = decision
             .candidates

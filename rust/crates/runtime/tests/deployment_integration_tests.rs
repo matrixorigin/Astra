@@ -14,7 +14,7 @@ fn tool_names(profile: &DeploymentProfile) -> Vec<String> {
 }
 
 /// Verify that DeploymentProfile factories produce the correct tool lists.
-/// The full E2E chain (disabled tools → dispatch reject → LLM surface) is
+/// The full E2E chain (disabled tool offers -> dispatch reject -> LLM surface) is
 /// covered in unit tests inside the astra-runtime crate
 /// (tool_execution_service and server_loop_host).
 #[tokio::test]

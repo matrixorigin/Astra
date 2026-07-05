@@ -3059,7 +3059,7 @@ async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
         .edge_registry_service(Arc::new(StaticEdgeRegistry {
             agents: vec![edge_agent_record("edge-selected")],
         }))
-        .initial_disabled_tools(&["web_fetch".to_string()])
+        .initial_disabled_tool_offers(&["web_fetch@server-builtin".to_string()])
         .build();
     let local = CountingLocalTransport::new();
 
@@ -3076,6 +3076,7 @@ async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
     assert!(server_result.is_error, "{server_result:?}");
     let metadata = server_result.metadata.expect("disabled metadata");
     assert_eq!(metadata["tool_disabled"], true);
+    assert_eq!(metadata["tool_offer_id"], "web_fetch@server-builtin");
 
     let edge_result = service
         .execute(

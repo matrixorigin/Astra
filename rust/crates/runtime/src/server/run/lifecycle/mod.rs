@@ -157,15 +157,15 @@ fn is_non_blocking_task_board_settlement(
         && !task_board_snapshot.requires_settlement_intervention()
 }
 
-/// Lazily load deployment-disabled tools from server config.
-/// Reads `[deployment].disabled_tools` from TOML + `ASTRA_DISABLED_TOOLS` env override.
-fn load_deployment_disabled_tools() -> Vec<String> {
+/// Lazily load deployment-disabled tool offers from server config.
+/// Reads `[deployment].disabled_tool_offers` from TOML + `ASTRA_DISABLED_TOOL_OFFERS` env override.
+fn load_deployment_disabled_tool_offers() -> Vec<String> {
     use std::sync::OnceLock;
     static DISABLED_TOOLS: OnceLock<Vec<String>> = OnceLock::new();
     DISABLED_TOOLS
         .get_or_init(|| {
             astra_core::ServerConfig::load()
-                .map(|sc| sc.deployment.disabled_tools.clone())
+                .map(|sc| sc.deployment.disabled_tool_offers.clone())
                 .unwrap_or_default()
         })
         .clone()
@@ -1273,7 +1273,7 @@ pub struct AgenticRunLifecycleService {
     /// share selector cooldown, in-flight dedup, event sink, and
     /// broker. `None` → extraction disabled (e.g. minimal test service).
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
-    /// Shared ToolExecutionService so executors share the same disabled_tools set.
+    /// Shared ToolExecutionService so executors share the same disabled_tool_offers set.
     tool_execution_service: Option<ToolExecutionService>,
     /// Shared persisted-reflection service used by the visible `reflect` tool.
     reflect_service: Arc<dyn astra_services::ReflectService>,
@@ -3240,10 +3240,10 @@ impl AgenticRunLifecycleService {
                 builder = builder.with_prefix_store(Some(Arc::clone(store)));
             }
         }
-        // Share the tool execution service's disabled-tools set so the LLM
-        // surface excludes admin-disabled tools (not just dispatch-rejected).
+        // Share the tool execution service's disabled tool-offer set so the LLM
+        // surface excludes admin-disabled tool offers (not just dispatch-rejected).
         if let Some(ref shared_tes) = self.tool_execution_service {
-            builder = builder.with_disabled_tools(shared_tes.disabled_tools_handle());
+            builder = builder.with_disabled_tool_offers(shared_tes.disabled_tool_offers_handle());
         }
         // Wire test LLM rounds from request context (E2E test hook).
         #[cfg(feature = "bridge-e2e-hooks")]
@@ -3533,7 +3533,7 @@ impl AgenticRunLifecycleService {
             .tool_selection
             .resolve_for_model(request.model.as_deref());
         let restricted_tools: std::collections::HashSet<String> =
-            load_deployment_disabled_tools().into_iter().collect();
+            load_deployment_disabled_tool_offers().into_iter().collect();
 
         AgenticLoopState {
             messages: vec![user_message],
@@ -5059,15 +5059,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // from re-executing when a session resumes after a crash.
             executor.enable_exactly_once().await;
 
-            // Apply shared ToolExecutionService (with admin-controllable disabled_tools)
+            // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.
             if let Some(ref shared_tes) = self.tool_execution_service {
                 executor = executor.with_tool_execution_service(shared_tes.clone());
             } else {
                 let mut builder = ToolExecutionService::builder();
-                let disabled = load_deployment_disabled_tools();
+                let disabled = load_deployment_disabled_tool_offers();
                 if !disabled.is_empty() {
-                    builder = builder.initial_disabled_tools(&disabled);
+                    builder = builder.initial_disabled_tool_offers(&disabled);
                 }
                 if let Some(pool) = &self.edge_connection_pool {
                     builder = builder.edge_connection_pool(pool.clone());
@@ -5988,15 +5988,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // from re-executing when a session resumes after a crash.
             executor.enable_exactly_once().await;
 
-            // Apply shared ToolExecutionService (with admin-controllable disabled_tools)
+            // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.
             if let Some(ref shared_tes) = self.tool_execution_service {
                 executor = executor.with_tool_execution_service(shared_tes.clone());
             } else {
                 let mut builder = ToolExecutionService::builder();
-                let disabled = load_deployment_disabled_tools();
+                let disabled = load_deployment_disabled_tool_offers();
                 if !disabled.is_empty() {
-                    builder = builder.initial_disabled_tools(&disabled);
+                    builder = builder.initial_disabled_tool_offers(&disabled);
                 }
                 if let Some(pool) = &self.edge_connection_pool {
                     builder = builder.edge_connection_pool(pool.clone());
@@ -7613,7 +7613,7 @@ pub struct ServerSubRunExecutor {
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     reflect_service: Arc<dyn astra_services::ReflectService>,
     inherited_permissions: InheritedPermissions,
-    /// Shared ToolExecutionService so executors share the same disabled_tools set.
+    /// Shared ToolExecutionService so executors share the same disabled_tool_offers set.
     pub tool_execution_service: Option<ToolExecutionService>,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds: Vec<Value>,
@@ -7834,7 +7834,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // deeper delegation trees but require threading the store into
         // `ServerSubRunExecutor` separately — scope-cut from G2 v1.
         if let Some(ref shared_tes) = self.tool_execution_service {
-            builder = builder.with_disabled_tools(shared_tes.disabled_tools_handle());
+            builder = builder.with_disabled_tool_offers(shared_tes.disabled_tool_offers_handle());
         }
         let mut host = builder.build();
         if let Some(sink) = config.live_event_sink.clone() {
@@ -7885,7 +7885,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .tool_selection
             .resolve_for_model(config.agent_profile.model_override.as_deref());
         let restricted_tools: std::collections::HashSet<String> =
-            load_deployment_disabled_tools().into_iter().collect();
+            load_deployment_disabled_tool_offers().into_iter().collect();
         let permission_context = PermissionSyncContext::shared(self.inherited_permissions.clone());
 
         let mut loop_state = AgenticLoopState {
@@ -8080,15 +8080,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
             // from re-executing when a session resumes after a crash.
             executor.enable_exactly_once().await;
 
-            // Apply shared ToolExecutionService (with admin-controllable disabled_tools)
+            // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.
             if let Some(ref shared_tes) = self.tool_execution_service {
                 executor = executor.with_tool_execution_service(shared_tes.clone());
             } else {
                 let mut builder = ToolExecutionService::builder();
-                let disabled = load_deployment_disabled_tools();
+                let disabled = load_deployment_disabled_tool_offers();
                 if !disabled.is_empty() {
-                    builder = builder.initial_disabled_tools(&disabled);
+                    builder = builder.initial_disabled_tool_offers(&disabled);
                 }
                 if let Some(pool) = self.shared_pool.as_ref() {
                     executor.set_context_manifest_pool(pool.clone());

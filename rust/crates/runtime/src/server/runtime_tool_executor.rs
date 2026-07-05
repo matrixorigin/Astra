@@ -354,7 +354,7 @@ impl RuntimeToolExecutor {
     }
 
     /// Replace the internal ToolExecutionService with a shared instance,
-    /// so that multiple executors share the same disabled_tools set.
+    /// so that multiple executors share the same disabled tool-offer set.
     pub fn with_tool_execution_service(mut self, service: ToolExecutionService) -> Self {
         self.tool_execution_service = service;
         self
