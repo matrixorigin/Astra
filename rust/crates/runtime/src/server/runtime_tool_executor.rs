@@ -247,6 +247,11 @@ pub struct RuntimeToolExecutor {
     /// Tool names searchable/admissible in the current server-host turn.
     /// `None` keeps direct unit-test executor calls permissive.
     current_searchable_tool_names: Arc<std::sync::RwLock<Option<HashSet<String>>>>,
+    /// Selected provider offers for the current wire tool surface, keyed by
+    /// canonical tool name. This is execution metadata; it never enters
+    /// prompt-visible tool schemas.
+    current_selected_tool_offers:
+        Arc<std::sync::RwLock<HashMap<String, SelectedToolOfferSnapshot>>>,
     /// Tool names listed in the current turn's `<deferred_tools>` manifest.
     /// Mirrors the CLI executor's `current_activatable_tool_names`. Populated
     /// from `ToolSurface::deferred()` per turn so the validator can emit the
@@ -341,6 +346,7 @@ impl RuntimeToolExecutor {
             request_scoped_mcp_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             current_searchable_tool_names: Arc::new(std::sync::RwLock::new(None)),
+            current_selected_tool_offers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             current_activatable_tool_names: Arc::new(std::sync::RwLock::new(None)),
             mcp_manager: None,
             agent_binding_mcp: None,
@@ -532,6 +538,17 @@ impl RuntimeToolExecutor {
         *guard = Some(names);
     }
 
+    pub fn set_current_selected_tool_offers(
+        &self,
+        offers: HashMap<String, SelectedToolOfferSnapshot>,
+    ) {
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.current_selected_tool_offers,
+            "current_selected_tool_offers",
+        );
+        *guard = offers;
+    }
+
     pub fn set_current_activatable_tool_names(&self, names: HashSet<String>) {
         let names = self.runtime_bound_tool_names(names);
         let mut guard = rwlock_write_reset_on_poison(
@@ -554,6 +571,15 @@ impl RuntimeToolExecutor {
             &self.current_searchable_tool_names,
             "current_searchable_tool_names",
         )
+    }
+
+    fn current_selected_tool_offer(&self, tool_name: &str) -> Option<SelectedToolOfferSnapshot> {
+        rwlock_read_clone_or_default(
+            &self.current_selected_tool_offers,
+            "current_selected_tool_offers",
+        )
+        .get(tool_name)
+        .cloned()
     }
 
     pub(super) fn current_tool_search_pool_schemas(&self) -> Vec<Value> {
@@ -1344,7 +1370,7 @@ impl RuntimeToolExecutor {
         );
     }
 
-    fn tool_execution_request(&self, name: &str, args: &Value) -> ToolExecutionRequest {
+    pub(crate) fn tool_execution_request(&self, name: &str, args: &Value) -> ToolExecutionRequest {
         let mut request = self.execution_binding.tool_execution_request(
             &self.user_id,
             &self.session_id,
@@ -1362,6 +1388,9 @@ impl RuntimeToolExecutor {
         &self,
         request: &ToolExecutionRequest,
     ) -> Option<SelectedToolOfferSnapshot> {
+        if let Some(offer) = self.current_selected_tool_offer(&request.tool_name) {
+            return Some(offer);
+        }
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let schemas = if astra_runtime_env::is_mcp_namespaced_tool_name(&request.tool_name) {
             let schemas =

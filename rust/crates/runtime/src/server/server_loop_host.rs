@@ -36,8 +36,8 @@ use crate::server::tool_route_selection::{
 };
 use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
-    ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind, WorkspaceAuthority,
-    WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
+    SelectedToolOfferSnapshot, ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind,
+    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
     capability_filter_edge_provided_tool_schemas_for_binding_with_context,
     capability_filtered_server_tool_schemas_with_context, projected_tool_end_event_fields,
     projected_tool_start_event_fields,
@@ -1069,6 +1069,10 @@ pub struct ServerAgenticLoopHost {
     /// readiness/policy so introspect can explain why they are unavailable
     /// without changing the LLM-visible `tools[]` payload.
     admission_tool_schemas: Vec<Value>,
+    /// Tool names actually advertised by the selected runtime provider for
+    /// this host. Empty means no explicit runtime provider schema inventory is
+    /// constraining admission (for example server-only or server sandbox).
+    runtime_declared_tool_names: HashSet<String>,
     capabilities: astra_turn_core::capability::CapabilitySet,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
@@ -1528,9 +1532,17 @@ impl ServerAgenticLoopHostBuilder {
         let schema_workspace = binding_snapshot.workspace.clone();
         let schema_executor = binding_snapshot.executor.clone();
         let schema_runtime = binding_snapshot.runtime.clone();
+        let runtime_declared_tool_names: HashSet<String> = self
+            .edge_tools
+            .iter()
+            .filter_map(tool_schema_name)
+            .map(str::to_string)
+            .collect();
         let schema_admission_context = ToolAdmissionContext {
             server_service_provider_ready: self.server_service_tool_catalog_enabled,
             control_plane_provider_ready: self.control_plane_tool_catalog_enabled,
+            runtime_declared_tool_names: (!runtime_declared_tool_names.is_empty())
+                .then(|| runtime_declared_tool_names.clone()),
             disabled_tool_offers: snapshot_builder_policy_handle(&self.disabled_tool_offers),
             provider_allowed_tools: snapshot_builder_policy_handle(&self.provider_allowed_tools),
             ..ToolAdmissionContext::default()
@@ -1565,12 +1577,6 @@ impl ServerAgenticLoopHostBuilder {
         }
         append_tool_schemas_unique(&mut admission_tool_schemas, self.edge_tools.clone());
         let server_catalog_tool_surface = !server_catalog_tools.is_empty();
-        let runtime_declared_tool_names: HashSet<String> = self
-            .edge_tools
-            .iter()
-            .filter_map(tool_schema_name)
-            .map(str::to_string)
-            .collect();
         let tool_schemas = if self.edge_tools.is_empty() {
             server_catalog_tools
         } else {
@@ -1635,6 +1641,7 @@ impl ServerAgenticLoopHostBuilder {
             resolved_llm_config_at: None,
             tool_schemas,
             admission_tool_schemas,
+            runtime_declared_tool_names,
             capabilities: self.capabilities,
             edge_profile: self.edge_profile,
             valid_tools,
@@ -3553,6 +3560,8 @@ impl ServerAgenticLoopHost {
                 .as_ref()
                 .map(|runtime| runtime.platform)
                 .unwrap_or(astra_runtime_env::RuntimePlatform::Unknown),
+            runtime_declared_tool_names: (!self.runtime_declared_tool_names.is_empty())
+                .then(|| self.runtime_declared_tool_names.clone()),
             disabled_tool_offers: self.disabled_tool_offers_snapshot(),
             provider_allowed_tools: self.provider_allowed_tools_snapshot(),
         }
@@ -3620,10 +3629,10 @@ impl ServerAgenticLoopHost {
                 match admission.selected_route() {
                     ToolExecutionRouteKind::EdgeBound
                     | ToolExecutionRouteKind::GatewayRelay
-                    | ToolExecutionRouteKind::SandboxResidentAgent => true,
-                    ToolExecutionRouteKind::ServerLocal
+                    | ToolExecutionRouteKind::SandboxResidentAgent
                     | ToolExecutionRouteKind::ServerControlPlane
-                    | ToolExecutionRouteKind::ServerRuntime
+                    | ToolExecutionRouteKind::ServerRuntime => true,
+                    ToolExecutionRouteKind::ServerLocal
                     | ToolExecutionRouteKind::RequestScopedMcp => executor.tool_runtime_ready(name),
                     ToolExecutionRouteKind::Unsupported => false,
                 }
@@ -3678,6 +3687,25 @@ impl ServerAgenticLoopHost {
         if let Some(executor) = state.runtime_tool_executor.as_deref() {
             executor.set_current_activatable_tool_names(activatable_deferred_tool_names.clone());
             executor.set_current_searchable_tool_schemas(wire_tools);
+            let registry = astra_runtime_env::ToolRegistry::builtins();
+            let selected_offers = wire_tools
+                .iter()
+                .filter_map(tool_schema_name)
+                .filter_map(|name| {
+                    let offer = self
+                        .admission_for_current_binding(name, &registry)
+                        .selected_offer?;
+                    Some((
+                        name.to_string(),
+                        SelectedToolOfferSnapshot::new_with_route(
+                            offer.tool_name,
+                            offer.provider_id,
+                            offer.route,
+                        ),
+                    ))
+                })
+                .collect();
+            executor.set_current_selected_tool_offers(selected_offers);
             extras.extend(executor.activated_deferred_tool_names());
         }
         self.current_deferred_tool_names = activatable_deferred_tool_names;
@@ -7082,6 +7110,45 @@ mod tests {
         assert!(
             !searchable.contains("read_file"),
             "tool_search must also mirror the final wire tools"
+        );
+    }
+
+    #[test]
+    fn sync_wire_surface_carries_selected_server_offer_for_shared_tool() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut runtime_executor = runtime_tool_executor_with_agent_context(dir.path());
+        runtime_executor.set_execution_binding_snapshot(edge_runtime_snapshot());
+        let executor = Arc::new(runtime_executor);
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(Arc::clone(&executor));
+
+        let visible = host.visible_turn_tools(&mut state);
+        let visible_names = schema_names(&visible);
+        assert!(
+            visible_names.contains("web_search"),
+            "server-owned web_search should be visible when the selected edge did not advertise it"
+        );
+
+        let request = executor.tool_execution_request("web_search", &json!({"query": "astra"}));
+        let selected_offer = request
+            .selected_offer
+            .expect("wire surface sync must carry selected offer into execution");
+        assert_eq!(selected_offer.offer_id, "web_search@server-builtin");
+        assert_eq!(selected_offer.provider_id, "server-builtin");
+        assert_eq!(
+            selected_offer.route,
+            ToolExecutionRouteKind::ServerRuntime,
+            "execution must follow the prompt-selected server offer instead of rerouting to edge"
         );
     }
 

@@ -77,6 +77,7 @@ pub(crate) struct ToolAdmissionContext {
     pub control_plane_provider_ready: bool,
     pub request_scoped_mcp_provider_ready: bool,
     pub selected_runtime_platform: astra_runtime_env::RuntimePlatform,
+    pub runtime_declared_tool_names: Option<HashSet<String>>,
     pub disabled_tool_offers: HashSet<String>,
     pub provider_allowed_tools: HashMap<String, HashSet<String>>,
 }
@@ -88,6 +89,7 @@ impl Default for ToolAdmissionContext {
             control_plane_provider_ready: true,
             request_scoped_mcp_provider_ready: false,
             selected_runtime_platform: astra_runtime_env::RuntimePlatform::Unknown,
+            runtime_declared_tool_names: None,
             disabled_tool_offers: HashSet::new(),
             provider_allowed_tools: HashMap::new(),
         }
@@ -293,8 +295,22 @@ fn admission_route_for_binding_and_providers(
     providers: &[CapacityProviderDeclaration],
     registry: &astra_runtime_env::ToolRegistry,
 ) -> ToolExecutionRouteKind {
+    let class = tool_execution_class(tool_name, registry);
     let binding_route =
         routing_decision_for_binding(tool_name, workspace.kind, executor.transport, registry);
+    if matches!(class, ToolExecutionClass::SharedServiceOrRuntime)
+        && !matches!(
+            binding_route,
+            ToolExecutionRouteKind::Unsupported | ToolExecutionRouteKind::ServerRuntime
+        )
+        && provider_for_route(tool_name, workspace, binding_route, providers).is_none()
+        && providers.iter().any(|provider| {
+            provider.provider_type == CapacityProviderType::ServerService
+                && provider.declares_tool(tool_name)
+        })
+    {
+        return ToolExecutionRouteKind::ServerRuntime;
+    }
     if !matches!(binding_route, ToolExecutionRouteKind::Unsupported) {
         return binding_route;
     }
@@ -332,12 +348,21 @@ pub(crate) fn active_provider_declarations_for_binding(
         let selected_runtime_platform = runtime
             .map(|runtime| runtime.platform)
             .unwrap_or(context.selected_runtime_platform);
-        providers.push(astra_runtime_env::runtime_workspace_provider(
+        let mut runtime_provider = astra_runtime_env::runtime_workspace_provider(
             capacity_provider_type_for_workspace_executor(workspace.kind, executor.kind),
             runtime_execution_provider_id_for_executor(executor),
             registry,
             selected_runtime_platform,
-        ));
+        );
+        if let Some(runtime_declared_tool_names) = context.runtime_declared_tool_names.as_ref() {
+            runtime_provider
+                .tool_names
+                .retain(|name| runtime_declared_tool_names.contains(name));
+            runtime_provider
+                .tool_schema_digests
+                .retain(|name, _| runtime_declared_tool_names.contains(name));
+        }
+        providers.push(runtime_provider);
     }
 
     if context.request_scoped_mcp_provider_ready

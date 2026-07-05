@@ -3148,10 +3148,16 @@ async fn selected_offer_route_mismatch_blocks_execution_without_provider_fallbac
 
     assert_eq!(
         service.routing_decision(&request),
-        ToolExecutionRouteKind::ServerRuntime,
-        "the binding alone would route web_fetch to the server"
+        ToolExecutionRouteKind::EdgeBound,
+        "selected offer route is the execution source of truth"
     );
-    let result = service.execute(request, &local).await;
+    let boundary = crate::server::tool_route_boundary::ToolRouteBoundary::new(
+        request,
+        ToolExecutionRouteKind::ServerRuntime,
+    );
+    let result = service
+        .execute_boundary_with_cancel(&boundary, &local, None)
+        .await;
 
     assert!(result.is_error, "{result:?}");
     assert_eq!(
