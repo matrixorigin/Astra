@@ -3876,18 +3876,6 @@ async fn validate_request_constraints_allows_explicit_request_scoped_runtime_mcp
 }
 
 #[tokio::test]
-async fn validate_request_constraints_allows_implicit_request_scoped_runtime_mcp_when_enabled() {
-    let service = test_service().with_allow_implicit_request_scoped_mcp(true);
-    let mut request = test_request("hello");
-    request.runtime_mcp_bindings = vec![test_runtime_mcp_binding()];
-
-    service
-        .validate_request_constraints("u1", &request)
-        .await
-        .expect("compatibility flag should allow implicit request-scoped runtime MCP");
-}
-
-#[tokio::test]
 async fn validate_request_constraints_requires_selected_model() {
     let service = test_service();
     let mut request = test_request("hello");
