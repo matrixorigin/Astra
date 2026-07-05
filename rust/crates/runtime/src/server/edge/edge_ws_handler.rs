@@ -25,42 +25,57 @@ const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 /// Global counter of active edge WebSocket connections.
 static EDGE_WS_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Axum handler for edge WebSocket upgrade.
-pub(crate) async fn edge_ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+struct EdgeWsConnectionPermit;
+
+impl Drop for EdgeWsConnectionPermit {
+    fn drop(&mut self) {
+        EDGE_WS_CONNECTION_COUNT.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn try_acquire_edge_ws_connection() -> Option<Arc<EdgeWsConnectionPermit>> {
     loop {
         let current = EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire);
         if current >= MAX_EDGE_WS_CONNECTIONS {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "too many edge WebSocket connections",
-            )
-                .into_response();
+            return None;
         }
         if EDGE_WS_CONNECTION_COUNT
             .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            break;
+            return Some(Arc::new(EdgeWsConnectionPermit));
         }
     }
+}
+
+/// Axum handler for edge WebSocket upgrade.
+pub(crate) async fn edge_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let Some(permit) = try_acquire_edge_ws_connection() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "too many edge WebSocket connections",
+        )
+            .into_response();
+    };
+    let failed_upgrade_permit = permit.clone();
     ws.max_message_size(256 * 1024)
-        .on_upgrade(move |socket| handle_edge_connection(socket, state))
+        .on_failed_upgrade(move |error| {
+            tracing::warn!(target: "astra::edge_ws", %error, "edge WebSocket upgrade failed");
+            drop(failed_upgrade_permit);
+        })
+        .on_upgrade(move |socket| handle_edge_connection(socket, state, permit))
         .into_response()
 }
 
 /// Main edge WebSocket connection loop.
-async fn handle_edge_connection(socket: WebSocket, state: AppState) {
-    // RAII guard: decrement on exit.
-    struct ConnGuard;
-    impl Drop for ConnGuard {
-        fn drop(&mut self) {
-            EDGE_WS_CONNECTION_COUNT.fetch_sub(1, Ordering::Release);
-        }
-    }
-    let _guard = ConnGuard;
+async fn handle_edge_connection(
+    socket: WebSocket,
+    state: AppState,
+    _permit: Arc<EdgeWsConnectionPermit>,
+) {
     let (ws_sink, mut ws_stream) = socket.split();
     let ws_sink = Arc::new(tokio::sync::Mutex::new(ws_sink));
 
@@ -817,5 +832,24 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn edge_ws_connection_permit_releases_after_all_upgrade_paths_drop() {
+        let previous = EDGE_WS_CONNECTION_COUNT.swap(0, Ordering::AcqRel);
+        let permit = try_acquire_edge_ws_connection().expect("permit should be available");
+        assert_eq!(EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire), 1);
+
+        let failed_upgrade_clone = permit.clone();
+        drop(failed_upgrade_clone);
+        assert_eq!(
+            EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire),
+            1,
+            "failed-upgrade callback clone must not release while the active upgrade owns the permit"
+        );
+
+        drop(permit);
+        assert_eq!(EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire), 0);
+        EDGE_WS_CONNECTION_COUNT.store(previous, Ordering::Release);
     }
 }
