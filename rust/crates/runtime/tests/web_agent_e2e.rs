@@ -585,46 +585,18 @@ fn ensure_test_edge_profile_for_edge_tools(payload: &mut Map<String, Value>) {
 }
 
 fn test_tool_requires_edge_runtime(tool: &Value) -> bool {
-    let Some(name) = tool
-        .get("function")
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
-    else {
-        return false;
-    };
-    matches!(
-        name,
-        "bash"
-            | "git"
-            | "glob"
-            | "grep"
-            | "list_dir"
-            | "publish_artifact"
-            | "read_file"
-            | "rollback_file_edits"
-            | "run_script"
-            | "str_replace"
-            | "symbols"
-            | "write_file"
-    )
+    astra_runtime_env::tool_schema_name(tool).is_some_and(test_tool_uses_client_ledger)
 }
 
 fn test_tool_uses_client_ledger(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "bash"
-            | "git"
-            | "glob"
-            | "grep"
-            | "list_dir"
-            | "publish_artifact"
-            | "read_file"
-            | "rollback_file_edits"
-            | "run_script"
-            | "str_replace"
-            | "symbols"
-            | "write_file"
-    )
+    astra_runtime_env::ToolRegistry::builtins()
+        .get(tool_name)
+        .is_some_and(|spec| {
+            matches!(
+                spec.required.executor,
+                astra_runtime_env::RequiredExecutor::RuntimeExecutor
+            )
+        })
 }
 
 /// Send a POST /chat/stream request and collect all SSE events from the stream.
