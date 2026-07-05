@@ -83,12 +83,10 @@ pub struct ServerConfig {
 
 /// Deployment-level tool capability controls.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DeploymentConfig {
     /// Tool offers disabled at deployment time (checked before dispatch).
     pub disabled_tool_offers: Vec<String>,
-    /// Canonical tool names disabled across every provider offer.
-    pub disabled_tool_names: Vec<String>,
     /// Exact provider allowlist: provider id -> canonical tool names enabled
     /// for that provider. A provider id absent from this map is unrestricted.
     pub provider_allowed_tools: HashMap<String, Vec<String>>,
@@ -98,9 +96,6 @@ impl DeploymentConfig {
     fn merge_from(&mut self, other: &Self) {
         if !other.disabled_tool_offers.is_empty() {
             self.disabled_tool_offers = other.disabled_tool_offers.clone();
-        }
-        if !other.disabled_tool_names.is_empty() {
-            self.disabled_tool_names = other.disabled_tool_names.clone();
         }
         if !other.provider_allowed_tools.is_empty() {
             self.provider_allowed_tools = other.provider_allowed_tools.clone();
@@ -698,8 +693,6 @@ pub struct AppSettings {
     pub database_bootstrap_catalog: String,
     /// Tool offers disabled at deployment time (deployment.toml -> server.toml -> env).
     pub disabled_tool_offers: Vec<String>,
-    /// Canonical tool names disabled across every provider offer.
-    pub disabled_tool_names: Vec<String>,
     /// Exact provider allowlist: provider id -> canonical tool names enabled
     /// for that provider.
     pub provider_allowed_tools: HashMap<String, Vec<String>>,
@@ -766,7 +759,6 @@ impl AppSettings {
         };
         let mut settings = Self::from_lookup(lookup)?;
         settings.disabled_tool_offers = sc.deployment.disabled_tool_offers.clone();
-        settings.disabled_tool_names = sc.deployment.disabled_tool_names.clone();
         settings.provider_allowed_tools = sc.deployment.provider_allowed_tools.clone();
         settings.external_auth_providers = sc.auth.external_providers.clone();
         Ok(settings)
@@ -852,7 +844,6 @@ impl AppSettings {
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
             external_auth_providers: Vec::new(),
             disabled_tool_offers: Self::disabled_tool_offers_from_lookup(&lookup),
-            disabled_tool_names: Vec::new(),
             provider_allowed_tools: HashMap::new(),
         })
     }
@@ -2008,7 +1999,6 @@ auth_mode = "legacy"
         let toml_str = r#"
             [deployment]
             disabled_tool_offers = ["tool_a@server", "tool_b@edge-1"]
-            disabled_tool_names = ["legacy_tool"]
 
             [deployment.provider_allowed_tools]
             server-builtin = ["web_fetch", "memory"]
@@ -2018,10 +2008,6 @@ auth_mode = "legacy"
         assert_eq!(
             config.deployment.disabled_tool_offers,
             vec!["tool_a@server".to_string(), "tool_b@edge-1".to_string()]
-        );
-        assert_eq!(
-            config.deployment.disabled_tool_names,
-            vec!["legacy_tool".to_string()]
         );
         assert_eq!(
             config
@@ -2050,7 +2036,6 @@ auth_mode = "legacy"
 
             [deployment]
             disabled_tool_offers = ["web_fetch@server-builtin"]
-            disabled_tool_names = ["mo_query"]
 
             [deployment.provider_allowed_tools]
             server-builtin = ["web_fetch"]
@@ -2062,7 +2047,6 @@ auth_mode = "legacy"
                 settings.disabled_tool_offers,
                 vec!["web_fetch@server-builtin".to_string()]
             );
-            assert_eq!(settings.disabled_tool_names, vec!["mo_query".to_string()]);
             assert_eq!(
                 settings
                     .provider_allowed_tools
@@ -2071,6 +2055,21 @@ auth_mode = "legacy"
                 &vec!["web_fetch".to_string()]
             );
         });
+    }
+
+    #[test]
+    fn deployment_rejects_legacy_global_disabled_tool_names() {
+        let toml_str = r#"
+            [deployment]
+            disabled_tool_names = ["web_fetch"]
+            "#;
+        let error = ServerConfig::parse(toml_str).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `disabled_tool_names`"),
+            "legacy global disabled tool names must fail fast: {error}"
+        );
     }
 
     #[test]

@@ -241,9 +241,6 @@ fn build_shared_tool_execution_service(
     if !policy.disabled_tool_offers.is_empty() {
         builder = builder.initial_disabled_tool_offers(&policy.disabled_tool_offers);
     }
-    if !policy.disabled_tool_names.is_empty() {
-        builder = builder.initial_disabled_tool_names(&policy.disabled_tool_names);
-    }
     if !policy.provider_allowed_tools.is_empty() {
         builder = builder.initial_provider_allowed_tools(policy.provider_allowed_tools.clone());
     }

@@ -1198,8 +1198,6 @@ pub struct ServerAgenticLoopHost {
     /// Shared handle to the runtime-disabled tool offers (admin API). Used to
     /// exclude admin-disabled tool offers from the LLM tool surface.
     disabled_tool_offers: Arc<tokio::sync::RwLock<HashSet<String>>>,
-    /// Shared handle to canonical tool names disabled across all offers.
-    disabled_tool_names: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Shared exact provider allowlist. Missing provider id means unrestricted.
     provider_allowed_tools: Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>,
     /// Optional LLM-based turn intent judge. When set, every turn first asks
@@ -1257,8 +1255,6 @@ pub struct ServerAgenticLoopHostBuilder {
     prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
     /// Shared handle to the runtime-disabled tool offers (admin API).
     disabled_tool_offers: Option<Arc<tokio::sync::RwLock<HashSet<String>>>>,
-    /// Shared handle to canonical tool names disabled across all offers.
-    disabled_tool_names: Option<Arc<tokio::sync::RwLock<HashSet<String>>>>,
     /// Shared exact provider allowlist. Missing provider id means unrestricted.
     provider_allowed_tools: Option<Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>>,
 }
@@ -1306,7 +1302,6 @@ impl ServerAgenticLoopHostBuilder {
             shared_dedup_state: None,
             prefix_store: None,
             disabled_tool_offers: None,
-            disabled_tool_names: None,
             provider_allowed_tools: None,
         }
     }
@@ -1525,7 +1520,6 @@ impl ServerAgenticLoopHostBuilder {
             server_service_provider_ready: self.server_tool_catalog_enabled,
             control_plane_provider_ready: self.server_tool_catalog_enabled,
             disabled_tool_offers: snapshot_builder_policy_handle(&self.disabled_tool_offers),
-            disabled_tool_names: snapshot_builder_policy_handle(&self.disabled_tool_names),
             provider_allowed_tools: snapshot_builder_policy_handle(&self.provider_allowed_tools),
             ..ToolAdmissionContext::default()
         };
@@ -1679,9 +1673,6 @@ impl ServerAgenticLoopHostBuilder {
             disabled_tool_offers: self
                 .disabled_tool_offers
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashSet::new()))),
-            disabled_tool_names: self
-                .disabled_tool_names
-                .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashSet::new()))),
             provider_allowed_tools: self
                 .provider_allowed_tools
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashMap::new()))),
@@ -1704,14 +1695,6 @@ impl ServerAgenticLoopHostBuilder {
         handle: Arc<tokio::sync::RwLock<HashSet<String>>>,
     ) -> Self {
         self.disabled_tool_offers = Some(handle);
-        self
-    }
-
-    pub fn with_disabled_tool_names(
-        mut self,
-        handle: Arc<tokio::sync::RwLock<HashSet<String>>>,
-    ) -> Self {
-        self.disabled_tool_names = Some(handle);
         self
     }
 
@@ -3499,13 +3482,6 @@ impl ServerAgenticLoopHost {
             .unwrap_or_default()
     }
 
-    fn disabled_tool_names_snapshot(&self) -> HashSet<String> {
-        self.disabled_tool_names
-            .try_read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
-    }
-
     fn provider_allowed_tools_snapshot(&self) -> HashMap<String, HashSet<String>> {
         self.provider_allowed_tools
             .try_read()
@@ -3524,7 +3500,6 @@ impl ServerAgenticLoopHost {
                 .map(|runtime| runtime.platform)
                 .unwrap_or(astra_runtime_env::RuntimePlatform::Unknown),
             disabled_tool_offers: self.disabled_tool_offers_snapshot(),
-            disabled_tool_names: self.disabled_tool_names_snapshot(),
             provider_allowed_tools: self.provider_allowed_tools_snapshot(),
         }
     }
@@ -7257,8 +7232,8 @@ mod tests {
 
     #[test]
     fn builder_applies_tool_policy_to_initial_prompt_surface() {
-        let disabled_names = Arc::new(tokio::sync::RwLock::new(HashSet::from([
-            "web_search".to_string()
+        let disabled_offers = Arc::new(tokio::sync::RwLock::new(HashSet::from([
+            "web_search@server-builtin".to_string(),
         ])));
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -7266,7 +7241,7 @@ mod tests {
             "user1".to_string(),
             "sess1".to_string(),
         )
-        .with_disabled_tool_names(disabled_names)
+        .with_disabled_tool_offers(disabled_offers)
         .build();
 
         let names = schema_names(&host.tool_schemas);

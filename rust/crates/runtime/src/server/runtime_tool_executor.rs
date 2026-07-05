@@ -924,11 +924,6 @@ impl RuntimeToolExecutor {
         let context = self
             .tool_execution_service
             .tool_admission_context_snapshot();
-        if context.disabled_tool_names.contains(name) {
-            return Some(astra_runtime_env::ToolUnavailableReason::PolicyDenied(
-                "tool disabled by policy".to_string(),
-            ));
-        }
         let offer_id = format!("{name}@request-scoped-mcp");
         if context.disabled_tool_offers.contains(&offer_id) {
             return Some(astra_runtime_env::ToolUnavailableReason::PolicyDenied(
@@ -1627,9 +1622,6 @@ fn admission_hidden_reason_to_unavailable(
         )),
         ToolHiddenReason::DisabledOffer => Some(ToolUnavailableReason::PolicyDenied(
             "tool offer disabled by policy".to_string(),
-        )),
-        ToolHiddenReason::DisabledTool => Some(ToolUnavailableReason::PolicyDenied(
-            "tool disabled by policy".to_string(),
         )),
         ToolHiddenReason::ProviderToolNotAllowed => Some(ToolUnavailableReason::PolicyDenied(
             "tool not allowed for selected provider".to_string(),
@@ -5232,22 +5224,22 @@ esac
     }
 
     #[tokio::test]
-    async fn disabled_runtime_tool_name_prunes_executor_surface_and_tool_search() {
+    async fn disabled_runtime_tool_offer_prunes_executor_surface_and_tool_search() {
         let (mut exec, _dir) = test_executor();
         exec = exec.with_tool_execution_service(
             ToolExecutionService::builder()
-                .initial_disabled_tool_names(&["bash".to_string()])
+                .initial_disabled_tool_offers(&["bash@server-sandbox".to_string()])
                 .build(),
         );
 
         let names = schema_name_set(exec.tool_schemas());
         assert!(
             !names.contains("bash"),
-            "disabled runtime tool names must not be prompt-visible"
+            "disabled runtime tool offers must not be prompt-visible"
         );
         assert!(
             !exec.tool_runtime_ready("bash"),
-            "disabled runtime tool names must not be readiness-visible"
+            "disabled runtime tool offers must not be readiness-visible"
         );
 
         let searchable = exec.capability_filtered_server_tool_schemas();
@@ -5267,7 +5259,7 @@ esac
                 .unwrap()
                 .iter()
                 .any(|value| value.as_str() == Some("bash")),
-            "disabled runtime tool should be reported missing from searchable surface: {}",
+            "disabled runtime tool offer should be reported missing from searchable surface: {}",
             result.output
         );
     }
@@ -5481,7 +5473,7 @@ esac
     }
 
     #[tokio::test]
-    async fn disabled_request_scoped_mcp_tool_name_blocks_execution() {
+    async fn disabled_request_scoped_mcp_offer_blocks_execution() {
         let (mut exec, _dir) = test_executor();
         let schema = json!({
             "type": "function",
@@ -5504,7 +5496,7 @@ esac
         ));
         exec = exec.with_tool_execution_service(
             ToolExecutionService::builder()
-                .initial_disabled_tool_names(&["mcp__calculator".to_string()])
+                .initial_disabled_tool_offers(&["mcp__calculator@request-scoped-mcp".to_string()])
                 .build(),
         );
 

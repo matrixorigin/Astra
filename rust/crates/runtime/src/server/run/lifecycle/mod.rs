@@ -3234,7 +3234,6 @@ impl AgenticRunLifecycleService {
         if let Some(ref shared_tes) = self.tool_execution_service {
             builder = builder
                 .with_disabled_tool_offers(shared_tes.disabled_tool_offers_handle())
-                .with_disabled_tool_names(shared_tes.disabled_tool_names_handle())
                 .with_provider_allowed_tools(shared_tes.provider_allowed_tools_handle());
         }
         // Wire test LLM rounds from request context (E2E test hook).
@@ -3524,11 +3523,6 @@ impl AgenticRunLifecycleService {
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(request.model.as_deref());
-        let restricted_tools: std::collections::HashSet<String> = load_deployment_tool_policy()
-            .disabled_tool_names
-            .into_iter()
-            .collect();
-
         AgenticLoopState {
             messages: vec![user_message],
             volatile_pending: Vec::new(),
@@ -3563,7 +3557,7 @@ impl AgenticRunLifecycleService {
             llm_rounds_completed: 0,
             last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
-            restricted_tools,
+            restricted_tools: std::collections::HashSet::new(),
             boosted_tools: std::collections::HashSet::new(),
             widen_selection_pending: false,
             step_recorder: StepRecorder::new(user_id, session_id, run_id),
@@ -7821,7 +7815,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
         if let Some(ref shared_tes) = self.tool_execution_service {
             builder = builder
                 .with_disabled_tool_offers(shared_tes.disabled_tool_offers_handle())
-                .with_disabled_tool_names(shared_tes.disabled_tool_names_handle())
                 .with_provider_allowed_tools(shared_tes.provider_allowed_tools_handle());
         }
         let mut host = builder.build();
@@ -7872,10 +7865,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(config.agent_profile.model_override.as_deref());
-        let restricted_tools: std::collections::HashSet<String> = load_deployment_tool_policy()
-            .disabled_tool_names
-            .into_iter()
-            .collect();
         let permission_context = PermissionSyncContext::shared(self.inherited_permissions.clone());
 
         let mut loop_state = AgenticLoopState {
@@ -7912,7 +7901,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             llm_rounds_completed: 0,
             last_request_message_count: None,
             turn_guard: TurnGuard::new(),
-            restricted_tools,
+            restricted_tools: std::collections::HashSet::new(),
             boosted_tools: std::collections::HashSet::new(),
             widen_selection_pending: false,
             step_recorder: StepRecorder::new(&config.user_id, &config.session_id, &config.run_id),

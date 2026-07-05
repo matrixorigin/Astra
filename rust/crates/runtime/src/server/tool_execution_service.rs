@@ -40,7 +40,6 @@ pub struct ToolExecutionServiceBuilder {
     sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
     disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
-    disabled_tool_names: Arc<RwLock<HashSet<String>>>,
     provider_allowed_tools: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
@@ -100,11 +99,6 @@ impl ToolExecutionServiceBuilder {
         self
     }
 
-    pub fn initial_disabled_tool_names(mut self, tools: &[String]) -> Self {
-        self.disabled_tool_names = Arc::new(RwLock::new(tools.iter().cloned().collect()));
-        self
-    }
-
     pub fn initial_provider_allowed_tools(
         mut self,
         tools: HashMap<String, HashSet<String>>,
@@ -123,7 +117,6 @@ impl ToolExecutionServiceBuilder {
             sandbox_resident_agent_transport: self.sandbox_resident_agent_transport,
             tool_registry: self.tool_registry,
             disabled_tool_offers: self.disabled_tool_offers,
-            disabled_tool_names: self.disabled_tool_names,
             provider_allowed_tools: self.provider_allowed_tools,
         }
     }
@@ -139,8 +132,6 @@ pub struct ToolExecutionService {
     tool_registry: astra_runtime_env::ToolRegistry,
     /// Runtime-disabled tool offers (admin API/config). Checked before dispatch.
     disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
-    /// Runtime-disabled canonical tool names. Disables every provider offer.
-    disabled_tool_names: Arc<RwLock<HashSet<String>>>,
     /// Optional exact allowlist per provider id. Missing provider id means
     /// unrestricted; present provider id means only listed canonical tools.
     provider_allowed_tools: Arc<RwLock<HashMap<String, HashSet<String>>>>,
@@ -197,10 +188,6 @@ impl ToolExecutionService {
         Arc::clone(&self.disabled_tool_offers)
     }
 
-    pub fn disabled_tool_names_handle(&self) -> Arc<RwLock<HashSet<String>>> {
-        Arc::clone(&self.disabled_tool_names)
-    }
-
     pub fn provider_allowed_tools_handle(&self) -> Arc<RwLock<HashMap<String, HashSet<String>>>> {
         Arc::clone(&self.provider_allowed_tools)
     }
@@ -209,11 +196,6 @@ impl ToolExecutionService {
         ToolAdmissionContext {
             disabled_tool_offers: self
                 .disabled_tool_offers
-                .try_read()
-                .map(|guard| guard.clone())
-                .unwrap_or_default(),
-            disabled_tool_names: self
-                .disabled_tool_names
                 .try_read()
                 .map(|guard| guard.clone())
                 .unwrap_or_default(),
@@ -361,7 +343,6 @@ impl ToolExecutionService {
 
         // ── Runtime offer policy check (admin API / config) ──
         let disabled_offer_ids = self.disabled_tool_offers.read().await.clone();
-        let disabled_tool_names = self.disabled_tool_names.read().await.clone();
         let provider_allowed_tools = self.provider_allowed_tools.read().await.clone();
         let admission = resolve_tool_admission_for_binding_with_context(
             &transport_request.tool_name,
@@ -372,17 +353,13 @@ impl ToolExecutionService {
             &self.tool_registry,
             ToolAdmissionContext {
                 disabled_tool_offers: disabled_offer_ids.clone(),
-                disabled_tool_names: disabled_tool_names.clone(),
                 provider_allowed_tools: provider_allowed_tools.clone(),
                 ..ToolAdmissionContext::default()
             },
         );
-        if let Some(offer_id) = disabled_offer_id_for_request(
-            &transport_request,
-            &admission,
-            &disabled_offer_ids,
-            &disabled_tool_names,
-        ) {
+        if let Some(offer_id) =
+            disabled_offer_id_for_request(&transport_request, &admission, &disabled_offer_ids)
+        {
             let mut meta = serde_json::Map::new();
             meta.insert("tool_disabled".to_string(), serde_json::Value::Bool(true));
             meta.insert(
@@ -611,19 +588,12 @@ fn disabled_offer_id_for_request(
     request: &ToolExecutionRequest,
     admission: &super::tool_admission::ToolAdmissionDecision,
     disabled_offer_ids: &HashSet<String>,
-    disabled_tool_names: &HashSet<String>,
 ) -> Option<String> {
-    if matches!(
-        admission.hidden_reason,
-        Some(ToolHiddenReason::DisabledOffer | ToolHiddenReason::DisabledTool)
-    ) {
+    if admission.hidden_reason == Some(ToolHiddenReason::DisabledOffer) {
         return admission.selected_offer_id().map(str::to_string);
     }
     if request.tool_name.starts_with("mcp__") {
         let request_scoped_offer_id = format!("{}@request-scoped-mcp", request.tool_name);
-        if disabled_tool_names.contains(&request.tool_name) {
-            return Some(request_scoped_offer_id);
-        }
         if disabled_offer_ids.contains(&request_scoped_offer_id) {
             return Some(request_scoped_offer_id);
         }

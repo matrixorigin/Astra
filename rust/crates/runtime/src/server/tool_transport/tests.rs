@@ -3094,31 +3094,6 @@ async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
 }
 
 #[tokio::test]
-async fn disabled_tool_name_blocks_every_selected_offer_before_transport() {
-    let service = ToolExecutionService::builder()
-        .initial_disabled_tool_names(&["web_fetch".to_string()])
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let result = service
-        .execute(
-            request(
-                "web_fetch",
-                WorkspaceBinding::none(),
-                ExecutorBinding::server_local(),
-            ),
-            &local,
-        )
-        .await;
-
-    assert!(result.is_error, "{result:?}");
-    let metadata = result.metadata.expect("disabled metadata");
-    assert_eq!(metadata["tool_disabled"], true);
-    assert_eq!(metadata["tool_offer_id"], "web_fetch@server-builtin");
-    assert_eq!(local.calls(), 0);
-}
-
-#[tokio::test]
 async fn provider_allowlist_blocks_selected_edge_offer_without_server_reroute() {
     let dispatch = Arc::new(StaticEdgeDispatch::default());
     let service = ToolExecutionService::builder()

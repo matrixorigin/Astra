@@ -54,7 +54,6 @@ pub(crate) enum ToolHiddenReason {
     UnsupportedRoute,
     SchemaConflict,
     DisabledOffer,
-    DisabledTool,
     ProviderToolNotAllowed,
 }
 
@@ -75,7 +74,6 @@ pub(crate) struct ToolAdmissionContext {
     pub request_scoped_mcp_provider_ready: bool,
     pub selected_runtime_platform: astra_runtime_env::RuntimePlatform,
     pub disabled_tool_offers: HashSet<String>,
-    pub disabled_tool_names: HashSet<String>,
     pub provider_allowed_tools: HashMap<String, HashSet<String>>,
 }
 
@@ -87,7 +85,6 @@ impl Default for ToolAdmissionContext {
             request_scoped_mcp_provider_ready: false,
             selected_runtime_platform: astra_runtime_env::RuntimePlatform::Unknown,
             disabled_tool_offers: HashSet::new(),
-            disabled_tool_names: HashSet::new(),
             provider_allowed_tools: HashMap::new(),
         }
     }
@@ -195,9 +192,6 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     let selected_offer_disabled = selected_offer_before_policy
         .as_ref()
         .is_some_and(|offer| offer_disabled(context, offer));
-    let selected_tool_disabled = selected_offer_before_policy
-        .as_ref()
-        .is_some_and(|offer| context.disabled_tool_names.contains(&offer.tool_name));
     let selected_offer_disallowed = selected_offer_before_policy
         .as_ref()
         .is_some_and(|offer| !provider_allows_tool(context, &offer.provider_id, &offer.tool_name));
@@ -222,11 +216,7 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
             return Some(ToolHiddenReason::ProviderRouteMismatch);
         }
         if selected_offer_disabled {
-            return Some(if selected_tool_disabled {
-                ToolHiddenReason::DisabledTool
-            } else {
-                ToolHiddenReason::DisabledOffer
-            });
+            return Some(ToolHiddenReason::DisabledOffer);
         }
         if selected_offer_disallowed {
             return Some(ToolHiddenReason::ProviderToolNotAllowed);
@@ -238,7 +228,6 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     } else if matches!(
         hidden_reason,
         None | Some(ToolHiddenReason::DisabledOffer)
-            | Some(ToolHiddenReason::DisabledTool)
             | Some(ToolHiddenReason::ProviderToolNotAllowed)
     ) && !matches!(class, ToolExecutionClass::TurnPipelineIntercept)
     {
@@ -534,8 +523,7 @@ fn has_schema_conflict_for_enabled_candidates(
 }
 
 fn offer_disabled(context: &ToolAdmissionContext, offer: &ToolOffer) -> bool {
-    context.disabled_tool_names.contains(&offer.tool_name)
-        || context.disabled_tool_offers.contains(&offer.offer_id)
+    context.disabled_tool_offers.contains(&offer.offer_id)
 }
 
 fn provider_allows_tool(
@@ -1108,41 +1096,6 @@ mod tests {
         assert_eq!(
             server_candidate.reason,
             ToolOfferCandidateReason::ProviderToolNotAllowed
-        );
-    }
-
-    #[test]
-    fn disabled_tool_name_hides_every_offer_for_selected_route() {
-        let decision = resolve_tool_admission_for_binding_with_context(
-            "web_fetch",
-            &[],
-            &WorkspaceBinding::edge_workspace(
-                "MacBook Pro",
-                "/Users/test/project",
-                WorkspaceAuthority::ReadWrite,
-            ),
-            &ExecutorBinding::edge_agent(
-                "edge-macpro",
-                "MacBook Pro",
-                ToolTransportKind::EdgeWs,
-                ExecutorStatus::Online,
-            ),
-            None,
-            &registry(),
-            ToolAdmissionContext {
-                disabled_tool_names: HashSet::from(["web_fetch".to_string()]),
-                ..ToolAdmissionContext::default()
-            },
-        );
-
-        assert!(!decision.visible);
-        assert_eq!(decision.hidden_reason, Some(ToolHiddenReason::DisabledTool));
-        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
-        assert!(
-            decision
-                .candidates
-                .iter()
-                .all(|candidate| candidate.reason == ToolOfferCandidateReason::Disabled)
         );
     }
 
