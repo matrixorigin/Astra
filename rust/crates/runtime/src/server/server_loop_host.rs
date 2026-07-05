@@ -1565,6 +1565,12 @@ impl ServerAgenticLoopHostBuilder {
         }
         append_tool_schemas_unique(&mut admission_tool_schemas, self.edge_tools.clone());
         let server_catalog_tool_surface = !server_catalog_tools.is_empty();
+        let runtime_declared_tool_names: HashSet<String> = self
+            .edge_tools
+            .iter()
+            .filter_map(tool_schema_name)
+            .map(str::to_string)
+            .collect();
         let tool_schemas = if self.edge_tools.is_empty() {
             server_catalog_tools
         } else {
@@ -1582,6 +1588,7 @@ impl ServerAgenticLoopHostBuilder {
                 &schema_executor,
                 schema_runtime.as_ref(),
                 schema_admission_context,
+                &runtime_declared_tool_names,
             );
             surface
         };
@@ -1755,6 +1762,7 @@ fn append_server_owned_tool_schemas_unique(
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
     admission_context: ToolAdmissionContext,
+    runtime_declared_tool_names: &HashSet<String>,
 ) {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let mut seen: HashSet<String> = surface
@@ -1765,6 +1773,22 @@ fn append_server_owned_tool_schemas_unique(
         let Some(name) = tool_schema_name(&schema) else {
             continue;
         };
+        let Some(spec) = registry.get(name) else {
+            continue;
+        };
+        match spec.required.executor {
+            astra_runtime_env::RequiredExecutor::RuntimeExecutor => continue,
+            astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor => {
+                if runtime_declared_tool_names.contains(name) {
+                    continue;
+                }
+                if seen.insert(name.to_string()) {
+                    surface.push(schema);
+                }
+                continue;
+            }
+            _ => {}
+        }
         let admission = resolve_tool_admission_for_binding_with_context(
             name,
             &candidates,
@@ -9193,6 +9217,36 @@ mod tests {
         );
         assert!(visible_names.contains("read_file"));
         assert!(!visible_names.contains("bash"));
+    }
+
+    #[test]
+    fn disabled_edge_shared_offer_does_not_fallback_to_server_offer() {
+        let disabled: HashSet<String> = ["web_fetch@edge-1".to_string()].into_iter().collect();
+        let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools_with_web_fetch())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_disabled_tool_offers(disabled_handle)
+        .build();
+
+        let mut state = create_test_state();
+        let visible = host.visible_turn_tools(&mut state);
+        let visible_names = schema_names(&visible);
+
+        assert!(
+            !visible_names.contains("web_fetch"),
+            "disabled edge-owned shared offer must not be silently replaced by the server offer"
+        );
+        assert!(
+            visible_names.contains("web_search"),
+            "server-owned shared tools remain available when the selected runtime provider did not advertise that tool"
+        );
     }
 
     #[test]

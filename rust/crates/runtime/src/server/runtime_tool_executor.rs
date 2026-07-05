@@ -4094,12 +4094,39 @@ esac
     async fn disabled_server_builtin_catalog_keeps_explicit_sandbox_and_mcp_routes() {
         let (mut exec, _dir) = test_executor();
         exec = exec.with_server_builtin_tools_disabled();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__demo__search",
+                "description": "Search the demo MCP source.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }
+        })]);
 
         let sandbox_tool = exec
             .execute_with_metadata("bash", &json!({"command": "echo should-not-run"}))
             .await;
         assert!(!sandbox_tool.is_error, "{sandbox_tool:?}");
         assert_eq!(sandbox_tool.output, "should-not-run\n");
+
+        let mcp_request =
+            exec.tool_execution_request("mcp__demo__search", &json!({"query": "hello"}));
+        let selected_offer = mcp_request
+            .selected_offer
+            .as_ref()
+            .expect("request-scoped MCP schema must produce a selected offer");
+        assert_eq!(
+            selected_offer.offer_id,
+            "mcp__demo__search@request-scoped-mcp"
+        );
+        assert_eq!(
+            selected_offer.route,
+            crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp
+        );
 
         let mcp = exec
             .execute_with_metadata("mcp__demo__search", &json!({"query": "hello"}))

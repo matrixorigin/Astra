@@ -152,7 +152,7 @@ pub fn cli_local_tool_schemas(
         .collect::<Vec<_>>();
     for schema in client_mcp {
         if let Some(name) = tool_schema_name(&schema)
-            && name.starts_with("mcp__")
+            && astra_runtime_env::is_mcp_namespaced_tool_name(name)
         {
             pool.push(schema);
         }
@@ -167,11 +167,9 @@ pub fn cli_remote_tool_schemas(
     capabilities: &astra_turn_core::capability::CapabilitySet,
 ) -> Vec<Value> {
     let mut pool = server_builtin_tool_schemas(capabilities);
-    pool.extend(
-        server_mcp.into_iter().filter(|schema| {
-            tool_schema_name(schema).is_some_and(|name| name.starts_with("mcp__"))
-        }),
-    );
+    pool.extend(server_mcp.into_iter().filter(|schema| {
+        tool_schema_name(schema).is_some_and(astra_runtime_env::is_mcp_namespaced_tool_name)
+    }));
     let mut schemas =
         astra_turn_core::tool_surface::resolve(CapabilitySurface::CliRemote, capabilities, &pool);
     if !capabilities.has(astra_turn_core::capability::Capability::ReflectService) {
@@ -511,6 +509,8 @@ mod tests {
         let tool_names = names(cli_remote_tool_schemas(
             vec![
                 schema("mcp__server_docs__query"),
+                schema("mcp__"),
+                schema("mcp__bad/name"),
                 schema("read_file"),
                 schema("powershell"),
                 json!({"type": "custom", "function": {"name": "mcp__custom__bad"}}),
@@ -521,7 +521,13 @@ mod tests {
         assert!(tool_names.contains(&"tool_search".to_string()));
         assert!(tool_names.contains(&"memory".to_string()));
         assert!(tool_names.contains(&"mcp__server_docs__query".to_string()));
-        for hidden in ["read_file", "powershell", "mcp__custom__bad"] {
+        for hidden in [
+            "read_file",
+            "powershell",
+            "mcp__custom__bad",
+            "mcp__",
+            "mcp__bad/name",
+        ] {
             assert!(
                 !tool_names.contains(&hidden.to_string()),
                 "{hidden} must not enter remote CLI server-executed schema surface: {tool_names:?}"
@@ -816,7 +822,11 @@ mod tests {
                 schema("ask_user"),
                 schema("custom_local_builtin"),
             ],
-            vec![schema("mcp__local__query")],
+            vec![
+                schema("mcp__local__query"),
+                schema("mcp__"),
+                schema("mcp__bad/name"),
+            ],
             &caps,
         ));
 
@@ -836,6 +846,12 @@ mod tests {
             !tool_names.contains(&"custom_local_builtin".to_string()),
             "client builtin schemas must still be declared by a CLI/server provider"
         );
+        for invalid in ["mcp__", "mcp__bad/name"] {
+            assert!(
+                !tool_names.contains(&invalid.to_string()),
+                "invalid MCP schema name {invalid:?} must not enter local CLI catalog: {tool_names:?}"
+            );
+        }
     }
 
     #[test]
