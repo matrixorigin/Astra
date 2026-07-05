@@ -577,6 +577,17 @@ mod tests {
             .collect()
     }
 
+    fn contains_object_key(value: &Value, needle: &str) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.contains_key(needle)
+                    || map.values().any(|child| contains_object_key(child, needle))
+            }
+            Value::Array(items) => items.iter().any(|child| contains_object_key(child, needle)),
+            _ => false,
+        }
+    }
+
     // ── tool surface routing ──
 
     #[test]
@@ -996,6 +1007,82 @@ mod tests {
             !tool_names.contains(&"mcp__docs__query".to_string()),
             "conflicting MCP offers must be hidden instead of first-wins"
         );
+    }
+
+    #[test]
+    fn cli_local_catalog_is_byte_stable_for_identical_inputs() {
+        let caps = full_server_capabilities_for_tests();
+        let client_mcp = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__docs__query",
+                    "description": "Query local docs.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__tickets__search",
+                    "description": "Search local tickets.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "q": { "type": "string" }
+                        },
+                        "required": ["q"]
+                    }
+                }
+            }),
+        ];
+
+        let first = cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            client_mcp.clone(),
+            &caps,
+        );
+        let second =
+            cli_local_tool_schemas(astra_tools::schemas::all_tool_schemas(), client_mcp, &caps);
+
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first tool schema list"),
+            serde_json::to_vec(&second).expect("serialize second tool schema list"),
+            "CLI local tool schema list must be byte-stable for identical provider inputs"
+        );
+    }
+
+    #[test]
+    fn cli_local_prompt_schemas_do_not_embed_provider_or_route_metadata() {
+        let caps = full_server_capabilities_for_tests();
+        let schemas = cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            vec![schema("mcp__docs__query")],
+            &caps,
+        );
+
+        for forbidden_key in [
+            "provider_id",
+            "provider_type",
+            "capacity_provider",
+            "offer_id",
+            "selected_offer",
+            "selected_route",
+            "executor_id",
+        ] {
+            assert!(
+                !schemas
+                    .iter()
+                    .any(|schema| contains_object_key(schema, forbidden_key)),
+                "provider/executor routing metadata key `{forbidden_key}` must not enter prompt-visible tool schemas"
+            );
+        }
     }
 
     #[test]
