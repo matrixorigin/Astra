@@ -76,11 +76,12 @@ pub(super) fn execution_result_is_error(
     tool_result_fields: Option<&Map<String, Value>>,
 ) -> bool {
     let metadata_failed = tool_result_fields.is_some_and(|fields| {
-        let failed_status = fields
+        let status_exit_code = fields
             .get("status")
             .and_then(serde_json::Value::as_str)
-            .and_then(edge_tool_status_exit_code)
-            .is_some_and(|exit_code| exit_code != 0);
+            .and_then(edge_tool_status_exit_code);
+        let failed_status = status_exit_code.is_some_and(|exit_code| exit_code != 0);
+        let successful_status = status_exit_code == Some(0);
         let runtime_error = fields.get("runtime_error").is_some();
         let blocked = fields
             .get("blocked")
@@ -88,7 +89,7 @@ pub(super) fn execution_result_is_error(
             .unwrap_or(false);
         let explicit_error_kind = fields.get("error_kind").is_some();
 
-        failed_status || runtime_error || blocked || explicit_error_kind
+        failed_status || runtime_error || blocked || (explicit_error_kind && !successful_status)
     });
 
     match classify_tool_error(name, result_str) {
@@ -165,6 +166,30 @@ mod tests {
             "Replaced 1 occurrence\n<<<ASTRA_TOOL_OK>>>",
             Some(&fields),
         ));
+    }
+
+    #[test]
+    fn successful_status_ignores_stale_error_kind_without_runtime_error() {
+        let mut fields = Map::new();
+        fields.insert("status".to_string(), Value::String("completed".to_string()));
+        fields.insert(
+            "error_kind".to_string(),
+            Value::String("transport_disconnected".to_string()),
+        );
+
+        assert!(!execution_result_is_error("list_dir", "ok", Some(&fields)));
+    }
+
+    #[test]
+    fn runtime_error_still_fails_even_with_successful_status() {
+        let mut fields = Map::new();
+        fields.insert("status".to_string(), Value::String("completed".to_string()));
+        fields.insert(
+            "runtime_error".to_string(),
+            serde_json::json!({"kind": "transport_disconnected"}),
+        );
+
+        assert!(execution_result_is_error("list_dir", "ok", Some(&fields)));
     }
 }
 
