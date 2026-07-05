@@ -78,6 +78,7 @@ use astra_tools::plan_task_mirror;
 
 mod tool_handlers;
 
+#[cfg(test)]
 fn resolved_server_tool_names(
     capabilities: &astra_turn_core::capability::CapabilitySet,
     workspace: &WorkspaceBinding,
@@ -93,7 +94,9 @@ fn resolved_server_tool_names(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolAdmission {
     Ready,
+    UnknownTool,
     MissingRuntimeBinding,
+    RuntimeBindingBusy(&'static str),
     RuntimeEnvironmentDenied(astra_runtime_env::ToolUnavailableReason),
     MissingCapability(Capability),
     MissingService(Capability),
@@ -685,6 +688,7 @@ impl RuntimeToolExecutor {
         }
     }
 
+    #[cfg(test)]
     fn supports_server_tool_name(&self, tool: &str) -> bool {
         if !self.server_builtin_tools_enabled {
             return false;
@@ -749,11 +753,7 @@ impl RuntimeToolExecutor {
 
     fn tool_admission_for_call(&self, name: &str, args: &Value) -> ToolAdmission {
         if name.starts_with("mcp__") {
-            return if self.mcp_tool_has_runtime_binding(name) {
-                ToolAdmission::Ready
-            } else {
-                ToolAdmission::MissingRuntimeBinding
-            };
+            return self.mcp_tool_admission(name);
         }
 
         if let Some(reason) = self.runtime_environment_tool_denial(name, args) {
@@ -764,7 +764,7 @@ impl RuntimeToolExecutor {
             return if self.tool_engine.contains(name) {
                 ToolAdmission::Ready
             } else {
-                ToolAdmission::MissingRuntimeBinding
+                ToolAdmission::UnknownTool
             };
         };
 
@@ -809,7 +809,10 @@ impl RuntimeToolExecutor {
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
         if name.starts_with("mcp__") {
-            return self.mcp_tool_has_runtime_binding(name);
+            return matches!(
+                self.mcp_tool_admission(name),
+                ToolAdmission::Ready | ToolAdmission::RuntimeBindingBusy(_)
+            );
         }
         if self
             .runtime_environment_tool_denial(name, &Value::Null)
@@ -826,28 +829,41 @@ impl RuntimeToolExecutor {
     }
 
     fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
+        matches!(
+            self.mcp_tool_admission(name),
+            ToolAdmission::Ready | ToolAdmission::RuntimeBindingBusy(_)
+        )
+    }
+
+    fn mcp_tool_admission(&self, name: &str) -> ToolAdmission {
         if self
             .agent_binding_mcp
             .as_ref()
             .is_some_and(|runtime| runtime.owns_public_tool_name(name))
         {
-            return true;
+            return ToolAdmission::Ready;
         }
         let Some(manager) = &self.mcp_manager else {
-            return false;
+            return ToolAdmission::MissingRuntimeBinding;
         };
-        manager
-            .try_read()
-            .is_ok_and(|manager| manager.find_tool_by_mcp_name(name).is_some())
+        match manager.try_read() {
+            Ok(manager) if manager.find_tool_by_mcp_name(name).is_some() => ToolAdmission::Ready,
+            Ok(_) => ToolAdmission::UnknownTool,
+            Err(_) => ToolAdmission::RuntimeBindingBusy("mcp_registry"),
+        }
     }
 
     fn capability_has_runtime_binding(&self, capability: Capability) -> bool {
-        if !capability.is_executor_gated() {
-            return true;
-        }
         match capability {
             Capability::AgentSpawner => self.agent_tool_context.is_some(),
-            _ => true,
+            Capability::MemoryService
+            | Capability::Database
+            | Capability::SkillsCatalog
+            | Capability::GitHubAuth
+            | Capability::LSPServer
+            | Capability::PlanLifecycle
+            | Capability::LocalBackgroundTasks
+            | Capability::ReflectService => !capability.is_executor_gated(),
         }
     }
 
@@ -911,6 +927,40 @@ impl RuntimeToolExecutor {
         )
     }
 
+    fn runtime_binding_busy_error_result(
+        &self,
+        name: &str,
+        provider: &'static str,
+    ) -> astra_tools::ToolResult {
+        tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error": format!(
+                    "Tool `{name}` is temporarily unavailable because runtime binding provider `{provider}` is refreshing or reconnecting. Retry the same tool call after the provider is ready."
+                ),
+                "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                "runtime_binding_state": "busy",
+                "runtime_binding_provider": provider,
+                "retryable": true,
+            })
+            .to_string(),
+        )
+    }
+
+    fn unknown_tool_error_result(&self, name: &str) -> astra_tools::ToolResult {
+        tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error": format!(
+                    "Unknown tool `{name}`. Use only tools advertised in the current turn surface; do not retry this exact name unless it appears in the tool schema."
+                ),
+                "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
+                "retryable": false,
+            })
+            .to_string(),
+        )
+    }
+
     fn capability_unavailable_error_result(
         &self,
         name: &str,
@@ -958,6 +1008,7 @@ impl RuntimeToolExecutor {
     ) -> Option<astra_tools::ToolResult> {
         match self.tool_admission_for_call(name, args) {
             ToolAdmission::Ready => None,
+            ToolAdmission::UnknownTool => Some(self.unknown_tool_error_result(name)),
             ToolAdmission::MissingRuntimeBinding
                 if self.tool_can_validate_without_runtime_binding(name, args) =>
             {
@@ -965,6 +1016,9 @@ impl RuntimeToolExecutor {
             }
             ToolAdmission::MissingRuntimeBinding => {
                 Some(self.runtime_binding_error_result(name, args))
+            }
+            ToolAdmission::RuntimeBindingBusy(provider) => {
+                Some(self.runtime_binding_busy_error_result(name, provider))
             }
             ToolAdmission::RuntimeEnvironmentDenied(reason) => {
                 Some(self.runtime_environment_denial_error_result(name, &reason))
@@ -1451,18 +1505,17 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
         request: &ToolExecutionRequest,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        if self.enforce_server_tool_capabilities {
+            if let Some(result) =
+                self.tool_binding_preflight_result(&request.tool_name, &request.args)
+            {
+                return result;
+            }
+        }
         if request.tool_name.starts_with("mcp__") {
             return self
                 .execute_mcp_tool(&request.tool_name, &request.args)
                 .await;
-        }
-        if self.enforce_server_tool_capabilities
-            && !self.supports_server_tool_name(&request.tool_name)
-        {
-            return astra_tools::ToolResult::error(format!(
-                "Error: Tool '{}' is not available in this runtime capability surface.",
-                request.tool_name
-            ));
         }
         spawn_resource_tool_call_recording(&self.user_id, self.resource_governor.as_ref());
         let args = server_local_tool_arguments(request);
@@ -5463,7 +5516,8 @@ esac
     async fn unknown_tool_returns_error_message() {
         let (exec, _dir) = test_executor();
         let result = exec.execute("nonexistent_tool", &json!({})).await;
-        assert!(result.contains("not available"));
+        assert!(result.contains("Unknown tool"));
+        assert!(result.contains(astra_core::ErrorKind::ToolNotFound.as_str()));
     }
 
     struct AlwaysTimeoutGate;

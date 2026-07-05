@@ -131,7 +131,6 @@ fn has_explicit_runtime_executor_provider(
         )
         && runtime.is_none_or(|runtime| {
             runtime.status == astra_runtime_env::RuntimeStatus::Ready
-                && runtime.session_manager != astra_runtime_env::RuntimeSessionManager::None
                 && runtime.isolation_backend != astra_runtime_env::RuntimeIsolationBackend::None
         })
         && !matches!(

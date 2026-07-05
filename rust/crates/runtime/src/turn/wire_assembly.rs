@@ -469,12 +469,8 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
     } else {
         volatile_preamble
     };
-    let drained_text = render_drained_volatile(&drained_volatile);
-    if !suppress_volatile && !drained_text.is_empty() {
-        volatile_preamble.push(serde_json::json!({
-            "role": "user",
-            "content": drained_text,
-        }));
+    if !suppress_volatile {
+        volatile_preamble.extend(render_drained_volatile_messages(&drained_volatile));
     }
 
     // Belt-and-suspenders: legacy callers still push mid-history volatile
@@ -497,41 +493,97 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
     let mut synthetic_tail_start: Option<usize> = None;
     let mut synthetic_tail_end: Option<usize> = None;
     if !volatile_preamble.is_empty() {
-        let volatile_text: String = volatile_preamble
-            .iter()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !volatile_text.is_empty() {
+        let mut system_parts = Vec::new();
+        let mut user_parts = Vec::new();
+        for message in &volatile_preamble {
+            let Some(content) = message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::trim)
+            else {
+                continue;
+            };
+            if content.is_empty() {
+                continue;
+            }
+            match message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user")
+            {
+                "system" => system_parts.push(content.to_string()),
+                "user" => user_parts.push(content.to_string()),
+                _ => user_parts.push(content.to_string()),
+            }
+        }
+
+        let volatile_system_text = system_parts.join("\n\n");
+        let volatile_user_text = user_parts.join("\n\n");
+        let has_system_volatile = !volatile_system_text.is_empty();
+        let has_user_volatile = !volatile_user_text.is_empty();
+        if has_system_volatile || has_user_volatile {
             let tail_role = llm_messages
                 .last()
                 .and_then(|m| m.get("role").and_then(Value::as_str));
             if tail_role == Some("user") {
-                let last_user = llm_messages
-                    .last_mut()
-                    .expect("tail_role=user implies a last message exists");
-                let existing = last_user
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                last_user["content"] = Value::String(format!("{volatile_text}\n\n{existing}"));
+                if has_system_volatile {
+                    let insert_at = llm_messages.len().saturating_sub(1);
+                    synthetic_tail_start = Some(insert_at);
+                    llm_messages.insert(
+                        insert_at,
+                        serde_json::json!({
+                            "role": "system",
+                            "content": volatile_system_text,
+                        }),
+                    );
+                    synthetic_tail_end = Some(llm_messages.len());
+                }
+                if has_user_volatile {
+                    let last_user = llm_messages
+                        .last_mut()
+                        .expect("tail_role=user implies a last message exists");
+                    let existing = last_user
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    last_user["content"] =
+                        Value::String(format!("{volatile_user_text}\n\n{existing}"));
+                }
             } else if tail_role == Some("tool") {
                 synthetic_tail_start = Some(llm_messages.len());
                 llm_messages.push(serde_json::json!({
                     "role": "assistant",
                     "content": "Understood.",
                 }));
-                llm_messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": volatile_text,
-                }));
+                if has_system_volatile {
+                    llm_messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": volatile_system_text,
+                    }));
+                }
+                if has_user_volatile {
+                    llm_messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": volatile_user_text,
+                    }));
+                }
                 synthetic_tail_end = Some(llm_messages.len());
             } else {
                 // No tail user available — append one synthetic tail reminder
                 // instead of rewriting a historical user message.
                 synthetic_tail_start = Some(llm_messages.len());
-                llm_messages.push(serde_json::json!({"role": "user", "content": volatile_text}));
+                if has_system_volatile {
+                    llm_messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": volatile_system_text,
+                    }));
+                }
+                if has_user_volatile {
+                    llm_messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": volatile_user_text,
+                    }));
+                }
                 synthetic_tail_end = Some(llm_messages.len());
             }
         }
@@ -617,6 +669,33 @@ pub(crate) fn render_drained_volatile(
             out.push_str("\n\n");
         }
         out.push_str(text);
+    }
+    out
+}
+
+fn render_drained_volatile_messages(
+    drained: &[crate::turn::agentic_loop::host::VolatileInjection],
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    let user_text = render_drained_volatile(drained);
+    if !user_text.is_empty() {
+        out.push(serde_json::json!({
+            "role": "user",
+            "content": user_text,
+        }));
+    }
+    for inj in drained {
+        if inj.kind.render_in_user_tail() {
+            continue;
+        }
+        let text = inj.content.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "role": inj.kind.default_role(),
+            "content": text,
+        }));
     }
     out
 }
@@ -1486,10 +1565,20 @@ mod tests {
             !user_text.contains("Self-Status"),
             "runtime telemetry must not be rendered as user intent: {user_text}"
         );
+        let system_text = msgs
+            .iter()
+            .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
+            .filter_map(|msg| msg.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            system_text.contains("Self-Status"),
+            "runtime telemetry should remain visible in the system lane"
+        );
     }
 
     #[test]
-    fn active_turn_frame_anchors_latest_user_goal_in_tail_volatile() {
+    fn active_turn_frame_anchors_latest_user_goal_in_system_tail() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
             kind: crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
@@ -1517,12 +1606,20 @@ mod tests {
 
         assert_eq!(msgs[1]["content"], "一共多少 changes？");
         assert_eq!(msgs[2]["content"], "148 files");
-        let tail = msgs.last().unwrap()["content"].as_str().unwrap();
-        assert!(tail.contains("[active-turn-frame:v1]"));
-        assert!(tail.contains("相关的测试够硬核吗"));
+        assert_eq!(msgs[3]["role"], "system");
+        let system_tail = msgs[3]["content"].as_str().unwrap();
+        assert!(system_tail.contains("[active-turn-frame:v1]"));
+        assert!(system_tail.contains("相关的测试够硬核吗"));
         assert!(
-            tail.contains("active_goal"),
+            system_tail.contains("active_goal"),
             "active goal frame must stay explicit after tool rounds"
+        );
+        assert_eq!(msgs.last().unwrap()["role"], "user");
+        let latest_user = msgs.last().unwrap()["content"].as_str().unwrap();
+        assert_eq!(latest_user, "相关的测试够硬核吗？");
+        assert!(
+            !latest_user.contains("[active-turn-frame:v1]"),
+            "runtime goal frame must not be rendered as user intent"
         );
     }
 

@@ -249,7 +249,16 @@ async fn handle_edge_connection(
                                         continue;
                                     }
                                 };
+                                dispatch_inflight.lock().await.insert(
+                                    row.request_id.clone(),
+                                    InflightEdgeDispatch {
+                                        user_id: row.user_id.clone(),
+                                        edge_agent_id: row.edge_agent_id.clone(),
+                                        request_id: row.request_id.clone(),
+                                    },
+                                );
                                 if send_edge_msg(&dispatch_sink, msg).await.is_err() {
+                                    dispatch_inflight.lock().await.remove(&row.request_id);
                                     tracing::warn!(
                                         target: "astra_runtime::edge_ws",
                                         user_id = %row.user_id,
@@ -267,14 +276,6 @@ async fn handle_edge_connection(
                                     stop_dispatch = true;
                                     break;
                                 }
-                                dispatch_inflight.lock().await.insert(
-                                    row.request_id.clone(),
-                                    InflightEdgeDispatch {
-                                        user_id: row.user_id.clone(),
-                                        edge_agent_id: row.edge_agent_id.clone(),
-                                        request_id: row.request_id.clone(),
-                                    },
-                                );
                             }
                             if stop_dispatch {
                                 break;

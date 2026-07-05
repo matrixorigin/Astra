@@ -1569,7 +1569,25 @@ impl VolatileKind {
     /// diagnostic state, not user intent, so it is intentionally excluded.
     #[must_use]
     pub fn render_in_user_tail(self) -> bool {
-        !matches!(self, Self::SelfStatus)
+        matches!(
+            self,
+            Self::ToolHealthWarning
+                | Self::StallNudge
+                | Self::ParallelBatchingForce
+                | Self::ExecutionEscalation
+                | Self::Corrective
+                | Self::CircuitBreaker
+                | Self::BudgetAdvisory
+                | Self::CompactResume
+                | Self::TaskBoardCompletionGate
+                | Self::TaskBoardStartGate
+                | Self::ExecutionRetry
+                | Self::ExplorationBudget
+                | Self::ContextPressure
+                | Self::DeferredUserInput
+                | Self::BudgetReview
+                | Self::IntentDrift
+        )
     }
 
     /// Default wire role for this kind. System-role for coaching /
@@ -1595,12 +1613,12 @@ impl VolatileKind {
             | Self::ContextPressure
             | Self::DeferredUserInput
             | Self::BudgetReview
-            | Self::IntentDrift
-            | Self::ActiveTurnFrame => "user",
+            | Self::IntentDrift => "user",
             // System-role: prevents injection via attacker-crafted file content.
             Self::HallucinationTripwire => "system",
             // System-role: in-band runtime snapshots or coaching.
             Self::SelfStatus
+            | Self::ActiveTurnFrame
             | Self::WorkingSet
             | Self::AlreadyFetched
             | Self::ToolBatchCoaching

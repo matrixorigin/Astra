@@ -1520,7 +1520,11 @@ impl ServerAgenticLoopHostBuilder {
                 &schema_executor,
                 schema_runtime.as_ref(),
             );
-            append_server_owned_tool_schemas_unique(&mut surface, server_catalog_tools);
+            append_server_owned_tool_schemas_unique(
+                &mut surface,
+                server_catalog_tools,
+                self.server_builtin_tools_enabled,
+            );
             surface
         };
 
@@ -1646,7 +1650,11 @@ impl ServerAgenticLoopHostBuilder {
     }
 }
 
-fn append_server_owned_tool_schemas_unique(surface: &mut Vec<Value>, candidates: Vec<Value>) {
+fn append_server_owned_tool_schemas_unique(
+    surface: &mut Vec<Value>,
+    candidates: Vec<Value>,
+    server_builtin_tools_enabled: bool,
+) {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let mut seen: HashSet<String> = surface
         .iter()
@@ -1656,14 +1664,19 @@ fn append_server_owned_tool_schemas_unique(surface: &mut Vec<Value>, candidates:
         let Some(name) = tool_schema_name(&schema) else {
             continue;
         };
-        if !matches!(
-            tool_execution_owner(name, &registry),
+        match tool_execution_owner(name, &registry) {
             ToolExecutionOwner::ServerControlPlane
-                | ToolExecutionOwner::ServerRuntime
-                | ToolExecutionOwner::RequestScopedMcp
-                | ToolExecutionOwner::InterceptedTurnPipeline
-        ) {
-            continue;
+            | ToolExecutionOwner::ServerRuntime
+            | ToolExecutionOwner::InterceptedTurnPipeline
+                if !server_builtin_tools_enabled =>
+            {
+                continue;
+            }
+            ToolExecutionOwner::ServerControlPlane
+            | ToolExecutionOwner::ServerRuntime
+            | ToolExecutionOwner::RequestScopedMcp
+            | ToolExecutionOwner::InterceptedTurnPipeline => {}
+            _ => continue,
         }
         if seen.insert(name.to_string()) {
             surface.push(schema);
