@@ -403,7 +403,15 @@ impl CapabilityResolver {
         capabilities: &EffectiveCapabilitySet,
         providers: &[CapacityProviderDeclaration],
     ) -> Vec<Value> {
+        let provider_schema_conflicts = provider_schema_conflicting_tool_names(providers);
+        let prompt_schema_conflicts =
+            astra_core::tool_schema::prompt_schema_conflicting_tool_names(&schemas);
         self.filter_tool_schemas_impl(registry, schemas, capabilities, |tool_name| {
+            if provider_schema_conflicts.contains(tool_name)
+                || prompt_schema_conflicts.contains(tool_name)
+            {
+                return false;
+            }
             providers
                 .iter()
                 .any(|provider| provider.declares_tool(tool_name))
@@ -637,6 +645,26 @@ impl CapabilityResolver {
 }
 
 pub use astra_core::tool_schema::tool_schema_name;
+
+fn provider_schema_conflicting_tool_names(
+    providers: &[CapacityProviderDeclaration],
+) -> HashSet<String> {
+    let mut digests_by_tool: HashMap<String, HashSet<String>> = HashMap::new();
+    for provider in providers {
+        for tool_name in &provider.tool_names {
+            if let Some(digest) = provider.schema_digest_for_tool(tool_name) {
+                digests_by_tool
+                    .entry(tool_name.clone())
+                    .or_default()
+                    .insert(digest.to_string());
+            }
+        }
+    }
+    digests_by_tool
+        .into_iter()
+        .filter_map(|(tool_name, digests)| (digests.len() > 1).then_some(tool_name))
+        .collect()
+}
 
 fn control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
@@ -1717,6 +1745,128 @@ mod tests {
 
         // Only the single valid `bash` schema should remain — no duplicates.
         assert_eq!(names, vec!["bash".to_string()]);
+    }
+
+    #[test]
+    fn filter_tool_schemas_fails_closed_for_same_name_schema_conflict() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let schemas = vec![
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "script": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
+        ];
+
+        let names: Vec<String> = CapabilityResolver
+            .filter_tool_schemas_for_providers(
+                &registry,
+                schemas,
+                &binding.capabilities,
+                &local_cli_providers(&registry),
+            )
+            .into_iter()
+            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["read_file".to_string()],
+            "same-name schemas with different prompt contracts must fail closed"
+        );
+    }
+
+    #[test]
+    fn filter_tool_schemas_dedupes_same_name_equivalent_schema_without_prompt_churn() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let schemas = vec![
+            serde_json::json!({"function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+        ];
+
+        let filtered = CapabilityResolver.filter_tool_schemas_for_providers(
+            &registry,
+            schemas.clone(),
+            &binding.capabilities,
+            &local_cli_providers(&registry),
+        );
+        let names: Vec<String> = filtered
+            .iter()
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+            .collect();
+
+        assert_eq!(names, vec!["bash".to_string()]);
+        assert_eq!(
+            filtered,
+            vec![schemas[0].clone()],
+            "dedupe must keep the first canonical schema bytes stable"
+        );
+    }
+
+    #[test]
+    fn filter_tool_schemas_fails_closed_for_same_tool_provider_digest_conflict() {
+        let registry = registry();
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::none(),
+            ExecutorBinding {
+                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                executor_id: "mcp".to_string(),
+                display_name: "MCP".to_string(),
+                transport: crate::ToolTransportKind::McpHttp,
+                status: crate::ExecutorStatus::Online,
+            },
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+        );
+        let schemas = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "mcp__weather__query"}
+        })];
+        let providers = vec![
+            crate::request_scoped_mcp_provider("mcp-a", ["mcp__weather__query".to_string()])
+                .with_tool_schema_digest("mcp__weather__query", "sha256:a"),
+            crate::request_scoped_mcp_provider("mcp-b", ["mcp__weather__query".to_string()])
+                .with_tool_schema_digest("mcp__weather__query", "sha256:b"),
+        ];
+
+        let names: Vec<String> = CapabilityResolver
+            .filter_tool_schemas_for_providers(
+                &registry,
+                schemas,
+                &binding.capabilities,
+                &providers,
+            )
+            .into_iter()
+            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+            .collect();
+
+        assert!(
+            names.is_empty(),
+            "same canonical tool from conflicting provider offers must not be prompt-visible"
+        );
     }
 
     #[test]

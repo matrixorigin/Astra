@@ -25,7 +25,7 @@ use astra_skills::manifest::{
     ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind, TrustTier,
 };
 use astra_skills::traits::{SkillError, SkillProvider};
-use astra_turn_core::tool::schema::tool_schema_name;
+use astra_turn_core::tool::schema::{prompt_schema_conflicting_tool_names, tool_schema_name};
 
 use crate::skills::{BundledSkillProvider, LocalSkillProvider, UnifiedSkillRegistry};
 
@@ -110,19 +110,24 @@ pub fn resolve_tool_schemas(request: ToolCatalogRequest) -> Vec<Value> {
         .collect(),
     };
 
+    let mut source_schemas = Vec::new();
+    for source in request.sources {
+        if allowed_sources.contains(&source.source) {
+            source_schemas.extend(source.schemas);
+        }
+    }
+    let schema_conflicts = prompt_schema_conflicting_tool_names(&source_schemas);
     let mut seen = HashSet::new();
     let mut resolved = Vec::new();
-    for source in request.sources {
-        if !allowed_sources.contains(&source.source) {
+    for schema in source_schemas {
+        let Some(name) = tool_schema_name(&schema) else {
+            continue;
+        };
+        if schema_conflicts.contains(name) {
             continue;
         }
-        for schema in source.schemas {
-            let Some(name) = tool_schema_name(&schema) else {
-                continue;
-            };
-            if seen.insert(name.to_string()) {
-                resolved.push(schema);
-            }
+        if seen.insert(name.to_string()) {
+            resolved.push(schema);
         }
     }
     resolved
@@ -230,13 +235,9 @@ pub fn cli_local_tool_schemas(
             })
         })
         .collect::<Vec<_>>();
-    let mut seen: HashSet<String> = pool
-        .iter()
-        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
-        .collect();
     for schema in client_mcp {
         if let Some(name) = tool_schema_name(&schema)
-            && seen.insert(name.to_string())
+            && name.starts_with("mcp__")
         {
             pool.push(schema);
         }
@@ -629,6 +630,45 @@ mod tests {
     }
 
     #[test]
+    fn tool_dedupe_fails_closed_when_same_name_sources_disagree_on_schema() {
+        let first = json!({
+            "type": "function",
+            "function": {
+                "name": "shared",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    }
+                }
+            }
+        });
+        let second = json!({
+            "type": "function",
+            "function": {
+                "name": "shared",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "q": { "type": "string" }
+                    }
+                }
+            }
+        });
+
+        let resolved = resolve_tool_schemas(
+            ToolCatalogRequest::new(CapabilitySurface::CliLocal)
+                .with_source(ToolCapabilitySource::ClientBuiltin, vec![first])
+                .with_source(ToolCapabilitySource::ClientMcp, vec![second]),
+        );
+
+        assert!(
+            resolved.is_empty(),
+            "same-name schemas with different contracts must not first-win into the prompt"
+        );
+    }
+
+    #[test]
     fn tool_surface_rejects_custom_type_but_accepts_missing_type_function_shorthand() {
         let resolved =
             resolve_tool_schemas(ToolCatalogRequest::new(CapabilitySurface::Web).with_source(
@@ -914,6 +954,47 @@ mod tests {
         assert!(
             !tool_names.contains(&"custom_local_builtin".to_string()),
             "client builtin schemas must still be declared by a CLI/server provider"
+        );
+    }
+
+    #[test]
+    fn cli_local_catalog_fails_closed_for_conflicting_mcp_schemas() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names = names(cli_local_tool_schemas(
+            vec![schema("read_file")],
+            vec![
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__docs__query",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string" }
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__docs__query",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "q": { "type": "string" }
+                            }
+                        }
+                    }
+                }),
+            ],
+            &caps,
+        ));
+
+        assert!(tool_names.contains(&"read_file".to_string()));
+        assert!(
+            !tool_names.contains(&"mcp__docs__query".to_string()),
+            "conflicting MCP offers must be hidden instead of first-wins"
         );
     }
 

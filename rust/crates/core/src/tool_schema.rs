@@ -16,7 +16,7 @@
 //! runtime tool surface without silently dropping otherwise valid function
 //! schemas from provider or edge surfaces that omit the redundant type field.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -55,6 +55,59 @@ pub fn tool_names_from_schemas(schemas: &[Value]) -> HashSet<String> {
 pub fn retain_tool_schemas_by_names(schemas: &mut Vec<Value>, allowed_names: &HashSet<String>) {
     schemas
         .retain(|schema| tool_schema_name(schema).is_some_and(|name| allowed_names.contains(name)));
+}
+
+/// Return tool names whose prompt-visible schemas contain conflicting
+/// contracts.
+///
+/// Missing top-level `type` is normalized to `"function"` when the schema has
+/// a `function` object, matching [`tool_schema_name`]. Equivalent shorthand and
+/// explicit function schemas therefore dedupe without prompt churn, while
+/// materially different argument schemas fail closed in callers.
+#[must_use]
+pub fn prompt_schema_conflicting_tool_names(schemas: &[Value]) -> HashSet<String> {
+    let mut schemas_by_tool: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
+    for schema in schemas {
+        let Some(tool_name) = tool_schema_name(schema) else {
+            continue;
+        };
+        schemas_by_tool
+            .entry(tool_name.to_string())
+            .or_default()
+            .insert(prompt_tool_schema_canonical_bytes(schema));
+    }
+    schemas_by_tool
+        .into_iter()
+        .filter_map(|(tool_name, schemas)| (schemas.len() > 1).then_some(tool_name))
+        .collect()
+}
+
+fn prompt_tool_schema_canonical_bytes(schema: &Value) -> Vec<u8> {
+    let mut normalized = schema.clone();
+    if let Value::Object(map) = &mut normalized
+        && !map.contains_key("type")
+        && map.contains_key("function")
+    {
+        map.insert("type".to_string(), Value::String("function".to_string()));
+    }
+    let canonical = canonical_json_value(&normalized);
+    serde_json::to_vec(&canonical).expect("canonical tool schema JSON must serialize")
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json_value).collect()),
+        Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json_value(&map[key]));
+            }
+            Value::Object(sorted)
+        }
+        other => other.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -164,5 +217,47 @@ mod tests {
             schemas.is_empty(),
             "empty search surface must not leak global schemas"
         );
+    }
+
+    #[test]
+    fn prompt_schema_conflicts_ignore_equivalent_function_shorthand() {
+        let conflicts = prompt_schema_conflicting_tool_names(&[
+            json!({"function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "bash"}}),
+        ]);
+
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn prompt_schema_conflicts_detect_same_name_different_contract() {
+        let conflicts = prompt_schema_conflicting_tool_names(&[
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "script": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        ]);
+
+        assert_eq!(conflicts, HashSet::from(["bash".to_string()]));
     }
 }

@@ -1,10 +1,11 @@
 //! Capability-driven tool surface resolution.
 
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::capability::CapabilitySet;
 use crate::tool::registry::meta::TOOL_CATALOG;
-use crate::tool::schema::tool_schema_name;
+use crate::tool::schema::{prompt_schema_conflicting_tool_names, tool_schema_name};
 
 /// User-facing execution surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,10 +50,14 @@ pub fn resolve_with_diagnostics(
     let _ = surface;
     let mut schemas = Vec::new();
     let mut missing_schemas = Vec::new();
-    let mut emitted = std::collections::HashSet::new();
+    let mut emitted = HashSet::new();
+    let conflicting_names = prompt_schema_conflicting_tool_names(all_schemas);
 
     for meta in TOOL_CATALOG {
         if !capabilities.has_all(meta.requires) {
+            continue;
+        }
+        if conflicting_names.contains(meta.name) {
             continue;
         }
         if let Some(schema) = find_schema(all_schemas, meta.name) {
@@ -70,6 +75,9 @@ pub fn resolve_with_diagnostics(
         let Some(name) = tool_schema_name(schema) else {
             continue;
         };
+        if conflicting_names.contains(name) {
+            continue;
+        }
         if emitted.contains(name) || TOOL_CATALOG.iter().any(|meta| meta.name == name) {
             continue;
         }
@@ -189,6 +197,59 @@ mod tests {
             .collect();
 
         assert_eq!(catalog_names, expected);
+    }
+
+    #[test]
+    fn resolve_fails_closed_for_same_name_prompt_schema_conflict() {
+        let pool = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "script": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            schema("read_file"),
+        ];
+
+        let visible = names(&resolve(Surface::CliLocal, &CapabilitySet::empty(), &pool));
+
+        assert_eq!(
+            visible,
+            vec!["read_file".to_string()],
+            "same-name conflicting prompt schemas must not first-win into the model surface"
+        );
+    }
+
+    #[test]
+    fn resolve_dedupes_equivalent_function_shorthand_without_changing_first_schema_bytes() {
+        let shorthand = json!({"function": {"name": "bash"}});
+        let explicit = json!({"type": "function", "function": {"name": "bash"}});
+        let resolved = resolve(
+            Surface::CliLocal,
+            &CapabilitySet::empty(),
+            &[shorthand.clone(), explicit],
+        );
+
+        assert_eq!(names(&resolved), vec!["bash".to_string()]);
+        assert_eq!(resolved, vec![shorthand]);
     }
 
     #[test]
