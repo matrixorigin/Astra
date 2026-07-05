@@ -268,6 +268,14 @@ pub struct ToolAdmissionCandidateSnapshotEntry {
     pub offer_id: String,
     pub provider_type: String,
     pub provider_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub executor_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub placement: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authority: String,
     pub route: String,
     pub readiness: String,
     pub selected: bool,
@@ -1058,6 +1066,10 @@ mod tests {
                         offer_id: "web_fetch@edge-1".to_string(),
                         provider_type: "edge_capacity".to_string(),
                         provider_id: "edge-1".to_string(),
+                        executor_id: "edge-1".to_string(),
+                        placement: "edge:edge-1".to_string(),
+                        scope: "workspace".to_string(),
+                        authority: "read_write".to_string(),
                         route: "EdgeBound".to_string(),
                         readiness: "ready".to_string(),
                         selected: true,
@@ -1068,6 +1080,10 @@ mod tests {
                         offer_id: "web_fetch@server-builtin".to_string(),
                         provider_type: "server_service".to_string(),
                         provider_id: "server-builtin".to_string(),
+                        executor_id: "server-service".to_string(),
+                        placement: "server".to_string(),
+                        scope: "session".to_string(),
+                        authority: "none".to_string(),
                         route: "ServerRuntime".to_string(),
                         readiness: "ready".to_string(),
                         selected: false,

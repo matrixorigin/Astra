@@ -3560,6 +3560,10 @@ impl ServerAgenticLoopHost {
                                 offer_id: candidate.offer.offer_id,
                                 provider_type: candidate.offer.provider_type.to_string(),
                                 provider_id: candidate.offer.provider_id,
+                                executor_id: candidate.offer.executor_id,
+                                placement: candidate.offer.placement,
+                                scope: candidate.offer.scope,
+                                authority: candidate.offer.authority,
                                 route: format!("{:?}", candidate.offer.route),
                                 readiness: candidate.offer.readiness.to_string(),
                                 selected: candidate.selected,
@@ -6197,6 +6201,14 @@ mod tests {
             Some("mcp__tools__query@request-scoped-mcp")
         );
         assert_eq!(entry.selected_route, "RequestScopedMcp");
+        assert!(entry.candidates.iter().any(|candidate| {
+            candidate.offer_id == "mcp__tools__query@request-scoped-mcp"
+                && candidate.selected
+                && candidate.executor_id == "request-scoped-mcp"
+                && candidate.placement == "request"
+                && candidate.scope == "request"
+                && candidate.authority == "none"
+        }));
     }
 
     #[test]
@@ -9210,11 +9222,20 @@ mod tests {
             web_fetch
                 .candidates
                 .iter()
-                .any(|candidate| candidate.offer_id == "web_fetch@edge-1" && candidate.selected)
+                .any(|candidate| candidate.offer_id == "web_fetch@edge-1"
+                    && candidate.selected
+                    && candidate.executor_id == "edge-1"
+                    && candidate.placement == "edge:edge-1"
+                    && candidate.scope == "workspace"
+                    && candidate.authority == "read_write")
         );
         assert!(web_fetch.candidates.iter().any(|candidate| {
             candidate.offer_id == "web_fetch@server-builtin"
                 && candidate.reason == "CurrentProviderPreferred"
+                && candidate.executor_id == "server-service"
+                && candidate.placement == "server"
+                && candidate.scope == "session"
+                && candidate.authority == "none"
         }));
     }
 
@@ -9264,6 +9285,9 @@ mod tests {
             candidate.offer_id == "web_fetch@edge-1"
                 && candidate.selected
                 && candidate.readiness == "offline"
+                && candidate.executor_id == "edge-1"
+                && candidate.placement == "edge:edge-1"
+                && candidate.scope == "workspace"
                 && candidate.reason == "ProviderUnavailable"
         }));
         assert!(web_fetch.candidates.iter().any(|candidate| {

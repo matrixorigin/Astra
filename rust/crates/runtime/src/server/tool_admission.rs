@@ -20,6 +20,10 @@ pub(crate) struct ToolOffer {
     pub offer_id: String,
     pub provider_type: CapacityProviderType,
     pub provider_id: String,
+    pub executor_id: String,
+    pub placement: String,
+    pub scope: String,
+    pub authority: String,
     pub schema_digest: String,
     pub route: ToolExecutionRouteKind,
     pub readiness: CapacityProviderStatus,
@@ -157,7 +161,7 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     let mut raw_candidates = if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
         Vec::new()
     } else {
-        candidate_offers_for_tool(tool_name, workspace, providers)
+        candidate_offers_for_tool(tool_name, workspace, executor, providers)
     };
     let selected_unready_offer = if !matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
         selected_unready_offer_for_route(
@@ -184,7 +188,14 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     let selected_offer_before_policy =
         if !matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
             provider_for_route(tool_name, workspace, route, providers).map(|provider| {
-                offer_for_provider(tool_name, provider, route, CapacityProviderStatus::Ready)
+                offer_for_provider(
+                    tool_name,
+                    provider,
+                    route,
+                    CapacityProviderStatus::Ready,
+                    workspace,
+                    executor,
+                )
             })
         } else {
             None
@@ -371,12 +382,18 @@ fn offer_for_provider(
     provider: &CapacityProviderDeclaration,
     route: ToolExecutionRouteKind,
     readiness: CapacityProviderStatus,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
 ) -> ToolOffer {
     ToolOffer {
         tool_name: tool_name.to_string(),
         offer_id: format!("{tool_name}@{}", provider.provider_id),
         provider_type: provider.provider_type,
         provider_id: provider.provider_id.clone(),
+        executor_id: executor_id_for_offer(provider, executor),
+        placement: placement_for_offer(provider),
+        scope: scope_for_offer(provider),
+        authority: authority_for_offer(provider, workspace.authority).to_string(),
         schema_digest: provider
             .schema_digest_for_tool(tool_name)
             .map(str::to_string)
@@ -401,6 +418,7 @@ fn provider_for_route<'a>(
 fn candidate_offers_for_tool(
     tool_name: &str,
     workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
     providers: &[CapacityProviderDeclaration],
 ) -> Vec<ToolOffer> {
     providers
@@ -412,6 +430,8 @@ fn candidate_offers_for_tool(
                 provider,
                 route_for_provider_type(provider.provider_type, workspace.kind),
                 CapacityProviderStatus::Ready,
+                workspace,
+                executor,
             )
         })
         .collect()
@@ -463,7 +483,9 @@ fn selected_unready_offer_for_route(
     if provider_readiness_is_executable(readiness) {
         return None;
     }
-    Some(offer_for_provider(tool_name, &provider, route, readiness))
+    Some(offer_for_provider(
+        tool_name, &provider, route, readiness, workspace, executor,
+    ))
 }
 
 fn capacity_provider_status_for_executor_status(status: ExecutorStatus) -> CapacityProviderStatus {
@@ -472,6 +494,84 @@ fn capacity_provider_status_for_executor_status(status: ExecutorStatus) -> Capac
         ExecutorStatus::Degraded => CapacityProviderStatus::Degraded,
         ExecutorStatus::Offline => CapacityProviderStatus::Offline,
         ExecutorStatus::Unknown => CapacityProviderStatus::Unknown,
+    }
+}
+
+fn executor_id_for_offer(
+    provider: &CapacityProviderDeclaration,
+    executor: &ExecutorBinding,
+) -> String {
+    match provider.provider_type {
+        CapacityProviderType::ServerService => "server-service".to_string(),
+        CapacityProviderType::ControlPlane => "server-control-plane".to_string(),
+        CapacityProviderType::RequestScopedMcp => provider.provider_id.clone(),
+        CapacityProviderType::EdgeCapacity
+        | CapacityProviderType::Sandbox
+        | CapacityProviderType::OrchestratorManagedRuntime
+        | CapacityProviderType::CliLocal => {
+            if executor.executor_id.is_empty() {
+                provider.provider_id.clone()
+            } else {
+                executor.executor_id.clone()
+            }
+        }
+        CapacityProviderType::Unknown => provider.provider_id.clone(),
+    }
+}
+
+fn placement_for_offer(provider: &CapacityProviderDeclaration) -> String {
+    match provider.provider_type {
+        CapacityProviderType::ServerService | CapacityProviderType::ControlPlane => {
+            "server".to_string()
+        }
+        CapacityProviderType::RequestScopedMcp => "request".to_string(),
+        CapacityProviderType::EdgeCapacity => format!("edge:{}", provider.provider_id),
+        CapacityProviderType::Sandbox => format!("sandbox:{}", provider.provider_id),
+        CapacityProviderType::OrchestratorManagedRuntime => {
+            format!("orchestrator:{}", provider.provider_id)
+        }
+        CapacityProviderType::CliLocal => format!("cli:{}", provider.provider_id),
+        CapacityProviderType::Unknown => format!("unknown:{}", provider.provider_id),
+    }
+}
+
+fn scope_for_offer(provider: &CapacityProviderDeclaration) -> String {
+    match provider.provider_type {
+        CapacityProviderType::RequestScopedMcp => "request".to_string(),
+        CapacityProviderType::EdgeCapacity
+        | CapacityProviderType::Sandbox
+        | CapacityProviderType::OrchestratorManagedRuntime
+        | CapacityProviderType::CliLocal => "workspace".to_string(),
+        CapacityProviderType::ServerService | CapacityProviderType::ControlPlane => {
+            "session".to_string()
+        }
+        CapacityProviderType::Unknown => "unknown".to_string(),
+    }
+}
+
+fn workspace_authority_label(authority: WorkspaceAuthority) -> &'static str {
+    match authority {
+        WorkspaceAuthority::ReadOnly => "read_only",
+        WorkspaceAuthority::ReadWrite => "read_write",
+        WorkspaceAuthority::None => "none",
+        WorkspaceAuthority::Unknown => "unknown",
+        _ => "unknown",
+    }
+}
+
+fn authority_for_offer(
+    provider: &CapacityProviderDeclaration,
+    workspace_authority: WorkspaceAuthority,
+) -> &'static str {
+    match provider.provider_type {
+        CapacityProviderType::EdgeCapacity
+        | CapacityProviderType::Sandbox
+        | CapacityProviderType::OrchestratorManagedRuntime
+        | CapacityProviderType::CliLocal => workspace_authority_label(workspace_authority),
+        CapacityProviderType::ServerService
+        | CapacityProviderType::ControlPlane
+        | CapacityProviderType::RequestScopedMcp
+        | CapacityProviderType::Unknown => "none",
     }
 }
 
@@ -705,6 +805,10 @@ mod tests {
         assert_eq!(offer.provider_type, CapacityProviderType::RequestScopedMcp);
         assert_eq!(offer.provider_id, "request-scoped-mcp");
         assert_eq!(offer.offer_id, "mcp__github__search@request-scoped-mcp");
+        assert_eq!(offer.executor_id, "request-scoped-mcp");
+        assert_eq!(offer.placement, "request");
+        assert_eq!(offer.scope, "request");
+        assert_eq!(offer.authority, "none");
         assert!(offer.schema_digest.starts_with("sha256:"));
         assert_eq!(decision.candidates.len(), 1);
         assert_eq!(
@@ -762,6 +866,9 @@ mod tests {
         );
         let offer = decision.selected_offer.expect("selected offer");
         assert_eq!(offer.provider_type, CapacityProviderType::RequestScopedMcp);
+        assert_eq!(offer.placement, "request");
+        assert_eq!(offer.scope, "request");
+        assert_eq!(offer.authority, "none");
         assert!(offer.schema_digest.starts_with("sha256:"));
     }
 
