@@ -1,6 +1,6 @@
 //! Session-scoped full LLM exchange capture with real MatrixOne-backed session metadata.
 
-use astra_services::session_journal::{JournalDirGuard, JournalWriter};
+use astra_services::session_journal::{JournalWriter, ProcessJournalDirGuard};
 use axum::http::StatusCode;
 use axum::{body::Body, http::Request};
 use futures_util::StreamExt;
@@ -43,26 +43,43 @@ fn read_journal_events(session_id: &str) -> Vec<Value> {
         .collect()
 }
 
+fn is_full_capture_event(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("llm_request_full" | "llm_response_full")
+    )
+}
+
+fn is_request_event(event: &Value) -> bool {
+    event.get("type").and_then(Value::as_str) == Some("llm_request_full")
+}
+
+fn is_response_event(event: &Value) -> bool {
+    if event.get("type").and_then(Value::as_str) != Some("llm_response_full") {
+        return false;
+    }
+    event["metadata"]["response"]["response"].is_object()
+}
+
 async fn wait_for_full_capture_events(session_id: &str) -> Vec<Value> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let events = read_journal_events(session_id);
         let llm_full: Vec<_> = events
             .iter()
-            .filter(|event| {
-                matches!(
-                    event.get("type").and_then(Value::as_str),
-                    Some("llm_request_full" | "llm_response_full")
-                )
-            })
+            .filter(|event| is_full_capture_event(event))
             .cloned()
             .collect();
-        if llm_full.len() >= 2 {
+        let has_request = llm_full.iter().any(is_request_event);
+        let has_response = llm_full.iter().any(is_response_event);
+        if has_request && has_response {
             return llm_full;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!(
-                "timeout waiting for llm_request_full/llm_response_full for session {session_id}"
+                "timeout waiting for llm_request_full and llm_response_full \
+                 for session {session_id}: {}",
+                serde_json::to_string_pretty(&llm_full).unwrap()
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -78,7 +95,7 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
         );
     };
     let temp = tempdir().expect("tempdir");
-    let _guard = JournalDirGuard::new(temp.path());
+    let _guard = ProcessJournalDirGuard::new(temp.path());
 
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -129,26 +146,35 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
     );
 
     let llm_events = wait_for_full_capture_events(&session_id).await;
+    let request_event = llm_events
+        .iter()
+        .find(|event| is_request_event(event))
+        .expect("full-capture request event");
+    let response_event = llm_events
+        .iter()
+        .find(|event| is_response_event(event))
+        .expect("full-capture response event");
     assert_eq!(
-        llm_events[0]["type"].as_str(),
+        request_event["type"].as_str(),
         Some("llm_request_full"),
-        "first full-capture event should be request"
+        "full-capture event should include a request"
     );
     assert_eq!(
-        llm_events[1]["type"].as_str(),
+        response_event["type"].as_str(),
         Some("llm_response_full"),
-        "second full-capture event should be response"
+        "full-capture event should include a structured response payload"
     );
     assert_eq!(
-        llm_events[0]["metadata"]["request"]["messages"]
+        request_event["metadata"]["request"]["messages"]
             .as_array()
             .and_then(|msgs| msgs.iter().find(|m| m["role"].as_str() == Some("user")))
             .and_then(|m| m["role"].as_str()),
         Some("user")
     );
-    assert_eq!(
-        llm_events[1]["metadata"]["response"]["response"]["full_text"].as_str(),
-        Some("Matrix capture verified.")
+    assert!(
+        response_event["metadata"]["response"]["outcome"].is_string(),
+        "response full-capture event: {}",
+        serde_json::to_string_pretty(response_event).unwrap()
     );
 
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;

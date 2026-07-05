@@ -8,7 +8,9 @@
 //! It can be replayed, exported, or analyzed by `/session` commands.
 //!
 //! **Test isolation:** use [`JournalDirGuard`] to redirect all `sessions`-rooted I/O on the
-//! current thread (journal JSONL, workspace, step checkpoints) without mutating `HOME`.
+//! current thread (journal JSONL, workspace, step checkpoints) without mutating `HOME`. Use
+//! [`ProcessJournalDirGuard`] only for integration tests that must observe journal writes from
+//! background tasks running on different Tokio worker threads.
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -28,6 +30,9 @@ use crate::{OwnerScope, SessionArtifactStore};
 thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
+
+static PROCESS_SESSIONS_DIR_OVERRIDES: LazyLock<Mutex<Vec<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn merge_execution_boundary_metadata(
     metadata: &mut serde_json::Value,
@@ -106,13 +111,25 @@ fn with_session_start_state_cache<R>(f: impl FnOnce(&mut BoundedSessionCache) ->
     }
 }
 
-/// Resolved local `sessions` directory (`~/.astra/sessions` or a per-thread override).
+/// Resolved local `sessions` directory (`~/.astra/sessions` or a test override).
 ///
 /// Step checkpoints, workspace metadata, and session journal files all live under this root.
 pub fn local_sessions_dir() -> PathBuf {
     LOCAL_SESSIONS_DIR_OVERRIDE.with(|c| {
         if let Some(ref p) = *c.borrow() {
             return p.clone();
+        }
+        let process_override = match PROCESS_SESSIONS_DIR_OVERRIDES.lock() {
+            Ok(overrides) => overrides.last().cloned(),
+            Err(poisoned) => {
+                tracing::warn!(
+                    "process_sessions_dir_overrides mutex poisoned; using last stored override"
+                );
+                poisoned.into_inner().last().cloned()
+            }
+        };
+        if let Some(p) = process_override {
+            return p;
         }
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -504,6 +521,40 @@ impl Drop for JournalDirGuard {
         LOCAL_SESSIONS_DIR_OVERRIDE.with(|c| {
             *c.borrow_mut() = prev;
         });
+    }
+}
+
+/// Redirect session journal + workspace + step checkpoint paths process-wide.
+///
+/// Use this only in tests that intentionally exercise cross-thread async
+/// background work. Prefer [`JournalDirGuard`] for ordinary single-threaded
+/// unit tests, because this guard affects every thread in the current process.
+#[must_use = "drop restores the previous process-wide sessions-dir override"]
+pub struct ProcessJournalDirGuard {
+    dir: PathBuf,
+}
+
+impl ProcessJournalDirGuard {
+    pub fn new(dir: impl AsRef<Path>) -> Self {
+        let dir = dir.as_ref().to_path_buf();
+        PROCESS_SESSIONS_DIR_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(dir.clone());
+        Self { dir }
+    }
+}
+
+impl Drop for ProcessJournalDirGuard {
+    fn drop(&mut self) {
+        let mut overrides = PROCESS_SESSIONS_DIR_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if overrides.last() == Some(&self.dir) {
+            overrides.pop();
+        } else if let Some(index) = overrides.iter().rposition(|dir| dir == &self.dir) {
+            overrides.remove(index);
+        }
     }
 }
 
