@@ -13,7 +13,7 @@
 //! Keeping those rules here prevents the Web picker, runtime prompt assembly,
 //! and CLI tool-surface assembly from growing separate capability policies.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,7 +25,7 @@ use astra_skills::manifest::{
     ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind, TrustTier,
 };
 use astra_skills::traits::{SkillError, SkillProvider};
-use astra_turn_core::tool::schema::{prompt_schema_conflicting_tool_names, tool_schema_name};
+use astra_turn_core::tool::schema::tool_schema_name;
 
 use crate::skills::{BundledSkillProvider, LocalSkillProvider, UnifiedSkillRegistry};
 
@@ -33,15 +33,6 @@ const REMOTE_SKILL_PAGE_SIZE: u32 = 500;
 const REMOTE_SKILL_MAX_ROWS: u32 = 5_000;
 
 pub use astra_turn_core::tool_surface::Surface as CapabilitySurface;
-
-/// Source bucket used for deterministic tool visibility and tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ToolCapabilitySource {
-    ServerBuiltin,
-    ServerMcp,
-    ClientBuiltin,
-    ClientMcp,
-}
 
 /// Skill source buckets used by the capability policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,83 +45,6 @@ pub enum SkillCapabilitySource {
     CliFilesystem,
     /// Skills compiled into the CLI/runtime binary.
     CliBundled,
-}
-
-#[derive(Clone, Debug)]
-pub struct ToolSchemaSource {
-    pub source: ToolCapabilitySource,
-    pub schemas: Vec<Value>,
-}
-
-impl ToolSchemaSource {
-    pub fn new(source: ToolCapabilitySource, schemas: Vec<Value>) -> Self {
-        Self { source, schemas }
-    }
-}
-
-/// Input for resolving tool schemas for one turn.
-#[derive(Clone, Debug)]
-pub struct ToolCatalogRequest {
-    pub surface: CapabilitySurface,
-    pub sources: Vec<ToolSchemaSource>,
-}
-
-impl ToolCatalogRequest {
-    pub fn new(surface: CapabilitySurface) -> Self {
-        Self {
-            surface,
-            sources: Vec::new(),
-        }
-    }
-
-    pub fn with_source(mut self, source: ToolCapabilitySource, schemas: Vec<Value>) -> Self {
-        self.sources.push(ToolSchemaSource::new(source, schemas));
-        self
-    }
-}
-
-/// Resolve visible tool schemas for an execution surface.
-///
-/// Dedupe is by function name with first source winning, which makes source
-/// precedence explicit and stable. This is not a permissive fallback: a source
-/// must be supplied by the caller to participate in resolution.
-pub fn resolve_tool_schemas(request: ToolCatalogRequest) -> Vec<Value> {
-    let allowed_sources: HashSet<ToolCapabilitySource> = match request.surface {
-        CapabilitySurface::Web | CapabilitySurface::CliRemote => [
-            ToolCapabilitySource::ServerBuiltin,
-            ToolCapabilitySource::ServerMcp,
-        ]
-        .into_iter()
-        .collect(),
-        CapabilitySurface::CliLocal => [
-            ToolCapabilitySource::ClientBuiltin,
-            ToolCapabilitySource::ClientMcp,
-        ]
-        .into_iter()
-        .collect(),
-    };
-
-    let mut source_schemas = Vec::new();
-    for source in request.sources {
-        if allowed_sources.contains(&source.source) {
-            source_schemas.extend(source.schemas);
-        }
-    }
-    let schema_conflicts = prompt_schema_conflicting_tool_names(&source_schemas);
-    let mut seen = HashSet::new();
-    let mut resolved = Vec::new();
-    for schema in source_schemas {
-        let Some(name) = tool_schema_name(&schema) else {
-            continue;
-        };
-        if schema_conflicts.contains(name) {
-            continue;
-        }
-        if seen.insert(name.to_string()) {
-            resolved.push(schema);
-        }
-    }
-    resolved
 }
 
 /// Full capability set for tests that need the complete catalog. Production
@@ -252,14 +166,14 @@ pub fn cli_remote_tool_schemas(
     server_mcp: Vec<Value>,
     capabilities: &astra_turn_core::capability::CapabilitySet,
 ) -> Vec<Value> {
-    let mut schemas = resolve_tool_schemas(
-        ToolCatalogRequest::new(CapabilitySurface::CliRemote)
-            .with_source(
-                ToolCapabilitySource::ServerBuiltin,
-                server_builtin_tool_schemas(capabilities),
-            )
-            .with_source(ToolCapabilitySource::ServerMcp, server_mcp),
+    let mut pool = server_builtin_tool_schemas(capabilities);
+    pool.extend(
+        server_mcp.into_iter().filter(|schema| {
+            tool_schema_name(schema).is_some_and(|name| name.starts_with("mcp__"))
+        }),
     );
+    let mut schemas =
+        astra_turn_core::tool_surface::resolve(CapabilitySurface::CliRemote, capabilities, &pool);
     if !capabilities.has(astra_turn_core::capability::Capability::ReflectService) {
         schemas.retain(|s| tool_schema_name(s) != Some("reflect"));
     }
@@ -589,113 +503,68 @@ mod tests {
         }
     }
 
-    // ── tool surface routing ──
+    // ── remote/server tool schema assembly ──
 
     #[test]
-    fn tool_surface_routing() {
-        let sources = vec![
-            ToolSchemaSource::new(ToolCapabilitySource::ServerBuiltin, vec![schema("server")]),
-            ToolSchemaSource::new(ToolCapabilitySource::ServerMcp, vec![schema("server_mcp")]),
-            ToolSchemaSource::new(ToolCapabilitySource::ClientBuiltin, vec![schema("client")]),
-            ToolSchemaSource::new(ToolCapabilitySource::ClientMcp, vec![schema("client_mcp")]),
-        ];
-
-        // Web / remote CLI: server-only tools
-        let web = names(resolve_tool_schemas(ToolCatalogRequest {
-            surface: CapabilitySurface::Web,
-            sources: sources.clone(),
-        }));
-        let remote_names = names(resolve_tool_schemas(ToolCatalogRequest {
-            surface: CapabilitySurface::CliRemote,
-            sources,
-        }));
-        assert_eq!(
-            web,
-            vec!["server", "server_mcp"],
-            "web must expose only server tools"
-        );
-        assert_eq!(remote_names, web, "remote CLI must match web");
-
-        // Local CLI: client-only tools
-        let local = names(resolve_tool_schemas(
-            ToolCatalogRequest::new(CapabilitySurface::CliLocal)
-                .with_source(ToolCapabilitySource::ServerBuiltin, vec![schema("server")])
-                .with_source(ToolCapabilitySource::ClientBuiltin, vec![schema("client")])
-                .with_source(ToolCapabilitySource::ClientMcp, vec![schema("client_mcp")]),
+    fn cli_remote_catalog_uses_server_builtin_and_namespaced_server_mcp_only() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names = names(cli_remote_tool_schemas(
+            vec![
+                schema("mcp__server_docs__query"),
+                schema("read_file"),
+                schema("powershell"),
+                json!({"type": "custom", "function": {"name": "mcp__custom__bad"}}),
+            ],
+            &caps,
         ));
-        assert_eq!(
-            local,
-            vec!["client", "client_mcp"],
-            "local CLI must use client tools only"
-        );
+
+        assert!(tool_names.contains(&"tool_search".to_string()));
+        assert!(tool_names.contains(&"memory".to_string()));
+        assert!(tool_names.contains(&"mcp__server_docs__query".to_string()));
+        for hidden in ["read_file", "powershell", "mcp__custom__bad"] {
+            assert!(
+                !tool_names.contains(&hidden.to_string()),
+                "{hidden} must not enter remote CLI server-executed schema surface: {tool_names:?}"
+            );
+        }
     }
 
     #[test]
-    fn tool_dedupe_keeps_first_source() {
-        let resolved = resolve_tool_schemas(
-            ToolCatalogRequest::new(CapabilitySurface::CliLocal)
-                .with_source(ToolCapabilitySource::ClientBuiltin, vec![schema("shared")])
-                .with_source(ToolCapabilitySource::ClientMcp, vec![schema("shared")]),
-        );
-
-        assert_eq!(names(resolved), vec!["shared".to_string()]);
-    }
-
-    #[test]
-    fn tool_dedupe_fails_closed_when_same_name_sources_disagree_on_schema() {
-        let first = json!({
-            "type": "function",
-            "function": {
-                "name": "shared",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string" }
+    fn cli_remote_catalog_fails_closed_for_conflicting_server_mcp_schema() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names = names(cli_remote_tool_schemas(
+            vec![
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__docs__query",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string" }
+                            }
+                        }
                     }
-                }
-            }
-        });
-        let second = json!({
-            "type": "function",
-            "function": {
-                "name": "shared",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "q": { "type": "string" }
+                }),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__docs__query",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "q": { "type": "string" }
+                            }
+                        }
                     }
-                }
-            }
-        });
-
-        let resolved = resolve_tool_schemas(
-            ToolCatalogRequest::new(CapabilitySurface::CliLocal)
-                .with_source(ToolCapabilitySource::ClientBuiltin, vec![first])
-                .with_source(ToolCapabilitySource::ClientMcp, vec![second]),
-        );
+                }),
+            ],
+            &caps,
+        ));
 
         assert!(
-            resolved.is_empty(),
-            "same-name schemas with different contracts must not first-win into the prompt"
-        );
-    }
-
-    #[test]
-    fn tool_surface_rejects_custom_type_but_accepts_missing_type_function_shorthand() {
-        let resolved =
-            resolve_tool_schemas(ToolCatalogRequest::new(CapabilitySurface::Web).with_source(
-                ToolCapabilitySource::ServerBuiltin,
-                vec![
-                    schema("server"),
-                    json!({"type": "custom", "function": {"name": "custom_shape"}}),
-                    json!({"function": {"name": "missing_type"}}),
-                ],
-            ));
-
-        assert_eq!(
-            names(resolved),
-            vec!["server".to_string(), "missing_type".to_string()],
-            "surface resolution must reject explicit non-function schemas while accepting function shorthand without a redundant top-level type"
+            !tool_names.contains(&"mcp__docs__query".to_string()),
+            "conflicting remote MCP schemas must be hidden instead of first-wins"
         );
     }
 
@@ -1106,11 +975,15 @@ mod tests {
                 !remote.contains(&tool.to_string()),
                 "remote CLI executes on the server and must not advertise client-only tool {tool}: {remote:?}"
             );
-            assert!(
-                local.contains(&tool.to_string()),
-                "local CLI should retain client-owned tool {tool}"
-            );
         }
+        assert!(
+            local.contains(&"lsp".to_string()),
+            "local CLI should retain client-owned LSP tools"
+        );
+        assert!(
+            !local.contains(&"powershell".to_string()),
+            "powershell requires an explicit Windows provider/platform fact, not the default local catalog: {local:?}"
+        );
     }
 
     #[test]
