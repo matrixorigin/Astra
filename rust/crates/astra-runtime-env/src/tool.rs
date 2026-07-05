@@ -1784,9 +1784,9 @@ mod tests {
     }
 
     #[test]
-    fn request_scoped_mcp_tools_use_mcp_executor_capability() {
+    fn request_scoped_mcp_tools_require_provider_offer_in_surface() {
         let registry = registry();
-        let binding = RunBinding::resolve(
+        let unbound = RunBinding::resolve(
             WorkspaceBinding::none(),
             ExecutorBinding {
                 kind: crate::ExecutorBindingKind::RequestScopedMcp,
@@ -1801,11 +1801,44 @@ mod tests {
         );
 
         assert_eq!(
-            CapabilityResolver.check_tool_call(
+            CapabilityResolver.check_tool_call_for_surface(
                 &registry,
                 "mcp__github__create_issue",
                 &serde_json::json!({}),
-                &binding.capabilities,
+                &unbound.capabilities,
+                &unbound.tool_surface,
+            ),
+            Err(ToolUnavailableReason::ExecutorUnavailable(
+                "tool_not_selected_by_current_provider_surface".to_string()
+            )),
+            "MCP executor capability alone must not make an undiscovered MCP tool executable"
+        );
+
+        let bound = RunBinding::resolve_with_provider_declarations(
+            WorkspaceBinding::none(),
+            ExecutorBinding {
+                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                executor_id: "mcp".to_string(),
+                display_name: "MCP server".to_string(),
+                transport: crate::ToolTransportKind::McpHttp,
+                status: crate::ExecutorStatus::Online,
+            },
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+            &[crate::request_scoped_mcp_provider(
+                "mcp",
+                ["mcp__github__create_issue".to_string()],
+            )],
+        );
+
+        assert_eq!(
+            CapabilityResolver.check_tool_call_for_surface(
+                &registry,
+                "mcp__github__create_issue",
+                &serde_json::json!({}),
+                &bound.capabilities,
+                &bound.tool_surface,
             ),
             Ok(())
         );
