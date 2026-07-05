@@ -533,80 +533,34 @@ fn no_workspace() -> WorkspaceBinding {
 mod tests {
     use super::*;
 
-    // ── Runtime disabled_tool_offers unit tests ───────────────────────────────
-
     #[tokio::test]
-    async fn disable_tool_offer_adds_to_set() {
-        let svc = ToolExecutionService::new_for_test();
-        assert!(svc.disable_tool_offer("web_search@server-builtin").await);
-        // Disabling again should return false (already disabled).
-        assert!(!svc.disable_tool_offer("web_search@server-builtin").await);
-    }
-
-    #[tokio::test]
-    async fn enable_tool_offer_removes_from_set() {
-        let svc = ToolExecutionService::new_for_test();
-        svc.disable_tool_offer("web_search@server-builtin").await;
-        assert!(svc.enable_tool_offer("web_search@server-builtin").await);
-        // Enabling again should return false (not disabled).
-        assert!(!svc.enable_tool_offer("web_search@server-builtin").await);
-    }
-
-    #[tokio::test]
-    async fn disabled_tool_offers_list_matches_state() {
-        let svc = ToolExecutionService::new_for_test();
-        svc.disable_tool_offer("web_fetch@server-builtin").await;
-        svc.disable_tool_offer("web_search@server-builtin").await;
-        let list = svc.disabled_tool_offers().await;
-        assert_eq!(list.len(), 2);
-        assert!(list.contains(&"web_fetch@server-builtin".to_string()));
-        assert!(list.contains(&"web_search@server-builtin".to_string()));
-    }
-
-    #[tokio::test]
-    async fn disabled_tool_offers_empty_by_default() {
+    async fn disabled_tool_offers_are_offer_ids_with_idempotent_updates() {
         let svc = ToolExecutionService::new_for_test();
         assert!(svc.disabled_tool_offers().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn is_tool_offer_disabled_reflects_state() {
-        let svc = ToolExecutionService::new_for_test();
         assert!(
-            !svc.is_tool_offer_disabled("web_search@server-builtin")
+            !svc.is_tool_offer_disabled("web_fetch@server-builtin")
                 .await
         );
-        svc.disable_tool_offer("web_search@server-builtin").await;
-        assert!(
-            svc.is_tool_offer_disabled("web_search@server-builtin")
-                .await
-        );
-        svc.enable_tool_offer("web_search@server-builtin").await;
-        assert!(
-            !svc.is_tool_offer_disabled("web_search@server-builtin")
-                .await
-        );
-    }
-
-    #[tokio::test]
-    async fn enable_nonexistent_is_noop() {
-        let svc = ToolExecutionService::new_for_test();
-        assert!(!svc.enable_tool_offer("nonexistent").await);
-    }
-
-    /// Verifies that `disable_tool_offer` / `disabled_tool_offers` work correctly
-    /// in an async context without deadlocks.
-    #[tokio::test]
-    async fn set_initial_disabled_tool_offers_from_async_context() {
-        let svc = ToolExecutionService::new_for_test();
-        assert!(svc.disabled_tool_offers().await.is_empty());
 
         svc.disable_tool_offer("web_fetch@server-builtin").await;
         svc.disable_tool_offer("web_search@server-builtin").await;
+        assert!(
+            svc.is_tool_offer_disabled("web_fetch@server-builtin")
+                .await
+        );
+        assert!(!svc.disable_tool_offer("web_fetch@server-builtin").await);
 
         let list = svc.disabled_tool_offers().await;
         assert_eq!(list.len(), 2);
         assert!(list.contains(&"web_fetch@server-builtin".to_string()));
         assert!(list.contains(&"web_search@server-builtin".to_string()));
+
+        assert!(svc.enable_tool_offer("web_fetch@server-builtin").await);
+        assert!(
+            !svc.is_tool_offer_disabled("web_fetch@server-builtin")
+                .await
+        );
+        assert!(!svc.enable_tool_offer("web_fetch@server-builtin").await);
+        assert!(!svc.enable_tool_offer("nonexistent@server-builtin").await);
     }
 }

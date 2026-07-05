@@ -585,6 +585,27 @@ fn build_introspect_observations(
     if matches!(
         request.facet,
         ObservationFacet::Session | ObservationFacet::Overview | ObservationFacet::Trace
+    ) {
+        for admission in &snapshot.tool_admission {
+            observations.push(ObservationRecord {
+                ref_id: Urn::new("observation", "local", "introspect")
+                    .seg("tool_admission")
+                    .seg(&admission.tool_name)
+                    .build(),
+                topic: "execution".to_string(),
+                facet: request.facet.as_str().to_string(),
+                kind: "tool_admission".to_string(),
+                severity: if admission.visible { "info" } else { "warning" }.to_string(),
+                summary: tool_admission_observation_summary(admission),
+                confidence: ObservationConfidence::evidence(0.85),
+                evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+            });
+        }
+    }
+
+    if matches!(
+        request.facet,
+        ObservationFacet::Session | ObservationFacet::Overview | ObservationFacet::Trace
     ) && let Some(summary) = latest_step_latency_summary(snapshot)
     {
         observations.push(ObservationRecord {
@@ -615,6 +636,31 @@ fn capacity_provider_observation_summary(
         super::capacity_provider_coverage_entry_summary(provider),
         provider.provider_id,
         capabilities
+    )
+}
+
+fn tool_admission_observation_summary(admission: &super::ToolAdmissionSnapshotEntry) -> String {
+    let selected = admission.selected_offer_id.as_deref().unwrap_or("-");
+    let hidden = admission.hidden_reason.as_deref().unwrap_or("-");
+    let candidates = admission
+        .candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{}:{}:{}",
+                candidate.offer_id, candidate.reason, candidate.readiness
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{} visible={} selected={} route={} hidden={} candidates=[{}]",
+        admission.tool_name,
+        admission.visible,
+        selected,
+        admission.selected_route,
+        hidden,
+        candidates
     )
 }
 

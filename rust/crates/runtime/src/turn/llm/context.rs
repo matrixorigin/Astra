@@ -1126,11 +1126,43 @@ pub(crate) fn annotate_tool_schemas_for_cache(
     cache_cfg: &PromptCacheConfig,
     always_load_names: &std::collections::HashSet<String>,
 ) {
+    stabilize_tool_schema_wire_order(tool_schemas, always_load_names);
     crate::turn::prompt_cache::annotate_tool_schemas_for_caching_with_always_load(
         tool_schemas,
         cache_cfg,
         always_load_names,
     );
+}
+
+fn stabilize_tool_schema_wire_order(
+    tool_schemas: &mut [Value],
+    always_load_names: &std::collections::HashSet<String>,
+) {
+    tool_schemas.sort_by(|left, right| {
+        let left_name = tool_name(left);
+        let right_name = tool_name(right);
+        let left_bucket = tool_schema_wire_bucket(left_name, always_load_names);
+        let right_bucket = tool_schema_wire_bucket(right_name, always_load_names);
+        left_bucket
+            .cmp(&right_bucket)
+            .then_with(|| left_name.unwrap_or("").cmp(right_name.unwrap_or("")))
+            .then_with(|| {
+                serde_json::to_string(left)
+                    .unwrap_or_default()
+                    .cmp(&serde_json::to_string(right).unwrap_or_default())
+            })
+    });
+}
+
+fn tool_schema_wire_bucket(
+    name: Option<&str>,
+    always_load_names: &std::collections::HashSet<String>,
+) -> u8 {
+    match name {
+        Some(name) if always_load_names.contains(name) => 0,
+        Some(_) => 1,
+        None => 2,
+    }
 }
 
 pub(crate) fn stabilize_tool_schemas_for_cache(
@@ -1304,6 +1336,36 @@ mod context_cache_contract_tests {
             .iter()
             .filter_map(|tool| tool_name(tool).map(str::to_string))
             .collect()
+    }
+
+    #[test]
+    fn final_tool_wire_list_is_byte_stable_across_input_order() {
+        let mut left = vec![tool("aaa_dynamic"), tool("read_file"), tool("bash")];
+        let mut right = vec![tool("bash"), tool("aaa_dynamic"), tool("read_file")];
+        let always_load_names =
+            HashSet::from(["bash".to_string(), "read_file".to_string()]);
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+
+        annotate_tool_schemas_for_cache(&mut left, &cache_cfg, &always_load_names);
+        annotate_tool_schemas_for_cache(&mut right, &cache_cfg, &always_load_names);
+
+        assert_eq!(tool_names(&left), vec!["bash", "read_file", "aaa_dynamic"]);
+        assert_eq!(tool_names(&right), tool_names(&left));
+        assert_eq!(
+            serde_json::to_vec(&left).expect("tool list serializes"),
+            serde_json::to_vec(&right).expect("tool list serializes"),
+            "final tool list must be byte-stable for the same CLI/provider surface"
+        );
+        assert!(left[0].get("cache_control").is_none());
+        assert_eq!(
+            left[1]["cache_control"]["type"].as_str(),
+            Some("ephemeral"),
+            "cache marker stays on the last always-load tool in the stable prefix"
+        );
+        assert!(left[2].get("cache_control").is_none());
     }
 
     #[test]

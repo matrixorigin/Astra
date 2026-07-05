@@ -291,6 +291,17 @@ pub trait AgenticLoopHost: Send {
         String::new()
     }
 
+    /// Host-provided structured tool-admission metadata for introspect/UI/audit.
+    ///
+    /// This must not mutate prompt-visible schemas. Hosts that have provider
+    /// bindings can expose selected offers and hidden candidates here.
+    fn tool_admission_snapshot(
+        &self,
+        _state: &AgenticLoopState,
+    ) -> Vec<astra_turn_core::introspect::ToolAdmissionSnapshotEntry> {
+        Vec::new()
+    }
+
     /// Receive the latest normalized runtime snapshot for the `introspect`
     /// tool.
     ///
@@ -451,17 +462,32 @@ pub(crate) fn publish_introspect_snapshot<H: AgenticLoopHost + ?Sized>(
     lifecycle_summary: String,
     inspection: Option<&crate::turn::inspection_service::InspectionService<'_>>,
 ) {
-    let snapshot = build_introspect_snapshot(state, lifecycle_summary, inspection);
+    let snapshot = build_introspect_snapshot_with_tool_admission(
+        state,
+        lifecycle_summary,
+        inspection,
+        host.tool_admission_snapshot(state),
+    );
     host.on_introspect_snapshot(&snapshot);
     if let Some(executor) = state.runtime_tool_executor.as_deref() {
         executor.update_introspect_snapshot(snapshot);
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_introspect_snapshot(
     state: &AgenticLoopState,
     lifecycle_summary: String,
     inspection: Option<&crate::turn::inspection_service::InspectionService<'_>>,
+) -> astra_turn_core::introspect::IntrospectSnapshot {
+    build_introspect_snapshot_with_tool_admission(state, lifecycle_summary, inspection, Vec::new())
+}
+
+fn build_introspect_snapshot_with_tool_admission(
+    state: &AgenticLoopState,
+    lifecycle_summary: String,
+    inspection: Option<&crate::turn::inspection_service::InspectionService<'_>>,
+    tool_admission: Vec<astra_turn_core::introspect::ToolAdmissionSnapshotEntry>,
 ) -> astra_turn_core::introspect::IntrospectSnapshot {
     let total_in = state.provider_input_tokens();
     let cache_ratio = if total_in > 0 {
@@ -614,6 +640,7 @@ pub(crate) fn build_introspect_snapshot(
         tool_health,
         working_memory_summary: working_mem,
         lifecycle_summary,
+        tool_admission,
         capacity_provider_coverage: state
             .runtime_tool_executor
             .as_deref()

@@ -3368,6 +3368,44 @@ impl ServerAgenticLoopHost {
         )
     }
 
+    fn tool_admission_snapshot_entries(
+        &self,
+    ) -> Vec<astra_turn_core::introspect::ToolAdmissionSnapshotEntry> {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut seen = HashSet::new();
+        self.tool_schemas
+            .iter()
+            .filter_map(tool_schema_name)
+            .filter(|name| seen.insert((*name).to_string()))
+            .map(|name| {
+                let decision = self.admission_for_current_binding(name, &registry);
+                astra_turn_core::introspect::ToolAdmissionSnapshotEntry {
+                    tool_name: decision.tool_name.clone(),
+                    visible: decision.visible,
+                    selected_offer_id: decision.selected_offer_id().map(str::to_string),
+                    selected_route: format!("{:?}", decision.selected_route()),
+                    hidden_reason: decision.hidden_reason.map(|reason| format!("{reason:?}")),
+                    candidates: decision
+                        .candidates
+                        .into_iter()
+                        .map(|candidate| {
+                            astra_turn_core::introspect::ToolAdmissionCandidateSnapshotEntry {
+                                offer_id: candidate.offer.offer_id,
+                                provider_type: candidate.offer.provider_type.to_string(),
+                                provider_id: candidate.offer.provider_id,
+                                route: format!("{:?}", candidate.offer.route),
+                                readiness: candidate.offer.readiness.to_string(),
+                                selected: candidate.selected,
+                                reason: format!("{:?}", candidate.reason),
+                                schema_digest: candidate.offer.schema_digest,
+                            }
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
     fn runtime_ready_turn_tools(&self, tools: Vec<Value>, state: &AgenticLoopState) -> Vec<Value> {
         let Some(executor) = state.runtime_tool_executor.as_deref() else {
             return tools;
@@ -3971,6 +4009,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         let plan_hint = self.read_plan_resume_hint();
         self.render_turn_start_lifecycle_summary(state, plan_hint.as_deref())
+    }
+
+    fn tool_admission_snapshot(
+        &self,
+        _state: &AgenticLoopState,
+    ) -> Vec<astra_turn_core::introspect::ToolAdmissionSnapshotEntry> {
+        self.tool_admission_snapshot_entries()
     }
 
     fn plan_mode_active(&self, _state: &AgenticLoopState) -> bool {
@@ -8658,59 +8703,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_turn_tools_excludes_disabled_tool_offers() {
-        let edge_tools = vec![
-            json!({
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "description": "Execute a bash command",
-                    "parameters": { "type": "object", "properties": {} }
-                }
-            }),
-            json!({
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "description": "Read a file",
-                    "parameters": { "type": "object", "properties": {} }
-                }
-            }),
-        ];
-
-        let disabled: HashSet<String> = ["bash@edge-1".to_string()].into_iter().collect();
-        let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
-
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u".to_string(),
-            "s".to_string(),
-        )
-        .with_server_tool_catalog_enabled(false)
-        .with_edge_tools(edge_tools)
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_disabled_tool_offers(disabled_handle)
-        .build();
-
-        let mut state = create_test_state();
-        let visible = host.visible_turn_tools(&mut state);
-        let visible_names: HashSet<&str> = visible
-            .iter()
-            .filter_map(|tool| {
-                tool.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-            })
-            .collect();
-
-        assert!(visible_names.contains("read_file"));
-        assert!(!visible_names.contains("bash"));
-        assert_eq!(visible_names.len(), 1);
-    }
-
-    #[test]
-    fn visible_turn_tools_excludes_disabled_edge_tools_with_default_server_catalog() {
+    fn visible_turn_tools_excludes_disabled_edge_offer_with_default_catalog() {
         let disabled: HashSet<String> = ["bash@edge-1".to_string()].into_iter().collect();
         let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
 
@@ -8738,7 +8731,43 @@ mod tests {
     }
 
     #[test]
-    fn disabled_shared_network_tool_is_route_scoped_in_visible_surface() {
+    fn tool_admission_snapshot_reports_selected_offer_candidates() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let admission = host.tool_admission_snapshot_entries();
+        let web_fetch = admission
+            .iter()
+            .find(|entry| entry.tool_name == "web_fetch")
+            .expect("web_fetch admission entry");
+
+        assert!(web_fetch.visible);
+        assert_eq!(
+            web_fetch.selected_offer_id.as_deref(),
+            Some("web_fetch@edge-1")
+        );
+        assert_eq!(web_fetch.selected_route, "EdgeBound");
+        assert!(
+            web_fetch
+                .candidates
+                .iter()
+                .any(|candidate| candidate.offer_id == "web_fetch@edge-1" && candidate.selected)
+        );
+        assert!(web_fetch.candidates.iter().any(|candidate| {
+            candidate.offer_id == "web_fetch@server-builtin"
+                && candidate.reason == "CurrentProviderPreferred"
+        }));
+    }
+
+    #[test]
+    fn disabled_shared_network_tool_is_offer_scoped_in_visible_surface() {
         let disabled: HashSet<String> = ["web_fetch@server-builtin".to_string()]
             .into_iter()
             .collect();
@@ -8756,7 +8785,7 @@ mod tests {
         let server_names = schema_names(&server_only.visible_turn_tools(&mut server_state));
         assert!(
             !server_names.contains("web_fetch"),
-            "server disabled_tool_offers must hide server-routed web_fetch"
+            "disabled web_fetch@server-builtin must hide only that selected offer"
         );
         assert!(
             server_names.contains("web_search"),
@@ -8777,7 +8806,7 @@ mod tests {
         let edge_names = schema_names(&edge_selected.visible_turn_tools(&mut edge_state));
         assert!(
             edge_names.contains("web_fetch"),
-            "server disabled_tool_offers must not hide edge-routed web_fetch"
+            "disabled web_fetch@server-builtin must not hide web_fetch@edge-1"
         );
         assert!(edge_names.contains("bash"));
         assert!(edge_names.contains("read_file"));
