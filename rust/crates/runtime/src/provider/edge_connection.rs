@@ -99,6 +99,7 @@ impl CapabilityProvider for EdgeConnectionProvider {
             astra_runtime_env::CapacityProviderType::EdgeCapacity,
             "edge-capacity",
             &self.tool_registry,
+            astra_runtime_env::RuntimePlatform::Unknown,
         )
         .tool_names
         .into_iter()

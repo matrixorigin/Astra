@@ -1291,6 +1291,7 @@ mod tests {
                 status: crate::RuntimeStatus::Ready,
                 ephemeral: true,
                 supports_long_sessions: true,
+                platform: crate::RuntimePlatform::Unknown,
                 interaction_channels: Vec::new(),
             },
             PolicyIntent::strict_orchestrator(),

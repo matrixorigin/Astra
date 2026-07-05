@@ -3518,6 +3518,11 @@ impl ServerAgenticLoopHost {
             server_service_provider_ready: self.server_provider_catalog_enabled,
             control_plane_provider_ready: self.server_provider_catalog_enabled,
             request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
+            selected_runtime_platform: self
+                .runtime_binding
+                .as_ref()
+                .map(|runtime| runtime.platform)
+                .unwrap_or(astra_runtime_env::RuntimePlatform::Unknown),
             disabled_tool_offers: self.disabled_tool_offers_snapshot(),
             disabled_tool_names: self.disabled_tool_names_snapshot(),
             provider_allowed_tools: self.provider_allowed_tools_snapshot(),
@@ -5938,6 +5943,38 @@ mod tests {
             }
         }));
         tools
+    }
+
+    fn sample_edge_tools_with_powershell() -> Vec<Value> {
+        let mut tools = sample_edge_tools();
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "powershell",
+                "description": "Execute a PowerShell command",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }));
+        tools
+    }
+
+    fn edge_runtime_snapshot_with_platform(
+        platform: astra_runtime_env::RuntimePlatform,
+    ) -> ExecutionBindingSnapshot {
+        ExecutionBindingSnapshot::new(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                crate::server::tool_transport::ExecutorStatus::Online,
+            ),
+            astra_runtime_env::RuntimeBinding::host_process("edge-host").with_platform(platform),
+        )
     }
 
     #[test]
@@ -9284,6 +9321,33 @@ mod tests {
         );
         assert!(edge_names.contains("bash"));
         assert!(edge_names.contains("read_file"));
+    }
+
+    #[test]
+    fn edge_visible_surface_gates_powershell_by_runtime_platform() {
+        for (platform, expected_visible) in [
+            (astra_runtime_env::RuntimePlatform::Unknown, false),
+            (astra_runtime_env::RuntimePlatform::Macos, false),
+            (astra_runtime_env::RuntimePlatform::Linux, false),
+            (astra_runtime_env::RuntimePlatform::Windows, true),
+        ] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .with_edge_tools(sample_edge_tools_with_powershell())
+            .with_execution_binding_snapshot(edge_runtime_snapshot_with_platform(platform))
+            .build();
+            let mut state = create_test_state();
+            let visible_names = schema_names(&host.visible_turn_tools(&mut state));
+            assert_eq!(
+                visible_names.contains("powershell"),
+                expected_visible,
+                "powershell visibility must follow runtime platform facts for {platform:?}: {visible_names:?}"
+            );
+        }
     }
 
     #[test]

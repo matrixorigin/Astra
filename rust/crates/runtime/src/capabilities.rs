@@ -202,6 +202,7 @@ pub fn runtime_executor_tool_schemas(
         astra_runtime_env::CapacityProviderType::Sandbox,
         "runtime-workspace",
         &registry,
+        astra_runtime_env::RuntimePlatform::Unknown,
     );
     let pool = schema_pool_declared_by_providers(&[provider]);
     let mut schemas =

@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{RequiredExecutor, ToolRegistry, ToolSpec, WorkspaceAuthority, tool_schema_name};
+use crate::{
+    RequiredExecutor, RuntimePlatform, ToolRegistry, ToolSpec, WorkspaceAuthority, tool_schema_name,
+};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -414,12 +416,13 @@ pub fn runtime_workspace_provider(
     provider_type: CapacityProviderType,
     provider_id: impl Into<String>,
     registry: &ToolRegistry,
+    platform: RuntimePlatform,
 ) -> CapacityProviderDeclaration {
     CapacityProviderDeclaration::from_registry(provider_type, provider_id, registry, |spec| {
         matches!(
             spec.required.executor,
             RequiredExecutor::RuntimeExecutor | RequiredExecutor::ServiceOrRuntimeExecutor
-        ) && runtime_workspace_provider_declares_tool(provider_type, spec.name.as_str())
+        ) && runtime_workspace_provider_declares_tool(provider_type, spec.name.as_str(), platform)
     })
 }
 
@@ -427,24 +430,37 @@ pub fn cli_local_provider(
     provider_id: impl Into<String>,
     registry: &ToolRegistry,
 ) -> CapacityProviderDeclaration {
-    runtime_workspace_provider(CapacityProviderType::CliLocal, provider_id, registry)
+    runtime_workspace_provider(
+        CapacityProviderType::CliLocal,
+        provider_id,
+        registry,
+        RuntimePlatform::current(),
+    )
 }
 
 fn runtime_workspace_provider_declares_tool(
     provider_type: CapacityProviderType,
     tool_name: &str,
+    platform: RuntimePlatform,
 ) -> bool {
-    // These are access-surface/platform-local affordances, not generic
-    // workspace executor capabilities. CLI-local may expose them because the
-    // terminal/platform is the access surface; web/server+edge must wait for an
-    // explicit terminal or platform-specific provider instead of showing tools
-    // that can only fail.
-    if !matches!(provider_type, CapacityProviderType::CliLocal)
-        && matches!(tool_name, "display_sixel" | "powershell")
-    {
-        return false;
+    match tool_name {
+        // Terminal rendering is an access-surface affordance, not generic
+        // workspace executor capacity.
+        "display_sixel" => matches!(provider_type, CapacityProviderType::CliLocal),
+        // PowerShell is platform capacity. User text such as "Windows" must not
+        // expose it; only a provider/runtime that advertises Windows may.
+        "powershell" => {
+            platform.supports_powershell()
+                && matches!(
+                    provider_type,
+                    CapacityProviderType::CliLocal
+                        | CapacityProviderType::EdgeCapacity
+                        | CapacityProviderType::Sandbox
+                        | CapacityProviderType::OrchestratorManagedRuntime
+                )
+        }
+        _ => true,
     }
-    true
 }
 
 pub fn request_scoped_mcp_provider(
@@ -558,7 +574,10 @@ mod tests {
         assert!(cli.declares_tool("web_fetch"));
         assert!(cli.declares_tool("web_search"));
         assert!(cli.declares_tool("read_file"));
-        assert!(cli.declares_tool("powershell"));
+        assert_eq!(
+            cli.declares_tool("powershell"),
+            RuntimePlatform::current().supports_powershell()
+        );
         assert!(cli.declares_tool("display_sixel"));
         assert!(!cli.declares_tool("memory"));
     }
@@ -571,7 +590,12 @@ mod tests {
             CapacityProviderType::Sandbox,
             CapacityProviderType::OrchestratorManagedRuntime,
         ] {
-            let provider = runtime_workspace_provider(provider_type, "runtime", &registry);
+            let provider = runtime_workspace_provider(
+                provider_type,
+                "runtime",
+                &registry,
+                RuntimePlatform::Unknown,
+            );
             assert!(provider.declares_tool("bash"));
             assert!(provider.declares_tool("web_fetch"));
             assert!(provider.declares_tool("web_search"));
@@ -583,6 +607,28 @@ mod tests {
             assert!(
                 !provider.declares_tool("display_sixel"),
                 "{provider_type} must not advertise terminal sixel rendering to web/server surfaces"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_runtime_workspace_providers_advertise_powershell() {
+        let registry = ToolRegistry::builtins();
+        for provider_type in [
+            CapacityProviderType::CliLocal,
+            CapacityProviderType::EdgeCapacity,
+            CapacityProviderType::Sandbox,
+            CapacityProviderType::OrchestratorManagedRuntime,
+        ] {
+            let provider = runtime_workspace_provider(
+                provider_type,
+                "runtime",
+                &registry,
+                RuntimePlatform::Windows,
+            );
+            assert!(
+                provider.declares_tool("powershell"),
+                "{provider_type} should advertise powershell when platform facts say Windows"
             );
         }
     }

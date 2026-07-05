@@ -104,6 +104,7 @@ impl CapabilityProvider for SandboxRuntimeProvider {
             astra_runtime_env::CapacityProviderType::Sandbox,
             "sandbox-runtime",
             &registry,
+            astra_runtime_env::RuntimePlatform::Unknown,
         )
         .tool_names
         .into_iter()

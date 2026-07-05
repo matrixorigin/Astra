@@ -385,6 +385,7 @@ fn runtime_env_runtime_binding(
         status: astra_runtime_env::RuntimeStatus::Ready,
         ephemeral: !matches!(executor.kind, ExecutorBindingKind::EdgeAgent),
         supports_long_sessions: true,
+        platform: astra_runtime_env::RuntimePlatform::Unknown,
         interaction_channels: vec![
             astra_runtime_env::RuntimeInteractionChannel::Exec,
             astra_runtime_env::RuntimeInteractionChannel::StdinPipe,

@@ -743,6 +743,7 @@ fn validate_edge_capabilities(
         astra_runtime_env::CapacityProviderType::EdgeCapacity,
         advert.binding.executor.executor_id.clone(),
         &registry,
+        advert.binding.runtime.platform,
     );
     let original_count = advert.binding.tool_surface.tool_names.len();
     advert.binding.tool_surface.tool_names.retain(|name| {

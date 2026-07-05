@@ -264,6 +264,41 @@ pub enum RuntimeInteractionChannel {
     FileTransfer,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePlatform {
+    Linux,
+    Macos,
+    Windows,
+    #[default]
+    Unknown,
+}
+
+impl RuntimePlatform {
+    pub const fn current() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Self::Windows
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self::Macos
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            Self::Linux
+        }
+        #[cfg(not(any(unix, target_os = "windows")))]
+        {
+            Self::Unknown
+        }
+    }
+
+    pub const fn supports_powershell(self) -> bool {
+        matches!(self, Self::Windows)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeStatus {
@@ -284,6 +319,8 @@ pub struct RuntimeBinding {
     pub ephemeral: bool,
     pub supports_long_sessions: bool,
     #[serde(default)]
+    pub platform: RuntimePlatform,
+    #[serde(default)]
     pub interaction_channels: Vec<RuntimeInteractionChannel>,
 }
 
@@ -298,6 +335,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Offline,
             ephemeral: true,
             supports_long_sessions: false,
+            platform: RuntimePlatform::Unknown,
             interaction_channels: Vec::new(),
         }
     }
@@ -312,6 +350,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Ready,
             ephemeral: false,
             supports_long_sessions: true,
+            platform: RuntimePlatform::current(),
             interaction_channels: vec![
                 RuntimeInteractionChannel::Exec,
                 RuntimeInteractionChannel::StdinPipe,
@@ -330,6 +369,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Ready,
             ephemeral: true,
             supports_long_sessions: true,
+            platform: RuntimePlatform::Linux,
             interaction_channels: vec![
                 RuntimeInteractionChannel::Exec,
                 RuntimeInteractionChannel::StdinPipe,
@@ -347,6 +387,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Ready,
             ephemeral: true,
             supports_long_sessions: false,
+            platform: RuntimePlatform::Unknown,
             interaction_channels: vec![
                 RuntimeInteractionChannel::Exec,
                 RuntimeInteractionChannel::StdinPipe,
@@ -369,6 +410,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Ready,
             ephemeral: true,
             supports_long_sessions: true,
+            platform: RuntimePlatform::Unknown,
             interaction_channels: vec![
                 RuntimeInteractionChannel::Exec,
                 RuntimeInteractionChannel::StdinPipe,
@@ -388,6 +430,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Ready,
             ephemeral: true,
             supports_long_sessions: true,
+            platform: RuntimePlatform::Linux,
             interaction_channels: vec![
                 RuntimeInteractionChannel::Exec,
                 RuntimeInteractionChannel::StdinPipe,
@@ -397,6 +440,11 @@ impl RuntimeBinding {
 
     pub fn with_launch_driver(mut self, launch_driver: RuntimeLaunchDriver) -> Self {
         self.launch_driver = launch_driver;
+        self
+    }
+
+    pub fn with_platform(mut self, platform: RuntimePlatform) -> Self {
+        self.platform = platform;
         self
     }
 }
@@ -522,6 +570,7 @@ fn default_capacity_provider_declarations(
             provider_type,
             default_runtime_provider_id(provider_type, executor),
             registry,
+            runtime.platform,
         ));
     }
 

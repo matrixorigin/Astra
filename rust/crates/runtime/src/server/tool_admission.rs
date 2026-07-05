@@ -73,6 +73,7 @@ pub(crate) struct ToolAdmissionContext {
     pub server_service_provider_ready: bool,
     pub control_plane_provider_ready: bool,
     pub request_scoped_mcp_provider_ready: bool,
+    pub selected_runtime_platform: astra_runtime_env::RuntimePlatform,
     pub disabled_tool_offers: HashSet<String>,
     pub disabled_tool_names: HashSet<String>,
     pub provider_allowed_tools: HashMap<String, HashSet<String>>,
@@ -84,6 +85,7 @@ impl Default for ToolAdmissionContext {
             server_service_provider_ready: true,
             control_plane_provider_ready: true,
             request_scoped_mcp_provider_ready: false,
+            selected_runtime_platform: astra_runtime_env::RuntimePlatform::Unknown,
             disabled_tool_offers: HashSet::new(),
             disabled_tool_names: HashSet::new(),
             provider_allowed_tools: HashMap::new(),
@@ -131,6 +133,10 @@ pub(crate) fn resolve_tool_admission_for_binding_with_context(
     registry: &astra_runtime_env::ToolRegistry,
     context: ToolAdmissionContext,
 ) -> ToolAdmissionDecision {
+    let mut context = context;
+    if let Some(runtime) = runtime {
+        context.selected_runtime_platform = runtime.platform;
+    }
     let providers = active_provider_declarations_for_binding(
         schemas, workspace, executor, runtime, registry, &context,
     );
@@ -157,7 +163,15 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
         candidate_offers_for_tool(tool_name, workspace, providers)
     };
     let selected_unready_offer = if !matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
-        selected_unready_offer_for_route(tool_name, workspace, executor, route, providers, registry)
+        selected_unready_offer_for_route(
+            tool_name,
+            workspace,
+            executor,
+            context.selected_runtime_platform,
+            route,
+            providers,
+            registry,
+        )
     } else {
         None
     };
@@ -293,10 +307,14 @@ pub(crate) fn active_provider_declarations_for_binding(
     }
 
     if has_explicit_runtime_executor_provider(workspace, executor, runtime) {
+        let selected_runtime_platform = runtime
+            .map(|runtime| runtime.platform)
+            .unwrap_or(context.selected_runtime_platform);
         providers.push(astra_runtime_env::runtime_workspace_provider(
             capacity_provider_type_for_workspace_executor(workspace.kind, executor.kind),
             runtime_execution_provider_id_for_executor(executor),
             registry,
+            selected_runtime_platform,
         ));
     }
 
@@ -414,6 +432,7 @@ fn selected_unready_offer_for_route(
     tool_name: &str,
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
+    platform: astra_runtime_env::RuntimePlatform,
     route: ToolExecutionRouteKind,
     ready_providers: &[CapacityProviderDeclaration],
     registry: &astra_runtime_env::ToolRegistry,
@@ -442,8 +461,12 @@ fn selected_unready_offer_for_route(
     }
 
     let provider_id = runtime_execution_provider_id_for_executor(executor);
-    let provider =
-        astra_runtime_env::runtime_workspace_provider(provider_type, provider_id, registry);
+    let provider = astra_runtime_env::runtime_workspace_provider(
+        provider_type,
+        provider_id,
+        registry,
+        platform,
+    );
     if !provider.declares_tool(tool_name) {
         return None;
     }
@@ -1132,6 +1155,7 @@ mod tests {
                 CapacityProviderType::EdgeCapacity,
                 "edge-macpro",
                 &registry(),
+                astra_runtime_env::RuntimePlatform::Unknown,
             )
             .with_tool_schema_digest("web_fetch", "sha256:edge"),
         ];
@@ -1178,6 +1202,7 @@ mod tests {
                 CapacityProviderType::EdgeCapacity,
                 "edge-macpro",
                 &registry(),
+                astra_runtime_env::RuntimePlatform::Unknown,
             )
             .with_tool_schema_digest("web_fetch", "sha256:edge"),
         ];
