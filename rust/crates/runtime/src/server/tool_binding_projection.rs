@@ -530,6 +530,25 @@ mod tests {
         }
     }
 
+    fn edge_workspace() -> WorkspaceBinding {
+        WorkspaceBinding {
+            kind: WorkspaceBindingKind::EdgeWorkspace,
+            display_name: "Edge workspace".to_string(),
+            cwd: Some("/Users/test/repo".to_string()),
+            authority: WorkspaceAuthority::ReadWrite,
+        }
+    }
+
+    fn edge_executor(executor_id: &str) -> ExecutorBinding {
+        ExecutorBinding {
+            kind: ExecutorBindingKind::EdgeAgent,
+            executor_id: executor_id.to_string(),
+            display_name: "Edge workspace".to_string(),
+            transport: ToolTransportKind::EdgeWs,
+            status: ExecutorStatus::Online,
+        }
+    }
+
     #[test]
     fn filters_project_tools_without_workspace_runtime() {
         let names = schema_names(capability_filter_tool_schemas_for_binding(
@@ -1005,19 +1024,8 @@ mod tests {
         );
         let edge_visible = capability_filter_tool_schemas_for_binding(
             vec![canonical_schema.clone()],
-            &WorkspaceBinding {
-                kind: WorkspaceBindingKind::EdgeWorkspace,
-                display_name: "Edge workspace".to_string(),
-                cwd: Some("/Users/test/repo".to_string()),
-                authority: WorkspaceAuthority::ReadWrite,
-            },
-            &ExecutorBinding {
-                kind: ExecutorBindingKind::EdgeAgent,
-                executor_id: "edge-1".to_string(),
-                display_name: "Edge workspace".to_string(),
-                transport: ToolTransportKind::EdgeWs,
-                status: ExecutorStatus::Online,
-            },
+            &edge_workspace(),
+            &edge_executor("edge-1"),
             None,
         );
 
@@ -1026,6 +1034,100 @@ mod tests {
         assert_eq!(
             server_visible, edge_visible,
             "provider/route selection must not mutate prompt-visible canonical schema"
+        );
+    }
+
+    #[test]
+    fn same_tool_schema_stays_stable_while_offer_selection_is_provider_scoped() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let canonical_schema = schema("web_fetch");
+        let workspace = edge_workspace();
+        let alice = edge_executor("edge-alice");
+        let bob = edge_executor("edge-bob");
+
+        let alice_visible = capability_filter_tool_schemas_for_binding(
+            vec![canonical_schema.clone()],
+            &workspace,
+            &alice,
+            None,
+        );
+        let bob_visible = capability_filter_tool_schemas_for_binding(
+            vec![canonical_schema.clone()],
+            &workspace,
+            &bob,
+            None,
+        );
+
+        assert_eq!(alice_visible, vec![canonical_schema.clone()]);
+        assert_eq!(
+            alice_visible, bob_visible,
+            "provider identity must not mutate prompt-visible canonical schema"
+        );
+
+        let alice_admission = crate::server::tool_admission::resolve_tool_admission_for_binding(
+            "web_fetch",
+            &[canonical_schema.clone()],
+            &workspace,
+            &alice,
+            None,
+            &registry,
+        );
+        let bob_admission = crate::server::tool_admission::resolve_tool_admission_for_binding(
+            "web_fetch",
+            &[canonical_schema],
+            &workspace,
+            &bob,
+            None,
+            &registry,
+        );
+
+        assert_eq!(
+            alice_admission.selected_offer_id(),
+            Some("web_fetch@edge-alice")
+        );
+        assert_eq!(
+            bob_admission.selected_offer_id(),
+            Some("web_fetch@edge-bob")
+        );
+    }
+
+    #[test]
+    fn provider_allowlist_is_provider_scoped_not_global_tool_scoped() {
+        let canonical_schema = schema("web_fetch");
+        let workspace = edge_workspace();
+        let alice = edge_executor("edge-alice");
+        let bob = edge_executor("edge-bob");
+        let context = ToolAdmissionContext {
+            provider_allowed_tools: HashMap::from([(
+                "edge-alice".to_string(),
+                HashSet::from(["bash".to_string()]),
+            )]),
+            ..ToolAdmissionContext::default()
+        };
+
+        let alice_visible = capability_filter_tool_schemas_for_binding_with_context(
+            vec![canonical_schema.clone()],
+            &workspace,
+            &alice,
+            None,
+            context.clone(),
+        );
+        let bob_visible = capability_filter_tool_schemas_for_binding_with_context(
+            vec![canonical_schema.clone()],
+            &workspace,
+            &bob,
+            None,
+            context,
+        );
+
+        assert!(
+            alice_visible.is_empty(),
+            "edge-alice allowlist excludes web_fetch and must hide only that provider's offer"
+        );
+        assert_eq!(
+            bob_visible,
+            vec![canonical_schema],
+            "edge-bob has no provider allowlist entry and must not inherit edge-alice policy"
         );
     }
 
