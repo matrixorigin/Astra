@@ -660,10 +660,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.remaining_turns as u32,
             );
             if !status.is_empty() {
-                astra_turn_core::chat_history_openai::append_openai_user_content_messages(
-                    &mut state.messages,
-                    &[status],
-                );
+                state.push_volatile(super::host::VolatileKind::SelfStatus, status);
             }
         }
 
@@ -671,10 +668,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             let guidance =
                 crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
             if !guidance.is_empty() {
-                astra_turn_core::chat_history_openai::append_openai_user_content_messages(
-                    &mut state.messages,
-                    &[guidance],
-                );
+                state.push_volatile(super::host::VolatileKind::BudgetAdvisory, guidance);
             }
         }
     }

@@ -7,12 +7,14 @@
 //! 4. After edge disconnects, it disappears from the pool
 //! 5. Multiple edges per user tracked correctly
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
 };
+use astra_services::multi_agent::EdgeDispatchService;
 use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::{SinkExt, StreamExt};
@@ -78,15 +80,198 @@ impl AuthService for StubAuthService {
     }
 }
 
+#[derive(Clone, Debug)]
+struct TestDispatchRow {
+    user_id: String,
+    edge_agent_id: String,
+    request_id: String,
+    payload_json: String,
+    result_json: Option<String>,
+    status: String,
+    failure_reason: Option<String>,
+}
+
+#[derive(Default)]
+struct TestEdgeDispatch {
+    rows: Mutex<HashMap<(String, String), TestDispatchRow>>,
+    terminal: tokio::sync::Notify,
+}
+
+impl TestEdgeDispatch {
+    async fn wait_for_status(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        expected: &str,
+    ) -> TestDispatchRow {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            {
+                let rows = self.rows.lock().expect("test edge dispatch rows");
+                if let Some(row) = rows.get(&(user_id.to_string(), request_id.to_string()))
+                    && row.status == expected
+                {
+                    return row.clone();
+                }
+            }
+            tokio::select! {
+                _ = self.terminal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    let rows = self.rows.lock().expect("test edge dispatch rows");
+                    panic!("timed out waiting for dispatch {request_id} to become {expected}: {:?}", rows.get(&(user_id.to_string(), request_id.to_string())));
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
+    async fn insert_dispatch(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        request_id: &str,
+        payload_json: &str,
+    ) -> Result<(), String> {
+        self.rows.lock().expect("test edge dispatch rows").insert(
+            (user_id.to_string(), request_id.to_string()),
+            TestDispatchRow {
+                user_id: user_id.to_string(),
+                edge_agent_id: edge_agent_id.to_string(),
+                request_id: request_id.to_string(),
+                payload_json: payload_json.to_string(),
+                result_json: None,
+                status: "pending".to_string(),
+                failure_reason: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn poll_pending(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+    ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+        let mut rows = self.rows.lock().expect("test edge dispatch rows");
+        let mut claimed = Vec::new();
+        for row in rows.values_mut() {
+            if row.user_id == user_id
+                && row.edge_agent_id == edge_agent_id
+                && row.status == "pending"
+            {
+                row.status = "dispatched".to_string();
+                claimed.push(astra_services::multi_agent::EdgeDispatchRow {
+                    user_id: row.user_id.clone(),
+                    edge_agent_id: row.edge_agent_id.clone(),
+                    request_id: row.request_id.clone(),
+                    payload_json: row.payload_json.clone(),
+                    result_json: row.result_json.clone(),
+                    status: row.status.clone(),
+                    pending_wait_us: 0,
+                });
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn deliver_result(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        edge_agent_id: &str,
+        result_json: &str,
+    ) -> Result<bool, String> {
+        let mut rows = self.rows.lock().expect("test edge dispatch rows");
+        let Some(row) = rows.get_mut(&(user_id.to_string(), request_id.to_string())) else {
+            return Ok(false);
+        };
+        if row.edge_agent_id != edge_agent_id {
+            return Ok(false);
+        }
+        row.status = "completed".to_string();
+        row.result_json = Some(result_json.to_string());
+        drop(rows);
+        self.terminal.notify_waiters();
+        Ok(true)
+    }
+
+    async fn fail_dispatch(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
+        let mut rows = self.rows.lock().expect("test edge dispatch rows");
+        let Some(row) = rows.get_mut(&(user_id.to_string(), request_id.to_string())) else {
+            return Ok(false);
+        };
+        row.status = "failed".to_string();
+        row.failure_reason = Some(reason.to_string());
+        row.result_json = Some(
+            json!({
+                "request_id": request_id,
+                "status": "failed",
+                "output": format!("edge dispatch {reason}"),
+                "duration_ms": 0,
+            })
+            .to_string(),
+        );
+        drop(rows);
+        self.terminal.notify_waiters();
+        Ok(true)
+    }
+
+    async fn wait_result(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<String>, String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let rows = self.rows.lock().expect("test edge dispatch rows");
+                let Some(row) = rows.get(&(user_id.to_string(), request_id.to_string())) else {
+                    return Ok(None);
+                };
+                if matches!(row.status.as_str(), "completed" | "failed") {
+                    return Ok(row.result_json.clone());
+                }
+            }
+            tokio::select! {
+                _ = self.terminal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+            }
+        }
+    }
+
+    async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
+        Ok(0)
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Spawn a minimal server, return address + shared state + handle.
 async fn spawn_test_server() -> (std::net::SocketAddr, AppState, tokio::task::JoinHandle<()>) {
+    spawn_test_server_with_dispatch(None).await
+}
+
+async fn spawn_test_server_with_dispatch(
+    dispatch: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
+) -> (std::net::SocketAddr, AppState, tokio::task::JoinHandle<()>) {
     let state = AppState::new(
         ServiceInfo::new("edge-e2e-test", "0.0.0-test", ""),
         Arc::new(StubHealthChecker),
     )
     .with_auth_service(Arc::new(StubAuthService));
+    let state = if let Some(dispatch) = dispatch {
+        state.with_edge_dispatch_service(dispatch)
+    } else {
+        state
+    };
 
     let state_clone = state.clone();
     let app = build_app(state);
@@ -256,6 +441,52 @@ async fn edge_ws_tool_request_roundtrip() {
     assert_eq!(result.duration_ms, Some(42));
 
     write.close().await.ok();
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_ws_disconnect_fails_inflight_dispatch_without_waiting_for_timeout() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+
+    let request_id = "dispatch-disconnect-1";
+    let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+        request_id: request_id.to_string(),
+        tool: "bash".to_string(),
+        args: json!({"command": "sleep 30"}),
+        timeout_secs: 30,
+    };
+    dispatch
+        .insert_dispatch(
+            "test-user-1",
+            "edge-disconnect",
+            request_id,
+            &serde_json::to_string(&payload).expect("payload json"),
+        )
+        .await
+        .expect("insert pending dispatch");
+
+    let mut ws = ws_auth(addr, "edge-disconnect", "disconnect-host").await;
+    let tool_req = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
+        .await
+        .expect("edge should receive dispatch before timeout")
+        .expect("edge websocket should remain open")
+        .expect("tool request frame");
+    let req_json: serde_json::Value = serde_json::from_str(&tool_req.into_text().unwrap()).unwrap();
+    assert_eq!(req_json["type"], "edge_tool_request");
+    assert_eq!(req_json["request_id"], request_id);
+    assert_eq!(req_json["tool"], "bash");
+
+    drop(ws);
+
+    let failed = dispatch
+        .wait_for_status("test-user-1", request_id, "failed")
+        .await;
+    assert_eq!(
+        failed.failure_reason.as_deref(),
+        Some("edge_ws_disconnected")
+    );
+
     server.abort();
 }
 

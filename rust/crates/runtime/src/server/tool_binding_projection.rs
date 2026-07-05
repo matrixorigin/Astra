@@ -6,7 +6,7 @@ use astra_turn_core::tool::schema::tool_schema_name;
 use serde_json::Value;
 
 use crate::server::tool_route_selection::{
-    ToolExecutionOwner, ToolExecutionRouteKind, routing_decision, tool_execution_owner,
+    ToolExecutionOwner, ToolExecutionRouteKind, routing_decision_for_binding, tool_execution_owner,
 };
 
 use super::tool_execution_binding::{
@@ -65,7 +65,7 @@ fn tool_route_is_visible_for_binding(
     tool_name: &str,
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
-    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    _runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> bool {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     match tool_execution_owner(tool_name, &registry) {
@@ -77,21 +77,8 @@ fn tool_route_is_visible_for_binding(
         ToolExecutionOwner::RuntimeExecutor => {}
     }
 
-    let request = ToolExecutionRequest {
-        user_id: "tool-surface".to_string(),
-        run_id: "tool-surface".to_string(),
-        session_id: "tool-surface".to_string(),
-        tool_call_id: "tool-surface".to_string(),
-        tool_name: tool_name.to_string(),
-        args: serde_json::json!({}),
-        workspace: workspace.clone(),
-        workspace_record: None,
-        executor: executor.clone(),
-        runtime: runtime.cloned(),
-        policy: ToolPolicySnapshot::default(),
-    };
     !matches!(
-        routing_decision(&request, &registry),
+        routing_decision_for_binding(tool_name, workspace.kind, executor.transport, &registry),
         ToolExecutionRouteKind::Unsupported
     )
 }
@@ -124,7 +111,7 @@ pub fn capability_filtered_server_tool_schemas(
 fn has_explicit_runtime_executor_provider(
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
-    _runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> bool {
     let workspace_provider_declared = matches!(
         workspace.kind,
@@ -138,6 +125,15 @@ fn has_explicit_runtime_executor_provider(
     let provider_type =
         capacity_provider_type_for_workspace_executor(workspace.kind, executor.kind);
     workspace_provider_declared
+        && matches!(
+            executor.status,
+            ExecutorStatus::Online | ExecutorStatus::Degraded
+        )
+        && runtime.is_none_or(|runtime| {
+            runtime.status == astra_runtime_env::RuntimeStatus::Ready
+                && runtime.session_manager != astra_runtime_env::RuntimeSessionManager::None
+                && runtime.isolation_backend != astra_runtime_env::RuntimeIsolationBackend::None
+        })
         && !matches!(
             provider_type,
             astra_runtime_env::CapacityProviderType::Unknown
@@ -747,6 +743,32 @@ mod tests {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must be invisible when workspace and executor provider ownership disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_offline_runtime_binding_does_not_expose_runtime_tools() {
+        let mut runtime = astra_runtime_env::RuntimeBinding::host_process("server-host");
+        runtime.status = astra_runtime_env::RuntimeStatus::Offline;
+
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &WorkspaceBinding::server_sandbox("/workspace"),
+            &ExecutorBinding::server_local(),
+            Some(&runtime),
+        ));
+
+        for expected in ["ask_user", "tool_search", "web_fetch"] {
+            assert!(
+                names.contains(expected),
+                "{expected} should remain visible from server/control-plane providers"
+            );
+        }
+        for hidden in ["read_file", "write_file", "bash", "git"] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must be invisible when the explicit runtime binding is offline"
             );
         }
     }

@@ -1069,6 +1069,7 @@ fn classify_pipeline_abort(
 /// paths can share the same message ordering and cache-sensitive volatile
 /// placement instead of each host rebuilding this logic.
 pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Value> {
+    queue_active_turn_frame(input.state);
     let drained = input.state.take_volatile_pending();
 
     let mut skills: Vec<_> = input.state.skills.invoked.values().collect();
@@ -1099,6 +1100,24 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
         input.cache_capability,
         input.cache_cfg,
     )
+}
+
+fn queue_active_turn_frame(state: &mut AgenticLoopState) {
+    let latest_user_message = state.message.trim();
+    if latest_user_message.is_empty() {
+        return;
+    }
+    let frame = json!({
+        "latest_user_message": latest_user_message,
+        "active_goal": latest_user_message,
+        "turn_id": state.session_turn,
+        "round_id": state.llm_rounds_completed,
+        "instruction": "Answer the latest user message first. History, memory, and tool results are evidence for this goal; do not finish with an answer to an older question."
+    });
+    state.push_volatile(
+        crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
+        format!("[active-turn-frame:v1]\n{frame}\n[/active-turn-frame]"),
+    );
 }
 
 /// Apply provider-specific cache annotations to the final visible tool schemas.
@@ -1373,6 +1392,51 @@ mod context_cache_contract_tests {
             output.manifest_trace.to_json()["model_context_window_tokens"],
             json!(1_000_000),
             "context assembly must use registry context_window, not model-name heuristics or 200K default"
+        );
+    }
+
+    #[test]
+    fn assemble_wire_messages_auto_injects_active_turn_frame() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.message = "相关的测试够硬核吗？".to_string();
+        state.session_turn = 7;
+        state.llm_rounds_completed = 3;
+        state.messages = vec![
+            json!({"role": "user", "content": "一共多少 changes？"}),
+            json!({"role": "assistant", "content": "148 files"}),
+            json!({"role": "user", "content": "相关的测试够硬核吗？"}),
+        ];
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let edge_profile = Map::new();
+        let cache_cfg = PromptCacheConfig::latch("openai", "gpt-4");
+
+        let messages = assemble_wire_messages(LlmWireAssemblyInput {
+            system_messages: vec![json!({"role": "system", "content": "sys"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state: &mut state,
+            thinking: &thinking,
+            edge_profile: &edge_profile,
+            session_id: "sid",
+            provider: "openai",
+            model_name: "gpt-4",
+            cache_capability: None,
+            cache_cfg: &cache_cfg,
+        });
+
+        let user_text = messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(user_text.contains("[active-turn-frame:v1]"));
+        assert!(user_text.contains("\"turn_id\":7"));
+        assert!(user_text.contains("\"round_id\":3"));
+        assert!(user_text.contains("相关的测试够硬核吗"));
+        assert!(
+            state.volatile_pending.is_empty(),
+            "active frame must be one-shot per LLM request"
         );
     }
 

@@ -606,6 +606,9 @@ pub(crate) fn render_drained_volatile(
 ) -> String {
     let mut out = String::new();
     for inj in drained {
+        if !inj.kind.render_in_user_tail() {
+            continue;
+        }
         let text = inj.content.trim();
         if text.is_empty() {
             continue;
@@ -1447,6 +1450,80 @@ mod tests {
         let user_content = msgs[1]["content"].as_str().unwrap();
         assert!(user_content.contains("volatile"), "volatile prepended");
         assert!(user_content.contains("hi"), "original content preserved");
+    }
+
+    #[test]
+    fn self_status_volatile_never_enters_user_role_wire_messages() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::SelfStatus,
+            content: "## ⚡ Self-Status\nTurn 9/299 | Cache: 86%".to_string(),
+            round_index: 9,
+        }];
+        let compacted = vec![json!({"role": "user", "content": "相关的测试够硬核吗？"})];
+        let msgs = assemble_llm_messages_with_cache_capability(
+            system,
+            Vec::new(),
+            drained,
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+            &cache_cfg(),
+        );
+
+        let user_text = msgs
+            .iter()
+            .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("user"))
+            .filter_map(|msg| msg.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(user_text.contains("相关的测试够硬核吗"));
+        assert!(
+            !user_text.contains("Self-Status"),
+            "runtime telemetry must not be rendered as user intent: {user_text}"
+        );
+    }
+
+    #[test]
+    fn active_turn_frame_anchors_latest_user_goal_in_tail_volatile() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
+            content: "[active-turn-frame:v1]\n{\"latest_user_message\":\"相关的测试够硬核吗？\",\"active_goal\":\"相关的测试够硬核吗？\"}\n[/active-turn-frame]".to_string(),
+            round_index: 3,
+        }];
+        let compacted = vec![
+            json!({"role": "user", "content": "一共多少 changes？"}),
+            json!({"role": "assistant", "content": "148 files"}),
+            json!({"role": "user", "content": "相关的测试够硬核吗？"}),
+        ];
+        let msgs = assemble_llm_messages_with_cache_capability(
+            system,
+            Vec::new(),
+            drained,
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+            &cache_cfg(),
+        );
+
+        assert_eq!(msgs[1]["content"], "一共多少 changes？");
+        assert_eq!(msgs[2]["content"], "148 files");
+        let tail = msgs.last().unwrap()["content"].as_str().unwrap();
+        assert!(tail.contains("[active-turn-frame:v1]"));
+        assert!(tail.contains("相关的测试够硬核吗"));
+        assert!(
+            tail.contains("active_goal"),
+            "active goal frame must stay explicit after tool rounds"
+        );
     }
 
     #[test]

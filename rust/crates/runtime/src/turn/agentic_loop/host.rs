@@ -1473,6 +1473,12 @@ pub enum VolatileKind {
     /// Budget/turn/round limit advisory ("You have reached the token
     /// budget…", "Do NOT call any more tools…").
     BudgetAdvisory,
+    /// Runtime telemetry snapshot. It must never be treated as a user
+    /// utterance, because doing so pollutes latest-user-goal extraction.
+    SelfStatus,
+    /// Per-round anchor for the current user goal. It is rebuilt from
+    /// authoritative runtime state immediately before each LLM request.
+    ActiveTurnFrame,
     /// Tactical adaptation hint.
     TacticalAdaptation,
     /// "Context was just compacted — continue working, do not
@@ -1552,8 +1558,18 @@ impl VolatileKind {
                 | Self::TaskBoardCompletionGate
                 | Self::TaskBoardStartGate
                 | Self::PlanModeMarker
-                | Self::IntentDrift,
+                | Self::IntentDrift
+                | Self::SelfStatus
+                | Self::ActiveTurnFrame,
         )
+    }
+
+    /// Whether this volatile kind may be rendered into the user-role
+    /// tail reminder used by cache-sensitive providers. Telemetry is
+    /// diagnostic state, not user intent, so it is intentionally excluded.
+    #[must_use]
+    pub fn render_in_user_tail(self) -> bool {
+        !matches!(self, Self::SelfStatus)
     }
 
     /// Default wire role for this kind. System-role for coaching /
@@ -1579,11 +1595,13 @@ impl VolatileKind {
             | Self::ContextPressure
             | Self::DeferredUserInput
             | Self::BudgetReview
-            | Self::IntentDrift => "user",
+            | Self::IntentDrift
+            | Self::ActiveTurnFrame => "user",
             // System-role: prevents injection via attacker-crafted file content.
             Self::HallucinationTripwire => "system",
             // System-role: in-band runtime snapshots or coaching.
-            Self::WorkingSet
+            Self::SelfStatus
+            | Self::WorkingSet
             | Self::AlreadyFetched
             | Self::ToolBatchCoaching
             | Self::TacticalAdaptation
@@ -2166,6 +2184,9 @@ impl AgenticLoopState {
         }
         let mut rendered = String::new();
         for inj in &drained {
+            if !inj.kind.render_in_user_tail() {
+                continue;
+            }
             let text = inj.content.trim();
             if text.is_empty() {
                 continue;
@@ -9013,6 +9034,27 @@ mod parallel_execution_tests {
         assert!(
             state.take_volatile_pending_as_message().is_none(),
             "second take must be None — lane was drained"
+        );
+    }
+
+    #[test]
+    fn take_volatile_pending_as_message_excludes_self_status_telemetry() {
+        let mut state = make_state();
+        state.push_volatile(
+            VolatileKind::SelfStatus,
+            "## ⚡ Self-Status\nTurn 9/299 | Cache: 86%",
+        );
+        state.push_volatile(VolatileKind::Corrective, "answer the latest question");
+
+        let msg = state
+            .take_volatile_pending_as_message()
+            .expect("corrective content should still render");
+        let content = msg["content"].as_str().unwrap();
+        assert_eq!(msg["role"], "user");
+        assert!(content.contains("answer the latest question"));
+        assert!(
+            !content.contains("Self-Status"),
+            "runtime telemetry must not be sent as a user message: {content}"
         );
     }
 

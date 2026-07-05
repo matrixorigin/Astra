@@ -549,18 +549,19 @@ fn ensure_test_edge_profile_for_edge_tools(payload: &mut Map<String, Value>) {
         .get("edge_tools")
         .and_then(Value::as_array)
         .is_some_and(|tools| tools.iter().any(test_tool_requires_edge_runtime));
-    if !has_edge_runtime_tools || context.contains_key("edge_profile") {
+    if !has_edge_runtime_tools {
         return;
     }
-    context.insert(
-        "edge_profile".to_string(),
-        json!({
-            "cwd": "/tmp/astra-web-agent-e2e-edge",
-            "edge_agent_id": "web-agent-e2e-edge",
-            "hostname": "web-agent-e2e",
-        }),
-    );
-    payload
+    context
+        .entry("edge_profile".to_string())
+        .or_insert_with(|| {
+            json!({
+                "cwd": "/tmp/astra-web-agent-e2e-edge",
+                "edge_agent_id": "web-agent-e2e-edge",
+                "hostname": "web-agent-e2e",
+            })
+        });
+    let workspace_binding = payload
         .entry("workspace_binding".to_string())
         .or_insert_with(|| {
             json!({
@@ -571,7 +572,12 @@ fn ensure_test_edge_profile_for_edge_tools(payload: &mut Map<String, Value>) {
                 "fallback_policy": "disabled"
             })
         });
-    payload
+    assert_eq!(
+        workspace_binding["kind"].as_str(),
+        Some("edge_workspace"),
+        "test payload with edge runtime tools must use an edge workspace binding"
+    );
+    let executor_binding = payload
         .entry("executor_binding".to_string())
         .or_insert_with(|| {
             json!({
@@ -582,6 +588,21 @@ fn ensure_test_edge_profile_for_edge_tools(payload: &mut Map<String, Value>) {
                 "status": "online"
             })
         });
+    assert_eq!(
+        executor_binding["kind"].as_str(),
+        Some("edge_agent"),
+        "test payload with edge runtime tools must use an edge executor binding"
+    );
+    assert_eq!(
+        executor_binding["transport"].as_str(),
+        Some("edge_ledger"),
+        "web_agent_e2e edge runtime tools are executed through the client ledger"
+    );
+    assert_eq!(
+        executor_binding["status"].as_str(),
+        Some("online"),
+        "web_agent_e2e edge runtime tool fixtures require an online executor"
+    );
 }
 
 fn test_tool_requires_edge_runtime(tool: &Value) -> bool {

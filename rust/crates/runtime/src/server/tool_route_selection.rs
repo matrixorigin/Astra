@@ -100,7 +100,21 @@ pub(crate) fn routing_decision(
     request: &ToolExecutionRequest,
     registry: &astra_runtime_env::ToolRegistry,
 ) -> ToolExecutionRouteKind {
-    match tool_execution_owner(&request.tool_name, registry) {
+    routing_decision_for_binding(
+        &request.tool_name,
+        request.workspace.kind,
+        request.executor.transport,
+        registry,
+    )
+}
+
+pub(crate) fn routing_decision_for_binding(
+    tool_name: &str,
+    workspace_kind: WorkspaceBindingKind,
+    executor_transport: ToolTransportKind,
+    registry: &astra_runtime_env::ToolRegistry,
+) -> ToolExecutionRouteKind {
+    match tool_execution_owner(tool_name, registry) {
         ToolExecutionOwner::ServerControlPlane => {
             return ToolExecutionRouteKind::ServerControlPlane;
         }
@@ -112,20 +126,15 @@ pub(crate) fn routing_decision(
         ToolExecutionOwner::RuntimeExecutor => {}
     }
 
-    if matches!(request.executor.transport, ToolTransportKind::GatewayRelay) {
+    if matches!(executor_transport, ToolTransportKind::GatewayRelay) {
         return ToolExecutionRouteKind::GatewayRelay;
     }
-    if matches!(
-        request.executor.transport,
-        ToolTransportKind::SandboxResidentAgent
-    ) {
+    if matches!(executor_transport, ToolTransportKind::SandboxResidentAgent) {
         return ToolExecutionRouteKind::SandboxResidentAgent;
     }
-    match request.workspace.kind {
+    match workspace_kind {
         WorkspaceBindingKind::EdgeWorkspace => return ToolExecutionRouteKind::EdgeBound,
-        WorkspaceBindingKind::ServerSandbox
-            if server_local_runtime_tool_supported(&request.tool_name) =>
-        {
+        WorkspaceBindingKind::ServerSandbox if server_local_runtime_tool_supported(tool_name) => {
             return ToolExecutionRouteKind::ServerLocal;
         }
         WorkspaceBindingKind::LocalFilesystem => return ToolExecutionRouteKind::Unsupported,

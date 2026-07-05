@@ -690,7 +690,20 @@ dev-start-server-edge:
 	@echo "   Edge workspace: $${ASTRA_EDGE_WORKSPACE_DIR:-$$(pwd)}"
 
 .PHONY: dev-start
-dev-start: dev-start-server-only
+dev-start:
+	@echo "Starting development environment..."
+	@$(MAKE) dev-deps-up
+	@$(MAKE) dev-deps-wait
+	@$(MAKE) dev-api-start
+	@$(MAKE) dev-web-start
+	@echo ""
+	@echo "✅ Development environment started!"
+	@echo "   API: http://localhost:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}"
+	@echo "   Web: http://localhost:$${ASTRA_WEB_PORT:-$${WEB_PORT:-3536}}"
+	@echo "   Edge provider: unchanged"
+	@echo ""
+	@echo "Use make dev-start-server-only to explicitly disconnect local edge."
+	@echo "Use make dev-start-server-edge to start or reconnect local edge."
 
 .PHONY: dev-start-docker
 # Docker API mode reuses the dev dependency stack; dev-api-docker-up starts only api.
@@ -932,8 +945,11 @@ test-server-only:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::binding_resolution::tests::edge_tools_without_profile_do_not_create_provider_binding
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::server_provider_surface_does_not_start_from_workspace_tools
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::mismatched_workspace_executor_does_not_expose_runtime_tools
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::explicit_offline_runtime_binding_does_not_expose_runtime_tools
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::visible_turn_tools_excludes_disabled_edge_tools_with_default_server_catalog
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::no_workspace_reports_sandbox_unbound
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::mismatched_workspace_executor_reports_unbound_provider
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_workspace_path_guard::tests::workspace_ownership_rejects_symlink_escape_even_when_lexical_path_is_inside
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::run_turn_pipeline_includes_turn_start_lifecycle_summary_for_web_agent
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::runtime_manifest_preserves_server_only_backbone_without_workspace_executor
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::runtime_tool_executor::tests::server_only_introspect_json_preserves_provider_coverage_graph
@@ -955,16 +971,20 @@ test-server-only:
 test-server-edge:
 	@echo "Running focused server+edge provider tests..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-edge
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::binding_resolution::tests::edge_profile_can_declare_read_only_workspace_authority
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::edge_profile_execution_bindings_make_edge_provider_explicit
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::turn_start_lifecycle_summary_reports_edge_provider_binding
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::builder_composes_server_owned_tools_with_edge_declared_runtime_tools
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::offline_edge_blocking_does_not_require_sse_event_channel
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::edge_ledger_delivery_selects_only_edge_bound_runtime_tools
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::server_catalog_with_edge_binding_still_routes_runtime_tools_to_edge
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::server_edge_composition_exposes_server_services_and_edge_runtime_tools
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::edge_workspace_without_server_cwd_reports_edge_capacity_ready
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::edge_offline_reports_edge_capacity_offline
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_bound_selected_executor_does_not_route_to_other_connected_edge
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_bound_offline_or_unknown_status_blocks_without_dispatch
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_dispatch_without_result_reports_transport_disconnected
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test edge_ws_e2e edge_ws_disconnect_fails_inflight_dispatch_without_waiting_for_timeout
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \

@@ -1,6 +1,8 @@
 use serde_json::Value;
 
-use super::tool_execution_binding::{ExecutorStatus, ToolExecutionRequest, WorkspaceBindingKind};
+use super::tool_execution_binding::{
+    ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, WorkspaceBindingKind,
+};
 use super::tool_transport_metadata::{
     RUN_BLOCKED_REASON_EXECUTOR_OFFLINE, RUN_BLOCKED_REASON_ROUTE_MISMATCH,
     TOOL_ERROR_KIND_CAPABILITY_DENIED, attach_runtime_error_metadata,
@@ -32,10 +34,14 @@ pub(crate) fn capability_denied_result(
 ) -> astra_tools::ToolResult {
     let offline_edge_executor =
         matches!(request.workspace.kind, WorkspaceBindingKind::EdgeWorkspace)
-            && matches!(request.executor.status, ExecutorStatus::Offline)
+            && matches!(request.executor.kind, ExecutorBindingKind::EdgeAgent)
             && matches!(
+                request.executor.status,
+                ExecutorStatus::Offline | ExecutorStatus::Unknown
+            )
+            && !matches!(
                 reason,
-                astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(_)
+                astra_runtime_env::ToolUnavailableReason::PolicyDenied(_)
             );
     let mut metadata = binding_event_fields(&request.workspace, &request.executor);
     attach_runtime_policy_metadata(&mut metadata, binding);

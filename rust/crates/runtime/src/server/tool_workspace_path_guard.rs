@@ -23,7 +23,7 @@ fn workspace_owns_absolute_path(workspace_root: &Path, raw_path: &str) -> bool {
     }
     let candidate_variants = unique_path_variants(candidate);
     let workspace_variants = unique_path_variants(workspace_root);
-    candidate_variants.iter().any(|candidate| {
+    candidate_variants.iter().all(|candidate| {
         workspace_variants
             .iter()
             .any(|workspace| candidate == workspace || candidate.starts_with(workspace))
@@ -143,4 +143,28 @@ pub(crate) fn server_sandbox_tool_path_mismatch(
         let subject = format!("tool '{tool_name}' argument '{field}'");
         server_sandbox_path_argument_mismatch(&subject, value, workspace_root, workspace_binding)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_ownership_rejects_symlink_escape_even_when_lexical_path_is_inside() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let outside_root = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace_root).expect("workspace");
+        std::fs::create_dir_all(&outside_root).expect("outside");
+        symlink(&outside_root, workspace_root.join("linked-out")).expect("symlink");
+
+        let escaped = workspace_root.join("linked-out/secret.txt");
+        assert!(
+            !workspace_owns_absolute_path(&workspace_root, &escaped.display().to_string()),
+            "a path that canonicalizes outside the workspace must not be accepted just because its lexical spelling starts with the workspace root"
+        );
+    }
 }

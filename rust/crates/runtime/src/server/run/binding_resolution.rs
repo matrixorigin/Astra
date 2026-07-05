@@ -84,7 +84,8 @@ pub(crate) fn execution_bindings_from_edge_profile(
             kind: WorkspaceBindingKind::EdgeWorkspace,
             display_name: display_name.clone(),
             cwd: Some(cwd),
-            authority: WorkspaceAuthority::ReadWrite,
+            authority: edge_profile_workspace_authority(edge_profile)
+                .unwrap_or(WorkspaceAuthority::ReadWrite),
             fallback_policy: FallbackPolicy::Disabled,
         }
     } else {
@@ -464,6 +465,18 @@ fn cloud_tool_transport_from_request(
     }
 }
 
+fn edge_profile_workspace_authority(
+    edge_profile: &Map<String, Value>,
+) -> Option<WorkspaceAuthority> {
+    let raw = first_non_empty_profile_string(edge_profile, &["authority", "workspace_authority"])?;
+    match raw.as_str() {
+        "read_only" | "readonly" | "ro" => Some(WorkspaceAuthority::ReadOnly),
+        "read_write" | "readwrite" | "rw" => Some(WorkspaceAuthority::ReadWrite),
+        "none" => Some(WorkspaceAuthority::None),
+        _ => None,
+    }
+}
+
 fn first_non_empty_profile_string(
     edge_profile: &Map<String, Value>,
     keys: &[&str],
@@ -764,6 +777,22 @@ mod tests {
         assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
         assert_eq!(executor.executor_id, "edge-1");
         assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
+    }
+
+    #[test]
+    fn edge_profile_can_declare_read_only_workspace_authority() {
+        let edge_profile = serde_json::json!({
+            "cwd": "/Users/test/project",
+            "edge_agent_id": "edge-1",
+            "authority": "read_only"
+        });
+        let (workspace, executor) =
+            execution_bindings_from_edge_profile(edge_profile.as_object().unwrap());
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
+        assert_eq!(workspace.cwd.as_deref(), Some("/Users/test/project"));
+        assert_eq!(workspace.authority, WorkspaceAuthority::ReadOnly);
+        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
     }
 
     #[test]

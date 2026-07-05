@@ -81,6 +81,12 @@ pub enum EvalSignal {
     /// (`test_failure`, `env_failure`, `execution_error`). Carries the
     /// normalized result class and number of unresolved streams.
     ToolOutcomeFailure { class: String, count: usize },
+    /// The final answer had no lexical overlap with the latest user request,
+    /// so tool success alone is not enough to call the turn successful.
+    FinalAnswerOffTarget {
+        matched_terms: usize,
+        required_terms: usize,
+    },
 }
 
 /// Default threshold for [`EvalSignal::RedundantOverlappingReads`]: minimum
@@ -530,6 +536,116 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     eval
 }
 
+pub fn apply_final_answer_relevance(
+    eval: &mut TurnEvaluation,
+    latest_user_message: &str,
+    final_answer: &str,
+) {
+    let Some(signal) = final_answer_relevance_signal(latest_user_message, final_answer) else {
+        return;
+    };
+    eval.signals
+        .retain(|signal| !matches!(signal, EvalSignal::AllToolsHealthy));
+    eval.signals.push(signal);
+    eval.success = false;
+    eval.quality = eval.quality.min(0.25);
+    eval.confidence = eval.confidence.max(0.75);
+}
+
+pub fn final_answer_relevance_signal(
+    latest_user_message: &str,
+    final_answer: &str,
+) -> Option<EvalSignal> {
+    let required = relevance_terms(latest_user_message);
+    if required.len() < 2 || final_answer.trim().is_empty() {
+        return None;
+    }
+    let answer_terms = relevance_terms(final_answer);
+    let matched = required
+        .iter()
+        .filter(|term| answer_terms.contains(*term))
+        .count();
+    if matched == 0 {
+        Some(EvalSignal::FinalAnswerOffTarget {
+            matched_terms: matched,
+            required_terms: required.len(),
+        })
+    } else {
+        None
+    }
+}
+
+fn relevance_terms(text: &str) -> std::collections::HashSet<String> {
+    let mut terms = std::collections::HashSet::new();
+    let mut ascii = String::new();
+    let mut cjk_run = String::new();
+
+    fn flush_ascii(buf: &mut String, terms: &mut std::collections::HashSet<String>) {
+        if buf.len() >= 3 && !is_relevance_stop_word(buf) {
+            terms.insert(buf.clone());
+        }
+        buf.clear();
+    }
+
+    fn flush_cjk(buf: &mut String, terms: &mut std::collections::HashSet<String>) {
+        let chars = buf.chars().collect::<Vec<_>>();
+        if chars.len() >= 2 {
+            for window in chars.windows(2) {
+                terms.insert(window.iter().collect::<String>());
+            }
+        }
+        buf.clear();
+    }
+
+    for ch in text.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            flush_cjk(&mut cjk_run, &mut terms);
+            ascii.push(ch);
+        } else if is_cjk(ch) {
+            flush_ascii(&mut ascii, &mut terms);
+            cjk_run.push(ch);
+        } else {
+            flush_ascii(&mut ascii, &mut terms);
+            flush_cjk(&mut cjk_run, &mut terms);
+        }
+    }
+    flush_ascii(&mut ascii, &mut terms);
+    flush_cjk(&mut cjk_run, &mut terms);
+    terms
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF | 0x2A700..=0x2B73F
+    )
+}
+
+fn is_relevance_stop_word(word: &str) -> bool {
+    matches!(
+        word,
+        "the"
+            | "and"
+            | "for"
+            | "you"
+            | "are"
+            | "can"
+            | "could"
+            | "would"
+            | "should"
+            | "what"
+            | "why"
+            | "how"
+            | "this"
+            | "that"
+            | "with"
+            | "from"
+            | "into"
+            | "about"
+            | "please"
+    )
+}
+
 fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
     matches!(
         signal,
@@ -547,6 +663,7 @@ fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
             | EvalSignal::ExplorationFamilyChurn { .. }
             | EvalSignal::HighCostLowYield { .. }
             | EvalSignal::ToolOutcomeFailure { .. }
+            | EvalSignal::FinalAnswerOffTarget { .. }
     )
 }
 
@@ -1327,6 +1444,15 @@ pub fn eval_signal_to_json_with_thresholds(
                 "Detected {count} unresolved tool outcome failure(s) classified as `{class}`"
             ),
         }),
+        EvalSignal::FinalAnswerOffTarget {
+            matched_terms,
+            required_terms,
+        } => json!({
+            "kind": "final_answer_off_target",
+            "matched_terms": matched_terms,
+            "required_terms": required_terms,
+            "message": "Final answer did not lexically overlap with the latest user request; tool activity alone cannot mark the turn successful",
+        }),
     }
 }
 pub fn eval_signals_to_json_with_thresholds(
@@ -1426,6 +1552,62 @@ mod tests {
             output_bytes: Some(120),
             no_op: true,
         }
+    }
+
+    #[test]
+    fn final_answer_relevance_flags_old_answer_to_new_question() {
+        let signal = final_answer_relevance_signal(
+            "相关的测试够硬核吗？",
+            "148 files changed, +9498 / -2335 lines, 11 commits.",
+        );
+
+        assert!(
+            matches!(signal, Some(EvalSignal::FinalAnswerOffTarget { .. })),
+            "obvious old-answer synthesis must be flagged: {signal:?}"
+        );
+    }
+
+    #[test]
+    fn final_answer_relevance_accepts_answer_covering_latest_question() {
+        let signal = final_answer_relevance_signal(
+            "相关的测试够硬核吗？",
+            "测试覆盖了 provider routing、edge offline、prompt cache 和 unhappy path，但还缺一次全量在线回归。",
+        );
+
+        assert_eq!(signal, None);
+    }
+
+    #[test]
+    fn apply_final_answer_relevance_downgrades_tool_success_when_answer_is_off_target() {
+        let mut eval = TurnEvaluation {
+            success: true,
+            quality: 0.8,
+            confidence: 0.6,
+            signals: vec![EvalSignal::AllToolsHealthy],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        apply_final_answer_relevance(
+            &mut eval,
+            "are the tests robust enough?",
+            "148 files changed, +9498 / -2335 lines, 11 commits.",
+        );
+
+        assert!(!eval.success);
+        assert!(eval.quality <= 0.25);
+        assert!(eval.confidence >= 0.75);
+        assert!(
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::FinalAnswerOffTarget { .. }))
+        );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
+            "tool success must not mask an off-target final answer"
+        );
     }
 
     fn journal_ok_call(name: &str) -> ToolCallRecord {

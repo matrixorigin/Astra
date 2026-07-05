@@ -3,15 +3,33 @@
 
 set -euo pipefail
 
-PID_FILE="${ASTRA_EDGE_PID_FILE:-astra_edge.pid}"
-LOG_FILE="${ASTRA_EDGE_LOG_FILE:-astra_edge.log}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+if [ -f "$REPO_ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/.env"
+    set +a
+fi
+
+PID_FILE="${ASTRA_EDGE_PID_FILE:-$REPO_ROOT/astra_edge.pid}"
+LOG_FILE="${ASTRA_EDGE_LOG_FILE:-$REPO_ROOT/astra_edge.log}"
+LOCK_DIR="${ASTRA_EDGE_LOCK_DIR:-$REPO_ROOT/.astra_edge.lock}"
 BUILD_MODE="${BUILD_MODE:-debug}"
 WORKSPACE_DIR="${ASTRA_EDGE_WORKSPACE_DIR:-$PWD}"
 
+mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "⚠️  astra-edge start/stop is already in progress"
+    exit 1
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
 if [ "$BUILD_MODE" = "release" ]; then
-    BIN_PATH="rust/target/release/astra-edge"
+    BIN_PATH="$REPO_ROOT/rust/target/release/astra-edge"
 else
-    BIN_PATH="rust/target/debug/astra-edge"
+    BIN_PATH="$REPO_ROOT/rust/target/debug/astra-edge"
 fi
 
 echo "Starting astra-edge provider (mode: $BUILD_MODE, workspace: $WORKSPACE_DIR)..."
@@ -25,10 +43,10 @@ if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         exit 0
     fi
     echo "⚠️  Multiple astra-edge processes detected; restarting the provider"
-    "$PWD/scripts/dev/stop-edge.sh" >/dev/null 2>&1 || true
+    ASTRA_EDGE_LOCK_HELD=1 "$SCRIPT_DIR/stop-edge.sh" >/dev/null 2>&1 || true
 elif [ -n "$RUNNING_PIDS" ]; then
     echo "⚠️  Stale astra-edge process detected; restarting the provider"
-    "$PWD/scripts/dev/stop-edge.sh" >/dev/null 2>&1 || true
+    ASTRA_EDGE_LOCK_HELD=1 "$SCRIPT_DIR/stop-edge.sh" >/dev/null 2>&1 || true
 fi
 
 if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
@@ -37,31 +55,46 @@ if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
 fi
 rm -f "$PID_FILE"
 
-if [ -f .env ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source .env
-    set +a
-fi
-
 API_PORT="${ASTRA_API_PORT:-17001}"
 SERVER_URL="${ASTRA_EDGE_SERVER_URL:-${ASTRA_SERVER_URL:-${ASTRA_API_URL:-http://127.0.0.1:${API_PORT}}}}"
 
-if ! NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 "$SERVER_URL/health" >/dev/null 2>&1; then
-    echo "❌ Astra API is not healthy at $SERVER_URL"
+edge_health_url() {
+    local base="${1%/}"
+    base="${base%%\?*}"
+    base="${base%%#*}"
+    case "$base" in
+        ws://*) base="http://${base#ws://}" ;;
+        wss://*) base="https://${base#wss://}" ;;
+    esac
+    case "$base" in
+        */edge/ws*) base="${base%%/edge/ws*}/edge/ws" ;;
+    esac
+    base="${base%/edge/ws}"
+    echo "$base/health"
+}
+
+SERVER_HEALTH_URL="$(edge_health_url "$SERVER_URL")"
+
+if ! NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 "$SERVER_HEALTH_URL" >/dev/null 2>&1; then
+    echo "❌ Astra API is not healthy at $SERVER_HEALTH_URL"
     echo "   Start server-only first: make dev-start-server-only"
     exit 1
 fi
 
 if [ "$BUILD_MODE" = "release" ]; then
     echo "Building release astra-edge binary..."
-    cargo build -q --manifest-path rust/Cargo.toml -p astra-edge --release --bin astra-edge
+    cargo build -q --manifest-path "$REPO_ROOT/rust/Cargo.toml" -p astra-edge --release --bin astra-edge
 else
     echo "Building debug astra-edge binary..."
-    cargo build -q --manifest-path rust/Cargo.toml -p astra-edge --bin astra-edge
+    cargo build -q --manifest-path "$REPO_ROOT/rust/Cargo.toml" -p astra-edge --bin astra-edge
 fi
 
-mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
+if ! NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 "$SERVER_HEALTH_URL" >/dev/null 2>&1; then
+    echo "❌ Astra API stopped responding at $SERVER_HEALTH_URL after astra-edge build"
+    echo "   Restart server-only first: make dev-start-server-only"
+    exit 1
+fi
+
 {
     echo ""
     echo "=== astra-edge start $(date) ==="
@@ -83,18 +116,6 @@ fi
 if command -v setsid >/dev/null 2>&1; then
     setsid "$BIN_PATH" "${ARGS[@]}" >> "$LOG_FILE" 2>&1 &
     PID=$!
-elif command -v screen >/dev/null 2>&1; then
-    screen -dmS astra-edge bash -lc \
-        'cd "$1"; log_file="$2"; shift 2; exec "$@" >> "$log_file" 2>&1' \
-        bash "$PWD" "$LOG_FILE" "$BIN_PATH" "${ARGS[@]}"
-    PID=""
-    for _ in {1..20}; do
-        PID=$(pgrep -x "astra-edge" 2>/dev/null | tail -n 1 || true)
-        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            break
-        fi
-        sleep 0.2
-    done
 else
     nohup "$BIN_PATH" "${ARGS[@]}" >> "$LOG_FILE" 2>&1 &
     PID=$!

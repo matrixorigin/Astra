@@ -331,13 +331,14 @@ fn runtime_executor_coverage(
     let status = match executor.status {
         ExecutorStatus::Online => astra_runtime_env::CapacityProviderStatus::Ready,
         ExecutorStatus::Degraded => astra_runtime_env::CapacityProviderStatus::Degraded,
-        ExecutorStatus::Offline => astra_runtime_env::CapacityProviderStatus::Offline,
-        ExecutorStatus::Unknown => astra_runtime_env::CapacityProviderStatus::Unknown,
+        ExecutorStatus::Offline | ExecutorStatus::Unknown => {
+            astra_runtime_env::CapacityProviderStatus::Offline
+        }
     };
     let unavailable_reason = match executor.status {
         ExecutorStatus::Online | ExecutorStatus::Degraded => None,
         ExecutorStatus::Offline => Some("executor_offline".to_string()),
-        ExecutorStatus::Unknown => Some("executor_status_unknown".to_string()),
+        ExecutorStatus::Unknown => Some("executor_status_unknown_offline".to_string()),
     };
     let capabilities = if unavailable_reason.is_some() {
         Vec::new()

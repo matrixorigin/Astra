@@ -13,6 +13,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
 use futures_util::stream::SplitSink;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -29,14 +30,21 @@ pub(crate) async fn edge_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let current = EDGE_WS_CONNECTION_COUNT.fetch_add(1, Ordering::Relaxed);
-    if current >= MAX_EDGE_WS_CONNECTIONS {
-        EDGE_WS_CONNECTION_COUNT.fetch_sub(1, Ordering::Relaxed);
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "too many edge WebSocket connections",
-        )
-            .into_response();
+    loop {
+        let current = EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire);
+        if current >= MAX_EDGE_WS_CONNECTIONS {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "too many edge WebSocket connections",
+            )
+                .into_response();
+        }
+        if EDGE_WS_CONNECTION_COUNT
+            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
     }
     ws.max_message_size(256 * 1024)
         .on_upgrade(move |socket| handle_edge_connection(socket, state))
@@ -49,7 +57,7 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     struct ConnGuard;
     impl Drop for ConnGuard {
         fn drop(&mut self) {
-            EDGE_WS_CONNECTION_COUNT.fetch_sub(1, Ordering::Relaxed);
+            EDGE_WS_CONNECTION_COUNT.fetch_sub(1, Ordering::Release);
         }
     }
     let _guard = ConnGuard;
@@ -183,13 +191,18 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
         .await;
 
     // ── Phase 2b: Spawn cross-pod dispatch relay polling task ─────────
+    let inflight_dispatches = Arc::new(tokio::sync::Mutex::new(HashMap::<
+        String,
+        InflightEdgeDispatch,
+    >::new()));
     let dispatch_user_id = user_id.clone();
     let dispatch_agent_id = edge_agent_id.clone();
     let dispatch_svc = state.execution.edge_dispatch_service.clone();
     let dispatch_sink = ws_sink.clone();
+    let dispatch_inflight = inflight_dispatches.clone();
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
 
-    let dispatch_task = tokio::spawn(async move {
+    let mut dispatch_task = tokio::spawn(async move {
         // 2000ms interval keeps per-connection DB QPS at 0.5
         // (vs 5 at 200ms). Cross-pod dispatch targets ~2s end-to-end.
         let mut interval = tokio::time::interval(Duration::from_millis(2000));
@@ -239,6 +252,14 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                     stop_dispatch = true;
                                     break;
                                 }
+                                dispatch_inflight.lock().await.insert(
+                                    row.request_id.clone(),
+                                    InflightEdgeDispatch {
+                                        user_id: row.user_id.clone(),
+                                        edge_agent_id: row.edge_agent_id.clone(),
+                                        request_id: row.request_id.clone(),
+                                    },
+                                );
                             }
                             if stop_dispatch {
                                 break;
@@ -258,6 +279,7 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     let pool_for_cleanup = state.edge_connection_pool.clone();
     let user_id_cleanup = user_id.clone();
     let edge_agent_id_cleanup = edge_agent_id.clone();
+    let read_inflight = inflight_dispatches.clone();
 
     // Task: forward server → edge messages from the pool channel
     let ws_sink_fwd = ws_sink.clone();
@@ -350,6 +372,8 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                             error = %e,
                                             "Edge WS: failed to deliver tool result for cross-pod"
                                         );
+                                    } else {
+                                        read_inflight.lock().await.remove(&request_id);
                                     }
                                 }
                                 Ok(EdgeClientMessage::Ping) => {
@@ -391,9 +415,24 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
 
     // ── Cleanup ──────────────────────────────────────────────────────
     forward_task.abort();
-    dispatch_task.abort();
     // Drop cancel sender so the dispatch task can break its loop cleanly.
     drop(dispatch_cancel_tx);
+    if tokio::time::timeout(Duration::from_millis(250), &mut dispatch_task)
+        .await
+        .is_err()
+    {
+        dispatch_task.abort();
+    }
+    let disconnected_dispatches = {
+        let mut inflight = inflight_dispatches.lock().await;
+        inflight.drain().map(|(_, row)| row).collect::<Vec<_>>()
+    };
+    fail_inflight_edge_dispatches(
+        state.execution.edge_dispatch_service.as_ref(),
+        &disconnected_dispatches,
+        "edge_ws_disconnected",
+    )
+    .await;
     pool_for_cleanup.unregister(&user_id_cleanup, &edge_agent_id_cleanup);
 
     // Unregister from DB edge registry so other pods stop routing to this edge.
@@ -410,6 +449,13 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     );
 }
 
+#[derive(Debug)]
+struct InflightEdgeDispatch {
+    user_id: String,
+    edge_agent_id: String,
+    request_id: String,
+}
+
 /// Helper: serialize and send an EdgeServerMessage over the WebSocket.
 async fn send_edge_msg(
     sink: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
@@ -422,6 +468,44 @@ async fn send_edge_msg(
         .send(Message::Text(text.into()))
         .await
         .map_err(|_| ())
+}
+
+async fn fail_inflight_edge_dispatches(
+    dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
+    rows: &[InflightEdgeDispatch],
+    reason: &'static str,
+) -> usize {
+    let mut failed = 0;
+    for row in rows {
+        match dispatch
+            .fail_dispatch(&row.user_id, &row.request_id, reason)
+            .await
+        {
+            Ok(true) => failed += 1,
+            Ok(false) => {
+                tracing::debug!(
+                    target: "astra_runtime::edge_ws",
+                    user_id = %row.user_id,
+                    edge_agent_id = %row.edge_agent_id,
+                    request_id = %row.request_id,
+                    reason,
+                    "Edge dispatch was already terminal before disconnect cleanup"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::edge_ws",
+                    user_id = %row.user_id,
+                    edge_agent_id = %row.edge_agent_id,
+                    request_id = %row.request_id,
+                    reason,
+                    error = %error,
+                    "Edge dispatch disconnect cleanup failed"
+                );
+            }
+        }
+    }
+    failed
 }
 
 async fn fail_claimed_edge_dispatch(

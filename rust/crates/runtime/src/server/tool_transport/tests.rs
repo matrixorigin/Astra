@@ -2737,51 +2737,53 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
 }
 
 #[tokio::test]
-async fn edge_bound_explicit_offline_status_blocks_without_dispatch() {
-    let dispatch = Arc::new(StaticEdgeDispatch::default());
-    let _local = CountingLocalTransport::new();
+async fn edge_bound_offline_or_unknown_status_blocks_without_dispatch() {
+    for status in [ExecutorStatus::Offline, ExecutorStatus::Unknown] {
+        let dispatch = Arc::new(StaticEdgeDispatch::default());
+        let _local = CountingLocalTransport::new();
 
-    let service = ToolExecutionService::builder()
-        .edge_dispatch_service(dispatch.clone())
-        .edge_registry_service(Arc::new(StaticEdgeRegistry {
-            agents: vec![edge_agent_record("edge-selected")],
-        }))
-        .build();
-    let local = CountingLocalTransport::new();
+        let service = ToolExecutionService::builder()
+            .edge_dispatch_service(dispatch.clone())
+            .edge_registry_service(Arc::new(StaticEdgeRegistry {
+                agents: vec![edge_agent_record("edge-selected")],
+            }))
+            .build();
+        let local = CountingLocalTransport::new();
 
-    let result = service
-        .execute(
-            request(
-                "bash",
-                WorkspaceBinding::edge_workspace(
-                    "MacBook Pro",
-                    "/Users/test/project",
-                    WorkspaceAuthority::ReadWrite,
+        let result = service
+            .execute(
+                request(
+                    "bash",
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-selected",
+                        "MacBook Pro",
+                        ToolTransportKind::EdgeWs,
+                        status,
+                    ),
                 ),
-                ExecutorBinding::edge_agent(
-                    "edge-selected",
-                    "MacBook Pro",
-                    ToolTransportKind::EdgeWs,
-                    ExecutorStatus::Offline,
-                ),
-            ),
-            &local,
-        )
-        .await;
+                &local,
+            )
+            .await;
 
-    assert!(result.is_error, "{result:?}");
-    let metadata = result.metadata.expect("offline metadata");
-    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_EXECUTOR_OFFLINE);
-    assert_eq!(metadata["executor"]["status"], "offline");
-    assert_eq!(local.calls(), 0);
-    assert!(
-        dispatch
-            .inserted_edge_agent_ids
-            .lock()
-            .expect("inserted edge agent ids lock")
-            .is_empty(),
-        "explicit offline executor status must block before edge ledger dispatch"
-    );
+        assert!(result.is_error, "{status:?}: {result:?}");
+        let metadata = result.metadata.expect("offline metadata");
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_EXECUTOR_OFFLINE);
+        assert_eq!(metadata["executor"]["status"], serde_json::json!(status));
+        assert_eq!(local.calls(), 0);
+        assert!(
+            dispatch
+                .inserted_edge_agent_ids
+                .lock()
+                .expect("inserted edge agent ids lock")
+                .is_empty(),
+            "explicit {status:?} executor status must block before edge ledger dispatch"
+        );
+    }
 }
 
 #[tokio::test]

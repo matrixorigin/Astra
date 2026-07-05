@@ -17,7 +17,10 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{
+    LazyLock, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
 
@@ -31,7 +34,15 @@ thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
-static PROCESS_SESSIONS_DIR_OVERRIDES: LazyLock<Mutex<Vec<PathBuf>>> =
+#[derive(Debug, Clone)]
+struct ProcessSessionsDirOverride {
+    id: u64,
+    dir: PathBuf,
+}
+
+static NEXT_PROCESS_SESSIONS_DIR_OVERRIDE_ID: AtomicU64 = AtomicU64::new(1);
+static PROCESS_SESSIONS_DIR_OVERRIDE_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROCESS_SESSIONS_DIR_OVERRIDES: LazyLock<Mutex<Vec<ProcessSessionsDirOverride>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn merge_execution_boundary_metadata(
@@ -120,12 +131,16 @@ pub fn local_sessions_dir() -> PathBuf {
             return p.clone();
         }
         let process_override = match PROCESS_SESSIONS_DIR_OVERRIDES.lock() {
-            Ok(overrides) => overrides.last().cloned(),
+            Ok(overrides) => overrides.last().map(|override_| override_.dir.clone()),
             Err(poisoned) => {
+                PROCESS_SESSIONS_DIR_OVERRIDE_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     "process_sessions_dir_overrides mutex poisoned; using last stored override"
                 );
-                poisoned.into_inner().last().cloned()
+                poisoned
+                    .into_inner()
+                    .last()
+                    .map(|override_| override_.dir.clone())
             }
         };
         if let Some(p) = process_override {
@@ -531,17 +546,21 @@ impl Drop for JournalDirGuard {
 /// unit tests, because this guard affects every thread in the current process.
 #[must_use = "drop restores the previous process-wide sessions-dir override"]
 pub struct ProcessJournalDirGuard {
-    dir: PathBuf,
+    id: u64,
 }
 
 impl ProcessJournalDirGuard {
     pub fn new(dir: impl AsRef<Path>) -> Self {
         let dir = dir.as_ref().to_path_buf();
+        let id = NEXT_PROCESS_SESSIONS_DIR_OVERRIDE_ID.fetch_add(1, Ordering::Relaxed);
         PROCESS_SESSIONS_DIR_OVERRIDES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(dir.clone());
-        Self { dir }
+            .push(ProcessSessionsDirOverride {
+                id,
+                dir: dir.clone(),
+            });
+        Self { id }
     }
 }
 
@@ -550,9 +569,15 @@ impl Drop for ProcessJournalDirGuard {
         let mut overrides = PROCESS_SESSIONS_DIR_OVERRIDES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if overrides.last() == Some(&self.dir) {
+        if overrides
+            .last()
+            .is_some_and(|override_| override_.id == self.id)
+        {
             overrides.pop();
-        } else if let Some(index) = overrides.iter().rposition(|dir| dir == &self.dir) {
+        } else if let Some(index) = overrides
+            .iter()
+            .rposition(|override_| override_.id == self.id)
+        {
             overrides.remove(index);
         }
     }
@@ -5623,6 +5648,48 @@ mod tests {
             assert_eq!(local_sessions_dir(), inner_sessions);
         }
         assert_eq!(local_sessions_dir(), outer_sessions);
+    }
+
+    #[test]
+    #[serial_test::serial(process_journal_dir_guard)]
+    fn process_journal_dir_guard_interleaved_drop_uses_guard_identity() {
+        let shared = tempdir().unwrap();
+        let shared_sessions = shared.path().join("sessions");
+        std::fs::create_dir_all(&shared_sessions).unwrap();
+
+        let outer = ProcessJournalDirGuard::new(&shared_sessions);
+        let outer_id = outer.id;
+        let inner = ProcessJournalDirGuard::new(&shared_sessions);
+        let inner_id = inner.id;
+
+        assert_ne!(outer_id, inner_id);
+        assert_eq!(local_sessions_dir(), shared_sessions);
+
+        drop(outer);
+        {
+            let overrides = PROCESS_SESSIONS_DIR_OVERRIDES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                !overrides.iter().any(|override_| override_.id == outer_id),
+                "dropping the outer guard must remove the outer override, not the same-path inner override"
+            );
+            assert!(
+                overrides.iter().any(|override_| override_.id == inner_id),
+                "the same-path inner override must remain active after interleaved outer drop"
+            );
+        }
+        assert_eq!(local_sessions_dir(), shared_sessions);
+
+        drop(inner);
+        let overrides = PROCESS_SESSIONS_DIR_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !overrides
+                .iter()
+                .any(|override_| { override_.id == outer_id || override_.id == inner_id })
+        );
     }
 
     #[test]
