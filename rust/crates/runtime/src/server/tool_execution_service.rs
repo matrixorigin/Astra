@@ -6,8 +6,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::tool_admission::{
-    ToolAdmissionContext, ToolHiddenReason, resolve_tool_admission_for_binding,
-    resolve_tool_admission_for_binding_with_context,
+    ToolAdmissionContext, ToolHiddenReason, resolve_tool_admission_for_binding_with_context,
 };
 use super::tool_edge_transport::execute_edge_bound;
 use super::tool_execution_binding::{
@@ -20,6 +19,7 @@ use super::tool_external_transport::{
 use super::tool_local_transport::{ServerLocalToolTransport, execute_local_transport};
 use super::tool_route_boundary::{ToolRouteBoundary, route_binding_event_fields};
 use super::tool_route_selection::ToolExecutionRouteKind;
+use super::tool_route_selection::routing_decision_for_binding;
 use super::tool_transport_errors::{
     capability_denied_result, selected_offer_route_mismatch_result,
     unsupported_workspace_executor_result,
@@ -238,15 +238,12 @@ impl ToolExecutionService {
         }) {
             return ToolExecutionRouteKind::RequestScopedMcp;
         }
-        resolve_tool_admission_for_binding(
+        routing_decision_for_binding(
             &request.tool_name,
-            &[],
-            &request.workspace,
-            &request.executor,
-            request.runtime.as_ref(),
+            request.workspace.kind,
+            request.executor.transport,
             &self.tool_registry,
         )
-        .selected_route()
     }
 
     pub(crate) fn cancelled_before_route_result(
@@ -344,6 +341,15 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport + ?Sized,
     {
         let transport_request = request.with_transport_arguments();
+        if matches!(route, ToolExecutionRouteKind::Unsupported)
+            && !matches!(
+                transport_request.workspace.kind,
+                WorkspaceBindingKind::None | WorkspaceBindingKind::Unknown
+            )
+        {
+            let binding = transport_request.runtime_environment_binding(&self.tool_registry);
+            return unsupported_workspace_executor_result(&transport_request, &binding);
+        }
         let binding = match self.authorize_tool_request(&transport_request) {
             Ok(binding) => binding,
             Err(ref err) => {

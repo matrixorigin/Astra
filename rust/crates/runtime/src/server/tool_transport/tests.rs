@@ -2945,7 +2945,6 @@ async fn server_runtime_tools_bypass_edge_transport() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let server_runtime_tools = [
-        "tool_search",
         "memory",
         "mo_query",
         "rollback_database_snapshots",
@@ -2986,6 +2985,30 @@ async fn server_runtime_tools_bypass_edge_transport() {
         assert_eq!(metadata["transport"], "server_local", "{tool}");
     }
     assert_eq!(local.calls(), server_runtime_tools.len());
+
+    let control_plane_request = request(
+        "tool_search",
+        WorkspaceBinding::edge_workspace(
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-macbook-1",
+            "MacBook Pro",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Offline,
+        ),
+    );
+    assert_eq!(
+        service.routing_decision(&control_plane_request),
+        ToolExecutionRouteKind::ServerControlPlane,
+        "tool_search is control-plane backbone and must not depend on edge transport"
+    );
+    let result = service.execute(control_plane_request, &local).await;
+    assert!(!result.is_error, "tool_search: {result:?}");
+    assert_eq!(result.output, "local:tool_search");
+    assert_eq!(local.calls(), server_runtime_tools.len() + 1);
 }
 
 #[tokio::test]

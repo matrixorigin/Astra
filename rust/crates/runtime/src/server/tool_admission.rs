@@ -106,6 +106,7 @@ impl ToolAdmissionDecision {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_tool_admission_for_binding(
     tool_name: &str,
     schemas: &[Value],
