@@ -231,6 +231,12 @@ impl ToolExecutionService {
     /// Primary resolution goes through the runtime tool registry: tool class
     /// declares the owner, then the current binding selects the transport.
     pub fn routing_decision(&self, request: &ToolExecutionRequest) -> ToolExecutionRouteKind {
+        if request.selected_offer.as_ref().is_some_and(|offer| {
+            offer.provider_id == "request-scoped-mcp"
+                && matches!(offer.route, ToolExecutionRouteKind::RequestScopedMcp)
+        }) {
+            return ToolExecutionRouteKind::RequestScopedMcp;
+        }
         resolve_tool_admission_for_binding(
             &request.tool_name,
             &[],

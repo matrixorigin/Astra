@@ -1351,13 +1351,8 @@ impl RuntimeToolExecutor {
             name,
             args,
         );
-        if name.starts_with("mcp__") {
-            request.workspace = WorkspaceBinding::none();
-            request.workspace_record = None;
-            request.executor = ExecutorBinding::request_scoped_mcp();
-            request.runtime = None;
-        }
         if let Some(offer) = self.selected_offer_for_request(&request) {
+            request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
         request
@@ -1368,15 +1363,22 @@ impl RuntimeToolExecutor {
         request: &ToolExecutionRequest,
     ) -> Option<SelectedToolOfferSnapshot> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        let schemas = if matches!(request.executor.kind, ExecutorBindingKind::Mcp) {
-            self.request_scoped_mcp_schemas_snapshot("selected_offer_request_scoped_mcp")
+        let schemas = if request.tool_name.starts_with("mcp__") {
+            let schemas =
+                self.request_scoped_mcp_schemas_snapshot("selected_offer_request_scoped_mcp");
+            if schemas
+                .iter()
+                .any(|schema| tool_schema_name(schema) == Some(request.tool_name.as_str()))
+            {
+                schemas
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
         let mut context = self.tool_admission_context();
-        if matches!(request.executor.kind, ExecutorBindingKind::Mcp) {
-            context.request_scoped_mcp_provider_ready = !schemas.is_empty();
-        }
+        context.request_scoped_mcp_provider_ready = !schemas.is_empty();
         let decision =
             crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
                 &request.tool_name,
@@ -1387,12 +1389,29 @@ impl RuntimeToolExecutor {
                 &registry,
                 context,
             );
-        decision
-            .selected_offer
-            .map(|offer| SelectedToolOfferSnapshot {
-                offer_id: offer.offer_id,
-                provider_id: offer.provider_id,
-            })
+        decision.selected_offer.map(|offer| {
+            SelectedToolOfferSnapshot::new_with_route(
+                offer.tool_name,
+                offer.provider_id,
+                offer.route,
+            )
+        })
+    }
+
+    fn request_with_selected_offer_route(
+        mut request: ToolExecutionRequest,
+        route: crate::server::tool_route_selection::ToolExecutionRouteKind,
+    ) -> ToolExecutionRequest {
+        if matches!(
+            route,
+            crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp
+        ) {
+            request.workspace = WorkspaceBinding::none();
+            request.workspace_record = None;
+            request.executor = ExecutorBinding::request_scoped_mcp();
+            request.runtime = None;
+        }
+        request
     }
 
     /// Swap the in-memory task store for a shared one (MatrixOne in
@@ -5521,6 +5540,63 @@ esac
             result.output
         );
         assert_eq!(parsed["missing"][0].as_str(), Some("mcp__ghost__query"));
+    }
+
+    #[test]
+    fn request_scoped_mcp_request_binding_is_selected_offer_driven() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_edge_workspace_binding(
+            "edge-macbook-1",
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        })]);
+
+        let request = exec.tool_execution_request("mcp__calculator", &json!({"expr": "1+1"}));
+
+        assert_eq!(request.workspace.kind, WorkspaceBindingKind::None);
+        assert_eq!(request.executor.kind, ExecutorBindingKind::Mcp);
+        assert_eq!(request.executor.executor_id, "request-scoped-mcp");
+        let offer = request.selected_offer.expect("selected MCP offer");
+        assert_eq!(offer.offer_id, "mcp__calculator@request-scoped-mcp");
+        assert_eq!(offer.provider_id, "request-scoped-mcp");
+        assert_eq!(
+            offer.route,
+            crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp
+        );
+    }
+
+    #[test]
+    fn mcp_prefixed_name_without_discovered_offer_does_not_override_binding() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_edge_workspace_binding(
+            "edge-macbook-1",
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+
+        let request = exec.tool_execution_request("mcp__ghost__query", &json!({"query": "hello"}));
+
+        assert_eq!(request.workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
+        assert_eq!(request.executor.kind, ExecutorBindingKind::EdgeAgent);
+        assert_eq!(request.executor.executor_id, "edge-macbook-1");
+        assert!(
+            request.selected_offer.is_none(),
+            "mcp__ prefix alone must not synthesize a selected offer"
+        );
     }
 
     #[tokio::test]

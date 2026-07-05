@@ -3,6 +3,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::tool_route_selection::ToolExecutionRouteKind;
+
 // Re-export canonical workspace/environment types from astra-runtime-env.
 pub use astra_runtime_env::{ExecutorStatus, WorkspaceAuthority, WorkspaceBindingKind};
 
@@ -221,6 +223,8 @@ pub struct ToolExecutionRequest {
 pub struct SelectedToolOfferSnapshot {
     pub offer_id: String,
     pub provider_id: String,
+    #[serde(default = "default_selected_offer_route")]
+    pub route: ToolExecutionRouteKind,
 }
 
 impl SelectedToolOfferSnapshot {
@@ -229,8 +233,26 @@ impl SelectedToolOfferSnapshot {
         Self {
             offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
             provider_id,
+            route: default_selected_offer_route(),
         }
     }
+
+    pub fn new_with_route(
+        tool_name: impl AsRef<str>,
+        provider_id: impl Into<String>,
+        route: ToolExecutionRouteKind,
+    ) -> Self {
+        let provider_id = provider_id.into();
+        Self {
+            offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
+            provider_id,
+            route,
+        }
+    }
+}
+
+fn default_selected_offer_route() -> ToolExecutionRouteKind {
+    ToolExecutionRouteKind::Unsupported
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
