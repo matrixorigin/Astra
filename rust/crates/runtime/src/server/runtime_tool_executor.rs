@@ -35,7 +35,9 @@ use astra_tools::tool_engine::ToolEngine;
 use astra_tools::{AskUserGate, ToolExecutor};
 use astra_turn_core::capability::Capability;
 use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
-use astra_turn_core::tool::schema::{retain_tool_schemas_by_names, tool_schema_name};
+use astra_turn_core::tool::schema::{
+    prompt_schema_conflicting_tool_names, retain_tool_schemas_by_names, tool_schema_name,
+};
 use async_trait::async_trait;
 
 use crate::orchestration::AgentToolContext;
@@ -500,9 +502,10 @@ impl RuntimeToolExecutor {
 
     pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {
         let allowed = self.provider_visible_runtime_tool_names();
+        let conflicts = prompt_schema_conflicting_tool_names(schemas);
         let names = astra_turn_core::tool::schema::tool_names_from_schemas(schemas)
             .into_iter()
-            .filter(|name| allowed.contains(name))
+            .filter(|name| allowed.contains(name) && !conflicts.contains(name))
             .collect();
         let mut guard = rwlock_write_reset_on_poison(
             &self.current_searchable_tool_names,
@@ -544,9 +547,11 @@ impl RuntimeToolExecutor {
             activatable_pool.retain(|schema| {
                 tool_schema_name(schema).is_some_and(|name| self.tool_runtime_ready(name))
             });
-            extend_tool_schema_pool_unique(&mut pool, activatable_pool);
+            pool.extend(activatable_pool);
         }
-        extend_tool_schema_pool_unique(&mut pool, self.ready_request_scoped_mcp_schemas());
+        pool.extend(self.ready_request_scoped_mcp_schemas());
+        remove_prompt_schema_conflicts(&mut pool);
+        dedupe_tool_schema_pool(&mut pool);
 
         let Some(mut searchable_names) = self.current_searchable_tool_names() else {
             return pool;
@@ -1498,19 +1503,26 @@ impl RuntimeToolExecutor {
     }
 }
 
-fn extend_tool_schema_pool_unique(pool: &mut Vec<Value>, additions: Vec<Value>) {
-    let mut seen = pool
-        .iter()
-        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
-        .collect::<HashSet<_>>();
-    for schema in additions {
+fn dedupe_tool_schema_pool(pool: &mut Vec<Value>) {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(pool.len());
+    for schema in std::mem::take(pool) {
         let Some(name) = tool_schema_name(&schema) else {
             continue;
         };
         if seen.insert(name.to_string()) {
-            pool.push(schema);
+            deduped.push(schema);
         }
     }
+    *pool = deduped;
+}
+
+fn remove_prompt_schema_conflicts(pool: &mut Vec<Value>) {
+    let conflicts = prompt_schema_conflicting_tool_names(pool);
+    if conflicts.is_empty() {
+        return;
+    }
+    pool.retain(|schema| tool_schema_name(schema).is_none_or(|name| !conflicts.contains(name)));
 }
 
 fn server_local_tool_arguments(request: &ToolExecutionRequest) -> Value {
@@ -4978,6 +4990,50 @@ esac
         );
     }
 
+    #[tokio::test]
+    async fn server_tool_search_does_not_resolve_conflicting_searchable_schema_name() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_searchable_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "github",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "github",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "q": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        ]);
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "conflicting searchable schema must fail closed instead of resolving via catalog fallback; got: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("github"));
+    }
+
     /// Deferred tools must still be discoverable via `tool_search(select:NAME)`
     /// even though they are *not* in the per-turn visible slice. Without this
     /// the activation flow deadlocks: prompt instructs the model to select a
@@ -5128,6 +5184,55 @@ esac
             parsed["matches"][0]["name"].as_str(),
             Some("mcp__calculator")
         );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_hides_conflicting_request_scoped_mcp_schemas() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__calculator",
+                    "description": "Evaluate arithmetic expression.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"expr": {"type": "string"}},
+                        "required": ["expr"]
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__calculator",
+                    "description": "Evaluate arithmetic expression.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"expression": {"type": "string"}},
+                        "required": ["expression"]
+                    }
+                }
+            }),
+        ]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "conflicting request-scoped MCP schemas must not first-win into tool_search; got: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("mcp__calculator"));
     }
 
     #[tokio::test]
