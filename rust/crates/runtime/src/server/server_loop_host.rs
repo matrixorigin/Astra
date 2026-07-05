@@ -79,11 +79,6 @@ const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
 const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
 
-fn server_owned_tool_name(tool_name: &str) -> bool {
-    crate::server::tool_binding_projection::is_server_control_plane_tool(tool_name)
-        || crate::server::tool_binding_projection::is_server_runtime_tool(tool_name)
-}
-
 fn insert_event_fields(event: &mut Map<String, Value>, fields: &Map<String, Value>) {
     for (key, value) in fields {
         event.entry(key.clone()).or_insert_with(|| value.clone());
@@ -2624,16 +2619,15 @@ impl ServerAgenticLoopHost {
     }
 
     fn edge_executor_offline_blocks_tool(&self, tool_name: &str) -> bool {
-        !server_owned_tool_name(tool_name)
-            && matches!(
-                self.workspace_binding.kind,
-                WorkspaceBindingKind::EdgeWorkspace
-            )
-            && matches!(self.executor_binding.kind, ExecutorBindingKind::EdgeAgent)
+        matches!(
+            self.workspace_binding.kind,
+            WorkspaceBindingKind::EdgeWorkspace
+        ) && matches!(self.executor_binding.kind, ExecutorBindingKind::EdgeAgent)
             && matches!(self.executor_binding.status, ExecutorStatus::Offline)
-            && astra_runtime_env::ToolRegistry::builtins()
-                .get(tool_name)
-                .is_some()
+            && matches!(
+                self.route_for_current_binding(tool_name),
+                ToolExecutionRouteKind::EdgeBound
+            )
     }
 
     fn edge_executor_offline_result(
@@ -6832,14 +6826,28 @@ mod tests {
             "this regression guard covers headless/server-side subruns"
         );
         let state = create_test_state();
-        let tool_calls = vec![json!({
-            "id": "call-offline-headless-bash",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": serde_json::to_string(&json!({"command": "pwd"})).unwrap(),
-            }
-        })];
+        let tool_calls = vec![
+            json!({
+                "id": "call-offline-headless-bash",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": serde_json::to_string(&json!({"command": "pwd"})).unwrap(),
+                }
+            }),
+            json!({
+                "id": "call-server-memory",
+                "type": "function",
+                "function": {
+                    "name": "memory",
+                    "arguments": serde_json::to_string(&json!({
+                        "action": "write",
+                        "content": "server-owned memory must not be blocked by edge offline state"
+                    }))
+                    .unwrap(),
+                }
+            }),
+        ];
 
         let results = host
             .maybe_deliver_edge_bound_tools_via_ledger(&state, &tool_calls)
