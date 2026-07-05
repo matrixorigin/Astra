@@ -1523,7 +1523,7 @@ impl ServerAgenticLoopHostBuilder {
             append_server_owned_tool_schemas_unique(
                 &mut surface,
                 server_catalog_tools,
-                self.server_builtin_tools_enabled,
+                self.server_tool_catalog_enabled,
             );
             surface
         };
