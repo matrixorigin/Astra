@@ -238,6 +238,106 @@ mod tests {
     }
 
     #[test]
+    fn turn_pipeline_intercept_is_not_an_executor_owner() {
+        assert_eq!(
+            tool_execution_owner(crate::turn::skill_tool::SKILL_TOOL_NAME, &registry()),
+            ToolExecutionOwner::TurnPipelineIntercept
+        );
+        assert_eq!(
+            routing_decision_for_binding(
+                crate::turn::skill_tool::SKILL_TOOL_NAME,
+                WorkspaceBindingKind::EdgeWorkspace,
+                ToolTransportKind::EdgeWs,
+                &registry(),
+            ),
+            ToolExecutionRouteKind::Unsupported,
+            "pipeline-intercepted tools must be consumed before executor routing"
+        );
+    }
+
+    #[test]
+    fn edge_provider_delivery_policy_lives_in_route_layer() {
+        assert!(runtime_tools_route_to_edge_provider(
+            WorkspaceBindingKind::EdgeWorkspace,
+            ExecutorBindingKind::ServerLocal,
+            ToolTransportKind::ServerLocal,
+        ));
+        assert!(runtime_tools_route_to_edge_provider(
+            WorkspaceBindingKind::ServerSandbox,
+            ExecutorBindingKind::EdgeAgent,
+            ToolTransportKind::EdgeWs,
+        ));
+        assert!(runtime_tools_route_to_edge_provider(
+            WorkspaceBindingKind::ServerSandbox,
+            ExecutorBindingKind::ServerLocal,
+            ToolTransportKind::EdgeLedger,
+        ));
+        assert!(!runtime_tools_route_to_edge_provider(
+            WorkspaceBindingKind::ServerSandbox,
+            ExecutorBindingKind::ServerLocal,
+            ToolTransportKind::ServerLocal,
+        ));
+
+        assert!(edge_bound_route_is_offline_for_binding(
+            "read_file",
+            WorkspaceBindingKind::EdgeWorkspace,
+            ExecutorBindingKind::EdgeAgent,
+            ExecutorStatus::Unknown,
+            ToolTransportKind::EdgeWs,
+            &registry(),
+        ));
+        assert!(!edge_bound_route_is_offline_for_binding(
+            "web_search",
+            WorkspaceBindingKind::EdgeWorkspace,
+            ExecutorBindingKind::EdgeAgent,
+            ExecutorStatus::Unknown,
+            ToolTransportKind::EdgeWs,
+            &registry(),
+        ));
+
+        assert!(!should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+            WorkspaceBindingKind::EdgeWorkspace,
+            ExecutorBindingKind::EdgeAgent,
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Offline,
+            true,
+            false,
+        ));
+        assert!(should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+            WorkspaceBindingKind::EdgeWorkspace,
+            ExecutorBindingKind::EdgeAgent,
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Offline,
+            true,
+            true,
+        ));
+        assert!(!should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+            WorkspaceBindingKind::EdgeWorkspace,
+            ExecutorBindingKind::EdgeAgent,
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+            true,
+            true,
+        ));
+        assert!(should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+            WorkspaceBindingKind::EdgeWorkspace,
+            ExecutorBindingKind::EdgeAgent,
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+            false,
+            true,
+        ));
+        assert!(should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+            WorkspaceBindingKind::EdgeWorkspace,
+            ExecutorBindingKind::EdgeAgent,
+            ToolTransportKind::EdgeLedger,
+            ExecutorStatus::Online,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
     fn local_filesystem_does_not_route_to_server_local() {
         let req = make_request(
             "bash",

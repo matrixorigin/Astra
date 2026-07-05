@@ -1512,14 +1512,12 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
         request: &ToolExecutionRequest,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
-        if self.enforce_server_tool_capabilities {
+        if request.tool_name.starts_with("mcp__") {
             if let Some(result) =
                 self.tool_binding_preflight_result(&request.tool_name, &request.args)
             {
                 return result;
             }
-        }
-        if request.tool_name.starts_with("mcp__") {
             return self
                 .execute_mcp_tool(&request.tool_name, &request.args)
                 .await;
@@ -2943,6 +2941,67 @@ esac
         )
     }
 
+    fn all_capabilities_for_admission_tests() -> [Capability; 9] {
+        [
+            Capability::AgentSpawner,
+            Capability::MemoryService,
+            Capability::Database,
+            Capability::SkillsCatalog,
+            Capability::GitHubAuth,
+            Capability::LSPServer,
+            Capability::PlanLifecycle,
+            Capability::LocalBackgroundTasks,
+            Capability::ReflectService,
+        ]
+    }
+
+    #[test]
+    fn executor_gated_capabilities_fail_closed_without_runtime_binding() {
+        let (exec, _dir) = test_executor();
+        for capability in all_capabilities_for_admission_tests() {
+            if capability.is_executor_gated() {
+                assert!(
+                    !exec.capability_has_runtime_binding(capability),
+                    "{capability:?} is executor-gated and must not pass without an explicit runtime binding"
+                );
+            } else {
+                assert!(
+                    exec.capability_has_runtime_binding(capability),
+                    "{capability:?} is not executor-gated and should not require a runtime binding"
+                );
+            }
+        }
+
+        let (exec, _dir) = test_executor_with_agent_context();
+        assert!(
+            exec.capability_has_runtime_binding(Capability::AgentSpawner),
+            "agent spawning becomes runtime-bound only after an explicit agent context is installed"
+        );
+    }
+
+    #[test]
+    fn service_dependency_readiness_is_exhaustive_and_service_specific() {
+        let (exec, _dir) = test_executor();
+        for capability in all_capabilities_for_admission_tests() {
+            match capability {
+                Capability::ReflectService => assert!(
+                    !exec.capability_service_dependency_ready(capability),
+                    "reflect must fail closed until the service is configured"
+                ),
+                _ => assert!(
+                    exec.capability_service_dependency_ready(capability),
+                    "{capability:?} is not a service dependency and should not be blocked here"
+                ),
+            }
+        }
+
+        let (exec, _dir) = test_executor_with_agent_context_and_reflect_service();
+        assert!(
+            exec.capability_service_dependency_ready(Capability::ReflectService),
+            "reflect becomes ready only when the reflect service provider is configured"
+        );
+    }
+
     fn test_agent_tool_context(work_dir: &Path) -> AgentToolContext {
         let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
         let tracker =
@@ -3764,6 +3823,32 @@ esac
             result.output.contains("no MCP manager configured"),
             "{}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_binding_busy_is_retryable_not_missing_binding() {
+        let (mut exec, _dir) = test_executor();
+        let manager = Arc::new(tokio::sync::RwLock::new(astra_mcp::McpClientManager::new()));
+        exec.set_mcp_manager(Arc::clone(&manager));
+
+        let _discovery_write_lock = manager.write().await;
+        assert_eq!(
+            exec.mcp_tool_admission("mcp__demo__search"),
+            ToolAdmission::RuntimeBindingBusy("mcp_registry"),
+            "MCP discovery/reconnect write-lock contention must be observable, not collapsed into missing binding"
+        );
+
+        let result = exec
+            .tool_binding_preflight_result("mcp__demo__search", &json!({"query": "hello"}))
+            .expect("busy MCP registry should short-circuit with structured feedback");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["runtime_binding_state"], "busy");
+        assert_eq!(parsed["runtime_binding_provider"], "mcp_registry");
+        assert_eq!(parsed["retryable"], true);
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolBinding.as_str()
         );
     }
 
@@ -5525,6 +5610,31 @@ esac
         let result = exec.execute("nonexistent_tool", &json!({})).await;
         assert!(result.contains("Unknown tool"));
         assert!(result.contains(astra_core::ErrorKind::ToolNotFound.as_str()));
+    }
+
+    #[tokio::test]
+    async fn server_local_transport_reuses_tool_admission_preflight() {
+        let (mut exec, _dir) = test_executor();
+        exec = exec.with_server_builtin_tools_disabled();
+        let args = json!({"command": "echo should-not-run"});
+        let expected = exec
+            .tool_binding_preflight_result("bash", &args)
+            .expect("bash should be rejected by the shared admission path");
+        let request = exec.tool_execution_request("bash", &args);
+
+        let actual =
+            <RuntimeToolExecutor as crate::server::tool_local_transport::ServerLocalToolTransport>::execute_server_local_tool(
+                &exec,
+                &request,
+                None,
+            )
+            .await;
+
+        assert_eq!(actual.is_error, expected.is_error);
+        assert_eq!(
+            actual.output, expected.output,
+            "server-local transport must not maintain a second divergent admission path"
+        );
     }
 
     struct AlwaysTimeoutGate;

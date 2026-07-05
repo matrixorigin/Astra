@@ -936,6 +936,26 @@ mod tests {
     }
 
     #[test]
+    fn runtime_session_manager_none_does_not_hide_ready_runtime_provider() {
+        let mut runtime = astra_runtime_env::RuntimeBinding::host_process("runtime-none-session");
+        runtime.session_manager = astra_runtime_env::RuntimeSessionManager::None;
+
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &WorkspaceBinding::server_sandbox("/workspace"),
+            &ExecutorBinding::server_local(),
+            Some(&runtime),
+        ));
+
+        for expected in ["bash", "read_file", "write_file", "git"] {
+            assert!(
+                names.contains(expected),
+                "{expected} must remain visible when the runtime is ready and isolated even if it has no long-session manager"
+            );
+        }
+    }
+
+    #[test]
     fn local_filesystem_maps_to_unknown_in_conversion() {
         // When the server receives a client-only LocalFilesystem workspace
         // kind, it should map to Unknown rather than propagating the variant.

@@ -6076,6 +6076,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn builder_does_not_append_server_owned_tools_when_catalog_disabled_with_edge_tools() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-no-server-builtins".to_string(),
+            "s-no-server-builtins".to_string(),
+        )
+        .with_server_tool_catalog_enabled(false)
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let names = schema_names(&host.tool_schemas);
+        assert!(
+            names.contains("bash"),
+            "edge-declared runtime tools should remain visible"
+        );
+        for server_owned in ["tool_search", "web_search", "memory", "introspect", "reflect"] {
+            assert!(
+                !names.contains(server_owned),
+                "{server_owned} must not leak from the server catalog when server-owned tools are disabled"
+            );
+        }
+    }
+
     fn schema_names(tools: &[Value]) -> HashSet<String> {
         tools
             .iter()

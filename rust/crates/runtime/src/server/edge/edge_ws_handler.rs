@@ -206,10 +206,7 @@ async fn handle_edge_connection(
         .await;
 
     // ── Phase 2b: Spawn cross-pod dispatch relay polling task ─────────
-    let inflight_dispatches = Arc::new(tokio::sync::Mutex::new(HashMap::<
-        String,
-        InflightEdgeDispatch,
-    >::new()));
+    let inflight_dispatches = InflightEdgeDispatchTracker::default();
     let dispatch_user_id = user_id.clone();
     let dispatch_agent_id = edge_agent_id.clone();
     let dispatch_svc = state.execution.edge_dispatch_service.clone();
@@ -249,16 +246,15 @@ async fn handle_edge_connection(
                                         continue;
                                     }
                                 };
-                                dispatch_inflight.lock().await.insert(
-                                    row.request_id.clone(),
-                                    InflightEdgeDispatch {
+                                dispatch_inflight
+                                    .track(InflightEdgeDispatch {
                                         user_id: row.user_id.clone(),
                                         edge_agent_id: row.edge_agent_id.clone(),
                                         request_id: row.request_id.clone(),
-                                    },
-                                );
+                                    })
+                                    .await;
                                 if send_edge_msg(&dispatch_sink, msg).await.is_err() {
-                                    dispatch_inflight.lock().await.remove(&row.request_id);
+                                    dispatch_inflight.remove(&row.request_id).await;
                                     tracing::warn!(
                                         target: "astra_runtime::edge_ws",
                                         user_id = %row.user_id,
@@ -389,7 +385,7 @@ async fn handle_edge_connection(
                                             "Edge WS: failed to deliver tool result for cross-pod"
                                         );
                                     } else {
-                                        read_inflight.lock().await.remove(&request_id);
+                                        read_inflight.remove(&request_id).await;
                                     }
                                 }
                                 Ok(EdgeClientMessage::Ping) => {
@@ -439,10 +435,7 @@ async fn handle_edge_connection(
     {
         dispatch_task.abort();
     }
-    let disconnected_dispatches = {
-        let mut inflight = inflight_dispatches.lock().await;
-        inflight.drain().map(|(_, row)| row).collect::<Vec<_>>()
-    };
+    let disconnected_dispatches = inflight_dispatches.drain().await;
     fail_inflight_edge_dispatches(
         state.execution.edge_dispatch_service.as_ref(),
         &disconnected_dispatches,
@@ -470,6 +463,41 @@ struct InflightEdgeDispatch {
     user_id: String,
     edge_agent_id: String,
     request_id: String,
+}
+
+#[derive(Clone)]
+struct InflightEdgeDispatchTracker {
+    inner: Arc<tokio::sync::Mutex<HashMap<String, InflightEdgeDispatch>>>,
+}
+
+impl Default for InflightEdgeDispatchTracker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl InflightEdgeDispatchTracker {
+    async fn track(&self, dispatch: InflightEdgeDispatch) {
+        self.inner
+            .lock()
+            .await
+            .insert(dispatch.request_id.clone(), dispatch);
+    }
+
+    async fn remove(&self, request_id: &str) -> Option<InflightEdgeDispatch> {
+        self.inner.lock().await.remove(request_id)
+    }
+
+    async fn drain(&self) -> Vec<InflightEdgeDispatch> {
+        self.inner
+            .lock()
+            .await
+            .drain()
+            .map(|(_, dispatch)| dispatch)
+            .collect()
+    }
 }
 
 /// Helper: serialize and send an EdgeServerMessage over the WebSocket.
@@ -832,6 +860,89 @@ mod tests {
                     "edge_ws_send_failed".to_string()
                 ),
             ]
+        );
+    }
+
+    fn inflight_dispatch(request_id: &str) -> InflightEdgeDispatch {
+        InflightEdgeDispatch {
+            user_id: "user-1".to_string(),
+            edge_agent_id: "edge-1".to_string(),
+            request_id: request_id.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn inflight_tracker_lifecycle_covers_send_fail_deliver_and_disconnect_drain() {
+        let tracker = InflightEdgeDispatchTracker::default();
+
+        tracker.track(inflight_dispatch("send-failed")).await;
+        let removed = tracker.remove("send-failed").await;
+        assert!(
+            removed.is_some(),
+            "send failure must remove the pre-registered dispatch before claimed-row failure handling"
+        );
+        assert!(
+            tracker.drain().await.is_empty(),
+            "send-failed dispatch must not be failed again during disconnect cleanup"
+        );
+
+        tracker.track(inflight_dispatch("delivered")).await;
+        let delivered = tracker.remove("delivered").await;
+        assert!(
+            delivered.is_some(),
+            "successful edge result delivery must remove the inflight dispatch"
+        );
+        assert!(
+            tracker.drain().await.is_empty(),
+            "delivered dispatch must not be treated as orphaned on disconnect"
+        );
+
+        tracker.track(inflight_dispatch("orphaned")).await;
+        let drained = tracker.drain().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].request_id, "orphaned");
+        assert!(
+            tracker.drain().await.is_empty(),
+            "disconnect cleanup must consume orphaned dispatches exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_tracker_concurrent_remove_and_disconnect_drain_consume_once() {
+        let tracker = InflightEdgeDispatchTracker::default();
+        tracker.track(inflight_dispatch("race")).await;
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let remove_tracker = tracker.clone();
+        let remove_barrier = std::sync::Arc::clone(&barrier);
+        let remove_task = tokio::spawn(async move {
+            remove_barrier.wait().await;
+            remove_tracker.remove("race").await
+        });
+
+        let drain_tracker = tracker.clone();
+        let drain_barrier = std::sync::Arc::clone(&barrier);
+        let drain_task = tokio::spawn(async move {
+            drain_barrier.wait().await;
+            drain_tracker.drain().await
+        });
+
+        barrier.wait().await;
+        let removed = remove_task.await.expect("remove task should not panic");
+        let drained = drain_task.await.expect("drain task should not panic");
+        let consumed_count = usize::from(removed.is_some())
+            + drained
+                .iter()
+                .filter(|dispatch| dispatch.request_id == "race")
+                .count();
+
+        assert_eq!(
+            consumed_count, 1,
+            "delivery and disconnect cleanup racing for the same dispatch must have exactly one winner"
+        );
+        assert!(
+            tracker.drain().await.is_empty(),
+            "no inflight dispatch should remain after the race resolves"
         );
     }
 
