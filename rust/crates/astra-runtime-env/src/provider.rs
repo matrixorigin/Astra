@@ -36,6 +36,13 @@ impl CapacityProviderType {
             Self::Unknown => "unknown",
         }
     }
+
+    pub const fn is_runtime_executor(self) -> bool {
+        matches!(
+            self,
+            Self::EdgeCapacity | Self::Sandbox | Self::OrchestratorManagedRuntime | Self::CliLocal
+        )
+    }
 }
 
 impl fmt::Display for CapacityProviderType {

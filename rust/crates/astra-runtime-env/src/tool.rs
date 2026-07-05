@@ -5,7 +5,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    CapacityProvider, CapacityProviderDeclaration, EffectiveCapabilitySet, NetworkCapability,
+    CapacityProvider, CapacityProviderDeclaration, CapacityProviderType, EffectiveCapabilitySet,
+    NetworkCapability,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -317,10 +318,49 @@ pub struct ToolDenial {
     pub reason: ToolUnavailableReason,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOfferCandidateReason {
+    Selected,
+    LowerPriority,
+    ProviderTypeMismatch,
+    CapabilityUnavailable,
+    SchemaConflict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolOfferCandidate {
+    pub offer_id: String,
+    pub provider_type: CapacityProviderType,
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_digest: Option<String>,
+    pub selected: bool,
+    pub reason: ToolOfferCandidateReason,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolSurfaceAdmission {
+    pub tool_name: String,
+    pub visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_offer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider_type: Option<CapacityProviderType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_reason: Option<ToolUnavailableReason>,
+    #[serde(default)]
+    pub candidates: Vec<ToolOfferCandidate>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AvailableToolSurface {
     pub tool_names: Vec<String>,
     pub denials: Vec<ToolDenial>,
+    #[serde(default, skip_serializing)]
+    pub admissions: Vec<ToolSurfaceAdmission>,
 }
 
 impl AvailableToolSurface {
@@ -333,6 +373,12 @@ impl AvailableToolSurface {
             .iter()
             .find(|denial| denial.tool_name == tool_name)
             .map(|denial| &denial.reason)
+    }
+
+    pub fn admission_for(&self, tool_name: &str) -> Option<&ToolSurfaceAdmission> {
+        self.admissions
+            .iter()
+            .find(|admission| admission.tool_name == tool_name)
     }
 }
 
@@ -360,39 +406,171 @@ impl CapabilityResolver {
         capabilities: &EffectiveCapabilitySet,
         providers: &[CapacityProviderDeclaration],
     ) -> AvailableToolSurface {
-        self.available_tool_surface_impl(registry, capabilities, |tool_name| {
-            providers
-                .iter()
-                .any(|provider| provider.declares_tool(tool_name))
-        })
+        self.available_tool_surface_impl(registry, capabilities, providers)
     }
 
     fn available_tool_surface_impl(
         &self,
         registry: &ToolRegistry,
         capabilities: &EffectiveCapabilitySet,
-        mut provider_declares: impl FnMut(&str) -> bool,
+        providers: &[CapacityProviderDeclaration],
     ) -> AvailableToolSurface {
+        let provider_schema_conflicts = provider_schema_conflicting_tool_names(providers);
         let mut tool_names = Vec::new();
         let mut denials = Vec::new();
-        for spec in registry.iter() {
-            if !provider_declares(&spec.name) {
+        let mut admissions = Vec::new();
+        let mut specs: Vec<ToolSpec> = registry.iter().cloned().collect();
+        let mut seen: HashSet<String> = specs.iter().map(|spec| spec.name.clone()).collect();
+        for provider in providers {
+            for tool_name in &provider.tool_names {
+                if seen.contains(tool_name) {
+                    continue;
+                }
+                let Some(spec) = dynamic_tool_spec(tool_name) else {
+                    continue;
+                };
+                seen.insert(tool_name.clone());
+                specs.push(spec);
+            }
+        }
+        for spec in &specs {
+            if !providers
+                .iter()
+                .any(|provider| provider.declares_tool(&spec.name))
+            {
+                continue;
+            }
+            let schema_conflicted = provider_schema_conflicts.contains(&spec.name);
+            let mut admission =
+                self.admission_for_spec(spec, capabilities, providers, schema_conflicted);
+            if schema_conflicted {
+                let reason =
+                    ToolUnavailableReason::PolicyDenied("provider_schema_conflict".to_string());
+                admission.visible = false;
+                admission.selected_offer_id = None;
+                admission.selected_provider_type = None;
+                admission.selected_provider_id = None;
+                admission.hidden_reason = Some(reason.clone());
+                denials.push(ToolDenial {
+                    tool_name: spec.name.clone(),
+                    reason,
+                });
+                admissions.push(admission);
                 continue;
             }
             match self.check(spec, capabilities) {
-                Ok(()) => tool_names.push(spec.name.clone()),
-                Err(reason) => denials.push(ToolDenial {
-                    tool_name: spec.name.clone(),
-                    reason,
-                }),
+                Ok(()) if admission.visible => tool_names.push(spec.name.clone()),
+                Ok(()) => {
+                    if let Some(reason) = admission.hidden_reason.clone() {
+                        denials.push(ToolDenial {
+                            tool_name: spec.name.clone(),
+                            reason,
+                        });
+                    }
+                }
+                Err(reason) => {
+                    admission.visible = false;
+                    admission.hidden_reason = Some(reason.clone());
+                    denials.push(ToolDenial {
+                        tool_name: spec.name.clone(),
+                        reason,
+                    });
+                }
             }
+            admissions.push(admission);
         }
         // Sort for deterministic serialization (HashMap iteration is non-deterministic).
         tool_names.sort();
         denials.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+        admissions.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
         AvailableToolSurface {
             tool_names,
             denials,
+            admissions,
+        }
+    }
+
+    fn admission_for_spec(
+        &self,
+        spec: &ToolSpec,
+        capabilities: &EffectiveCapabilitySet,
+        providers: &[CapacityProviderDeclaration],
+        schema_conflicted: bool,
+    ) -> ToolSurfaceAdmission {
+        let declared_candidates: Vec<&CapacityProviderDeclaration> = providers
+            .iter()
+            .filter(|provider| provider.declares_tool(&spec.name))
+            .collect();
+        let selected_provider = if schema_conflicted {
+            None
+        } else {
+            selected_provider_for_tool(spec, capabilities, &declared_candidates)
+        };
+        let selected_offer_id =
+            selected_provider.map(|provider| offer_id(spec.name.as_str(), provider));
+        let selected_provider_type = selected_provider.map(|provider| provider.provider_type);
+        let selected_provider_id = selected_provider.map(|provider| provider.provider_id.clone());
+        let hidden_reason = if selected_provider.is_none() && !schema_conflicted {
+            Some(ToolUnavailableReason::ExecutorUnavailable(
+                "no_matching_provider_offer".to_string(),
+            ))
+        } else {
+            None
+        };
+        let mut candidates: Vec<ToolOfferCandidate> = declared_candidates
+            .into_iter()
+            .map(|provider| {
+                let offer_id = offer_id(spec.name.as_str(), provider);
+                let selected = selected_offer_id.as_deref() == Some(offer_id.as_str());
+                let reason = if schema_conflicted {
+                    ToolOfferCandidateReason::SchemaConflict
+                } else if selected {
+                    ToolOfferCandidateReason::Selected
+                } else if provider_type_matches_requirement(
+                    spec.required.executor,
+                    provider.provider_type,
+                ) && provider_capability_ready(
+                    spec.required.executor,
+                    capabilities,
+                    provider.provider_type,
+                ) {
+                    ToolOfferCandidateReason::LowerPriority
+                } else if provider_type_matches_requirement(
+                    spec.required.executor,
+                    provider.provider_type,
+                ) {
+                    ToolOfferCandidateReason::CapabilityUnavailable
+                } else {
+                    ToolOfferCandidateReason::ProviderTypeMismatch
+                };
+                ToolOfferCandidate {
+                    offer_id,
+                    provider_type: provider.provider_type,
+                    provider_id: provider.provider_id.clone(),
+                    schema_digest: provider
+                        .schema_digest_for_tool(&spec.name)
+                        .map(str::to_string),
+                    selected,
+                    reason,
+                }
+            })
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.provider_type
+                .as_str()
+                .cmp(b.provider_type.as_str())
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+                .then_with(|| a.offer_id.cmp(&b.offer_id))
+        });
+
+        ToolSurfaceAdmission {
+            tool_name: spec.name.clone(),
+            visible: selected_provider.is_some() && self.check(spec, capabilities).is_ok(),
+            selected_offer_id,
+            selected_provider_type,
+            selected_provider_id,
+            hidden_reason,
+            candidates,
         }
     }
 
@@ -642,6 +820,112 @@ impl CapabilityResolver {
 
         Ok(())
     }
+}
+
+fn selected_provider_for_tool<'a>(
+    spec: &ToolSpec,
+    capabilities: &EffectiveCapabilitySet,
+    providers: &[&'a CapacityProviderDeclaration],
+) -> Option<&'a CapacityProviderDeclaration> {
+    let mut candidates: Vec<&CapacityProviderDeclaration> = providers
+        .iter()
+        .copied()
+        .filter(|provider| {
+            provider_type_matches_requirement(spec.required.executor, provider.provider_type)
+                && provider_capability_ready(
+                    spec.required.executor,
+                    capabilities,
+                    provider.provider_type,
+                )
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        provider_selection_rank(spec.required.executor, capabilities, a.provider_type)
+            .cmp(&provider_selection_rank(
+                spec.required.executor,
+                capabilities,
+                b.provider_type,
+            ))
+            .then_with(|| a.provider_type.as_str().cmp(b.provider_type.as_str()))
+            .then_with(|| a.provider_id.cmp(&b.provider_id))
+    });
+    candidates.into_iter().next()
+}
+
+fn provider_capability_ready(
+    required: RequiredExecutor,
+    capabilities: &EffectiveCapabilitySet,
+    provider_type: CapacityProviderType,
+) -> bool {
+    match required {
+        RequiredExecutor::None => true,
+        RequiredExecutor::ControlPlane => capabilities.executor.control_plane,
+        RequiredExecutor::ServiceExecutor => capabilities.executor.server_service,
+        RequiredExecutor::ServiceOrRuntimeExecutor => {
+            (provider_type == CapacityProviderType::ServerService
+                && capabilities.executor.server_service)
+                || (provider_type.is_runtime_executor() && capabilities.executor.runtime_executor)
+        }
+        RequiredExecutor::RuntimeExecutor => capabilities.executor.runtime_executor,
+        RequiredExecutor::McpExecutor => capabilities.executor.mcp_executor,
+    }
+}
+
+fn provider_type_matches_requirement(
+    required: RequiredExecutor,
+    provider_type: CapacityProviderType,
+) -> bool {
+    match required {
+        RequiredExecutor::None => true,
+        RequiredExecutor::ControlPlane => provider_type == CapacityProviderType::ControlPlane,
+        RequiredExecutor::ServiceExecutor => provider_type == CapacityProviderType::ServerService,
+        RequiredExecutor::ServiceOrRuntimeExecutor => {
+            provider_type == CapacityProviderType::ServerService
+                || provider_type.is_runtime_executor()
+        }
+        RequiredExecutor::RuntimeExecutor => provider_type.is_runtime_executor(),
+        RequiredExecutor::McpExecutor => provider_type == CapacityProviderType::RequestScopedMcp,
+    }
+}
+
+fn provider_selection_rank(
+    required: RequiredExecutor,
+    capabilities: &EffectiveCapabilitySet,
+    provider_type: CapacityProviderType,
+) -> u8 {
+    match required {
+        RequiredExecutor::ServiceOrRuntimeExecutor
+            if capabilities.executor.runtime_executor && provider_type.is_runtime_executor() =>
+        {
+            0
+        }
+        RequiredExecutor::ServiceOrRuntimeExecutor
+            if provider_type == CapacityProviderType::ServerService =>
+        {
+            1
+        }
+        RequiredExecutor::RuntimeExecutor if provider_type == CapacityProviderType::CliLocal => 0,
+        RequiredExecutor::RuntimeExecutor
+            if provider_type == CapacityProviderType::EdgeCapacity =>
+        {
+            1
+        }
+        RequiredExecutor::RuntimeExecutor if provider_type == CapacityProviderType::Sandbox => 2,
+        RequiredExecutor::RuntimeExecutor
+            if provider_type == CapacityProviderType::OrchestratorManagedRuntime =>
+        {
+            3
+        }
+        _ => 0,
+    }
+}
+
+fn offer_id(tool_name: &str, provider: &CapacityProviderDeclaration) -> String {
+    format!(
+        "{tool_name}@{}:{}",
+        provider.provider_type.as_str(),
+        provider.provider_id
+    )
 }
 
 pub use astra_core::tool_schema::tool_schema_name;
@@ -969,7 +1253,7 @@ mod tests {
         assert_eq!(
             CapabilityResolver.check_tool(&registry, "tool_search", &binding.capabilities),
             Err(ToolUnavailableReason::ExecutorUnavailable(
-                "service_executor_required".to_string()
+                "control_plane_required".to_string()
             ))
         );
     }
@@ -995,6 +1279,17 @@ mod tests {
             assert_eq!(
                 binding.tool_surface.denial_for(tool),
                 Some(&ToolUnavailableReason::PolicyDenied(
+                    PolicyIntent::disallowed_tool_reason(tool)
+                ))
+            );
+            let admission = binding
+                .tool_surface
+                .admission_for(tool)
+                .unwrap_or_else(|| panic!("{tool} admission"));
+            assert!(!admission.visible);
+            assert_eq!(
+                admission.hidden_reason,
+                Some(ToolUnavailableReason::PolicyDenied(
                     PolicyIntent::disallowed_tool_reason(tool)
                 ))
             );
@@ -1633,6 +1928,176 @@ mod tests {
     }
 
     #[test]
+    fn local_cli_shared_network_offer_overrides_server_without_prompt_schema_churn() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let admission = binding
+            .tool_surface
+            .admission_for("web_fetch")
+            .expect("web_fetch admission");
+
+        assert!(admission.visible);
+        assert_eq!(
+            admission.selected_provider_type,
+            Some(crate::CapacityProviderType::CliLocal)
+        );
+        assert_eq!(admission.selected_provider_id.as_deref(), Some("local-cli"));
+        assert_eq!(
+            admission.selected_offer_id.as_deref(),
+            Some("web_fetch@cli_local:local-cli")
+        );
+        assert!(admission.candidates.iter().any(|candidate| {
+            candidate.provider_type == crate::CapacityProviderType::ServerService
+                && candidate.reason == ToolOfferCandidateReason::LowerPriority
+        }));
+
+        let schema = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch a URL"
+            }
+        });
+        let providers = local_cli_providers(&registry);
+        let mut reversed_providers = providers.clone();
+        reversed_providers.reverse();
+        let filtered = CapabilityResolver.filter_tool_schemas_for_providers(
+            &registry,
+            vec![schema.clone()],
+            &binding.capabilities,
+            &providers,
+        );
+        let filtered_reversed = CapabilityResolver.filter_tool_schemas_for_providers(
+            &registry,
+            vec![schema.clone()],
+            &binding.capabilities,
+            &reversed_providers,
+        );
+
+        assert_eq!(filtered, vec![schema.clone()]);
+        assert_eq!(
+            filtered_reversed,
+            vec![schema],
+            "provider route selection must not rewrite prompt-visible schemas"
+        );
+    }
+
+    #[test]
+    fn cloud_control_plane_shared_network_offer_uses_server_service() {
+        let registry = registry();
+        let binding = RunBinding::cloud_control_plane(&registry);
+        let admission = binding
+            .tool_surface
+            .admission_for("web_fetch")
+            .expect("web_fetch admission");
+
+        assert!(admission.visible);
+        assert_eq!(
+            admission.selected_provider_type,
+            Some(crate::CapacityProviderType::ServerService)
+        );
+        assert_eq!(
+            admission.selected_offer_id.as_deref(),
+            Some("web_fetch@server_service:server-service")
+        );
+    }
+
+    #[test]
+    fn edge_shared_network_offer_uses_edge_not_server_fallback() {
+        let registry = registry();
+        let binding = RunBinding::edge_developer("/repo", &registry);
+        let admission = binding
+            .tool_surface
+            .admission_for("web_fetch")
+            .expect("web_fetch admission");
+
+        assert!(admission.visible);
+        assert_eq!(
+            admission.selected_provider_type,
+            Some(crate::CapacityProviderType::EdgeCapacity)
+        );
+        assert_eq!(
+            admission.selected_provider_id.as_deref(),
+            Some("edge-agent")
+        );
+        assert_eq!(admission.candidates.len(), 1);
+    }
+
+    #[test]
+    fn provider_schema_conflict_hides_surface_and_admission() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let providers = vec![
+            crate::server_service_provider("server", &registry)
+                .with_tool_schema_digest("web_fetch", "sha256:server-contract"),
+            crate::cli_local_provider("cli", &registry)
+                .with_tool_schema_digest("web_fetch", "sha256:cli-contract"),
+        ];
+
+        let surface = CapabilityResolver.available_tool_surface_for_providers(
+            &registry,
+            &binding.capabilities,
+            &providers,
+        );
+        let admission = surface
+            .admission_for("web_fetch")
+            .expect("web_fetch admission");
+
+        assert!(!surface.contains("web_fetch"));
+        assert_eq!(
+            surface.denial_for("web_fetch"),
+            Some(&ToolUnavailableReason::PolicyDenied(
+                "provider_schema_conflict".to_string()
+            ))
+        );
+        assert!(!admission.visible);
+        assert_eq!(admission.selected_offer_id, None);
+        assert!(
+            admission
+                .candidates
+                .iter()
+                .all(|candidate| candidate.reason == ToolOfferCandidateReason::SchemaConflict)
+        );
+    }
+
+    #[test]
+    fn provider_type_mismatch_is_a_diagnosed_hidden_offer_not_silent_visibility() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let providers = vec![crate::CapacityProviderDeclaration::new(
+            crate::CapacityProviderType::ServerService,
+            "wrong-owner",
+            ["bash".to_string()],
+        )];
+
+        let surface = CapabilityResolver.available_tool_surface_for_providers(
+            &registry,
+            &binding.capabilities,
+            &providers,
+        );
+        let admission = surface.admission_for("bash").expect("bash admission");
+
+        assert!(!surface.contains("bash"));
+        assert_eq!(
+            surface.denial_for("bash"),
+            Some(&ToolUnavailableReason::ExecutorUnavailable(
+                "no_matching_provider_offer".to_string()
+            ))
+        );
+        assert!(!admission.visible);
+        assert_eq!(
+            admission.hidden_reason,
+            Some(ToolUnavailableReason::ExecutorUnavailable(
+                "no_matching_provider_offer".to_string()
+            ))
+        );
+        assert_eq!(
+            admission.candidates[0].reason,
+            ToolOfferCandidateReason::ProviderTypeMismatch
+        );
+    }
+
+    #[test]
     fn request_scoped_mcp_schema_filter_requires_exact_provider_binding() {
         let registry = registry();
         let binding = RunBinding::resolve(
@@ -1669,6 +2134,44 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["mcp__weather".to_string()]);
+    }
+
+    #[test]
+    fn request_scoped_mcp_surface_includes_provider_bound_dynamic_tool() {
+        let registry = registry();
+        let providers = vec![crate::request_scoped_mcp_provider(
+            "mcp",
+            ["mcp__weather".to_string()],
+        )];
+        let binding = RunBinding::resolve_with_provider_declarations(
+            WorkspaceBinding::none(),
+            ExecutorBinding {
+                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                executor_id: "mcp".to_string(),
+                display_name: "MCP".to_string(),
+                transport: crate::ToolTransportKind::McpHttp,
+                status: crate::ExecutorStatus::Online,
+            },
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+            &providers,
+        );
+        let admission = binding
+            .tool_surface
+            .admission_for("mcp__weather")
+            .expect("dynamic MCP admission");
+
+        assert!(binding.tool_surface.contains("mcp__weather"));
+        assert!(admission.visible);
+        assert_eq!(
+            admission.selected_provider_type,
+            Some(crate::CapacityProviderType::RequestScopedMcp)
+        );
+        assert_eq!(
+            admission.selected_offer_id.as_deref(),
+            Some("mcp__weather@request_scoped_mcp:mcp")
+        );
     }
 
     #[test]

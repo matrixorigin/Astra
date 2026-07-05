@@ -719,9 +719,14 @@ fn validate_runtime_tool_name(
             ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(tool_name)),
         ));
     }
-    CapabilityResolver
-        .check_tool(registry, tool_name, &binding.capabilities)
-        .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
+    let capability_check =
+        CapabilityResolver.check_tool(registry, tool_name, &binding.capabilities);
+    if matches!(capability_check, Err(ToolUnavailableReason::UnknownTool)) {
+        return capability_check
+            .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason));
+    }
+    validate_tool_surface_admission(binding, tool_name)?;
+    capability_check.map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
 }
 
 fn validate_runtime_tool_call(
@@ -736,9 +741,39 @@ fn validate_runtime_tool_call(
             ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(tool_name)),
         ));
     }
-    CapabilityResolver
-        .check_tool_call(registry, tool_name, args, &binding.capabilities)
-        .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
+    let capability_check =
+        CapabilityResolver.check_tool_call(registry, tool_name, args, &binding.capabilities);
+    if matches!(capability_check, Err(ToolUnavailableReason::UnknownTool)) {
+        return capability_check
+            .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason));
+    }
+    validate_tool_surface_admission(binding, tool_name)?;
+    capability_check.map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
+}
+
+fn validate_tool_surface_admission(
+    binding: &RunBinding,
+    tool_name: &str,
+) -> Result<(), RuntimeError> {
+    if binding.tool_surface.contains(tool_name) {
+        return Ok(());
+    }
+    let reason = binding
+        .tool_surface
+        .denial_for(tool_name)
+        .cloned()
+        .or_else(|| {
+            binding
+                .tool_surface
+                .admission_for(tool_name)
+                .and_then(|admission| admission.hidden_reason.clone())
+        })
+        .unwrap_or_else(|| {
+            ToolUnavailableReason::ExecutorUnavailable(
+                "tool_not_selected_by_current_provider_surface".to_string(),
+            )
+        });
+    Err(RuntimeError::tool_unavailable(tool_name, reason))
 }
 
 #[async_trait]
@@ -908,7 +943,7 @@ mod tests {
     fn gvisor_binding() -> RunBinding {
         let registry = ToolRegistry::builtins();
         RunBinding::resolve(
-            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
             ExecutorBinding::local_cli(),
             RuntimeBinding::gvisor("gvisor-1"),
             PolicyIntent::local_developer(),
@@ -1008,7 +1043,7 @@ mod tests {
         // host_process runtime cannot satisfy GVisor.
         let registry = ToolRegistry::builtins();
         let binding = RunBinding::resolve(
-            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
             ExecutorBinding::local_cli(),
             RuntimeBinding::gvisor("gvisor-1"),
             PolicyIntent::strict_orchestrator(),
@@ -1048,7 +1083,7 @@ mod tests {
     async fn prepare_session_rejects_requested_tool_outside_policy_allowlist() {
         let registry = ToolRegistry::builtins();
         let binding = RunBinding::resolve(
-            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
             ExecutorBinding::local_cli(),
             RuntimeBinding::gvisor("gvisor-1"),
             PolicyIntent::local_developer().with_allowed_tools(["read_file"]),
@@ -1107,11 +1142,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn invocation_validation_rejects_tools_not_selected_by_provider_surface() {
+        let registry = ToolRegistry::builtins();
+        let providers = vec![
+            crate::server_service_provider("server", &registry),
+            crate::control_plane_provider("control", &registry),
+        ];
+        let binding = RunBinding::resolve_with_provider_declarations(
+            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
+            ExecutorBinding::local_cli(),
+            RuntimeBinding::host_process("local-host"),
+            PolicyIntent::local_developer(),
+            &registry,
+            &providers,
+        );
+        let invocation = RuntimeToolInvocation::new(
+            "call-1",
+            "bash",
+            json!({"cmd": "pwd"}),
+            binding,
+            PolicyRevision::INITIAL,
+        );
+
+        let err = validate_runtime_tool_invocation(&registry, &invocation)
+            .expect_err("surface-hidden tool must not be executable through capability fallback");
+
+        assert_eq!(err.kind, RuntimeErrorKind::ToolUnavailable);
+        assert_eq!(
+            err.tool_reason,
+            Some(ToolUnavailableReason::ExecutorUnavailable(
+                "tool_not_selected_by_current_provider_surface".to_string()
+            ))
+        );
+    }
+
     #[tokio::test]
     async fn execute_tool_rejects_policy_disallowed_tool_before_execution() {
         let registry = ToolRegistry::builtins();
         let binding = RunBinding::resolve(
-            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
             ExecutorBinding::local_cli(),
             RuntimeBinding::gvisor("gvisor-1"),
             PolicyIntent::local_developer().with_allowed_tools(["read_file"]),

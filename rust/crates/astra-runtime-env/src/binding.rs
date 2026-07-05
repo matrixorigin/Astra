@@ -627,11 +627,19 @@ fn apply_policy_tool_allowlist(policy: &PolicyIntent, tool_surface: &mut Availab
         if policy.allows_tool(tool_name) {
             return true;
         }
+        let reason =
+            ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(tool_name));
+        if let Some(admission) = tool_surface
+            .admissions
+            .iter_mut()
+            .find(|admission| admission.tool_name == *tool_name)
+        {
+            admission.visible = false;
+            admission.hidden_reason = Some(reason.clone());
+        }
         policy_denials.push(ToolDenial {
             tool_name: tool_name.clone(),
-            reason: ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(
-                tool_name,
-            )),
+            reason,
         });
         false
     });
@@ -641,6 +649,14 @@ fn apply_policy_tool_allowlist(policy: &PolicyIntent, tool_surface: &mut Availab
             denial.reason = ToolUnavailableReason::PolicyDenied(
                 PolicyIntent::disallowed_tool_reason(&denial.tool_name),
             );
+        }
+    }
+    for admission in &mut tool_surface.admissions {
+        if !policy.allows_tool(&admission.tool_name) {
+            admission.visible = false;
+            admission.hidden_reason = Some(ToolUnavailableReason::PolicyDenied(
+                PolicyIntent::disallowed_tool_reason(&admission.tool_name),
+            ));
         }
     }
     tool_surface.denials.extend(policy_denials);
@@ -687,6 +703,10 @@ mod tests {
             true
         );
         assert!(value["binding"]["tool_surface"]["tool_names"].is_array());
+        assert!(
+            value["binding"]["tool_surface"].get("admissions").is_none(),
+            "selected provider offers are runtime evidence and must not churn prompt/runtime advertisement bytes"
+        );
     }
 
     #[test]
