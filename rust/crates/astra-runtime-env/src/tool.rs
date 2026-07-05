@@ -1048,7 +1048,7 @@ fn request_scoped_mcp(name: &str) -> ToolSpec {
 }
 
 fn dynamic_tool_spec(name: &str) -> Option<ToolSpec> {
-    if name.starts_with("mcp__") {
+    if crate::is_mcp_namespaced_tool_name(name) {
         return Some(request_scoped_mcp(name));
     }
     None

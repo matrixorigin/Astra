@@ -807,7 +807,7 @@ impl RuntimeToolExecutor {
     }
 
     fn executor_tool_readiness_for_call(&self, name: &str, args: &Value) -> ExecutorToolReadiness {
-        if name.starts_with("mcp__") {
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
             if let Some(reason) = self.request_scoped_mcp_admission_policy_denial(name) {
                 return ExecutorToolReadiness::RuntimeEnvironmentDenied(reason);
             }
@@ -902,7 +902,7 @@ impl RuntimeToolExecutor {
     }
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
-        if name.starts_with("mcp__") {
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
             return matches!(
                 self.mcp_executor_tool_readiness(name),
                 ExecutorToolReadiness::Ready | ExecutorToolReadiness::RuntimeBindingBusy(_)
@@ -1363,7 +1363,7 @@ impl RuntimeToolExecutor {
         request: &ToolExecutionRequest,
     ) -> Option<SelectedToolOfferSnapshot> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        let schemas = if request.tool_name.starts_with("mcp__") {
+        let schemas = if astra_runtime_env::is_mcp_namespaced_tool_name(&request.tool_name) {
             let schemas =
                 self.request_scoped_mcp_schemas_snapshot("selected_offer_request_scoped_mcp");
             if schemas
@@ -1747,7 +1747,7 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
         request: &ToolExecutionRequest,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
-        if request.tool_name.starts_with("mcp__") {
+        if astra_runtime_env::is_mcp_namespaced_tool_name(&request.tool_name) {
             if let Some(result) =
                 self.executor_readiness_preflight_result(&request.tool_name, &request.args)
             {
@@ -2833,7 +2833,7 @@ mod tests {
         let unclassified: Vec<_> = handler_names
             .iter()
             .filter(|n| {
-                !schema_names.contains(*n) && !n.starts_with("mcp__") // dynamic prefix handler
+                !schema_names.contains(*n) && !astra_runtime_env::is_mcp_namespaced_tool_name(n)
             })
             .cloned()
             .collect();

@@ -78,7 +78,7 @@ pub(crate) fn tool_execution_class(
     tool_name: &str,
     registry: &astra_runtime_env::ToolRegistry,
 ) -> ToolExecutionClass {
-    if tool_name.starts_with("mcp__") {
+    if astra_runtime_env::is_mcp_namespaced_tool_name(tool_name) {
         return ToolExecutionClass::RequestScopedMcp;
     }
     if is_intercepted_turn_pipeline_tool(tool_name) {

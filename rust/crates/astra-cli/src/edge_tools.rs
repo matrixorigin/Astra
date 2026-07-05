@@ -1371,7 +1371,7 @@ impl ToolExecutor {
                 let Some(name) = astra_turn_core::tool::schema::tool_schema_name(schema) else {
                     return true;
                 };
-                if name.starts_with("mcp__") {
+                if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
                     dropped_mcp_schema_names.push(name.to_string());
                     return false;
                 }
@@ -1521,7 +1521,7 @@ impl ToolExecutor {
     }
 
     fn tool_has_public_schema_runtime_binding(&self, name: &str) -> bool {
-        if name.starts_with("mcp__") {
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
             return self.mcp_tool_has_runtime_binding(name);
         }
 
@@ -1577,7 +1577,7 @@ impl ToolExecutor {
         args: &Value,
     ) -> Option<astra_runtime_env::ToolUnavailableReason> {
         let registry = runtime_env_builtin_registry();
-        if registry.get(name).is_none() && !name.starts_with("mcp__") {
+        if registry.get(name).is_none() && !astra_runtime_env::is_mcp_namespaced_tool_name(name) {
             return None;
         }
         let binding = self.runtime_environment_binding_for_tool(name, registry);
@@ -1597,7 +1597,9 @@ impl ToolExecutor {
         name: &str,
         registry: &astra_runtime_env::ToolRegistry,
     ) -> astra_runtime_env::RunBinding {
-        if name.starts_with("mcp__") && self.mcp_tool_has_runtime_binding(name) {
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name)
+            && self.mcp_tool_has_runtime_binding(name)
+        {
             return astra_runtime_env::RunBinding::resolve(
                 astra_runtime_env::WorkspaceBinding::none(),
                 astra_runtime_env::ExecutorBinding {
@@ -5029,7 +5031,9 @@ impl ToolExecutor {
                 "config" => self.config_tool(args),
                 "brief" => self.brief(args).await,
                 "context_analysis" => self.context_analysis(args),
-                _ if name.starts_with("mcp__") => self.execute_mcp_tool(name, args).await,
+                _ if astra_runtime_env::is_mcp_namespaced_tool_name(name) => {
+                    self.execute_mcp_tool(name, args).await
+                }
                 _ => {
                     // Delegate unknown tools to the shared DefaultToolExecutor.
                     use astra_tools::ToolExecutor as _;
@@ -5550,7 +5554,7 @@ impl ToolExecutor {
                     .iter()
                     .any(|meta| meta.name == name.as_str())
             })
-            .filter(|name| name.starts_with("mcp__"))
+            .filter(|name| astra_runtime_env::is_mcp_namespaced_tool_name(name))
             .collect();
         let dropped_by_surface = outcome
             .dropped_by_surface

@@ -247,6 +247,10 @@ pub fn is_valid_provider_id(value: &str) -> bool {
     astra_core::tool_offer::is_valid_provider_id(value)
 }
 
+pub fn is_mcp_namespaced_tool_name(value: &str) -> bool {
+    astra_core::tool_offer::is_mcp_namespaced_tool_name(value)
+}
+
 pub fn is_valid_tool_offer_tool_name(value: &str) -> bool {
     astra_core::tool_offer::is_valid_tool_offer_tool_name(value)
 }
@@ -512,7 +516,7 @@ pub fn request_scoped_mcp_provider_from_schemas(
         let Some(tool_name) = tool_schema_name(schema) else {
             continue;
         };
-        if !tool_name.starts_with("mcp__") {
+        if !is_mcp_namespaced_tool_name(tool_name) {
             continue;
         }
         declaration.tool_names.insert(tool_name.to_string());

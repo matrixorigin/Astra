@@ -232,7 +232,8 @@ pub(crate) fn runtime_environment_binding_for_parts(
 }
 
 fn is_explicit_request_scoped_mcp_binding(tool_name: &str, executor: &ExecutorBinding) -> bool {
-    tool_name.starts_with("mcp__") && matches!(executor.kind, ExecutorBindingKind::Mcp)
+    astra_runtime_env::is_mcp_namespaced_tool_name(tool_name)
+        && matches!(executor.kind, ExecutorBindingKind::Mcp)
 }
 
 fn runtime_env_workspace_binding(

@@ -1992,7 +1992,7 @@ impl ServerAgenticLoopHost {
         context.request_scoped_mcp_provider_ready |= source_schemas
             .iter()
             .filter_map(tool_schema_name)
-            .any(|name| name.starts_with("mcp__"));
+            .any(astra_runtime_env::is_mcp_namespaced_tool_name);
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let schemas: Vec<Value> = source_schemas
             .iter()
@@ -2019,7 +2019,7 @@ impl ServerAgenticLoopHost {
                 .and_then(|f| f.get("name"))
                 .and_then(|v| v.as_str())
             {
-                if name.starts_with("mcp__") {
+                if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
                     installed_request_scoped_mcp_schema = true;
                 }
                 self.valid_tools.insert(name.to_string());

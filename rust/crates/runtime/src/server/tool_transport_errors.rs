@@ -115,7 +115,7 @@ pub(crate) fn unsupported_workspace_executor_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
 ) -> astra_tools::ToolResult {
-    if !request.tool_name.starts_with("mcp__")
+    if !astra_runtime_env::is_mcp_namespaced_tool_name(&request.tool_name)
         && astra_runtime_env::ToolRegistry::builtins()
             .get(&request.tool_name)
             .is_none()

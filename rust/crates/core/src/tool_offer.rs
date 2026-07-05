@@ -14,6 +14,22 @@ pub fn tool_offer_id(tool_name: &str, provider_id: &str) -> String {
     format!("{tool_name}@{provider_id}")
 }
 
+pub const MCP_NAMESPACED_TOOL_PREFIX: &str = "mcp__";
+
+/// Returns true when `value` is a syntactically valid MCP namespaced canonical
+/// tool name such as `mcp__github__search`.
+///
+/// This is only a name-shape predicate. It does not mean an MCP provider is
+/// configured, ready, selected, or authorized for the current scope.
+pub fn is_mcp_namespaced_tool_name(value: &str) -> bool {
+    value
+        .strip_prefix(MCP_NAMESPACED_TOOL_PREFIX)
+        .is_some_and(|suffix| {
+            suffix.bytes().any(|byte| byte.is_ascii_alphanumeric())
+                && is_valid_tool_offer_tool_name(value)
+        })
+}
+
 pub fn is_valid_tool_offer_id(value: &str) -> bool {
     let Some((tool_name, provider_id)) = value.split_once('@') else {
         return false;
@@ -63,6 +79,15 @@ mod tests {
             tool_offer_id("web_fetch", "server-builtin"),
             "web_fetch@server-builtin"
         );
+    }
+
+    #[test]
+    fn mcp_namespaced_tool_name_is_only_a_valid_name_shape() {
+        assert!(is_mcp_namespaced_tool_name("mcp__github__search"));
+        assert!(is_mcp_namespaced_tool_name("mcp__local_docs__query"));
+        assert!(!is_mcp_namespaced_tool_name("web_fetch"));
+        assert!(!is_mcp_namespaced_tool_name("mcp__bad/name"));
+        assert!(!is_mcp_namespaced_tool_name("mcp__"));
     }
 
     #[test]
