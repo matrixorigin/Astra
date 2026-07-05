@@ -1126,12 +1126,14 @@ pub(crate) fn annotate_tool_schemas_for_cache(
     cache_cfg: &PromptCacheConfig,
     always_load_names: &std::collections::HashSet<String>,
 ) {
+    canonicalize_tool_schemas_for_wire(tool_schemas);
     stabilize_tool_schema_wire_order(tool_schemas, always_load_names);
     crate::turn::prompt_cache::annotate_tool_schemas_for_caching_with_always_load(
         tool_schemas,
         cache_cfg,
         always_load_names,
     );
+    canonicalize_tool_schemas_for_wire(tool_schemas);
 }
 
 fn stabilize_tool_schema_wire_order(
@@ -1162,6 +1164,34 @@ fn tool_schema_wire_bucket(
         Some(name) if always_load_names.contains(name) => 0,
         Some(_) => 1,
         None => 2,
+    }
+}
+
+fn canonicalize_tool_schemas_for_wire(tool_schemas: &mut [Value]) {
+    for schema in tool_schemas {
+        canonicalize_json_for_wire(schema);
+    }
+}
+
+fn canonicalize_json_for_wire(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                canonicalize_json_for_wire(item);
+            }
+        }
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
+            entries.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+
+            let mut canonical = Map::new();
+            for (key, mut value) in entries {
+                canonicalize_json_for_wire(&mut value);
+                canonical.insert(key, value);
+            }
+            *map = canonical;
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -1338,12 +1368,47 @@ mod context_cache_contract_tests {
             .collect()
     }
 
+    fn tool_with_parameter_insert_order(name: &str, parameter_names: &[&str]) -> Value {
+        let mut properties = Map::new();
+        for parameter_name in parameter_names {
+            properties.insert(
+                (*parameter_name).to_string(),
+                json!({"type": "string", "description": format!("{name} {parameter_name}")}),
+            );
+        }
+
+        let mut parameters = Map::new();
+        parameters.insert("properties".to_string(), Value::Object(properties));
+        parameters.insert("type".to_string(), Value::String("object".to_string()));
+
+        let mut function = Map::new();
+        function.insert("parameters".to_string(), Value::Object(parameters));
+        function.insert(
+            "description".to_string(),
+            Value::String(format!("tool {name}")),
+        );
+        function.insert("name".to_string(), Value::String(name.to_string()));
+
+        let mut schema = Map::new();
+        schema.insert("function".to_string(), Value::Object(function));
+        schema.insert("type".to_string(), Value::String("function".to_string()));
+        Value::Object(schema)
+    }
+
+    fn strict_history_cache_capability() -> astra_turn_core::cache_placement::CacheCapability {
+        astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        }
+    }
+
     #[test]
     fn final_tool_wire_list_is_byte_stable_across_input_order() {
         let mut left = vec![tool("aaa_dynamic"), tool("read_file"), tool("bash")];
         let mut right = vec![tool("bash"), tool("aaa_dynamic"), tool("read_file")];
-        let always_load_names =
-            HashSet::from(["bash".to_string(), "read_file".to_string()]);
+        let always_load_names = HashSet::from(["bash".to_string(), "read_file".to_string()]);
         let cache_cfg = PromptCacheConfig {
             cache_enabled: true,
             is_anthropic: true,
@@ -1366,6 +1431,63 @@ mod context_cache_contract_tests {
             "cache marker stays on the last always-load tool in the stable prefix"
         );
         assert!(left[2].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn final_tool_wire_list_is_byte_stable_across_multi_round_cli_surface() {
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let always_load_names = HashSet::from(["bash".to_string(), "read_file".to_string()]);
+        let round_zero_current = vec![
+            tool_with_parameter_insert_order("read_file", &["path", "offset"]),
+            tool_with_parameter_insert_order("aaa_dynamic", &["query", "limit"]),
+            tool_with_parameter_insert_order("bash", &["cmd", "timeout"]),
+        ];
+        let round_zero_visible = round_zero_current.clone();
+        let round_zero_sticky = stabilize_tool_schemas_for_cache(
+            &round_zero_current,
+            &[],
+            &round_zero_visible,
+            strict_history_cache_capability(),
+            0,
+        );
+        let mut round_zero_wire = round_zero_sticky.clone();
+        annotate_tool_schemas_for_cache(&mut round_zero_wire, &cache_cfg, &always_load_names);
+
+        let round_one_current = vec![
+            tool_with_parameter_insert_order("bash", &["timeout", "cmd"]),
+            tool_with_parameter_insert_order("read_file", &["offset", "path"]),
+            tool_with_parameter_insert_order("aaa_dynamic", &["limit", "query"]),
+        ];
+        let round_one_visible = round_one_current.clone();
+        let mut round_one_wire = stabilize_tool_schemas_for_cache(
+            &round_one_current,
+            &round_zero_sticky,
+            &round_one_visible,
+            strict_history_cache_capability(),
+            1,
+        );
+        annotate_tool_schemas_for_cache(&mut round_one_wire, &cache_cfg, &always_load_names);
+
+        assert_eq!(
+            tool_names(&round_zero_wire),
+            vec!["bash", "read_file", "aaa_dynamic"]
+        );
+        assert_eq!(tool_names(&round_one_wire), tool_names(&round_zero_wire));
+        assert_eq!(
+            serde_json::to_vec(&round_zero_wire).expect("round zero tools serialize"),
+            serde_json::to_vec(&round_one_wire).expect("round one tools serialize"),
+            "a stable CLI/provider surface must produce byte-identical final tool lists across rounds"
+        );
+        assert!(round_one_wire[0].get("cache_control").is_none());
+        assert_eq!(
+            round_one_wire[1]["cache_control"]["type"].as_str(),
+            Some("ephemeral"),
+            "the cache marker remains on the deterministic always-load prefix boundary"
+        );
+        assert!(round_one_wire[2].get("cache_control").is_none());
     }
 
     #[test]
