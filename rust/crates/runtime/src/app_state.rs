@@ -1188,6 +1188,7 @@ mod tests {
             ),
             workspace_record: None,
             runtime: None,
+            selected_offer: None,
             policy: crate::server::tool_transport::ToolPolicySnapshot::default(),
         };
         let handle =

@@ -792,8 +792,21 @@ fn request(
         workspace_record: None,
         executor,
         runtime: None,
+        selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     }
+}
+
+fn request_scoped_mcp_request(tool_name: &str) -> ToolExecutionRequest {
+    request(
+        tool_name,
+        WorkspaceBinding::none(),
+        ExecutorBinding::request_scoped_mcp(),
+    )
+    .with_selected_offer(SelectedToolOfferSnapshot::new(
+        tool_name,
+        "request-scoped-mcp",
+    ))
 }
 
 #[test]
@@ -3185,11 +3198,7 @@ async fn request_scoped_mcp_tools_bypass_edge_transport() {
         }))
         .build();
     let local = CountingLocalTransport::new();
-    let edge_request = request(
-        "mcp__demo__search",
-        WorkspaceBinding::none(),
-        ExecutorBinding::request_scoped_mcp(),
-    );
+    let edge_request = request_scoped_mcp_request("mcp__demo__search");
 
     assert_eq!(
         service.routing_decision(&edge_request),
@@ -3218,10 +3227,8 @@ async fn request_scoped_mcp_tools_bypass_edge_transport() {
 }
 
 #[tokio::test]
-async fn disabled_request_scoped_mcp_offer_blocks_execution_without_schema_inventory() {
-    let service = ToolExecutionService::builder()
-        .initial_disabled_tool_offers(&["mcp__demo__search@request-scoped-mcp".to_string()])
-        .build();
+async fn request_scoped_mcp_execution_requires_selected_offer_snapshot() {
+    let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let result = service
         .execute(
@@ -3235,6 +3242,24 @@ async fn disabled_request_scoped_mcp_offer_blocks_execution_without_schema_inven
         .await;
 
     assert!(result.is_error, "{result:?}");
+    assert_eq!(local.calls(), 0);
+    let metadata = result.metadata.expect("missing selected offer metadata");
+    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
+    assert_eq!(metadata["executor"]["kind"], "mcp");
+    assert_eq!(metadata["transport"], "mcp_http");
+}
+
+#[tokio::test]
+async fn disabled_request_scoped_mcp_offer_blocks_selected_offer_without_schema_inventory() {
+    let service = ToolExecutionService::builder()
+        .initial_disabled_tool_offers(&["mcp__demo__search@request-scoped-mcp".to_string()])
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(request_scoped_mcp_request("mcp__demo__search"), &local)
+        .await;
+
+    assert!(result.is_error, "{result:?}");
     let metadata = result.metadata.expect("disabled metadata");
     assert_eq!(metadata["tool_disabled"], true);
     assert_eq!(
@@ -3245,7 +3270,7 @@ async fn disabled_request_scoped_mcp_offer_blocks_execution_without_schema_inven
 }
 
 #[tokio::test]
-async fn request_scoped_mcp_provider_allowlist_blocks_unlisted_tool_without_schema_inventory() {
+async fn request_scoped_mcp_provider_allowlist_blocks_selected_offer_without_schema_inventory() {
     let service = ToolExecutionService::builder()
         .initial_provider_allowed_tools(HashMap::from([(
             "request-scoped-mcp".to_string(),
@@ -3254,14 +3279,7 @@ async fn request_scoped_mcp_provider_allowlist_blocks_unlisted_tool_without_sche
         .build();
     let local = CountingLocalTransport::new();
     let result = service
-        .execute(
-            request(
-                "mcp__demo__search",
-                WorkspaceBinding::none(),
-                ExecutorBinding::request_scoped_mcp(),
-            ),
-            &local,
-        )
+        .execute(request_scoped_mcp_request("mcp__demo__search"), &local)
         .await;
 
     assert!(result.is_error, "{result:?}");
@@ -3390,7 +3408,11 @@ async fn request_scoped_mcp_cancel_reports_mcp_binding() {
         "mcp__rag__retrieve",
         WorkspaceBinding::none(),
         ExecutorBinding::request_scoped_mcp(),
-    );
+    )
+    .with_selected_offer(SelectedToolOfferSnapshot::new(
+        "mcp__rag__retrieve",
+        "request-scoped-mcp",
+    ));
 
     let result = service
         .execute_with_cancel(request, &local, Some(cancel))
@@ -3671,6 +3693,7 @@ fn edge_executor_id_returns_none_for_empty_id() {
         run_id: "run-1".to_string(),
         session_id: "session-1".to_string(),
         tool_call_id: "tc-1".to_string(),
+        selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     };
     assert_eq!(
@@ -3705,6 +3728,7 @@ fn edge_executor_id_rejects_whitespace_only_id() {
         run_id: "run-1".to_string(),
         session_id: "session-1".to_string(),
         tool_call_id: "tc-1".to_string(),
+        selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     };
     assert_eq!(
@@ -3739,6 +3763,7 @@ fn edge_executor_id_returns_some_for_valid_id() {
         run_id: "run-1".to_string(),
         session_id: "session-1".to_string(),
         tool_call_id: "tc-1".to_string(),
+        selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     };
     assert_eq!(edge_executor_id(&request), Some("valid-edge-123"));

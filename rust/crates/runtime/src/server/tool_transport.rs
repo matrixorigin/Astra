@@ -7,8 +7,8 @@ pub use super::tool_binding_projection::{
 pub(crate) use super::tool_execution_binding::ExecutionBindingState;
 pub use super::tool_execution_binding::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
-    ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind, WorkspaceAuthority,
-    WorkspaceBinding, WorkspaceBindingKind,
+    SelectedToolOfferSnapshot, ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind,
+    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
 };
 pub use super::tool_execution_service::{ToolExecutionService, ToolExecutionServiceBuilder};
 pub use super::tool_external_transport::ExternalTransport;

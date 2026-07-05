@@ -212,7 +212,25 @@ pub struct ToolExecutionRequest {
     pub executor: ExecutorBinding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<astra_runtime_env::RuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_offer: Option<SelectedToolOfferSnapshot>,
     pub policy: ToolPolicySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectedToolOfferSnapshot {
+    pub offer_id: String,
+    pub provider_id: String,
+}
+
+impl SelectedToolOfferSnapshot {
+    pub fn new(tool_name: impl AsRef<str>, provider_id: impl Into<String>) -> Self {
+        let provider_id = provider_id.into();
+        Self {
+            offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
+            provider_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -341,12 +359,18 @@ impl ExecutionBindingState {
             workspace_record: self.workspace_record.clone(),
             executor: self.executor.clone(),
             runtime: self.runtime.clone(),
+            selected_offer: None,
             policy: ToolPolicySnapshot::default(),
         }
     }
 }
 
 impl ToolExecutionRequest {
+    pub(crate) fn with_selected_offer(mut self, offer: SelectedToolOfferSnapshot) -> Self {
+        self.selected_offer = Some(offer);
+        self
+    }
+
     pub(crate) fn with_transport_arguments(&self) -> Self {
         let mut request = self.clone();
         request.args = transport_tool_arguments(&request.args);

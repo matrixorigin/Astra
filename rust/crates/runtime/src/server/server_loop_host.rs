@@ -3455,6 +3455,7 @@ impl ServerAgenticLoopHost {
                     workspace_record: None,
                     executor: self.executor_binding.clone(),
                     runtime: self.runtime_binding.clone(),
+                    selected_offer: None,
                     policy: ToolPolicySnapshot::default(),
                 };
                 let binding = request.runtime_environment_binding(&registry);

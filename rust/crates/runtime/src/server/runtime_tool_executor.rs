@@ -63,9 +63,9 @@ use crate::server::tool_session_state_rollback::{
 };
 
 use crate::server::tool_transport::{
-    ExecutionBindingState, ExecutorBinding, ServerLocalToolTransport,
-    TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT, TOOL_ERROR_KIND_CANCELLED,
-    TOOL_ERROR_KIND_CAPABILITY_DENIED, TOOL_ERROR_KIND_EXECUTOR_OFFLINE,
+    ExecutionBindingState, ExecutorBinding, ExecutorBindingKind, SelectedToolOfferSnapshot,
+    ServerLocalToolTransport, TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT,
+    TOOL_ERROR_KIND_CANCELLED, TOOL_ERROR_KIND_CAPABILITY_DENIED, TOOL_ERROR_KIND_EXECUTOR_OFFLINE,
     TOOL_ERROR_KIND_TOOL_TIMEOUT, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
     TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH, ToolExecutionRequest, ToolExecutionService,
     ToolPolicySnapshot, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
@@ -1349,7 +1349,42 @@ impl RuntimeToolExecutor {
             request.executor = ExecutorBinding::request_scoped_mcp();
             request.runtime = None;
         }
+        if let Some(offer) = self.selected_offer_for_request(&request) {
+            request = request.with_selected_offer(offer);
+        }
         request
+    }
+
+    fn selected_offer_for_request(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Option<SelectedToolOfferSnapshot> {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let schemas = if matches!(request.executor.kind, ExecutorBindingKind::Mcp) {
+            self.request_scoped_mcp_schemas_snapshot("selected_offer_request_scoped_mcp")
+        } else {
+            Vec::new()
+        };
+        let mut context = self.tool_admission_context();
+        if matches!(request.executor.kind, ExecutorBindingKind::Mcp) {
+            context.request_scoped_mcp_provider_ready = !schemas.is_empty();
+        }
+        let decision =
+            crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
+                &request.tool_name,
+                &schemas,
+                &request.workspace,
+                &request.executor,
+                request.runtime.as_ref(),
+                &registry,
+                context,
+            );
+        decision
+            .selected_offer
+            .map(|offer| SelectedToolOfferSnapshot {
+                offer_id: offer.offer_id,
+                provider_id: offer.provider_id,
+            })
     }
 
     /// Swap the in-memory task store for a shared one (MatrixOne in

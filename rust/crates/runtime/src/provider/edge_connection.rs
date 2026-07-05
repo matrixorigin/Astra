@@ -156,6 +156,7 @@ impl CapabilityProvider for EdgeConnectionProvider {
                 ExecutorStatus::Online,
             ),
             runtime: None,
+            selected_offer: None,
             policy: ToolPolicySnapshot::default(),
         };
 

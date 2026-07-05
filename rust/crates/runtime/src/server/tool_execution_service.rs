@@ -343,6 +343,17 @@ impl ToolExecutionService {
                 return capability_denied_result(&transport_request, &err.0, err.1.clone());
             }
         };
+        if matches!(route, ToolExecutionRouteKind::RequestScopedMcp)
+            && transport_request.selected_offer.is_none()
+        {
+            return capability_denied_result(
+                &transport_request,
+                &binding,
+                astra_runtime_env::ToolUnavailableReason::PolicyDenied(
+                    "selected tool offer is required for request-scoped MCP execution".to_string(),
+                ),
+            );
+        }
 
         // ── Runtime offer policy check (admin API / config) ──
         let disabled_offer_ids = self.disabled_tool_offers.read().await.clone();
@@ -590,14 +601,11 @@ fn disabled_offer_id_for_request(
     if admission.hidden_reason == Some(ToolHiddenReason::DisabledOffer) {
         return admission.selected_offer_id().map(str::to_string);
     }
-    if request.tool_name.starts_with("mcp__") {
-        let request_scoped_offer_id =
-            astra_runtime_env::tool_offer_id(&request.tool_name, "request-scoped-mcp");
-        if disabled_offer_ids.contains(&request_scoped_offer_id) {
-            return Some(request_scoped_offer_id);
-        }
-    }
-    None
+    request
+        .selected_offer
+        .as_ref()
+        .filter(|offer| disabled_offer_ids.contains(&offer.offer_id))
+        .map(|offer| offer.offer_id.clone())
 }
 
 fn disallowed_offer_id_for_request(
@@ -609,19 +617,11 @@ fn disallowed_offer_id_for_request(
         let offer = admission.selected_offer.as_ref()?;
         return Some((offer.offer_id.clone(), offer.provider_id.clone()));
     }
-    if request.tool_name.starts_with("mcp__") {
-        let provider_id = "request-scoped-mcp";
-        if provider_allowed_tools
-            .get(provider_id)
-            .is_some_and(|allowed| !allowed.contains(&request.tool_name))
-        {
-            return Some((
-                astra_runtime_env::tool_offer_id(&request.tool_name, provider_id),
-                provider_id.to_string(),
-            ));
-        }
-    }
-    None
+    let offer = request.selected_offer.as_ref()?;
+    provider_allowed_tools
+        .get(&offer.provider_id)
+        .is_some_and(|allowed| !allowed.contains(&request.tool_name))
+        .then(|| (offer.offer_id.clone(), offer.provider_id.clone()))
 }
 
 fn validate_tool_offer_id(offer_id: &str) -> Result<(), String> {
