@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use astra_runtime_env::{
     CapacityProvider, CapacityProviderDeclaration, CapacityProviderStatus, CapacityProviderType,
@@ -29,6 +29,7 @@ pub(crate) struct ToolOffer {
 pub(crate) enum ToolOfferCandidateReason {
     Selected,
     Disabled,
+    ProviderToolNotAllowed,
     CurrentProviderPreferred,
     LowerPriority,
     RouteMismatch,
@@ -51,6 +52,8 @@ pub(crate) enum ToolHiddenReason {
     UnsupportedRoute,
     SchemaConflict,
     DisabledOffer,
+    DisabledTool,
+    ProviderToolNotAllowed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +72,8 @@ pub(crate) struct ToolAdmissionContext {
     pub control_plane_provider_ready: bool,
     pub request_scoped_mcp_provider_ready: bool,
     pub disabled_tool_offers: HashSet<String>,
+    pub disabled_tool_names: HashSet<String>,
+    pub provider_allowed_tools: HashMap<String, HashSet<String>>,
 }
 
 impl Default for ToolAdmissionContext {
@@ -78,6 +83,8 @@ impl Default for ToolAdmissionContext {
             control_plane_provider_ready: true,
             request_scoped_mcp_provider_ready: false,
             disabled_tool_offers: HashSet::new(),
+            disabled_tool_names: HashSet::new(),
+            provider_allowed_tools: HashMap::new(),
         }
     }
 }
@@ -147,9 +154,9 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     } else {
         candidate_offers_for_tool(tool_name, workspace, providers)
     };
-    let schema_conflict = has_schema_conflict(&raw_candidates);
+    let schema_conflict = has_schema_conflict_for_enabled_candidates(&raw_candidates, context);
 
-    let selected_offer_before_disabled =
+    let selected_offer_before_policy =
         if !matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
             provider_for_route(tool_name, workspace, route, providers).map(|provider| {
                 offer_for_provider(tool_name, provider, route, CapacityProviderStatus::Ready)
@@ -157,9 +164,15 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
         } else {
             None
         };
-    let selected_offer_disabled = selected_offer_before_disabled
+    let selected_offer_disabled = selected_offer_before_policy
         .as_ref()
-        .is_some_and(|offer| context.disabled_tool_offers.contains(&offer.offer_id));
+        .is_some_and(|offer| offer_disabled(context, offer));
+    let selected_tool_disabled = selected_offer_before_policy
+        .as_ref()
+        .is_some_and(|offer| context.disabled_tool_names.contains(&offer.tool_name));
+    let selected_offer_disallowed = selected_offer_before_policy
+        .as_ref()
+        .is_some_and(|offer| !provider_allows_tool(context, &offer.provider_id, &offer.tool_name));
 
     let hidden_reason = hidden_reason_for(class, route).or_else(|| {
         if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
@@ -178,14 +191,25 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
             return Some(ToolHiddenReason::ProviderRouteMismatch);
         }
         if selected_offer_disabled {
-            return Some(ToolHiddenReason::DisabledOffer);
+            return Some(if selected_tool_disabled {
+                ToolHiddenReason::DisabledTool
+            } else {
+                ToolHiddenReason::DisabledOffer
+            });
+        }
+        if selected_offer_disallowed {
+            return Some(ToolHiddenReason::ProviderToolNotAllowed);
         }
         None
     });
-    let selected_offer = if matches!(hidden_reason, None | Some(ToolHiddenReason::DisabledOffer))
-        && !matches!(class, ToolExecutionClass::TurnPipelineIntercept)
+    let selected_offer = if matches!(
+        hidden_reason,
+        None | Some(ToolHiddenReason::DisabledOffer)
+            | Some(ToolHiddenReason::DisabledTool)
+            | Some(ToolHiddenReason::ProviderToolNotAllowed)
+    ) && !matches!(class, ToolExecutionClass::TurnPipelineIntercept)
     {
-        selected_offer_before_disabled
+        selected_offer_before_policy
     } else {
         None
     };
@@ -195,11 +219,15 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
             let selected = selected_offer
                 .as_ref()
                 .is_some_and(|selected| selected.offer_id == offer.offer_id);
-            let disabled = context.disabled_tool_offers.contains(&offer.offer_id);
+            let disabled = offer_disabled(context, &offer);
+            let provider_disallowed =
+                !provider_allows_tool(context, &offer.provider_id, &offer.tool_name);
             let reason = if schema_conflict {
                 ToolOfferCandidateReason::SchemaConflict
             } else if disabled {
                 ToolOfferCandidateReason::Disabled
+            } else if provider_disallowed {
+                ToolOfferCandidateReason::ProviderToolNotAllowed
             } else {
                 candidate_reason(&offer, selected, route)
             };
@@ -384,12 +412,37 @@ fn candidate_reason(
     ToolOfferCandidateReason::RouteMismatch
 }
 
-fn has_schema_conflict(candidates: &[ToolOffer]) -> bool {
-    let mut digests = candidates.iter().map(|offer| offer.schema_digest.as_str());
+fn has_schema_conflict_for_enabled_candidates(
+    candidates: &[ToolOffer],
+    context: &ToolAdmissionContext,
+) -> bool {
+    let mut digests = candidates
+        .iter()
+        .filter(|offer| {
+            !offer_disabled(context, offer)
+                && provider_allows_tool(context, &offer.provider_id, &offer.tool_name)
+        })
+        .map(|offer| offer.schema_digest.as_str());
     let Some(first) = digests.next() else {
         return false;
     };
     digests.any(|digest| digest != first)
+}
+
+fn offer_disabled(context: &ToolAdmissionContext, offer: &ToolOffer) -> bool {
+    context.disabled_tool_names.contains(&offer.tool_name)
+        || context.disabled_tool_offers.contains(&offer.offer_id)
+}
+
+fn provider_allows_tool(
+    context: &ToolAdmissionContext,
+    provider_id: &str,
+    tool_name: &str,
+) -> bool {
+    context
+        .provider_allowed_tools
+        .get(provider_id)
+        .is_none_or(|allowed| allowed.contains(tool_name))
 }
 
 fn route_for_provider_type(
@@ -804,6 +857,136 @@ mod tests {
     }
 
     #[test]
+    fn provider_allowlist_disallows_selected_edge_offer_without_server_reroute() {
+        let decision = resolve_tool_admission_for_binding_with_context(
+            "web_fetch",
+            &[],
+            &WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            &ExecutorBinding::edge_agent(
+                "edge-macpro",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            None,
+            &registry(),
+            ToolAdmissionContext {
+                provider_allowed_tools: HashMap::from([(
+                    "edge-macpro".to_string(),
+                    HashSet::from(["bash".to_string()]),
+                )]),
+                ..ToolAdmissionContext::default()
+            },
+        );
+
+        assert!(!decision.visible);
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::ProviderToolNotAllowed)
+        );
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
+        let edge_candidate = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.offer.offer_id == "web_fetch@edge-macpro")
+            .expect("edge candidate");
+        assert!(edge_candidate.selected);
+        assert_eq!(
+            edge_candidate.reason,
+            ToolOfferCandidateReason::ProviderToolNotAllowed
+        );
+        let server_candidate = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.offer.offer_id == "web_fetch@server-builtin")
+            .expect("server candidate");
+        assert!(!server_candidate.selected);
+        assert_eq!(
+            server_candidate.reason,
+            ToolOfferCandidateReason::CurrentProviderPreferred
+        );
+    }
+
+    #[test]
+    fn provider_allowlist_on_server_does_not_hide_selected_edge_offer() {
+        let decision = resolve_tool_admission_for_binding_with_context(
+            "web_fetch",
+            &[],
+            &WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            &ExecutorBinding::edge_agent(
+                "edge-macpro",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            None,
+            &registry(),
+            ToolAdmissionContext {
+                provider_allowed_tools: HashMap::from([(
+                    "server-builtin".to_string(),
+                    HashSet::from(["memory".to_string()]),
+                )]),
+                ..ToolAdmissionContext::default()
+            },
+        );
+
+        assert!(decision.visible);
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
+        let server_candidate = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.offer.offer_id == "web_fetch@server-builtin")
+            .expect("server candidate");
+        assert_eq!(
+            server_candidate.reason,
+            ToolOfferCandidateReason::ProviderToolNotAllowed
+        );
+    }
+
+    #[test]
+    fn disabled_tool_name_hides_every_offer_for_selected_route() {
+        let decision = resolve_tool_admission_for_binding_with_context(
+            "web_fetch",
+            &[],
+            &WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            &ExecutorBinding::edge_agent(
+                "edge-macpro",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            None,
+            &registry(),
+            ToolAdmissionContext {
+                disabled_tool_names: HashSet::from(["web_fetch".to_string()]),
+                ..ToolAdmissionContext::default()
+            },
+        );
+
+        assert!(!decision.visible);
+        assert_eq!(decision.hidden_reason, Some(ToolHiddenReason::DisabledTool));
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
+        assert!(
+            decision
+                .candidates
+                .iter()
+                .all(|candidate| candidate.reason == ToolOfferCandidateReason::Disabled)
+        );
+    }
+
+    #[test]
     fn same_tool_name_with_different_schema_digests_fails_closed() {
         let providers = vec![
             astra_runtime_env::server_service_provider("server-builtin", &registry())
@@ -846,6 +1029,53 @@ mod tests {
                 .iter()
                 .all(|candidate| !candidate.selected
                     && candidate.reason == ToolOfferCandidateReason::SchemaConflict)
+        );
+    }
+
+    #[test]
+    fn schema_conflict_ignores_policy_excluded_candidates() {
+        let providers = vec![
+            astra_runtime_env::server_service_provider("server-builtin", &registry())
+                .with_tool_schema_digest("web_fetch", "sha256:server"),
+            astra_runtime_env::runtime_workspace_provider(
+                CapacityProviderType::EdgeCapacity,
+                "edge-macpro",
+                &registry(),
+            )
+            .with_tool_schema_digest("web_fetch", "sha256:edge"),
+        ];
+        let decision = resolve_tool_admission_for_providers_with_context(
+            "web_fetch",
+            &WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            &ExecutorBinding::edge_agent(
+                "edge-macpro",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            &providers,
+            &registry(),
+            &ToolAdmissionContext {
+                provider_allowed_tools: HashMap::from([(
+                    "server-builtin".to_string(),
+                    HashSet::from(["memory".to_string()]),
+                )]),
+                ..ToolAdmissionContext::default()
+            },
+        );
+
+        assert!(decision.visible);
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
+        assert!(
+            decision
+                .candidates
+                .iter()
+                .any(|candidate| candidate.reason
+                    == ToolOfferCandidateReason::ProviderToolNotAllowed)
         );
     }
 }

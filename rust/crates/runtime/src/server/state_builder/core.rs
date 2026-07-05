@@ -1,4 +1,7 @@
 use super::*;
+use crate::server::deployment_tool_policy::{
+    DeploymentToolPolicy, apply_deployment_tool_policy, load_deployment_tool_policy,
+};
 use crate::server::tool_transport::ToolExecutionService;
 
 pub(super) fn build_auth_service(
@@ -212,7 +215,7 @@ pub(super) fn install_execution_services(
         state.edge_connection_pool.clone(),
         Arc::clone(&edge_dispatch_service),
         Arc::clone(&edge_registry_service),
-        &load_deployment_disabled_tool_offers(),
+        &load_deployment_tool_policy(),
     );
     state
         .with_task_service(Arc::new(MatrixOneTaskService::from_shared(shared_pool)))
@@ -229,22 +232,22 @@ fn build_shared_tool_execution_service(
     edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     edge_dispatch_service: Arc<dyn EdgeDispatchService>,
     edge_registry_service: Arc<dyn EdgeRegistryService>,
-    disabled_tool_offers: &[String],
+    policy: &DeploymentToolPolicy,
 ) -> ToolExecutionService {
     let mut builder = ToolExecutionService::builder()
         .edge_connection_pool(edge_connection_pool)
         .edge_dispatch_service(edge_dispatch_service)
         .edge_registry_service(edge_registry_service);
-    if !disabled_tool_offers.is_empty() {
-        builder = builder.initial_disabled_tool_offers(disabled_tool_offers);
+    if !policy.disabled_tool_offers.is_empty() {
+        builder = builder.initial_disabled_tool_offers(&policy.disabled_tool_offers);
+    }
+    if !policy.disabled_tool_names.is_empty() {
+        builder = builder.initial_disabled_tool_names(&policy.disabled_tool_names);
+    }
+    if !policy.provider_allowed_tools.is_empty() {
+        builder = builder.initial_provider_allowed_tools(policy.provider_allowed_tools.clone());
     }
     builder.build()
-}
-
-fn load_deployment_disabled_tool_offers() -> Vec<String> {
-    astra_core::ServerConfig::load()
-        .map(|config| config.deployment.disabled_tool_offers)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -332,7 +335,7 @@ mod tests {
             pool.clone(),
             Arc::new(astra_services::multi_agent::UnconfiguredEdgeDispatchService),
             Arc::new(astra_services::multi_agent::UnconfiguredEdgeRegistryService),
-            &[],
+            &DeploymentToolPolicy::default(),
         );
         let request = edge_request();
         let handle =

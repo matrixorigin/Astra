@@ -87,12 +87,23 @@ pub struct ServerConfig {
 pub struct DeploymentConfig {
     /// Tool offers disabled at deployment time (checked before dispatch).
     pub disabled_tool_offers: Vec<String>,
+    /// Canonical tool names disabled across every provider offer.
+    pub disabled_tool_names: Vec<String>,
+    /// Exact provider allowlist: provider id -> canonical tool names enabled
+    /// for that provider. A provider id absent from this map is unrestricted.
+    pub provider_allowed_tools: HashMap<String, Vec<String>>,
 }
 
 impl DeploymentConfig {
     fn merge_from(&mut self, other: &Self) {
         if !other.disabled_tool_offers.is_empty() {
             self.disabled_tool_offers = other.disabled_tool_offers.clone();
+        }
+        if !other.disabled_tool_names.is_empty() {
+            self.disabled_tool_names = other.disabled_tool_names.clone();
+        }
+        if !other.provider_allowed_tools.is_empty() {
+            self.provider_allowed_tools = other.provider_allowed_tools.clone();
         }
     }
 
@@ -687,6 +698,11 @@ pub struct AppSettings {
     pub database_bootstrap_catalog: String,
     /// Tool offers disabled at deployment time (deployment.toml -> server.toml -> env).
     pub disabled_tool_offers: Vec<String>,
+    /// Canonical tool names disabled across every provider offer.
+    pub disabled_tool_names: Vec<String>,
+    /// Exact provider allowlist: provider id -> canonical tool names enabled
+    /// for that provider.
+    pub provider_allowed_tools: HashMap<String, Vec<String>>,
 }
 
 impl fmt::Debug for AppSettings {
@@ -750,6 +766,8 @@ impl AppSettings {
         };
         let mut settings = Self::from_lookup(lookup)?;
         settings.disabled_tool_offers = sc.deployment.disabled_tool_offers.clone();
+        settings.disabled_tool_names = sc.deployment.disabled_tool_names.clone();
+        settings.provider_allowed_tools = sc.deployment.provider_allowed_tools.clone();
         settings.external_auth_providers = sc.auth.external_providers.clone();
         Ok(settings)
     }
@@ -834,6 +852,8 @@ impl AppSettings {
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
             external_auth_providers: Vec::new(),
             disabled_tool_offers: Self::disabled_tool_offers_from_lookup(&lookup),
+            disabled_tool_names: Vec::new(),
+            provider_allowed_tools: HashMap::new(),
         })
     }
 }
@@ -1988,12 +2008,69 @@ auth_mode = "legacy"
         let toml_str = r#"
             [deployment]
             disabled_tool_offers = ["tool_a@server", "tool_b@edge-1"]
+            disabled_tool_names = ["legacy_tool"]
+
+            [deployment.provider_allowed_tools]
+            server-builtin = ["web_fetch", "memory"]
+            edge-macpro = ["bash", "read_file"]
             "#;
         let config = ServerConfig::parse(toml_str).unwrap();
         assert_eq!(
             config.deployment.disabled_tool_offers,
             vec!["tool_a@server".to_string(), "tool_b@edge-1".to_string()]
         );
+        assert_eq!(
+            config.deployment.disabled_tool_names,
+            vec!["legacy_tool".to_string()]
+        );
+        assert_eq!(
+            config
+                .deployment
+                .provider_allowed_tools
+                .get("server-builtin")
+                .unwrap(),
+            &vec!["web_fetch".to_string(), "memory".to_string()]
+        );
+        assert_eq!(
+            config
+                .deployment
+                .provider_allowed_tools
+                .get("edge-macpro")
+                .unwrap(),
+            &vec!["bash".to_string(), "read_file".to_string()]
+        );
+    }
+
+    #[test]
+    fn app_settings_carry_deployment_tool_policy_from_server_config() {
+        let toml_str = r#"
+            [auth]
+            jwt_secret = "test-jwt-secret-that-is-long-enough-123456"
+            bridge_secret = "test-bridge-secret"
+
+            [deployment]
+            disabled_tool_offers = ["web_fetch@server-builtin"]
+            disabled_tool_names = ["mo_query"]
+
+            [deployment.provider_allowed_tools]
+            server-builtin = ["web_fetch"]
+            "#;
+        let config = ServerConfig::parse(toml_str).unwrap();
+        temp_env::with_var("MATRIXONE_PASSWORD", Some("test-password"), || {
+            let settings = AppSettings::from_server_config(&config).unwrap();
+            assert_eq!(
+                settings.disabled_tool_offers,
+                vec!["web_fetch@server-builtin".to_string()]
+            );
+            assert_eq!(settings.disabled_tool_names, vec!["mo_query".to_string()]);
+            assert_eq!(
+                settings
+                    .provider_allowed_tools
+                    .get("server-builtin")
+                    .unwrap(),
+                &vec!["web_fetch".to_string()]
+            );
+        });
     }
 
     #[test]

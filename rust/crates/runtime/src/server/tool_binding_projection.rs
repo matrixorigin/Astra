@@ -444,7 +444,7 @@ fn builtin_tool_registry() -> &'static astra_runtime_env::ToolRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use serde_json::{Value, json};
 
@@ -837,6 +837,50 @@ mod tests {
                 "{hidden} must still require an explicit request-scoped provider"
             );
         }
+    }
+
+    #[test]
+    fn provider_allowlist_filters_prompt_visible_schema_without_server_fallback() {
+        let names = schema_names(capability_filter_tool_schemas_for_binding_with_context(
+            vec![
+                schema("ask_user"),
+                schema("memory"),
+                schema("web_fetch"),
+                schema("bash"),
+            ],
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+            ToolAdmissionContext {
+                provider_allowed_tools: HashMap::from([
+                    (
+                        "server-builtin".to_string(),
+                        HashSet::from(["memory".to_string()]),
+                    ),
+                    ("edge-1".to_string(), HashSet::from(["bash".to_string()])),
+                ]),
+                ..ToolAdmissionContext::default()
+            },
+        ));
+
+        assert!(names.contains("ask_user"));
+        assert!(names.contains("memory"));
+        assert!(names.contains("bash"));
+        assert!(
+            !names.contains("web_fetch"),
+            "web_fetch is disallowed on the selected edge offer and must not fall back to server: {names:?}"
+        );
     }
 
     #[test]

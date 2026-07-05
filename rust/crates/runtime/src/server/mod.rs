@@ -29,6 +29,7 @@ mod chat_handlers;
 mod cleanup_retry;
 pub mod conflict_resolver;
 pub mod delegation;
+pub(crate) mod deployment_tool_policy;
 pub mod device_lease_sweeper;
 mod edge;
 mod external_runtime_context;

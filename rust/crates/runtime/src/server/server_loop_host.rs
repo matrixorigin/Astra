@@ -1192,6 +1192,10 @@ pub struct ServerAgenticLoopHost {
     /// Shared handle to the runtime-disabled tool offers (admin API). Used to
     /// exclude admin-disabled tool offers from the LLM tool surface.
     disabled_tool_offers: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Shared handle to canonical tool names disabled across all offers.
+    disabled_tool_names: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Shared exact provider allowlist. Missing provider id means unrestricted.
+    provider_allowed_tools: Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>,
     /// Optional LLM-based turn intent judge. When set, every turn first asks
     /// the judge to classify the user's message. Judge failure is non-fatal:
     /// the turn proceeds without explicit semantic intent.
@@ -1247,6 +1251,10 @@ pub struct ServerAgenticLoopHostBuilder {
     prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
     /// Shared handle to the runtime-disabled tool offers (admin API).
     disabled_tool_offers: Option<Arc<tokio::sync::RwLock<HashSet<String>>>>,
+    /// Shared handle to canonical tool names disabled across all offers.
+    disabled_tool_names: Option<Arc<tokio::sync::RwLock<HashSet<String>>>>,
+    /// Shared exact provider allowlist. Missing provider id means unrestricted.
+    provider_allowed_tools: Option<Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>>,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -1292,6 +1300,8 @@ impl ServerAgenticLoopHostBuilder {
             shared_dedup_state: None,
             prefix_store: None,
             disabled_tool_offers: None,
+            disabled_tool_names: None,
+            provider_allowed_tools: None,
         }
     }
 
@@ -1639,6 +1649,12 @@ impl ServerAgenticLoopHostBuilder {
             disabled_tool_offers: self
                 .disabled_tool_offers
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashSet::new()))),
+            disabled_tool_names: self
+                .disabled_tool_names
+                .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashSet::new()))),
+            provider_allowed_tools: self
+                .provider_allowed_tools
+                .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashMap::new()))),
             turn_intent_judge: None,
         }
     }
@@ -1658,6 +1674,22 @@ impl ServerAgenticLoopHostBuilder {
         handle: Arc<tokio::sync::RwLock<HashSet<String>>>,
     ) -> Self {
         self.disabled_tool_offers = Some(handle);
+        self
+    }
+
+    pub fn with_disabled_tool_names(
+        mut self,
+        handle: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    ) -> Self {
+        self.disabled_tool_names = Some(handle);
+        self
+    }
+
+    pub fn with_provider_allowed_tools(
+        mut self,
+        handle: Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>,
+    ) -> Self {
+        self.provider_allowed_tools = Some(handle);
         self
     }
 }
@@ -3386,12 +3418,28 @@ impl ServerAgenticLoopHost {
             .unwrap_or_default()
     }
 
+    fn disabled_tool_names_snapshot(&self) -> HashSet<String> {
+        self.disabled_tool_names
+            .try_read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn provider_allowed_tools_snapshot(&self) -> HashMap<String, HashSet<String>> {
+        self.provider_allowed_tools
+            .try_read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
     fn tool_admission_context(&self) -> ToolAdmissionContext {
         ToolAdmissionContext {
             server_service_provider_ready: self.server_provider_catalog_enabled,
             control_plane_provider_ready: self.server_provider_catalog_enabled,
             request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
             disabled_tool_offers: self.disabled_tool_offers_snapshot(),
+            disabled_tool_names: self.disabled_tool_names_snapshot(),
+            provider_allowed_tools: self.provider_allowed_tools_snapshot(),
         }
     }
 

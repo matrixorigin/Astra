@@ -1,7 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -3094,6 +3094,82 @@ async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
 }
 
 #[tokio::test]
+async fn disabled_tool_name_blocks_every_selected_offer_before_transport() {
+    let service = ToolExecutionService::builder()
+        .initial_disabled_tool_names(&["web_fetch".to_string()])
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(
+            request(
+                "web_fetch",
+                WorkspaceBinding::none(),
+                ExecutorBinding::server_local(),
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("disabled metadata");
+    assert_eq!(metadata["tool_disabled"], true);
+    assert_eq!(metadata["tool_offer_id"], "web_fetch@server-builtin");
+    assert_eq!(local.calls(), 0);
+}
+
+#[tokio::test]
+async fn provider_allowlist_blocks_selected_edge_offer_without_server_reroute() {
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .initial_provider_allowed_tools(HashMap::from([(
+            "edge-selected".to_string(),
+            HashSet::from(["bash".to_string()]),
+        )]))
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(
+            request(
+                "web_fetch",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("provider disallowed metadata");
+    assert_eq!(metadata["tool_provider_disallowed"], true);
+    assert_eq!(metadata["tool_offer_id"], "web_fetch@edge-selected");
+    assert_eq!(metadata["provider_id"], "edge-selected");
+    assert_eq!(local.calls(), 0);
+    assert!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .is_empty(),
+        "disallowed selected offer must be blocked before edge dispatch"
+    );
+}
+
+#[tokio::test]
 async fn local_code_tool_remains_edge_bound_with_edge_binding() {
     let service = ToolExecutionService::new_for_test();
     let local_code_tools = ["bash", "read_file", "list_dir", "grep", "glob", "git"];
@@ -3204,6 +3280,43 @@ async fn disabled_request_scoped_mcp_offer_blocks_execution_without_schema_inven
         metadata["tool_offer_id"],
         "mcp__demo__search@request-scoped-mcp"
     );
+    assert_eq!(local.calls(), 0);
+}
+
+#[tokio::test]
+async fn request_scoped_mcp_provider_allowlist_blocks_unlisted_tool_without_schema_inventory() {
+    let service = ToolExecutionService::builder()
+        .initial_provider_allowed_tools(HashMap::from([(
+            "request-scoped-mcp".to_string(),
+            HashSet::from(["mcp__demo__allowed".to_string()]),
+        )]))
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(
+            request(
+                "mcp__demo__search",
+                WorkspaceBinding::none(),
+                ExecutorBinding {
+                    kind: ExecutorBindingKind::Mcp,
+                    executor_id: "request-scoped-mcp".to_string(),
+                    display_name: "MCP server".to_string(),
+                    transport: ToolTransportKind::McpHttp,
+                    status: ExecutorStatus::Online,
+                },
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("provider disallowed metadata");
+    assert_eq!(metadata["tool_provider_disallowed"], true);
+    assert_eq!(
+        metadata["tool_offer_id"],
+        "mcp__demo__search@request-scoped-mcp"
+    );
+    assert_eq!(metadata["provider_id"], "request-scoped-mcp");
     assert_eq!(local.calls(), 0);
 }
 
