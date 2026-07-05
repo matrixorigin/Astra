@@ -124,7 +124,7 @@ impl DeploymentConfig {
 
 fn validate_tool_offer_ids(offer_ids: &[String]) -> Result<(), String> {
     for offer_id in offer_ids {
-        if !is_valid_tool_offer_id(offer_id) {
+        if !crate::tool_offer::is_valid_tool_offer_id(offer_id) {
             return Err(format!(
                 "disabled_tool_offers entries must be concrete offer ids in the form '<tool>@<provider>' (got '{offer_id}')"
             ));
@@ -133,34 +133,17 @@ fn validate_tool_offer_ids(offer_ids: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn is_valid_tool_offer_id(value: &str) -> bool {
-    let Some((tool_name, provider_id)) = value.split_once('@') else {
-        return false;
-    };
-    !provider_id.contains('@')
-        && is_valid_tool_offer_tool_name(tool_name)
-        && is_valid_tool_offer_provider_id(provider_id)
-}
-
-fn is_valid_tool_offer_tool_name(value: &str) -> bool {
-    is_valid_tool_offer_identifier_part(value, false)
-}
-
-fn is_valid_tool_offer_provider_id(value: &str) -> bool {
-    is_valid_tool_offer_identifier_part(value, true)
-}
-
 fn validate_provider_allowed_tools(
     provider_allowed_tools: &HashMap<String, Vec<String>>,
 ) -> Result<(), String> {
     for (provider_id, tool_names) in provider_allowed_tools {
-        if !is_valid_tool_offer_provider_id(provider_id) {
+        if !crate::tool_offer::is_valid_provider_id(provider_id) {
             return Err(format!(
                 "provider_allowed_tools keys must be concrete provider ids (got '{provider_id}')"
             ));
         }
         for tool_name in tool_names {
-            if !is_valid_tool_offer_tool_name(tool_name) {
+            if !crate::tool_offer::is_valid_tool_offer_tool_name(tool_name) {
                 return Err(format!(
                     "provider_allowed_tools values must be canonical tool names (got '{tool_name}' for provider '{provider_id}')"
                 ));
@@ -168,16 +151,6 @@ fn validate_provider_allowed_tools(
         }
     }
     Ok(())
-}
-
-fn is_valid_tool_offer_identifier_part(value: &str, provider: bool) -> bool {
-    !value.is_empty()
-        && value.bytes().any(|byte| byte.is_ascii_alphanumeric())
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'_' | b'-')
-                || (provider && matches!(byte, b'.' | b':'))
-        })
 }
 
 /// Database connection pool configuration.

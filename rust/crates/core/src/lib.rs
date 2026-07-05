@@ -386,6 +386,7 @@ pub mod net;
 pub mod observation;
 pub mod observation_journal;
 pub mod runtime_limits;
+pub mod tool_offer;
 pub mod tool_schema;
 
 /// Re-export for [`crate::agent_*!`] macros (call sites do not need a direct `tracing` dependency).
