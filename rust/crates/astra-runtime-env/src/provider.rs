@@ -1,9 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use crate::{RequiredExecutor, ToolRegistry, ToolSpec, WorkspaceAuthority};
+use crate::{RequiredExecutor, ToolRegistry, ToolSpec, WorkspaceAuthority, tool_schema_name};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -119,6 +121,8 @@ pub struct CapacityProviderDeclaration {
     #[serde(default)]
     pub tool_names: BTreeSet<String>,
     #[serde(default)]
+    pub tool_schema_digests: BTreeMap<String, String>,
+    #[serde(default)]
     pub dynamic_prefixes: Vec<String>,
 }
 
@@ -152,10 +156,16 @@ impl CapacityProviderDeclaration {
         provider_id: impl Into<String>,
         tool_names: impl IntoIterator<Item = String>,
     ) -> Self {
+        let tool_names: BTreeSet<String> = tool_names.into_iter().collect();
+        let tool_schema_digests = tool_names
+            .iter()
+            .map(|name| (name.clone(), canonical_tool_name_digest(name)))
+            .collect();
         Self {
             provider_type,
             provider_id: provider_id.into(),
-            tool_names: tool_names.into_iter().collect(),
+            tool_names,
+            tool_schema_digests,
             dynamic_prefixes: Vec::new(),
         }
     }
@@ -166,19 +176,84 @@ impl CapacityProviderDeclaration {
         registry: &ToolRegistry,
         mut predicate: impl FnMut(&ToolSpec) -> bool,
     ) -> Self {
-        Self::new(
+        let mut declaration = Self {
             provider_type,
-            provider_id,
-            registry
-                .iter()
-                .filter(|spec| predicate(spec))
-                .map(|spec| spec.name.clone()),
-        )
+            provider_id: provider_id.into(),
+            tool_names: BTreeSet::new(),
+            tool_schema_digests: BTreeMap::new(),
+            dynamic_prefixes: Vec::new(),
+        };
+        for spec in registry.iter().filter(|spec| predicate(spec)) {
+            declaration.tool_names.insert(spec.name.clone());
+            declaration
+                .tool_schema_digests
+                .insert(spec.name.clone(), canonical_tool_spec_digest(spec));
+        }
+        declaration
     }
 
     pub fn with_dynamic_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.dynamic_prefixes.push(prefix.into());
         self
+    }
+
+    pub fn with_tool_schema_digest(
+        mut self,
+        tool_name: impl Into<String>,
+        schema_digest: impl Into<String>,
+    ) -> Self {
+        let tool_name = tool_name.into();
+        self.tool_names.insert(tool_name.clone());
+        self.tool_schema_digests
+            .insert(tool_name, schema_digest.into());
+        self
+    }
+
+    pub fn schema_digest_for_tool(&self, tool_name: &str) -> Option<&str> {
+        if self.tool_names.contains(tool_name) {
+            return self.tool_schema_digests.get(tool_name).map(String::as_str);
+        }
+        None
+    }
+}
+
+pub fn canonical_tool_spec_digest(spec: &ToolSpec) -> String {
+    let value = serde_json::to_value(spec).expect("ToolSpec must serialize");
+    canonical_sha256_digest("tool_spec", &value)
+}
+
+pub fn canonical_tool_schema_digest(schema: &Value) -> String {
+    canonical_sha256_digest("tool_schema", schema)
+}
+
+fn canonical_tool_name_digest(tool_name: &str) -> String {
+    canonical_sha256_digest("tool_name", &serde_json::json!({ "name": tool_name }))
+}
+
+fn canonical_sha256_digest(kind: &str, value: &Value) -> String {
+    let canonical = canonical_json_value(value);
+    let bytes = serde_json::to_vec(&canonical).expect("canonical JSON must serialize");
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    format!("sha256:{digest:x}")
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json_value).collect()),
+        Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json_value(&map[key]));
+            }
+            Value::Object(sorted)
+        }
+        other => other.clone(),
     }
 }
 
@@ -383,6 +458,30 @@ pub fn request_scoped_mcp_provider(
     )
 }
 
+pub fn request_scoped_mcp_provider_from_schemas(
+    provider_id: impl Into<String>,
+    schemas: &[Value],
+) -> CapacityProviderDeclaration {
+    let mut declaration = CapacityProviderDeclaration::new(
+        CapacityProviderType::RequestScopedMcp,
+        provider_id,
+        Vec::<String>::new(),
+    );
+    for schema in schemas {
+        let Some(tool_name) = tool_schema_name(schema) else {
+            continue;
+        };
+        if !tool_name.starts_with("mcp__") {
+            continue;
+        }
+        declaration.tool_names.insert(tool_name.to_string());
+        declaration
+            .tool_schema_digests
+            .insert(tool_name.to_string(), canonical_tool_schema_digest(schema));
+    }
+    declaration
+}
+
 fn labels<const N: usize>(values: [&'static str; N]) -> Vec<String> {
     values.into_iter().map(str::to_string).collect()
 }
@@ -494,5 +593,55 @@ mod tests {
 
         assert!(provider.declares_tool("mcp__weather"));
         assert!(!provider.declares_tool("mcp__calculator"));
+    }
+
+    #[test]
+    fn mcp_schema_digest_is_canonical_across_json_key_order() {
+        let first = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__weather__query",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": { "type": "string" },
+                        "unit": { "type": "string" }
+                    }
+                }
+            }
+        });
+        let second = serde_json::json!({
+            "function": {
+                "parameters": {
+                    "properties": {
+                        "unit": { "type": "string" },
+                        "city": { "type": "string" }
+                    },
+                    "type": "object"
+                },
+                "name": "mcp__weather__query"
+            },
+            "type": "function"
+        });
+
+        assert_eq!(
+            canonical_tool_schema_digest(&first),
+            canonical_tool_schema_digest(&second)
+        );
+    }
+
+    #[test]
+    fn request_scoped_mcp_provider_from_schemas_uses_schema_digest() {
+        let schema = serde_json::json!({
+            "type": "function",
+            "function": { "name": "mcp__weather__query" }
+        });
+        let provider = request_scoped_mcp_provider_from_schemas("mcp", &[schema.clone()]);
+
+        assert!(provider.declares_tool("mcp__weather__query"));
+        assert_eq!(
+            provider.schema_digest_for_tool("mcp__weather__query"),
+            Some(canonical_tool_schema_digest(&schema).as_str())
+        );
     }
 }
