@@ -37,6 +37,7 @@ impl ToolExecutionRouteKind {
 pub(crate) enum ToolExecutionOwner {
     ServerControlPlane,
     ServerRuntime,
+    ServiceOrRuntime,
     RuntimeExecutor,
     RequestScopedMcp,
     /// Virtual turn-pipeline tools are advertised as schemas but are consumed
@@ -64,6 +65,8 @@ pub(crate) const SERVER_LOCAL_RUNTIME_TOOL_NAMES: &[&str] = &[
     "run_script",
     "str_replace",
     "symbols",
+    "web_fetch",
+    "web_search",
     "write_file",
 ];
 
@@ -89,6 +92,9 @@ pub(crate) fn tool_execution_owner(
     match spec.required.executor {
         astra_runtime_env::RequiredExecutor::ControlPlane => ToolExecutionOwner::ServerControlPlane,
         astra_runtime_env::RequiredExecutor::ServiceExecutor => ToolExecutionOwner::ServerRuntime,
+        astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor => {
+            ToolExecutionOwner::ServiceOrRuntime
+        }
         astra_runtime_env::RequiredExecutor::McpExecutor => ToolExecutionOwner::RequestScopedMcp,
         astra_runtime_env::RequiredExecutor::RuntimeExecutor
         | astra_runtime_env::RequiredExecutor::None => ToolExecutionOwner::RuntimeExecutor,
@@ -126,6 +132,27 @@ pub(crate) fn routing_decision_for_binding(
         ToolExecutionOwner::RequestScopedMcp => return ToolExecutionRouteKind::RequestScopedMcp,
         ToolExecutionOwner::TurnPipelineIntercept | ToolExecutionOwner::Unknown => {
             return ToolExecutionRouteKind::Unsupported;
+        }
+        ToolExecutionOwner::ServiceOrRuntime => {
+            if matches!(executor_transport, ToolTransportKind::GatewayRelay) {
+                return ToolExecutionRouteKind::GatewayRelay;
+            }
+            if matches!(executor_transport, ToolTransportKind::SandboxResidentAgent) {
+                return ToolExecutionRouteKind::SandboxResidentAgent;
+            }
+            return match workspace_kind {
+                WorkspaceBindingKind::EdgeWorkspace => ToolExecutionRouteKind::EdgeBound,
+                WorkspaceBindingKind::ServerSandbox
+                    if server_local_runtime_tool_supported(tool_name) =>
+                {
+                    ToolExecutionRouteKind::ServerLocal
+                }
+                WorkspaceBindingKind::LocalFilesystem => ToolExecutionRouteKind::Unsupported,
+                WorkspaceBindingKind::CloudWorkspace
+                | WorkspaceBindingKind::None
+                | WorkspaceBindingKind::Unknown
+                | WorkspaceBindingKind::ServerSandbox => ToolExecutionRouteKind::ServerRuntime,
+            };
         }
         ToolExecutionOwner::RuntimeExecutor => {}
     }
@@ -292,8 +319,16 @@ mod tests {
             ToolTransportKind::EdgeWs,
             &registry(),
         ));
-        assert!(!edge_bound_route_is_offline_for_binding(
+        assert!(edge_bound_route_is_offline_for_binding(
             "web_search",
+            WorkspaceBindingKind::EdgeWorkspace,
+            ExecutorBindingKind::EdgeAgent,
+            ExecutorStatus::Unknown,
+            ToolTransportKind::EdgeWs,
+            &registry(),
+        ));
+        assert!(!edge_bound_route_is_offline_for_binding(
+            "memory",
             WorkspaceBindingKind::EdgeWorkspace,
             ExecutorBindingKind::EdgeAgent,
             ExecutorStatus::Unknown,
@@ -436,7 +471,7 @@ mod tests {
         );
 
         let service = make_request(
-            "web_search",
+            "memory",
             WorkspaceBindingKind::EdgeWorkspace,
             ToolTransportKind::ServerLocal,
         );
@@ -444,6 +479,89 @@ mod tests {
             routing_decision(&service, &registry()),
             ToolExecutionRouteKind::ServerRuntime
         );
+    }
+
+    #[test]
+    fn shared_network_tools_prefer_current_runtime_executor() {
+        struct Case {
+            tool: &'static str,
+            workspace: WorkspaceBindingKind,
+            transport: ToolTransportKind,
+            expected: ToolExecutionRouteKind,
+        }
+
+        let cases = [
+            Case {
+                tool: "web_fetch",
+                workspace: WorkspaceBindingKind::None,
+                transport: ToolTransportKind::ServerLocal,
+                expected: ToolExecutionRouteKind::ServerRuntime,
+            },
+            Case {
+                tool: "web_search",
+                workspace: WorkspaceBindingKind::None,
+                transport: ToolTransportKind::ServerLocal,
+                expected: ToolExecutionRouteKind::ServerRuntime,
+            },
+            Case {
+                tool: "web_fetch",
+                workspace: WorkspaceBindingKind::EdgeWorkspace,
+                transport: ToolTransportKind::EdgeWs,
+                expected: ToolExecutionRouteKind::EdgeBound,
+            },
+            Case {
+                tool: "web_search",
+                workspace: WorkspaceBindingKind::EdgeWorkspace,
+                transport: ToolTransportKind::EdgeWs,
+                expected: ToolExecutionRouteKind::EdgeBound,
+            },
+            Case {
+                tool: "web_fetch",
+                workspace: WorkspaceBindingKind::ServerSandbox,
+                transport: ToolTransportKind::ServerLocal,
+                expected: ToolExecutionRouteKind::ServerLocal,
+            },
+            Case {
+                tool: "web_fetch",
+                workspace: WorkspaceBindingKind::None,
+                transport: ToolTransportKind::GatewayRelay,
+                expected: ToolExecutionRouteKind::GatewayRelay,
+            },
+            Case {
+                tool: "web_fetch",
+                workspace: WorkspaceBindingKind::None,
+                transport: ToolTransportKind::SandboxResidentAgent,
+                expected: ToolExecutionRouteKind::SandboxResidentAgent,
+            },
+        ];
+
+        for case in cases {
+            let req = make_request(case.tool, case.workspace, case.transport);
+            assert_eq!(
+                routing_decision(&req, &registry()),
+                case.expected,
+                "{} with {:?}/{:?}",
+                case.tool,
+                case.workspace,
+                case.transport
+            );
+        }
+    }
+
+    #[test]
+    fn server_only_service_tools_do_not_follow_edge_executor() {
+        for name in ["memory", "mo_query", "github"] {
+            let req = make_request(
+                name,
+                WorkspaceBindingKind::EdgeWorkspace,
+                ToolTransportKind::EdgeWs,
+            );
+            assert_eq!(
+                routing_decision(&req, &registry()),
+                ToolExecutionRouteKind::ServerRuntime,
+                "{name} must remain server-service owned"
+            );
+        }
     }
 
     #[test]

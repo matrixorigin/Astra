@@ -254,6 +254,8 @@ pub fn control_plane_capabilities(extra: impl IntoIterator<Item = &'static str>)
 
 pub fn read_write_workspace_capabilities() -> Vec<String> {
     labels([
+        CAP_WEB_FETCH,
+        CAP_WEB_SEARCH,
         CAP_WORKSPACE_READ,
         CAP_WORKSPACE_WRITE,
         CAP_SHELL,
@@ -265,7 +267,13 @@ pub fn read_write_workspace_capabilities() -> Vec<String> {
 
 pub fn workspace_runtime_capabilities(authority: WorkspaceAuthority) -> Vec<String> {
     match authority {
-        WorkspaceAuthority::ReadOnly => labels([CAP_WORKSPACE_READ, CAP_GIT_READ, CAP_SYMBOLS]),
+        WorkspaceAuthority::ReadOnly => labels([
+            CAP_WEB_FETCH,
+            CAP_WEB_SEARCH,
+            CAP_WORKSPACE_READ,
+            CAP_GIT_READ,
+            CAP_SYMBOLS,
+        ]),
         WorkspaceAuthority::ReadWrite => read_write_workspace_capabilities(),
         WorkspaceAuthority::None | WorkspaceAuthority::Unknown => Vec::new(),
     }
@@ -306,7 +314,12 @@ pub fn server_service_provider(
         CapacityProviderType::ServerService,
         provider_id,
         registry,
-        |spec| matches!(spec.required.executor, RequiredExecutor::ServiceExecutor),
+        |spec| {
+            matches!(
+                spec.required.executor,
+                RequiredExecutor::ServiceExecutor | RequiredExecutor::ServiceOrRuntimeExecutor
+            )
+        },
     )
 }
 
@@ -328,8 +341,10 @@ pub fn runtime_workspace_provider(
     registry: &ToolRegistry,
 ) -> CapacityProviderDeclaration {
     CapacityProviderDeclaration::from_registry(provider_type, provider_id, registry, |spec| {
-        matches!(spec.required.executor, RequiredExecutor::RuntimeExecutor)
-            && runtime_workspace_provider_declares_tool(provider_type, spec.name.as_str())
+        matches!(
+            spec.required.executor,
+            RequiredExecutor::RuntimeExecutor | RequiredExecutor::ServiceOrRuntimeExecutor
+        ) && runtime_workspace_provider_declares_tool(provider_type, spec.name.as_str())
     })
 }
 
@@ -409,7 +424,13 @@ mod tests {
         assert!(workspace_runtime_capabilities(WorkspaceAuthority::None).is_empty());
         assert_eq!(
             workspace_runtime_capabilities(WorkspaceAuthority::ReadOnly),
-            vec![CAP_WORKSPACE_READ, CAP_GIT_READ, CAP_SYMBOLS]
+            vec![
+                CAP_WEB_FETCH,
+                CAP_WEB_SEARCH,
+                CAP_WORKSPACE_READ,
+                CAP_GIT_READ,
+                CAP_SYMBOLS
+            ]
         );
         assert!(
             workspace_runtime_capabilities(WorkspaceAuthority::ReadWrite)
@@ -426,6 +447,7 @@ mod tests {
         let cli = cli_local_provider("cli", &registry);
 
         assert!(server.declares_tool("web_fetch"));
+        assert!(server.declares_tool("web_search"));
         assert!(server.declares_tool("memory"));
         assert!(!server.declares_tool("bash"));
 
@@ -434,6 +456,8 @@ mod tests {
         assert!(!control.declares_tool("web_fetch"));
 
         assert!(cli.declares_tool("bash"));
+        assert!(cli.declares_tool("web_fetch"));
+        assert!(cli.declares_tool("web_search"));
         assert!(cli.declares_tool("read_file"));
         assert!(cli.declares_tool("powershell"));
         assert!(cli.declares_tool("display_sixel"));
@@ -450,6 +474,8 @@ mod tests {
         ] {
             let provider = runtime_workspace_provider(provider_type, "runtime", &registry);
             assert!(provider.declares_tool("bash"));
+            assert!(provider.declares_tool("web_fetch"));
+            assert!(provider.declares_tool("web_search"));
             assert!(provider.declares_tool("read_file"));
             assert!(
                 !provider.declares_tool("powershell"),

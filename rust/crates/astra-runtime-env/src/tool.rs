@@ -32,6 +32,7 @@ pub enum RequiredExecutor {
     None,
     ControlPlane,
     ServiceExecutor,
+    ServiceOrRuntimeExecutor,
     RuntimeExecutor,
     McpExecutor,
 }
@@ -122,9 +123,9 @@ impl ToolRequirements {
         }
     }
 
-    pub const fn server_network() -> Self {
+    pub const fn shared_network() -> Self {
         Self {
-            executor: RequiredExecutor::ServiceExecutor,
+            executor: RequiredExecutor::ServiceOrRuntimeExecutor,
             network: RequiredNetwork::AllowList,
             ..Self::none()
         }
@@ -275,8 +276,8 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         server_service("mo_query", ToolLoadPolicy::Deferred),
         server_service("rollback_database_snapshots", ToolLoadPolicy::Deferred),
         server_service("tool_search", ToolLoadPolicy::AlwaysLoad),
-        server_network("web_search", ToolLoadPolicy::Deferred),
-        server_network("web_fetch", ToolLoadPolicy::Deferred),
+        shared_network("web_search", ToolLoadPolicy::Deferred),
+        shared_network("web_fetch", ToolLoadPolicy::Deferred),
         server_network_credentials("github", ToolLoadPolicy::Deferred),
         project_write("publish_artifact", ToolLoadPolicy::Deferred),
         project_read("read_file", ToolLoadPolicy::AlwaysLoad),
@@ -496,6 +497,14 @@ impl CapabilityResolver {
                     "service_executor_required".to_string(),
                 ));
             }
+            RequiredExecutor::ServiceOrRuntimeExecutor
+                if !capabilities.executor.server_service
+                    && !capabilities.executor.runtime_executor =>
+            {
+                return Err(ToolUnavailableReason::ExecutorUnavailable(
+                    "service_or_runtime_executor_required".to_string(),
+                ));
+            }
             RequiredExecutor::RuntimeExecutor if !capabilities.executor.runtime_executor => {
                 return Err(ToolUnavailableReason::ExecutorUnavailable(
                     "runtime_executor_required".to_string(),
@@ -508,6 +517,7 @@ impl CapabilityResolver {
             }
             RequiredExecutor::ControlPlane
             | RequiredExecutor::ServiceExecutor
+            | RequiredExecutor::ServiceOrRuntimeExecutor
             | RequiredExecutor::RuntimeExecutor
             | RequiredExecutor::McpExecutor => {}
         }
@@ -646,7 +656,7 @@ fn server_service(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     }
 }
 
-fn server_network(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
+fn shared_network(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
         load_policy,
@@ -654,7 +664,7 @@ fn server_network(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
             uses_network: true,
             ..ToolEffect::none()
         },
-        required: ToolRequirements::server_network(),
+        required: ToolRequirements::shared_network(),
     }
 }
 
@@ -883,6 +893,8 @@ mod tests {
             "bash",
             "read_file",
             "write_file",
+            "web_fetch",
+            "web_search",
             "git",
             "git_clone",
             "find_definition",
@@ -911,9 +923,15 @@ mod tests {
         );
 
         assert!(binding.tool_surface.contains("read_file"));
+        assert!(binding.tool_surface.contains("web_fetch"));
+        assert!(binding.tool_surface.contains("web_search"));
         assert!(!binding.tool_surface.contains("ask_user"));
         assert!(!binding.tool_surface.contains("tool_search"));
         assert!(!binding.tool_surface.contains("memory"));
+        assert_eq!(
+            CapabilityResolver.check_tool(&registry, "web_fetch", &binding.capabilities),
+            Ok(())
+        );
         assert_eq!(
             CapabilityResolver.check_tool(&registry, "ask_user", &binding.capabilities),
             Err(ToolUnavailableReason::ExecutorUnavailable(
@@ -1347,8 +1365,16 @@ mod tests {
 
         assert!(binding.tool_surface.contains("git"));
         assert!(!binding.tool_surface.contains("git_clone"));
+        assert!(!binding.tool_surface.contains("web_fetch"));
+        assert!(!binding.tool_surface.contains("web_search"));
         assert_eq!(
             binding.tool_surface.denial_for("git_clone"),
+            Some(&ToolUnavailableReason::PolicyDenied(
+                "network_allow_list".to_string()
+            ))
+        );
+        assert_eq!(
+            binding.tool_surface.denial_for("web_fetch"),
             Some(&ToolUnavailableReason::PolicyDenied(
                 "network_allow_list".to_string()
             ))
@@ -1423,6 +1449,8 @@ mod tests {
         let schemas = vec![
             serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
             serde_json::json!({"type": "function", "function": {"name": "memory"}}),
+            serde_json::json!({"type": "function", "function": {"name": "web_fetch"}}),
+            serde_json::json!({"type": "function", "function": {"name": "web_search"}}),
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
             serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
             serde_json::json!({"type": "function", "function": {"name": "not_registered"}}),
@@ -1439,7 +1467,14 @@ mod tests {
             .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
             .collect();
 
-        for expected in ["tool_search", "memory", "bash", "read_file"] {
+        for expected in [
+            "tool_search",
+            "memory",
+            "web_fetch",
+            "web_search",
+            "bash",
+            "read_file",
+        ] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "{expected} should be visible for a local CLI runtime: {names:?}"

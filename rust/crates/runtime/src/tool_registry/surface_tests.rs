@@ -158,6 +158,7 @@ fn server_builtin_inventory_is_public_schema_backed() {
                 spec.required.executor,
                 astra_runtime_env::RequiredExecutor::ControlPlane
                     | astra_runtime_env::RequiredExecutor::ServiceExecutor
+                    | astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
             ),
             "server builtin inventory must be server-owned, not runtime-executor: {name}"
         );

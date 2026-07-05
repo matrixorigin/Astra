@@ -1667,6 +1667,7 @@ fn append_server_owned_tool_schemas_unique(
         match tool_execution_owner(name, &registry) {
             ToolExecutionOwner::ServerControlPlane
             | ToolExecutionOwner::ServerRuntime
+            | ToolExecutionOwner::ServiceOrRuntime
             | ToolExecutionOwner::TurnPipelineIntercept
                 if !server_builtin_tools_enabled =>
             {
@@ -1674,6 +1675,7 @@ fn append_server_owned_tool_schemas_unique(
             }
             ToolExecutionOwner::ServerControlPlane
             | ToolExecutionOwner::ServerRuntime
+            | ToolExecutionOwner::ServiceOrRuntime
             | ToolExecutionOwner::RequestScopedMcp
             | ToolExecutionOwner::TurnPipelineIntercept => {}
             _ => continue,
@@ -3412,8 +3414,17 @@ impl ServerAgenticLoopHost {
                     .map(String::from)
             })
             .filter(|name| {
+                let route = self.route_for_current_binding(name);
+                let disabled_on_current_route = disabled.contains(name)
+                    && matches!(
+                        route,
+                        ToolExecutionRouteKind::ServerLocal
+                            | ToolExecutionRouteKind::ServerControlPlane
+                            | ToolExecutionRouteKind::ServerRuntime
+                            | ToolExecutionRouteKind::RequestScopedMcp
+                    );
                 !crate::turn::agentic::tool_interception::runtime_allows_tool(state, name)
-                    || disabled.contains(name)
+                    || disabled_on_current_route
             })
             .collect()
     }
@@ -8729,6 +8740,50 @@ mod tests {
         );
         assert!(visible_names.contains("read_file"));
         assert!(!visible_names.contains("bash"));
+    }
+
+    #[test]
+    fn disabled_shared_network_tool_is_route_scoped_in_visible_surface() {
+        let disabled: HashSet<String> = ["web_fetch".to_string()].into_iter().collect();
+        let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
+
+        let mut server_only = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_disabled_tools(disabled_handle.clone())
+        .build();
+        let mut server_state = create_test_state();
+        let server_names = schema_names(&server_only.visible_turn_tools(&mut server_state));
+        assert!(
+            !server_names.contains("web_fetch"),
+            "server disabled_tools must hide server-routed web_fetch"
+        );
+        assert!(
+            server_names.contains("web_search"),
+            "unrelated server-routed shared tools remain visible"
+        );
+
+        let mut edge_selected = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_disabled_tools(disabled_handle)
+        .build();
+        let mut edge_state = create_test_state();
+        let edge_names = schema_names(&edge_selected.visible_turn_tools(&mut edge_state));
+        assert!(
+            edge_names.contains("web_fetch"),
+            "server disabled_tools must not hide edge-routed web_fetch"
+        );
+        assert!(edge_names.contains("bash"));
+        assert!(edge_names.contains("read_file"));
     }
 
     #[test]

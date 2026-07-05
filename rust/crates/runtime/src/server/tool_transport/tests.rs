@@ -2944,8 +2944,6 @@ async fn server_runtime_tools_bypass_edge_transport() {
     let local = CountingLocalTransport::new();
     let server_runtime_tools = [
         "tool_search",
-        "web_search",
-        "web_fetch",
         "memory",
         "mo_query",
         "rollback_database_snapshots",
@@ -2986,6 +2984,125 @@ async fn server_runtime_tools_bypass_edge_transport() {
         assert_eq!(metadata["transport"], "server_local", "{tool}");
     }
     assert_eq!(local.calls(), server_runtime_tools.len());
+}
+
+#[tokio::test]
+async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_binding() {
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+
+    for tool in ["web_fetch", "web_search"] {
+        let server_request = request(
+            tool,
+            WorkspaceBinding::none(),
+            ExecutorBinding::server_local(),
+        );
+        assert_eq!(
+            service.routing_decision(&server_request),
+            ToolExecutionRouteKind::ServerRuntime,
+            "{tool} must be service-backed when no runtime executor is selected"
+        );
+        let server_result = service.execute(server_request, &local).await;
+        assert!(!server_result.is_error, "{tool}: {server_result:?}");
+        assert_eq!(server_result.output, format!("local:{tool}"));
+
+        let edge_request = request(
+            tool,
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-selected",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+        assert_eq!(
+            service.routing_decision(&edge_request),
+            ToolExecutionRouteKind::EdgeBound,
+            "{tool} must prefer the selected edge executor"
+        );
+        let edge_result = service.execute(edge_request, &local).await;
+        assert!(!edge_result.is_error, "{tool}: {edge_result:?}");
+        assert_eq!(edge_result.output, "ledger-result");
+    }
+
+    assert_eq!(local.calls(), 2);
+    assert_eq!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .as_slice(),
+        ["edge-selected", "edge-selected"]
+    );
+}
+
+#[tokio::test]
+async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .initial_disabled_tools(&["web_fetch".to_string()])
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let server_result = service
+        .execute(
+            request(
+                "web_fetch",
+                WorkspaceBinding::none(),
+                ExecutorBinding::server_local(),
+            ),
+            &local,
+        )
+        .await;
+    assert!(server_result.is_error, "{server_result:?}");
+    let metadata = server_result.metadata.expect("disabled metadata");
+    assert_eq!(metadata["tool_disabled"], true);
+
+    let edge_result = service
+        .execute(
+            request(
+                "web_fetch",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+    assert!(!edge_result.is_error, "{edge_result:?}");
+    assert_eq!(edge_result.output, "ledger-result");
+    assert_eq!(local.calls(), 0);
+    assert_eq!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .as_slice(),
+        ["edge-selected"]
+    );
 }
 
 #[tokio::test]

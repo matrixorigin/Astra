@@ -289,11 +289,19 @@ impl ToolExecutionService {
         };
 
         // ── Runtime disabled-tools check (admin API / config) ──
-        if self
-            .disabled_tools
-            .read()
-            .await
-            .contains(&transport_request.tool_name)
+        let disabled_applies_to_route = matches!(
+            route,
+            ToolExecutionRouteKind::ServerLocal
+                | ToolExecutionRouteKind::ServerControlPlane
+                | ToolExecutionRouteKind::ServerRuntime
+                | ToolExecutionRouteKind::RequestScopedMcp
+        );
+        if disabled_applies_to_route
+            && self
+                .disabled_tools
+                .read()
+                .await
+                .contains(&transport_request.tool_name)
         {
             let mut meta = serde_json::Map::new();
             meta.insert("tool_disabled".to_string(), serde_json::Value::Bool(true));

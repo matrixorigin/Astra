@@ -74,7 +74,7 @@ fn tool_route_is_visible_for_binding(
         | ToolExecutionOwner::RequestScopedMcp
         | ToolExecutionOwner::TurnPipelineIntercept => return true,
         ToolExecutionOwner::Unknown => return false,
-        ToolExecutionOwner::RuntimeExecutor => {}
+        ToolExecutionOwner::ServiceOrRuntime | ToolExecutionOwner::RuntimeExecutor => {}
     }
 
     !matches!(
@@ -872,6 +872,78 @@ mod tests {
     }
 
     #[test]
+    fn shared_network_tool_runtime_binding_follows_selected_executor() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+
+        let server_only = runtime_environment_binding_for_parts(
+            "web_fetch",
+            &no_workspace(),
+            &ExecutorBinding::server_local(),
+            None,
+            &ToolPolicySnapshot::default(),
+            &registry,
+        );
+        assert_eq!(
+            server_only.executor.kind,
+            astra_runtime_env::ExecutorBindingKind::ControlPlane
+        );
+        assert!(server_only.capabilities.executor.server_service);
+        assert!(!server_only.capabilities.executor.runtime_executor);
+
+        let server_sandbox = runtime_environment_binding_for_parts(
+            "web_fetch",
+            &WorkspaceBinding::server_sandbox("/workspace"),
+            &ExecutorBinding::server_local(),
+            None,
+            &ToolPolicySnapshot::default(),
+            &registry,
+        );
+        assert_eq!(
+            server_sandbox.executor.kind,
+            astra_runtime_env::ExecutorBindingKind::ServerRuntime
+        );
+        assert!(server_sandbox.capabilities.executor.server_service);
+        assert!(server_sandbox.capabilities.executor.runtime_executor);
+
+        let edge = runtime_environment_binding_for_parts(
+            "web_fetch",
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+            &ToolPolicySnapshot::default(),
+            &registry,
+        );
+        assert_eq!(
+            edge.executor.kind,
+            astra_runtime_env::ExecutorBindingKind::EdgeAgent
+        );
+        assert!(!edge.capabilities.executor.server_service);
+        assert!(edge.capabilities.executor.runtime_executor);
+        assert!(
+            astra_runtime_env::CapabilityResolver
+                .check_tool_call(
+                    &registry,
+                    "web_fetch",
+                    &serde_json::json!({}),
+                    &edge.capabilities,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn production_server_edge_surface_hides_admin_and_platform_local_tools() {
         let names = schema_names(capability_filtered_server_tool_schemas(
             &crate::capabilities::lifecycle_server_capabilities(true, true),
@@ -995,9 +1067,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_session_manager_none_does_not_hide_ready_runtime_provider() {
-        let mut runtime = astra_runtime_env::RuntimeBinding::host_process("runtime-none-session");
-        runtime.session_manager = astra_runtime_env::RuntimeSessionManager::None;
+    fn runtime_without_long_session_support_does_not_hide_ready_runtime_provider() {
+        let mut runtime = astra_runtime_env::RuntimeBinding::host_process("runtime-short-session");
+        runtime.supports_long_sessions = false;
 
         let names = schema_names(capability_filtered_server_tool_schemas(
             &crate::capabilities::full_server_capabilities_for_tests(),
@@ -1009,7 +1081,7 @@ mod tests {
         for expected in ["bash", "read_file", "write_file", "git"] {
             assert!(
                 names.contains(expected),
-                "{expected} must remain visible when the runtime is ready and isolated even if it has no long-session manager"
+                "{expected} must remain visible when the runtime is ready and isolated even if it does not support long sessions"
             );
         }
     }

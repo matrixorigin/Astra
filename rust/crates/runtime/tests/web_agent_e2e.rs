@@ -616,6 +616,7 @@ fn test_tool_uses_client_ledger(tool_name: &str) -> bool {
             matches!(
                 spec.required.executor,
                 astra_runtime_env::RequiredExecutor::RuntimeExecutor
+                    | astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
             )
         })
 }
