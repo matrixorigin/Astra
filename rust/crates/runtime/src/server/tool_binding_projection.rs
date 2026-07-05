@@ -205,11 +205,28 @@ pub(crate) fn runtime_environment_binding_for_parts(
     registry: &astra_runtime_env::ToolRegistry,
 ) -> astra_runtime_env::RunBinding {
     let runtime = runtime.unwrap_or_else(|| runtime_env_runtime_binding(workspace, executor));
+    let workspace_binding = runtime_env_workspace_binding(workspace);
+    let executor_binding = runtime_env_executor_binding(tool_name, workspace, executor);
+    let policy_intent = runtime_env_policy_intent(workspace, policy);
+    if tool_name.starts_with("mcp__") {
+        let providers = vec![astra_runtime_env::request_scoped_mcp_provider(
+            "request-scoped-mcp",
+            [tool_name.to_string()],
+        )];
+        return astra_runtime_env::RunBinding::resolve_with_provider_declarations(
+            workspace_binding,
+            executor_binding,
+            runtime,
+            policy_intent,
+            registry,
+            &providers,
+        );
+    }
     astra_runtime_env::RunBinding::resolve(
-        runtime_env_workspace_binding(workspace),
-        runtime_env_executor_binding(tool_name, workspace, executor),
+        workspace_binding,
+        executor_binding,
         runtime,
-        runtime_env_policy_intent(workspace, policy),
+        policy_intent,
         registry,
     )
 }
