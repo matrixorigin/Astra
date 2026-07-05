@@ -32,9 +32,13 @@ fi
 
 PIDS=$(pgrep -x "astra-edge" 2>/dev/null || true)
 if [ -n "$PIDS" ]; then
-    echo "$PIDS" | xargs -r kill 2>/dev/null || true
+    for pid in $PIDS; do
+        kill "$pid" 2>/dev/null || true
+    done
     sleep 2
-    pgrep -x "astra-edge" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    for pid in $(pgrep -x "astra-edge" 2>/dev/null || true); do
+        kill -9 "$pid" 2>/dev/null || true
+    done
 fi
 
 echo "✅ astra-edge stopped"

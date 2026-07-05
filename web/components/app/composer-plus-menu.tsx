@@ -94,6 +94,22 @@ function edgeDisplayName(edge: EdgeWorkspace) {
   return edge.hostname?.trim() || edge.edge_agent_id || 'Edge workspace';
 }
 
+function normalizeSlashPath(path: string) {
+  const absolute = path.replace(/\\/g, '/').replace(/\/+/g, '/');
+  const parts: string[] = [];
+  for (const part of absolute.split('/')) {
+    if (!part || part === '.') {
+      continue;
+    }
+    if (part === '..') {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return absolute.startsWith('/') ? `/${parts.join('/')}` : parts.join('/');
+}
+
 function sameSelection(
   left: WorkspaceSelection | null | undefined,
   right: WorkspaceSelection | null | undefined,
@@ -114,9 +130,30 @@ function sameSelection(
   );
 }
 
+function edgeMatchesSelection(
+  edge: EdgeWorkspace,
+  selection: WorkspaceSelection | null | undefined,
+) {
+  if (selection?.kind !== 'edge_workspace') {
+    return false;
+  }
+  const edgeCwd = edge.workspace_dir?.trim();
+  if (!edgeCwd) {
+    return false;
+  }
+  if (edge.edge_agent_id === selection.edgeAgentId) {
+    return true;
+  }
+  if (normalizeSlashPath(edgeCwd) !== normalizeSlashPath(selection.cwd)) {
+    return false;
+  }
+  const displayName = selection.displayName?.trim();
+  return !displayName || edge.hostname?.trim() === displayName;
+}
+
 function workspaceLabel(selection: WorkspaceSelection | null | undefined) {
   if (!selection) {
-    return 'Astra';
+    return 'Web';
   }
   if (selection.kind === 'server_sandbox') {
     return 'Server sandbox';
@@ -131,7 +168,7 @@ function edgeIsConnected(
   if (selection?.kind !== 'edge_workspace') {
     return true;
   }
-  return edges.some((edge) => sameSelection(edgeSelection(edge), selection));
+  return edges.some((edge) => edgeMatchesSelection(edge, selection));
 }
 
 function environmentSummary(
@@ -142,10 +179,11 @@ function environmentSummary(
     selection?.kind === 'edge_workspace' && !edgeIsConnected(selection, edges);
   if (!selection) {
     return {
-      label: 'Astra',
-      detail: 'Web runtime',
+      label: 'Web',
+      detail: 'No workspace',
       unavailable: false,
       icon: Monitor,
+      connected: false,
     };
   }
   if (selection.kind === 'server_sandbox') {
@@ -154,6 +192,7 @@ function environmentSummary(
       detail: 'Server workspace',
       unavailable: false,
       icon: HardDrive,
+      connected: true,
     };
   }
   return {
@@ -161,6 +200,7 @@ function environmentSummary(
     detail: selection.cwd,
     unavailable,
     icon: HardDrive,
+    connected: !unavailable,
   };
 }
 
@@ -213,8 +253,8 @@ function EnvironmentPanel({
       )}
       <Row
         icon={Monitor}
-        label="Astra"
-        description="Web, memory, planning, MCP"
+        label="Web"
+        description="Chat, web, memory, planning"
         selected={!workspaceSelection}
         onClick={() => selectEnvironment(null)}
       />
@@ -239,7 +279,10 @@ function EnvironmentPanel({
           icon={HardDrive}
           label={edgeDisplayName(edge)}
           description={selection.cwd}
-          selected={sameSelection(workspaceSelection, selection)}
+          selected={
+            sameSelection(workspaceSelection, selection) ||
+            edgeMatchesSelection(edge, workspaceSelection)
+          }
           onClick={() => selectEnvironment(selection)}
         />
       ))}
@@ -292,7 +335,11 @@ export function ComposerEnvironmentChip({
           <span
             className={cn(
               'size-1.5 shrink-0 rounded-full',
-              summary.unavailable ? 'bg-warning' : 'bg-success',
+              summary.unavailable
+                ? 'bg-warning'
+                : summary.connected
+                  ? 'bg-success'
+                  : 'bg-text-muted',
             )}
           />
           <Icon className="size-3.5 shrink-0" />

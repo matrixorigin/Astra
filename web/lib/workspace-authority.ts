@@ -4,7 +4,7 @@ import type { WorkspaceSelection } from "@/lib/api/types";
 export function defaultWorkspaceBinding(): WorkspaceBinding {
   return {
     kind: "none",
-    display_name: "Astra",
+    display_name: "Web",
     authority: "none",
     fallback_policy: "disabled",
   };
@@ -14,7 +14,7 @@ export function defaultExecutorBinding(): ExecutorBinding {
   return {
     kind: "server_local",
     executor_id: "server-control-plane",
-    display_name: "Astra",
+    display_name: "Server control plane",
     transport: "server_local",
     status: "online",
   };

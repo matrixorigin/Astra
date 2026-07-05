@@ -6,6 +6,54 @@ import {
 } from "@/lib/runtime-client";
 import { normalizeSlashPath } from "@/lib/workspace-authority";
 
+type EdgeStatusEntry = EdgeStatusResponse["edges"][number];
+
+function edgeWorkspaceMatchesSelection(
+  edge: EdgeStatusEntry,
+  selection: Extract<WorkspaceSelection, { kind: "edge_workspace" }>,
+) {
+  const liveCwd = edge.workspace_dir?.trim() ?? "";
+  return (
+    liveCwd &&
+    normalizeSlashPath(liveCwd) === normalizeSlashPath(selection.cwd)
+  );
+}
+
+function edgeDisplayMatchesSelection(
+  edge: EdgeStatusEntry,
+  selection: Extract<WorkspaceSelection, { kind: "edge_workspace" }>,
+) {
+  const displayName = selection.displayName?.trim();
+  if (!displayName) {
+    return true;
+  }
+  return edge.hostname?.trim() === displayName;
+}
+
+function newestConnectedFirst(left: EdgeStatusEntry, right: EdgeStatusEntry) {
+  return left.connected_secs - right.connected_secs;
+}
+
+function resolveLiveEdgeForSelection(
+  edges: EdgeStatusEntry[],
+  selection: Extract<WorkspaceSelection, { kind: "edge_workspace" }>,
+) {
+  const exact = edges.find(
+    (candidate) => candidate.edge_agent_id === selection.edgeAgentId,
+  );
+  if (exact) {
+    return exact;
+  }
+
+  const sameWorkspace = edges
+    .filter((candidate) => edgeWorkspaceMatchesSelection(candidate, selection))
+    .sort(newestConnectedFirst);
+  const sameDisplay = sameWorkspace.filter((candidate) =>
+    edgeDisplayMatchesSelection(candidate, selection),
+  );
+  return sameDisplay[0] ?? sameWorkspace[0];
+}
+
 export async function verifyLiveWorkspaceSelection(
   selection: WorkspaceSelection | null | undefined,
   runtime: WebRuntimeClient,
@@ -18,9 +66,7 @@ export async function verifyLiveWorkspaceSelection(
     auth: "required",
     operation: "verify edge workspace binding",
   });
-  const edge = status.edges.find(
-    (candidate) => candidate.edge_agent_id === selection.edgeAgentId,
-  );
+  const edge = resolveLiveEdgeForSelection(status.edges, selection);
   if (!edge) {
     throw new RuntimeClientError({
       operation: "verify edge workspace binding",
@@ -48,6 +94,7 @@ export async function verifyLiveWorkspaceSelection(
 
   return {
     ...selection,
+    edgeAgentId: edge.edge_agent_id,
     displayName:
       edge.hostname ?? selection.displayName ?? selection.edgeAgentId,
     cwd: liveCwd,

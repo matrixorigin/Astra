@@ -183,6 +183,45 @@ describe("web store user scoping", () => {
     ).toHaveLength(1);
   });
 
+  it("stores an initial workspace selection on the pending local chat shell", async () => {
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
+      .mockResolvedValueOnce(jsonResponse(runtimeRunList([])));
+
+    const result = await createChatWithMessage("user-a", {
+      message: "list files in this workspace",
+      model: "sonnet-4.6-adaptive",
+      options: {
+        webSearch: false,
+        thinking: true,
+        activeSkills: [],
+      },
+      projectId: null,
+      workspaceSelection: {
+        kind: "edge_workspace",
+        edgeAgentId: "edge-1",
+        displayName: "MacBook Pro",
+        cwd: "/Users/test/astra",
+      },
+    });
+
+    await expect(getChatHydrated("user-a", result.chatId)).resolves.toEqual(
+      expect.objectContaining({
+        workspaceSelection: {
+          kind: "edge_workspace",
+          edgeAgentId: "edge-1",
+          displayName: "MacBook Pro",
+          cwd: "/Users/test/astra",
+        },
+        workspaceSelectionExplicit: true,
+        pendingTurn: expect.objectContaining({
+          content: "list files in this workspace",
+        }),
+      }),
+    );
+  });
+
   it("syncs a persisted backend session back onto the existing local web chat id", async () => {
     const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
     const result = await createChatWithMessage("user-a", {

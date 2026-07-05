@@ -151,6 +151,7 @@ pub(crate) fn attach_runtime_error_metadata(
     error: &astra_runtime_env::RuntimeError,
     reason: &str,
 ) {
+    metadata.insert("status".to_string(), Value::String("failed".to_string()));
     metadata.insert(
         "error_kind".to_string(),
         Value::String(error.kind.to_string()),
@@ -173,6 +174,10 @@ pub(crate) fn attach_runtime_error_metadata(
     metadata.insert(
         "runtime_error".to_string(),
         serde_json::to_value(error).unwrap_or(Value::Null),
+    );
+    metadata.insert(
+        "result_class".to_string(),
+        Value::String("execution_error".to_string()),
     );
 }
 

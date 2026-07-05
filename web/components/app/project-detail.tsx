@@ -11,9 +11,13 @@ import { InstructionsModal } from '@/components/app/instructions-modal';
 import { KnowledgeCard } from '@/components/app/knowledge-card';
 import { KnowledgeItem } from '@/components/app/knowledge-item';
 import { ChatRow } from '@/components/app/chat-row';
-import { createChat } from '@/lib/api/chats';
+import { createChat, getEdgeStatus } from '@/lib/api/chats';
 import { getProject, updateProject, uploadProjectFile } from '@/lib/api/projects';
-import type { ProjectDetail as ProjectDetailType } from '@/lib/api/types';
+import type {
+  EdgeStatusResponse,
+  ProjectDetail as ProjectDetailType,
+  WorkspaceSelection,
+} from '@/lib/api/types';
 import { relativeTime } from '@/lib/utils/time';
 import { subscribeChatLifecycleChange } from '@/lib/chat-lifecycle-events';
 
@@ -23,6 +27,30 @@ export function ProjectDetail({ initial }: { initial: ProjectDetailType }) {
   const [detail, setDetail] = useState(initial);
   const [instructionsOpen, setInstructionsOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [workspaceSelection, setWorkspaceSelection] =
+    useState<WorkspaceSelection | null>(null);
+  const [edgeWorkspaces, setEdgeWorkspaces] =
+    useState<EdgeStatusResponse['edges']>([]);
+  const [edgeWorkspacesLoading, setEdgeWorkspacesLoading] = useState(false);
+  const [edgeWorkspacesError, setEdgeWorkspacesError] = useState<string | null>(
+    null,
+  );
+
+  const refreshEdgeWorkspaces = useCallback(async () => {
+    setEdgeWorkspacesLoading(true);
+    setEdgeWorkspacesError(null);
+    try {
+      const status = await getEdgeStatus();
+      setEdgeWorkspaces(status.edges);
+    } catch (error) {
+      setEdgeWorkspaces([]);
+      setEdgeWorkspacesError(
+        error instanceof Error ? error.message : 'Failed to load environments.',
+      );
+    } finally {
+      setEdgeWorkspacesLoading(false);
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     setDetail(await getProject(detail.project.id));
@@ -35,6 +63,10 @@ export function ProjectDetail({ initial }: { initial: ProjectDetailType }) {
   useEffect(() => subscribeChatLifecycleChange(() => {
     void refresh();
   }), [refresh]);
+
+  useEffect(() => {
+    void refreshEdgeWorkspaces();
+  }, [refreshEdgeWorkspaces]);
 
   return (
     <div className="grid h-full overflow-y-auto overscroll-contain grid-cols-[minmax(0,1fr)_var(--right-panel-width)] gap-0 max-lg:grid-cols-1">
@@ -59,6 +91,12 @@ export function ProjectDetail({ initial }: { initial: ProjectDetailType }) {
           projectContext={{ projectId: detail.project.id }}
           className="mt-8 max-w-composer"
           placeholder={`Ask about ${detail.project.name}...`}
+          workspaceSelection={workspaceSelection}
+          edgeWorkspaces={edgeWorkspaces}
+          edgeWorkspacesLoading={edgeWorkspacesLoading}
+          edgeWorkspacesError={edgeWorkspacesError}
+          onWorkspaceSelectionChange={setWorkspaceSelection}
+          onRefreshEdgeWorkspaces={refreshEdgeWorkspaces}
           onSubmit={async ({ text, options }) => {
             setBusy(true);
             try {
@@ -71,6 +109,7 @@ export function ProjectDetail({ initial }: { initial: ProjectDetailType }) {
                   activeSkills: options.activeSkills,
                 },
                 projectId: detail.project.id,
+                workspaceSelection,
               });
               router.push(`/projects/${detail.project.id}/chats/${result.chatId}`);
             } finally {

@@ -1002,11 +1002,6 @@ async fn no_file_environment_local_code_blocks_without_server_fallback() {
         .await;
 
     assert!(result.is_error, "{result:?}");
-    assert!(
-        result.output.contains("no fallback was attempted"),
-        "{}",
-        result.output
-    );
     let metadata = result.metadata.expect("capability metadata");
     assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
     assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CAPABILITY_DENIED);

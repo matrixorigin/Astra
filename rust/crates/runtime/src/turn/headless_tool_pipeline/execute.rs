@@ -75,16 +75,26 @@ pub(super) fn execution_result_is_error(
     result_str: &str,
     tool_result_fields: Option<&Map<String, Value>>,
 ) -> bool {
-    let metadata_failed = tool_result_fields
-        .and_then(|fields| fields.get("status"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(edge_tool_status_exit_code)
-        .is_some_and(|exit_code| exit_code != 0);
+    let metadata_failed = tool_result_fields.is_some_and(|fields| {
+        let failed_status = fields
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .and_then(edge_tool_status_exit_code)
+            .is_some_and(|exit_code| exit_code != 0);
+        let runtime_error = fields.get("runtime_error").is_some();
+        let blocked = fields
+            .get("blocked")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let explicit_error_kind = fields.get("error_kind").is_some();
+
+        failed_status || runtime_error || blocked || explicit_error_kind
+    });
 
     match classify_tool_error(name, result_str) {
         ToolErrorSeverity::HardError => true,
         ToolErrorSeverity::InfrastructureError => true,
-        ToolErrorSeverity::SoftError => false,
+        ToolErrorSeverity::SoftError => metadata_failed,
         // Success arm — body-wins reconciliation contract:
         //
         // When edge metadata says the call failed (non-zero exit status) but
@@ -112,6 +122,50 @@ fn execution_error_kind(
         .and_then(|fields| fields.get("error_kind"))
         .and_then(serde_json::Value::as_str)
         .and_then(astra_core::ErrorKind::parse_tag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Map, Value};
+
+    #[test]
+    fn transport_failure_metadata_marks_read_only_tool_as_error() {
+        let mut fields = Map::new();
+        fields.insert("status".to_string(), Value::String("failed".to_string()));
+        fields.insert(
+            "error_kind".to_string(),
+            Value::String("transport_disconnected".to_string()),
+        );
+        fields.insert("blocked".to_string(), Value::Bool(true));
+
+        assert!(execution_result_is_error(
+            "list_dir",
+            "Error: transport 'edge_ws' disconnected or timed out while executing tool 'list_dir'",
+            Some(&fields),
+        ));
+    }
+
+    #[test]
+    fn plain_read_only_timeout_without_runtime_metadata_stays_soft() {
+        assert!(!execution_result_is_error(
+            "grep",
+            "Error: command timed out after 30s",
+            None,
+        ));
+    }
+
+    #[test]
+    fn explicit_success_body_can_override_stale_failed_status() {
+        let mut fields = Map::new();
+        fields.insert("status".to_string(), Value::String("failed".to_string()));
+
+        assert!(!execution_result_is_error(
+            "str_replace",
+            "Replaced 1 occurrence\n<<<ASTRA_TOOL_OK>>>",
+            Some(&fields),
+        ));
+    }
 }
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {

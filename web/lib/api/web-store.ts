@@ -817,11 +817,15 @@ export async function createChatWithMessage(
     model: string;
     options: Omit<ComposerOptions, "model">;
     projectId?: string | null;
+    workspaceSelection?: WorkspaceSelection | null;
   },
 ) {
   const store = getStore(ownerUserId);
   const timestamp = nowIso();
   const projectId = payload.projectId ?? null;
+  const workspaceSelection = payload.workspaceSelection
+    ? normalizeWorkspaceSelection(payload.workspaceSelection)
+    : undefined;
   if (
     projectId &&
     !store.projects.some((project) => project.id === projectId)
@@ -846,6 +850,7 @@ export async function createChatWithMessage(
     lastMessagePreview: payload.message,
     model: payload.model,
     backendSessionId: null,
+    ...(workspaceSelection ? { workspaceSelection } : {}),
     messages: [userMessage],
     activeRun: undefined,
     pendingTurn: {

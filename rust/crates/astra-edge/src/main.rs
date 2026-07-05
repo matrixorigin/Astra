@@ -20,6 +20,7 @@ use astra_server_types::edge_ws_protocol::{
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -47,9 +48,9 @@ struct Args {
     #[arg(long, env = "ASTRA_WORKSPACE_DIR", default_value = ".")]
     workspace_dir: PathBuf,
 
-    /// Edge agent identifier
-    #[arg(long, env = "ASTRA_EDGE_ID", default_value_t = default_edge_id())]
-    edge_id: String,
+    /// Edge agent identifier. Defaults to a stable id derived from hostname + canonical workspace.
+    #[arg(long, env = "ASTRA_EDGE_ID")]
+    edge_id: Option<String>,
 
     /// Auto-reconnect on disconnect
     #[arg(long, default_value_t = true)]
@@ -65,12 +66,33 @@ struct EdgeConfig {
     reconnect: bool,
 }
 
-fn default_edge_id() -> String {
+fn normalized_hostname() -> String {
     let hostname = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown".into());
-    format!("edge-{hostname}-{}", &uuid::Uuid::new_v4().to_string()[..8])
+    hostname
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn default_edge_id(workspace_dir: &Path) -> String {
+    let workspace = canonical_workspace_dir(workspace_dir);
+    let mut hasher = Sha256::new();
+    hasher.update(workspace.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("edge-{}-{suffix}", normalized_hostname())
 }
 
 fn default_server_url() -> String {
@@ -94,11 +116,38 @@ fn edge_ws_url(server_url: &str) -> String {
     } else {
         trimmed.to_string()
     };
-    if with_ws_scheme.ends_with("/edge/ws") {
+
+    if let Ok(mut url) = reqwest::Url::parse(&with_ws_scheme) {
+        url.set_path(&normalized_edge_ws_path(url.path()));
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string()
+    } else if with_ws_scheme.ends_with("/edge/ws") {
         with_ws_scheme
     } else {
         format!("{with_ws_scheme}/edge/ws")
     }
+}
+
+fn normalized_edge_ws_path(path: &str) -> String {
+    let segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    if segments.is_empty() {
+        return "/edge/ws".to_string();
+    }
+
+    if let Some(index) = segments
+        .windows(2)
+        .position(|window| window == ["edge", "ws"])
+    {
+        return format!("/{}", segments[..index + 2].join("/"));
+    }
+
+    format!("/{}/edge/ws", segments.join("/"))
 }
 
 fn token_from_credentials(
@@ -132,11 +181,17 @@ fn resolve_token(args: &Args) -> Result<String, String> {
 
 fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     let raw_server_url = args.server_url.clone().unwrap_or_else(default_server_url);
+    let workspace_dir = canonical_workspace_dir(&args.workspace_dir);
+    let token = resolve_token(&args)?;
+    let edge_id = args
+        .edge_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default_edge_id(&workspace_dir));
     Ok(EdgeConfig {
         server_url: edge_ws_url(&raw_server_url),
-        token: resolve_token(&args)?,
-        workspace_dir: args.workspace_dir,
-        edge_id: args.edge_id,
+        token,
+        workspace_dir,
+        edge_id,
         reconnect: args.reconnect,
     })
 }
@@ -444,6 +499,20 @@ mod tests {
     }
 
     #[test]
+    fn default_edge_id_is_stable_for_the_same_workspace() {
+        let workspace = Path::new("/workspace/app");
+        assert_eq!(default_edge_id(workspace), default_edge_id(workspace));
+    }
+
+    #[test]
+    fn default_edge_id_is_workspace_scoped() {
+        assert_ne!(
+            default_edge_id(Path::new("/workspace/app-a")),
+            default_edge_id(Path::new("/workspace/app-b"))
+        );
+    }
+
+    #[test]
     fn edge_ws_url_accepts_api_or_ws_base_urls() {
         assert_eq!(
             edge_ws_url("http://127.0.0.1:17001"),
@@ -455,6 +524,26 @@ mod tests {
         );
         assert_eq!(
             edge_ws_url("wss://astra.example.com/edge/ws"),
+            "wss://astra.example.com/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com/edge/ws/extra-path"),
+            "wss://astra.example.com/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com/prefix"),
+            "wss://astra.example.com/prefix/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com/prefix/edge/ws/extra-path"),
+            "wss://astra.example.com/prefix/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com/not-edge/ws"),
+            "wss://astra.example.com/not-edge/ws/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com/edge/ws?debug=1#fragment"),
             "wss://astra.example.com/edge/ws"
         );
     }

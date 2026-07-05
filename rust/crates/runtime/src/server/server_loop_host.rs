@@ -1033,11 +1033,11 @@ fn build_captured_llm_request(
 /// 2. Builds system prompt + conversation context
 /// 3. Calls the LLM directly via [`call_llm_and_collect`]
 /// 4. Accumulates response into [`ChatTurnSseAccum`]
-/// 5. For tool calls: waits on `edge_callback_ledger` for edge-executed results
+/// 5. For tool calls: runs the headless tool phase, optionally using a thin-client ledger
 ///
-/// The tool execution in step 5 is handled by the runtime's headless round,
-/// which maps tool calls to edge tool results. The ledger is populated by
-/// the client posting to `POST /tools/result`.
+/// Web+Edge/server+edge runs execute workspace tools through the runtime
+/// executor transport. The browser ledger is reserved for thin clients that
+/// can execute local tools and post results to `POST /tools/result`.
 pub struct ServerAgenticLoopHost {
     // ── LLM resolution ──
     matrixone: MatrixOneSettings,
@@ -2543,7 +2543,9 @@ impl ServerAgenticLoopHost {
             "total_tokens": u.total_tokens(),
         }));
 
-        let edge_tool_round = self.deliver_edge_bound_tools_via_ledger(&tool_calls).await;
+        let edge_tool_round = self
+            .maybe_deliver_edge_bound_tools_via_ledger(state, &tool_calls)
+            .await;
 
         let accum = ChatTurnSseAccum {
             full_text: full_text.clone(),
@@ -2784,6 +2786,32 @@ impl ServerAgenticLoopHost {
         }
         self.deliver_edge_tools_via_ledger(&edge_bound_tool_calls)
             .await
+    }
+
+    fn should_deliver_edge_bound_tools_via_client_ledger(&self, state: &AgenticLoopState) -> bool {
+        self.event_tx.is_some() && state.runtime_tool_executor.is_none()
+    }
+
+    async fn maybe_deliver_edge_bound_tools_via_ledger(
+        &mut self,
+        state: &AgenticLoopState,
+        tool_calls: &[Value],
+    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        if !self.should_deliver_edge_bound_tools_via_client_ledger(state) {
+            if self.event_tx.is_some()
+                && state.runtime_tool_executor.is_some()
+                && !tool_calls.is_empty()
+            {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    user_id = %self.user_id,
+                    tool_call_count = tool_calls.len(),
+                    "skip browser edge-tool ledger because runtime tool executor is available"
+                );
+            }
+            return Vec::new();
+        }
+        self.deliver_edge_bound_tools_via_ledger(tool_calls).await
     }
 
     fn edge_ledger_tool_calls_for_delivery(&self, tool_calls: &[Value]) -> Vec<Value> {
@@ -4652,17 +4680,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }));
         }
 
-        // ── 5. Edge tool delivery via ledger (streaming mode) ────────────
+        // ── 5. Edge tool delivery via ledger (thin-client streaming mode) ─
         //
-        // When streaming to a web client with edge tools, emit `tool_request`
-        // SSE events so the client can execute tools locally, then wait on
-        // the ledger for the results posted via `POST /tools/result`.
-        //
-        // Only edge-bound runtime executor tools are sent to the edge ledger.
-        // Server-service/control-plane/MCP calls stay in the headless pipeline
-        // and execute through the server-side executor path.
+        // Web+Edge/server+edge runs have a runtime executor and must execute
+        // workspace tools through the executor transport. The browser ledger
+        // is only for thin clients that can execute local tools themselves.
         let edge_tool_round = self
-            .deliver_edge_bound_tools_via_ledger(&result.tool_calls)
+            .maybe_deliver_edge_bound_tools_via_ledger(state, &result.tool_calls)
             .await;
 
         // ── 6. Build turn result ────────────────────────────────────────
@@ -5859,6 +5883,62 @@ mod tests {
         })]);
 
         assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn web_edge_runtime_executor_does_not_use_browser_tool_ledger() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-web-edge".to_string(),
+            "s-web-edge".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        host.set_event_tx(tx);
+
+        let tool_call = json!({
+            "id": "read-1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"README.md"}"#}
+        });
+        assert_eq!(
+            host.edge_ledger_tool_calls_for_delivery(&[tool_call]).len(),
+            1,
+            "read_file remains an edge-bound runtime tool"
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(runtime_tool_executor_with_agent_context(dir.path()));
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(executor);
+
+        assert!(
+            !host.should_deliver_edge_bound_tools_via_client_ledger(&state),
+            "Web+Edge must execute runtime tools through the runtime executor, not wait for browser /tools/result"
+        );
+    }
+
+    #[test]
+    fn thin_client_without_runtime_executor_can_use_browser_tool_ledger() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-thin-client".to_string(),
+            "s-thin-client".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        host.set_event_tx(tx);
+
+        let state = create_test_state();
+
+        assert!(
+            host.should_deliver_edge_bound_tools_via_client_ledger(&state),
+            "the browser/client ledger remains available only for thin clients without a runtime executor"
+        );
     }
 
     #[test]

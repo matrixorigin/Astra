@@ -186,6 +186,7 @@ export type CreateChatRequest = {
   model: string;
   options: Omit<ComposerOptions, 'model'>;
   projectId?: string | null;
+  workspaceSelection?: WorkspaceSelection | null;
 };
 
 export type CreateChatResponse = {

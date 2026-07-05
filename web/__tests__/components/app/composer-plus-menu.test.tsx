@@ -81,7 +81,7 @@ describe("ComposerPlusMenu environment selection", () => {
     });
   });
 
-  it("lets the user clear an edge binding back to Astra", async () => {
+  it("lets the user clear an edge binding back to Web without workspace", async () => {
     const user = userEvent.setup();
     const onWorkspaceSelectionChange = vi.fn();
     const workspaceSelection: WorkspaceSelection = {
@@ -105,7 +105,7 @@ describe("ComposerPlusMenu environment selection", () => {
 
     await user.click(screen.getByRole("button", { name: "Open add menu" }));
     await user.click(screen.getByRole("button", { name: /Environment/i }));
-    await user.click(screen.getByText("Astra").closest("button")!);
+    await user.click(screen.getByText("Web").closest("button")!);
 
     expect(onWorkspaceSelectionChange).toHaveBeenCalledWith(null);
   });
@@ -127,6 +127,32 @@ describe("ComposerPlusMenu environment selection", () => {
 
     expect(screen.getByText("Bound edge is offline")).toBeInTheDocument();
     expect(screen.getByText("MacBook Pro · /Users/test/astra")).toBeInTheDocument();
+  });
+
+  it("treats a restarted edge with the same workspace as connected", async () => {
+    const user = userEvent.setup();
+    renderMenu({
+      workspaceSelection: {
+        kind: "edge_workspace",
+        edgeAgentId: "edge-old-random",
+        displayName: "MacBook Pro",
+        cwd: "/Users/test/astra",
+      },
+      edgeWorkspaces: [
+        {
+          edge_agent_id: "edge-new-stable",
+          hostname: "MacBook Pro",
+          workspace_dir: "/Users/test/astra",
+          connected_secs: 3,
+        },
+      ],
+    });
+
+    await user.click(screen.getByRole("button", { name: "Open add menu" }));
+    await user.click(screen.getByRole("button", { name: /Environment/i }));
+
+    expect(screen.queryByText("Bound edge is offline")).not.toBeInTheDocument();
+    expect(screen.getByText("MacBook Pro")).toBeInTheDocument();
   });
 });
 
@@ -171,7 +197,7 @@ describe("ComposerEnvironmentChip", () => {
       onWorkspaceSelectionChange,
     });
 
-    await user.click(screen.getByRole("button", { name: "Environment: Astra" }));
+    await user.click(screen.getByRole("button", { name: "Environment: Web" }));
     await user.click(screen.getByText("MacBook Pro").closest("button")!);
 
     expect(onWorkspaceSelectionChange).toHaveBeenCalledWith({

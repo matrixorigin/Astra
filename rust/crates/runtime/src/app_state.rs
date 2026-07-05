@@ -629,6 +629,14 @@ impl AppState {
         self
     }
 
+    pub fn with_tool_execution_service(
+        mut self,
+        tool_execution_service: ToolExecutionService,
+    ) -> Self {
+        self.tool_execution_service = tool_execution_service;
+        self
+    }
+
     pub fn with_task_lease_service(
         mut self,
         task_lease_service: Arc<dyn TaskLeaseService>,
