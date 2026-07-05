@@ -759,6 +759,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_management_provider_does_not_claim_local_background_process_tools() {
+        let reg = CapabilityRegistry::new();
+
+        reg.register(
+            "state-management",
+            Arc::new(stub_provider(
+                vec![ToolCapability::Category(ToolCategory::StateManagement)],
+                5,
+                false,
+            )),
+        )
+        .await
+        .unwrap();
+
+        let task_request = ToolRequest {
+            capability: ToolCapability::Named("task".into()),
+            tool_name: "task".into(),
+            tool_call_id: "call-task".into(),
+            parameters: serde_json::Value::Null,
+            isolation_required: IsolationIntent::None,
+            storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
+        };
+        assert!(
+            reg.resolve(&task_request).await.is_ok(),
+            "durable task-board tool belongs to state management"
+        );
+
+        let background_request = ToolRequest {
+            capability: ToolCapability::Named("task_output".into()),
+            tool_name: "task_output".into(),
+            tool_call_id: "call-bg-task".into(),
+            parameters: serde_json::Value::Null,
+            isolation_required: IsolationIntent::None,
+            storage: None,
+            user_id: "test-user".into(),
+            run_id: "test-run".into(),
+            session_id: "test-session".into(),
+        };
+        assert!(
+            matches!(
+                reg.resolve(&background_request).await,
+                Err(ProviderError::NotCapable { .. })
+            ),
+            "typed background process tools require their own provider category"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_named_tool_does_not_match_category_provider() {
         let reg = CapabilityRegistry::new();
 

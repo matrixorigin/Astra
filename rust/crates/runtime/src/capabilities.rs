@@ -687,16 +687,16 @@ mod tests {
         );
     }
 
-    // ── surface-routed lifecycle tools ──
+    // ── surface-routed backbone and local process tools ──
 
     #[test]
-    fn surface_routed_lifecycle_tools() {
+    fn surface_routed_backbone_and_local_process_tools() {
         use astra_turn_core::capability::{Capability, CapabilitySet};
         use astra_turn_core::tool_surface::{Surface, resolve};
 
         let pool = astra_tools::schemas::all_tool_schemas();
 
-        // ── Plan lifecycle: server-only ──
+        // ── Plan lifecycle: server-owned in web/remote execution ──
         let base_caps = CapabilitySet::empty()
             .with(Capability::AgentSpawner)
             .with(Capability::MemoryService)
@@ -712,7 +712,7 @@ mod tests {
 
         assert!(
             !local_plan.contains(&"enter_plan_mode".to_string()),
-            "plan lifecycle tools are server-only"
+            "this capability pass models server-owned plan lifecycle; CLI local plan mode is injected by the CLI adapter"
         );
         assert!(
             web_plan.contains(&"enter_plan_mode".to_string()),
@@ -723,7 +723,6 @@ mod tests {
             "remote CLI plan visibility must match web"
         );
 
-        // ── Background task tools: local-only ──
         let server_caps = lifecycle_server_capabilities(true, true);
         let local_caps = CapabilitySet::empty()
             .with(Capability::MemoryService)
@@ -731,6 +730,25 @@ mod tests {
             .with(Capability::PlanLifecycle)
             .with(Capability::LocalBackgroundTasks);
 
+        // ── Durable task board: runtime backbone, not CLI-local ──
+        for (surface, names) in [
+            ("web", names(resolve(Surface::Web, &server_caps, &pool))),
+            (
+                "remote CLI",
+                names(resolve(Surface::CliRemote, &server_caps, &pool)),
+            ),
+            (
+                "local CLI",
+                names(resolve(Surface::CliLocal, &local_caps, &pool)),
+            ),
+        ] {
+            assert!(
+                names.contains(&"task".to_string()),
+                "{surface} must expose the durable task-board backbone: {names:?}"
+            );
+        }
+
+        // ── Typed background process tools: local executor only ──
         let web_bg = names(resolve(Surface::Web, &server_caps, &pool));
         let remote_bg = names(resolve(Surface::CliRemote, &server_caps, &pool));
         let local_bg = names(resolve(Surface::CliLocal, &local_caps, &pool));
@@ -790,7 +808,15 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        for visible in ["ask_user", "agent", "tool_search", "web_fetch", "memory"] {
+        for visible in [
+            "ask_user",
+            "agent",
+            "task",
+            "session",
+            "tool_search",
+            "web_fetch",
+            "memory",
+        ] {
             assert!(
                 tool_names.contains(visible),
                 "{visible} should be declared by the server builtin provider"
@@ -810,6 +836,9 @@ mod tests {
             "git_clone",
             "find_definition",
             "find_references",
+            "task_output",
+            "task_stop",
+            "task_list",
         ] {
             assert!(
                 !tool_names.contains(hidden),
