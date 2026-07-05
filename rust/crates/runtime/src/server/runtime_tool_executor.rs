@@ -7275,10 +7275,11 @@ esac
         }
     }
 
-    /// Core plan-mode write guard contract: bash is blocked while a plan is
-    /// in authoring phase, and unblocked after exit_plan_mode(approved=true).
+    /// Core plan-mode write guard contract: mutating bash is blocked while a
+    /// plan is in authoring phase. Read-only bash remains available through
+    /// the args-aware plan-mode policy.
     #[tokio::test]
-    async fn plan_mode_write_guard_blocks_bash_during_authoring_unblocks_after_exit() {
+    async fn plan_mode_write_guard_blocks_mutating_bash_during_authoring() {
         let repo = Arc::new(InMemoryPlanRepo::new());
 
         // Seed a plan in authoring state (has subtasks, all pending, none done).
@@ -7304,13 +7305,21 @@ esac
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
 
-        // ── Phase 1: bash must be blocked ────────────────────────────────
+        // ── Phase 1: mutating bash must be blocked ───────────────────────
         let result = exec
-            .execute("bash", &json!({"command": "echo hello"}))
+            .execute("bash", &json!({"command": "touch plan.txt"}))
             .await;
         assert!(
             result.contains("blocked while plan mode is active"),
-            "bash must be blocked during authoring, got: {result}"
+            "mutating bash must be blocked during authoring, got: {result}"
+        );
+
+        let result = exec
+            .execute("bash", &json!({"command": "ls"}))
+            .await;
+        assert!(
+            !result.contains("blocked while plan mode is active"),
+            "read-only bash must remain available during authoring, got: {result}"
         );
 
         // write_file also blocked.
@@ -7333,13 +7342,13 @@ esac
             "exit_plan_mode must submit, not self-approve, got: {exit_result}"
         );
 
-        // bash remains blocked until a trusted approval clears active_plan_id.
+        // Mutating bash remains blocked until a trusted approval clears active_plan_id.
         let result = exec
-            .execute("bash", &json!({"command": "echo hello"}))
+            .execute("bash", &json!({"command": "touch plan.txt"}))
             .await;
         assert!(
             result.contains("blocked while plan mode is active"),
-            "bash must remain blocked after model-supplied exit_plan_mode, got: {result}"
+            "mutating bash must remain blocked after model-supplied exit_plan_mode, got: {result}"
         );
     }
 

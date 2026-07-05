@@ -368,7 +368,7 @@ pub struct DecisionEnvelope {
 
 pub(crate) fn plan_mode_denial_reason(tool_name: &str) -> String {
     format!(
-        "Tool '{tool_name}' denied by permission mode. Plan mode allows only already-visible read-only tools plus `enter_plan_mode` / `exit_plan_mode`; author the plan, then call `exit_plan_mode(plan=...)`."
+        "Tool '{tool_name}' denied by permission mode. Plan mode keeps the normal tool surface for exploration but allows only read-only invocations plus `enter_plan_mode` / `exit_plan_mode`; author the plan, then call `exit_plan_mode(plan=...)`."
     )
 }
 
@@ -742,8 +742,6 @@ pub fn evaluate_permission(
     if explicit_approval_reason(tool_name, args).is_none()
         && is_read_only_tool_with_args(tool_name, Some(args))
         && ctx.mode() != PermissionMode::Deny
-        && !(ctx.mode() == PermissionMode::Plan
-            && is_plan_mode_unstructured_execute_tool(tool_name))
     {
         let decision = HardDecision::Allow;
         push_matched(
@@ -783,22 +781,17 @@ pub fn evaluate_permission(
             "plan mode ignores mutating allow rules",
         );
         let mode_label = ctx.mode().to_string();
-        // Plan-control tools (`enter_plan_mode` / `exit_plan_mode`)
-        // must remain callable in plan mode — they are the model's
-        // only escape hatch (the `tool_schema_prune` module
-        // deliberately keeps them in the visible schema for the same
-        // reason). Without this exemption schema and runtime
-        // disagree: the model sees `exit_plan_mode`, calls it to
-        // surface its plan, runtime denies it as "denied by permission
-        // mode", and the agent is stuck in plan mode forever.
-        // Regression: session 4cb6b459.
-        if crate::tool::schema::prune::PLAN_MODE_REQUIRED_TOOLS.contains(&tool_name) {
+        // Use the same args-aware plan-mode policy as execution preflight.
+        // This keeps admission and execution aligned: read-only invocations,
+        // plan-control tools, and plan-internal authoring pass; external
+        // implementation side effects are denied.
+        if !crate::plan_mode_policy::is_plan_mode_blocked_tool(tool_name, args) {
             let decision = HardDecision::Allow;
             push_matched(
                 &mut trace,
                 EvaluationStep::Mode,
                 &decision,
-                "plan-control tool — exempt from plan-mode deny",
+                "allowed by plan-mode policy",
             );
             return envelope(
                 decision,
@@ -1049,10 +1042,6 @@ pub fn evaluate_permission(
         will_save,
         risk_tags,
     )
-}
-
-fn is_plan_mode_unstructured_execute_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "bash" | "background_shell" | "powershell")
 }
 
 /// Preview the rule that an "Always allow" action would persist for this call.
@@ -2024,15 +2013,10 @@ mod tests {
             &ctx,
         );
         assert!(
-            matches!(read_only_bash.decision, HardDecision::Deny { .. }),
-            "plan mode must deny shell execution even when args look read-only: {read_only_bash:?}"
+            matches!(read_only_bash.decision, HardDecision::Allow),
+            "plan mode must allow args-aware read-only shell exploration: {read_only_bash:?}"
         );
-        assert_eq!(
-            read_only_bash.source,
-            DecisionSource::Mode {
-                mode: "plan".to_string()
-            }
-        );
+        assert_eq!(read_only_bash.source, DecisionSource::ReadShortCircuit);
     }
 
     #[test]
@@ -2065,7 +2049,7 @@ mod tests {
     fn plan_mode_denial_reason_does_not_special_case_unsupported_plan_tool_shapes() {
         for tool_name in ["session", "agent"] {
             let reason = plan_mode_denial_reason(tool_name);
-            assert!(reason.contains("already-visible read-only tools"));
+            assert!(reason.contains("read-only invocations"));
             assert!(reason.contains("exit_plan_mode(plan=...)"));
             assert!(!reason.contains("no longer routes through"));
             assert!(!reason.contains("Use `exit_plan_mode` directly"));
@@ -2075,7 +2059,7 @@ mod tests {
     #[test]
     fn generic_plan_mode_denial_reason_points_to_exit_tool() {
         let reason = plan_mode_denial_reason("bash");
-        assert!(reason.contains("already-visible read-only tools"));
+        assert!(reason.contains("read-only invocations"));
         assert!(reason.contains("exit_plan_mode(plan=...)"));
     }
 

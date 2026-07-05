@@ -100,7 +100,6 @@ use astra_tools::passive_tsc_check;
 mod shell;
 use astra_tools::env_tools;
 use astra_tools::schemas::all_tool_schemas as full_tool_schemas;
-use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind_with_args};
 pub use env_tools::apply_overlay as apply_env_overlay;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
@@ -218,28 +217,7 @@ pub fn local_tool_schemas() -> Vec<Value> {
 /// session-scoped authoring tools (`task`, memory_*) stay available so the
 /// agent can keep authoring without mutating the external world.
 pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
-    // Legacy standalone tools are always blocked
-    if tool == "task_stop" {
-        return true;
-    }
-
-    // Consolidated `task` tool: block only destructive actions (stop)
-    if tool == "task" {
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        return action == "stop";
-    }
-
-    if matches!(
-        cloud_gated_tool_kind_with_args(tool, Some(args)),
-        Some(CloudGatedToolKind::Write | CloudGatedToolKind::Execute)
-    ) {
-        return true;
-    }
-
-    matches!(
-        tool,
-        "bash" | "write_file" | "str_replace" | "rollback_database_snapshots"
-    )
+    astra_turn_core::plan_mode_policy::is_plan_mode_blocked_tool(tool, args)
 }
 
 fn git_stash_action_args(args: &Value) -> Value {

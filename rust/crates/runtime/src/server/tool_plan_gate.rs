@@ -16,8 +16,8 @@ pub(crate) struct PlanModeSnapshot {
 
 /// Tools that mutate the world outside the session. Blocked while plan mode
 /// is active (`PlanPhase` = Planning|Refining) to mirror the reference agent's
-/// `prepareContextForPlanMode` behaviour: the model must call ExitPlanMode
-/// before writing anything.
+/// permission-overlay behaviour: the model must call ExitPlanMode before
+/// writing anything.
 ///
 /// Read-only tools (grep, glob, read_file, git action=status/diff/log,
 /// web_search) and session-scoped authoring tools (`task`, memory_retrieve,
@@ -281,8 +281,6 @@ mod tests {
     fn plan_mode_blocks_all_write_and_execute_class_tools() {
         for (tool, args) in [
             ("bash", json!({"command": "touch plan.txt"})),
-            ("bash", json!({"command": "git status --short"})),
-            ("bash", json!({"command": "ls src"})),
             ("background_shell", json!({"command": "ls src"})),
             ("powershell", json!({"command": "Get-ChildItem"})),
             ("write_file", json!({"path": "plan.txt", "content": "x"})),
@@ -311,6 +309,8 @@ mod tests {
     fn plan_mode_allows_read_only_exploration_by_args() {
         for (tool, args) in [
             ("read_file", json!({"path": "src/lib.rs"})),
+            ("bash", json!({"command": "git status --short"})),
+            ("bash", json!({"command": "ls src"})),
             ("grep", json!({"pattern": "needle", "path": "src"})),
             ("glob", json!({"pattern": "**/*.rs"})),
             ("list_dir", json!({"path": "src"})),

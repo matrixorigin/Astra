@@ -82,8 +82,14 @@ pub fn prune_tool_schemas(tools: &[Value], tier: CompactionTier) -> Vec<Value> {
 /// for user approval.
 pub const PLAN_MODE_REQUIRED_TOOLS: &[&str] = &["enter_plan_mode", "exit_plan_mode"];
 
-/// Collect schema names from `schemas` that are mutating, so the caller can
-/// merge them into its `restricted_tools` set when entering plan mode.
+/// Legacy helper: collect schema names from `schemas` that a caller may choose
+/// to hide for a schema-pruned planning surface.
+///
+/// Main agent loops should not use this for plan mode. Plan mode is a
+/// permission overlay over a stable capability surface; mutating invocations
+/// should be blocked by `plan_mode_policy`, not hidden from the schema. This
+/// helper remains for narrow callers that intentionally build a reduced
+/// read-only sub-surface.
 ///
 /// Read-only schemas and the [`PLAN_MODE_REQUIRED_TOOLS`] are always kept.
 /// Tools whose category cannot be classified are treated as mutating (fail-safe).

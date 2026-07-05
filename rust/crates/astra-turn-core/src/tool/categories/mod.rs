@@ -612,6 +612,15 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
                 meta_category = ToolCategory::Mutating;
                 meta_flags = NONE;
             }
+            Some("stash")
+                if args
+                    .and_then(|a| a.get("stash_action").or_else(|| a.get("sub_action")))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|action| matches!(action, "list" | "show")) =>
+            {
+                meta_category = ToolCategory::ReadOnly;
+                meta_flags = GR;
+            }
             Some("commit" | "revert_commit" | "stash" | "push") | None => {
                 meta_category = ToolCategory::Mutating;
                 meta_flags = A;
@@ -689,6 +698,14 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
                 "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
                 | "contributors",
             ) => ToolIdempotency::PureRead,
+            Some("stash")
+                if args
+                    .and_then(|a| a.get("stash_action").or_else(|| a.get("sub_action")))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|action| matches!(action, "list" | "show")) =>
+            {
+                ToolIdempotency::PureRead
+            }
             _ => ToolIdempotency::NonIdempotent,
         }
     } else if name == "github" {

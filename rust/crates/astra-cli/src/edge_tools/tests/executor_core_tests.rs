@@ -1068,6 +1068,19 @@ async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
         result.contains("hello"),
         "read_file must return the file contents. Got: {result}"
     );
+
+    let result = executor
+        .execute("bash", &json!({"command": "ls"}))
+        .await;
+
+    assert!(
+        !result.contains("blocked while plan mode is active"),
+        "read-only bash must remain available during plan authoring. Got: {result}"
+    );
+    assert!(
+        result.contains("probe.txt"),
+        "read-only bash should execute in the workspace and observe files. Got: {result}"
+    );
 }
 
 #[tokio::test]
