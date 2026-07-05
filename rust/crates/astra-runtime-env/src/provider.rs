@@ -124,6 +124,7 @@ pub struct CapacityProviderCoverageEntry {
 /// provider declares ownership of the tool, then binding/runtime/policy checks
 /// decide whether the declared tool is actually usable for this turn.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "CapacityProviderDeclarationWire")]
 pub struct CapacityProviderDeclaration {
     pub provider_type: CapacityProviderType,
     pub provider_id: String,
@@ -131,8 +132,57 @@ pub struct CapacityProviderDeclaration {
     pub tool_names: BTreeSet<String>,
     #[serde(default)]
     pub tool_schema_digests: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CapacityProviderDeclarationWire {
+    provider_type: CapacityProviderType,
+    provider_id: String,
     #[serde(default)]
-    pub dynamic_prefixes: Vec<String>,
+    tool_names: BTreeSet<String>,
+    #[serde(default)]
+    tool_schema_digests: BTreeMap<String, String>,
+}
+
+impl TryFrom<CapacityProviderDeclarationWire> for CapacityProviderDeclaration {
+    type Error = String;
+
+    fn try_from(raw: CapacityProviderDeclarationWire) -> Result<Self, Self::Error> {
+        let provider_id = validate_provider_id(raw.provider_id)?;
+        let tool_names: BTreeSet<String> = raw
+            .tool_names
+            .into_iter()
+            .map(|tool_name| validate_declared_tool_name_for_provider(raw.provider_type, tool_name))
+            .collect::<Result<_, _>>()?;
+
+        for tool_name in raw.tool_schema_digests.keys() {
+            validate_declared_tool_name_for_provider(raw.provider_type, tool_name.clone())?;
+            if !tool_names.contains(tool_name) {
+                return Err(format!(
+                    "provider schema digest key must reference a declared tool name: {tool_name}"
+                ));
+            }
+        }
+
+        let tool_schema_digests = tool_names
+            .iter()
+            .map(|tool_name| {
+                let digest = raw
+                    .tool_schema_digests
+                    .get(tool_name)
+                    .cloned()
+                    .unwrap_or_else(|| canonical_tool_name_digest(tool_name));
+                (tool_name.clone(), digest)
+            })
+            .collect();
+
+        Ok(Self {
+            provider_type: raw.provider_type,
+            provider_id,
+            tool_names,
+            tool_schema_digests,
+        })
+    }
 }
 
 pub trait CapacityProvider {
@@ -152,10 +202,6 @@ impl CapacityProvider for CapacityProviderDeclaration {
 
     fn declares_tool(&self, tool_name: &str) -> bool {
         self.tool_names.contains(tool_name)
-            || self
-                .dynamic_prefixes
-                .iter()
-                .any(|prefix| tool_name.starts_with(prefix))
     }
 }
 
@@ -165,17 +211,20 @@ impl CapacityProviderDeclaration {
         provider_id: impl Into<String>,
         tool_names: impl IntoIterator<Item = String>,
     ) -> Self {
-        let tool_names: BTreeSet<String> = tool_names.into_iter().collect();
+        let provider_id = canonical_provider_id(provider_id);
+        let tool_names: BTreeSet<String> = tool_names
+            .into_iter()
+            .map(|tool_name| canonical_declared_tool_name_for_provider(provider_type, tool_name))
+            .collect();
         let tool_schema_digests = tool_names
             .iter()
             .map(|name| (name.clone(), canonical_tool_name_digest(name)))
             .collect();
         Self {
             provider_type,
-            provider_id: provider_id.into(),
+            provider_id,
             tool_names,
             tool_schema_digests,
-            dynamic_prefixes: Vec::new(),
         }
     }
 
@@ -185,25 +234,22 @@ impl CapacityProviderDeclaration {
         registry: &ToolRegistry,
         mut predicate: impl FnMut(&ToolSpec) -> bool,
     ) -> Self {
+        let provider_id = canonical_provider_id(provider_id);
         let mut declaration = Self {
             provider_type,
-            provider_id: provider_id.into(),
+            provider_id,
             tool_names: BTreeSet::new(),
             tool_schema_digests: BTreeMap::new(),
-            dynamic_prefixes: Vec::new(),
         };
         for spec in registry.iter().filter(|spec| predicate(spec)) {
-            declaration.tool_names.insert(spec.name.clone());
+            let tool_name =
+                canonical_declared_tool_name_for_provider(provider_type, spec.name.clone());
+            declaration.tool_names.insert(tool_name.clone());
             declaration
                 .tool_schema_digests
-                .insert(spec.name.clone(), canonical_tool_spec_digest(spec));
+                .insert(tool_name, canonical_tool_spec_digest(spec));
         }
         declaration
-    }
-
-    pub fn with_dynamic_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.dynamic_prefixes.push(prefix.into());
-        self
     }
 
     pub fn with_tool_schema_digest(
@@ -211,7 +257,7 @@ impl CapacityProviderDeclaration {
         tool_name: impl Into<String>,
         schema_digest: impl Into<String>,
     ) -> Self {
-        let tool_name = tool_name.into();
+        let tool_name = canonical_declared_tool_name_for_provider(self.provider_type, tool_name);
         self.tool_names.insert(tool_name.clone());
         self.tool_schema_digests
             .insert(tool_name, schema_digest.into());
@@ -294,7 +340,7 @@ impl CapacityProviderCoverageEntry {
     ) -> Self {
         Self {
             provider_type,
-            provider_id: provider_id.into(),
+            provider_id: canonical_provider_id(provider_id),
             status: CapacityProviderStatus::Ready,
             capabilities,
             unavailable_reason: None,
@@ -309,7 +355,7 @@ impl CapacityProviderCoverageEntry {
     ) -> Self {
         Self {
             provider_type,
-            provider_id: provider_id.into(),
+            provider_id: canonical_provider_id(provider_id),
             status,
             capabilities: Vec::new(),
             unavailable_reason: Some(reason.into()),
@@ -496,6 +542,10 @@ pub fn request_scoped_mcp_provider(
     provider_id: impl Into<String>,
     tool_names: impl IntoIterator<Item = String>,
 ) -> CapacityProviderDeclaration {
+    let tool_names = tool_names
+        .into_iter()
+        .map(canonical_request_scoped_mcp_tool_name)
+        .collect::<Vec<_>>();
     CapacityProviderDeclaration::new(
         CapacityProviderType::RequestScopedMcp,
         provider_id,
@@ -529,6 +579,48 @@ pub fn request_scoped_mcp_provider_from_schemas(
 
 fn labels<const N: usize>(values: [&'static str; N]) -> Vec<String> {
     values.into_iter().map(str::to_string).collect()
+}
+
+fn canonical_provider_id(provider_id: impl Into<String>) -> String {
+    validate_provider_id(provider_id).unwrap_or_else(|message| panic!("{message}"))
+}
+
+fn canonical_declared_tool_name_for_provider(
+    provider_type: CapacityProviderType,
+    tool_name: impl Into<String>,
+) -> String {
+    validate_declared_tool_name_for_provider(provider_type, tool_name)
+        .unwrap_or_else(|message| panic!("{message}"))
+}
+
+fn canonical_request_scoped_mcp_tool_name(tool_name: impl Into<String>) -> String {
+    canonical_declared_tool_name_for_provider(CapacityProviderType::RequestScopedMcp, tool_name)
+}
+
+fn validate_provider_id(provider_id: impl Into<String>) -> Result<String, String> {
+    let provider_id = provider_id.into();
+    if !is_valid_provider_id(&provider_id) {
+        return Err(format!("invalid capacity provider id: {provider_id}"));
+    }
+    Ok(provider_id)
+}
+
+fn validate_declared_tool_name_for_provider(
+    provider_type: CapacityProviderType,
+    tool_name: impl Into<String>,
+) -> Result<String, String> {
+    let tool_name = tool_name.into();
+    if !is_valid_tool_offer_tool_name(&tool_name) {
+        return Err(format!("invalid provider-declared tool name: {tool_name}"));
+    }
+    if provider_type == CapacityProviderType::RequestScopedMcp
+        && !is_mcp_namespaced_tool_name(&tool_name)
+    {
+        return Err(format!(
+            "request-scoped MCP provider tool name must be namespaced: {tool_name}"
+        ));
+    }
+    Ok(tool_name)
 }
 
 #[cfg(test)]
@@ -575,6 +667,123 @@ mod tests {
         assert!(!is_valid_tool_offer_id("web_fetch@edge@macpro"));
         assert!(!is_valid_tool_offer_id("web.fetch@server-builtin"));
         assert!(!is_valid_tool_offer_id("web_fetch@edge/macpro"));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid capacity provider id")]
+    fn provider_declaration_rejects_invalid_provider_id_at_construction() {
+        let _ = CapacityProviderDeclaration::new(
+            CapacityProviderType::EdgeCapacity,
+            "edge@macpro",
+            ["bash".to_string()],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid provider-declared tool name")]
+    fn provider_declaration_rejects_invalid_tool_name_at_construction() {
+        let _ = CapacityProviderDeclaration::new(
+            CapacityProviderType::ServerService,
+            "server-builtin",
+            ["web.fetch".to_string()],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid capacity provider id")]
+    fn provider_coverage_rejects_invalid_provider_id_at_construction() {
+        let _ = CapacityProviderCoverageEntry::ready(
+            CapacityProviderType::RequestScopedMcp,
+            "mcp@github",
+            vec!["mcp__github__search".to_string()],
+        );
+    }
+
+    #[test]
+    fn provider_declaration_deserialization_enforces_canonical_ids() {
+        let provider: CapacityProviderDeclaration = serde_json::from_value(serde_json::json!({
+            "provider_type": "edge_capacity",
+            "provider_id": "edge:macpro.local",
+            "tool_names": ["bash"]
+        }))
+        .expect("valid provider declaration should deserialize");
+
+        assert!(provider.declares_tool("bash"));
+        assert_eq!(provider.provider_id, "edge:macpro.local");
+
+        let invalid_provider =
+            serde_json::from_value::<CapacityProviderDeclaration>(serde_json::json!({
+                "provider_type": "edge_capacity",
+                "provider_id": "edge@macpro",
+                "tool_names": ["bash"]
+            }))
+            .expect_err("invalid provider id must fail deserialization");
+        assert!(
+            invalid_provider
+                .to_string()
+                .contains("invalid capacity provider id")
+        );
+
+        let invalid_tool =
+            serde_json::from_value::<CapacityProviderDeclaration>(serde_json::json!({
+                "provider_type": "server_service",
+                "provider_id": "server-builtin",
+                "tool_names": ["web.fetch"]
+            }))
+            .expect_err("invalid tool name must fail deserialization");
+        assert!(
+            invalid_tool
+                .to_string()
+                .contains("invalid provider-declared tool name")
+        );
+    }
+
+    #[test]
+    fn provider_declaration_deserialization_ignores_legacy_dynamic_prefixes() {
+        let provider: CapacityProviderDeclaration = serde_json::from_value(serde_json::json!({
+            "provider_type": "request_scoped_mcp",
+            "provider_id": "mcp",
+            "tool_names": [],
+            "dynamic_prefixes": ["mcp__"]
+        }))
+        .expect("unknown legacy dynamic prefix field should not affect provider declaration");
+
+        assert!(!provider.declares_tool("mcp__ghost__query"));
+    }
+
+    #[test]
+    fn request_scoped_mcp_deserialization_rejects_non_namespaced_tools() {
+        let error = serde_json::from_value::<CapacityProviderDeclaration>(serde_json::json!({
+            "provider_type": "request_scoped_mcp",
+            "provider_id": "mcp",
+            "tool_names": ["web_fetch"]
+        }))
+        .expect_err("request-scoped MCP must not advertise canonical non-MCP tools implicitly");
+
+        assert!(
+            error
+                .to_string()
+                .contains("request-scoped MCP provider tool name must be namespaced")
+        );
+    }
+
+    #[test]
+    fn provider_declaration_deserialization_rejects_orphan_schema_digest_keys() {
+        let error = serde_json::from_value::<CapacityProviderDeclaration>(serde_json::json!({
+            "provider_type": "server_service",
+            "provider_id": "server-builtin",
+            "tool_names": ["web_fetch"],
+            "tool_schema_digests": {
+                "web_search": "sha256:unexpected"
+            }
+        }))
+        .expect_err("schema digest keys must be scoped to declared tools");
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider schema digest key must reference a declared tool name")
+        );
     }
 
     #[test]
@@ -703,6 +912,19 @@ mod tests {
 
         assert!(provider.declares_tool("mcp__weather"));
         assert!(!provider.declares_tool("mcp__calculator"));
+    }
+
+    #[test]
+    #[should_panic(expected = "request-scoped MCP provider tool name must be namespaced")]
+    fn request_scoped_mcp_provider_rejects_non_mcp_tool_names_without_compatibility_offer() {
+        let _ = request_scoped_mcp_provider("mcp", ["web_fetch".to_string()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid provider-declared tool name")]
+    fn provider_schema_digest_rejects_invalid_tool_name() {
+        let _ = server_service_provider("server", &ToolRegistry::builtins())
+            .with_tool_schema_digest("web.fetch", "sha256:invalid");
     }
 
     #[test]

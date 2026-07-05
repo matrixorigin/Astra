@@ -3,11 +3,11 @@
 /// Offer ids are runtime/control-plane identifiers. They must not be embedded
 /// into prompt-visible tool schemas.
 pub fn tool_offer_id(tool_name: &str, provider_id: &str) -> String {
-    debug_assert!(
+    assert!(
         is_valid_tool_offer_tool_name(tool_name),
         "invalid tool name for offer id: {tool_name}"
     );
-    debug_assert!(
+    assert!(
         is_valid_provider_id(provider_id),
         "invalid provider id for offer id: {provider_id}"
     );
@@ -100,5 +100,17 @@ mod tests {
         assert!(!is_valid_tool_offer_id("web_fetch@edge@macpro"));
         assert!(!is_valid_tool_offer_id("web.fetch@server-builtin"));
         assert!(!is_valid_tool_offer_id("web_fetch@edge/macpro"));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid provider id for offer id")]
+    fn tool_offer_id_rejects_invalid_provider_ids_in_release() {
+        let _ = tool_offer_id("web_fetch", "edge@macpro");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid tool name for offer id")]
+    fn tool_offer_id_rejects_invalid_tool_names_in_release() {
+        let _ = tool_offer_id("web.fetch", "server-builtin");
     }
 }
