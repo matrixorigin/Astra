@@ -26,7 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::{AgentProgressEvent, ProgressEventType};
 use crate::server::tool_admission::{
-    ToolAdmissionContext, resolve_tool_admission_for_binding_with_context,
+    ToolAdmissionContext, has_explicit_runtime_executor_provider,
+    resolve_tool_admission_for_binding_with_context,
 };
 use crate::server::tool_route_selection::{
     ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding, routing_decision_for_binding,
@@ -1063,6 +1064,11 @@ pub struct ServerAgenticLoopHost {
     /// `edge_tools`, this surface may include server-service/control-plane,
     /// request-scoped MCP, edge, sandbox, or managed-runtime tools.
     tool_schemas: Vec<Value>,
+    /// Provider-advertised schema pool used only for admission diagnostics.
+    /// This intentionally includes schemas hidden from the prompt by
+    /// readiness/policy so introspect can explain why they are unavailable
+    /// without changing the LLM-visible `tools[]` payload.
+    admission_tool_schemas: Vec<Value>,
     capabilities: astra_turn_core::capability::CapabilitySet,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
@@ -1534,6 +1540,24 @@ impl ServerAgenticLoopHostBuilder {
         } else {
             Vec::new()
         };
+        let mut admission_tool_schemas = Vec::new();
+        if self.server_tool_catalog_enabled {
+            append_tool_schemas_unique(
+                &mut admission_tool_schemas,
+                crate::capabilities::server_builtin_tool_schemas(&self.capabilities),
+            );
+            if has_explicit_runtime_executor_provider(
+                &schema_workspace,
+                &schema_executor,
+                schema_runtime.as_ref(),
+            ) {
+                append_tool_schemas_unique(
+                    &mut admission_tool_schemas,
+                    crate::capabilities::runtime_executor_tool_schemas(&self.capabilities),
+                );
+            }
+        }
+        append_tool_schemas_unique(&mut admission_tool_schemas, self.edge_tools.clone());
         let server_catalog_tool_surface = !server_catalog_tools.is_empty();
         let tool_schemas = if self.edge_tools.is_empty() {
             server_catalog_tools
@@ -1594,6 +1618,7 @@ impl ServerAgenticLoopHostBuilder {
             resolved_llm_config: None,
             resolved_llm_config_at: None,
             tool_schemas,
+            admission_tool_schemas,
             capabilities: self.capabilities,
             edge_profile: self.edge_profile,
             valid_tools,
@@ -1707,6 +1732,21 @@ where
         .as_ref()
         .and_then(|handle| handle.try_read().ok().map(|guard| guard.clone()))
         .unwrap_or_default()
+}
+
+fn append_tool_schemas_unique(surface: &mut Vec<Value>, candidates: Vec<Value>) {
+    let mut seen: HashSet<String> = surface
+        .iter()
+        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+        .collect();
+    for schema in candidates {
+        let Some(name) = tool_schema_name(&schema) else {
+            continue;
+        };
+        if seen.insert(name.to_string()) {
+            surface.push(schema);
+        }
+    }
 }
 
 fn append_server_owned_tool_schemas_unique(
@@ -1935,6 +1975,7 @@ impl ServerAgenticLoopHost {
     /// so the LLM sees MCP tools and the validator admits them.
     pub fn install_runtime_tool_schemas(&mut self, schemas: Vec<Value>) {
         let source_schemas = schemas;
+        append_tool_schemas_unique(&mut self.admission_tool_schemas, source_schemas.clone());
         let mut context = self.tool_admission_context();
         context.request_scoped_mcp_provider_ready |= source_schemas
             .iter()
@@ -3487,8 +3528,10 @@ impl ServerAgenticLoopHost {
         &self,
     ) -> Vec<astra_turn_core::introspect::ToolAdmissionSnapshotEntry> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut snapshot_schemas = self.admission_tool_schemas.clone();
+        append_tool_schemas_unique(&mut snapshot_schemas, self.tool_schemas.clone());
         let mut seen = HashSet::new();
-        self.tool_schemas
+        snapshot_schemas
             .iter()
             .filter_map(tool_schema_name)
             .filter(|name| seen.insert((*name).to_string()))
@@ -9101,6 +9144,61 @@ mod tests {
         );
         assert!(web_fetch.candidates.iter().any(|candidate| {
             candidate.offer_id == "web_fetch@server-builtin"
+                && candidate.reason == "CurrentProviderPreferred"
+        }));
+    }
+
+    #[test]
+    fn tool_admission_snapshot_reports_unavailable_selected_edge_offer() {
+        let offline_edge_snapshot = ExecutionBindingSnapshot::new(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                crate::server::tool_transport::ExecutorStatus::Offline,
+            ),
+            astra_runtime_env::RuntimeBinding::host_process("edge-host"),
+        );
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools_with_web_fetch())
+        .with_execution_binding_snapshot(offline_edge_snapshot)
+        .build();
+
+        let admission = host.tool_admission_snapshot_entries();
+        let web_fetch = admission
+            .iter()
+            .find(|entry| entry.tool_name == "web_fetch")
+            .expect("web_fetch admission entry");
+
+        assert!(!web_fetch.visible);
+        assert_eq!(
+            web_fetch.selected_offer_id.as_deref(),
+            Some("web_fetch@edge-1")
+        );
+        assert_eq!(web_fetch.selected_route, "EdgeBound");
+        assert_eq!(
+            web_fetch.hidden_reason.as_deref(),
+            Some("ProviderUnavailable")
+        );
+        assert!(web_fetch.candidates.iter().any(|candidate| {
+            candidate.offer_id == "web_fetch@edge-1"
+                && candidate.selected
+                && candidate.readiness == "offline"
+                && candidate.reason == "ProviderUnavailable"
+        }));
+        assert!(web_fetch.candidates.iter().any(|candidate| {
+            candidate.offer_id == "web_fetch@server-builtin"
+                && !candidate.selected
                 && candidate.reason == "CurrentProviderPreferred"
         }));
     }

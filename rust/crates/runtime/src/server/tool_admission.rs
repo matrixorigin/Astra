@@ -29,6 +29,7 @@ pub(crate) struct ToolOffer {
 pub(crate) enum ToolOfferCandidateReason {
     Selected,
     Disabled,
+    ProviderUnavailable,
     ProviderToolNotAllowed,
     CurrentProviderPreferred,
     LowerPriority,
@@ -48,6 +49,7 @@ pub(crate) struct ToolOfferCandidate {
 pub(crate) enum ToolHiddenReason {
     UnknownTool,
     NoProvider,
+    ProviderUnavailable,
     ProviderRouteMismatch,
     UnsupportedRoute,
     SchemaConflict,
@@ -149,11 +151,23 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     let route =
         routing_decision_for_binding(tool_name, workspace.kind, executor.transport, registry);
 
-    let raw_candidates = if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
+    let mut raw_candidates = if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
         Vec::new()
     } else {
         candidate_offers_for_tool(tool_name, workspace, providers)
     };
+    let selected_unready_offer = if !matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
+        selected_unready_offer_for_route(tool_name, workspace, executor, route, providers, registry)
+    } else {
+        None
+    };
+    if let Some(offer) = selected_unready_offer.as_ref()
+        && !raw_candidates
+            .iter()
+            .any(|candidate| candidate.offer_id == offer.offer_id)
+    {
+        raw_candidates.push(offer.clone());
+    }
     let schema_conflict = has_schema_conflict_for_enabled_candidates(&raw_candidates, context);
 
     let selected_offer_before_policy =
@@ -181,6 +195,9 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
         if schema_conflict {
             return Some(ToolHiddenReason::SchemaConflict);
         }
+        if selected_unready_offer.is_some() {
+            return Some(ToolHiddenReason::ProviderUnavailable);
+        }
         if !providers
             .iter()
             .any(|provider| provider.declares_tool(tool_name))
@@ -202,7 +219,9 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
         }
         None
     });
-    let selected_offer = if matches!(
+    let selected_offer = if hidden_reason == Some(ToolHiddenReason::ProviderUnavailable) {
+        selected_unready_offer
+    } else if matches!(
         hidden_reason,
         None | Some(ToolHiddenReason::DisabledOffer)
             | Some(ToolHiddenReason::DisabledTool)
@@ -224,6 +243,8 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
                 !provider_allows_tool(context, &offer.provider_id, &offer.tool_name);
             let reason = if schema_conflict {
                 ToolOfferCandidateReason::SchemaConflict
+            } else if !provider_readiness_is_executable(offer.readiness) {
+                ToolOfferCandidateReason::ProviderUnavailable
             } else if disabled {
                 ToolOfferCandidateReason::Disabled
             } else if provider_disallowed {
@@ -387,6 +408,66 @@ fn candidate_offers_for_tool(
             )
         })
         .collect()
+}
+
+fn selected_unready_offer_for_route(
+    tool_name: &str,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    route: ToolExecutionRouteKind,
+    ready_providers: &[CapacityProviderDeclaration],
+    registry: &astra_runtime_env::ToolRegistry,
+) -> Option<ToolOffer> {
+    let provider_type = provider_type_for_route(route, workspace.kind)?;
+    if matches!(
+        provider_type,
+        CapacityProviderType::ServerService
+            | CapacityProviderType::ControlPlane
+            | CapacityProviderType::RequestScopedMcp
+            | CapacityProviderType::CliLocal
+            | CapacityProviderType::Unknown
+    ) {
+        return None;
+    }
+    if ready_providers.iter().any(|provider| {
+        provider.provider_type == provider_type && provider.declares_tool(tool_name)
+    }) {
+        return None;
+    }
+    if !matches!(
+        workspace.authority,
+        WorkspaceAuthority::ReadOnly | WorkspaceAuthority::ReadWrite
+    ) {
+        return None;
+    }
+
+    let provider_id = runtime_execution_provider_id_for_executor(executor);
+    let provider =
+        astra_runtime_env::runtime_workspace_provider(provider_type, provider_id, registry);
+    if !provider.declares_tool(tool_name) {
+        return None;
+    }
+    let readiness = capacity_provider_status_for_executor_status(executor.status);
+    if provider_readiness_is_executable(readiness) {
+        return None;
+    }
+    Some(offer_for_provider(tool_name, &provider, route, readiness))
+}
+
+fn capacity_provider_status_for_executor_status(status: ExecutorStatus) -> CapacityProviderStatus {
+    match status {
+        ExecutorStatus::Online => CapacityProviderStatus::Ready,
+        ExecutorStatus::Degraded => CapacityProviderStatus::Degraded,
+        ExecutorStatus::Offline => CapacityProviderStatus::Offline,
+        ExecutorStatus::Unknown => CapacityProviderStatus::Unknown,
+    }
+}
+
+fn provider_readiness_is_executable(readiness: CapacityProviderStatus) -> bool {
+    matches!(
+        readiness,
+        CapacityProviderStatus::Ready | CapacityProviderStatus::Degraded
+    )
 }
 
 fn candidate_reason(
@@ -736,15 +817,71 @@ mod tests {
         assert_eq!(decision.route, ToolExecutionRouteKind::EdgeBound);
         assert_eq!(
             decision.hidden_reason,
-            Some(ToolHiddenReason::ProviderRouteMismatch)
+            Some(ToolHiddenReason::ProviderUnavailable)
         );
-        assert!(decision.selected_offer.is_none());
-        assert_eq!(decision.candidates.len(), 1);
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
+        assert_eq!(decision.candidates.len(), 2);
+        let edge_candidate = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.offer.offer_id == "web_fetch@edge-macpro")
+            .expect("offline selected edge candidate");
+        assert!(edge_candidate.selected);
         assert_eq!(
-            decision.candidates[0].offer.offer_id,
-            "web_fetch@server-builtin"
+            edge_candidate.reason,
+            ToolOfferCandidateReason::ProviderUnavailable
         );
-        assert!(!decision.candidates[0].selected);
+        assert_eq!(
+            edge_candidate.offer.readiness,
+            CapacityProviderStatus::Offline
+        );
+        let server_candidate = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.offer.offer_id == "web_fetch@server-builtin")
+            .expect("server candidate");
+        assert!(!server_candidate.selected);
+        assert_eq!(
+            server_candidate.reason,
+            ToolOfferCandidateReason::CurrentProviderPreferred
+        );
+    }
+
+    #[test]
+    fn unknown_selected_runtime_provider_is_hidden_with_candidate_diagnostics() {
+        let decision = resolve_tool_admission_for_binding(
+            "read_file",
+            &[],
+            &WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadOnly,
+            ),
+            &ExecutorBinding::edge_agent(
+                "edge-macpro",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Unknown,
+            ),
+            None,
+            &registry(),
+        );
+
+        assert!(!decision.visible);
+        assert_eq!(decision.route, ToolExecutionRouteKind::EdgeBound);
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::ProviderUnavailable)
+        );
+        assert_eq!(decision.selected_offer_id(), Some("read_file@edge-macpro"));
+        assert_eq!(decision.candidates.len(), 1);
+        let candidate = &decision.candidates[0];
+        assert!(candidate.selected);
+        assert_eq!(
+            candidate.reason,
+            ToolOfferCandidateReason::ProviderUnavailable
+        );
+        assert_eq!(candidate.offer.readiness, CapacityProviderStatus::Unknown);
     }
 
     #[test]

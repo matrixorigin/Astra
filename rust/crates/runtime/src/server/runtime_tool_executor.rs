@@ -1611,6 +1611,9 @@ fn admission_hidden_reason_to_unavailable(
         ToolHiddenReason::NoProvider => Some(ToolUnavailableReason::ExecutorUnavailable(
             "no capacity provider declares this tool for the current binding".to_string(),
         )),
+        ToolHiddenReason::ProviderUnavailable => Some(ToolUnavailableReason::ExecutorUnavailable(
+            "the selected capacity provider is not ready for this binding".to_string(),
+        )),
         ToolHiddenReason::ProviderRouteMismatch => {
             Some(ToolUnavailableReason::ExecutorUnavailable(
                 "no capacity provider matches the selected execution route".to_string(),
