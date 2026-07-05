@@ -117,12 +117,25 @@ pub(super) fn execution_result_is_error(
 }
 
 fn execution_error_kind(
+    result_str: &str,
     tool_result_fields: Option<&Map<String, Value>>,
 ) -> Option<astra_core::ErrorKind> {
     tool_result_fields
         .and_then(|fields| fields.get("error_kind"))
         .and_then(serde_json::Value::as_str)
         .and_then(astra_core::ErrorKind::parse_tag)
+        .or_else(|| structured_output_error_kind(result_str))
+}
+
+fn structured_output_error_kind(result_str: &str) -> Option<astra_core::ErrorKind> {
+    serde_json::from_str::<Value>(result_str)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error_kind")
+                .and_then(Value::as_str)
+                .and_then(astra_core::ErrorKind::parse_tag)
+        })
 }
 
 #[cfg(test)]
@@ -228,7 +241,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &execution.result_str,
             execution.tool_result_fields.as_ref(),
         );
-        let source_error_kind = execution_error_kind(execution.tool_result_fields.as_ref());
+        let source_error_kind =
+            execution_error_kind(&execution.result_str, execution.tool_result_fields.as_ref());
         let tool_already_restricted = self.ctx.restricted_tools.contains(&execution.name);
         let quiet = self.ctx.quiet;
         let term = &mut self.ctx.term;
@@ -266,6 +280,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &execution.name,
             &mut execution.result_str,
             source_error_kind,
+            is_err,
             resource_limit_recorded,
             self.ctx.turn_guard,
         );

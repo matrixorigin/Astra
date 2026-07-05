@@ -1431,10 +1431,21 @@ mod context_cache_contract_tests {
             .filter_map(|message| message.get("content").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(user_text.contains("[active-turn-frame:v1]"));
-        assert!(user_text.contains("\"turn_id\":7"));
-        assert!(user_text.contains("\"round_id\":3"));
         assert!(user_text.contains("相关的测试够硬核吗"));
+        assert!(
+            !user_text.contains("[active-turn-frame:v1]"),
+            "runtime goal frame must not be rendered as user intent"
+        );
+        let system_text = messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(system_text.contains("[active-turn-frame:v1]"));
+        assert!(system_text.contains("\"turn_id\":7"));
+        assert!(system_text.contains("\"round_id\":3"));
+        assert!(system_text.contains("相关的测试够硬核吗"));
         assert!(
             state.volatile_pending.is_empty(),
             "active frame must be one-shot per LLM request"

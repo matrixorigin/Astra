@@ -62,6 +62,7 @@ mod state_builder;
 pub mod sweeper_lease;
 mod task_handlers;
 pub mod team;
+pub(crate) mod tool_admission;
 pub(crate) mod tool_agent_info;
 pub(crate) mod tool_agent_runtime;
 pub(crate) mod tool_approval_preflight;

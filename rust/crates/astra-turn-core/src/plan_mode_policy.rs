@@ -21,11 +21,11 @@ fn is_plan_internal_authoring_tool(tool_name: &str, args: &Value) -> bool {
     match tool_name {
         "memory" => matches!(
             args.get("action").and_then(Value::as_str),
-            Some("recall" | "expand" | "profile")
+            Some("recall" | "expand" | "profile" | "remember" | "update")
         ),
         "task" => matches!(
             args.get("action").and_then(Value::as_str),
-            Some("list" | "get" | "list_user")
+            Some("create" | "update" | "list" | "get" | "list_user" | "adopt")
         ),
         "task_output" | "task_list" => true,
         _ => false,
@@ -36,6 +36,29 @@ fn is_plan_internal_authoring_tool(tool_name: &str, args: &Value) -> bool {
 /// their command text appears read-only.
 fn is_persistent_execution_surface(tool_name: &str) -> bool {
     matches!(tool_name, "background_shell")
+}
+
+fn is_plan_read_only_bash(args: &Value) -> bool {
+    let Some(command) = args.get("command").and_then(Value::as_str).map(str::trim) else {
+        return false;
+    };
+    let command = command.strip_prefix("cd ").map_or(command, |rest| {
+        rest.split_once("&&")
+            .map(|(_, tail)| tail.trim())
+            .unwrap_or(rest)
+    });
+    matches!(
+        command.split_whitespace().next(),
+        Some("ls" | "pwd" | "grep" | "find" | "rg" | "cat" | "head" | "tail" | "wc")
+    ) || command.starts_with("git status")
+        || command.starts_with("git diff")
+        || command.starts_with("git log")
+        || command.starts_with("git show")
+        || command.starts_with("git blame")
+        || command.starts_with("cargo check")
+        || command.starts_with("cargo test")
+        || command.starts_with("make check")
+        || command.starts_with("make test")
 }
 
 /// Returns true when a tool invocation must be blocked while plan authoring is
@@ -50,6 +73,9 @@ pub fn is_plan_mode_blocked_tool(tool_name: &str, args: &Value) -> bool {
     }
     if is_persistent_execution_surface(tool_name) {
         return true;
+    }
+    if tool_name == "bash" {
+        return !is_plan_read_only_bash(args);
     }
     crate::tool::categories::classify(tool_name, Some(args))
         .category
@@ -104,15 +130,6 @@ mod tests {
             ("run_script", json!({"script": "touch plan.txt"})),
             ("rollback_database_snapshots", json!({})),
             ("background_shell", json!({"command": "ls rust"})),
-            (
-                "task",
-                json!({"action": "create", "title": "draft plan item"}),
-            ),
-            ("task", json!({"action": "update", "task_id": "t1"})),
-            (
-                "memory",
-                json!({"action": "remember", "content": "plan context"}),
-            ),
         ] {
             assert!(
                 is_plan_mode_blocked_tool(tool, &args),
@@ -127,8 +144,17 @@ mod tests {
             ("list_dir", json!({"path": "src"})),
             ("enter_plan_mode", json!({})),
             ("exit_plan_mode", json!({"plan": "1. inspect"})),
+            (
+                "task",
+                json!({"action": "create", "title": "draft plan item"}),
+            ),
+            ("task", json!({"action": "update", "task_id": "t1"})),
             ("task", json!({"action": "list"})),
             ("task", json!({"action": "get", "task_id": "t1"})),
+            (
+                "memory",
+                json!({"action": "remember", "content": "plan context"}),
+            ),
             (
                 "memory",
                 json!({"action": "recall", "query": "plan context"}),

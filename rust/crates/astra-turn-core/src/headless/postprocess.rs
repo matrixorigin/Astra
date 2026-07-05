@@ -82,11 +82,14 @@ pub fn append_headless_result_quality_feedback(
     name: &str,
     result_str: &mut String,
     source_error_kind: Option<ErrorCategory>,
+    execution_failed: bool,
     resource_limit_recorded: bool,
     turn_guard: &mut TurnGuard,
 ) -> ResultQuality {
     let result_quality = if resource_limit_recorded {
         ResultQuality::Error
+    } else if execution_failed {
+        turn_guard.record_failed_tool_result_with_kind(name, result_str.as_str(), source_error_kind)
     } else {
         turn_guard.record_tool_result_with_kind(name, result_str.as_str(), source_error_kind)
     };
@@ -332,9 +335,37 @@ mod tests {
     fn append_feedback_after_success() {
         let mut tg = TurnGuard::new();
         let mut out = "ok".to_string();
-        let _q = append_headless_result_quality_feedback("bash", &mut out, None, false, &mut tg);
+        let _q =
+            append_headless_result_quality_feedback("bash", &mut out, None, false, false, &mut tg);
         // May or may not append depending on classifier; string should remain valid UTF-8.
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn append_feedback_preserves_structured_execution_failure() {
+        let mut tg = TurnGuard::new();
+        let mut out = json!({
+            "status": "failed",
+            "error": "Unknown tool `outline`",
+            "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
+            "retryable": false
+        })
+        .to_string();
+        out.push_str("\nadditional recovery guidance");
+
+        let quality = append_headless_result_quality_feedback(
+            "outline",
+            &mut out,
+            Some(astra_core::ErrorKind::ToolNotFound),
+            true,
+            false,
+            &mut tg,
+        );
+
+        assert_eq!(quality, ResultQuality::Error);
+        let health = tg.health.get("outline").expect("tool health");
+        assert_eq!(health.total_failures, 1);
+        assert_eq!(health.consecutive_failures, 1);
     }
 
     #[test]

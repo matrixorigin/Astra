@@ -58,17 +58,6 @@ impl ToolExecutionClass {
             Self::RuntimeExecutor | Self::Unknown => false,
         }
     }
-
-    pub(crate) fn visibility_without_route(self) -> Option<bool> {
-        match self {
-            Self::ServerControlPlane
-            | Self::ServerService
-            | Self::RequestScopedMcp
-            | Self::TurnPipelineIntercept => Some(true),
-            Self::Unknown => Some(false),
-            Self::SharedServiceOrRuntime | Self::RuntimeExecutor => None,
-        }
-    }
 }
 
 /// Server-local adapters for workspace/runtime tools.
@@ -130,6 +119,7 @@ fn is_intercepted_turn_pipeline_tool(tool_name: &str) -> bool {
         || tool_name.eq_ignore_ascii_case(crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME)
 }
 
+#[cfg(test)]
 pub(crate) fn routing_decision(
     request: &ToolExecutionRequest,
     registry: &astra_runtime_env::ToolRegistry,

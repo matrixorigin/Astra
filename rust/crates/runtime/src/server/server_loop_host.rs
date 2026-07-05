@@ -25,6 +25,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+use crate::server::tool_admission::resolve_tool_admission_for_binding;
 use crate::server::tool_route_selection::{
     ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding, routing_decision_for_binding,
     runtime_tools_route_to_edge_provider,
@@ -3348,11 +3349,22 @@ impl ServerAgenticLoopHost {
 
     fn route_for_current_binding(&self, tool_name: &str) -> ToolExecutionRouteKind {
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        routing_decision_for_binding(
+        self.admission_for_current_binding(tool_name, &registry)
+            .selected_route()
+    }
+
+    fn admission_for_current_binding(
+        &self,
+        tool_name: &str,
+        registry: &astra_runtime_env::ToolRegistry,
+    ) -> crate::server::tool_admission::ToolAdmissionDecision {
+        resolve_tool_admission_for_binding(
             tool_name,
-            self.workspace_binding.kind,
-            self.executor_binding.transport,
-            &registry,
+            &self.tool_schemas,
+            &self.workspace_binding,
+            &self.executor_binding,
+            self.runtime_binding.as_ref(),
+            registry,
         )
     }
 
@@ -3394,6 +3406,7 @@ impl ServerAgenticLoopHost {
             .try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
+        let registry = astra_runtime_env::ToolRegistry::builtins();
         self.tool_schemas
             .iter()
             .filter_map(|tool| {
@@ -3403,15 +3416,9 @@ impl ServerAgenticLoopHost {
                     .map(String::from)
             })
             .filter(|name| {
-                let route = self.route_for_current_binding(name);
-                let disabled_on_current_route = disabled.contains(name)
-                    && matches!(
-                        route,
-                        ToolExecutionRouteKind::ServerLocal
-                            | ToolExecutionRouteKind::ServerControlPlane
-                            | ToolExecutionRouteKind::ServerRuntime
-                            | ToolExecutionRouteKind::RequestScopedMcp
-                    );
+                let admission = self.admission_for_current_binding(name, &registry);
+                let disabled_on_current_route =
+                    disabled.contains(name) && admission.admin_disabled_applies();
                 !crate::turn::agentic::tool_interception::runtime_allows_tool(state, name)
                     || disabled_on_current_route
             })
@@ -5962,7 +5969,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["read_file"]);
+        assert_eq!(names, vec!["read_file", "web_search"]);
     }
 
     #[test]
@@ -9430,7 +9437,7 @@ mod tests {
         );
         assert_eq!(
             llm_events[0]["metadata"]["request_summary"]["message_count"].as_u64(),
-            Some(2)
+            Some(3)
         );
         assert!(
             llm_events[0]["metadata"]["prompt_request_id"]
@@ -10347,11 +10354,11 @@ mod tests {
 
         let event = rx.try_recv().expect("tool_call_start event");
         assert_eq!(event["type"], "tool_call_start");
-        assert_eq!(event["workspace"]["kind"], "none");
-        assert_eq!(event["executor"]["kind"], "server_local");
-        assert_eq!(event["executor"]["executor_id"], "server-runtime");
-        assert_eq!(event["executor"]["display_name"], "Server runtime");
-        assert_eq!(event["transport"], "server_local");
+        assert_eq!(event["workspace"]["kind"], "edge_workspace");
+        assert_eq!(event["executor"]["kind"], "edge_agent");
+        assert_eq!(event["executor"]["executor_id"], "edge-1");
+        assert_eq!(event["executor"]["display_name"], "MacBook Pro");
+        assert_eq!(event["transport"], "edge_ws");
     }
 
     #[test]

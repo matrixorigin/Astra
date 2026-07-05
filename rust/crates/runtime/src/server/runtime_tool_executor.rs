@@ -92,7 +92,7 @@ fn resolved_server_tool_names(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ToolAdmission {
+enum ExecutorToolReadiness {
     Ready,
     UnknownTool,
     MissingRuntimeBinding,
@@ -744,43 +744,56 @@ impl RuntimeToolExecutor {
     }
 
     pub(crate) fn tool_runtime_ready(&self, name: &str) -> bool {
-        matches!(self.tool_admission(name), ToolAdmission::Ready)
+        matches!(
+            self.executor_tool_readiness(name),
+            ExecutorToolReadiness::Ready
+        )
     }
 
-    fn tool_admission(&self, name: &str) -> ToolAdmission {
-        self.tool_admission_for_call(name, &Value::Null)
+    fn executor_tool_readiness(&self, name: &str) -> ExecutorToolReadiness {
+        self.executor_tool_readiness_for_call(name, &Value::Null)
     }
 
-    fn tool_admission_for_call(&self, name: &str, args: &Value) -> ToolAdmission {
+    fn executor_tool_readiness_for_call(&self, name: &str, args: &Value) -> ExecutorToolReadiness {
         if name.starts_with("mcp__") {
-            return self.mcp_tool_admission(name);
+            return self.mcp_executor_tool_readiness(name);
         }
 
+        let runtime_registry = astra_runtime_env::ToolRegistry::builtins();
+        let runtime_registry_knows_tool = runtime_registry.get(name).is_some();
         if let Some(reason) = self.runtime_environment_tool_denial(name, args) {
-            return ToolAdmission::RuntimeEnvironmentDenied(reason);
+            return ExecutorToolReadiness::RuntimeEnvironmentDenied(reason);
         }
 
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
-            return ToolAdmission::UnknownTool;
+            return if runtime_registry_knows_tool {
+                ExecutorToolReadiness::Ready
+            } else {
+                ExecutorToolReadiness::UnknownTool
+            };
         };
+
+        if !runtime_registry_knows_tool {
+            return ExecutorToolReadiness::UnknownTool;
+        }
 
         for capability in meta.requires {
             if !self.capabilities.has(*capability) {
                 return if self.capability_is_service_dependency(*capability) {
-                    ToolAdmission::MissingService(*capability)
+                    ExecutorToolReadiness::MissingService(*capability)
                 } else {
-                    ToolAdmission::MissingCapability(*capability)
+                    ExecutorToolReadiness::MissingCapability(*capability)
                 };
             }
             if !self.capability_has_runtime_binding(*capability) {
-                return ToolAdmission::MissingRuntimeBinding;
+                return ExecutorToolReadiness::MissingRuntimeBinding;
             }
             if !self.capability_service_dependency_ready(*capability) {
-                return ToolAdmission::MissingService(*capability);
+                return ExecutorToolReadiness::MissingService(*capability);
             }
         }
 
-        ToolAdmission::Ready
+        ExecutorToolReadiness::Ready
     }
 
     fn runtime_environment_tool_denial(
@@ -790,6 +803,25 @@ impl RuntimeToolExecutor {
     ) -> Option<astra_runtime_env::ToolUnavailableReason> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         registry.get(name)?;
+        let admission = crate::server::tool_admission::resolve_tool_admission_for_binding(
+            name,
+            &[],
+            self.execution_binding.workspace(),
+            self.execution_binding.executor(),
+            self.execution_binding.runtime(),
+            &registry,
+        );
+        if matches!(
+            admission.selected_route(),
+            crate::server::tool_route_selection::ToolExecutionRouteKind::ServerRuntime
+        ) && registry.get(name).is_some_and(|spec| {
+            matches!(
+                spec.required.executor,
+                astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
+            )
+        }) {
+            return None;
+        }
         let binding = crate::server::tool_binding_projection::runtime_environment_binding_for_parts(
             name,
             self.execution_binding.workspace(),
@@ -806,8 +838,8 @@ impl RuntimeToolExecutor {
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
         if name.starts_with("mcp__") {
             return matches!(
-                self.mcp_tool_admission(name),
-                ToolAdmission::Ready | ToolAdmission::RuntimeBindingBusy(_)
+                self.mcp_executor_tool_readiness(name),
+                ExecutorToolReadiness::Ready | ExecutorToolReadiness::RuntimeBindingBusy(_)
             );
         }
         if self
@@ -817,7 +849,9 @@ impl RuntimeToolExecutor {
             return false;
         }
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
-            return false;
+            return astra_runtime_env::ToolRegistry::builtins()
+                .get(name)
+                .is_some();
         };
         meta.requires
             .iter()
@@ -826,26 +860,28 @@ impl RuntimeToolExecutor {
 
     fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
         matches!(
-            self.mcp_tool_admission(name),
-            ToolAdmission::Ready | ToolAdmission::RuntimeBindingBusy(_)
+            self.mcp_executor_tool_readiness(name),
+            ExecutorToolReadiness::Ready | ExecutorToolReadiness::RuntimeBindingBusy(_)
         )
     }
 
-    fn mcp_tool_admission(&self, name: &str) -> ToolAdmission {
+    fn mcp_executor_tool_readiness(&self, name: &str) -> ExecutorToolReadiness {
         if self
             .agent_binding_mcp
             .as_ref()
             .is_some_and(|runtime| runtime.owns_public_tool_name(name))
         {
-            return ToolAdmission::Ready;
+            return ExecutorToolReadiness::Ready;
         }
         let Some(manager) = &self.mcp_manager else {
-            return ToolAdmission::MissingRuntimeBinding;
+            return ExecutorToolReadiness::MissingRuntimeBinding;
         };
         match manager.try_read() {
-            Ok(manager) if manager.find_tool_by_mcp_name(name).is_some() => ToolAdmission::Ready,
-            Ok(_) => ToolAdmission::UnknownTool,
-            Err(_) => ToolAdmission::RuntimeBindingBusy("mcp_registry"),
+            Ok(manager) if manager.find_tool_by_mcp_name(name).is_some() => {
+                ExecutorToolReadiness::Ready
+            }
+            Ok(_) => ExecutorToolReadiness::UnknownTool,
+            Err(_) => ExecutorToolReadiness::RuntimeBindingBusy("mcp_registry"),
         }
     }
 
@@ -1004,32 +1040,32 @@ impl RuntimeToolExecutor {
         )
     }
 
-    fn tool_binding_preflight_result(
+    fn executor_readiness_preflight_result(
         &self,
         name: &str,
         args: &Value,
     ) -> Option<astra_tools::ToolResult> {
-        match self.tool_admission_for_call(name, args) {
-            ToolAdmission::Ready => None,
-            ToolAdmission::UnknownTool => Some(self.unknown_tool_error_result(name)),
-            ToolAdmission::MissingRuntimeBinding
+        match self.executor_tool_readiness_for_call(name, args) {
+            ExecutorToolReadiness::Ready => None,
+            ExecutorToolReadiness::UnknownTool => Some(self.unknown_tool_error_result(name)),
+            ExecutorToolReadiness::MissingRuntimeBinding
                 if self.tool_can_validate_without_runtime_binding(name, args) =>
             {
                 None
             }
-            ToolAdmission::MissingRuntimeBinding => {
+            ExecutorToolReadiness::MissingRuntimeBinding => {
                 Some(self.runtime_binding_error_result(name, args))
             }
-            ToolAdmission::RuntimeBindingBusy(provider) => {
+            ExecutorToolReadiness::RuntimeBindingBusy(provider) => {
                 Some(self.runtime_binding_busy_error_result(name, provider))
             }
-            ToolAdmission::RuntimeEnvironmentDenied(reason) => {
+            ExecutorToolReadiness::RuntimeEnvironmentDenied(reason) => {
                 Some(self.runtime_environment_denial_error_result(name, &reason))
             }
-            ToolAdmission::MissingCapability(capability) => {
+            ExecutorToolReadiness::MissingCapability(capability) => {
                 Some(self.capability_unavailable_error_result(name, capability))
             }
-            ToolAdmission::MissingService(capability) => {
+            ExecutorToolReadiness::MissingService(capability) => {
                 Some(self.service_dependency_error_result(name, capability))
             }
         }
@@ -1378,7 +1414,7 @@ impl RuntimeToolExecutor {
     }
 
     async fn run_local_tool_preflight(&self, name: &str, args: &Value) -> LocalToolPreflight {
-        if let Some(result) = self.tool_binding_preflight_result(name, args) {
+        if let Some(result) = self.executor_readiness_preflight_result(name, args) {
             return LocalToolPreflight::ShortCircuit(result);
         }
 
@@ -1510,7 +1546,7 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
     ) -> astra_tools::ToolResult {
         if request.tool_name.starts_with("mcp__") {
             if let Some(result) =
-                self.tool_binding_preflight_result(&request.tool_name, &request.args)
+                self.executor_readiness_preflight_result(&request.tool_name, &request.args)
             {
                 return result;
             }
@@ -1776,13 +1812,16 @@ mod tests {
             "read-only git inspection should remain visible with a read-only workspace provider"
         );
         assert!(
-            exec.tool_binding_preflight_result("git", &json!({"action": "status"}))
+            exec.executor_readiness_preflight_result("git", &json!({"action": "status"}))
                 .is_none(),
             "read-only git actions should pass runtime-env admission"
         );
 
         let blocked = exec
-            .tool_binding_preflight_result("git", &json!({"action": "commit", "message": "no"}))
+            .executor_readiness_preflight_result(
+                "git",
+                &json!({"action": "commit", "message": "no"}),
+            )
             .expect("git commit must be blocked before execution on read-only workspace");
         assert!(blocked.is_error, "{blocked:?}");
         let value: Value = serde_json::from_str(&blocked.output).unwrap();
@@ -3815,8 +3854,14 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolBinding.as_str()
+        );
+        assert_eq!(parsed["retryable"], false);
         assert!(
-            result.output.contains("no MCP manager configured"),
+            parsed["error"].as_str().unwrap().contains("MCP server"),
             "{}",
             result.output
         );
@@ -3830,13 +3875,13 @@ esac
 
         let _discovery_write_lock = manager.write().await;
         assert_eq!(
-            exec.mcp_tool_admission("mcp__demo__search"),
-            ToolAdmission::RuntimeBindingBusy("mcp_registry"),
+            exec.mcp_executor_tool_readiness("mcp__demo__search"),
+            ExecutorToolReadiness::RuntimeBindingBusy("mcp_registry"),
             "MCP discovery/reconnect write-lock contention must be observable, not collapsed into missing binding"
         );
 
         let result = exec
-            .tool_binding_preflight_result("mcp__demo__search", &json!({"query": "hello"}))
+            .executor_readiness_preflight_result("mcp__demo__search", &json!({"query": "hello"}))
             .expect("busy MCP registry should short-circuit with structured feedback");
         let parsed: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(parsed["runtime_binding_state"], "busy");
@@ -3849,26 +3894,29 @@ esac
     }
 
     #[tokio::test]
-    async fn capability_enforcement_blocks_local_tools_but_allows_mcp_forwarding() {
+    async fn disabled_server_builtin_catalog_keeps_explicit_sandbox_and_mcp_routes() {
         let (mut exec, _dir) = test_executor();
         exec = exec.with_server_builtin_tools_disabled();
 
-        let blocked = exec
+        let sandbox_tool = exec
             .execute_with_metadata("bash", &json!({"command": "echo should-not-run"}))
             .await;
-        assert!(blocked.is_error, "{blocked:?}");
-        assert!(
-            blocked.output.contains("not available"),
-            "{}",
-            blocked.output
-        );
+        assert!(!sandbox_tool.is_error, "{sandbox_tool:?}");
+        assert_eq!(sandbox_tool.output, "should-not-run\n");
 
         let mcp = exec
             .execute_with_metadata("mcp__demo__search", &json!({"query": "hello"}))
             .await;
         assert!(mcp.is_error, "{mcp:?}");
+        let parsed: Value = serde_json::from_str(&mcp.output).unwrap();
+        assert_eq!(parsed["status"], "failed");
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolBinding.as_str()
+        );
+        assert_eq!(parsed["retryable"], false);
         assert!(
-            mcp.output.contains("no MCP manager configured"),
+            parsed["error"].as_str().unwrap().contains("MCP server"),
             "{}",
             mcp.output
         );
@@ -3904,8 +3952,14 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolBinding.as_str()
+        );
+        assert_eq!(parsed["retryable"], false);
         assert!(
-            result.output.contains("no MCP manager configured"),
+            parsed["error"].as_str().unwrap().contains("MCP server"),
             "{}",
             result.output
         );
@@ -4116,7 +4170,7 @@ esac
     }
 
     #[tokio::test]
-    async fn edge_bound_web_search_runs_on_server_runtime_with_explicit_metadata() {
+    async fn shared_network_web_search_prefers_bound_edge_provider() {
         let (mut exec, _dir) = test_executor();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         exec.set_work_surface_event_tx(tx);
@@ -4138,13 +4192,13 @@ esac
             )
             .await;
 
-        assert!(!result.is_error, "{result:?}");
-        assert!(result.output.contains("search_url"), "{result:?}");
-        let metadata = result.metadata.as_ref().expect("server runtime metadata");
-        assert_eq!(metadata["workspace"]["kind"], "none");
-        assert_eq!(metadata["executor"]["kind"], "server_local");
-        assert_eq!(metadata["executor"]["display_name"], "Server runtime");
-        assert_eq!(metadata["transport"], "server_local");
+        assert!(result.is_error, "{result:?}");
+        let metadata = result.metadata.as_ref().expect("edge runtime metadata");
+        assert_eq!(metadata["error_kind"], "transport_disconnected");
+        assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+        assert_eq!(metadata["executor"]["kind"], "edge_agent");
+        assert_eq!(metadata["executor"]["display_name"], "MacBook Pro");
+        assert_eq!(metadata["transport"], "edge_ws");
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -4155,11 +4209,11 @@ esac
             .iter()
             .find(|event| event["type"] == "tool_routing_decision")
             .expect("tool_routing_decision");
-        assert_eq!(routing["route"], "server_runtime");
+        assert_eq!(routing["route"], "edge_bound");
         assert_eq!(routing["run_id"], "run-web-search");
-        assert_eq!(routing["workspace"]["kind"], "none");
-        assert_eq!(routing["executor"]["display_name"], "Server runtime");
-        assert_eq!(routing["transport"], "server_local");
+        assert_eq!(routing["workspace"]["kind"], "edge_workspace");
+        assert_eq!(routing["executor"]["display_name"], "MacBook Pro");
+        assert_eq!(routing["transport"], "edge_ws");
 
         let started = events
             .iter()
@@ -4167,19 +4221,16 @@ esac
             .expect("tool_transport_started");
         assert_eq!(started["call_id"], "call-web-search");
         assert_eq!(started["run_id"], "run-web-search");
-        assert_eq!(started["workspace"]["kind"], "none");
-        assert_eq!(started["executor"]["display_name"], "Server runtime");
-        assert_eq!(started["transport"], "server_local");
+        assert_eq!(started["workspace"]["kind"], "edge_workspace");
+        assert_eq!(started["executor"]["display_name"], "MacBook Pro");
+        assert_eq!(started["transport"], "edge_ws");
 
-        let completed = events
-            .iter()
-            .find(|event| event["type"] == "tool_transport_completed")
-            .expect("tool_transport_completed");
-        assert_eq!(completed["call_id"], "call-web-search");
-        assert_eq!(completed["run_id"], "run-web-search");
-        assert_eq!(completed["workspace"]["kind"], "none");
-        assert_eq!(completed["executor"]["display_name"], "Server runtime");
-        assert_eq!(completed["transport"], "server_local");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "tool_transport_completed"),
+            "transport-disconnected edge route must not be reported as completed: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -5649,19 +5700,27 @@ esac
     async fn unknown_tool_returns_error_message() {
         let (exec, _dir) = test_executor();
         let result = exec.execute("nonexistent_tool", &json!({})).await;
-        assert!(result.contains("Unknown tool"));
-        assert!(result.contains(astra_core::ErrorKind::ToolNotFound.as_str()));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["status"], "failed");
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolNotFound.as_str()
+        );
+        assert_eq!(parsed["retryable"], false);
     }
 
     #[tokio::test]
-    async fn server_local_transport_reuses_tool_admission_preflight() {
+    async fn server_local_transport_reuses_executor_readiness_preflight() {
         let (mut exec, _dir) = test_executor();
-        exec = exec.with_server_builtin_tools_disabled();
-        let args = json!({"command": "echo should-not-run"});
+        let manager = Arc::new(tokio::sync::RwLock::new(astra_mcp::McpClientManager::new()));
+        exec.set_mcp_manager(Arc::clone(&manager));
+
+        let _discovery_write_lock = manager.write().await;
+        let args = json!({"query": "hello"});
         let expected = exec
-            .tool_binding_preflight_result("bash", &args)
-            .expect("bash should be rejected by the shared admission path");
-        let request = exec.tool_execution_request("bash", &args);
+            .executor_readiness_preflight_result("mcp__demo__search", &args)
+            .expect("busy MCP registry should be rejected by executor readiness preflight");
+        let request = exec.tool_execution_request("mcp__demo__search", &args);
 
         let actual =
             <RuntimeToolExecutor as crate::server::tool_local_transport::ServerLocalToolTransport>::execute_server_local_tool(
@@ -5674,7 +5733,7 @@ esac
         assert_eq!(actual.is_error, expected.is_error);
         assert_eq!(
             actual.output, expected.output,
-            "server-local transport must not maintain a second divergent admission path"
+            "server-local transport must not maintain a second divergent executor readiness path"
         );
     }
 
@@ -6532,18 +6591,15 @@ esac
         ] {
             let result = exec.execute_with_metadata(name, &json!({})).await;
             assert!(result.is_error, "{name}: {result:?}");
-            let metadata = result.metadata.as_ref().expect("metadata should exist");
+            let parsed = serde_json::from_str::<Value>(&result.output).expect("json error body");
             assert_eq!(
-                metadata.get("capability_denial").and_then(Value::as_str),
-                Some("UnknownTool"),
+                parsed.get("error_kind").and_then(Value::as_str),
+                Some(astra_core::ErrorKind::ToolNotFound.as_str()),
                 "{name}: {result:?}"
             );
-            assert!(
-                metadata
-                    .get("execution_started")
-                    .and_then(Value::as_bool)
-                    .is_some_and(|started| !started),
-                "{name}: {result:?}"
+            assert_eq!(
+                parsed.get("retryable").and_then(Value::as_bool),
+                Some(false)
             );
         }
     }
@@ -6556,18 +6612,15 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
-        let metadata = result.metadata.as_ref().expect("metadata should exist");
+        let parsed = serde_json::from_str::<Value>(&result.output).expect("json error body");
         assert_eq!(
-            metadata.get("capability_denial").and_then(Value::as_str),
-            Some("UnknownTool"),
+            parsed.get("error_kind").and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolNotFound.as_str()),
             "{result:?}"
         );
-        assert!(
-            metadata
-                .get("execution_started")
-                .and_then(Value::as_bool)
-                .is_some_and(|started| !started),
-            "{result:?}"
+        assert_eq!(
+            parsed.get("retryable").and_then(Value::as_bool),
+            Some(false)
         );
     }
 
@@ -6721,18 +6774,15 @@ esac
         ] {
             let result = exec.execute_with_metadata(name, &json!({})).await;
             assert!(result.is_error, "{name}: {result:?}");
-            let metadata = result.metadata.as_ref().expect("metadata should exist");
+            let parsed = serde_json::from_str::<Value>(&result.output).expect("json error body");
             assert_eq!(
-                metadata.get("capability_denial").and_then(Value::as_str),
-                Some("UnknownTool"),
+                parsed.get("error_kind").and_then(Value::as_str),
+                Some(astra_core::ErrorKind::ToolNotFound.as_str()),
                 "{name}: {result:?}"
             );
-            assert!(
-                metadata
-                    .get("execution_started")
-                    .and_then(Value::as_bool)
-                    .is_some_and(|started| !started),
-                "{name}: {result:?}"
+            assert_eq!(
+                parsed.get("retryable").and_then(Value::as_bool),
+                Some(false)
             );
         }
     }

@@ -5,14 +5,14 @@ use astra_runtime_env::CapacityProvider;
 use astra_turn_core::tool::schema::tool_schema_name;
 use serde_json::Value;
 
-use crate::server::tool_route_selection::{
-    ToolExecutionRouteKind, routing_decision_for_binding, tool_execution_class,
+use crate::server::tool_admission::{
+    active_provider_declarations_for_binding, has_explicit_runtime_executor_provider,
+    resolve_tool_admission_for_providers,
 };
 
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolPolicySnapshot,
     ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
-    capacity_provider_type_for_workspace_executor, runtime_execution_provider_id_for_executor,
 };
 
 const EDGE_CLIENT_WORKSPACE_SENTINEL_CWD: &str = "__edge_client_provided_workspace__";
@@ -38,8 +38,22 @@ pub fn capability_filter_tool_schemas_for_binding(
             {
                 return false;
             }
-            if !tool_route_is_visible_for_binding(tool_name, workspace, executor, runtime) {
+            let admission = resolve_tool_admission_for_providers(
+                tool_name, workspace, executor, &providers, &registry,
+            );
+            if !admission.visible {
                 return false;
+            }
+            if admission.selected_route()
+                == super::tool_route_selection::ToolExecutionRouteKind::ServerRuntime
+                && registry.get(tool_name).is_some_and(|spec| {
+                    matches!(
+                        spec.required.executor,
+                        astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
+                    )
+                })
+            {
+                return true;
             }
             let binding = runtime_environment_binding_for_parts(
                 tool_name,
@@ -59,23 +73,6 @@ pub fn capability_filter_tool_schemas_for_binding(
                 .is_ok()
         })
         .collect()
-}
-
-fn tool_route_is_visible_for_binding(
-    tool_name: &str,
-    workspace: &WorkspaceBinding,
-    executor: &ExecutorBinding,
-    _runtime: Option<&astra_runtime_env::RuntimeBinding>,
-) -> bool {
-    let registry = astra_runtime_env::ToolRegistry::builtins();
-    if let Some(visible) = tool_execution_class(tool_name, &registry).visibility_without_route() {
-        return visible;
-    }
-
-    !matches!(
-        routing_decision_for_binding(tool_name, workspace.kind, executor.transport, &registry),
-        ToolExecutionRouteKind::Unsupported
-    )
 }
 
 pub fn capability_filter_edge_provided_tool_schemas_for_binding(
@@ -101,71 +98,6 @@ pub fn capability_filtered_server_tool_schemas(
         );
     }
     capability_filter_tool_schemas_for_binding(pool, workspace, executor, runtime)
-}
-
-fn has_explicit_runtime_executor_provider(
-    workspace: &WorkspaceBinding,
-    executor: &ExecutorBinding,
-    runtime: Option<&astra_runtime_env::RuntimeBinding>,
-) -> bool {
-    let workspace_provider_declared = matches!(
-        workspace.kind,
-        WorkspaceBindingKind::ServerSandbox
-            | WorkspaceBindingKind::EdgeWorkspace
-            | WorkspaceBindingKind::CloudWorkspace
-    ) && !matches!(
-        workspace.authority,
-        WorkspaceAuthority::None | WorkspaceAuthority::Unknown
-    );
-    let provider_type =
-        capacity_provider_type_for_workspace_executor(workspace.kind, executor.kind);
-    workspace_provider_declared
-        && matches!(
-            executor.status,
-            ExecutorStatus::Online | ExecutorStatus::Degraded
-        )
-        && runtime.is_none_or(|runtime| {
-            runtime.status == astra_runtime_env::RuntimeStatus::Ready
-                && runtime.isolation_backend != astra_runtime_env::RuntimeIsolationBackend::None
-        })
-        && !matches!(
-            provider_type,
-            astra_runtime_env::CapacityProviderType::Unknown
-        )
-}
-
-fn active_provider_declarations_for_binding(
-    schemas: &[Value],
-    workspace: &WorkspaceBinding,
-    executor: &ExecutorBinding,
-    runtime: Option<&astra_runtime_env::RuntimeBinding>,
-    registry: &astra_runtime_env::ToolRegistry,
-) -> Vec<astra_runtime_env::CapacityProviderDeclaration> {
-    let mut providers = vec![
-        astra_runtime_env::server_service_provider("server-builtin", registry),
-        astra_runtime_env::control_plane_provider("server-control-plane", registry),
-    ];
-
-    if has_explicit_runtime_executor_provider(workspace, executor, runtime) {
-        providers.push(astra_runtime_env::runtime_workspace_provider(
-            capacity_provider_type_for_workspace_executor(workspace.kind, executor.kind),
-            runtime_execution_provider_id_for_executor(executor),
-            registry,
-        ));
-    }
-
-    if matches!(executor.kind, ExecutorBindingKind::Mcp) {
-        providers.push(astra_runtime_env::request_scoped_mcp_provider(
-            "request-scoped-mcp",
-            schemas
-                .iter()
-                .filter_map(tool_schema_name)
-                .filter(|name| name.starts_with("mcp__"))
-                .map(str::to_string),
-        ));
-    }
-
-    providers
 }
 
 fn extend_tool_schema_pool_unique(pool: &mut Vec<Value>, extra: Vec<Value>) {
@@ -935,6 +867,42 @@ mod tests {
                     &edge.capabilities,
                 )
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn shared_network_tool_schema_is_stable_across_selected_offers() {
+        let canonical_schema = schema("web_fetch");
+        let server_visible = capability_filter_tool_schemas_for_binding(
+            vec![canonical_schema.clone()],
+            &no_workspace(),
+            &ExecutorBinding::server_local(),
+            None,
+        );
+        let edge_visible = capability_filter_tool_schemas_for_binding(
+            vec![canonical_schema.clone()],
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+        );
+
+        assert_eq!(server_visible, vec![canonical_schema.clone()]);
+        assert_eq!(edge_visible, vec![canonical_schema]);
+        assert_eq!(
+            server_visible, edge_visible,
+            "provider/route selection must not mutate prompt-visible canonical schema"
         );
     }
 

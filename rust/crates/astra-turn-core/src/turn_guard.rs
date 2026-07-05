@@ -321,6 +321,34 @@ impl TurnGuard {
         source_error_kind: Option<astra_core::ErrorKind>,
     ) -> ResultQuality {
         let quality = result_quality::classify_result(result_str);
+        self.record_tool_result_quality_with_kind(tool_name, result_str, source_error_kind, quality)
+    }
+
+    /// Record a tool result whose execution layer has already determined that
+    /// the call failed. This is needed for structured JSON errors that later
+    /// receive appended recovery guidance, because the appended text can make
+    /// the visible body no longer parse as JSON.
+    pub fn record_failed_tool_result_with_kind(
+        &mut self,
+        tool_name: &str,
+        result_str: &str,
+        source_error_kind: Option<astra_core::ErrorKind>,
+    ) -> ResultQuality {
+        self.record_tool_result_quality_with_kind(
+            tool_name,
+            result_str,
+            source_error_kind,
+            ResultQuality::Error,
+        )
+    }
+
+    fn record_tool_result_quality_with_kind(
+        &mut self,
+        tool_name: &str,
+        result_str: &str,
+        source_error_kind: Option<astra_core::ErrorKind>,
+        quality: ResultQuality,
+    ) -> ResultQuality {
         match quality {
             ResultQuality::Success => {
                 self.health.record_success(tool_name);

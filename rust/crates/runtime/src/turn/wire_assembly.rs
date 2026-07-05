@@ -513,7 +513,13 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
             {
                 "system" => system_parts.push(content.to_string()),
                 "user" => user_parts.push(content.to_string()),
-                _ => user_parts.push(content.to_string()),
+                // Historical volatile preamble was represented as a
+                // user reminder plus an assistant acknowledgement. The
+                // acknowledgement is a transport shim, not instruction
+                // content, so it must not be folded into the synthetic
+                // reminder user. If the protocol tail requires an assistant
+                // bridge, we synthesize that below from the real tail role.
+                _ => {}
             }
         }
 

@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::tool_execution_binding::{
     ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, WorkspaceBindingKind,
@@ -32,6 +32,26 @@ pub(crate) fn capability_denied_result(
     binding: &astra_runtime_env::RunBinding,
     reason: astra_runtime_env::ToolUnavailableReason,
 ) -> astra_tools::ToolResult {
+    if matches!(
+        reason,
+        astra_runtime_env::ToolUnavailableReason::UnknownTool
+    ) {
+        return astra_tools::ToolResult {
+            output: json!({
+                "status": "failed",
+                "error": format!(
+                    "Unknown tool `{}`. Use only tools advertised in the current turn surface; do not retry this exact name unless it appears in the tool schema.",
+                    request.tool_name
+                ),
+                "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
+                "retryable": false,
+            })
+            .to_string(),
+            metadata: None,
+            is_error: true,
+            exit_semantics: None,
+        };
+    }
     let offline_edge_executor =
         matches!(request.workspace.kind, WorkspaceBindingKind::EdgeWorkspace)
             && matches!(request.executor.kind, ExecutorBindingKind::EdgeAgent)
@@ -95,6 +115,27 @@ pub(crate) fn unsupported_workspace_executor_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
 ) -> astra_tools::ToolResult {
+    if !request.tool_name.starts_with("mcp__")
+        && astra_runtime_env::ToolRegistry::builtins()
+            .get(&request.tool_name)
+            .is_none()
+    {
+        return astra_tools::ToolResult {
+            output: json!({
+                "status": "failed",
+                "error": format!(
+                    "Unknown tool `{}`. Use only tools advertised in the current turn surface; do not retry this exact name unless it appears in the tool schema.",
+                    request.tool_name
+                ),
+                "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
+                "retryable": false,
+            })
+            .to_string(),
+            metadata: None,
+            is_error: true,
+            exit_semantics: None,
+        };
+    }
     let mut blocked_executor = request.executor.clone();
     blocked_executor.status = ExecutorStatus::Degraded;
     let mut metadata = binding_event_fields(&request.workspace, &blocked_executor);

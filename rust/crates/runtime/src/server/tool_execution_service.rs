@@ -5,6 +5,7 @@ use serde_json::Map;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use super::tool_admission::{disabled_tool_policy_applies, resolve_tool_admission_for_binding};
 use super::tool_edge_transport::execute_edge_bound;
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy, ToolExecutionRequest,
@@ -15,7 +16,7 @@ use super::tool_external_transport::{
 };
 use super::tool_local_transport::{ServerLocalToolTransport, execute_local_transport};
 use super::tool_route_boundary::{ToolRouteBoundary, route_binding_event_fields};
-use super::tool_route_selection::{ToolExecutionRouteKind, routing_decision};
+use super::tool_route_selection::ToolExecutionRouteKind;
 use super::tool_transport_errors::{
     capability_denied_result, unsupported_workspace_executor_result,
 };
@@ -183,7 +184,15 @@ impl ToolExecutionService {
     /// Primary resolution goes through the runtime tool registry: tool class
     /// declares the owner, then the current binding selects the transport.
     pub fn routing_decision(&self, request: &ToolExecutionRequest) -> ToolExecutionRouteKind {
-        routing_decision(request, &self.tool_registry)
+        resolve_tool_admission_for_binding(
+            &request.tool_name,
+            &[],
+            &request.workspace,
+            &request.executor,
+            request.runtime.as_ref(),
+            &self.tool_registry,
+        )
+        .selected_route()
     }
 
     pub(crate) fn cancelled_before_route_result(
@@ -289,13 +298,8 @@ impl ToolExecutionService {
         };
 
         // ── Runtime disabled-tools check (admin API / config) ──
-        let disabled_applies_to_route = matches!(
-            route,
-            ToolExecutionRouteKind::ServerLocal
-                | ToolExecutionRouteKind::ServerControlPlane
-                | ToolExecutionRouteKind::ServerRuntime
-                | ToolExecutionRouteKind::RequestScopedMcp
-        );
+        let disabled_applies_to_route =
+            disabled_tool_policy_applies(&transport_request.tool_name, route, &self.tool_registry);
         if disabled_applies_to_route
             && self
                 .disabled_tools

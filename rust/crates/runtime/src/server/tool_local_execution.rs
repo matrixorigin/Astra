@@ -6,7 +6,7 @@ use std::sync::{
 
 use astra_core::SharedPool;
 use astra_services::resource_governor::ResourceGovernor;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -68,9 +68,17 @@ pub(crate) async fn run_local_tool_preflight(
 }
 
 pub(crate) fn unknown_local_tool_result(name: &str) -> astra_tools::ToolResult {
-    astra_tools::ToolResult::error(format!(
-        "Error: Tool '{name}' is not available in the current runtime tool surface. The runtime did not advertise this tool for this turn; use a visible tool, select an advertised deferred tool with tool_search, or bind the required capacity provider."
-    ))
+    astra_tools::ToolResult::error(
+        json!({
+            "status": "failed",
+            "error": format!(
+                "Tool `{name}` is not available in the current runtime tool surface. The runtime did not advertise this tool for this turn; use a visible tool, select an advertised deferred tool with tool_search, or bind the required capacity provider."
+            ),
+            "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
+            "retryable": false,
+        })
+        .to_string(),
+    )
 }
 
 pub(crate) fn spawn_resource_tool_call_recording(
@@ -258,11 +266,19 @@ mod tests {
         let result = unknown_local_tool_result("delegate");
 
         assert!(result.is_error);
-        assert!(result.output.contains("Tool 'delegate' is not available"));
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["status"], "failed");
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolNotFound.as_str()
+        );
+        assert_eq!(parsed["retryable"], false);
+        let error = parsed["error"].as_str().unwrap();
+        assert!(error.contains("Tool `delegate` is not available"));
         assert!(!result.output.contains("Available:"));
         assert!(!result.output.contains("mo_query"));
         assert!(!result.output.contains("powershell"));
-        assert!(result.output.contains("current runtime tool surface"));
+        assert!(error.contains("current runtime tool surface"));
     }
 
     #[test]

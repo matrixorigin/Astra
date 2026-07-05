@@ -856,6 +856,8 @@ mod tests {
 
         for visible in [
             "bash",
+            "web_fetch",
+            "web_search",
             "read_file",
             "write_file",
             "git",
@@ -873,7 +875,7 @@ mod tests {
                 "{hidden} requires an explicit terminal/platform-local provider, not the generic server runtime provider pool"
             );
         }
-        for server_owned in ["ask_user", "agent", "tool_search", "web_fetch", "memory"] {
+        for server_owned in ["ask_user", "agent", "tool_search", "memory"] {
             assert!(
                 !tool_names.contains(server_owned),
                 "{server_owned} must stay in the server builtin provider pool"
