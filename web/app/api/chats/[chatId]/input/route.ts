@@ -10,7 +10,6 @@ import { RuntimeClientError } from "@/lib/runtime-client";
 import {
   normalizeWorkspaceSelection,
   sameWorkspaceSelection,
-  validateWorkspaceAuthority,
 } from "@/lib/workspace-authority";
 
 const MAX_DEFERRED_INPUT_CHARS = 20_000;
@@ -65,7 +64,7 @@ export async function POST(
   if (hasRequestedWorkspace && !requestedWorkspaceSelection) {
     return NextResponse.json(
       {
-        error: "workspace must be a server sandbox or edge workspace selection",
+        error: "workspace must be a valid file environment selection",
         code: "invalid_workspace_selection",
       },
       { status: 400 },
@@ -84,17 +83,6 @@ export async function POST(
       { status: 409 },
     );
   }
-  const workspaceError = validateWorkspaceAuthority(
-    body.content,
-    storedWorkspaceSelection,
-  );
-  if (workspaceError) {
-    return NextResponse.json(
-      { error: workspaceError.message, code: workspaceError.code },
-      { status: 409 },
-    );
-  }
-
   try {
     const result = await queueDeferredRunInput(auth.user.user_id, chatId, body);
     if (!result) {

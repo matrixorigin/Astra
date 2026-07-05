@@ -340,7 +340,7 @@ pub(crate) fn projected_tool_end_event_fields(
 fn server_runtime_event_fields() -> Map<String, Value> {
     let workspace = WorkspaceBinding {
         kind: WorkspaceBindingKind::None,
-        display_name: "No workspace".to_string(),
+        display_name: "No file environment".to_string(),
         cwd: None,
         authority: WorkspaceAuthority::None,
         fallback_policy: FallbackPolicy::Disabled,

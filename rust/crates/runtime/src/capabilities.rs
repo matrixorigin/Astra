@@ -19,6 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use astra_runtime_env::CapacityProvider;
 use astra_services::skills::{SkillListCursor, SkillListRecord, SkillRecord, SkillService};
 use astra_skills::manifest::{
     ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind, TrustTier,
@@ -159,23 +160,60 @@ pub fn server_capabilities_from(
     )
 }
 
-/// Tool schemas for Web agent / server-executed turns.
+/// Server-service/control-plane schemas declared by the server builtin provider.
 ///
-/// Capability-driven (see `astra_turn_core::tool_surface`). The catalog,
-/// the `requires` metadata, and the active server `CapabilitySet` together
-/// decide what the model sees.
-pub fn server_runtime_tool_schemas(
+/// This is the provider-owned source pool for Web / remote server execution.
+/// Workspace and process schemas are intentionally absent here; they are added
+/// only by an explicit runtime/workspace provider binding in
+/// `tool_binding_projection`.
+pub fn server_builtin_tool_schemas(
     capabilities: &astra_turn_core::capability::CapabilitySet,
 ) -> Vec<Value> {
-    let mut schemas = astra_turn_core::tool_surface::resolve(
-        CapabilitySurface::Web,
-        capabilities,
-        &astra_tools::schemas::all_tool_schemas(),
-    );
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let providers = vec![
+        astra_runtime_env::server_service_provider("server-builtin", &registry),
+        astra_runtime_env::control_plane_provider("server-control-plane", &registry),
+    ];
+    let pool = schema_pool_declared_by_providers(&providers);
+    let mut schemas =
+        astra_turn_core::tool_surface::resolve(CapabilitySurface::Web, capabilities, &pool);
     if !capabilities.has(astra_turn_core::capability::Capability::ReflectService) {
         schemas.retain(|s| tool_schema_name(s) != Some("reflect"));
     }
     retain_server_executable_schemas(&mut schemas);
+    #[cfg(unix)]
+    {
+        astra_tools::schemas::narrow_run_script_for_server(&mut schemas);
+    }
+    schemas
+}
+
+/// Compatibility wrapper for server-owned schemas.
+///
+/// Historically this function started from `all_tool_schemas()`. That made the
+/// server registry look like it owned workspace/process tools and relied on
+/// later filters to hide them. Keep the public name for call-site stability,
+/// but make the semantics provider-declared: server builtin only.
+pub fn server_runtime_tool_schemas(
+    capabilities: &astra_turn_core::capability::CapabilitySet,
+) -> Vec<Value> {
+    server_builtin_tool_schemas(capabilities)
+}
+
+/// Runtime/workspace executor schemas that require an explicit execution
+/// provider such as edge, server sandbox, or orchestrator-managed runtime.
+pub fn runtime_executor_tool_schemas(
+    capabilities: &astra_turn_core::capability::CapabilitySet,
+) -> Vec<Value> {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let provider = astra_runtime_env::runtime_workspace_provider(
+        astra_runtime_env::CapacityProviderType::Sandbox,
+        "runtime-workspace",
+        &registry,
+    );
+    let pool = schema_pool_declared_by_providers(&[provider]);
+    let mut schemas =
+        astra_turn_core::tool_surface::resolve(CapabilitySurface::Web, capabilities, &pool);
     #[cfg(unix)]
     {
         astra_tools::schemas::narrow_run_script_for_server(&mut schemas);
@@ -189,7 +227,22 @@ pub fn cli_local_tool_schemas(
     client_mcp: Vec<Value>,
     capabilities: &astra_turn_core::capability::CapabilitySet,
 ) -> Vec<Value> {
-    let mut pool = client_builtin;
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let providers = vec![
+        astra_runtime_env::server_service_provider("cli-server-service", &registry),
+        astra_runtime_env::control_plane_provider("cli-control-plane", &registry),
+        astra_runtime_env::cli_local_provider("cli-local", &registry),
+    ];
+    let mut pool = client_builtin
+        .into_iter()
+        .filter(|schema| {
+            tool_schema_name(schema).is_some_and(|name| {
+                providers
+                    .iter()
+                    .any(|provider| provider.declares_tool(name))
+            })
+        })
+        .collect::<Vec<_>>();
     let mut seen: HashSet<String> = pool
         .iter()
         .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
@@ -210,20 +263,14 @@ pub fn cli_remote_tool_schemas(
     server_mcp: Vec<Value>,
     capabilities: &astra_turn_core::capability::CapabilitySet,
 ) -> Vec<Value> {
-    let mut pool = astra_tools::schemas::all_tool_schemas();
-    let mut seen: HashSet<String> = pool
-        .iter()
-        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
-        .collect();
-    for schema in server_mcp {
-        if let Some(name) = tool_schema_name(&schema)
-            && seen.insert(name.to_string())
-        {
-            pool.push(schema);
-        }
-    }
-    let mut schemas =
-        astra_turn_core::tool_surface::resolve(CapabilitySurface::CliRemote, capabilities, &pool);
+    let mut schemas = resolve_tool_schemas(
+        ToolCatalogRequest::new(CapabilitySurface::CliRemote)
+            .with_source(
+                ToolCapabilitySource::ServerBuiltin,
+                server_builtin_tool_schemas(capabilities),
+            )
+            .with_source(ToolCapabilitySource::ServerMcp, server_mcp),
+    );
     if !capabilities.has(astra_turn_core::capability::Capability::ReflectService) {
         schemas.retain(|s| tool_schema_name(s) != Some("reflect"));
     }
@@ -237,6 +284,25 @@ pub fn cli_remote_tool_schemas(
 
 fn retain_server_executable_schemas(schemas: &mut Vec<Value>) {
     schemas.retain(|schema| !matches!(tool_schema_name(schema), Some("lsp" | "powershell")));
+}
+
+fn schema_pool_declared_by_providers(
+    providers: &[astra_runtime_env::CapacityProviderDeclaration],
+) -> Vec<Value> {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    astra_tools::schemas::all_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            tool_schema_name(schema).is_some_and(|name| {
+                registry
+                    .get(name)
+                    .is_some_and(|spec| spec.load_policy.is_public_schema_policy())
+                    && providers
+                        .iter()
+                        .any(|provider| provider.declares_tool(name))
+            })
+        })
+        .collect()
 }
 
 /// Return the skill source policy for a surface.
@@ -714,6 +780,118 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn server_builtin_schema_pool_is_provider_declared_only() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names: std::collections::BTreeSet<String> =
+            names(server_builtin_tool_schemas(&caps))
+                .into_iter()
+                .collect();
+
+        for visible in ["ask_user", "agent", "tool_search", "web_fetch", "memory"] {
+            assert!(
+                tool_names.contains(visible),
+                "{visible} should be declared by the server builtin provider"
+            );
+        }
+        for hidden in [
+            "bash",
+            "read_file",
+            "write_file",
+            "str_replace",
+            "git",
+            "run_script",
+            "symbols",
+            "delete_file",
+            "multi_edit",
+            "background_shell",
+            "git_clone",
+            "find_definition",
+            "find_references",
+        ] {
+            assert!(
+                !tool_names.contains(hidden),
+                "{hidden} must require an explicit runtime/workspace provider"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_executor_schema_pool_is_not_server_builtin_capacity() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names: std::collections::BTreeSet<String> =
+            names(runtime_executor_tool_schemas(&caps))
+                .into_iter()
+                .collect();
+
+        for visible in [
+            "bash",
+            "read_file",
+            "write_file",
+            "git",
+            "run_script",
+            "lsp",
+            "powershell",
+        ] {
+            assert!(
+                tool_names.contains(visible),
+                "{visible} should be available to explicit runtime/workspace providers"
+            );
+        }
+        for server_owned in ["ask_user", "agent", "tool_search", "web_fetch", "memory"] {
+            assert!(
+                !tool_names.contains(server_owned),
+                "{server_owned} must stay in the server builtin provider pool"
+            );
+        }
+        for internal in [
+            "delete_file",
+            "multi_edit",
+            "background_shell",
+            "git_clone",
+            "find_definition",
+            "find_references",
+        ] {
+            assert!(
+                !tool_names.contains(internal),
+                "{internal} is an internal execution helper and must not enter model schema pools"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_local_catalog_filters_builtin_source_by_provider_ownership() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names = names(cli_local_tool_schemas(
+            vec![
+                schema("read_file"),
+                schema("bash"),
+                schema("memory"),
+                schema("ask_user"),
+                schema("custom_local_builtin"),
+            ],
+            vec![schema("mcp__local__query")],
+            &caps,
+        ));
+
+        for expected in [
+            "read_file",
+            "bash",
+            "memory",
+            "ask_user",
+            "mcp__local__query",
+        ] {
+            assert!(
+                tool_names.contains(&expected.to_string()),
+                "{expected} should remain visible in local CLI catalog: {tool_names:?}"
+            );
+        }
+        assert!(
+            !tool_names.contains(&"custom_local_builtin".to_string()),
+            "client builtin schemas must still be declared by a CLI/server provider"
+        );
     }
 
     #[test]

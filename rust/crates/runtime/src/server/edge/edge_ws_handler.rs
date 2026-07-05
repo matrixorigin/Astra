@@ -5,6 +5,7 @@
 //! Results are sent back over the same WebSocket.
 
 use super::*;
+use astra_runtime_env::CapacityProvider;
 use astra_server_types::edge_connection_pool::EdgeToolResult;
 use astra_server_types::edge_ws_protocol::*;
 
@@ -527,16 +528,28 @@ fn validate_edge_capabilities(
         return None;
     }
 
-    // Cross-reference tool names against the server-side built-in registry.
-    // Strip any tool name that doesn't exist — a malicious edge cannot
-    // fabricate tools it doesn't really have.
+    // Cross-reference tool names against the edge provider contract. Strip
+    // registry-only, server-owned, or currently unavailable tools — edge is a
+    // runtime executor provider, not a source of server/control-plane capacity.
     let registry = astra_runtime_env::ToolRegistry::builtins();
+    let edge_provider = astra_runtime_env::runtime_workspace_provider(
+        astra_runtime_env::CapacityProviderType::EdgeCapacity,
+        advert.binding.executor.executor_id.clone(),
+        &registry,
+    );
     let original_count = advert.binding.tool_surface.tool_names.len();
+    advert.binding.tool_surface.tool_names.retain(|name| {
+        registry.get(name).is_some()
+            && edge_provider.declares_tool(name)
+            && astra_runtime_env::CapabilityResolver
+                .check_tool(&registry, name, &advert.binding.capabilities)
+                .is_ok()
+    });
     advert
         .binding
         .tool_surface
-        .tool_names
-        .retain(|name| registry.get(name).is_some());
+        .denials
+        .retain(|denial| edge_provider.declares_tool(&denial.tool_name));
     let stripped = original_count - advert.binding.tool_surface.tool_names.len();
     if stripped > 0 {
         tracing::warn!(
@@ -544,7 +557,7 @@ fn validate_edge_capabilities(
             edge_agent_id = %edge_agent_id,
             stripped,
             remaining = advert.binding.tool_surface.tool_names.len(),
-            "edge advertised non-existent tools — stripped"
+            "edge advertised tools outside edge provider ownership — stripped"
         );
     }
 
@@ -554,6 +567,7 @@ fn validate_edge_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_runtime_env::{RuntimeEnvironmentAdvertisement, ToolUnavailableReason};
     use astra_services::multi_agent::{EdgeDispatchRow, EdgeDispatchService};
     use std::sync::Mutex;
 
@@ -630,6 +644,69 @@ mod tests {
             status: "dispatched".to_string(),
             pending_wait_us: 0,
         }
+    }
+
+    fn edge_advertisement_with_tools(tool_names: &[&str]) -> serde_json::Value {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut binding = astra_runtime_env::RunBinding::edge_developer("/workspace", &registry);
+        binding.tool_surface.tool_names =
+            tool_names.iter().map(|name| (*name).to_string()).collect();
+        binding.tool_surface.denials = vec![
+            astra_runtime_env::ToolDenial {
+                tool_name: "ask_user".to_string(),
+                reason: ToolUnavailableReason::ExecutorUnavailable(
+                    "control_plane_required".to_string(),
+                ),
+            },
+            astra_runtime_env::ToolDenial {
+                tool_name: "write_file".to_string(),
+                reason: ToolUnavailableReason::PolicyDenied("filesystem_write".to_string()),
+            },
+        ];
+        serde_json::to_value(RuntimeEnvironmentAdvertisement::new(binding))
+            .expect("edge advertisement serializes")
+    }
+
+    #[test]
+    fn validate_edge_capabilities_strips_non_edge_provider_tools() {
+        let capabilities = edge_advertisement_with_tools(&[
+            "read_file",
+            "bash",
+            "ask_user",
+            "tool_search",
+            "memory",
+            "mcp__weather",
+            "not_registered",
+        ]);
+
+        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
+            .expect("valid edge advertisement");
+        let advert: RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(sanitized).expect("sanitized advertisement");
+
+        assert!(advert.binding.tool_surface.contains("read_file"));
+        assert!(advert.binding.tool_surface.contains("bash"));
+        for hidden in [
+            "ask_user",
+            "tool_search",
+            "memory",
+            "mcp__weather",
+            "not_registered",
+        ] {
+            assert!(
+                !advert.binding.tool_surface.contains(hidden),
+                "{hidden} must not be accepted as edge-owned capacity"
+            );
+        }
+        assert!(
+            advert
+                .binding
+                .tool_surface
+                .denials
+                .iter()
+                .all(|denial| denial.tool_name == "write_file"),
+            "edge capability denials should only describe edge-owned runtime tools"
+        );
     }
 
     #[tokio::test]

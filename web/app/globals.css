@@ -1041,7 +1041,7 @@ textarea {
   }
 }
 
-@container (max-width: 940px) {
+@container (max-width: 1100px) {
   .astra-dot-nav {
     display: none;
   }

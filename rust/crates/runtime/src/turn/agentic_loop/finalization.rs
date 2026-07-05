@@ -611,7 +611,7 @@ fn update_working_memory_for_turn_settlement(state: &mut AgenticLoopState) {
     let task_summary = state
         .hooks
         .task_board_snapshot
-        .has_completion_blocking_tasks()
+        .requires_settlement_intervention()
         .then(|| state.hooks.task_board_snapshot.short_summary());
     let interruption = state.interruption.clone();
     let Some(session) = state.pipeline_session.as_mut() else {
@@ -716,17 +716,37 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
             "agentic loop reached terminal state while unfinished task-board work remained: {}",
             state.hooks.task_board_snapshot.short_summary()
         );
-        let task_board_interruption_created = state.interruption.is_none();
+        let requires_intervention = state
+            .hooks
+            .task_board_snapshot
+            .requires_settlement_intervention();
+        let should_record_empty_completion = state.final_text.trim().is_empty();
+        let should_record_interruption = requires_intervention || should_record_empty_completion;
+        let task_board_interruption_created =
+            should_record_interruption && state.interruption.is_none();
         if state.interruption.is_none() {
-            state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-                astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
-                astra_turn_core::interruption::ResumeAction::RequiresIntervention {
-                    description:
-                        "unfinished task-board work remains; wait for explicit user direction before continuing"
-                            .to_string(),
-                },
-                settlement_interruption_summary(state, Some(detail)),
-            ));
+            if !should_record_interruption {
+                tracing::info!(
+                    target: "astra::loop_guard",
+                    summary = %state.hooks.task_board_snapshot.short_summary(),
+                    "unfinished task-board bookkeeping left as non-blocking settlement metadata"
+                );
+            } else {
+                let resume_action = if requires_intervention {
+                    astra_turn_core::interruption::ResumeAction::RequiresIntervention {
+                        description:
+                            "unfinished task-board work remains; wait for explicit user direction before continuing"
+                                .to_string(),
+                    }
+                } else {
+                    astra_turn_core::interruption::ResumeAction::ContinueImmediately
+                };
+                state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+                    astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
+                    resume_action,
+                    settlement_interruption_summary(state, Some(detail)),
+                ));
+            }
         }
         if state.final_text.trim().is_empty() && task_board_interruption_created {
             state.final_text.clear();
@@ -1056,7 +1076,7 @@ async fn close_pending_memory_feedback_at_turn_end(state: &mut AgenticLoopState)
     if astra_tools::memoria::MemoriaClient::pending_recall_count(session_id) == 0 {
         return;
     }
-    let report = if let Some(executor) = state.server_tool_executor.as_deref() {
+    let report = if let Some(executor) = state.runtime_tool_executor.as_deref() {
         executor
             .close_pending_memory_feedback_at_turn_end("server-turn-end")
             .await
@@ -1478,7 +1498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_preserves_assistant_text_when_tasks_need_direction() {
+    async fn finalize_and_render_does_not_pause_final_answer_for_in_progress_bookkeeping() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.final_text = "Done.".into();
@@ -1507,19 +1527,15 @@ mod tests {
             state.final_text, "Done.",
             "assistant text is model output and must not be rewritten by task-board control state"
         );
-        let interruption = state
-            .interruption
-            .as_ref()
-            .expect("unfinished task-board work should record an interruption");
-        assert!(matches!(
-            &interruption.resume_action,
-            astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
-        ));
+        assert!(
+            state.interruption.is_none(),
+            "in-progress task-board bookkeeping must not turn an answered run into a paused run"
+        );
         assert_eq!(host.rendered_final_text, vec!["Done.".to_string()]);
     }
 
     #[tokio::test]
-    async fn finalize_and_render_persists_unfinished_task_as_blocker_not_auto_resume() {
+    async fn finalize_and_render_persists_paused_task_as_blocker_not_auto_resume() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         attach_pipeline_session(&mut state);
@@ -1531,7 +1547,7 @@ mod tests {
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
-                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::Paused,
                     subtasks: Vec::new(),
                     created_at: "2025-01-01T00:00:00Z".to_string(),
                     updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -1553,7 +1569,7 @@ mod tests {
             .render_prompt_section();
         assert!(
             rendered.contains("Blockers:") && rendered.contains("unfinished_task_board:"),
-            "unfinished task-board state must be preserved without auto-resume pressure: {rendered}"
+            "paused task-board state must be preserved without auto-resume pressure: {rendered}"
         );
         assert!(
             !rendered.contains("Next action:"),
@@ -1754,7 +1770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_records_task_board_intervention_without_assistant_text() {
+    async fn finalize_and_render_records_task_board_empty_completion_without_assistant_text() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.final_text.clear();
@@ -1781,23 +1797,23 @@ mod tests {
 
         assert_eq!(
             state.final_text, "",
-            "task-board intervention is structured run state, not assistant prose"
+            "task-board empty completion is structured run state, not assistant prose"
         );
         assert!(
             host.rendered_final_text.is_empty(),
-            "empty task-board intervention must not render an assistant bubble"
+            "empty task-board completion must not render an assistant bubble"
         );
         let interruption = state
             .interruption
             .as_ref()
-            .expect("task-board blocker should record interruption state");
+            .expect("empty task-board completion should record interruption state");
         assert_eq!(
             interruption.kind,
             astra_turn_core::interruption::InterruptionKind::EmptyCompletion
         );
         assert!(matches!(
             &interruption.resume_action,
-            astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately
         ));
     }
 
@@ -2308,7 +2324,7 @@ mod tests {
         let mut state = make_state();
         let session_id = format!("server-finalize-feedback-{}", uuid::Uuid::new_v4());
         let workspace = tempfile::TempDir::new().unwrap();
-        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+        let executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
             workspace.path().to_path_buf(),
             "test-user".into(),
             session_id.clone(),
@@ -2318,7 +2334,7 @@ mod tests {
         astra_tools::memoria::MemoriaClient::reset_recall_ledger(&session_id);
         astra_tools::memoria::MemoriaClient::record_recall(&session_id, 1, vec!["m1".into()]);
         state.current_session_id = Some(session_id.clone());
-        state.server_tool_executor = Some(std::sync::Arc::new(executor));
+        state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
         state.final_text = "Done.".into();
 
         finalize_and_render(&mut host, &mut state).await;

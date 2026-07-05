@@ -321,7 +321,7 @@ fn edge_unavailable_result(
 
 fn edge_transport_disconnected_message(request: &ToolExecutionRequest) -> String {
     format!(
-        "Error: transport '{}' disconnected or timed out while executing tool '{}' on executor '{}'. Reconnect the executor transport and retry; server fallback remains disabled for this workspace.",
+        "Error: transport '{}' disconnected or timed out while executing tool '{}' on executor '{}'. Reconnect the executor transport and retry; no alternate execution provider is available for this file environment.",
         serde_json::to_value(request.executor.transport)
             .ok()
             .and_then(|value| value.as_str().map(ToString::to_string))

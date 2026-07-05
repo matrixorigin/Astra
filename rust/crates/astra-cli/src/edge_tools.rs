@@ -15,6 +15,7 @@ use std::{
 use astra_runtime::tool_sandbox::{
     SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
+use astra_runtime_env::CapacityProvider as _;
 use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
 use astra_turn_core::tool::deferred_activation::ToolSurfaceNames;
 
@@ -155,13 +156,25 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_search",
 ];
 
+fn runtime_env_builtin_registry() -> &'static astra_runtime_env::ToolRegistry {
+    static REGISTRY: std::sync::OnceLock<astra_runtime_env::ToolRegistry> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(astra_runtime_env::ToolRegistry::builtins)
+}
+
 fn local_runtime_tool_schemas(raw_schemas: Vec<Value>) -> Vec<Value> {
-    let registry = astra_runtime_env::ToolRegistry::builtins();
-    let binding = astra_runtime_env::RunBinding::local_developer(".", &registry);
-    astra_runtime_env::CapabilityResolver.filter_tool_schemas(
-        &registry,
+    let registry = runtime_env_builtin_registry();
+    let binding = astra_runtime_env::RunBinding::local_developer(".", registry);
+    let providers = vec![
+        astra_runtime_env::server_service_provider("cli-server-service", registry),
+        astra_runtime_env::control_plane_provider("cli-control-plane", registry),
+        astra_runtime_env::cli_local_provider("local-cli", registry),
+    ];
+    astra_runtime_env::CapabilityResolver.filter_tool_schemas_for_providers(
+        registry,
         raw_schemas,
         &binding.capabilities,
+        &providers,
     )
 }
 
@@ -189,6 +202,7 @@ struct CliCapabilityView {
     dropped_by_capability: Vec<Value>,
     dropped_by_surface: Vec<String>,
     mcp_pass_through: Vec<String>,
+    capacity_provider_coverage: Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry>,
 }
 
 pub fn local_tool_schemas() -> Vec<Value> {
@@ -196,7 +210,7 @@ pub fn local_tool_schemas() -> Vec<Value> {
 }
 
 /// Plan-mode write guard tool list (CLI parity with
-/// `server_tool_executor::is_plan_mode_blocked_tool`). While a plan is
+/// `runtime_tool_executor::is_plan_mode_blocked_tool`). While a plan is
 /// in `phase=planning` these tools must be short-circuited: they all
 /// mutate the world (filesystem, DB, git, GitHub), so allowing them
 /// would let the model execute a plan it has not yet had approved.
@@ -1066,9 +1080,10 @@ pub struct ToolExecutor {
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
     /// Shared tool executor for delegating unknown tools to astra-tools.
     default_executor: astra_tools::executor::DefaultToolExecutor,
-    /// Plugin-registered non-MCP tool schemas. MCP schemas live in
-    /// `mcp_runtime` so routing ownership and discovery data stay atomic.
-    plugin_schemas: std::sync::RwLock<Vec<Value>>,
+    /// Schemas declared by CLI-side providers except request-scoped MCP
+    /// (server service, control plane, and CLI local executor). MCP schemas live
+    /// in `mcp_runtime` so routing ownership and discovery data stay atomic.
+    cli_local_provider_schemas: std::sync::RwLock<Vec<Value>>,
     /// Atomic snapshot of the current visible/deferred execution surface.
     ///
     /// Visible and activatable names are read together by admission and
@@ -1136,7 +1151,7 @@ impl ToolExecutor {
             )
             .build()
             .unwrap_or_else(|_| Client::new()),
-            plugin_schemas: std::sync::RwLock::new(Vec::new()),
+            cli_local_provider_schemas: std::sync::RwLock::new(Vec::new()),
             current_tool_surface: std::sync::RwLock::new(ToolSurfaceNames::default()),
             activated_deferred_tools: std::sync::RwLock::new(HashSet::new()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
@@ -1231,8 +1246,10 @@ impl ToolExecutor {
                 }
             })
         }));
-        let schemas = self.runtime_bound_tool_schemas(schemas);
-        self.set_current_visible_tool_schemas(&schemas);
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&schemas);
+        let mut guard =
+            rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
+        *guard = ToolSurfaceNames::installed(names, HashSet::new());
     }
 
     /// Install the per-turn `ask_user` channel so tools can surface a
@@ -1361,13 +1378,40 @@ impl ToolExecutor {
         self
     }
 
-    /// Install plugin-registered non-MCP schemas so `tool_search(select:NAME)`
-    /// can resolve skill-backed tools. Called after plugin manifests load.
+    /// Install schemas declared by CLI-side providers so
+    /// `tool_search(select:NAME)` can resolve provider-owned dynamic tools. MCP
+    /// schemas are rejected here: they require an MCP runtime binding and must
+    /// be installed through `install_mcp_bundle`.
     ///
-    /// Poison handling: plugin schemas are a rebuildable cache. Reset cached
+    /// Poison handling: provider schemas are a rebuildable cache. Reset cached
     /// state on poison instead of reusing possibly half-written inner data.
-    pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
-        let mut guard = rwlock_write_reset_on_poison(&self.plugin_schemas, "plugin_schemas");
+    pub fn set_cli_local_provider_schemas(&self, schemas: Vec<Value>) {
+        let mut dropped_mcp_schema_names = Vec::new();
+        let schemas = schemas
+            .into_iter()
+            .filter(|schema| {
+                let Some(name) = astra_turn_core::tool::schema::tool_schema_name(schema) else {
+                    return true;
+                };
+                if name.starts_with("mcp__") {
+                    dropped_mcp_schema_names.push(name.to_string());
+                    return false;
+                }
+                true
+            })
+            .collect();
+        if !dropped_mcp_schema_names.is_empty() {
+            tracing::warn!(
+                target: "astra.cli.capacity_provider",
+                dropped = ?dropped_mcp_schema_names,
+                "dropped MCP schemas from CLI local provider; install them through the MCP runtime provider"
+            );
+        }
+
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.cli_local_provider_schemas,
+            "cli_local_provider_schemas",
+        );
         *guard = schemas;
     }
 
@@ -1386,7 +1430,8 @@ impl ToolExecutor {
 
     /// Install the visible `tools[]` names for the current LLM request.
     pub fn set_current_visible_tool_schemas(&self, schemas: &[Value]) {
-        let names = astra_turn_core::tool::schema::tool_names_from_schemas(schemas);
+        let visible_schemas = self.runtime_bound_tool_schemas(schemas.to_vec());
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible_schemas);
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
         let activatable = guard.activatable().cloned().unwrap_or_default();
@@ -1413,7 +1458,8 @@ impl ToolExecutor {
         visible_schemas: &[Value],
         activatable_names: HashSet<String>,
     ) {
-        let visible = astra_turn_core::tool::schema::tool_names_from_schemas(visible_schemas);
+        let visible_schemas = self.runtime_bound_tool_schemas(visible_schemas.to_vec());
+        let visible = astra_turn_core::tool::schema::tool_names_from_schemas(&visible_schemas);
         let activatable = self.runtime_bound_tool_names(activatable_names);
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
@@ -1472,7 +1518,7 @@ impl ToolExecutor {
 
         astra_turn_core::tool::deferred_activation::searchable_runtime_bound_tool_names(
             &surface,
-            |name| self.tool_has_runtime_binding(name),
+            |name| self.tool_has_public_schema_runtime_binding(name),
         )
     }
 
@@ -1482,7 +1528,7 @@ impl ToolExecutor {
 
     fn runtime_bound_tool_names(&self, names: HashSet<String>) -> HashSet<String> {
         astra_turn_core::tool::deferred_activation::runtime_bound_tool_names(names, |name| {
-            self.tool_has_runtime_binding(name)
+            self.tool_has_public_schema_runtime_binding(name)
         })
     }
 
@@ -1491,22 +1537,102 @@ impl ToolExecutor {
             .into_iter()
             .filter(|schema| {
                 astra_turn_core::tool::schema::tool_schema_name(schema)
-                    .is_some_and(|name| self.tool_has_runtime_binding(name))
+                    .is_some_and(|name| self.tool_has_public_schema_runtime_binding(name))
             })
             .collect()
     }
 
-    fn tool_has_runtime_binding(&self, name: &str) -> bool {
+    fn tool_has_public_schema_runtime_binding(&self, name: &str) -> bool {
         if name.starts_with("mcp__") {
             return self.mcp_tool_has_runtime_binding(name);
         }
+
+        let registry = runtime_env_builtin_registry();
+        if let Some(spec) = registry.get(name) {
+            if !spec.load_policy.is_public_schema_policy() {
+                return false;
+            }
+            if !self.cli_builtin_providers_declare_tool(name, registry) {
+                return false;
+            }
+            return self.tool_has_runtime_binding(name);
+        }
+
+        self.cli_local_provider_schema_has_name(name) && self.tool_has_runtime_binding(name)
+    }
+
+    fn cli_builtin_providers_declare_tool(
+        &self,
+        name: &str,
+        registry: &astra_runtime_env::ToolRegistry,
+    ) -> bool {
+        [
+            astra_runtime_env::server_service_provider("cli-server-service", registry),
+            astra_runtime_env::control_plane_provider("cli-control-plane", registry),
+            astra_runtime_env::cli_local_provider("local-cli", registry),
+        ]
+        .iter()
+        .any(|provider| provider.declares_tool(name))
+    }
+
+    fn tool_has_runtime_binding(&self, name: &str) -> bool {
+        self.tool_has_runtime_binding_for_call(name, &Value::Null)
+    }
+
+    fn tool_has_runtime_binding_for_call(&self, name: &str, args: &Value) -> bool {
+        if self.runtime_environment_tool_denial(name, args).is_some() {
+            return false;
+        }
+
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
             return self.cli_declared_local_tool_has_name(name)
-                || self.plugin_schema_has_name(name);
+                || self.cli_local_provider_schema_has_name(name);
         };
         meta.requires
             .iter()
             .all(|capability| self.capability_has_runtime_binding(*capability))
+    }
+
+    fn runtime_environment_tool_denial(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<astra_runtime_env::ToolUnavailableReason> {
+        let registry = runtime_env_builtin_registry();
+        if registry.get(name).is_none() && !name.starts_with("mcp__") {
+            return None;
+        }
+        let binding = self.runtime_environment_binding_for_tool(name, registry);
+        astra_runtime_env::CapabilityResolver
+            .check_tool_call(registry, name, args, &binding.capabilities)
+            .err()
+    }
+
+    fn runtime_environment_binding_for_tool(
+        &self,
+        name: &str,
+        registry: &astra_runtime_env::ToolRegistry,
+    ) -> astra_runtime_env::RunBinding {
+        if name.starts_with("mcp__") && self.mcp_tool_has_runtime_binding(name) {
+            return astra_runtime_env::RunBinding::resolve(
+                astra_runtime_env::WorkspaceBinding::none(),
+                astra_runtime_env::ExecutorBinding {
+                    kind: astra_runtime_env::ExecutorBindingKind::RequestScopedMcp,
+                    executor_id: "cli-request-scoped-mcp".to_string(),
+                    display_name: "CLI MCP server".to_string(),
+                    transport: astra_runtime_env::ToolTransportKind::McpHttp,
+                    status: astra_runtime_env::ExecutorStatus::Online,
+                },
+                astra_runtime_env::RuntimeBinding::none(),
+                astra_runtime_env::PolicyIntent::cloud_control_plane(),
+                registry,
+            );
+        }
+
+        astra_runtime_env::RunBinding::local_developer(
+            self.project_root.display().to_string(),
+            registry,
+        )
     }
 
     fn cli_declared_local_tool_has_name(&self, name: &str) -> bool {
@@ -1524,8 +1650,8 @@ impl ToolExecutor {
                 .contains(name)
     }
 
-    fn plugin_schema_has_name(&self, name: &str) -> bool {
-        self.external_schemas_snapshot("external_schemas_runtime_binding")
+    fn cli_local_provider_schema_has_name(&self, name: &str) -> bool {
+        self.cli_local_provider_schemas_snapshot("cli_local_provider_schemas_runtime_binding")
             .iter()
             .any(|schema| {
                 astra_turn_core::tool::schema::tool_schema_name(schema)
@@ -1579,7 +1705,7 @@ impl ToolExecutor {
     }
 
     fn tool_binding_admission_denial(&self, name: &str, args: &Value) -> Option<EdgeToolRun> {
-        if self.tool_has_runtime_binding(name) {
+        if self.tool_has_runtime_binding_for_call(name, args) {
             return None;
         }
         if self.tool_can_validate_without_runtime_binding(name, args) {
@@ -1707,28 +1833,32 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn runtime_bound_external_schemas_excluding(
+    pub(crate) fn runtime_bound_provider_owned_schemas_excluding(
         &self,
         restricted_tools: &HashSet<String>,
     ) -> Vec<Value> {
-        let external_schemas: Vec<Value> = self
-            .external_schemas_snapshot("external_schemas_deferred_manifest")
+        let provider_schemas: Vec<Value> = self
+            .provider_owned_schemas_snapshot("provider_owned_schemas_deferred_manifest")
             .into_iter()
             .filter(|schema| {
                 astra_turn_core::tool::schema::tool_schema_name(schema)
                     .is_none_or(|name| !restricted_tools.contains(name))
             })
             .collect();
-        self.runtime_bound_tool_schemas(external_schemas)
+        self.runtime_bound_tool_schemas(provider_schemas)
     }
 
-    pub(super) fn external_schemas_snapshot(&self, label: &str) -> Vec<Value> {
-        let mut schemas = rwlock_read_clone_or_default(&self.plugin_schemas, label);
+    pub(super) fn provider_owned_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+        let mut schemas = self.cli_local_provider_schemas_snapshot(label);
         schemas.extend(
             self.mcp_runtime_snapshot("mcp_runtime_schema_snapshot")
                 .schemas,
         );
         schemas
+    }
+
+    fn cli_local_provider_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+        rwlock_read_clone_or_default(&self.cli_local_provider_schemas, label)
     }
 
     pub(super) fn mcp_runtime_snapshot(&self, label: &str) -> EdgeMcpRuntimeSnapshot {
@@ -2185,7 +2315,7 @@ impl ToolExecutor {
         astra_core::sync_poison::recover_rwlock_read(&self.cloud_token).clone()
     }
 
-    // ─── Plan-mode write guard (parity with server_tool_executor) ───────────
+    // ─── Plan-mode write guard (parity with runtime_tool_executor) ───────────
     //
     // While a plan is in authoring (`phase=planning` or `phase=refining`),
     // world-mutating tools must be
@@ -5199,8 +5329,17 @@ impl ToolExecutor {
         })
     }
 
+    fn provider_visible_tool_schemas(&self) -> Vec<Value> {
+        let mut tools = self.runtime_bound_provider_owned_schemas_excluding(&HashSet::new());
+        if tools.is_empty() {
+            tools = self.runtime_bound_tool_schemas(local_tool_schemas());
+        }
+        tools
+    }
+
     fn tool_names(&self) -> Vec<String> {
-        all_tool_schemas()
+        let mut names: Vec<String> = self
+            .provider_visible_tool_schemas()
             .iter()
             .filter_map(|s| {
                 s.get("function")
@@ -5208,11 +5347,13 @@ impl ToolExecutor {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             })
-            .collect()
+            .collect();
+        names.sort();
+        names
     }
 
     fn tool_count(&self) -> usize {
-        all_tool_schemas().len()
+        self.tool_names().len()
     }
 
     async fn get_agent_info(&self, args: &Value) -> String {
@@ -5311,6 +5452,7 @@ impl ToolExecutor {
                 "tools_dropped_by_capability": caps.dropped_by_capability,
                 "tools_dropped_by_surface": caps.dropped_by_surface,
                 "tools_pass_through_mcp": caps.mcp_pass_through,
+                "capacity_provider_coverage": caps.capacity_provider_coverage,
                 "tool_count": model.capabilities.total_tools,
                 "retry_cautioned_tools": model.capabilities.retry_cautioned_tools,
                 "skills": model.capabilities.skills,
@@ -5334,6 +5476,7 @@ impl ToolExecutor {
                 "tools_dropped_by_capability": caps.dropped_by_capability,
                 "tools_dropped_by_surface": caps.dropped_by_surface,
                 "tools_pass_through_mcp": caps.mcp_pass_through,
+                "capacity_provider_coverage": caps.capacity_provider_coverage,
                 "tool_count": tool_count,
             })
         }
@@ -5366,7 +5509,7 @@ impl ToolExecutor {
         }
 
         let mut pool = full_tool_schemas();
-        pool.extend(self.external_schemas_snapshot("external_schemas_capability_view"));
+        pool.extend(self.provider_owned_schemas_snapshot("provider_owned_schemas_capability_view"));
 
         let outcome = astra_turn_core::tool_surface::resolve_with_diagnostics(
             astra_turn_core::tool_surface::Surface::CliLocal,
@@ -5438,7 +5581,67 @@ impl ToolExecutor {
             dropped_by_capability,
             dropped_by_surface,
             mcp_pass_through,
+            capacity_provider_coverage: self.cli_capacity_provider_coverage(),
         }
+    }
+
+    fn cli_capacity_provider_coverage(
+        &self,
+    ) -> Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry> {
+        vec![
+            self.cli_local_provider_coverage(),
+            self.cli_control_plane_provider_coverage(),
+            self.cli_request_scoped_mcp_provider_coverage(),
+        ]
+    }
+
+    fn cli_local_provider_coverage(
+        &self,
+    ) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        astra_runtime_env::CapacityProviderCoverageEntry::ready(
+            astra_runtime_env::CapacityProviderType::CliLocal,
+            "local-cli",
+            astra_runtime_env::read_write_workspace_capabilities(),
+        )
+    }
+
+    fn cli_control_plane_provider_coverage(
+        &self,
+    ) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        let mut extra = vec![
+            astra_runtime_env::CAP_INTROSPECT,
+            astra_runtime_env::CAP_REFLECT,
+        ];
+        if self.spawn_context.is_some() {
+            extra.push(astra_runtime_env::CAP_MULTI_AGENT);
+        }
+        if self.bg_task_commands.is_some() {
+            extra.push(astra_runtime_env::CAP_LOCAL_BACKGROUND_TASKS);
+        }
+        astra_runtime_env::CapacityProviderCoverageEntry::ready(
+            astra_runtime_env::CapacityProviderType::ControlPlane,
+            "cli-control-plane",
+            astra_runtime_env::control_plane_capabilities(extra),
+        )
+    }
+
+    fn cli_request_scoped_mcp_provider_coverage(
+        &self,
+    ) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        let schemas = self
+            .mcp_runtime_snapshot("cli_request_scoped_mcp_coverage")
+            .schemas;
+        let ready_names = schemas
+            .iter()
+            .filter_map(astra_turn_core::tool::schema::tool_schema_name)
+            .filter(|name| self.mcp_tool_has_runtime_binding(name))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        astra_runtime_env::request_scoped_mcp_coverage(
+            "cli-request-scoped-mcp",
+            !schemas.is_empty(),
+            ready_names,
+        )
     }
 
     /// Build a SelfModel snapshot from available observability session data.
@@ -5673,6 +5876,17 @@ mod tests {
         (dir, executor)
     }
 
+    fn function_schema(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": format!("{name} test schema"),
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })
+    }
+
     #[test]
     fn cloud_plan_summary_requires_canonical_status_field() {
         let executor = test_executor();
@@ -5721,7 +5935,7 @@ mod tests {
             HashSet::from(["tool_search".to_string(), "ask_user".to_string()])
         );
 
-        executor.set_plugin_schemas(vec![plugin_schema.clone()]);
+        executor.set_cli_local_provider_schemas(vec![plugin_schema.clone()]);
         let filtered = executor.runtime_bound_tool_schemas(candidate_schemas());
         let names = astra_turn_core::tool::schema::tool_names_from_schemas(&filtered);
         assert_eq!(
@@ -5731,6 +5945,106 @@ mod tests {
                 "ask_user".to_string(),
                 "plugin_registered".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn runtime_bound_tool_schemas_hide_internal_builtin_helpers() {
+        let executor = test_executor();
+        let filtered = executor.runtime_bound_tool_schemas(vec![
+            function_schema("read_file"),
+            function_schema("delete_file"),
+            function_schema("multi_edit"),
+            function_schema("background_shell"),
+            function_schema("git_clone"),
+            function_schema("find_definition"),
+            function_schema("find_references"),
+        ]);
+
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(&filtered),
+            HashSet::from(["read_file".to_string()]),
+            "internal helper schemas must not be prompt-visible even when the local runtime can execute their underlying capability"
+        );
+    }
+
+    #[test]
+    fn current_tool_surface_filters_internal_helpers_before_admission() {
+        let executor = test_executor();
+
+        executor.set_current_activatable_tool_names(HashSet::from([
+            "read_file".to_string(),
+            "delete_file".to_string(),
+            "multi_edit".to_string(),
+        ]));
+        assert_eq!(
+            executor.current_activatable_tool_names_snapshot(),
+            HashSet::from(["read_file".to_string()]),
+            "deferred activation must mirror public provider-owned schemas, not internal helper executability"
+        );
+
+        executor.set_current_tool_surface(
+            &[
+                function_schema("read_file"),
+                function_schema("delete_file"),
+                function_schema("multi_edit"),
+            ],
+            HashSet::from(["background_shell".to_string()]),
+        );
+        let surface = executor.current_tool_surface_snapshot("test_visible_surface");
+        assert_eq!(
+            surface.visible().cloned().unwrap_or_default(),
+            HashSet::from(["read_file".to_string()]),
+            "manual visible-surface installation must not admit internal helper schemas"
+        );
+        assert!(
+            surface
+                .activatable()
+                .cloned()
+                .unwrap_or_default()
+                .is_empty(),
+            "manual activatable surface must not retain internal helper names"
+        );
+    }
+
+    #[test]
+    fn cli_runtime_env_admission_allows_local_workspace_tools() {
+        let (_dir, executor) = temp_executor();
+
+        for (tool, args) in [
+            ("read_file", serde_json::json!({"path": "README.md"})),
+            ("bash", serde_json::json!({"command": "pwd"})),
+            (
+                "git",
+                serde_json::json!({"action": "commit", "message": "local change"}),
+            ),
+        ] {
+            assert!(
+                executor
+                    .runtime_environment_tool_denial(tool, &args)
+                    .is_none(),
+                "{tool} should be allowed by the CLI local provider runtime-env binding"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_runtime_env_admission_requires_request_scoped_mcp_executor() {
+        let executor = test_executor();
+
+        let denial = executor
+            .runtime_environment_tool_denial("mcp__weather", &serde_json::json!({"city": "NYC"}))
+            .expect("MCP tool without runtime binding must be denied");
+
+        assert_eq!(
+            denial,
+            astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(
+                "mcp_executor_required".to_string()
+            )
+        );
+        assert!(
+            !executor.tool_has_runtime_binding("mcp__weather"),
+            "MCP schema must stay invisible without request-scoped MCP ownership"
         );
     }
 
@@ -6790,6 +7104,32 @@ mod tests {
             .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
             .unwrap_or_default();
         assert!(missing.contains(&"LocalBackgroundTasks"));
+
+        let providers = parsed["capacity_provider_coverage"]
+            .as_array()
+            .expect("capacity_provider_coverage");
+        let cli_local = providers
+            .iter()
+            .find(|provider| provider["provider_type"] == "cli_local")
+            .expect("CLI introspect must expose cli_local provider coverage");
+        assert_eq!(cli_local["status"].as_str(), Some("ready"));
+        assert!(
+            cli_local["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some("shell"))),
+            "cli_local provider should report shell capacity; got {out}"
+        );
+        let mcp = providers
+            .iter()
+            .find(|provider| provider["provider_type"] == "request_scoped_mcp")
+            .expect("CLI introspect must expose request-scoped MCP provider coverage");
+        assert_eq!(mcp["status"].as_str(), Some("unbound"));
+        assert_eq!(
+            mcp["unavailable_reason"].as_str(),
+            Some("no_request_scoped_mcp_provider_bound")
+        );
     }
 
     #[tokio::test]
@@ -6821,15 +7161,72 @@ mod tests {
             !dropped.iter().any(|entry| entry["name"] == "task_output"),
             "task_output must be visible when LocalBackgroundTasks is active; got {out}"
         );
+
+        let providers = parsed["capacity_provider_coverage"]
+            .as_array()
+            .expect("capacity_provider_coverage");
+        let control_plane = providers
+            .iter()
+            .find(|provider| provider["provider_type"] == "control_plane")
+            .expect("CLI introspect must expose control-plane provider coverage");
+        assert!(
+            control_plane["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some("local_background_tasks"))),
+            "control-plane provider should report local background task capacity when wired; got {out}"
+        );
     }
 
     #[tokio::test]
-    async fn tool_search_rejects_mcp_plugin_schema_without_runtime_binding() {
-        // MCP schemas are only callable when the MCP manager currently owns
-        // the public tool name. A cached schema alone must not make
-        // `tool_search(select:mcp__X)` more optimistic than execution.
+    async fn introspect_capability_reports_stale_mcp_provider_unbound() {
+        let mut executor = test_executor();
+        executor.install_mcp_bundle(
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::mcp_client::McpClientManager::new(),
+            )),
+            vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__weather",
+                    "description": "Get weather for a city.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+        );
+
+        let out = executor
+            .execute(
+                "introspect",
+                &serde_json::json!({"dimension": "capability"}),
+            )
+            .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("introspect must return JSON");
+        let providers = parsed["capacity_provider_coverage"]
+            .as_array()
+            .expect("capacity_provider_coverage");
+        let mcp = providers
+            .iter()
+            .find(|provider| provider["provider_type"] == "request_scoped_mcp")
+            .expect("request-scoped MCP coverage");
+
+        assert_eq!(mcp["status"].as_str(), Some("unbound"));
+        assert_eq!(
+            mcp["unavailable_reason"].as_str(),
+            Some("no_request_scoped_mcp_runtime_binding")
+        );
+        assert!(mcp["capabilities"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_search_rejects_mcp_schema_installed_on_cli_local_provider() {
+        // MCP schemas are only callable when the MCP provider currently owns
+        // the public tool name. Installing an MCP-shaped schema on the CLI
+        // local provider must not make it visible or activatable.
         let executor = test_executor();
-        let plugin = serde_json::json!({
+        let schema = serde_json::json!({
             "type": "function",
             "function": {
                 "name": "mcp__weather",
@@ -6841,7 +7238,7 @@ mod tests {
                 }
             }
         });
-        executor.set_plugin_schemas(vec![plugin]);
+        executor.set_cli_local_provider_schemas(vec![schema]);
         executor.set_current_activatable_tool_names(HashSet::from(["mcp__weather".to_string()]));
         assert!(
             executor
@@ -6865,7 +7262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_search_rejects_stale_mcp_plugin_schema_not_owned_by_manager() {
+    async fn tool_search_rejects_stale_mcp_schema_not_owned_by_manager() {
         let mut executor = test_executor();
         executor.install_mcp_bundle(
             std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -6906,9 +7303,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_bound_external_schemas_excluding_filters_restricted_plugins() {
+    fn runtime_bound_provider_owned_schemas_excluding_filters_restricted_cli_provider_tools() {
         let executor = test_executor();
-        executor.set_plugin_schemas(vec![serde_json::json!({
+        executor.set_cli_local_provider_schemas(vec![serde_json::json!({
             "type": "function",
             "function": {
                 "name": "custom_weather",
@@ -6921,18 +7318,18 @@ mod tests {
             }
         })]);
 
-        let unrestricted = executor.runtime_bound_external_schemas_excluding(&HashSet::new());
+        let unrestricted = executor.runtime_bound_provider_owned_schemas_excluding(&HashSet::new());
         assert_eq!(
             astra_turn_core::tool::schema::tool_names_from_schemas(&unrestricted),
             HashSet::from(["custom_weather".to_string()])
         );
 
-        let restricted = executor.runtime_bound_external_schemas_excluding(&HashSet::from([
+        let restricted = executor.runtime_bound_provider_owned_schemas_excluding(&HashSet::from([
             "custom_weather".to_string(),
         ]));
         assert!(
             restricted.is_empty(),
-            "restricted dynamic plugin schemas must not be advertised as deferred"
+            "restricted dynamic CLI provider schemas must not be advertised as deferred"
         );
     }
 
@@ -7026,31 +7423,32 @@ mod tests {
         );
     }
 
-    /// Poison recovery: plugin schemas are a cache. If a prior panic poisoned
+    /// Poison recovery: CLI provider schemas are a cache. If a prior panic poisoned
     /// the RwLock, reset to a known empty state rather than reading possibly
-    /// half-written inner data; a later `set_plugin_schemas` repopulates it.
+    /// half-written inner data; a later `set_cli_local_provider_schemas` repopulates it.
     #[tokio::test]
-    async fn tool_search_resets_poisoned_plugin_schemas_lock() {
+    async fn tool_search_resets_poisoned_cli_local_provider_schemas_lock() {
         let executor = test_executor();
-        let plugin = serde_json::json!({
+        let schema = serde_json::json!({
             "type": "function",
             "function": {
-                "name": "mcp__calc",
+                "name": "custom_calc",
                 "description": "Evaluate expressions.",
                 "parameters": {"type": "object", "properties": {}}
             }
         });
-        executor.set_plugin_schemas(vec![plugin.clone()]);
-        executor.set_current_activatable_tool_names(HashSet::from(["mcp__calc".to_string()]));
+        executor.set_cli_local_provider_schemas(vec![schema.clone()]);
+        executor.set_current_activatable_tool_names(HashSet::from(["custom_calc".to_string()]));
 
         // Simulate a prior panic-poisoned write lock.
-        let arc = std::sync::Arc::new(&executor.plugin_schemas);
+        let arc = std::sync::Arc::new(&executor.cli_local_provider_schemas);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = arc.write().unwrap();
             panic!("simulated panic under write lock");
         }));
         assert!(
-            executor.plugin_schemas.read().is_err() || executor.plugin_schemas.write().is_err(),
+            executor.cli_local_provider_schemas.read().is_err()
+                || executor.cli_local_provider_schemas.write().is_err(),
             "lock should be poisoned for the test to be meaningful"
         );
 
@@ -7059,32 +7457,28 @@ mod tests {
         let out = executor
             .execute(
                 "tool_search",
-                &serde_json::json!({"query": "select:mcp__calc"}),
+                &serde_json::json!({"query": "select:custom_calc"}),
             )
             .await;
         let parsed = parse_tool_search_output(&out);
         assert_eq!(tool_search_match_names(&parsed), Vec::<String>::new());
         assert_eq!(
             tool_search_string_array(&parsed, "missing"),
-            vec!["mcp__calc".to_string()]
+            vec!["custom_calc".to_string()]
         );
 
-        executor.set_plugin_schemas(vec![plugin]);
+        executor.set_cli_local_provider_schemas(vec![schema]);
         let out = executor
             .execute(
                 "tool_search",
-                &serde_json::json!({"query": "select:mcp__calc"}),
+                &serde_json::json!({"query": "select:custom_calc"}),
             )
             .await;
         let parsed = parse_tool_search_output(&out);
         assert_eq!(
             tool_search_match_names(&parsed),
-            Vec::<String>::new(),
-            "repopulating the cache should not bypass the missing MCP runtime binding"
-        );
-        assert_eq!(
-            tool_search_string_array(&parsed, "missing"),
-            vec!["mcp__calc".to_string()]
+            vec!["custom_calc".to_string()],
+            "repopulating the CLI provider cache should restore provider-owned tools"
         );
     }
 

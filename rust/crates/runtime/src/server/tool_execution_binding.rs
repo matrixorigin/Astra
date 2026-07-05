@@ -26,7 +26,7 @@ impl WorkspaceBinding {
     pub fn none() -> Self {
         Self {
             kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
+            display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
             fallback_policy: FallbackPolicy::Disabled,
@@ -148,6 +148,43 @@ impl ExecutorBinding {
             transport: ToolTransportKind::SandboxResidentAgent,
             status,
         }
+    }
+}
+
+pub(crate) fn runtime_env_executor_kind_for_provider(
+    kind: ExecutorBindingKind,
+) -> astra_runtime_env::ExecutorBindingKind {
+    match kind {
+        ExecutorBindingKind::ServerLocal => astra_runtime_env::ExecutorBindingKind::ServerRuntime,
+        ExecutorBindingKind::EdgeAgent => astra_runtime_env::ExecutorBindingKind::EdgeAgent,
+        ExecutorBindingKind::OrchestratorManaged => {
+            astra_runtime_env::ExecutorBindingKind::OrchestratorManaged
+        }
+        ExecutorBindingKind::ThinClient
+        | ExecutorBindingKind::Mcp
+        | ExecutorBindingKind::Unknown => astra_runtime_env::ExecutorBindingKind::Unknown,
+    }
+}
+
+pub(crate) fn capacity_provider_type_for_workspace_executor(
+    workspace_kind: WorkspaceBindingKind,
+    executor_kind: ExecutorBindingKind,
+) -> astra_runtime_env::CapacityProviderType {
+    astra_runtime_env::runtime_execution_provider_type(
+        workspace_kind,
+        runtime_env_executor_kind_for_provider(executor_kind),
+    )
+}
+
+pub(crate) fn runtime_execution_provider_id_for_executor(executor: &ExecutorBinding) -> String {
+    match executor.kind {
+        ExecutorBindingKind::ServerLocal => "server-sandbox".to_string(),
+        ExecutorBindingKind::EdgeAgent | ExecutorBindingKind::OrchestratorManaged => {
+            executor.executor_id.clone()
+        }
+        ExecutorBindingKind::ThinClient
+        | ExecutorBindingKind::Mcp
+        | ExecutorBindingKind::Unknown => "workspace-executor".to_string(),
     }
 }
 

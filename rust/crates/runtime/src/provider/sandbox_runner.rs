@@ -12,7 +12,7 @@ use astra_runtime_env::IsolationIntent;
 use async_trait::async_trait;
 
 use super::traits::{CapabilityProvider, ProviderError, ToolRequest, ToolResult};
-use super::types::{ProviderKind, ToolCapability, ToolCategory};
+use super::types::{ProviderKind, ToolCapability};
 
 // ---------------------------------------------------------------------------
 // SandboxRuntimeProvider
@@ -99,14 +99,16 @@ impl CapabilityProvider for SandboxRuntimeProvider {
     }
 
     async fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![
-            // ── Shell ──
-            ToolCapability::Category(ToolCategory::Shell),
-            // ── FileSystem ──
-            ToolCapability::Category(ToolCategory::FileSystem),
-            // ── VersionControl ──
-            ToolCapability::Category(ToolCategory::VersionControl),
-        ]
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        astra_runtime_env::runtime_workspace_provider(
+            astra_runtime_env::CapacityProviderType::Sandbox,
+            "sandbox-runtime",
+            &registry,
+        )
+        .tool_names
+        .into_iter()
+        .map(ToolCapability::Named)
+        .collect()
     }
 
     async fn health_check(&self) -> Result<(), ProviderError> {
@@ -186,7 +188,7 @@ impl CapabilityProvider for SandboxRuntimeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::types::{ToolCapability, ToolCategory};
+    use crate::provider::types::ToolCapability;
 
     /// Stub sandbox service that returns canned responses.
     struct StubSandboxService;
@@ -246,12 +248,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capabilities_include_shell_filesystem_vcs() {
+    async fn capabilities_are_named_runtime_workspace_tools() {
         let provider = SandboxRuntimeProvider::new(10);
         let caps = provider.capabilities().await;
-        assert!(caps.contains(&ToolCapability::Category(ToolCategory::Shell)));
-        assert!(caps.contains(&ToolCapability::Category(ToolCategory::FileSystem)));
-        assert!(caps.contains(&ToolCapability::Category(ToolCategory::VersionControl)));
+        assert!(caps.contains(&ToolCapability::Named("bash".into())));
+        assert!(caps.contains(&ToolCapability::Named("read_file".into())));
+        assert!(caps.contains(&ToolCapability::Named("git".into())));
+        assert!(!caps.contains(&ToolCapability::Named("memory".into())));
     }
 
     #[tokio::test]

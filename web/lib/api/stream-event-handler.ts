@@ -68,10 +68,20 @@ function eventStatusFeedback(event: StreamEvent): string | undefined {
   for (const key of ["message", "error", "user_message"] as const) {
     const value = (event as Record<string, unknown>)[key];
     if (typeof value === "string" && value.trim()) {
-      return value;
+      return value.trim();
     }
   }
   return undefined;
+}
+
+function explicitEventMessage(event: StreamEvent): string {
+  for (const key of ["message", "error", "user_message"] as const) {
+    const value = (event as Record<string, unknown>)[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
 }
 
 export function isRunBlockedEvent(type: string): boolean {
@@ -189,6 +199,21 @@ export function applyStreamEvent(
       // RunBlockedEvent carries no run_id field; keep whatever runId is already known
       const runId = state.runId;
       const waitingFor = blockedWaitingFor(event);
+      const message = explicitEventMessage(event);
+      if (message && !state.assistantText) {
+        state.assistantText = message;
+        updateStreamingAssistantMessage(
+          ctx.ownerUserId,
+          ctx.chatId,
+          ctx.assistantMessageId,
+          {
+            content: state.assistantText,
+            reasoning: state.reasoningText || undefined,
+            reasoningStatus: state.reasoningText ? "streaming" : undefined,
+            status: "streaming",
+          },
+        );
+      }
       if (runId) {
         state.runId = runId;
         setActiveRun({

@@ -7,6 +7,8 @@ help:
 	@echo ""
 	@echo "Quick Start:"
 	@echo "  make dev-start          - Start all (deps + API server + web UI)"
+	@echo "  make dev-start-server-only - Start server-only runtime (deps + API + web; no edge provider)"
+	@echo "  make dev-start-server-edge - Start server + local astra-edge provider"
 	@echo "  make dev-stop           - Stop all services"
 	@echo "  make dev-status         - Show all service status"
 	@echo "  make dev-init           - Initialize development environment"
@@ -37,10 +39,21 @@ help:
 	@echo "  make dev-web-logs       - Show web UI logs"
 	@echo "  make dev-web-status     - Show web UI status"
 	@echo ""
+	@echo "Edge Provider:"
+	@echo "  make dev-edge-start     - Start local astra-edge provider for web/server workspace tools"
+	@echo "  make dev-edge-stop      - Stop local astra-edge provider"
+	@echo "  make dev-edge-logs      - Show astra-edge logs"
+	@echo "  make dev-edge-status    - Show astra-edge status"
+	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see rust/.config/nextest.toml)"
+	@echo "  make test-runtime-profiles - Server-only + server+edge + managed runtime + CLI-local profile guardrails"
+	@echo "  make test-server-only   - Focused Web/runtime tests for server-only access surface"
+	@echo "  make test-server-edge   - Focused tests for edge provider protocol and routing"
+	@echo "  make test-managed-runtime - Focused tests for sandbox/orchestrator/MCP provider routing"
+	@echo "  make test-cli-local     - Focused tests for CLI-local provider routing"
 	@echo "  make test-no-sticky-control - Fast no-sticky control-plane tests (approval/ask_user/edge callbacks; no live DB)"
 	@echo "  make test-cleanup-pressure - Live MatrixOne cleanup pressure probes (explicit, not part of test-online)"
 	@echo "  make test-durable-event-pressure - Live MatrixOne durable event pressure probe (explicit, not part of test-online)"
@@ -63,6 +76,8 @@ help:
 	@echo "  make build-debug        - Build entire Rust workspace (debug, fast)"
 	@echo "  make build-server       - Build astra-server (release)"
 	@echo "  make build-server-debug - Build astra-server (debug, fast)"
+	@echo "  make build-edge         - Build astra-edge provider (release)"
+	@echo "  make build-edge-debug   - Build astra-edge provider (debug, fast)"
 	@echo "  make build-cli          - Build astra CLI (release)"
 	@echo "  make build-cli-debug    - Build astra CLI (debug, fast)"
 	@echo ""
@@ -82,6 +97,8 @@ help:
 	@echo "All-in-One Docker Deployment:"
 	@echo "  make stack-env          - Create .env and generate stack secrets"
 	@echo "  make stack-up           - Start MatrixOne + Memoria + API"
+	@echo "  make stack-up-server-only - Start compose stack without local edge provider"
+	@echo "  make stack-up-server-edge - Start compose stack plus local astra-edge provider"
 	@echo "  make stack-down         - Stop compose stack"
 	@echo "  make stack-clean        - Stop compose stack and remove MatrixOne data"
 	@echo "  make stack-status       - Show compose stack status"
@@ -105,6 +122,7 @@ RUST_TARGET_DIR := rust/target
 RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
 RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
 API_SERVER_BIN := astra-server
+EDGE_BIN := astra-edge
 CLI_BINS := astra
 CLI_RELEASE_FLAGS ?= --no-default-features
 IMAGE_NAME ?= matrixorigin/astra
@@ -407,6 +425,39 @@ dev-web-status:
 	fi
 
 # ============================================================================
+# Edge Provider (local execution provider for server/web runtime)
+# ============================================================================
+
+.PHONY: dev-edge-start
+dev-edge-start:
+	@BUILD_MODE=$${ASTRA_EDGE_BUILD_MODE:-debug} ./scripts/dev/start-edge.sh
+
+.PHONY: dev-edge-stop
+dev-edge-stop:
+	@./scripts/dev/stop-edge.sh
+
+.PHONY: dev-edge-logs
+dev-edge-logs:
+	@LOG_FILE=$${ASTRA_EDGE_LOG_FILE:-astra_edge.log}; \
+	if [ -f "$$LOG_FILE" ]; then \
+		tail -f "$$LOG_FILE"; \
+	else \
+		echo "❌ $$LOG_FILE not found. Is astra-edge running?"; \
+	fi
+
+.PHONY: dev-edge-status
+dev-edge-status:
+	@PID_FILE=$${ASTRA_EDGE_PID_FILE:-astra_edge.pid}; \
+	echo "Edge Provider Status:"; \
+	echo "====================="; \
+	if [ -f "$$PID_FILE" ] && kill -0 $$(cat "$$PID_FILE") 2>/dev/null; then \
+		PID=$$(cat "$$PID_FILE"); \
+		echo "  ✅ Running (PID: $$PID)"; \
+	else \
+		echo "  ❌ Not running"; \
+	fi
+
+# ============================================================================
 # API Server (Docker Mode)
 # ============================================================================
 
@@ -574,6 +625,19 @@ stack-up: stack-config
 	@API_PORT=$$(sed -n 's/^ASTRA_API_PORT=//p' $(STACK_ENV) | tail -1); \
 	echo "   API: http://localhost:$${API_PORT:-$(DEFAULT_API_PORT)}"
 
+.PHONY: stack-up-server-only
+stack-up-server-only:
+	@echo "Ensuring no local astra-edge provider remains connected..."
+	@$(MAKE) dev-edge-stop
+	@$(MAKE) stack-up
+	@echo "✅ Server-only stack ready (no local edge provider connected)"
+
+.PHONY: stack-up-server-edge
+stack-up-server-edge: stack-up-server-only
+	@API_PORT=$$([ -f "$(STACK_ENV)" ] && sed -n 's/^ASTRA_API_PORT=//p' $(STACK_ENV) | tail -1 || true); \
+	ASTRA_EDGE_SERVER_URL="http://127.0.0.1:$${API_PORT:-$(DEFAULT_API_PORT)}" $(MAKE) dev-edge-start
+	@echo "✅ Server + edge stack ready"
+
 .PHONY: stack-down
 stack-down:
 	@$(STACK_COMPOSE) down
@@ -596,17 +660,37 @@ stack-logs: stack-check-env
 # Composite Commands
 # ============================================================================
 
-.PHONY: dev-start
-dev-start: dev-deps-up dev-deps-wait dev-api-start dev-web-start
+.PHONY: dev-start-server-only
+dev-start-server-only:
+	@echo "Starting server-only development environment..."
+	@$(MAKE) dev-edge-stop
+	@$(MAKE) dev-deps-up
+	@$(MAKE) dev-deps-wait
+	@$(MAKE) dev-api-start
+	@$(MAKE) dev-web-start
 	@echo ""
-	@echo "✅ Development environment started!"
+	@echo "✅ Server-only development environment started!"
 	@echo "   API: http://localhost:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}"
 	@echo "   Web: http://localhost:$${ASTRA_WEB_PORT:-$${WEB_PORT:-3536}}"
+	@echo "   Edge provider: not connected"
 	@echo ""
 	@echo "Next steps:"
 	@echo "  astra register"
 	@echo "  astra login"
 	@echo "  astra chat"
+
+.PHONY: dev-start-server-edge
+dev-start-server-edge:
+	@$(MAKE) dev-start-server-only
+	@$(MAKE) dev-edge-start
+	@echo ""
+	@echo "✅ Server + edge development environment started!"
+	@echo "   API: http://localhost:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}"
+	@echo "   Web: http://localhost:$${ASTRA_WEB_PORT:-$${WEB_PORT:-3536}}"
+	@echo "   Edge workspace: $${ASTRA_EDGE_WORKSPACE_DIR:-$$(pwd)}"
+
+.PHONY: dev-start
+dev-start: dev-start-server-only
 
 .PHONY: dev-start-docker
 # Docker API mode reuses the dev dependency stack; dev-api-docker-up starts only api.
@@ -617,7 +701,7 @@ dev-start-docker: dev-deps-up dev-deps-wait dev-api-docker-up
 	@echo "   API: http://localhost:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}"
 
 .PHONY: dev-stop
-dev-stop: dev-web-stop dev-api-stop dev-deps-down
+dev-stop: dev-edge-stop dev-web-stop dev-api-stop dev-deps-down
 	@echo "✅ All services stopped"
 
 .PHONY: dev-restart
@@ -633,9 +717,11 @@ dev-status:
 	@$(MAKE) dev-api-status
 	@echo ""
 	@$(MAKE) dev-web-status
+	@echo ""
+	@$(MAKE) dev-edge-status
 
 .PHONY: dev-clean
-dev-clean: dev-web-stop dev-api-stop dev-deps-clean
+dev-clean: dev-edge-stop dev-web-stop dev-api-stop dev-deps-clean
 	@echo "✅ Development environment cleaned"
 
 .PHONY: dev-reset
@@ -715,6 +801,15 @@ build-server-release: sweep
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --release --bin $(API_SERVER_BIN)
 	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/$(API_SERVER_BIN)"
 
+.PHONY: build-edge
+build-edge: build-edge-release
+
+.PHONY: build-edge-release
+build-edge-release: sweep
+	@echo "Building astra-edge (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-edge --release --bin $(EDGE_BIN)
+	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/$(EDGE_BIN)"
+
 # --- Debug builds (no sweep, no --release => fast incremental) ---
 
 .PHONY: build-debug
@@ -735,6 +830,12 @@ build-server-debug:
 	@echo "Building astra-server (debug)..."
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --bin $(API_SERVER_BIN)
 	@echo "Binary: $(RUST_DEBUG_BIN_DIR)/$(API_SERVER_BIN)"
+
+.PHONY: build-edge-debug
+build-edge-debug:
+	@echo "Building astra-edge (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-edge --bin $(EDGE_BIN)
+	@echo "Binary: $(RUST_DEBUG_BIN_DIR)/$(EDGE_BIN)"
 
 # ============================================================================
 # Cleanup
@@ -815,7 +916,82 @@ test-dashboard: ## Build astra-test and launch live dashboard
 	./rust/target/release/astra-test --live-dashboard
 
 .PHONY: test-offline
-test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline test-web-offline
+# Run the focused runtime profile gate first so provider/surface regressions fail
+# before the broader workspace, bridge-hook, SDK, and web offline suites.
+test-offline: sweep test-runtime-profiles test-workspace test-runtime-bridge-hooks test-sdk-offline test-web-offline
+
+.PHONY: test-runtime-profiles
+test-runtime-profiles: test-server-only test-server-edge test-managed-runtime test-cli-local
+	@echo "✅ Runtime profile guardrails passed"
+
+.PHONY: test-server-only
+test-server-only:
+	@echo "Running focused server-only access-surface tests..."
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime-env runtime_execution_provider_type_requires_matching_workspace_executor_pair
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test runtime_refactor_guardrails
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::binding_resolution::tests::edge_tools_without_profile_do_not_create_provider_binding
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::server_provider_surface_does_not_start_from_workspace_tools
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::mismatched_workspace_executor_does_not_expose_runtime_tools
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::no_workspace_reports_sandbox_unbound
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::mismatched_workspace_executor_reports_unbound_provider
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::run_turn_pipeline_includes_turn_start_lifecycle_summary_for_web_agent
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::runtime_manifest_preserves_server_only_backbone_without_workspace_executor
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::runtime_tool_executor::tests::server_only_introspect_json_preserves_provider_coverage_graph
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::runtime_tool_executor::tests::server_only_reflect_report_includes_runtime_provider_coverage
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::stream_run_cache_miss_replays_durable_text_done
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::subrun_turn_budget
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::server_subrun_completed_status
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::finalize_run_events
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test bridge_e2e_comprehensive --features bridge-e2e-hooks chat_stream_bridge_secret_does_not_route_to_bridge
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_executes_sync_dynamic_spawn_with_server_executor
+	@cd web && npm test -- --run \
+		__tests__/app/edges-status-route.test.ts \
+		__tests__/lib/chat-input-route.test.ts \
+		__tests__/lib/chat-stream-route.test.ts \
+		__tests__/lib/stream-event-handler.test.ts \
+		__tests__/lib/workspace-authority.test.ts
+
+.PHONY: test-server-edge
+test-server-edge:
+	@echo "Running focused server+edge provider tests..."
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-edge
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::edge_profile_execution_bindings_make_edge_provider_explicit
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::turn_start_lifecycle_summary_reports_edge_provider_binding
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::builder_composes_server_owned_tools_with_edge_declared_runtime_tools
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::edge_ledger_delivery_selects_only_edge_bound_runtime_tools
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::server_catalog_with_edge_binding_still_routes_runtime_tools_to_edge
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::server_edge_composition_exposes_server_services_and_edge_runtime_tools
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::edge_workspace_without_server_cwd_reports_edge_capacity_ready
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::edge_offline_reports_edge_capacity_offline
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_bound_selected_executor_does_not_route_to_other_connected_edge
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_dispatch_without_result_reports_transport_disconnected
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
+	@cd web && npm test -- --run \
+		__tests__/app/edges-status-route.test.ts \
+		__tests__/lib/work-surface.test.ts \
+		__tests__/lib/workspace-authority.test.ts
+
+.PHONY: test-managed-runtime
+test-managed-runtime:
+	@echo "Running focused sandbox, orchestrator-managed runtime, and request-scoped MCP provider tests..."
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime-env request_scoped_mcp_schema_filter_requires_exact_provider_binding
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime-env read_only_snapshot_helper_exposes_reads_through_orchestrator_runtime
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::mcp_schema_is_hidden_without_request_scoped_mcp_provider
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::mcp_executor_provider_declares_request_scoped_mcp_schemas
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_binding_projection::tests::server_sandbox_binding_exposes_project_runtime_tools
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::builder_runtime_surface_follows_server_sandbox_binding
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::builder_runtime_surface_follows_orchestrator_read_only_binding
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::tool_call_start_projects_request_scoped_mcp_metadata
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::server_sandbox_reports_sandbox_ready
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib orchestrator_managed_executes_through_sandbox_resident_agent_transport
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib orchestrator_managed_without_sandbox_resident_agent_transport_does_not_fallback_to_local
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib request_scoped_mcp_tools_bypass_edge_transport
+
+.PHONY: test-cli-local
+test-cli-local:
+	@echo "Running focused CLI-local provider tests..."
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib capabilities::tests::cli_local_catalog_filters_builtin_source_by_provider_ownership
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-cli --lib edge_tools::tests::schema_tests::local_cli_catalog_uses_runtime_env_surface_for_local_runtime
 
 # Fast correctness gate for the no-sticky control plane. This intentionally
 # stays out of the default test targets: it is focused evidence for LB/session

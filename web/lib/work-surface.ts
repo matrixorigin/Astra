@@ -78,7 +78,7 @@ export type AgentSurfaceEvent = {
   type: string;
   label: string;
   detail?: string;
-  tone: "neutral" | "running" | "success" | "danger";
+  tone: "neutral" | "running" | "success" | "warning" | "danger";
   timestamp: number;
 };
 
@@ -996,9 +996,11 @@ function describeAgentEvent(
     detail = agent.reason ?? agent.resultSummary;
     tone = "danger";
   } else if (type === "agent_interrupted") {
-    label = "Interrupted";
-    detail = agent.resultSummary ?? agent.reason ?? progress;
-    tone = "danger";
+    const reason = agent.reason ?? stringField(event, "reason");
+    const display = agentInterruptionDisplay(reason);
+    label = display.label;
+    detail = agent.resultSummary ?? display.detail ?? progress;
+    tone = display.tone;
   } else {
     return null;
   }
@@ -1013,6 +1015,38 @@ function describeAgentEvent(
     agent.toolName ?? "",
   ].join(":");
   return { id, type: eventType, label, detail, tone, timestamp };
+}
+
+function agentInterruptionDisplay(reason?: string): {
+  label: string;
+  detail?: string;
+  tone: AgentSurfaceEvent["tone"];
+} {
+  const normalized = (reason ?? "").trim().toLowerCase();
+  if (!normalized || normalized === "interrupted" || normalized === "empty_completion") {
+    return {
+      label: "Needs final answer",
+      detail: "The subagent stopped before producing a final answer.",
+      tone: "warning",
+    };
+  }
+  if (
+    normalized === "budget_exhausted" ||
+    normalized === "turn_budget_exhausted" ||
+    normalized === "max_turns_exceeded" ||
+    normalized === "max_turns"
+  ) {
+    return {
+      label: "Needs continuation",
+      detail: "The subagent reached its turn budget.",
+      tone: "warning",
+    };
+  }
+  return {
+    label: "Interrupted",
+    detail: reason,
+    tone: "danger",
+  };
 }
 
 function turnDetail(event: Record<string, unknown>) {
@@ -1123,16 +1157,10 @@ function finalizeActiveAgentForRunStatus(
   if (runStatus === "paused" || runStatus === "interrupted") {
     return {
       ...agent,
-      status: "interrupted",
-      reason:
-        agent.reason ??
-        stringField(event, "error_kind") ??
-        stringField(event, "kind") ??
-        "parent_run_interrupted",
+      status: "waiting",
+      reason: agent.reason ?? "parent_run_paused",
       resultSummary:
         agent.resultSummary ??
-        stringField(event, "message") ??
-        stringField(event, "user_message") ??
         "Parent run paused before a terminal subagent event was observed.",
       updatedAt: timestamp,
     };

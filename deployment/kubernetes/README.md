@@ -2,17 +2,31 @@
 
 Production deployment with Helm. All components except API are optional.
 
+## Runtime Profiles
+
+The Kubernetes chart deploys the server runtime only. That is the right default
+for Web agent backbone features such as memory, planning, MCP, introspection,
+trace, audit, and server-service tools. It does not implicitly provide a
+workspace or process executor.
+
+Use server+edge only when Web sessions need capacity owned by a specific
+workspace or network boundary, such as local files, shell, git, private network
+access, or hardware attached to an edge host. Run `astra-edge` as a separate
+provider process with its own token and workspace binding, and point it at the
+cluster API endpoint. Do not hide it inside the API deployment; edge capacity is
+part of the provider set, not part of the server backbone.
+
 ## Quick Start
 
 ```bash
-# Minimal: API only (external DB + Redis)
+# Server-only: API only (external DB + Redis)
 helm install astra ./chart \
   --set matrixone.enabled=false \
   --set matrixone.external.host=db.prod.internal \
   --set redis.enabled=false \
   --set redis.external.url=redis://redis.prod.internal:6379
 
-# Full: everything in-cluster
+# Server-only with in-cluster dependencies
 helm install astra ./chart
 ```
 

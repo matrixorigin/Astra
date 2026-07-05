@@ -851,7 +851,7 @@ fn server_git_mutation_targets(tool_results: &[Value]) -> Vec<String> {
 }
 
 async fn rollback_server_git_mutations(
-    executor: &crate::server::server_tool_executor::ServerToolExecutor,
+    executor: &crate::server::runtime_tool_executor::RuntimeToolExecutor,
     targets: &[String],
 ) -> Option<Value> {
     if targets.is_empty() {
@@ -910,7 +910,7 @@ async fn rollback_server_git_mutations(
 
 fn open_server_rollback_boundary(
     session_id: Option<&str>,
-    executor: &crate::server::server_tool_executor::ServerToolExecutor,
+    executor: &crate::server::runtime_tool_executor::RuntimeToolExecutor,
     turn_index: u32,
     tool_calls: &[Value],
 ) -> Option<ServerRollbackBoundary> {
@@ -952,7 +952,7 @@ fn open_server_rollback_boundary(
 
 async fn finalize_server_rollback_boundary(
     session_id: Option<&str>,
-    executor: &crate::server::server_tool_executor::ServerToolExecutor,
+    executor: &crate::server::runtime_tool_executor::RuntimeToolExecutor,
     active: &ServerRollbackBoundary,
     new_records: &[ToolCallRecord],
     new_tool_results: &[Value],
@@ -1294,7 +1294,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     let all_tool_calls = tool_calls.as_slice();
     let edge_round_for_headless = edge_tool_round.as_slice();
     let active_server_rollback_boundary =
-        state.server_tool_executor.as_deref().and_then(|executor| {
+        state.runtime_tool_executor.as_deref().and_then(|executor| {
             open_server_rollback_boundary(
                 state.current_session_id.as_deref(),
                 executor,
@@ -1367,7 +1367,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             permission_context: state.permission_context.as_ref(),
             progress_emitter: state.messaging.progress_emitter.as_ref(),
             pre_resolved_results: &pre_resolved_results,
-            server_tool_executor: state.server_tool_executor.as_deref(),
+            runtime_tool_executor: state.runtime_tool_executor.as_deref(),
             turn_start: Some(tool_record_turn_start),
             llm_round: obs_llm_round,
             plan_mode_active,
@@ -1628,7 +1628,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     if let (Some(active), Some(executor)) = (
         active_server_rollback_boundary.as_ref(),
-        state.server_tool_executor.as_deref(),
+        state.runtime_tool_executor.as_deref(),
     ) {
         let new_records = &state.stall.tool_call_records[evo_records_before..];
         finalize_server_rollback_boundary(
@@ -2069,6 +2069,41 @@ mod tests {
         assert_eq!(
             snapshot.step_latency[0].terminal_event_kind.as_deref(),
             Some("StepIncomplete")
+        );
+    }
+
+    #[test]
+    fn introspect_snapshot_includes_server_capacity_provider_coverage() {
+        let mut state = make_state();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        state.runtime_tool_executor = Some(Arc::new(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+                dir.path().to_path_buf(),
+                "test-user".into(),
+                "test-session".into(),
+                None,
+                None,
+            ),
+        ));
+
+        let snapshot = build_introspect_snapshot(&state, String::new(), None);
+        let runtime = snapshot
+            .capacity_provider_coverage
+            .iter()
+            .find(|provider| provider.provider_type == "sandbox")
+            .expect("sandbox provider coverage");
+
+        assert_eq!(runtime.status, "unbound");
+        assert_eq!(
+            runtime.unavailable_reason.as_deref(),
+            Some("no_workspace_provider_bound")
+        );
+        assert!(
+            snapshot
+                .capacity_provider_coverage
+                .iter()
+                .any(|provider| provider.provider_type == "server_service"
+                    && provider.status == "ready")
         );
     }
 
@@ -2581,7 +2616,7 @@ esac
         dir: &tempfile::TempDir,
         turn_index: u32,
     ) -> (
-        crate::server::server_tool_executor::ServerToolExecutor,
+        crate::server::runtime_tool_executor::RuntimeToolExecutor,
         std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>,
     ) {
         let mut workspace =
@@ -2589,7 +2624,7 @@ esac
         workspace.cwd = dir.path().display().to_string();
         astra_services::session_workspace::write_workspace(&workspace).unwrap();
 
-        let mut executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             session_id.to_string(),
@@ -2612,8 +2647,8 @@ esac
     fn server_executor_for_test_workspace(
         workspace: &std::path::Path,
         session_id: &str,
-    ) -> crate::server::server_tool_executor::ServerToolExecutor {
-        let mut executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+    ) -> crate::server::runtime_tool_executor::RuntimeToolExecutor {
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
             workspace.to_path_buf(),
             "test-user".into(),
             session_id.to_string(),

@@ -755,7 +755,7 @@ async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
             && live_output["executor"]["kind"].as_str() == Some("server_local")
             && live_output["executor"]["executor_id"].as_str() == Some("server-control-plane")
             && live_output["transport"].as_str() == Some("server_local"),
-        "server dynamic spawn should stream child output into agent_live_event: {serialized}"
+        "server-only dynamic spawn should stream child output without inventing a workspace executor provider: {serialized}"
     );
     assert!(
         live_events.iter().any(|event| {
@@ -1864,7 +1864,7 @@ async fn server_side_tools_no_edge_tools_auto_populated() {
     let (app, _) = build_test_app();
 
     // No edge_tools in context → server_side_tools = true.
-    // The mock LLM returns tool calls, but server_tool_executor would handle them.
+    // The mock LLM returns tool calls, but runtime_tool_executor would handle them.
     // With mock LLM, tool calls with no edge tools won't go through the ledger.
     let payload = json!({
         "message": "Hello server mode",

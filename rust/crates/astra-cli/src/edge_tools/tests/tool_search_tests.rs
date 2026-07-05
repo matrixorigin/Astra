@@ -346,10 +346,10 @@ async fn keyword_search_uses_the_same_visible_union_activatable_pool() {
 }
 
 #[tokio::test]
-async fn mcp_plugin_schema_requires_runtime_binding_to_resolve() {
+async fn mcp_schema_on_cli_local_provider_is_not_visible() {
     let executor = executor();
     set_visible(&executor, &["bash", "tool_search"]);
-    let plugin = json!({
+    let schema = json!({
         "type": "function",
         "function": {
             "name": "mcp__weather",
@@ -361,7 +361,7 @@ async fn mcp_plugin_schema_requires_runtime_binding_to_resolve() {
             }
         }
     });
-    executor.set_plugin_schemas(vec![plugin]);
+    executor.set_cli_local_provider_schemas(vec![schema]);
 
     let hidden = run_search(&executor, json!({"query": "select:mcp__weather"})).await;
     assert!(match_names(&hidden).is_empty());
@@ -375,7 +375,7 @@ async fn mcp_plugin_schema_requires_runtime_binding_to_resolve() {
     let activatable = run_search(&executor, json!({"query": "select:mcp__weather"})).await;
     assert!(
         match_names(&activatable).is_empty(),
-        "cached MCP schemas must not resolve without a manager-owned runtime tool: {activatable}"
+        "MCP schemas installed on the CLI local provider must not resolve without a manager-owned runtime tool: {activatable}"
     );
     assert_eq!(
         field_strings(&activatable, "missing"),

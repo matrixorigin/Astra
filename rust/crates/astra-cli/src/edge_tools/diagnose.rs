@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use super::{AGGREGATE_OUTPUT_BUDGET, ToolExecutor, all_tool_schemas};
+use super::{AGGREGATE_OUTPUT_BUDGET, ToolExecutor};
 
 impl ToolExecutor {
     // ─── Diagnose tool ────────────────────────────────────────────────────────────
@@ -160,15 +160,7 @@ impl ToolExecutor {
 
         // Available tools info
         if category == "all" || category == "tools" {
-            let tools = all_tool_schemas();
-            let tool_names: Vec<&str> = tools
-                .iter()
-                .filter_map(|t| {
-                    t.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str)
-                })
-                .collect();
+            let tool_names = self.tool_names();
 
             let mut tools_info = serde_json::Map::new();
             tools_info.insert("count".to_string(), json!(tool_names.len()));
@@ -182,17 +174,17 @@ impl ToolExecutor {
                         "file_ops",
                         vec!["read_file", "write_file", "str_replace", "list_dir"],
                     ),
-                    (
-                        "search",
-                        vec!["grep", "glob", "find_definition", "find_references"],
-                    ),
+                    ("search", vec!["grep", "glob", "symbols", "lsp"]),
                     ("git", vec!["git"]),
                     ("tasks", vec!["task"]),
                     ("utility", vec!["bash", "web_fetch", "sleep", "ask_user"]),
                 ];
                 let mut cat_status = serde_json::Map::new();
                 for (cat, expected) in categories {
-                    let available = expected.iter().filter(|t| tool_names.contains(t)).count();
+                    let available = expected
+                        .iter()
+                        .filter(|t| tool_names.iter().any(|name| name == *t))
+                        .count();
                     cat_status.insert(
                         cat.to_string(),
                         json!(format!("{}/{}", available, expected.len())),

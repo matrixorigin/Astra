@@ -1541,18 +1541,7 @@ fn fanout_get_results_status_label(group: &AgentFanoutGroupProjection) -> &'stat
 }
 
 fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
-    match status {
-        AgentFanoutSlotStatus::Planned => "planned",
-        AgentFanoutSlotStatus::SpawnAccepted => "spawn_accepted",
-        AgentFanoutSlotStatus::SpawnRejected => "spawn_rejected",
-        AgentFanoutSlotStatus::Running => "running",
-        AgentFanoutSlotStatus::Completed => "completed",
-        AgentFanoutSlotStatus::Interrupted => "interrupted",
-        AgentFanoutSlotStatus::Failed => "failed",
-        AgentFanoutSlotStatus::CancelledByUser => "cancelled_by_user",
-        AgentFanoutSlotStatus::CancelledByParentBudget => "cancelled_by_parent_budget",
-        AgentFanoutSlotStatus::TimedOut => "timed_out",
-    }
+    status.as_str()
 }
 
 /// Handle `agent(action='spawn')`.

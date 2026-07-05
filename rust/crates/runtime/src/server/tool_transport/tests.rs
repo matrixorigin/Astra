@@ -981,7 +981,7 @@ async fn server_sandbox_routes_to_server_local_transport() {
 }
 
 #[tokio::test]
-async fn no_workspace_local_code_blocks_without_server_fallback() {
+async fn no_file_environment_local_code_blocks_without_server_fallback() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let result = service
@@ -990,7 +990,7 @@ async fn no_workspace_local_code_blocks_without_server_fallback() {
                 "bash",
                 WorkspaceBinding {
                     kind: WorkspaceBindingKind::None,
-                    display_name: "No workspace".to_string(),
+                    display_name: "No file environment".to_string(),
                     cwd: None,
                     authority: WorkspaceAuthority::None,
                     fallback_policy: FallbackPolicy::Disabled,
@@ -1113,13 +1113,13 @@ async fn policy_allowed_tools_blocks_disallowed_tool_before_local_transport() {
 }
 
 #[test]
-fn no_workspace_binding_resolves_to_control_plane_tool_surface_only() {
+fn no_file_environment_binding_resolves_to_control_plane_tool_surface_only() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let request = request(
         "bash",
         WorkspaceBinding {
             kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
+            display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
             fallback_policy: FallbackPolicy::Disabled,
@@ -1184,14 +1184,14 @@ fn server_sandbox_binding_reports_host_process_runtime_not_provider_runtime() {
 }
 
 #[tokio::test]
-async fn no_workspace_mcp_retrieve_runs_as_request_scoped_mcp_without_runtime() {
+async fn no_file_environment_mcp_retrieve_runs_as_request_scoped_mcp_without_runtime() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let request = request(
         "mcp__rag__retrieve",
         WorkspaceBinding {
             kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
+            display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
             fallback_policy: FallbackPolicy::Disabled,
@@ -2346,7 +2346,26 @@ async fn cloud_workspace_blocks_without_server_fallback() {
 
     assert!(result.is_error, "{result:?}");
     assert!(
-        result.output.contains("No server fallback was attempted"),
+        result
+            .output
+            .contains("No alternate execution provider was attempted"),
+        "{}",
+        result.output
+    );
+    assert!(
+        result
+            .output
+            .contains("workspace provider with an available executor"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("Select Server sandbox"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("connected edge workspace"),
         "{}",
         result.output
     );
@@ -2390,7 +2409,7 @@ async fn edge_offline_with_fallback_disabled_does_not_call_server_local() {
 
     assert!(result.is_error, "{result:?}");
     assert!(
-        result.output.contains("fallback is disabled"),
+        result.output.contains("No alternate execution provider"),
         "{}",
         result.output
     );
@@ -3168,7 +3187,7 @@ async fn request_scoped_mcp_cancel_reports_mcp_binding() {
         "mcp__rag__retrieve",
         WorkspaceBinding {
             kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
+            display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
             fallback_policy: FallbackPolicy::Disabled,

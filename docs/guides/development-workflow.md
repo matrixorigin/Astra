@@ -7,8 +7,11 @@
 make dev-init           # Complete setup: .env + dependencies + config
 
 # Daily development
-make dev-start          # Start all services (< 10 seconds)
+make dev-start-server-only # Start deps + API + Web without a local edge provider
 make dev-status         # Check if everything is ready
+
+# Web sessions that need local files/shell/git
+make dev-start-server-edge # Also starts astra-edge for this repo
 
 # After code changes
 make dev-api-restart    # Restart API server only
@@ -21,15 +24,17 @@ make dev-stop
 
 ### Quick Start Commands
 
-| Command                 | Description                    | Time    |
-| ----------------------- | ------------------------------ | ------- |
-| `make dev-start`        | Start deps + API (source mode) | ~5s     |
-| `make dev-start-docker` | Start deps + API (Docker mode) | ~10s    |
-| `make dev-stop`         | Stop all services              | ~2s     |
-| `make dev-status`       | Show all service status        | instant |
-| `make dev-init`         | Initialize environment         | ~10s    |
+| Command                      | Description                                                      | Time    |
+| ---------------------------- | ---------------------------------------------------------------- | ------- |
+| `make dev-start`             | Alias for `make dev-start-server-only`                           | ~5s     |
+| `make dev-start-server-only` | Start deps + API + Web; server-service tools only, no edge tools | ~5s     |
+| `make dev-start-server-edge` | Start server-only, then connect local `astra-edge`               | ~10s    |
+| `make dev-start-docker`      | Start deps + API in Docker mode                                  | ~10s    |
+| `make dev-stop`              | Stop Web, API, deps, and local `astra-edge` if running           | ~2s     |
+| `make dev-status`            | Show dependency, API, Web, and edge-provider status              | instant |
+| `make dev-init`              | Initialize environment                                           | ~10s    |
 
-### Dependency Services (MatrixOne + Redis)
+### Dependency Services (MatrixOne + Memoria)
 
 | Command                | Description                      |
 | ---------------------- | -------------------------------- |
@@ -61,11 +66,26 @@ make dev-stop
 | `make dev-api-docker-logs`             | Tail container logs    |
 | `make dev-api-docker-scale REPLICAS=N` | Scale to N replicas    |
 
+### Runtime Profiles
+
+| Profile          | Command                      | Use when                                                                 |
+| ---------------- | ---------------------------- | ------------------------------------------------------------------------ |
+| Server-only      | `make dev-start-server-only` | Testing Web agent backbone, server-service tools, memory, planning, MCP. |
+| Server + edge    | `make dev-start-server-edge` | Testing Web access to local files, shell, git, private networks.         |
+| Docker server    | `make dev-start-docker`      | Testing API container packaging without a local edge provider.           |
+| Docker + edge    | `make dev-start-docker && make dev-edge-start` | Testing a containerized API with a host `astra-edge`.       |
+
+`astra-edge` reads the selected Astra CLI profile token by default. Run
+`astra login` first, or set `ASTRA_TOKEN` explicitly. Override the local
+workspace with `ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make dev-edge-start`.
+
 ### Testing
 
 | Command              | Description                                                                                                              |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `make test`          | Run all Rust workspace tests                                                                                             |
+| `make test-server-only` | Focused server-only Web/runtime tests                                                                                 |
+| `make test-server-edge` | Focused edge provider protocol and routing tests                                                                       |
 | `make test-contract` | Run `http_contract` / `admin_contract` (astra-runtime) + settings JSON contract (`astra-core` `settings_contract_tests`) |
 
 ## Typical Workflows
@@ -74,8 +94,11 @@ make dev-stop
 
 ```bash
 # Morning
-make dev-start          # Start everything
+make dev-start-server-only # Start server-only profile
 make dev-status         # Verify ready
+
+# Need local workspace tools from Web
+make dev-start-server-edge
 
 # Development loop
 # ... edit code ...
@@ -104,6 +127,9 @@ make test-contract
 ```bash
 # Start with Docker
 make dev-start-docker
+
+# Optional: connect host local workspace provider
+make dev-edge-start
 
 # Scale up
 make dev-api-docker-scale REPLICAS=4

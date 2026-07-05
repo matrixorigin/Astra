@@ -220,7 +220,7 @@ fn validator_denial_body(
 
 fn runtime_binding_denial_for_unmatched_execution(
     execution: &HeadlessResolvedExecution,
-    server_tool_executor: Option<&crate::server::server_tool_executor::ServerToolExecutor>,
+    runtime_tool_executor: Option<&crate::server::runtime_tool_executor::RuntimeToolExecutor>,
 ) -> Option<String> {
     if execution.is_edge_tool {
         return None;
@@ -240,7 +240,7 @@ fn runtime_binding_denial_for_unmatched_execution(
         return None;
     }
     let has_runtime_binding =
-        server_tool_executor.is_some_and(|executor| executor.has_runtime_binding(&execution.name));
+        runtime_tool_executor.is_some_and(|executor| executor.has_runtime_binding(&execution.name));
     if has_runtime_binding {
         return None;
     }
@@ -681,13 +681,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         if !self.ctx.valid_tool_names.contains(&execution.name) {
             let is_prompt_deferred = self.ctx.deferred_tool_names.contains(&execution.name);
-            let is_activatable_deferred = self.ctx.server_tool_executor.is_some_and(|exec| {
+            let is_activatable_deferred = self.ctx.runtime_tool_executor.is_some_and(|exec| {
                 exec.current_activatable_tool_names_snapshot()
                     .contains(&execution.name)
             });
             let tool_runtime_ready = |name: &str| {
                 self.ctx
-                    .server_tool_executor
+                    .runtime_tool_executor
                     .is_some_and(|exec| exec.tool_runtime_ready(name))
             };
             let action = execution.args.get("action").and_then(Value::as_str);
@@ -697,7 +697,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 tool_runtime_ready,
             ) {
                 DirectDeferredCallAdmission::Activate { name } => {
-                    if let Some(exec) = self.ctx.server_tool_executor {
+                    if let Some(exec) = self.ctx.runtime_tool_executor {
                         exec.record_direct_deferred_call_activation(&name);
                     }
                     (
@@ -806,7 +806,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         if let Some(err_msg) = runtime_binding_denial_for_unmatched_execution(
             &execution,
-            self.ctx.server_tool_executor,
+            self.ctx.runtime_tool_executor,
         ) {
             if !self.ctx.quiet {
                 self.ctx.term.emit_line(

@@ -460,7 +460,7 @@ test('activity shows actionable execution-environment blocked state', async ({ p
           tool: 'bash',
           reason: 'executor_offline',
           message:
-            "Error: executor 'MacBook Pro' is offline. Server fallback is disabled.",
+            "Error: executor 'MacBook Pro' is offline. No alternate execution provider is available for this file environment.",
           transport: 'edge_ws',
           fallback_policy: 'disabled',
           workspace: {

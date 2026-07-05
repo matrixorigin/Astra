@@ -297,7 +297,7 @@ pub trait AgenticLoopHost: Send {
     /// The runtime owns snapshot construction because the authoritative token,
     /// round, cache, and stall fields live in [`AgenticLoopState`]. Hosts only
     /// decide where to publish the snapshot: the CLI stores it on its local
-    /// [`ToolExecutor`], while server mode uses [`ServerToolExecutor`] below.
+    /// [`ToolExecutor`], while server mode uses [`RuntimeToolExecutor`] below.
     fn on_introspect_snapshot(
         &mut self,
         _snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
@@ -453,7 +453,7 @@ pub(crate) fn publish_introspect_snapshot<H: AgenticLoopHost + ?Sized>(
 ) {
     let snapshot = build_introspect_snapshot(state, lifecycle_summary, inspection);
     host.on_introspect_snapshot(&snapshot);
-    if let Some(executor) = state.server_tool_executor.as_deref() {
+    if let Some(executor) = state.runtime_tool_executor.as_deref() {
         executor.update_introspect_snapshot(snapshot);
     }
 }
@@ -614,6 +614,11 @@ pub(crate) fn build_introspect_snapshot(
         tool_health,
         working_memory_summary: working_mem,
         lifecycle_summary,
+        capacity_provider_coverage: state
+            .runtime_tool_executor
+            .as_deref()
+            .map(|executor| executor.capacity_provider_coverage())
+            .unwrap_or_default(),
         total_input_tokens: state.provider_input_tokens(),
         total_output_tokens: state.total_completion,
         cache_read_tokens: state.total_cache_read,
@@ -1268,6 +1273,14 @@ impl TaskBoardSnapshot {
         self.in_progress_count > 0 || self.paused_count > 0 || self.blocked_count > 0
     }
 
+    /// Whether the final run settlement must wait for explicit external/user
+    /// intervention. In-progress tasks still deserve one reconciliation round,
+    /// but they are bookkeeping until they become paused or dependency-blocked.
+    #[must_use]
+    pub fn requires_settlement_intervention(&self) -> bool {
+        self.paused_count > 0 || self.blocked_count > 0
+    }
+
     #[must_use]
     pub fn has_any_tracked_tasks(&self) -> bool {
         self.tracked_count > 0
@@ -1887,7 +1900,8 @@ pub struct AgenticLoopState {
     // ── Server-side tool execution ──
     /// Optional server-side tool executor for web agent sessions (no CLI edge agent).
     /// When present, tools that have no edge match are executed directly by the server.
-    pub server_tool_executor: Option<Arc<crate::server::server_tool_executor::ServerToolExecutor>>,
+    pub runtime_tool_executor:
+        Option<Arc<crate::server::runtime_tool_executor::RuntimeToolExecutor>>,
 
     // ── Interruption tracking ──
     /// Structured interruption record populated by early-exit paths.
@@ -2984,7 +2998,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         step_signal_collector: None,
         tool_budget_override: None,
         recent_tactical_actions: Vec::new(),
-        server_tool_executor: None,
+        runtime_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
         memory_extraction_service: None,
@@ -3476,7 +3490,7 @@ pub(crate) mod tests {
             step_signal_collector: None,
             tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
-            server_tool_executor: None,
+            runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
@@ -3592,6 +3606,7 @@ pub(crate) mod tests {
         );
         assert!(snapshot.has_unfinished_tasks());
         assert!(snapshot.has_completion_blocking_tasks());
+        assert!(snapshot.requires_settlement_intervention());
         assert!(!snapshot.all_tracked_tasks_completed());
         assert!(snapshot.short_summary().contains("task(s) remain"));
         assert_eq!(
@@ -3683,7 +3698,37 @@ pub(crate) mod tests {
             !snapshot.has_completion_blocking_tasks(),
             "pending-only task board is backlog, not an active completion blocker"
         );
+        assert!(!snapshot.requires_settlement_intervention());
         assert!(!snapshot.all_tracked_tasks_completed());
+    }
+
+    #[test]
+    fn task_board_snapshot_in_progress_reconciles_but_does_not_require_intervention() {
+        let snapshot = TaskBoardSnapshot::from_active_tasks(&[SessionTask {
+            archived_at: None,
+            id: "task-1".to_string(),
+            title: "running bookkeeping".to_string(),
+            description: None,
+            status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
+            subtasks: Vec::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        }]);
+
+        assert!(snapshot.has_unfinished_tasks());
+        assert!(
+            snapshot.has_completion_blocking_tasks(),
+            "in-progress work should still trigger one model reconciliation round"
+        );
+        assert!(
+            !snapshot.requires_settlement_intervention(),
+            "in-progress bookkeeping alone must not pause a run after a final answer exists"
+        );
     }
 
     #[test]
@@ -3708,6 +3753,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.completed_count, 1);
         assert!(!snapshot.has_unfinished_tasks());
         assert!(!snapshot.has_completion_blocking_tasks());
+        assert!(!snapshot.requires_settlement_intervention());
         assert!(snapshot.all_tracked_tasks_completed());
     }
 
@@ -3733,6 +3779,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.paused_count, 1);
         assert!(snapshot.has_unfinished_tasks());
         assert!(snapshot.has_completion_blocking_tasks());
+        assert!(snapshot.requires_settlement_intervention());
         assert!(!snapshot.all_tracked_tasks_completed());
         assert_eq!(snapshot.status_count_summary(), "1 paused task(s) remain");
     }
@@ -8876,13 +8923,13 @@ mod parallel_execution_tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Session c47c2dca REGRESSION: bridge_inprocess path must drain the
+    // Session c47c2dca REGRESSION: the chat-turn adapter path must drain the
     // structured volatile lane so runtime nudges reach the LLM.
     //
     // 65606b95 migrated 27 runtime injection sites from
     // `state.messages.push(...)` to `state.push_volatile(Kind, content)`.
     // `server_loop_host` drains via `wire_assembly::assemble_llm_messages`,
-    // but the CLI `astra chat` path (bridge_inprocess) NEVER drained the
+    // but the CLI `astra chat` path NEVER drained the
     // lane — every Self-check, force-stop, budget-advisory, corrective,
     // stall-nudge, working-set snapshot, etc. was silently dropped.
     //

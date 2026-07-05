@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   PATH_CHAT_STREAM,
-  PATH_EDGES_STATUS,
   buildQueryString,
   chatRunStreamPath,
 } from "@astra/sdk";
@@ -23,23 +22,19 @@ import {
   type StreamEventState,
 } from "@/lib/api/stream-event-handler";
 import {
-  RuntimeClientError,
   WebRuntimeClient,
   readRuntimeErrorDetail,
   requireRuntimeClient,
 } from "@/lib/runtime-client";
 import type {
-  EdgeStatusResponse,
   SendMessageRequest,
-  WorkspaceSelection,
 } from "@/lib/api/types";
 import {
-  normalizeSlashPath,
   normalizeWorkspaceSelection,
   resolveWorkspaceBindings,
   sameWorkspaceSelection,
-  validateWorkspaceAuthority,
 } from "@/lib/workspace-authority";
+import { verifyLiveWorkspaceSelection } from "@/lib/workspace-selection-server";
 
 const encoder = new TextEncoder();
 
@@ -74,54 +69,6 @@ function normalizedActiveSkills(skills?: string[]) {
   return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort(
     (left, right) => left.localeCompare(right),
   );
-}
-
-async function verifyLiveWorkspaceSelection(
-  selection: WorkspaceSelection | null | undefined,
-  runtime: WebRuntimeClient,
-): Promise<WorkspaceSelection | null | undefined> {
-  if (selection?.kind !== "edge_workspace") {
-    return selection;
-  }
-
-  const status = await runtime.get<EdgeStatusResponse>(PATH_EDGES_STATUS, {
-    auth: "required",
-    operation: "verify edge workspace binding",
-  });
-  const edge = status.edges.find(
-    (candidate) => candidate.edge_agent_id === selection.edgeAgentId,
-  );
-  if (!edge) {
-    throw new RuntimeClientError({
-      operation: "verify edge workspace binding",
-      path: PATH_EDGES_STATUS,
-      status: 409,
-      detail: `Edge executor ${selection.displayName ?? selection.edgeAgentId} is offline. Reconnect edge or choose a connected workspace. Server fallback is disabled for this workspace.`,
-    });
-  }
-
-  const liveCwd = edge.workspace_dir?.trim() ?? "";
-  if (
-    !liveCwd ||
-    normalizeSlashPath(liveCwd) !== normalizeSlashPath(selection.cwd)
-  ) {
-    const current = liveCwd
-      ? `currently reports ${liveCwd}`
-      : "does not report a workspace";
-    throw new RuntimeClientError({
-      operation: "verify edge workspace binding",
-      path: PATH_EDGES_STATUS,
-      status: 409,
-      detail: `Edge executor ${edge.hostname ?? selection.displayName ?? selection.edgeAgentId} ${current}, not ${selection.cwd}. Choose the current edge workspace, then retry. Server fallback is disabled for this workspace.`,
-    });
-  }
-
-  return {
-    ...selection,
-    displayName:
-      edge.hostname ?? selection.displayName ?? selection.edgeAgentId,
-    cwd: liveCwd,
-  };
 }
 
 async function readSendMessageRequest(
@@ -561,7 +508,7 @@ export async function POST(
   if (hasRequestedWorkspace && !requestedWorkspaceSelection) {
     return NextResponse.json(
       {
-        error: "workspace must be a server sandbox or edge workspace selection",
+        error: "workspace must be a valid file environment selection",
         code: "invalid_workspace_selection",
       },
       { status: 400 },
@@ -569,16 +516,6 @@ export async function POST(
   }
   const workspaceSelection =
     requestedWorkspaceSelection ?? storedWorkspaceSelection;
-  const workspaceError = validateWorkspaceAuthority(
-    body.content,
-    workspaceSelection,
-  );
-  if (workspaceError) {
-    return NextResponse.json(
-      { error: workspaceError.message, code: workspaceError.code },
-      { status: 409 },
-    );
-  }
   if (
     requestedWorkspaceSelection &&
     !sameWorkspaceSelection(

@@ -290,7 +290,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
-        'data: {"type":"run_blocked","session_id":"session-1","reason":"fallback_disabled","message":"Server fallback is disabled for this workspace."}\n\n',
+        'data: {"type":"run_blocked","session_id":"session-1","reason":"fallback_disabled","message":"No alternate execution provider is available for this file environment."}\n\n',
       ]),
     });
 

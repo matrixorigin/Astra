@@ -1379,15 +1379,155 @@ async fn server_spawn_runtime_context_requires_parent_lineage() {
 }
 
 #[test]
-fn subrun_turn_budget_uses_explicit_spawn_max_turns() {
+fn subrun_turn_budget_keeps_profile_extensions_when_spawn_budget_is_small() {
     let profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
         "explore the codebase and implement the fix",
     );
     let budget = resolve_subrun_agentic_turn_budget(profile, Some(3));
 
-    assert_eq!(budget.initial_turns, 3);
-    assert_eq!(budget.hard_turn_limit, 3);
+    assert!(
+        budget.initial_turns > 3,
+        "server sub-runs must mirror CLI: spawn max_turns starts the child state, but profile policy still controls adaptive budget"
+    );
+    assert!(
+        budget.hard_turn_limit > budget.initial_turns,
+        "small spawn budgets must not become a hard server-only ceiling"
+    );
+    assert!(
+        budget.max_extensions > 0,
+        "server sub-runs must retain adaptive extension room like CLI sub-agents"
+    );
+}
+
+#[test]
+fn subrun_turn_budget_respects_spawn_budget_above_profile_hard_limit() {
+    let profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
+        "answer this small question",
+    );
+    let budget = resolve_subrun_agentic_turn_budget(profile, Some(240));
+
+    assert_eq!(budget.initial_turns, 240);
+    assert_eq!(budget.hard_turn_limit, 240);
     assert_eq!(budget.max_extensions, 0);
+}
+
+#[test]
+fn server_subrun_completed_status_settles_non_blocking_task_board_completion() {
+    let svc = test_service();
+    let request = test_request("subrun task board bookkeeping");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "child-run-1",
+        None,
+        None,
+        None,
+    );
+    state.final_text.clear();
+    state.hooks.task_board_snapshot =
+        lifecycle_task_board_snapshot(astra_tools::task_mgmt::SessionTaskStatusKind::InProgress);
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
+        astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+        astra_turn_core::interruption::InterruptionStateSummary {
+            has_checkpoint: true,
+            tool_calls_completed: 1,
+            turns_completed: 1,
+            remaining_turns: 3,
+            error_detail: Some("task-board bookkeeping settlement".to_string()),
+            stall_signal: None,
+            resume_restricted_tools: vec![],
+        },
+    ));
+
+    assert_eq!(server_subrun_completed_status(&state), STATUS_COMPLETED);
+    let outcome = Ok(AgenticLoopOutcome::Completed);
+    assert_eq!(
+        server_subrun_live_termination(&outcome, &state),
+        astra_turn_core::agent_live_event::AgentLiveTermination::Completed
+    );
+    assert_eq!(server_subrun_live_reason(&outcome, &state), None);
+}
+
+#[test]
+fn server_subrun_completed_status_pauses_task_board_intervention() {
+    let svc = test_service();
+    let request = test_request("subrun paused task board");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "child-run-1",
+        None,
+        None,
+        None,
+    );
+    state.final_text = "Paused pending user direction.".to_string();
+    state.hooks.task_board_snapshot =
+        lifecycle_task_board_snapshot(astra_tools::task_mgmt::SessionTaskStatusKind::Paused);
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
+        astra_turn_core::interruption::ResumeAction::RequiresIntervention {
+            description: "paused task needs direction".to_string(),
+        },
+        astra_turn_core::interruption::InterruptionStateSummary {
+            has_checkpoint: true,
+            tool_calls_completed: 1,
+            turns_completed: 1,
+            remaining_turns: 3,
+            error_detail: Some("paused task needs direction".to_string()),
+            stall_signal: None,
+            resume_restricted_tools: vec![],
+        },
+    ));
+
+    assert_eq!(server_subrun_completed_status(&state), STATUS_PAUSED);
+    let outcome = Ok(AgenticLoopOutcome::Completed);
+    assert_eq!(
+        server_subrun_live_termination(&outcome, &state),
+        astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled
+    );
+    assert_eq!(
+        server_subrun_live_reason(&outcome, &state).as_deref(),
+        Some("paused")
+    );
+}
+
+#[test]
+fn server_subrun_completed_status_does_not_promote_tool_only_empty_completion() {
+    let svc = test_service();
+    let request = test_request("subrun tool-only empty completion");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "child-run-1",
+        None,
+        None,
+        None,
+    );
+    state.final_text =
+        "[turn_interrupted] 1 tool call(s) completed. Work preserved above.".to_string();
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
+        astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+        astra_turn_core::interruption::InterruptionStateSummary {
+            has_checkpoint: true,
+            tool_calls_completed: 1,
+            turns_completed: 1,
+            remaining_turns: 3,
+            error_detail: Some("loop ended without final text".to_string()),
+            stall_signal: None,
+            resume_restricted_tools: vec![],
+        },
+    ));
+
+    assert_eq!(
+        server_subrun_completed_status(&state),
+        STATUS_PAUSED,
+        "successful tools alone are not a synthesized agent answer"
+    );
 }
 
 #[test]
@@ -3443,11 +3583,10 @@ fn request_execution_bindings_use_actual_server_workspace_for_server_sandbox() {
 }
 
 #[test]
-fn server_workspace_binding_decision_respects_explicit_binding_and_edge_tools() {
+fn server_workspace_binding_decision_uses_only_explicit_binding() {
     let mut request = test_request("hello");
 
-    assert!(!request_uses_server_workspace(&request, false));
-    assert!(!request_uses_server_workspace(&request, true));
+    assert!(!request_uses_server_workspace(&request));
 
     request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
         kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
@@ -3457,7 +3596,7 @@ fn server_workspace_binding_decision_respects_explicit_binding_and_edge_tools() 
         authority: None,
         fallback_policy: None,
     });
-    assert!(request_uses_server_workspace(&request, true));
+    assert!(request_uses_server_workspace(&request));
 
     request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
         kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
@@ -3469,8 +3608,7 @@ fn server_workspace_binding_decision_respects_explicit_binding_and_edge_tools() 
         authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
         fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
-    assert!(!request_uses_server_workspace(&request, false));
-    assert!(!request_uses_server_workspace(&request, true));
+    assert!(!request_uses_server_workspace(&request));
 }
 
 #[test]
@@ -3538,7 +3676,7 @@ fn workspace_binding_request_accepts_legacy_cwd_alias() {
 }
 
 #[test]
-fn edge_profile_execution_bindings_make_legacy_edge_tools_explicit() {
+fn edge_profile_execution_bindings_make_edge_provider_explicit() {
     let mut edge_profile = Map::new();
     edge_profile.insert("cwd".to_string(), json!("/Users/xupeng/github/astra"));
     edge_profile.insert("edge_agent_id".to_string(), json!("edge-macbook-1"));
@@ -3547,9 +3685,8 @@ fn edge_profile_execution_bindings_make_legacy_edge_tools_explicit() {
     let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
         &test_request("review this repo"),
         &edge_profile,
-        true,
     )
-    .expect("legacy edge profile should produce explicit bindings");
+    .expect("edge profile should produce explicit bindings");
 
     assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
     assert_eq!(workspace.display_name, "MacBook Pro");
@@ -3560,20 +3697,19 @@ fn edge_profile_execution_bindings_make_legacy_edge_tools_explicit() {
     assert_eq!(executor.executor_id, "edge-macbook-1");
     assert_eq!(executor.display_name, "MacBook Pro");
     assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
-    assert_eq!(executor.status, ExecutorStatus::Online);
+    assert_eq!(executor.status, ExecutorStatus::Unknown);
 }
 
 #[test]
-fn missing_edge_profile_execution_bindings_emit_no_workspace() {
+fn missing_edge_profile_execution_bindings_emit_no_file_environment() {
     let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
         &test_request("hello"),
         &Map::new(),
-        false,
     )
-    .expect("missing edge profile should still produce an explicit no-workspace binding");
+    .expect("missing edge profile should still produce an explicit no-file-environment binding");
 
     assert_eq!(workspace.kind, WorkspaceBindingKind::None);
-    assert_eq!(workspace.display_name, "No workspace");
+    assert_eq!(workspace.display_name, "No file environment");
     assert_eq!(workspace.authority, WorkspaceAuthority::None);
     assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
     assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
@@ -3584,26 +3720,25 @@ fn missing_edge_profile_execution_bindings_emit_no_workspace() {
 }
 
 #[test]
-fn missing_edge_profile_with_edge_tools_uses_edge_ledger() {
+fn edge_tools_without_profile_do_not_create_edge_ledger_binding() {
     let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
         &test_request("run client tool"),
         &Map::new(),
-        true,
     )
-    .expect("edge tools should produce an explicit edge-ledger binding");
+    .expect("missing edge profile should produce no-file control-plane binding");
 
-    assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-    assert_eq!(workspace.display_name, "Edge workspace");
+    assert_eq!(workspace.kind, WorkspaceBindingKind::None);
+    assert_eq!(workspace.display_name, "No file environment");
     assert_eq!(workspace.cwd, None);
-    assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-    assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-    assert_eq!(executor.executor_id, "edge-ledger");
-    assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
+    assert_eq!(workspace.authority, WorkspaceAuthority::None);
+    assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
+    assert_eq!(executor.executor_id, "server-control-plane");
+    assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
     assert_eq!(executor.status, ExecutorStatus::Online);
 }
 
 #[test]
-fn explicit_no_workspace_binding_uses_server_control_plane_executor() {
+fn explicit_no_file_environment_binding_uses_server_control_plane_executor() {
     let mut request = test_request("plan only");
     request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
         kind: astra_services::runs::WorkspaceBindingRequestKind::None,
@@ -3618,7 +3753,7 @@ fn explicit_no_workspace_binding_uses_server_control_plane_executor() {
         resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
 
     assert_eq!(workspace.kind, WorkspaceBindingKind::None);
-    assert_eq!(workspace.display_name, "No workspace");
+    assert_eq!(workspace.display_name, "No file environment");
     assert_eq!(workspace.authority, WorkspaceAuthority::None);
     assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
     assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
@@ -4752,10 +4887,180 @@ fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() 
         events[0]["data"]["interruption"]["kind"],
         "budget_exhausted"
     );
+    assert!(
+        events[0]["data"]["interruption"]["user_message"]
+            .as_str()
+            .is_some_and(|msg| msg.to_ascii_lowercase().contains("budget")),
+        "interruption detail should carry the budget stop reason: {events:?}"
+    );
     assert_eq!(events[1]["event_type"], "run_interrupted");
     assert_eq!(events[2]["event_type"], "run_finished");
     assert_eq!(events[2]["data"]["interrupted"], true);
     assert_eq!(events[2]["data"]["interruption_kind"], "budget_exhausted");
+}
+
+fn lifecycle_task_board_snapshot(
+    status: astra_tools::task_mgmt::SessionTaskStatusKind,
+) -> crate::turn::agentic_loop::host::TaskBoardSnapshot {
+    crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
+        astra_tools::task_mgmt::SessionTask {
+            archived_at: None,
+            id: "task-1".to_string(),
+            title: "finish validation".to_string(),
+            description: None,
+            status,
+            subtasks: Vec::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        },
+    ])
+}
+
+#[test]
+fn finalize_run_events_completes_answered_run_with_in_progress_task_board() {
+    let svc = test_service();
+    let request = test_request("answered task");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.final_text = "Done.".to_string();
+    state.hooks.task_board_snapshot =
+        lifecycle_task_board_snapshot(astra_tools::task_mgmt::SessionTaskStatusKind::InProgress);
+
+    let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+        Ok(AgenticLoopOutcome::Completed),
+        vec![],
+        &state,
+    );
+
+    assert_eq!(status, RunStatus::Completed);
+    assert!(error.is_none());
+    assert_eq!(events[0]["event_type"], "text_done");
+    assert_eq!(events[0]["data"]["full_text"], "Done.");
+    assert_eq!(events[1]["event_type"], "run_finished");
+    assert!(events[1]["data"].get("waiting_for").is_none());
+    assert!(
+        events
+            .iter()
+            .all(|event| event["event_type"] != "run_interrupted"),
+        "in-progress task-board bookkeeping must not interrupt an answered run: {events:?}"
+    );
+}
+
+#[test]
+fn finalize_run_events_completes_non_blocking_task_board_empty_settlement() {
+    let svc = test_service();
+    let request = test_request("empty settlement");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.final_text.clear();
+    state.hooks.task_board_snapshot =
+        lifecycle_task_board_snapshot(astra_tools::task_mgmt::SessionTaskStatusKind::InProgress);
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
+        astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+        astra_turn_core::interruption::InterruptionStateSummary {
+            has_checkpoint: true,
+            tool_calls_completed: 1,
+            turns_completed: 1,
+            remaining_turns: 3,
+            error_detail: Some(
+                "agentic loop reached terminal state while unfinished task-board bookkeeping remained"
+                    .to_string(),
+            ),
+            stall_signal: None,
+            resume_restricted_tools: vec![],
+        },
+    ));
+
+    let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+        Ok(AgenticLoopOutcome::Completed),
+        vec![],
+        &state,
+    );
+
+    assert_eq!(status, RunStatus::Completed);
+    assert!(error.is_none());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event_type"], "run_finished");
+    assert_eq!(
+        events[0]["data"]["settled_interruption_kind"],
+        "empty_completion"
+    );
+    assert_eq!(events[0]["data"]["resume_mode"], "settle");
+    assert_eq!(events[0]["data"]["task_board"]["in_progress_count"], 1);
+    assert!(events[0]["data"].get("waiting_for").is_none());
+    assert!(
+        events
+            .iter()
+            .all(|event| event["event_type"] != "run_interrupted"),
+        "non-blocking task-board settlement must not surface as a user-facing interruption: {events:?}"
+    );
+}
+
+#[test]
+fn finalize_run_events_keeps_task_board_intervention_for_paused_task() {
+    let svc = test_service();
+    let request = test_request("paused task");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.final_text = "Paused pending user direction.".to_string();
+    state.hooks.task_board_snapshot =
+        lifecycle_task_board_snapshot(astra_tools::task_mgmt::SessionTaskStatusKind::Paused);
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
+        astra_turn_core::interruption::ResumeAction::RequiresIntervention {
+            description: "paused task needs direction".to_string(),
+        },
+        astra_turn_core::interruption::InterruptionStateSummary {
+            has_checkpoint: true,
+            tool_calls_completed: 1,
+            turns_completed: 1,
+            remaining_turns: 3,
+            error_detail: Some("paused task needs direction".to_string()),
+            stall_signal: None,
+            resume_restricted_tools: vec![],
+        },
+    ));
+
+    let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+        Ok(AgenticLoopOutcome::Completed),
+        vec![],
+        &state,
+    );
+
+    assert_eq!(status, RunStatus::Paused);
+    assert_eq!(error.as_deref(), Some("task_board_intervention"));
+    assert_eq!(events[1]["event_type"], "run_interrupted");
+    assert_eq!(events[1]["data"]["waiting_for"], "task_board_intervention");
+    assert_eq!(events[1]["data"]["task_board"]["paused_count"], 1);
+    assert_eq!(events[2]["event_type"], "run_finished");
+    assert_eq!(events[2]["data"]["waiting_for"], "task_board_intervention");
 }
 
 #[test]
@@ -6050,6 +6355,65 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
         }))
     );
     server.abort();
+}
+
+#[test]
+fn runtime_manifest_preserves_server_only_backbone_without_workspace_executor() {
+    let mut request = test_request("answer with server-side context");
+    request.parts = vec![json!({"type": "text", "text": "answer with server-side context"})];
+    request.attachments = vec![json!({"id": "att-server-only", "kind": "note"})];
+    request.capabilities = vec![
+        "web_fetch".to_string(),
+        "memory".to_string(),
+        "introspect".to_string(),
+    ];
+    request.context = Some(
+        json!({
+            "access_surface": "web",
+            "workspace": null
+        })
+        .as_object()
+        .expect("context object")
+        .clone(),
+    );
+
+    let manifest = AgenticRunLifecycleService::build_runtime_manifest(
+        &request,
+        &PreparedRuntimeCapabilities::default(),
+        false,
+    )
+    .expect("selected_model should produce a server-only runtime manifest");
+
+    assert_eq!(manifest["schema_version"], "astra_runtime_manifest.v1");
+    assert_eq!(manifest["runtime_profile"], "astra_native");
+    assert_eq!(manifest["selected_model"]["model"], "test-model");
+    assert_eq!(manifest["model_resolution"]["source"], "astra_native");
+    assert_eq!(manifest["model_resolution"]["resolved"], true);
+    assert_eq!(
+        manifest["turn"]["message"],
+        "answer with server-side context"
+    );
+    assert_eq!(manifest["turn"]["parts"][0]["type"], "text");
+    assert_eq!(manifest["turn"]["attachments"][0]["id"], "att-server-only");
+    assert_eq!(manifest["turn"]["edge_executor_id"], Value::Null);
+    assert_eq!(manifest["turn"]["context"]["access_surface"], "web");
+    assert_eq!(manifest["turn"]["capabilities"][0], "web_fetch");
+    assert_eq!(
+        manifest["capacity_resolution"]["server_builtin_surface"],
+        "server_service_control_plane_only"
+    );
+    assert_eq!(
+        manifest["capacity_resolution"]["workspace_executor_admitted"], false,
+        "pure Web/server-only keeps the full runtime backbone but must not imply workspace/process capacity"
+    );
+    assert!(
+        manifest.get("agent_binding").is_none(),
+        "server-only native runtime should not invent an agent-binding runtime"
+    );
+    assert!(
+        manifest.get("request_scoped_runtime").is_none(),
+        "server-only native runtime should not invent request-scoped MCP/skill runtime state"
+    );
 }
 
 #[test]
@@ -8606,7 +8970,7 @@ fn lifecycle_executor_construction_wires_reflect_service() {
         .count();
     assert!(
         root_wires >= 3,
-        "root/resume/sub-run ServerToolExecutor construction must all inject the shared reflect service"
+        "root/resume/sub-run RuntimeToolExecutor construction must all inject the shared reflect service"
     );
     assert!(
         production.contains(".with_reflect_service(Arc::clone(&self.reflect_service))"),

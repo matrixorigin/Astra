@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { renderToString } from "react-dom/server";
 import { MessageBubble } from "@/components/app/message-bubble";
 import type { ChatMessage } from "@/lib/api/types";
@@ -40,6 +40,7 @@ function assistantMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
 describe("MessageBubble", () => {
   beforeEach(() => {
     HTMLElement.prototype.scrollTo = vi.fn();
+    HTMLElement.prototype.scrollBy = vi.fn();
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: {
@@ -160,6 +161,118 @@ describe("MessageBubble", () => {
       expect(screen.getByText(/^Thinking \d+s$/)).toBeInTheDocument();
     });
     expect(screen.queryByText(/^Thought/)).not.toBeInTheDocument();
+  });
+
+  it("does not flash Thought during a transient reasoning completion", async () => {
+    vi.useFakeTimers();
+    try {
+      const { rerender } = render(
+        <MessageBubble
+          message={assistantMessage({
+            reasoning: "Finished one internal reasoning segment.",
+            reasoningStatus: "streaming",
+            status: "streaming",
+          })}
+        />,
+      );
+
+      expect(screen.getByText(/^Thinking/)).toBeInTheDocument();
+
+      rerender(
+        <MessageBubble
+          message={assistantMessage({
+            reasoning: "Finished one internal reasoning segment.",
+            reasoningStatus: "complete",
+            status: "complete",
+            completedAt: null,
+          })}
+        />,
+      );
+
+      expect(screen.getByText(/^Thinking/)).toBeInTheDocument();
+      expect(screen.queryByText(/^Thought/)).not.toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(899);
+      });
+      expect(screen.getByText(/^Thinking/)).toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(screen.getByText(/^Thought/)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not force-scroll reasoning after manual scrollback", async () => {
+    const scrollTo = vi.fn();
+    const { rerender } = render(
+      <MessageBubble
+        message={assistantMessage({
+          reasoning: "First reasoning line.\n\nSecond reasoning line.",
+          reasoningStatus: "streaming",
+          status: "streaming",
+        })}
+      />,
+    );
+
+    const scroller = screen.getByTestId("reasoning-scroll-container");
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1000 },
+      scrollTop: { configurable: true, value: 300 },
+      clientHeight: { configurable: true, value: 240 },
+      scrollTo: { configurable: true, value: scrollTo },
+    });
+    fireEvent.wheel(scroller, { deltaY: -120 });
+    scrollTo.mockClear();
+
+    rerender(
+      <MessageBubble
+        message={assistantMessage({
+          reasoning:
+            "First reasoning line.\n\nSecond reasoning line.\n\nNew reasoning line.",
+          reasoningStatus: "streaming",
+          status: "streaming",
+        })}
+      />,
+    );
+
+    expect(screen.getByText("New reasoning line.")).toBeInTheDocument();
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("forwards streaming reasoning wheel gestures to the chat scroller", () => {
+    const scrollBy = vi.fn();
+    const { container } = render(
+      <div data-chat-scroll-container="true">
+        <MessageBubble
+          message={assistantMessage({
+            reasoning: "Streaming reasoning line.",
+            reasoningStatus: "streaming",
+            status: "streaming",
+          })}
+        />
+      </div>,
+    );
+    const chatScroller = container.querySelector(
+      '[data-chat-scroll-container="true"]',
+    ) as HTMLElement;
+    Object.defineProperty(chatScroller, "scrollBy", {
+      configurable: true,
+      value: scrollBy,
+    });
+
+    fireEvent.wheel(screen.getByTestId("reasoning-scroll-container"), {
+      deltaY: 120,
+    });
+
+    expect(scrollBy).toHaveBeenCalledWith({
+      top: 120,
+      left: 0,
+      behavior: "auto",
+    });
   });
 
   it("does not render live elapsed time into streaming reasoning SSR markup", () => {

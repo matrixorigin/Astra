@@ -1,4 +1,4 @@
-use super::types::AgentStatus;
+use super::types::{AgentStatus, agent_completion_is_interrupted, agent_finish_reason_text};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -308,8 +308,8 @@ pub fn render_completed_agent_result(
     result: &str,
     finish_reason: Option<&str>,
 ) -> String {
-    let reason = finish_reason.unwrap_or("normal");
-    let interrupted = reason != "normal";
+    let reason = agent_finish_reason_text(finish_reason);
+    let interrupted = agent_completion_is_interrupted(Some(reason));
     let mut body = json!({
         "status": if interrupted {
             AgentToolResultStatusKind::Interrupted.as_str()

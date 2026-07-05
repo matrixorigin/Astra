@@ -25,6 +25,9 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+use crate::server::tool_route_selection::{
+    ToolExecutionOwner, ToolExecutionRouteKind, routing_decision, tool_execution_owner,
+};
 use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
     ToolExecutionRequest, ToolPolicySnapshot, WorkspaceAuthority, WorkspaceBinding,
@@ -75,14 +78,6 @@ const MAX_STREAMED_TURN_EVENT_BUFFER: usize = 2_048;
 const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
 const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
-
-fn tool_call_function_name(tool_call: &Value) -> Option<&str> {
-    tool_call
-        .get("function")
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
-        .or_else(|| tool_call.get("name").and_then(Value::as_str))
-}
 
 fn server_owned_tool_name(tool_name: &str) -> bool {
     crate::server::tool_binding_projection::is_server_control_plane_tool(tool_name)
@@ -1063,7 +1058,11 @@ pub struct ServerAgenticLoopHost {
     resolved_llm_config_at: Option<Instant>,
 
     // ── Context ──
-    edge_tools: Vec<Value>,
+    /// Final prompt-visible tool schemas after provider declaration, binding,
+    /// readiness, and policy filtering. Despite the request field name
+    /// `edge_tools`, this surface may include server-service/control-plane,
+    /// request-scoped MCP, edge, sandbox, or managed-runtime tools.
+    tool_schemas: Vec<Value>,
     capabilities: astra_turn_core::capability::CapabilitySet,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
@@ -1473,11 +1472,15 @@ impl ServerAgenticLoopHostBuilder {
     }
 
     pub fn build(self) -> ServerAgenticLoopHost {
+        // Compose the prompt-visible tool surface from provider declarations:
+        // server-owned tools are always eligible when the server catalog is
+        // enabled, while workspace/process tools require an explicit runtime
+        // executor provider or an edge-provided schema.
         let binding_snapshot = self.execution_bindings.clone().unwrap_or_else(|| {
             ExecutionBindingSnapshot::inferred(
                 WorkspaceBinding {
                     kind: WorkspaceBindingKind::None,
-                    display_name: "No workspace".to_string(),
+                    display_name: "No file environment".to_string(),
                     cwd: None,
                     authority: WorkspaceAuthority::None,
                     fallback_policy: FallbackPolicy::Disabled,
@@ -1502,7 +1505,7 @@ impl ServerAgenticLoopHostBuilder {
         let schema_workspace = binding_snapshot.workspace.clone();
         let schema_executor = binding_snapshot.executor.clone();
         let schema_runtime = binding_snapshot.runtime.clone();
-        let edge_tools = if auto_server_catalog {
+        let server_catalog_tools = if self.server_tool_catalog_enabled {
             capability_filtered_server_tool_schemas(
                 &self.capabilities,
                 &schema_workspace,
@@ -1510,15 +1513,23 @@ impl ServerAgenticLoopHostBuilder {
                 schema_runtime.as_ref(),
             )
         } else {
-            capability_filter_edge_provided_tool_schemas_for_binding(
+            Vec::new()
+        };
+        let server_catalog_tool_surface = !server_catalog_tools.is_empty();
+        let tool_schemas = if self.edge_tools.is_empty() {
+            server_catalog_tools
+        } else {
+            let mut surface = capability_filter_edge_provided_tool_schemas_for_binding(
                 self.edge_tools,
                 &schema_workspace,
                 &schema_executor,
                 schema_runtime.as_ref(),
-            )
+            );
+            append_server_owned_tool_schemas_unique(&mut surface, server_catalog_tools);
+            surface
         };
 
-        let mut valid_tools: HashSet<String> = edge_tools
+        let mut valid_tools: HashSet<String> = tool_schemas
             .iter()
             .filter_map(|t| {
                 t.get("function")
@@ -1558,14 +1569,14 @@ impl ServerAgenticLoopHostBuilder {
             resolved_llm_params: None,
             resolved_llm_config: None,
             resolved_llm_config_at: None,
-            edge_tools,
+            tool_schemas,
             capabilities: self.capabilities,
             edge_profile: self.edge_profile,
             valid_tools,
             admissible_extras,
             current_deferred_tool_names: HashSet::new(),
             server_side_tools,
-            server_catalog_tool_surface: auto_server_catalog,
+            server_catalog_tool_surface,
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
             full_llm_capture: self.full_llm_capture,
@@ -1638,6 +1649,72 @@ impl ServerAgenticLoopHostBuilder {
         self.disabled_tools = Some(handle);
         self
     }
+}
+
+fn append_server_owned_tool_schemas_unique(surface: &mut Vec<Value>, candidates: Vec<Value>) {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let mut seen: HashSet<String> = surface
+        .iter()
+        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+        .collect();
+    for schema in candidates {
+        let Some(name) = tool_schema_name(&schema) else {
+            continue;
+        };
+        if !matches!(
+            tool_execution_owner(name, &registry),
+            ToolExecutionOwner::ServerControlPlane
+                | ToolExecutionOwner::ServerRuntime
+                | ToolExecutionOwner::RequestScopedMcp
+                | ToolExecutionOwner::InterceptedTurnPipeline
+        ) {
+            continue;
+        }
+        if seen.insert(name.to_string()) {
+            surface.push(schema);
+        }
+    }
+}
+
+fn serde_label<T: serde::Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn workspace_binding_summary(workspace: &WorkspaceBinding) -> String {
+    let mut parts = vec![
+        format!("kind={}", serde_label(workspace.kind)),
+        format!("authority={}", serde_label(workspace.authority)),
+    ];
+    if !workspace.display_name.trim().is_empty() {
+        parts.push(format!("name={}", workspace.display_name));
+    }
+    if let Some(cwd) = workspace
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+    {
+        parts.push(format!("cwd={cwd}"));
+    }
+    parts.join(" · ")
+}
+
+fn executor_binding_summary(executor: &ExecutorBinding) -> String {
+    let mut parts = vec![
+        format!("kind={}", serde_label(executor.kind)),
+        format!("transport={}", serde_label(executor.transport)),
+        format!("status={}", serde_label(executor.status)),
+    ];
+    if !executor.executor_id.trim().is_empty() {
+        parts.push(format!("id={}", executor.executor_id));
+    }
+    if !executor.display_name.trim().is_empty() {
+        parts.push(format!("name={}", executor.display_name));
+    }
+    parts.join(" · ")
 }
 
 impl ServerAgenticLoopHost {
@@ -1796,11 +1873,9 @@ impl ServerAgenticLoopHost {
     }
 
     /// Install runtime MCP tool schemas into the LLM tool surface.
-    /// Updates `edge_tools`, `valid_tools`, and `admissible_extras`
+    /// Updates `tool_schemas`, `valid_tools`, and `admissible_extras`
     /// so the LLM sees MCP tools and the validator admits them.
     pub fn install_runtime_tool_schemas(&mut self, schemas: Vec<Value>) {
-        let runtime_tools_are_the_only_tool_surface =
-            !schemas.is_empty() && self.edge_tools.is_empty();
         for schema in &schemas {
             if let Some(name) = schema
                 .get("function")
@@ -1811,10 +1886,7 @@ impl ServerAgenticLoopHost {
                 self.admissible_extras.push(name.to_string());
             }
         }
-        self.edge_tools.extend(schemas);
-        if runtime_tools_are_the_only_tool_surface {
-            self.server_side_tools = true;
-        }
+        self.tool_schemas.extend(schemas);
     }
 
     fn read_plan_resume_hint(&self) -> Option<String> {
@@ -1845,18 +1917,21 @@ impl ServerAgenticLoopHost {
             .as_deref()
             .or(self.model_override.as_deref())
             .unwrap_or("auto");
-        let mode = if self.server_side_tools {
-            "web-agent (server-side tools)"
-        } else {
-            "edge-agent (edge-provided tools)"
-        };
         let interaction = self.turn_interaction_mode().label();
-        let workspace = self
-            .edge_profile
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let runtime_mode = if self.server_side_tools {
+            "server-side"
+        } else if self.server_catalog_tool_surface {
+            "mixed-provider"
+        } else {
+            "external-provider"
+        };
         let agent_id = self.edge_profile.get("agent_id").and_then(Value::as_str);
+        let provider_coverage = crate::server::tool_transport_metadata::capacity_provider_coverage(
+            &self.workspace_binding,
+            &self.executor_binding,
+        );
+        let provider_coverage_summary =
+            astra_turn_core::introspect::capacity_provider_coverage_summary(&provider_coverage);
 
         let lineage_parent = self
             .edge_profile
@@ -1885,15 +1960,18 @@ impl ServerAgenticLoopHost {
 
         let mut lines = vec![
             "# Turn-start session execution state".to_string(),
-            format!("- Mode: {mode} · interaction: {interaction}"),
+            format!(
+                "- Runtime surface: mode={runtime_mode} · interaction={interaction} · providers={provider_coverage_summary}"
+            ),
+            format!(
+                "- Workspace binding: {}",
+                workspace_binding_summary(&self.workspace_binding)
+            ),
+            format!(
+                "- Executor binding: {}",
+                executor_binding_summary(&self.executor_binding)
+            ),
             format!("- Session: {session_id} · run: {run_id} · model: {model}"),
-            match workspace {
-                Some(cwd) => format!("- Workspace: {cwd}"),
-                None if self.server_side_tools => {
-                    "- Workspace: server-provisioned (edge cwd unavailable)".to_string()
-                }
-                None => "- Workspace: unavailable".to_string(),
-            },
             format!("- Plan resume: {plan_line}"),
             format!(
                 "- Task board: {}",
@@ -2227,7 +2305,7 @@ impl ServerAgenticLoopHost {
             None => PromptCacheConfig::default(),
         };
 
-        let edge_tools_snapshot = self.edge_tools.clone();
+        let tool_schemas_snapshot = self.tool_schemas.clone();
         // Use the same pipeline path as `execute_turn` so mock-replay exercises
         // exactly what a real turn would send. The previous implementation had
         let (provider_name, model_name_for_pipeline) = match &self.mock_provider {
@@ -2237,7 +2315,7 @@ impl ServerAgenticLoopHost {
         let user_content = state.message.clone();
         let mock_pipeline = self.run_turn_pipeline(
             state,
-            &edge_tools_snapshot,
+            &tool_schemas_snapshot,
             &provider_name,
             &model_name_for_pipeline,
             &user_content,
@@ -2465,16 +2543,7 @@ impl ServerAgenticLoopHost {
             "total_tokens": u.total_tokens(),
         }));
 
-        let edge_delivery_tool_calls = self.edge_deliverable_tool_calls(&tool_calls, state);
-        let edge_tool_round = if !self.server_side_tools
-            && self.should_deliver_edge_tool_calls(&edge_delivery_tool_calls)
-            && !edge_delivery_tool_calls.is_empty()
-        {
-            self.deliver_edge_tools_via_ledger(&edge_delivery_tool_calls)
-                .await
-        } else {
-            Vec::new()
-        };
+        let edge_tool_round = self.deliver_edge_bound_tools_via_ledger(&tool_calls).await;
 
         let accum = ChatTurnSseAccum {
             full_text: full_text.clone(),
@@ -2550,46 +2619,6 @@ impl ServerAgenticLoopHost {
             edge_tool_round,
             error_kind: None,
         })
-    }
-
-    fn edge_deliverable_tool_calls(
-        &self,
-        tool_calls: &[Value],
-        state: &AgenticLoopState,
-    ) -> Vec<Value> {
-        tool_calls
-            .iter()
-            .filter(|tool_call| !self.server_catalog_tool_call_runs_on_server(tool_call, state))
-            .cloned()
-            .collect()
-    }
-
-    fn server_catalog_tool_call_runs_on_server(
-        &self,
-        tool_call: &Value,
-        state: &AgenticLoopState,
-    ) -> bool {
-        if !self.server_catalog_tool_surface {
-            return false;
-        }
-        let Some(tool_name) = tool_call_function_name(tool_call) else {
-            return false;
-        };
-        if !server_owned_tool_name(tool_name) {
-            return false;
-        }
-        state
-            .server_tool_executor
-            .as_deref()
-            .is_some_and(|executor| executor.tool_runtime_ready(tool_name))
-    }
-
-    fn should_deliver_edge_tool_calls(&self, tool_calls: &[Value]) -> bool {
-        self.event_tx.is_some()
-            || tool_calls.iter().any(|tool_call| {
-                tool_call_function_name(tool_call)
-                    .is_some_and(|tool_name| self.edge_executor_offline_blocks_tool(tool_name))
-            })
     }
 
     fn edge_executor_offline_blocks_tool(&self, tool_name: &str) -> bool {
@@ -2742,6 +2771,53 @@ impl ServerAgenticLoopHost {
     /// **P0-3**: When the in-memory ledger times out and an edge dispatch
     /// service is wired (cross-pod deployment), falls back to DB-polling
     /// for results delivered by another pod.
+    async fn deliver_edge_bound_tools_via_ledger(
+        &mut self,
+        tool_calls: &[Value],
+    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        if self.event_tx.is_none() || tool_calls.is_empty() {
+            return Vec::new();
+        }
+        let edge_bound_tool_calls = self.edge_ledger_tool_calls_for_delivery(tool_calls);
+        if edge_bound_tool_calls.is_empty() {
+            return Vec::new();
+        }
+        self.deliver_edge_tools_via_ledger(&edge_bound_tool_calls)
+            .await
+    }
+
+    fn edge_ledger_tool_calls_for_delivery(&self, tool_calls: &[Value]) -> Vec<Value> {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        tool_calls
+            .iter()
+            .filter_map(|tool_call| {
+                if !tool_call.is_object() {
+                    return None;
+                }
+                let (tool_call_id, tool_name, args) =
+                    astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event(tool_call);
+                let request = ToolExecutionRequest {
+                    user_id: self.user_id.clone(),
+                    run_id: String::new(),
+                    session_id: self.session_id.clone(),
+                    tool_call_id,
+                    tool_name,
+                    args,
+                    workspace: self.workspace_binding.clone(),
+                    workspace_record: None,
+                    executor: self.executor_binding.clone(),
+                    runtime: self.runtime_binding.clone(),
+                    policy: ToolPolicySnapshot::default(),
+                };
+                matches!(
+                    routing_decision(&request, &registry),
+                    ToolExecutionRouteKind::EdgeBound
+                )
+                .then(|| tool_call.clone())
+            })
+            .collect()
+    }
+
     async fn deliver_edge_tools_via_ledger(
         &mut self,
         tool_calls: &[Value],
@@ -3172,11 +3248,11 @@ impl ServerAgenticLoopHost {
     /// constraints and are pruned here; skill `allowed_tools` is only a hint
     /// and must not silently hide otherwise-callable tools from the model.
     fn filtered_turn_tools(&self, restricted_tools: &HashSet<String>) -> Vec<Value> {
-        filter_tool_schemas_by_excluded_names(self.edge_tools.clone(), restricted_tools)
+        filter_tool_schemas_by_excluded_names(self.tool_schemas.clone(), restricted_tools)
     }
 
     fn runtime_ready_turn_tools(&self, tools: Vec<Value>, state: &AgenticLoopState) -> Vec<Value> {
-        let Some(executor) = state.server_tool_executor.as_deref() else {
+        let Some(executor) = state.runtime_tool_executor.as_deref() else {
             return tools;
         };
         tools
@@ -3204,7 +3280,7 @@ impl ServerAgenticLoopHost {
             .try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
-        self.edge_tools
+        self.tool_schemas
             .iter()
             .filter_map(|tool| {
                 tool.get("function")
@@ -3235,9 +3311,9 @@ impl ServerAgenticLoopHost {
             wire_tools,
             self.resolved_model_name.as_deref(),
             self.resolved_context_window,
-            state.server_tool_executor.as_deref(),
+            state.runtime_tool_executor.as_deref(),
         );
-        if let Some(executor) = state.server_tool_executor.as_deref() {
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
             executor.set_current_activatable_tool_names(activatable_deferred_tool_names.clone());
             executor.set_current_searchable_tool_schemas(wire_tools);
             extras.extend(executor.activated_deferred_tool_names());
@@ -3279,7 +3355,7 @@ impl ServerAgenticLoopHost {
         wire_tools: &[Value],
         resolved_model_name: Option<&str>,
         resolved_context_window: Option<u32>,
-        executor: Option<&crate::server::server_tool_executor::ServerToolExecutor>,
+        executor: Option<&crate::server::runtime_tool_executor::RuntimeToolExecutor>,
     ) -> HashSet<String> {
         let deferred_tool_names = self.prompt_deferred_tool_names_for_wire_tools(
             wire_tools,
@@ -3364,7 +3440,7 @@ impl ServerAgenticLoopHost {
             wire_tools,
             Some(model_name),
             model_context_window,
-            state.server_tool_executor.as_deref(),
+            state.runtime_tool_executor.as_deref(),
         );
         if manifest_names.is_empty() {
             return String::new();
@@ -3423,7 +3499,7 @@ impl ServerAgenticLoopHost {
         for boosted in &state.boosted_tools {
             effective.remove(boosted);
         }
-        if let Some(executor) = state.server_tool_executor.as_deref() {
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
             for name in executor.activated_deferred_tool_names() {
                 // Rescue activated deferred tools so they're visible this turn.
                 effective.remove(&name);
@@ -4582,18 +4658,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // SSE events so the client can execute tools locally, then wait on
         // the ledger for the results posted via `POST /tools/result`.
         //
-        // When server_side_tools is true, the headless pipeline uses
-        // server_tool_executor and no ledger is needed.
-        let edge_delivery_tool_calls = self.edge_deliverable_tool_calls(&result.tool_calls, state);
-        let edge_tool_round = if !self.server_side_tools
-            && self.should_deliver_edge_tool_calls(&edge_delivery_tool_calls)
-            && !edge_delivery_tool_calls.is_empty()
-        {
-            self.deliver_edge_tools_via_ledger(&edge_delivery_tool_calls)
-                .await
-        } else {
-            Vec::new()
-        };
+        // Only edge-bound runtime executor tools are sent to the edge ledger.
+        // Server-service/control-plane/MCP calls stay in the headless pipeline
+        // and execute through the server-side executor path.
+        let edge_tool_round = self
+            .deliver_edge_bound_tools_via_ledger(&result.tool_calls)
+            .await;
 
         // ── 6. Build turn result ────────────────────────────────────────
         let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
@@ -4854,7 +4924,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         {
             let name_owned = name.to_string();
             self.valid_tools.insert(name_owned.clone());
-            if let Some(existing) = self.edge_tools.iter_mut().find(|tool| {
+            if let Some(existing) = self.tool_schemas.iter_mut().find(|tool| {
                 tool.get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(Value::as_str)
@@ -4862,7 +4932,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }) {
                 *existing = schema;
             } else {
-                self.edge_tools.push(schema);
+                self.tool_schemas.push(schema);
             }
         }
     }
@@ -5567,7 +5637,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_populates_server_tools_by_default_when_edge_tools_empty() {
+    fn builder_populates_server_provider_tools_by_default_when_no_runtime_surface() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -5579,9 +5649,8 @@ mod tests {
         ))
         .build();
 
-        assert!(host.server_side_tools);
         assert!(
-            !host.edge_tools.is_empty(),
+            !host.tool_schemas.is_empty(),
             "web/default mode should expose server runtime tool schemas"
         );
     }
@@ -5600,9 +5669,8 @@ mod tests {
         .with_server_tool_catalog_enabled(false)
         .build();
 
-        assert!(!host.server_side_tools);
         assert!(
-            host.edge_tools.is_empty(),
+            host.tool_schemas.is_empty(),
             "Agent Binding mode starts with no local/request tool schemas"
         );
     }
@@ -5638,7 +5706,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_runtime_mcp_tools_switch_empty_host_to_server_side_execution() {
+    fn registry_runtime_mcp_tools_remain_request_scoped_without_edge_surface() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -5652,7 +5720,7 @@ mod tests {
         .with_static_tool_catalog_admissible(false)
         .build();
 
-        assert!(!host.server_side_tools);
+        assert!(host.tool_schemas.is_empty());
 
         host.install_runtime_tool_schemas(vec![json!({
             "type": "function",
@@ -5663,11 +5731,16 @@ mod tests {
             }
         })]);
 
-        assert!(
-            host.server_side_tools,
-            "registry runtime MCP tools are executed by ServerToolExecutor, not edge ledger"
-        );
         assert!(host.valid_tool_names().contains("mcp__tools__query"));
+        let selected = host.edge_ledger_tool_calls_for_delivery(&[json!({
+            "id": "mcp-1",
+            "type": "function",
+            "function": {"name": "mcp__tools__query", "arguments": r#"{"query":"docs"}"#}
+        })]);
+        assert!(
+            selected.is_empty(),
+            "request-scoped MCP tools must not be delivered to the edge ledger"
+        );
     }
 
     #[test]
@@ -5685,8 +5758,6 @@ mod tests {
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
-        assert!(!host.server_side_tools);
-
         host.install_runtime_tool_schemas(vec![json!({
             "type": "function",
             "function": {
@@ -5696,11 +5767,127 @@ mod tests {
             }
         })]);
 
-        assert!(
-            !host.server_side_tools,
-            "existing edge/client tool surfaces must keep edge-ledger execution"
-        );
         assert!(host.valid_tool_names().contains("mcp__tools__query"));
+        let selected = host.edge_ledger_tool_calls_for_delivery(&[
+            json!({
+                "id": "read-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": r#"{"path":"README.md"}"#}
+            }),
+            json!({
+                "id": "mcp-1",
+                "type": "function",
+                "function": {"name": "mcp__tools__query", "arguments": r#"{"query":"docs"}"#}
+            }),
+        ]);
+        let selected_names = selected
+            .iter()
+            .map(|tool_call| {
+                astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event(tool_call).1
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(selected_names, vec!["read_file"]);
+    }
+
+    #[test]
+    fn edge_ledger_delivery_selects_only_edge_bound_runtime_tools() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-route".to_string(),
+            "s-route".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let tool_calls = vec![
+            json!({
+                "id": "read-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": r#"{"path":"README.md"}"#}
+            }),
+            json!({
+                "id": "web-1",
+                "type": "function",
+                "function": {"name": "web_search", "arguments": r#"{"query":"astra"}"#}
+            }),
+            json!({
+                "id": "mcp-1",
+                "type": "function",
+                "function": {"name": "mcp__docs__query", "arguments": r#"{"query":"astra"}"#}
+            }),
+            json!({
+                "id": "unknown-1",
+                "type": "function",
+                "function": {"name": "totally_unknown", "arguments": "{}"}
+            }),
+        ];
+
+        let selected = host.edge_ledger_tool_calls_for_delivery(&tool_calls);
+        let names = selected
+            .iter()
+            .map(|tool_call| {
+                astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event(tool_call).1
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    #[test]
+    fn server_catalog_with_edge_binding_still_routes_runtime_tools_to_edge() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-catalog-edge".to_string(),
+            "s-catalog-edge".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let names = schema_names(&host.tool_schemas);
+        assert!(
+            names.contains("read_file"),
+            "edge-bound runtime tools should be visible when the edge provider is explicitly bound"
+        );
+
+        let selected = host.edge_ledger_tool_calls_for_delivery(&[json!({
+            "id": "read-1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"README.md"}"#}
+        })]);
+
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn builder_composes_server_owned_tools_with_edge_declared_runtime_tools() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-compose".to_string(),
+            "s-compose".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let names = schema_names(&host.tool_schemas);
+        for expected in ["bash", "read_file", "tool_search", "web_search", "memory"] {
+            assert!(
+                names.contains(expected),
+                "{expected} should be visible in the composed server+edge surface: {names:?}"
+            );
+            assert!(
+                host.valid_tool_names().contains(expected),
+                "{expected} should be admitted in the composed server+edge surface"
+            );
+        }
+        assert!(
+            !names.contains("write_file"),
+            "edge-provided runtime surfaces must not be widened with runtime tools the edge did not declare"
+        );
     }
 
     fn schema_names(tools: &[Value]) -> HashSet<String> {
@@ -5728,10 +5915,10 @@ mod tests {
         )
     }
 
-    fn server_tool_executor_with_agent_context(
+    fn runtime_tool_executor_with_agent_context(
         work_dir: &Path,
-    ) -> crate::server::server_tool_executor::ServerToolExecutor {
-        let mut executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+    ) -> crate::server::runtime_tool_executor::RuntimeToolExecutor {
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
             work_dir.to_path_buf(),
             "user1".into(),
             "sess1".into(),
@@ -6169,9 +6356,9 @@ mod tests {
         assert!(host.valid_tool_names().contains("read_file"));
 
         let dir = tempfile::TempDir::new().unwrap();
-        let executor = Arc::new(server_tool_executor_with_agent_context(dir.path()));
+        let executor = Arc::new(runtime_tool_executor_with_agent_context(dir.path()));
         let mut state = create_test_state();
-        state.server_tool_executor = Some(Arc::clone(&executor));
+        state.runtime_tool_executor = Some(Arc::clone(&executor));
 
         let wire_tools = vec![sample_edge_tools()[0].clone()];
         host.sync_valid_tools_to_wire_surface_for_state(&wire_tools, &state);
@@ -6223,9 +6410,9 @@ mod tests {
         host.resolved_context_window = Some(200_000);
 
         let dir = tempfile::TempDir::new().unwrap();
-        let executor = Arc::new(server_tool_executor_with_agent_context(dir.path()));
+        let executor = Arc::new(runtime_tool_executor_with_agent_context(dir.path()));
         let mut state = create_test_state();
-        state.server_tool_executor = Some(Arc::clone(&executor));
+        state.runtime_tool_executor = Some(Arc::clone(&executor));
 
         let _visible = host.visible_turn_tools(&mut state);
 
@@ -6284,7 +6471,7 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let executor = Arc::new(
-            crate::server::server_tool_executor::ServerToolExecutor::new(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
                 dir.path().to_path_buf(),
                 "test-user".into(),
                 "test-session".into(),
@@ -6293,7 +6480,7 @@ mod tests {
             ),
         );
         let mut state = create_test_state();
-        state.server_tool_executor = Some(Arc::clone(&executor));
+        state.runtime_tool_executor = Some(Arc::clone(&executor));
 
         let visible = host.visible_turn_tools(&mut state);
         let visible_names = schema_names(&visible);
@@ -6332,7 +6519,7 @@ mod tests {
         .with_edge_tools(sample_edge_tools())
         .build();
 
-        let names = schema_names(&host.edge_tools);
+        let names = schema_names(&host.tool_schemas);
         assert!(!names.contains("bash"));
         assert!(!names.contains("read_file"));
         assert!(!host.valid_tool_names().contains("bash"));
@@ -6340,7 +6527,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_default_server_side_tools_hide_project_tools_without_runtime() {
+    fn builder_default_server_surface_hides_project_tools_without_runtime() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6349,7 +6536,7 @@ mod tests {
         )
         .build();
 
-        let names = schema_names(&host.edge_tools);
+        let names = schema_names(&host.tool_schemas);
         assert!(names.contains("ask_user"));
         assert!(names.contains("tool_search"));
         assert!(names.contains("web_search"));
@@ -6373,7 +6560,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_server_side_tools_follow_server_sandbox_binding() {
+    fn builder_runtime_surface_follows_server_sandbox_binding() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6386,7 +6573,7 @@ mod tests {
         )
         .build();
 
-        let names = schema_names(&host.edge_tools);
+        let names = schema_names(&host.tool_schemas);
         for visible in [
             "ask_user",
             "tool_search",
@@ -6407,7 +6594,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_server_side_tools_hide_project_tools_when_edge_offline() {
+    fn builder_runtime_surface_hides_project_tools_when_edge_offline() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6429,7 +6616,7 @@ mod tests {
         )
         .build();
 
-        let names = schema_names(&host.edge_tools);
+        let names = schema_names(&host.tool_schemas);
         for visible in ["agent", "tool_search", "web_search", "memory"] {
             assert!(
                 names.contains(visible),
@@ -6456,7 +6643,51 @@ mod tests {
     }
 
     #[test]
-    fn builder_server_side_tools_follow_orchestrator_read_only_binding() {
+    fn builder_runtime_surface_exposes_project_tools_for_online_edge_binding_without_edge_tools() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                crate::server::tool_transport::ExecutorStatus::Online,
+            ),
+        )
+        .build();
+
+        let names = schema_names(&host.tool_schemas);
+        for visible in [
+            "ask_user",
+            "tool_search",
+            "web_fetch",
+            "bash",
+            "read_file",
+            "write_file",
+            "git",
+        ] {
+            assert!(
+                names.contains(visible),
+                "{visible} should be advertised for an online edge workspace binding without request-scoped edge_tools: {names:?}"
+            );
+            assert!(
+                host.valid_tool_names().contains(visible),
+                "{visible} should be admitted for an online edge workspace binding"
+            );
+        }
+    }
+
+    #[test]
+    fn builder_runtime_surface_follows_orchestrator_read_only_binding() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6482,7 +6713,7 @@ mod tests {
         ))
         .build();
 
-        let names = schema_names(&host.edge_tools);
+        let names = schema_names(&host.tool_schemas);
         for visible in ["read_file", "grep", "glob", "git"] {
             assert!(
                 names.contains(visible),
@@ -6552,7 +6783,7 @@ mod tests {
         );
         pipeline_session.recovery.consecutive_ptl_errors = 3;
         state.pipeline_session = Some(pipeline_session);
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         let error = match host.run_turn_pipeline(
             &mut state,
@@ -6760,7 +6991,7 @@ mod tests {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         let outcome = host
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4", "just do it")
@@ -6813,7 +7044,7 @@ mod tests {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         let outcome = host
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
@@ -6825,12 +7056,18 @@ mod tests {
             "turn-start lifecycle summary must be injected into prompt context: {text}"
         );
         assert!(
-            text.contains("Mode: web-agent (server-side tools) · interaction: headless"),
-            "web-agent mode marker must be explicit: {text}"
+            text.contains("Runtime surface: mode=server-side · interaction=headless · providers=server_service:ready, control_plane:ready, sandbox:unbound (workspace executor not bound)"),
+            "runtime provider coverage must be explicit: {text}"
         );
         assert!(
-            text.contains("Workspace: server-provisioned (edge cwd unavailable)"),
-            "web-agent mode without edge cwd must explain workspace source: {text}"
+            text.contains(
+                "Workspace binding: kind=none · authority=none · name=No file environment"
+            ),
+            "workspace binding must come from execution binding state, not topology shorthand: {text}"
+        );
+        assert!(
+            text.contains("Executor binding: kind=server_local · transport=server_local · status=online · id=server-control-plane · name=Server control plane"),
+            "executor binding must be explicit: {text}"
         );
         assert!(
             text.contains("Plan resume: [plan-resume] goal=\"stabilize\""),
@@ -6870,7 +7107,7 @@ mod tests {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         let outcome = host
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
@@ -6917,7 +7154,7 @@ mod tests {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         let outcome = host
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
@@ -6939,7 +7176,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_start_lifecycle_summary_reports_edge_mode_and_workspace() {
+    fn turn_start_lifecycle_summary_reports_edge_provider_binding() {
         let mut edge_profile = Map::new();
         edge_profile.insert("cwd".to_string(), Value::String("/tmp/proj".to_string()));
 
@@ -6961,12 +7198,16 @@ mod tests {
         let summary = host.turn_start_lifecycle_summary(&state);
 
         assert!(
-            summary.contains("Mode: edge-agent (edge-provided tools) · interaction: prompt"),
-            "edge-connected mode should be explicit: {summary}"
+            summary.contains("Runtime surface: mode=mixed-provider · interaction=prompt · providers=server_service:ready, control_plane:ready, edge_capacity:ready"),
+            "edge provider coverage should be explicit: {summary}"
         );
         assert!(
-            summary.contains("Workspace: /tmp/proj"),
-            "edge cwd should be surfaced in lifecycle summary: {summary}"
+            summary.contains("Workspace binding: kind=edge_workspace · authority=read_write · name=MacBook Pro · cwd=/Users/test/project"),
+            "workspace binding cwd should come from execution binding, not edge_profile fallback: {summary}"
+        );
+        assert!(
+            summary.contains("Executor binding: kind=edge_agent · transport=edge_ws · status=online · id=edge-1 · name=MacBook Pro"),
+            "executor binding should be surfaced in lifecycle summary: {summary}"
         );
         assert!(
             summary.contains("Plan resume: none"),
@@ -6992,7 +7233,7 @@ mod tests {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         state.current_round_index = 0;
         let round0 = host
@@ -7056,7 +7297,7 @@ mod tests {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         // Updated contract: strict-history providers (MiniMax) must
         // suppress volatile preamble on EVERY round, not just >0.
@@ -7100,7 +7341,7 @@ mod tests {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         for round in [0u32, 1, 5] {
             state.current_round_index = round;
@@ -7141,7 +7382,7 @@ mod tests {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         state.current_round_index = 0;
         let r0 = host
@@ -7197,7 +7438,7 @@ mod tests {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         // Capture system content on two different rounds and assert the
         // byte-stable invariant. The old MarkerIsolated branch embedded
@@ -7259,7 +7500,7 @@ mod tests {
         // Force the planner to escalate beyond Normal via recovery state.
         ps.recovery.consecutive_ptl_errors = 1;
         state.pipeline_session = Some(ps);
-        let tools = host.edge_tools.clone();
+        let tools = host.tool_schemas.clone();
 
         let outcome = host
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4", "continue")
@@ -7812,7 +8053,7 @@ mod tests {
             step_signal_collector: None,
             tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
-            server_tool_executor: None,
+            runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
@@ -7985,15 +8226,15 @@ mod tests {
         )
         .with_server_sandbox_workspace(dir.path())
         .build();
-        let raw_names = astra_turn_core::tool::schema::tool_names_from_schemas(&host.edge_tools);
+        let raw_names = astra_turn_core::tool::schema::tool_names_from_schemas(&host.tool_schemas);
         assert!(
             raw_names.contains("reflect"),
             "capability-only server surface starts with reflect before executor readiness filtering"
         );
 
         let mut state = create_test_state();
-        state.server_tool_executor = Some(Arc::new(
-            crate::server::server_tool_executor::ServerToolExecutor::new(
+        state.runtime_tool_executor = Some(Arc::new(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
                 dir.path().to_path_buf(),
                 "u".to_string(),
                 "s".to_string(),
@@ -8028,7 +8269,7 @@ mod tests {
         ))
         .build();
 
-        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&host.edge_tools);
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&host.tool_schemas);
         assert!(
             !names.contains("reflect"),
             "builder must fail closed before executor filtering when the reflect service is unconfigured: {names:?}"
@@ -8342,7 +8583,7 @@ mod tests {
     // ── inject_tool_schema tests ────────────────────────────────────────────
 
     #[test]
-    fn inject_tool_schema_adds_to_edge_tools_and_valid_tools() {
+    fn inject_tool_schema_adds_to_tool_surface_and_valid_tools() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -8354,14 +8595,14 @@ mod tests {
         .build();
 
         assert!(!host.valid_tool_names().contains("delegate"));
-        let initial_count = host.edge_tools.len();
+        let initial_count = host.tool_schemas.len();
 
         use crate::turn::agentic_loop::host::delegate_tool_schema;
         host.inject_tool_schema(delegate_tool_schema());
 
         assert!(host.valid_tool_names().contains("delegate"));
-        assert_eq!(host.edge_tools.len(), initial_count + 1);
-        let last = host.edge_tools.last().unwrap();
+        assert_eq!(host.tool_schemas.len(), initial_count + 1);
+        let last = host.tool_schemas.last().unwrap();
         assert_eq!(last["function"]["name"], "delegate");
     }
 
@@ -8378,13 +8619,13 @@ mod tests {
         .build();
 
         use crate::turn::agentic_loop::host::delegate_tool_schema;
-        let initial_count = host.edge_tools.len();
+        let initial_count = host.tool_schemas.len();
 
         host.inject_tool_schema(delegate_tool_schema());
         host.inject_tool_schema(delegate_tool_schema());
 
         // Only one injection — duplicate is skipped
-        assert_eq!(host.edge_tools.len(), initial_count + 1);
+        assert_eq!(host.tool_schemas.len(), initial_count + 1);
     }
 
     #[test]
@@ -8399,11 +8640,11 @@ mod tests {
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
-        let initial_count = host.edge_tools.len();
+        let initial_count = host.tool_schemas.len();
         host.inject_tool_schema(json!({"bad": "schema"}));
 
         // No change — malformed schema ignored
-        assert_eq!(host.edge_tools.len(), initial_count);
+        assert_eq!(host.tool_schemas.len(), initial_count);
     }
 
     // ── llm_cancel_for_state (aligns server loop with AgenticLoopState cancel fields) ──

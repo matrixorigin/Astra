@@ -1,4 +1,4 @@
-//! Server-side tool executor for web agent sessions.
+//! Provider-backed runtime tool executor for server-hosted agentic runs.
 //!
 //! By default the server exposes only server-service and control-plane tools.
 //! Workspace/process execution, such as bash, file mutation, git, or test
@@ -11,8 +11,8 @@
 //! # Integration
 //!
 //! The executor is injected into `HeadlessToolRoundCtx` via the
-//! `server_tool_executor` field. When present, the headless round
-//! calls it directly instead of waiting for edge POST callbacks.
+//! `runtime_tool_executor` field. It executes server-owned tools locally and
+//! delegates runtime-executor tools through the bound provider route.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -90,10 +90,11 @@ fn resolved_server_tool_names(
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolAdmission {
     Ready,
     MissingRuntimeBinding,
+    RuntimeEnvironmentDenied(astra_runtime_env::ToolUnavailableReason),
     MissingCapability(Capability),
     MissingService(Capability),
 }
@@ -120,11 +121,11 @@ impl SessionConfigState {
     }
 }
 
-/// Server-side tool executor for web agent sessions.
+/// Provider-backed runtime tool executor for server-hosted agentic runs.
 ///
-/// Wraps tool calls in a sandboxed environment without requiring a CLI process.
-/// Created per-session by `AgenticRunLifecycleService::create_run()`.
-pub struct ServerToolExecutor {
+/// Server-service and control-plane tools run locally. Workspace/process tools
+/// are only available when an explicit provider binding exists.
+pub struct RuntimeToolExecutor {
     // ── Identity ──────────────────────────────────────────────────────────────
     /// Workspace root for this session.
     pub(super) workspace_root: PathBuf,
@@ -155,7 +156,7 @@ pub struct ServerToolExecutor {
     /// Shared default executor for delegating common tool logic.
     pub(super) default_executor: DefaultToolExecutor,
     /// Canonical handler registry for server-local tools.
-    tool_engine: ToolEngine<ServerToolExecutor>,
+    tool_engine: ToolEngine<RuntimeToolExecutor>,
     /// Cooperative cancellation for server-owned runtime/control-plane tool awaits.
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Explicit workspace, executor, runtime, and provisioned workspace record
@@ -223,11 +224,11 @@ pub struct ServerToolExecutor {
     /// shared HTTP transport pool. Unlike `mcp_manager`, this never holds a
     /// long-lived authorization-scoped MCP session.
     agent_binding_mcp: Option<Arc<super::runtime_mcp::AgentBindingMcpRuntime>>,
-    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
-    /// server-side allowlist when `tool_search(select:NAME)` runs so
-    /// deferred activation reaches plugin tools. Populated by the server
-    /// loop host once MCP servers have been refreshed.
-    plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
+    /// Request-scoped MCP tool schemas. Joined with the server-side allowlist
+    /// only when the matching MCP runtime binding is ready, so deferred
+    /// activation reaches MCP tools without treating arbitrary schemas as
+    /// server-owned capacity.
+    request_scoped_mcp_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
     /// Deferred tool names whose full schema has been fetched via
     /// `tool_search(query="select:NAME")` in this session.
     activated_deferred_tools: Arc<std::sync::RwLock<HashSet<String>>>,
@@ -260,7 +261,7 @@ pub struct ServerToolExecutor {
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
 }
 
-impl ServerToolExecutor {
+impl RuntimeToolExecutor {
     /// Create a new server tool executor for a session.
     pub fn new(
         workspace_root: PathBuf,
@@ -287,7 +288,7 @@ impl ServerToolExecutor {
         let task_manager = Arc::new(TaskManager::new(session_id.clone(), task_store));
 
         let capabilities = crate::capabilities::full_server_capabilities_for_tests();
-        let tool_engine = tool_handlers::server_tool_engine();
+        let tool_engine = tool_handlers::runtime_tool_engine();
 
         Self {
             workspace_root: workspace_root.clone(),
@@ -321,7 +322,7 @@ impl ServerToolExecutor {
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
-            plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+            request_scoped_mcp_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             current_searchable_tool_names: Arc::new(std::sync::RwLock::new(None)),
             current_activatable_tool_names: Arc::new(std::sync::RwLock::new(None)),
@@ -344,7 +345,7 @@ impl ServerToolExecutor {
     /// Public accessor for transport-aware tool execution routing.
     /// Callers wire edge, gateway relay, and sandbox-resident
     /// agent transports through this handle instead of through
-    /// `ServerToolExecutor` thin-setters.
+    /// `RuntimeToolExecutor` thin-setters.
     pub fn tool_execution_service(&mut self) -> &mut ToolExecutionService {
         &mut self.tool_execution_service
     }
@@ -480,19 +481,26 @@ impl ServerToolExecutor {
         self.agent_binding_mcp = Some(agent_binding_mcp);
     }
 
-    /// Install plugin-registered schemas (MCP, etc.) so
+    /// Install request-scoped MCP schemas so
     /// `tool_search(select:NAME)` can resolve them for deferred activation.
-    /// Called by the server loop host after MCP manager refresh.
+    /// Called by the server loop host after request-scoped MCP discovery.
     ///
-    /// Poison handling: plugin schemas are a rebuildable cache. Reset cached
+    /// Poison handling: MCP schemas are a rebuildable cache. Reset cached
     /// state on poison instead of reusing possibly half-written inner data.
-    pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
-        let mut guard = rwlock_write_reset_on_poison(&self.plugin_schemas, "plugin_schemas");
+    pub fn set_request_scoped_mcp_schemas(&self, schemas: Vec<Value>) {
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.request_scoped_mcp_schemas,
+            "request_scoped_mcp_schemas",
+        );
         *guard = schemas;
     }
 
     pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {
-        let names = astra_turn_core::tool::schema::tool_names_from_schemas(schemas);
+        let allowed = self.provider_visible_runtime_tool_names();
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(schemas)
+            .into_iter()
+            .filter(|name| allowed.contains(name))
+            .collect();
         let mut guard = rwlock_write_reset_on_poison(
             &self.current_searchable_tool_names,
             "current_searchable_tool_names",
@@ -501,6 +509,7 @@ impl ServerToolExecutor {
     }
 
     pub fn set_current_activatable_tool_names(&self, names: HashSet<String>) {
+        let names = self.runtime_bound_tool_names(names);
         let mut guard = rwlock_write_reset_on_poison(
             &self.current_activatable_tool_names,
             "current_activatable_tool_names",
@@ -527,15 +536,14 @@ impl ServerToolExecutor {
         let mut pool = self.capability_filtered_server_tool_schemas();
         let activatable = self.current_activatable_tool_names_snapshot();
         if !activatable.is_empty() {
-            let mut activatable_pool =
-                crate::capabilities::server_runtime_tool_schemas(&self.capabilities);
+            let mut activatable_pool = self.capability_filtered_server_tool_schemas();
             retain_tool_schemas_by_names(&mut activatable_pool, &activatable);
             activatable_pool.retain(|schema| {
                 tool_schema_name(schema).is_some_and(|name| self.tool_runtime_ready(name))
             });
             extend_tool_schema_pool_unique(&mut pool, activatable_pool);
         }
-        pool.extend(self.external_schemas_snapshot("external_schemas_tool_search"));
+        extend_tool_schema_pool_unique(&mut pool, self.ready_request_scoped_mcp_schemas());
 
         let Some(mut searchable_names) = self.current_searchable_tool_names() else {
             return pool;
@@ -612,12 +620,17 @@ impl ServerToolExecutor {
         guard.extend(names);
     }
 
-    pub(crate) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
-        rwlock_read_clone_or_default(&self.plugin_schemas, label)
+    pub(crate) fn request_scoped_mcp_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+        rwlock_read_clone_or_default(&self.request_scoped_mcp_schemas, label)
     }
 
-    pub(crate) fn external_schemas_snapshot(&self, label: &str) -> Vec<Value> {
-        self.plugin_schemas_snapshot(label)
+    pub(crate) fn ready_request_scoped_mcp_schemas(&self) -> Vec<Value> {
+        self.request_scoped_mcp_schemas_snapshot("request_scoped_mcp_schemas_ready")
+            .into_iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_some_and(|name| self.mcp_tool_has_runtime_binding(name))
+            })
+            .collect()
     }
 
     /// Record a direct deferred call as an activation intent. Called when the
@@ -706,9 +719,24 @@ impl ServerToolExecutor {
     }
 
     pub(crate) fn runtime_bound_tool_names(&self, names: HashSet<String>) -> HashSet<String> {
+        let allowed = self.provider_visible_runtime_tool_names();
         astra_turn_core::tool::deferred_activation::runtime_bound_tool_names(names, |name| {
-            self.tool_runtime_ready(name)
+            allowed.contains(name)
         })
+    }
+
+    fn provider_visible_runtime_tool_names(&self) -> HashSet<String> {
+        let mut names: HashSet<String> = self
+            .capability_filtered_server_tool_schemas()
+            .iter()
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+            .collect();
+        names.extend(
+            self.ready_request_scoped_mcp_schemas()
+                .iter()
+                .filter_map(|schema| tool_schema_name(schema).map(str::to_string)),
+        );
+        names
     }
 
     pub(crate) fn tool_runtime_ready(&self, name: &str) -> bool {
@@ -716,6 +744,10 @@ impl ServerToolExecutor {
     }
 
     fn tool_admission(&self, name: &str) -> ToolAdmission {
+        self.tool_admission_for_call(name, &Value::Null)
+    }
+
+    fn tool_admission_for_call(&self, name: &str, args: &Value) -> ToolAdmission {
         if name.starts_with("mcp__") {
             return if self.mcp_tool_has_runtime_binding(name) {
                 ToolAdmission::Ready
@@ -724,12 +756,12 @@ impl ServerToolExecutor {
             };
         }
 
-        if !self.runtime_environment_allows_tool(name) {
-            return ToolAdmission::MissingRuntimeBinding;
+        if let Some(reason) = self.runtime_environment_tool_denial(name, args) {
+            return ToolAdmission::RuntimeEnvironmentDenied(reason);
         }
 
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
-            return if self.tool_engine.contains(name) || self.plugin_schema_has_name(name) {
+            return if self.tool_engine.contains(name) {
                 ToolAdmission::Ready
             } else {
                 ToolAdmission::MissingRuntimeBinding
@@ -755,11 +787,13 @@ impl ServerToolExecutor {
         ToolAdmission::Ready
     }
 
-    fn runtime_environment_allows_tool(&self, name: &str) -> bool {
+    fn runtime_environment_tool_denial(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<astra_runtime_env::ToolUnavailableReason> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        if registry.get(name).is_none() {
-            return true;
-        }
+        registry.get(name)?;
         let binding = crate::server::tool_binding_projection::runtime_environment_binding_for_parts(
             name,
             self.execution_binding.workspace(),
@@ -769,29 +803,26 @@ impl ServerToolExecutor {
             &registry,
         );
         astra_runtime_env::CapabilityResolver
-            .check_tool_call(&registry, name, &json!({}), &binding.capabilities)
-            .is_ok()
+            .check_tool_call(&registry, name, args, &binding.capabilities)
+            .err()
     }
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
         if name.starts_with("mcp__") {
             return self.mcp_tool_has_runtime_binding(name);
         }
-        if !self.runtime_environment_allows_tool(name) {
+        if self
+            .runtime_environment_tool_denial(name, &Value::Null)
+            .is_some()
+        {
             return false;
         }
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
-            return self.tool_engine.contains(name) || self.plugin_schema_has_name(name);
+            return self.tool_engine.contains(name);
         };
         meta.requires
             .iter()
             .all(|capability| self.capability_has_runtime_binding(*capability))
-    }
-
-    fn plugin_schema_has_name(&self, name: &str) -> bool {
-        self.external_schemas_snapshot("external_schemas_runtime_binding")
-            .iter()
-            .any(|schema| tool_schema_name(schema).is_some_and(|schema_name| schema_name == name))
     }
 
     fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
@@ -861,6 +892,25 @@ impl ServerToolExecutor {
         )
     }
 
+    fn runtime_environment_denial_error_result(
+        &self,
+        name: &str,
+        reason: &astra_runtime_env::ToolUnavailableReason,
+    ) -> astra_tools::ToolResult {
+        tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error": format!(
+                    "Tool `{name}` is not available for this run binding: {reason}. Select a workspace, executor, runtime, or policy that provides the required capability."
+                ),
+                "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                "runtime_env_reason": reason,
+                "retryable": false,
+            })
+            .to_string(),
+        )
+    }
+
     fn capability_unavailable_error_result(
         &self,
         name: &str,
@@ -906,7 +956,7 @@ impl ServerToolExecutor {
         name: &str,
         args: &Value,
     ) -> Option<astra_tools::ToolResult> {
-        match self.tool_admission(name) {
+        match self.tool_admission_for_call(name, args) {
             ToolAdmission::Ready => None,
             ToolAdmission::MissingRuntimeBinding
                 if self.tool_can_validate_without_runtime_binding(name, args) =>
@@ -915,6 +965,9 @@ impl ServerToolExecutor {
             }
             ToolAdmission::MissingRuntimeBinding => {
                 Some(self.runtime_binding_error_result(name, args))
+            }
+            ToolAdmission::RuntimeEnvironmentDenied(reason) => {
+                Some(self.runtime_environment_denial_error_result(name, &reason))
             }
             ToolAdmission::MissingCapability(capability) => {
                 Some(self.capability_unavailable_error_result(name, capability))
@@ -1029,14 +1082,47 @@ impl ServerToolExecutor {
     }
 
     pub(super) fn binding_event_fields(&self) -> Map<String, Value> {
-        binding_event_fields(
+        let mut fields = binding_event_fields(
             self.execution_binding.workspace(),
             self.execution_binding.executor(),
-        )
+        );
+        fields.insert(
+            "capacity_provider_coverage".to_string(),
+            serde_json::to_value(self.capacity_provider_coverage()).unwrap_or(Value::Null),
+        );
+        fields
     }
 
     pub fn binding_metadata(&self) -> Value {
         Value::Object(self.binding_event_fields())
+    }
+
+    pub fn capacity_provider_coverage(
+        &self,
+    ) -> Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry> {
+        let mut coverage = crate::server::tool_transport_metadata::capacity_provider_coverage(
+            self.execution_binding.workspace(),
+            self.execution_binding.executor(),
+        );
+        coverage.push(self.request_scoped_mcp_provider_coverage());
+        coverage
+    }
+
+    fn request_scoped_mcp_provider_coverage(
+        &self,
+    ) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        let schemas = self.request_scoped_mcp_schemas_snapshot("request_scoped_mcp_coverage");
+        let ready_names = schemas
+            .iter()
+            .filter_map(tool_schema_name)
+            .filter(|name| self.mcp_tool_has_runtime_binding(name))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        astra_runtime_env::request_scoped_mcp_coverage(
+            "request-scoped-mcp",
+            !schemas.is_empty(),
+            ready_names,
+        )
     }
 
     fn try_emit_work_surface_event(&self, event: Map<String, Value>, unavailable_label: &str) {
@@ -1145,7 +1231,8 @@ impl ServerToolExecutor {
     /// Routing order:
     /// 1. Route from the explicit workspace/executor binding.
     /// 2. Server-sandbox runs execute server-local tools.
-    /// 3. Edge-bound runs execute on edge only; server fallback is disabled.
+    /// 3. Edge-bound runs execute on edge only; no alternate execution
+    ///    provider is silently attempted.
     pub async fn execute(&self, name: &str, args: &Value) -> String {
         self.execute_with_metadata(name, args).await.output
     }
@@ -1352,13 +1439,13 @@ fn server_local_tool_arguments(request: &ToolExecutionRequest) -> Value {
 
 // ─── ToolExecutor trait implementation ────────────────────────────────────────
 //
-// This allows ServerToolExecutor to be used polymorphically wherever
+// This allows RuntimeToolExecutor to be used polymorphically wherever
 // `dyn ToolExecutor` (or `impl ToolExecutor`) is required, e.g. in
 // shared pipeline code that doesn't know whether it runs on the server
 // or on an edge/CLI client.
 
 #[async_trait]
-impl ServerLocalToolTransport for ServerToolExecutor {
+impl ServerLocalToolTransport for RuntimeToolExecutor {
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,
@@ -1385,10 +1472,10 @@ impl ServerLocalToolTransport for ServerToolExecutor {
 }
 
 #[async_trait]
-impl ToolExecutor for ServerToolExecutor {
+impl ToolExecutor for RuntimeToolExecutor {
     async fn execute(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         // Delegate to the concrete method that already returns ToolResult.
-        ServerToolExecutor::execute_with_metadata(self, name, args).await
+        RuntimeToolExecutor::execute_with_metadata(self, name, args).await
     }
 
     fn tool_schemas(&self) -> Vec<Value> {
@@ -1401,7 +1488,7 @@ impl ToolExecutor for ServerToolExecutor {
 
     async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         // Explicitly delegate to the inherent method (not the default trait impl).
-        ServerToolExecutor::execute_with_metadata(self, name, args).await
+        RuntimeToolExecutor::execute_with_metadata(self, name, args).await
     }
 }
 
@@ -1486,7 +1573,7 @@ mod tests {
     #[test]
     fn new_executor_defaults_to_control_plane_without_workspace_runtime() {
         let dir = TempDir::new().unwrap();
-        let exec = ServerToolExecutor::new(
+        let exec = RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             "test-session".into(),
@@ -1528,7 +1615,7 @@ mod tests {
         exec.set_execution_bindings(
             WorkspaceBinding {
                 kind: WorkspaceBindingKind::None,
-                display_name: "No workspace".to_string(),
+                display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
                 fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
@@ -1557,6 +1644,102 @@ mod tests {
     }
 
     #[test]
+    fn deferred_surface_state_drops_project_tools_without_workspace_runtime() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::None,
+                display_name: "No file environment".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::None,
+                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        exec.set_current_searchable_tool_schemas(&astra_tools::schemas::all_tool_schemas());
+        exec.set_current_activatable_tool_names(HashSet::from([
+            "bash".to_string(),
+            "memory".to_string(),
+        ]));
+
+        let searchable = exec
+            .current_searchable_tool_names()
+            .expect("searchable names should be installed");
+        assert!(searchable.contains("tool_search"));
+        assert!(searchable.contains("memory"));
+        assert!(!searchable.contains("bash"));
+        assert!(!searchable.contains("read_file"));
+
+        let activatable = exec.current_activatable_tool_names_snapshot();
+        assert!(activatable.contains("memory"));
+        assert!(!activatable.contains("bash"));
+    }
+
+    #[tokio::test]
+    async fn direct_project_tool_call_without_workspace_is_rejected_by_runtime_env_admission() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::None,
+                display_name: "No file environment".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::None,
+                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        let result = exec
+            .execute_with_metadata("read_file", &json!({"path": "README.md"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("runtime_executor_required")
+                || result.output.contains("runtime executor"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn action_sensitive_runtime_env_admission_blocks_read_only_write_actions() {
+        let (mut exec, dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::ServerSandbox,
+                display_name: "Read-only server sandbox".to_string(),
+                cwd: Some(dir.path().display().to_string()),
+                authority: WorkspaceAuthority::ReadOnly,
+                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        assert!(
+            exec.tool_runtime_ready("git"),
+            "read-only git inspection should remain visible with a read-only workspace provider"
+        );
+        assert!(
+            exec.tool_binding_preflight_result("git", &json!({"action": "status"}))
+                .is_none(),
+            "read-only git actions should pass runtime-env admission"
+        );
+
+        let blocked = exec
+            .tool_binding_preflight_result("git", &json!({"action": "commit", "message": "no"}))
+            .expect("git commit must be blocked before execution on read-only workspace");
+        assert!(blocked.is_error, "{blocked:?}");
+        let value: Value = serde_json::from_str(&blocked.output).unwrap();
+        assert_eq!(value["status"], "failed");
+        assert_eq!(
+            value["runtime_env_reason"],
+            json!({"PolicyDenied": "filesystem_write"})
+        );
+    }
+
+    #[test]
     fn supported_server_tool_names_follow_current_runtime_binding() {
         let (mut exec, _dir) = test_executor();
         assert!(
@@ -1567,7 +1750,7 @@ mod tests {
         exec.set_execution_bindings(
             WorkspaceBinding {
                 kind: WorkspaceBindingKind::None,
-                display_name: "No workspace".to_string(),
+                display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
                 fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
@@ -1582,6 +1765,93 @@ mod tests {
         assert!(
             !exec.supports_server_tool_name("bash"),
             "project tools must not remain supported after binding changes to no-runtime"
+        );
+    }
+
+    fn provider_coverage_status<'a>(
+        coverage: &'a [astra_turn_core::introspect::CapacityProviderCoverageEntry],
+        provider_type: &str,
+    ) -> &'a astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        coverage
+            .iter()
+            .find(|provider| provider.provider_type == provider_type)
+            .unwrap_or_else(|| panic!("missing provider coverage: {provider_type}"))
+    }
+
+    #[test]
+    fn capacity_provider_coverage_reports_request_scoped_mcp_unbound_by_default() {
+        let (exec, _dir) = test_executor();
+        let coverage = exec.capacity_provider_coverage();
+        let mcp = provider_coverage_status(&coverage, "request_scoped_mcp");
+
+        assert_eq!(mcp.status, "unbound");
+        assert_eq!(
+            mcp.unavailable_reason.as_deref(),
+            Some("no_request_scoped_mcp_provider_bound")
+        );
+        assert!(mcp.capabilities.is_empty());
+    }
+
+    #[test]
+    fn capacity_provider_coverage_reports_request_scoped_mcp_schema_without_binding() {
+        let (exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })]);
+
+        let coverage = exec.capacity_provider_coverage();
+        let mcp = provider_coverage_status(&coverage, "request_scoped_mcp");
+
+        assert_eq!(mcp.status, "unbound");
+        assert_eq!(
+            mcp.unavailable_reason.as_deref(),
+            Some("no_request_scoped_mcp_runtime_binding")
+        );
+        assert!(mcp.capabilities.is_empty());
+    }
+
+    #[test]
+    fn capacity_provider_coverage_reports_request_scoped_mcp_ready_when_bound() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+
+        let coverage = exec.capacity_provider_coverage();
+        let mcp = provider_coverage_status(&coverage, "request_scoped_mcp");
+
+        assert_eq!(mcp.status, "ready");
+        assert!(mcp.unavailable_reason.is_none());
+        assert_eq!(mcp.capabilities, vec!["mcp__calculator".to_string()]);
+
+        let metadata = exec.binding_metadata();
+        let metadata_coverage = metadata["capacity_provider_coverage"]
+            .as_array()
+            .expect("binding metadata should include provider coverage");
+        let mcp_metadata = metadata_coverage
+            .iter()
+            .find(|provider| provider["provider_type"].as_str() == Some("request_scoped_mcp"))
+            .expect("binding metadata should include request-scoped MCP provider coverage");
+        assert_eq!(mcp_metadata["status"].as_str(), Some("ready"));
+        assert_eq!(
+            mcp_metadata["capabilities"][0].as_str(),
+            Some("mcp__calculator")
         );
     }
 
@@ -1633,6 +1903,59 @@ mod tests {
             .await;
         assert!(!result.is_error, "{result:?}");
         assert!(result.output.contains("reflect ready"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn server_only_reflect_report_includes_runtime_provider_coverage() {
+        let dir = TempDir::new().unwrap();
+        let exec = RuntimeToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        )
+        .with_reflect_service(Arc::new(ReadyReflectService));
+
+        let names = schema_name_set(exec.tool_schemas());
+        assert!(names.contains("reflect"));
+        assert!(
+            !names.contains("bash"),
+            "server-only reflect must not imply workspace/process executor tools: {names:?}"
+        );
+
+        let result = exec
+            .execute_with_metadata("reflect", &json!({"topic": "execution"}))
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        let report: Value =
+            serde_json::from_str(&result.output).expect("reflect should return JSON report");
+        let providers = report["data_coverage"]["providers"]
+            .as_object()
+            .expect("reflect report should include data coverage providers");
+
+        for (provider, status) in [
+            ("runtime_provider:server_service", "ready"),
+            ("runtime_provider:control_plane", "ready"),
+            ("runtime_provider:sandbox", "unbound"),
+            ("runtime_provider:request_scoped_mcp", "unbound"),
+        ] {
+            assert_eq!(
+                providers
+                    .get(provider)
+                    .and_then(|coverage| coverage["status"].as_str()),
+                Some(status),
+                "reflect report must expose {provider}={status}: {}",
+                result.output
+            );
+        }
+        assert_eq!(
+            providers["runtime_provider:sandbox"]["reason"].as_str(),
+            Some("no_workspace_provider_bound"),
+            "reflect should make the missing workspace executor explicit: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -1905,7 +2228,7 @@ mod tests {
         exec.set_execution_bindings(
             WorkspaceBinding {
                 kind: WorkspaceBindingKind::None,
-                display_name: "No workspace".to_string(),
+                display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
                 fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
@@ -1956,6 +2279,79 @@ mod tests {
                 .as_ref()
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
             "ToolEngine introspect results should still receive execution metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_only_introspect_json_preserves_provider_coverage_graph() {
+        let dir = TempDir::new().unwrap();
+        let exec = RuntimeToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        let provider_coverage = exec.capacity_provider_coverage();
+        exec.update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
+            capacity_provider_coverage: provider_coverage,
+            turns_completed: 1,
+            turns_remaining: 0,
+            turn_budget_unlimited: true,
+            ..Default::default()
+        });
+
+        let result = exec
+            .execute_with_metadata("introspect", &json!({"format": "json"}))
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        let report: Value =
+            serde_json::from_str(&result.output).expect("introspect should return JSON report");
+        let observations = report["observations"]
+            .as_array()
+            .expect("json report should include observations");
+
+        for expected in [
+            "server_service:ready",
+            "control_plane:ready",
+            "sandbox:unbound (workspace executor not bound)",
+            "request_scoped_mcp:unbound",
+        ] {
+            assert!(
+                observations.iter().any(|observation| {
+                    observation["kind"] == "capacity_provider"
+                        && observation["summary"]
+                            .as_str()
+                            .is_some_and(|summary| summary.contains(expected))
+                }),
+                "server-only introspect observations must expose provider coverage `{expected}`: {}",
+                result.output
+            );
+        }
+
+        let graph_nodes = report["graph_slice"]["nodes"]
+            .as_array()
+            .expect("json report should include graph nodes");
+        assert!(
+            graph_nodes.iter().any(|node| {
+                node["label"] == "capacity_provider"
+                    && node["summary"]
+                        .as_str()
+                        .is_some_and(|summary| summary.contains("server_service:ready"))
+            }),
+            "provider coverage must be reachable in the introspect evidence graph: {}",
+            result.output
+        );
+        assert!(
+            graph_nodes.iter().any(|node| {
+                node["label"] == "observed_evidence"
+                    && node["summary"]
+                        .as_str()
+                        .is_some_and(|summary| summary.contains("turns=1/∞"))
+            }),
+            "runtime snapshot evidence should stay linked in the graph: {}",
+            result.output
         );
     }
 
@@ -2359,7 +2755,7 @@ mod tests {
         let (exec, _dir) = test_executor();
         assert!(
             exec.supports_server_tool_name("session"),
-            "session must be accepted by ServerToolExecutor"
+            "session must be accepted by RuntimeToolExecutor"
         );
 
         let session_schema = crate::capabilities::server_runtime_tool_schemas(
@@ -2457,9 +2853,9 @@ esac
         std::fs::set_permissions(&script, perms).unwrap();
     }
 
-    fn test_executor() -> (ServerToolExecutor, TempDir) {
+    fn test_executor() -> (RuntimeToolExecutor, TempDir) {
         let dir = TempDir::new().unwrap();
-        let mut exec = ServerToolExecutor::new(
+        let mut exec = RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             "test-session".into(),
@@ -2473,13 +2869,13 @@ esac
         (exec, dir)
     }
 
-    fn test_executor_with_agent_context() -> (ServerToolExecutor, TempDir) {
+    fn test_executor_with_agent_context() -> (RuntimeToolExecutor, TempDir) {
         let (mut exec, dir) = test_executor();
         exec.set_agent_tool_context(test_agent_tool_context(dir.path()));
         (exec, dir)
     }
 
-    fn test_executor_with_agent_context_and_reflect_service() -> (ServerToolExecutor, TempDir) {
+    fn test_executor_with_agent_context_and_reflect_service() -> (RuntimeToolExecutor, TempDir) {
         let (exec, dir) = test_executor_with_agent_context();
         (
             exec.with_reflect_service(Arc::new(ReadyReflectService)),
@@ -3561,7 +3957,7 @@ esac
 
         assert!(result.is_error, "{result:?}");
         assert!(
-            result.output.contains("fallback is disabled"),
+            result.output.contains("No alternate execution provider"),
             "{}",
             result.output
         );
@@ -3737,7 +4133,7 @@ esac
         assert!(
             blocked["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("Server fallback is disabled")),
+                .is_some_and(|message| message.contains("No alternate execution provider")),
             "{blocked:?}"
         );
     }
@@ -4059,7 +4455,7 @@ esac
     fn session_state_test_executor(
         turn_index: u32,
     ) -> (
-        ServerToolExecutor,
+        RuntimeToolExecutor,
         TempDir,
         String,
         std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>,
@@ -4071,7 +4467,7 @@ esac
         workspace.cwd = dir.path().display().to_string();
         astra_services::session_workspace::write_workspace(&workspace).unwrap();
 
-        let mut exec = ServerToolExecutor::new(
+        let mut exec = RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             session_id.clone(),
@@ -4089,15 +4485,15 @@ esac
 
     #[test]
     fn session_state_tools_publish_workspace_artifacts() {
-        let source = include_str!("server_tool_executor.rs");
+        let source = include_str!("runtime_tool_executor.rs");
         assert!(
             source.contains("publish_current_workspace(\"adjust_config\")"),
             "adjust_config should publish remote workspace artifacts"
         );
-        let handlers = include_str!("server_tool_executor/tool_handlers.rs");
+        let handlers = include_str!("runtime_tool_executor/tool_handlers.rs");
         assert!(
             handlers.contains(
-                "publish_current_workspace(\"server_tool_executor:rollback_session_state\")"
+                "publish_current_workspace(\"runtime_tool_executor:rollback_session_state\")"
             ),
             "rollback_session_state should publish remote workspace artifacts after local restore"
         );
@@ -4337,7 +4733,7 @@ esac
     #[tokio::test]
     async fn default_tool_search_does_not_resolve_workspace_runtime_tools() {
         let dir = TempDir::new().unwrap();
-        let exec = ServerToolExecutor::new(
+        let exec = RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             "test-session".into(),
@@ -4439,9 +4835,9 @@ esac
     }
 
     #[tokio::test]
-    async fn server_tool_search_resolves_plugin_after_install() {
+    async fn server_tool_search_hides_request_scoped_mcp_without_runtime_binding() {
         let (exec, _dir) = test_executor();
-        let plugin = json!({
+        let schema = json!({
             "type": "function",
             "function": {
                 "name": "mcp__calculator",
@@ -4453,7 +4849,42 @@ esac
                 }
             }
         });
-        exec.set_plugin_schemas(vec![plugin]);
+        exec.set_request_scoped_mcp_schemas(vec![schema]);
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "MCP schema must not resolve before a request-scoped MCP provider owns it; got: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("mcp__calculator"));
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_resolves_request_scoped_mcp_with_runtime_binding() {
+        let (mut exec, _dir) = test_executor();
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_request_scoped_mcp_schemas(vec![schema]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
 
         let result = exec
             .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
@@ -4461,7 +4892,7 @@ esac
         let parsed: Value = serde_json::from_str(&result.output).unwrap();
         assert!(
             parsed["missing"].as_array().unwrap().is_empty(),
-            "plugin must resolve after set_plugin_schemas on server path; got: {}",
+            "MCP schema must resolve when a request-scoped MCP provider owns it; got: {}",
             result.output
         );
         assert_eq!(
@@ -5357,6 +5788,18 @@ esac
             )
             .is_some()
         );
+        let mismatch = server_sandbox_local_path_mismatch(
+            "cd ~/github/astra && git status",
+            workspace_root,
+            &workspace,
+        )
+        .expect("path mismatch");
+        assert!(
+            mismatch.contains("current workspace provider"),
+            "{mismatch}"
+        );
+        assert!(!mismatch.contains("connected edge workspace"), "{mismatch}");
+        assert!(!mismatch.contains("Server sandbox"), "{mismatch}");
     }
 
     #[test]
@@ -5488,8 +5931,12 @@ esac
             )
             .await;
         assert!(result.is_error, "{result:?}");
-        assert!(result.output.contains("Server sandbox"), "{result:?}");
-        assert!(result.output.contains("edge workspace"), "{result:?}");
+        assert!(
+            result.output.contains("current workspace provider"),
+            "{result:?}"
+        );
+        assert!(!result.output.contains("Server sandbox"), "{result:?}");
+        assert!(!result.output.contains("edge workspace"), "{result:?}");
         let metadata = result.metadata.as_ref().expect("path mismatch metadata");
         assert_eq!(
             metadata["error_kind"],
@@ -5542,8 +5989,12 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
-        assert!(result.output.contains("Server sandbox"), "{result:?}");
-        assert!(result.output.contains("edge workspace"), "{result:?}");
+        assert!(
+            result.output.contains("current workspace provider"),
+            "{result:?}"
+        );
+        assert!(!result.output.contains("Server sandbox"), "{result:?}");
+        assert!(!result.output.contains("edge workspace"), "{result:?}");
         let metadata = result.metadata.as_ref().expect("path mismatch metadata");
         assert_eq!(
             metadata["error_kind"],
@@ -5578,7 +6029,11 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
-        assert!(result.output.contains("Server sandbox"), "{result:?}");
+        assert!(
+            result.output.contains("current workspace provider"),
+            "{result:?}"
+        );
+        assert!(!result.output.contains("Server sandbox"), "{result:?}");
         assert!(result.output.contains("/tmp/user-local-repo"), "{result:?}");
         let metadata = result.metadata.as_ref().expect("path mismatch metadata");
         assert_eq!(

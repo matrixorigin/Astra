@@ -26,7 +26,6 @@ use astra_runtime::{
         AgenticLoopState, CancellationState, ErrorRecoveryState, MessagingState, SkillState,
         StallTrackingState, StopHookState, TelemetryState, runtime_manifest_for_model,
     },
-    turn::agentic_turn_telemetry::step_recorder_chat_ephemeral_run_id,
     turn::chat_history_openai::openai_messages_from_repl_history,
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::edge_prompt_context::detect_project_languages,
@@ -154,6 +153,18 @@ fn root_permission_context_handle(
     perm_manager: &crate::cli::permission_manager::PermissionManager,
 ) -> RootPermissionContextHandle {
     perm_manager.runtime_permission_handle()
+}
+
+fn step_recorder_for_cli_turn(
+    user_id: &str,
+    session_id: Option<&str>,
+    run_id: &str,
+) -> StepRecorder {
+    if let Some(session_id) = session_id {
+        StepRecorder::with_persistence(user_id, session_id, run_id)
+    } else {
+        StepRecorder::new(user_id, "ephemeral", run_id)
+    }
 }
 
 async fn refresh_root_permission_context(
@@ -492,12 +503,11 @@ pub(crate) async fn stream_chat_sse(
     );
     let mcp_runtime_schemas = all_schemas.1.clone();
     let all_schemas = all_schemas.0;
+    executor.set_cli_local_provider_schemas(all_schemas.clone());
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
     // can resolve MCP tool schemas by name.
     if let Some(ref mgr) = p.mcp_manager {
         executor.install_mcp_bundle(mgr.clone(), mcp_runtime_schemas);
-    } else {
-        executor.set_plugin_schemas(mcp_runtime_schemas);
     }
     deferred_activation_state::restore_into_executor(&p.activated_deferred_tool_names, &executor);
     let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
@@ -597,19 +607,11 @@ pub(crate) async fn stream_chat_sse(
         cfg.runtime_limits.resolve_turn_ceiling(p.is_plan_subtask)
     };
     let current_user_id = cli_user_id();
-    let step_recorder = if let Some(session_id) = current_session_id.as_deref() {
-        StepRecorder::with_persistence(
-            &current_user_id,
-            session_id,
-            step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),
-        )
-    } else {
-        StepRecorder::new(
-            &current_user_id,
-            "ephemeral",
-            step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),
-        )
-    };
+    let step_recorder = step_recorder_for_cli_turn(
+        &current_user_id,
+        current_session_id.as_deref(),
+        &parent_turn_run_id,
+    );
     let mut local_discovered_skills = HashSet::new();
     let discovered_skills = match p.discovered_skills.as_deref_mut() {
         Some(shared) => std::mem::take(shared),
@@ -944,7 +946,7 @@ pub(crate) async fn stream_chat_sse(
         step_signal_collector: None,
         tool_budget_override: None,
         recent_tactical_actions: Vec::new(),
-        server_tool_executor: None,
+        runtime_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
         memory_extraction_service: p.session_memory_extractor.clone(),
@@ -1282,6 +1284,7 @@ mod tests {
         missing_model_selection_journal_event, missing_model_selection_turn_failure,
         normalize_turn_model, refresh_root_permission_context, require_selected_turn_model,
         restored_compaction_effectiveness, root_permission_context_handle,
+        step_recorder_for_cli_turn,
     };
     use crate::cli::permission_manager::{PermissionManager, PermissionMode};
     use astra_runtime::turn::permission_gate::{PermissionCheckResult, check_tool_permission};
@@ -1613,6 +1616,28 @@ mod tests {
         assert_eq!(
             normalize_turn_model(Some("MiniMax-M2.7")),
             Some("MiniMax-M2.7")
+        );
+    }
+
+    #[test]
+    fn cli_step_recorder_uses_runtime_run_id_as_trace_identity() {
+        let recorder =
+            step_recorder_for_cli_turn("user-1", Some("session-1"), "run-parent-visible");
+        let summary = recorder.summary();
+        assert_eq!(summary.session_id, "session-1");
+        assert_eq!(summary.task_id, "run-parent-visible");
+        assert!(
+            !summary.task_id.starts_with("chat-"),
+            "StepRecorder identity must not diverge from AgenticLoopState.current_run_id"
+        );
+
+        let ephemeral = step_recorder_for_cli_turn("user-1", None, "run-parent-ephemeral");
+        let summary = ephemeral.summary();
+        assert_eq!(summary.session_id, "ephemeral");
+        assert_eq!(summary.task_id, "run-parent-ephemeral");
+        assert!(
+            !summary.task_id.starts_with("chat-"),
+            "ephemeral CLI sessions still use the runtime run id for trace identity"
         );
     }
 

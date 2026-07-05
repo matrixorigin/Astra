@@ -872,9 +872,9 @@ mod tests {
                         "waiting_for": "task_board_intervention",
                         "user_message": "Task-board work remains open.",
                         "task_board": {
-                            "summary": "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
-                            "in_progress_count": 1,
-                            "active_tasks": ["task-2 Investigate [in_progress]"]
+                            "summary": "1 paused task(s) remain: task-2 Investigate [paused]",
+                            "paused_count": 1,
+                            "active_tasks": ["task-2 Investigate [paused]"]
                         }
                     },
                     "index": 10
@@ -900,9 +900,9 @@ mod tests {
                 "user_message": "Task-board work remains open.",
                 "message": "Task-board work remains open.",
                 "task_board": {
-                    "summary": "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
-                    "in_progress_count": 1,
-                    "active_tasks": ["task-2 Investigate [in_progress]"]
+                    "summary": "1 paused task(s) remain: task-2 Investigate [paused]",
+                    "paused_count": 1,
+                    "active_tasks": ["task-2 Investigate [paused]"]
                 },
                 "index": 10
             })
@@ -1008,7 +1008,7 @@ mod tests {
                 json!({
                     "event_type": "run_blocked", "reason": "fallback_disabled",
                     "data": {
-                        "message": "Server fallback is disabled.",
+                        "message": "No alternate execution provider is available.",
                         "reason": "fallback_disabled"
                     },
                     "index": 4
@@ -1035,7 +1035,7 @@ mod tests {
             json!({
                 "type": "run_blocked", "reason": "fallback_disabled",
                 "run_id": "run-123",
-                "message": "Server fallback is disabled.",
+                "message": "No alternate execution provider is available.",
                 "reason": "fallback_disabled",
                 "index": 4
             })

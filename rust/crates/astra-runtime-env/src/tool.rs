@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{EffectiveCapabilitySet, NetworkCapability};
+use crate::{
+    CapacityProvider, CapacityProviderDeclaration, EffectiveCapabilitySet, NetworkCapability,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -351,14 +353,31 @@ pub enum ToolUnavailableReason {
 pub struct CapabilityResolver;
 
 impl CapabilityResolver {
-    pub fn available_tool_surface(
+    pub fn available_tool_surface_for_providers(
         &self,
         registry: &ToolRegistry,
         capabilities: &EffectiveCapabilitySet,
+        providers: &[CapacityProviderDeclaration],
+    ) -> AvailableToolSurface {
+        self.available_tool_surface_impl(registry, capabilities, |tool_name| {
+            providers
+                .iter()
+                .any(|provider| provider.declares_tool(tool_name))
+        })
+    }
+
+    fn available_tool_surface_impl(
+        &self,
+        registry: &ToolRegistry,
+        capabilities: &EffectiveCapabilitySet,
+        mut provider_declares: impl FnMut(&str) -> bool,
     ) -> AvailableToolSurface {
         let mut tool_names = Vec::new();
         let mut denials = Vec::new();
         for spec in registry.iter() {
+            if !provider_declares(&spec.name) {
+                continue;
+            }
             match self.check(spec, capabilities) {
                 Ok(()) => tool_names.push(spec.name.clone()),
                 Err(reason) => denials.push(ToolDenial {
@@ -376,11 +395,26 @@ impl CapabilityResolver {
         }
     }
 
-    pub fn filter_tool_schemas(
+    pub fn filter_tool_schemas_for_providers(
         &self,
         registry: &ToolRegistry,
         schemas: Vec<Value>,
         capabilities: &EffectiveCapabilitySet,
+        providers: &[CapacityProviderDeclaration],
+    ) -> Vec<Value> {
+        self.filter_tool_schemas_impl(registry, schemas, capabilities, |tool_name| {
+            providers
+                .iter()
+                .any(|provider| provider.declares_tool(tool_name))
+        })
+    }
+
+    fn filter_tool_schemas_impl(
+        &self,
+        registry: &ToolRegistry,
+        schemas: Vec<Value>,
+        capabilities: &EffectiveCapabilitySet,
+        mut provider_declares: impl FnMut(&str) -> bool,
     ) -> Vec<Value> {
         let mut seen = HashSet::new();
         schemas
@@ -390,6 +424,9 @@ impl CapabilityResolver {
                     return false;
                 };
                 if !seen.insert(tool_name.to_string()) {
+                    return false;
+                }
+                if !provider_declares(tool_name) {
                     return false;
                 }
                 let dynamic_spec = dynamic_tool_spec(tool_name);
@@ -449,10 +486,12 @@ impl CapabilityResolver {
     ) -> Result<(), ToolUnavailableReason> {
         match spec.required.executor {
             RequiredExecutor::None => {}
-            RequiredExecutor::ControlPlane | RequiredExecutor::ServiceExecutor
-                if !(capabilities.executor.control_plane
-                    || capabilities.executor.runtime_executor) =>
-            {
+            RequiredExecutor::ControlPlane if !capabilities.executor.control_plane => {
+                return Err(ToolUnavailableReason::ExecutorUnavailable(
+                    "control_plane_required".to_string(),
+                ));
+            }
+            RequiredExecutor::ServiceExecutor if !capabilities.executor.server_service => {
                 return Err(ToolUnavailableReason::ExecutorUnavailable(
                     "service_executor_required".to_string(),
                 ));
@@ -775,6 +814,21 @@ mod tests {
         ToolRegistry::builtins()
     }
 
+    fn local_cli_providers(registry: &ToolRegistry) -> Vec<crate::CapacityProviderDeclaration> {
+        vec![
+            crate::server_service_provider("server", registry),
+            crate::control_plane_provider("control", registry),
+            crate::cli_local_provider("cli", registry),
+        ]
+    }
+
+    fn server_providers(registry: &ToolRegistry) -> Vec<crate::CapacityProviderDeclaration> {
+        vec![
+            crate::server_service_provider("server", registry),
+            crate::control_plane_provider("control", registry),
+        ]
+    }
+
     #[test]
     fn builtin_tool_specs_have_unique_names_before_hashmap_projection() {
         let mut seen = std::collections::BTreeSet::new();
@@ -842,6 +896,39 @@ mod tests {
     }
 
     #[test]
+    fn runtime_executor_binding_does_not_imply_server_owned_capacity() {
+        let registry = registry();
+        let binding = RunBinding::edge_developer("/repo", &registry);
+
+        assert!(
+            !binding.capabilities.executor.control_plane,
+            "edge workspace execution capacity must not declare control-plane ownership"
+        );
+        assert!(binding.capabilities.executor.runtime_executor);
+        assert!(
+            !binding.capabilities.executor.server_service,
+            "edge workspace execution capacity must not declare server-service ownership"
+        );
+
+        assert!(binding.tool_surface.contains("read_file"));
+        assert!(!binding.tool_surface.contains("ask_user"));
+        assert!(!binding.tool_surface.contains("tool_search"));
+        assert!(!binding.tool_surface.contains("memory"));
+        assert_eq!(
+            CapabilityResolver.check_tool(&registry, "ask_user", &binding.capabilities),
+            Err(ToolUnavailableReason::ExecutorUnavailable(
+                "control_plane_required".to_string()
+            ))
+        );
+        assert_eq!(
+            CapabilityResolver.check_tool(&registry, "tool_search", &binding.capabilities),
+            Err(ToolUnavailableReason::ExecutorUnavailable(
+                "service_executor_required".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn policy_allowed_tools_restricts_visible_tool_surface() {
         let registry = registry();
         let binding = RunBinding::resolve(
@@ -854,7 +941,7 @@ mod tests {
 
         assert!(binding.tool_surface.contains("read_file"));
         assert!(binding.tool_surface.contains("git"));
-        for tool in ["bash", "write_file", "ask_user"] {
+        for tool in ["bash", "write_file"] {
             assert!(
                 !binding.tool_surface.contains(tool),
                 "{tool} must be hidden by allowed_tools"
@@ -866,6 +953,8 @@ mod tests {
                 ))
             );
         }
+        assert!(!binding.tool_surface.contains("ask_user"));
+        assert_eq!(binding.tool_surface.denial_for("ask_user"), None);
     }
 
     #[test]
@@ -1136,9 +1225,8 @@ mod tests {
         assert!(!binding.tool_surface.contains("bash"));
         assert_eq!(
             binding.tool_surface.denial_for("read_file"),
-            Some(&ToolUnavailableReason::WorkspaceUnavailable(
-                "readable_workspace_required".to_string()
-            ))
+            None,
+            "unknown workspace ownership must make workspace tools invisible, not visible with a wall"
         );
     }
 
@@ -1194,9 +1282,8 @@ mod tests {
         assert!(!binding.tool_surface.contains("read_file"));
         assert_eq!(
             binding.tool_surface.denial_for("read_file"),
-            Some(&ToolUnavailableReason::ExecutorUnavailable(
-                "runtime_executor_required".to_string()
-            ))
+            None,
+            "missing executor transport must make workspace tools invisible, not visible with a wall"
         );
     }
 
@@ -1342,7 +1429,12 @@ mod tests {
         ];
 
         let names: Vec<String> = CapabilityResolver
-            .filter_tool_schemas(&registry, schemas, &binding.capabilities)
+            .filter_tool_schemas_for_providers(
+                &registry,
+                schemas,
+                &binding.capabilities,
+                &local_cli_providers(&registry),
+            )
             .into_iter()
             .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
             .collect();
@@ -1369,7 +1461,12 @@ mod tests {
         ];
 
         let names: Vec<String> = CapabilityResolver
-            .filter_tool_schemas(&registry, schemas, &binding.capabilities)
+            .filter_tool_schemas_for_providers(
+                &registry,
+                schemas,
+                &binding.capabilities,
+                &local_cli_providers(&registry),
+            )
             .into_iter()
             .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
             .collect();
@@ -1388,7 +1485,12 @@ mod tests {
         ];
 
         let names: Vec<String> = CapabilityResolver
-            .filter_tool_schemas(&registry, schemas, &binding.capabilities)
+            .filter_tool_schemas_for_providers(
+                &registry,
+                schemas,
+                &binding.capabilities,
+                &server_providers(&registry),
+            )
             .into_iter()
             .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
             .collect();
@@ -1396,6 +1498,113 @@ mod tests {
         assert!(names.iter().any(|name| name == "tool_search"));
         assert!(!names.iter().any(|name| name == "bash"));
         assert!(!names.iter().any(|name| name == "read_file"));
+    }
+
+    #[test]
+    fn provider_aware_schema_filter_requires_provider_declaration() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let schemas = vec![
+            serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
+        ];
+        let server_only = vec![
+            crate::server_service_provider("server", &registry),
+            crate::control_plane_provider("control", &registry),
+        ];
+
+        let names: Vec<String> = CapabilityResolver
+            .filter_tool_schemas_for_providers(
+                &registry,
+                schemas.clone(),
+                &binding.capabilities,
+                &server_only,
+            )
+            .into_iter()
+            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+            .collect();
+
+        assert!(names.iter().any(|name| name == "tool_search"));
+        assert!(!names.iter().any(|name| name == "bash"));
+        assert!(!names.iter().any(|name| name == "read_file"));
+
+        let with_cli = vec![
+            crate::server_service_provider("server", &registry),
+            crate::control_plane_provider("control", &registry),
+            crate::cli_local_provider("cli", &registry),
+        ];
+        let names: Vec<String> = CapabilityResolver
+            .filter_tool_schemas_for_providers(&registry, schemas, &binding.capabilities, &with_cli)
+            .into_iter()
+            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+            .collect();
+
+        assert!(names.iter().any(|name| name == "tool_search"));
+        assert!(names.iter().any(|name| name == "bash"));
+        assert!(names.iter().any(|name| name == "read_file"));
+    }
+
+    #[test]
+    fn provider_aware_tool_surface_requires_provider_declaration() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let server_only = vec![
+            crate::server_service_provider("server", &registry),
+            crate::control_plane_provider("control", &registry),
+        ];
+
+        let surface = CapabilityResolver.available_tool_surface_for_providers(
+            &registry,
+            &binding.capabilities,
+            &server_only,
+        );
+
+        assert!(surface.contains("tool_search"));
+        assert!(surface.contains("ask_user"));
+        assert!(!surface.contains("bash"));
+        assert!(!surface.contains("read_file"));
+        assert_eq!(surface.denial_for("bash"), None);
+        assert_eq!(surface.denial_for("read_file"), None);
+    }
+
+    #[test]
+    fn request_scoped_mcp_schema_filter_requires_exact_provider_binding() {
+        let registry = registry();
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::none(),
+            ExecutorBinding {
+                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                executor_id: "mcp".to_string(),
+                display_name: "MCP".to_string(),
+                transport: crate::ToolTransportKind::McpHttp,
+                status: crate::ExecutorStatus::Online,
+            },
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+        );
+        let schemas = vec![
+            serde_json::json!({"type": "function", "function": {"name": "mcp__weather"}}),
+            serde_json::json!({"type": "function", "function": {"name": "mcp__calculator"}}),
+        ];
+        let providers = vec![crate::request_scoped_mcp_provider(
+            "mcp",
+            ["mcp__weather".to_string()],
+        )];
+
+        let names: Vec<String> = CapabilityResolver
+            .filter_tool_schemas_for_providers(
+                &registry,
+                schemas,
+                &binding.capabilities,
+                &providers,
+            )
+            .into_iter()
+            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+            .collect();
+
+        assert_eq!(names, vec!["mcp__weather".to_string()]);
     }
 
     #[test]
@@ -1461,7 +1670,12 @@ mod tests {
         ];
 
         let names: Vec<String> = CapabilityResolver
-            .filter_tool_schemas(&registry, schemas, &binding.capabilities)
+            .filter_tool_schemas_for_providers(
+                &registry,
+                schemas,
+                &binding.capabilities,
+                &local_cli_providers(&registry),
+            )
             .into_iter()
             .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
             .collect();
@@ -1477,7 +1691,12 @@ mod tests {
         let schemas = vec![serde_json::json!({"function": {"name": "read_file"}})];
 
         let names: Vec<String> = CapabilityResolver
-            .filter_tool_schemas(&registry, schemas, &binding.capabilities)
+            .filter_tool_schemas_for_providers(
+                &registry,
+                schemas,
+                &binding.capabilities,
+                &local_cli_providers(&registry),
+            )
             .into_iter()
             .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
             .collect();

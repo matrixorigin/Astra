@@ -263,6 +263,7 @@ dependencies = [
 name = "astra-edge"
 version = "0.1.0"
 dependencies = [
+ "astra-credentials",
  "astra-logging",
  "astra-runtime-env",
  "astra-server-types",
@@ -671,6 +672,7 @@ dependencies = [
  "astra-messaging",
  "astra-pipeline",
  "astra-prompts",
+ "astra-runtime-env",
  "astra-sandbox",
  "astra-services",
  "astra-text-utils",

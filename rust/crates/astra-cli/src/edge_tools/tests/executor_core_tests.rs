@@ -1,5 +1,5 @@
 use super::{fanout_test_context, test_executor, test_spawner};
-use crate::edge_tools::{ToolExecutor, all_tool_schemas, truncate_output};
+use crate::edge_tools::{ToolExecutor, local_tool_schemas, truncate_output};
 use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
 use chrono::Utc;
@@ -12,15 +12,19 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[test]
 fn executor_tool_count_matches_schemas() {
     let executor = test_executor();
-    assert_eq!(executor.tool_count(), all_tool_schemas().len());
+    let expected = executor.runtime_bound_tool_schemas(local_tool_schemas());
+    assert_eq!(executor.tool_count(), expected.len());
 }
 
 #[test]
 fn executor_tool_names_match_schemas() {
     let executor = test_executor();
     let names = executor.tool_names();
-    assert_eq!(names.len(), all_tool_schemas().len());
+    let expected = executor.runtime_bound_tool_schemas(local_tool_schemas());
+    assert_eq!(names.len(), expected.len());
     assert!(names.contains(&"bash".to_string()));
+    assert!(!names.contains(&"delete_file".to_string()));
+    assert!(!names.contains(&"multi_edit".to_string()));
 }
 
 #[tokio::test]
@@ -935,7 +939,7 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
 // files via `write_file` while the active plan was still in `planning`
 // phase (rejected v2/v3, never approved). The server tool executor
 // already short-circuits mutation tools while a plan is being authored
-// (`server_tool_executor::is_plan_mode_blocked_tool` +
+// (`runtime_tool_executor::is_plan_mode_blocked_tool` +
 // `plan_mode_authoring_active`), but the CLI's local `ToolExecutor`
 // did NOT. These tests pin the parity contract.
 

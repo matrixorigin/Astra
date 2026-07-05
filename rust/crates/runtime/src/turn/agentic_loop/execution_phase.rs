@@ -4800,8 +4800,8 @@ mod tests {
     /// per turn so a model that ignores the corrective doesn't churn the
     /// global round budget. After the gate fires once, the next text-only
     /// completion should fall through to terminal rendering, where
-    /// `ensure_terminal_text` records structured task-board state without
-    /// rewriting assistant text (covered by the finalization tests).
+    /// terminal settlement leaves the task-board state observable without
+    /// turning a valid assistant answer into a paused run.
     #[tokio::test]
     async fn unfinished_task_board_gate_is_one_shot_per_turn() {
         let mut host = StubbornTextOnlyHost::new(vec![
@@ -4841,8 +4841,8 @@ mod tests {
             "task-board control state must not be rewritten into assistant prose"
         );
         assert!(
-            state.interruption.is_some(),
-            "unfinished active task-board work should still record structured interruption state"
+            state.interruption.is_none(),
+            "in-progress task-board bookkeeping must not pause a run that produced an answer"
         );
         let unfinished_notices = host
             .emitted_lines

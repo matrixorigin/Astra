@@ -747,7 +747,7 @@ pub(crate) fn assemble_bridge_context(
                     "provider": input.session.provider,
                     "resolved": true,
                 },
-                "runtime_profile": "bridge_inprocess",
+                "runtime_profile": astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
             })),
         },
     }
@@ -1406,6 +1406,11 @@ mod context_cache_contract_tests {
             output.manifest_trace.to_json()["model_context_window_tokens"],
             json!(1_000_000),
             "bridge context assembly must preserve the resolved model context_window"
+        );
+        assert_eq!(
+            output.manifest_trace.to_json()["runtime_manifest"]["runtime_profile"],
+            astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
+            "the /chat/turn adapter must surface CLI local capacity, not an implementation class name"
         );
     }
 

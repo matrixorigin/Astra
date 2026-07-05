@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json;
 
 use super::traits::{CapabilityProvider, ProviderError, ToolRequest, ToolResult};
-use super::types::{ProviderKind, ToolCapability, ToolCategory};
+use super::types::{ProviderKind, ToolCapability};
 use crate::server::tool_edge_transport::execute_edge_bound;
 use crate::server::tool_execution_binding::{
     ExecutorBinding, ExecutorStatus, ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind,
@@ -95,14 +95,15 @@ impl CapabilityProvider for EdgeConnectionProvider {
     }
 
     async fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![
-            // ── Shell / process ──
-            ToolCapability::Category(ToolCategory::Shell),
-            // ── File system ──
-            ToolCapability::Category(ToolCategory::FileSystem),
-            // ── Version control ──
-            ToolCapability::Category(ToolCategory::VersionControl),
-        ]
+        astra_runtime_env::runtime_workspace_provider(
+            astra_runtime_env::CapacityProviderType::EdgeCapacity,
+            "edge-capacity",
+            &self.tool_registry,
+        )
+        .tool_names
+        .into_iter()
+        .map(ToolCapability::Named)
+        .collect()
     }
 
     async fn health_check(&self) -> Result<(), ProviderError> {
@@ -239,7 +240,10 @@ mod tests {
         let provider = EdgeConnectionProvider::new(5);
         let caps = provider.capabilities().await;
         assert!(!caps.is_empty());
-        assert!(caps.len() >= 3);
+        assert!(caps.contains(&ToolCapability::Named("bash".into())));
+        assert!(caps.contains(&ToolCapability::Named("read_file".into())));
+        assert!(caps.contains(&ToolCapability::Named("git".into())));
+        assert!(!caps.contains(&ToolCapability::Named("memory".into())));
     }
 
     #[test]

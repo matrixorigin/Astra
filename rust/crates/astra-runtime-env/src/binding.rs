@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AvailableToolSurface, CapabilityResolver, EffectiveCapabilitySet, PolicyIntent, ToolDenial,
-    ToolRegistry, ToolUnavailableReason,
+    AvailableToolSurface, CapabilityResolver, CapacityProviderDeclaration, CapacityProviderType,
+    EffectiveCapabilitySet, PolicyIntent, ToolDenial, ToolRegistry, ToolUnavailableReason,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,7 +39,7 @@ impl WorkspaceBinding {
     pub fn none() -> Self {
         Self {
             kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
+            display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
             persistent: false,
@@ -187,6 +187,27 @@ impl ExecutorBinding {
     /// process running on a developer's machine that connects via WebSocket.
     pub fn is_edge_agent(&self) -> bool {
         matches!(self.kind, ExecutorBindingKind::EdgeAgent)
+    }
+}
+
+pub fn runtime_execution_provider_type(
+    workspace_kind: WorkspaceBindingKind,
+    executor_kind: ExecutorBindingKind,
+) -> CapacityProviderType {
+    match (workspace_kind, executor_kind) {
+        (WorkspaceBindingKind::LocalFilesystem, ExecutorBindingKind::LocalCli) => {
+            CapacityProviderType::CliLocal
+        }
+        (WorkspaceBindingKind::EdgeWorkspace, ExecutorBindingKind::EdgeAgent) => {
+            CapacityProviderType::EdgeCapacity
+        }
+        (WorkspaceBindingKind::ServerSandbox, ExecutorBindingKind::ServerRuntime) => {
+            CapacityProviderType::Sandbox
+        }
+        (WorkspaceBindingKind::CloudWorkspace, ExecutorBindingKind::OrchestratorManaged) => {
+            CapacityProviderType::OrchestratorManagedRuntime
+        }
+        _ => CapacityProviderType::Unknown,
     }
 }
 
@@ -398,9 +419,28 @@ impl RunBinding {
         policy: PolicyIntent,
         registry: &ToolRegistry,
     ) -> Self {
+        let providers =
+            default_capacity_provider_declarations(&workspace, &executor, &runtime, registry);
+        Self::resolve_with_provider_declarations(
+            workspace, executor, runtime, policy, registry, &providers,
+        )
+    }
+
+    pub fn resolve_with_provider_declarations(
+        workspace: WorkspaceBinding,
+        executor: ExecutorBinding,
+        runtime: RuntimeBinding,
+        policy: PolicyIntent,
+        registry: &ToolRegistry,
+        providers: &[CapacityProviderDeclaration],
+    ) -> Self {
         let capabilities =
             EffectiveCapabilitySet::from_bindings(&workspace, &executor, &runtime, &policy);
-        let mut tool_surface = CapabilityResolver.available_tool_surface(registry, &capabilities);
+        let mut tool_surface = CapabilityResolver.available_tool_surface_for_providers(
+            registry,
+            &capabilities,
+            providers,
+        );
         apply_policy_tool_allowlist(&policy, &mut tool_surface);
         Self {
             workspace,
@@ -450,6 +490,81 @@ impl RunBinding {
             PolicyIntent::read_only_review(),
             registry,
         )
+    }
+}
+
+fn default_capacity_provider_declarations(
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: &RuntimeBinding,
+    registry: &ToolRegistry,
+) -> Vec<CapacityProviderDeclaration> {
+    let mut providers = Vec::new();
+
+    if matches!(
+        executor.kind,
+        ExecutorBindingKind::ControlPlane | ExecutorBindingKind::LocalCli
+    ) {
+        providers.push(crate::control_plane_provider("control-plane", registry));
+    }
+
+    if matches!(
+        executor.kind,
+        ExecutorBindingKind::ControlPlane
+            | ExecutorBindingKind::ServerRuntime
+            | ExecutorBindingKind::LocalCli
+    ) {
+        providers.push(crate::server_service_provider("server-service", registry));
+    }
+
+    if let Some(provider_type) = default_runtime_provider_type(workspace, executor, runtime) {
+        providers.push(crate::runtime_workspace_provider(
+            provider_type,
+            default_runtime_provider_id(provider_type, executor),
+            registry,
+        ));
+    }
+
+    providers
+}
+
+fn default_runtime_provider_type(
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    _runtime: &RuntimeBinding,
+) -> Option<CapacityProviderType> {
+    if matches!(
+        workspace.authority,
+        WorkspaceAuthority::None | WorkspaceAuthority::Unknown
+    ) {
+        return None;
+    }
+
+    match runtime_execution_provider_type(workspace.kind, executor.kind) {
+        CapacityProviderType::Unknown => None,
+        provider_type => Some(provider_type),
+    }
+}
+
+fn default_runtime_provider_id(
+    provider_type: CapacityProviderType,
+    executor: &ExecutorBinding,
+) -> String {
+    match provider_type {
+        CapacityProviderType::CliLocal => executor.executor_id.clone(),
+        CapacityProviderType::EdgeCapacity => executor.executor_id.clone(),
+        CapacityProviderType::OrchestratorManagedRuntime => executor.executor_id.clone(),
+        CapacityProviderType::Sandbox => {
+            if executor.executor_id.is_empty() {
+                "server-sandbox".to_string()
+            } else {
+                executor.executor_id.clone()
+            }
+        }
+        CapacityProviderType::ServerService
+        | CapacityProviderType::ControlPlane
+        | CapacityProviderType::RequestScopedMcp
+        | CapacityProviderType::Unknown => executor.executor_id.clone(),
     }
 }
 
@@ -601,5 +716,66 @@ mod tests {
         let kind = WorkspaceBindingKind::LocalFilesystem;
         let json = serde_json::to_string(&kind).unwrap();
         assert_eq!(json, "\"local_filesystem\"");
+    }
+
+    #[test]
+    fn runtime_execution_provider_type_requires_matching_workspace_executor_pair() {
+        assert_eq!(
+            runtime_execution_provider_type(
+                WorkspaceBindingKind::LocalFilesystem,
+                ExecutorBindingKind::LocalCli
+            ),
+            CapacityProviderType::CliLocal
+        );
+        assert_eq!(
+            runtime_execution_provider_type(
+                WorkspaceBindingKind::EdgeWorkspace,
+                ExecutorBindingKind::EdgeAgent
+            ),
+            CapacityProviderType::EdgeCapacity
+        );
+        assert_eq!(
+            runtime_execution_provider_type(
+                WorkspaceBindingKind::ServerSandbox,
+                ExecutorBindingKind::ServerRuntime
+            ),
+            CapacityProviderType::Sandbox
+        );
+        assert_eq!(
+            runtime_execution_provider_type(
+                WorkspaceBindingKind::CloudWorkspace,
+                ExecutorBindingKind::OrchestratorManaged
+            ),
+            CapacityProviderType::OrchestratorManagedRuntime
+        );
+
+        for (workspace_kind, executor_kind) in [
+            (
+                WorkspaceBindingKind::EdgeWorkspace,
+                ExecutorBindingKind::ServerRuntime,
+            ),
+            (
+                WorkspaceBindingKind::ServerSandbox,
+                ExecutorBindingKind::EdgeAgent,
+            ),
+            (
+                WorkspaceBindingKind::CloudWorkspace,
+                ExecutorBindingKind::LocalCli,
+            ),
+            (
+                WorkspaceBindingKind::LocalFilesystem,
+                ExecutorBindingKind::OrchestratorManaged,
+            ),
+            (
+                WorkspaceBindingKind::None,
+                ExecutorBindingKind::ServerRuntime,
+            ),
+        ] {
+            assert_eq!(
+                runtime_execution_provider_type(workspace_kind, executor_kind),
+                CapacityProviderType::Unknown,
+                "{workspace_kind:?} + {executor_kind:?} must not infer runtime provider ownership"
+            );
+        }
     }
 }

@@ -16,6 +16,7 @@ astra-pipeline.workspace = true
 astra-sandbox.workspace = true
 astra-services.workspace = true
 astra-prompts.workspace = true
+astra-runtime-env.workspace = true
 astra-text-utils.workspace = true
 astra-thin-client.workspace = true
 astra-tools = { path = "../astra-tools" }

@@ -308,7 +308,7 @@ describe("chat stream route proxy cancellation", () => {
       "chat-1",
       undefined,
     );
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
       "user-a",
       "chat-1",
       "assistant-1",
@@ -376,7 +376,7 @@ describe("chat stream route proxy cancellation", () => {
         waitingFor: "executor_offline",
       }),
     );
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
       "user-a",
       "chat-1",
       "assistant-1",
@@ -661,6 +661,35 @@ describe("chat stream route proxy cancellation", () => {
     await reader?.cancel();
   });
 
+  it("rejects invalid file environment selections before starting a run", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "review the current branch",
+          workspace: { kind: "unknown_environment" },
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "workspace must be a valid file environment selection",
+      code: "invalid_workspace_selection",
+    });
+    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
+    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
+  });
+
   it("streams local-code prompts when server sandbox is explicitly selected", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
@@ -825,14 +854,14 @@ describe("chat stream route proxy cancellation", () => {
     const second = await reader!.read();
     const secondText = new TextDecoder().decode(second.value);
     expect(secondText).toContain('"type":"error"');
-    expect(secondText).toContain("Server fallback is disabled");
+    expect(secondText).toContain("No alternate execution provider");
     expect(runtime.fetchResponse).not.toHaveBeenCalled();
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
       "assistant-1",
       expect.objectContaining({
-        content: expect.stringContaining("Server fallback is disabled"),
+        content: expect.stringContaining("No alternate execution provider"),
         status: "failed",
       }),
     );

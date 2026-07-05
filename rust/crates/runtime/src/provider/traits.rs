@@ -114,7 +114,7 @@ pub enum ProviderError {
 /// Runtime that can execute server-service/control-plane tools (memory, task,
 /// session, web_search, web_fetch, github, introspect, reflect, agent).
 ///
-/// ServerToolExecutor implements this so ServerBuiltinProvider can
+/// RuntimeToolExecutor implements this so ServerBuiltinProvider can
 /// delegate builtin tool calls without knowing the full executor structure.
 #[async_trait]
 pub trait ServerToolRuntime: Send + Sync {

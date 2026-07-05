@@ -10,20 +10,21 @@
 /// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm::client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`call_llm_stream`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm::client::wait_until_cancelled_or_pending) in the bridge stream |
 /// | Tool permission queue + single resolve | CLI: `astra-cli` `permission_manager`; cloud: edge approval ledger / `POST /tools/result`. "resolve once" matches ledger single-shot semantics |
 ///
-/// # Legacy Status
+/// # Adapter Status
 ///
-/// This module implements the **old-style cloud tool loop** (its own `for round_ix..`
-/// loop inside `stream!`). It does NOT use [`run_agentic_loop_with_host`], so semantic
-/// dedup and full step recording are still absent here. Legacy `/chat/turn` and
-/// `/chat/stream` now thinly reuse the shared TurnGuard / post-tool-policy shell so
-/// they no longer bypass runtime stall and tool-restriction controls entirely.
+/// This module is the remaining HTTP `/chat/turn` single-turn transport adapter.
+/// It still has its own `for round_ix..` loop inside `stream!` and does NOT use
+/// [`run_agentic_loop_with_host`], so semantic dedup and full step recording are
+/// still absent here. It must not present itself as a separate agent runtime:
+/// public runtime metadata is expressed as CLI local capacity, while
+/// implementation-specific provenance such as `BRIDGE_CACHE_SOURCE` stays
+/// internal for prompt-cache continuity and journal diagnostics.
 ///
 /// **Preferred replacement**: Use [`super::loop_dispatcher::LoopDispatcher`] with
 /// [`ServerAgenticLoopHost`](crate::server::server_loop_host::ServerAgenticLoopHost)
 /// which runs the full unified cognitive loop including all runtime policies.
 ///
-/// This bridge remains wired for backward compatibility with existing `/chat/turn`
-/// and `/chat/stream` HTTP endpoints. New features should target the unified loop.
+/// New features should target the unified loop.
 ///
 /// # Architecture (legacy)
 ///
@@ -168,7 +169,7 @@ fn rewrite_bridge_runtime_manifest_model_resolution(
         "resolved": true,
         "fallback": fallback_trace,
     });
-    manifest["runtime_profile"] = json!("bridge_inprocess");
+    manifest["runtime_profile"] = json!(astra_runtime_env::CapacityProviderType::CliLocal.as_str());
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -5013,6 +5014,11 @@ mod tests {
         assert_eq!(
             manifest["model_resolution"]["fallback"]["from_model"],
             "deepseek-v4-pro-official"
+        );
+        assert_eq!(
+            manifest["runtime_profile"],
+            astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
+            "public runtime metadata should identify the CLI local capacity provider, not the in-process bridge adapter"
         );
     }
 

@@ -1,4 +1,6 @@
 import {
+  WORKSPACE_EXECUTION_BLOCKED_MESSAGE,
+  WORKSPACE_EXECUTION_WAITING_MESSAGE,
   blockedRunMessage,
   projectRunWaitingState,
   runWaitingStatusMessage,
@@ -10,12 +12,13 @@ describe("run status messages", () => {
       "Run paused because the execution environment is offline. Reconnect it or choose another environment.",
     );
     expect(runWaitingStatusMessage("fallback_disabled", true)).toBe(
-      "Run paused because this request needs a file or command environment. Connect one or choose a sandbox, then retry.",
+      WORKSPACE_EXECUTION_WAITING_MESSAGE,
     );
     expect(
       runWaitingStatusMessage("workspace_executor_unavailable", true),
-    ).toBe(
-      "Run paused because this request needs a file or command environment. Connect one or choose a sandbox, then retry.",
+    ).toBe(WORKSPACE_EXECUTION_WAITING_MESSAGE);
+    expect(WORKSPACE_EXECUTION_WAITING_MESSAGE).not.toContain(
+      "edge workspace",
     );
   });
 
@@ -54,7 +57,10 @@ describe("run status messages", () => {
       "The referenced path is outside the selected file environment. Choose the environment that contains it or use a path inside the current one.",
     );
     expect(blockedRunMessage("workspace_executor_unavailable")).toBe(
-      "This request needs a file or command environment. Connect one or choose a sandbox, then retry.",
+      WORKSPACE_EXECUTION_BLOCKED_MESSAGE,
+    );
+    expect(WORKSPACE_EXECUTION_BLOCKED_MESSAGE).not.toContain(
+      "edge workspace",
     );
   });
 });

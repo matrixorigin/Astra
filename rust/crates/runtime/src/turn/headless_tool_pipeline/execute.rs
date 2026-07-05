@@ -23,14 +23,14 @@ const EDGE_PROTOCOL_ERROR_PREFIX: &str = "Error: headless edge protocol";
 /// No &mut pipeline needed — only shared refs.
 pub(crate) async fn execute_tool_pure(
     execution: &mut super::HeadlessResolvedExecution,
-    server_tool_executor: Option<&crate::server::server_tool_executor::ServerToolExecutor>,
+    runtime_tool_executor: Option<&crate::server::runtime_tool_executor::RuntimeToolExecutor>,
     api: &ThinClient,
     token: &str,
     current_session_id: Option<&String>,
     session_turn: u32,
 ) {
     if !execution.is_edge_tool && execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
-        if let Some(executor) = server_tool_executor {
+        if let Some(executor) = runtime_tool_executor {
             executor.set_turn_index(session_turn.max(1));
             let mut server_args = execution.args.clone();
             if let Some(obj) = server_args.as_object_mut() {
@@ -128,7 +128,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let tool_start = Instant::now();
         execute_tool_pure(
             &mut execution,
-            self.ctx.server_tool_executor,
+            self.ctx.runtime_tool_executor,
             self.ctx.api,
             self.ctx.token,
             self.ctx.current_session_id,

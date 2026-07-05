@@ -60,6 +60,11 @@ pub struct IntrospectSnapshot {
     /// began.
     #[serde(default)]
     pub lifecycle_summary: String,
+    /// Capacity-provider coverage for this runtime surface. This is separate
+    /// from data coverage: it describes which execution/provider classes are
+    /// ready, unbound, degraded, or unavailable for tool visibility.
+    #[serde(default)]
+    pub capacity_provider_coverage: Vec<CapacityProviderCoverageEntry>,
     /// Provider-reported input token total for this snapshot. This includes
     /// fresh input tokens, cached-read input tokens, and cache-creation tokens.
     pub total_input_tokens: u64,
@@ -238,6 +243,8 @@ pub struct CircuitBreakerSnapshot {
     pub consecutive_failures: u64,
 }
 
+pub use astra_runtime_env::CapacityProviderCoverageEntry;
+
 /// Text output depth chosen from the normalized observation-plane request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntrospectTextDepth {
@@ -330,6 +337,10 @@ fn render_hint(s: &IntrospectSnapshot) -> String {
         out.push_str(" model=");
         out.push_str(model);
     }
+    if !s.capacity_provider_coverage.is_empty() {
+        out.push_str(" providers=");
+        out.push_str(&capacity_provider_inline_summary(s));
+    }
     out
 }
 
@@ -379,6 +390,11 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
             ));
         }
     }
+    if !s.capacity_provider_coverage.is_empty() {
+        out.push_str("Capacity providers: ");
+        out.push_str(&capacity_provider_inline_summary(s));
+        out.push('\n');
+    }
     if !s.alerts.is_empty() {
         out.push_str("Alerts:\n");
         for alert in s.alerts.iter().take(3) {
@@ -399,6 +415,42 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
         out.push('\n');
     }
     out.trim_end().to_string()
+}
+
+fn capacity_provider_inline_summary(s: &IntrospectSnapshot) -> String {
+    capacity_provider_coverage_summary(&s.capacity_provider_coverage)
+}
+
+pub fn capacity_provider_coverage_summary(coverage: &[CapacityProviderCoverageEntry]) -> String {
+    coverage
+        .iter()
+        .map(capacity_provider_coverage_entry_summary)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn capacity_provider_coverage_entry_summary(
+    provider: &CapacityProviderCoverageEntry,
+) -> String {
+    let mut label = format!("{}:{}", provider.provider_type, provider.status);
+    if let Some(reason) = provider.unavailable_reason.as_deref() {
+        label.push_str(" (");
+        label.push_str(capacity_provider_unavailable_text(reason));
+        label.push(')');
+    }
+    label
+}
+
+fn capacity_provider_unavailable_text(reason: &str) -> &str {
+    match reason {
+        "no_workspace_provider_bound" => "workspace executor not bound",
+        "no_executor_provider_bound" => "executor provider not bound",
+        "executor_offline" => "executor offline",
+        "executor_status_unknown" => "executor status unknown",
+        "no_request_scoped_mcp_provider_bound" => "request-scoped MCP provider not bound",
+        "no_request_scoped_mcp_runtime_binding" => "request-scoped MCP runtime not bound",
+        _ => "provider unavailable",
+    }
 }
 
 pub fn turn_budget_label(s: &IntrospectSnapshot) -> String {
@@ -873,6 +925,7 @@ mod tests {
             lifecycle_summary:
                 "### Turn-start session execution state\nresume pending: [plan-resume] goal=\"Fix auth\""
                     .into(),
+            capacity_provider_coverage: Vec::new(),
             total_input_tokens: 145_000,
             total_output_tokens: 12_000,
             cache_read_tokens: 95_000,
@@ -1240,6 +1293,36 @@ mod tests {
             summary.contains("Snapshot age: 2 turn(s)"),
             "summary should surface staleness: {summary}"
         );
+    }
+
+    #[test]
+    fn runtime_snapshot_renders_capacity_provider_coverage() {
+        let snap = IntrospectSnapshot {
+            capacity_provider_coverage: vec![
+                CapacityProviderCoverageEntry::ready(
+                    astra_runtime_env::CapacityProviderType::ServerService,
+                    "server-builtin",
+                    vec!["web_fetch".into()],
+                ),
+                CapacityProviderCoverageEntry::unavailable(
+                    astra_runtime_env::CapacityProviderType::Sandbox,
+                    "workspace-executor",
+                    astra_runtime_env::CapacityProviderStatus::Unbound,
+                    "no_workspace_provider_bound",
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let hint = render_introspect(&snap, IntrospectTextDepth::Hint);
+        assert!(hint.contains("providers=server_service:ready"));
+        assert!(hint.contains("sandbox:unbound (workspace executor not bound)"));
+        assert!(!hint.contains("no_workspace_provider_bound"));
+
+        let summary = render_introspect(&snap, IntrospectTextDepth::Summary);
+        assert!(summary.contains("Capacity providers: server_service:ready"));
+        assert!(summary.contains("sandbox:unbound (workspace executor not bound)"));
+        assert!(!summary.contains("no_workspace_provider_bound"));
     }
 
     #[test]

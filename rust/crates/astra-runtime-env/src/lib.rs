@@ -14,6 +14,7 @@
 mod binding;
 mod capability;
 mod policy;
+mod provider;
 mod runtime_environment;
 
 mod tool;
@@ -22,6 +23,7 @@ mod workspace;
 pub use binding::*;
 pub use capability::*;
 pub use policy::*;
+pub use provider::*;
 pub use runtime_environment::*;
 pub use tool::*;
 pub use workspace::*;

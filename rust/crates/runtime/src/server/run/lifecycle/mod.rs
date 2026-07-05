@@ -95,6 +95,7 @@ use astra_turn_core::contracts::{
     TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
     TurnSkillSelectionRecord, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
 };
+use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
 use astra_core::{
@@ -126,7 +127,7 @@ use crate::server::tool_transport::{
     ToolExecutionService, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
     WorkspaceBindingKind, binding_event_fields,
 };
-use crate::server::{server_skill_subrun, server_tool_executor};
+use crate::server::{runtime_tool_executor, server_skill_subrun};
 
 const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
 const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
@@ -137,6 +138,24 @@ const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 #[cfg(test)]
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
+
+fn is_non_blocking_task_board_settlement(
+    interruption: &astra_turn_core::interruption::InterruptionRecord,
+    task_board_snapshot: &crate::turn::agentic_loop::host::TaskBoardSnapshot,
+    loop_state: &AgenticLoopState,
+    waiting_for: Option<&str>,
+) -> bool {
+    matches!(interruption.kind, InterruptionKind::EmptyCompletion)
+        && matches!(
+            interruption.resume_action,
+            ResumeAction::ContinueImmediately
+        )
+        && matches!(interruption.resume_mode, ResumeMode::Settle)
+        && waiting_for.is_none()
+        && loop_state.final_text.trim().is_empty()
+        && task_board_snapshot.has_unfinished_tasks()
+        && !task_board_snapshot.requires_settlement_intervention()
+}
 
 /// Lazily load deployment-disabled tools from server config.
 /// Reads `[deployment].disabled_tools` from TOML + `ASTRA_DISABLED_TOOLS` env override.
@@ -152,23 +171,23 @@ fn load_deployment_disabled_tools() -> Vec<String> {
         .clone()
 }
 
-/// Wire a freshly-constructed [`server_tool_executor::ServerToolExecutor`]
+/// Wire a freshly-constructed [`runtime_tool_executor::RuntimeToolExecutor`]
 /// into the agentic loop state: Arc-wrap it, attach the task-board monitor,
 /// and set the tool-executor handle.  This small helper deduplicates the
 /// same three-line pattern repeated at every executor construction site.
 fn wire_executor_into_state(
-    executor: server_tool_executor::ServerToolExecutor,
+    executor: runtime_tool_executor::RuntimeToolExecutor,
     state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
 ) {
     let executor = std::sync::Arc::new(executor);
     state.hooks.task_board_monitor = Some(executor.task_manager());
-    state.server_tool_executor = Some(executor);
+    state.runtime_tool_executor = Some(executor);
 }
 
 fn wire_reflect_service_into_executor(
-    executor: server_tool_executor::ServerToolExecutor,
+    executor: runtime_tool_executor::RuntimeToolExecutor,
     service: &Arc<dyn astra_services::ReflectService>,
-) -> server_tool_executor::ServerToolExecutor {
+) -> runtime_tool_executor::RuntimeToolExecutor {
     executor.with_reflect_service(Arc::clone(service))
 }
 
@@ -1714,7 +1733,7 @@ impl AgenticRunLifecycleService {
     #[allow(clippy::too_many_arguments)]
     async fn wire_server_dynamic_agent_tools(
         &self,
-        executor: &mut server_tool_executor::ServerToolExecutor,
+        executor: &mut runtime_tool_executor::RuntimeToolExecutor,
         user_id: &str,
         session_id: &str,
         run_id: &str,
@@ -2317,9 +2336,10 @@ impl AgenticRunLifecycleService {
                 Ok(AgenticLoopOutcome::Completed) => {
                     if let Some(interruption) = loop_state.interruption.as_ref() {
                         let task_board_snapshot = loop_state.hooks.task_board_snapshot.clone();
-                        let task_board_unfinished =
-                            task_board_snapshot.has_completion_blocking_tasks();
-                        let waiting_for = if task_board_unfinished {
+                        let task_board_open = task_board_snapshot.has_unfinished_tasks();
+                        let task_board_requires_intervention =
+                            task_board_snapshot.requires_settlement_intervention();
+                        let waiting_for = if task_board_requires_intervention {
                             Some("task_board_intervention".to_string())
                         } else if matches!(
                             interruption.resume_action,
@@ -2330,6 +2350,38 @@ impl AgenticRunLifecycleService {
                         } else {
                             None
                         };
+                        let task_board_payload = task_board_open.then(|| {
+                            json!({
+                                "summary": task_board_snapshot.short_summary(),
+                                "tracked_count": task_board_snapshot.tracked_count,
+                                "pending_count": task_board_snapshot.pending_count,
+                                "in_progress_count": task_board_snapshot.in_progress_count,
+                                "paused_count": task_board_snapshot.paused_count,
+                                "blocked_count": task_board_snapshot.blocked_count,
+                                "terminal_non_success_count": task_board_snapshot.terminal_non_success_count,
+                                "active_tasks": task_board_snapshot.active_tasks,
+                            })
+                        });
+                        if is_non_blocking_task_board_settlement(
+                            interruption,
+                            &task_board_snapshot,
+                            loop_state,
+                            waiting_for.as_deref(),
+                        ) {
+                            let mut finished = usage;
+                            finished["settled_interruption_kind"] =
+                                Value::String(interruption.kind.label().to_string());
+                            finished["resume_mode"] =
+                                Value::String(interruption.resume_mode.label().to_string());
+                            if let Some(task_board) = task_board_payload {
+                                finished["task_board"] = task_board;
+                            }
+                            events.push(json!({
+                                "event_type": "run_finished",
+                                "data": finished,
+                            }));
+                            return (events, RunStatus::Completed, None);
+                        }
                         let mut interruption_json = interruption.to_json();
                         if let Some(obj) = interruption_json.as_object_mut() {
                             if let Some(waiting_for) = waiting_for.as_ref() {
@@ -2338,20 +2390,8 @@ impl AgenticRunLifecycleService {
                                     Value::String(waiting_for.clone()),
                                 );
                             }
-                            if task_board_unfinished {
-                                obj.insert(
-                                    "task_board".to_string(),
-                                    json!({
-                                        "summary": task_board_snapshot.short_summary(),
-                                        "tracked_count": task_board_snapshot.tracked_count,
-                                        "pending_count": task_board_snapshot.pending_count,
-                                        "in_progress_count": task_board_snapshot.in_progress_count,
-                                        "paused_count": task_board_snapshot.paused_count,
-                                        "blocked_count": task_board_snapshot.blocked_count,
-                                        "terminal_non_success_count": task_board_snapshot.terminal_non_success_count,
-                                        "active_tasks": task_board_snapshot.active_tasks,
-                                    }),
-                                );
+                            if let Some(task_board) = task_board_payload {
+                                obj.insert("task_board".to_string(), task_board);
                             }
                         }
                         if !loop_state.final_text.is_empty() {
@@ -3613,7 +3653,7 @@ impl AgenticRunLifecycleService {
             step_signal_collector: None,
             tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
-            server_tool_executor: None,
+            runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
@@ -4760,19 +4800,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .as_ref()
             .map(|record| PathBuf::from(&record.root_or_volume_ref));
 
-        let server_workspace = if cloud_workspace_record.is_none()
-            && request_uses_server_workspace(&request, !edge_tools.is_empty())
-        {
-            match self.provision_server_workspace(&session_id) {
-                Ok(workspace) => Some(workspace),
-                Err(error) => {
-                    self.runs.write().await.remove(&run_id);
-                    return Err(error);
+        let server_workspace =
+            if cloud_workspace_record.is_none() && request_uses_server_workspace(&request) {
+                match self.provision_server_workspace(&session_id) {
+                    Ok(workspace) => Some(workspace),
+                    Err(error) => {
+                        self.runs.write().await.remove(&run_id);
+                        return Err(error);
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let execution_bindings = cloud_execution_bindings
             .or_else(|| {
                 server_workspace.as_deref().map(|workspace| {
@@ -4782,14 +4821,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 })
             })
             .or_else(|| {
-                resolve_request_execution_bindings_without_server_workspace(
-                    &request,
-                    &edge_profile,
-                    !edge_tools.is_empty(),
-                )
-                .map(|(workspace, executor)| {
-                    ExecutionBindingSnapshot::inferred(workspace, executor)
-                })
+                resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
+                    .map(|(workspace, executor)| {
+                        ExecutionBindingSnapshot::inferred(workspace, executor)
+                    })
             });
         let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
         let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
@@ -4952,7 +4987,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &session_id,
         )
         .await;
-        // The ServerToolExecutor is the owner for server-side runtime tools
+        // The RuntimeToolExecutor is the owner for server-side runtime tools
         // such as `agent`. For edge-bound runs this workspace is only an
         // internal runtime scratch dir; execution routing still follows the
         // explicit workspace/executor binding and cannot silently fall back.
@@ -4981,7 +5016,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error));
                 }
             };
-            let mut executor = server_tool_executor::ServerToolExecutor::new(
+            let mut executor = runtime_tool_executor::RuntimeToolExecutor::new(
                 workspace.clone(),
                 user_id.clone(),
                 session_id.clone(),
@@ -5035,7 +5070,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if let Some(agent_binding_mcp) = &bundle.agent_binding_mcp {
                     executor.set_agent_binding_mcp(agent_binding_mcp.clone());
                 }
-                executor.set_plugin_schemas(bundle.schemas.clone());
+                executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
             }
             // Wire the plan repository so enter/exit_plan_mode tools work and
             // the write-tool guard can check `active_plan_id`.
@@ -5066,12 +5101,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
             let agent_working_dir =
                 agent_working_dir_for_bindings(execution_bindings.as_ref(), workspace.as_path());
-            host.set_execution_metadata(Value::Object(binding_event_fields(
-                &binding_snapshot.workspace,
-                &binding_snapshot.executor,
-            )));
             executor.set_execution_binding_snapshot(binding_snapshot);
             executor.set_workspace_record(cloud_workspace_record.clone());
+            host.set_execution_metadata(executor.binding_metadata());
 
             self.wire_server_dynamic_agent_tools(
                 &mut executor,
@@ -5603,13 +5635,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .as_ref()
             .map(|record| PathBuf::from(&record.root_or_volume_ref));
 
-        let server_workspace = if cloud_workspace_record.is_none()
-            && request_uses_server_workspace(&request, !edge_tools.is_empty())
-        {
-            Some(self.provision_server_workspace(&session_id)?)
-        } else {
-            None
-        };
+        let server_workspace =
+            if cloud_workspace_record.is_none() && request_uses_server_workspace(&request) {
+                Some(self.provision_server_workspace(&session_id)?)
+            } else {
+                None
+            };
         let execution_bindings = cloud_execution_bindings
             .or_else(|| {
                 server_workspace.as_deref().map(|workspace| {
@@ -5619,14 +5650,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 })
             })
             .or_else(|| {
-                resolve_request_execution_bindings_without_server_workspace(
-                    &request,
-                    &edge_profile,
-                    !edge_tools.is_empty(),
-                )
-                .map(|(workspace, executor)| {
-                    ExecutionBindingSnapshot::inferred(workspace, executor)
-                })
+                resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
+                    .map(|(workspace, executor)| {
+                        ExecutionBindingSnapshot::inferred(workspace, executor)
+                    })
             });
         let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
         let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
@@ -5916,7 +5943,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error));
                 }
             };
-            let mut executor = server_tool_executor::ServerToolExecutor::new(
+            let mut executor = runtime_tool_executor::RuntimeToolExecutor::new(
                 workspace.clone(),
                 user_id.clone(),
                 session_id.clone(),
@@ -5963,7 +5990,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 executor = executor.with_tool_execution_service(builder.build());
             }
 
-            // ── MCP: inject manager + plugin schemas into executor ────
+            // ── MCP: inject request-scoped provider state into executor ────
             if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
                 if let Some(manager) = &bundle.manager {
                     executor.set_mcp_manager(manager.clone());
@@ -5971,7 +5998,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if let Some(agent_binding_mcp) = &bundle.agent_binding_mcp {
                     executor.set_agent_binding_mcp(agent_binding_mcp.clone());
                 }
-                executor.set_plugin_schemas(bundle.schemas.clone());
+                executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
             }
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());
@@ -5996,12 +6023,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
             let agent_working_dir =
                 agent_working_dir_for_bindings(execution_bindings.as_ref(), workspace.as_path());
-            host.set_execution_metadata(Value::Object(binding_event_fields(
-                &binding_snapshot.workspace,
-                &binding_snapshot.executor,
-            )));
             executor.set_execution_binding_snapshot(binding_snapshot);
             executor.set_workspace_record(cloud_workspace_record.clone());
+            host.set_execution_metadata(executor.binding_metadata());
             executor.set_work_surface_event_tx(event_tx.clone());
             self.wire_server_dynamic_agent_tools(
                 &mut executor,
@@ -7361,7 +7385,9 @@ fn server_subrun_live_termination(
     loop_state: &AgenticLoopState,
 ) -> AgentLiveTermination {
     match outcome {
-        Ok(AgenticLoopOutcome::Completed) if loop_state.interruption.is_some() => {
+        Ok(AgenticLoopOutcome::Completed)
+            if server_subrun_completed_status(loop_state) == STATUS_PAUSED =>
+        {
             AgentLiveTermination::Cancelled
         }
         Ok(AgenticLoopOutcome::Completed) => AgentLiveTermination::Completed,
@@ -7377,7 +7403,9 @@ fn server_subrun_live_reason(
     loop_state: &AgenticLoopState,
 ) -> Option<String> {
     match outcome {
-        Ok(AgenticLoopOutcome::Completed) if loop_state.interruption.is_some() => {
+        Ok(AgenticLoopOutcome::Completed)
+            if server_subrun_completed_status(loop_state) == STATUS_PAUSED =>
+        {
             Some("paused".to_string())
         }
         Ok(AgenticLoopOutcome::Completed) => None,
@@ -7385,6 +7413,34 @@ fn server_subrun_live_reason(
         Ok(AgenticLoopOutcome::Waiting(reason)) => Some(reason.clone()),
         Ok(AgenticLoopOutcome::Error(error)) => Some(error.clone()),
         Err(error) => Some(error.to_string()),
+    }
+}
+
+fn server_subrun_completed_status(loop_state: &AgenticLoopState) -> &'static str {
+    let Some(interruption) = loop_state.interruption.as_ref() else {
+        return STATUS_COMPLETED;
+    };
+    let task_board_snapshot = &loop_state.hooks.task_board_snapshot;
+    let waiting_for = if task_board_snapshot.requires_settlement_intervention() {
+        Some("task_board_intervention")
+    } else if matches!(
+        interruption.resume_action,
+        astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
+            | astra_turn_core::interruption::ResumeAction::StartNewSession
+    ) {
+        Some("user_intervention")
+    } else {
+        None
+    };
+    if is_non_blocking_task_board_settlement(
+        interruption,
+        task_board_snapshot,
+        loop_state,
+        waiting_for,
+    ) {
+        STATUS_COMPLETED
+    } else {
+        STATUS_PAUSED
     }
 }
 
@@ -7661,16 +7717,27 @@ fn resolve_subrun_agentic_turn_budget(
     task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
     explicit_max_turns: Option<u32>,
 ) -> astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
+    let runtime_ceiling = astra_core::RuntimeLimits::global().max_turns;
+    let base = astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+        task_profile,
+        runtime_ceiling,
+        None,
+    );
+    let Some(explicit_max_turns) = explicit_max_turns.map(|turns| turns as usize) else {
+        return base;
+    };
+    if explicit_max_turns <= base.hard_turn_limit {
+        return base;
+    }
     astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
         task_profile,
-        astra_core::RuntimeLimits::global().max_turns,
-        explicit_max_turns.map(|max_turns| {
-            let max_turns = max_turns as usize;
+        runtime_ceiling,
+        Some(
             astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
-                initial_turns: Some(max_turns),
-                hard_turn_limit: Some(max_turns),
-            }
-        }),
+                initial_turns: Some(explicit_max_turns),
+                hard_turn_limit: Some(explicit_max_turns),
+            },
+        ),
     )
 }
 
@@ -7928,7 +7995,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             step_signal_collector: None,
             tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
-            server_tool_executor: None,
+            runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
@@ -7964,7 +8031,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             loop_state.session_turn = u32::try_from(trace_context.turn_seq).unwrap_or(0);
         }
 
-        // ── Wire ServerToolExecutor for sub-run tool execution ──────────
+        // ── Wire RuntimeToolExecutor for sub-run tool execution ──────────
         // Without this, the headless pipeline fallback cannot execute tools
         // server-side and sub-agents would get edge-protocol errors.
         {
@@ -7973,7 +8040,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
                 config.user_id.clone(),
             )?;
-            let mut executor = server_tool_executor::ServerToolExecutor::new(
+            let mut executor = runtime_tool_executor::RuntimeToolExecutor::new(
                 subrun_workspace,
                 config.user_id.clone(),
                 config.session_id.clone(),
@@ -8115,11 +8182,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let prompt_tokens = loop_state.provider_input_tokens();
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => {
-                let status = if loop_state.interruption.is_some() {
-                    STATUS_PAUSED
-                } else {
-                    STATUS_COMPLETED
-                };
+                let status = server_subrun_completed_status(&loop_state);
                 Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,

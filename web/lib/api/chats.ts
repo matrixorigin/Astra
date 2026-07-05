@@ -78,7 +78,7 @@ export function updateChatModel(chatId: string, model: string) {
 
 export function updateChatWorkspaceSelection(
   chatId: string,
-  workspaceSelection: WorkspaceSelection,
+  workspaceSelection: WorkspaceSelection | null,
 ) {
   return requestJson<ChatDetail>(`/api/chats/${encodeURIComponent(chatId)}`, {
     method: "PATCH",

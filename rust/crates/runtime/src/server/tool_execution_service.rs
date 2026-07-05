@@ -488,7 +488,7 @@ fn append_route_binding_metadata(
 fn no_workspace() -> WorkspaceBinding {
     WorkspaceBinding {
         kind: WorkspaceBindingKind::None,
-        display_name: "No workspace".to_string(),
+        display_name: "No file environment".to_string(),
         cwd: None,
         authority: WorkspaceAuthority::None,
         fallback_policy: FallbackPolicy::Disabled,

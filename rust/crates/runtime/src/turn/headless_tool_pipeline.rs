@@ -241,7 +241,8 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub effective_permission_timeout: Duration,
     /// Optional server-side tool executor for web agent sessions (no CLI edge agent).
     /// When present, tools that have no edge match are executed directly by the server.
-    pub server_tool_executor: Option<&'a crate::server::server_tool_executor::ServerToolExecutor>,
+    pub runtime_tool_executor:
+        Option<&'a crate::server::runtime_tool_executor::RuntimeToolExecutor>,
     // ── Observability (Phase 1) ──
     /// Turn start instant for computing start_offset_ms on tool records.
     pub turn_start: Option<std::time::Instant>,
@@ -447,7 +448,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             .map(|p| (p.execution, p.idem_key))
             .collect();
 
-        let server_executor = self.ctx.server_tool_executor;
+        let server_executor = self.ctx.runtime_tool_executor;
         let api = self.ctx.api;
         let token = self.ctx.token;
         let session_id = self.ctx.current_session_id;
@@ -603,8 +604,8 @@ mod tests {
     fn server_executor_for_test_workspace(
         workspace: &std::path::Path,
         session_id: &str,
-    ) -> crate::server::server_tool_executor::ServerToolExecutor {
-        let mut executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+    ) -> crate::server::runtime_tool_executor::RuntimeToolExecutor {
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
             workspace.to_path_buf(),
             "test-user".into(),
             session_id.to_string(),
@@ -686,15 +687,15 @@ mod tests {
         fn pipeline_with_server_executor<'a>(
             &'a mut self,
             turn_index: usize,
-            server_tool_executor: Option<
-                &'a crate::server::server_tool_executor::ServerToolExecutor,
+            runtime_tool_executor: Option<
+                &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
             >,
         ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
             let session_turn = turn_index.saturating_add(1).min(u32::MAX as usize) as u32;
             self.pipeline_with_server_executor_for_session_turn(
                 turn_index,
                 session_turn.max(1),
-                server_tool_executor,
+                runtime_tool_executor,
             )
         }
 
@@ -702,8 +703,8 @@ mod tests {
             &'a mut self,
             turn_index: usize,
             session_turn: u32,
-            server_tool_executor: Option<
-                &'a crate::server::server_tool_executor::ServerToolExecutor,
+            runtime_tool_executor: Option<
+                &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
             >,
         ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
             HeadlessToolExecutionPipeline::new(
@@ -740,7 +741,7 @@ mod tests {
                     permission_context: self.permission_context.as_ref(),
                     progress_emitter: None,
                     effective_permission_timeout: Duration::from_secs(30),
-                    server_tool_executor,
+                    runtime_tool_executor,
                     turn_start: None,
                     llm_round: 0,
                     plan_mode_active: false,
@@ -1855,7 +1856,7 @@ mod tests {
             .execution
             .tool_result_fields
             .as_ref()
-            .expect("server fallback metadata");
+            .expect("alternate execution provider metadata");
         assert!(result_fields["commit_sha"].as_str().is_some());
         pipeline.record_execution(executed).await;
         assert!(
@@ -2589,7 +2590,7 @@ mod tests {
             _ => panic!("expected Continue"),
         };
 
-        // execute_execution: ServerToolExecutor doesn't know the tool,
+        // execute_execution: RuntimeToolExecutor doesn't know the tool,
         // returns an explicit not-available error.
         let executed = pipeline.execute_execution(permitted).await;
         assert!(
@@ -2604,12 +2605,12 @@ mod tests {
         let health = pipeline.ctx.turn_guard.health.get(missing_tool);
         assert!(
             health.is_some(),
-            "missing tool should be tracked after server fallback error"
+            "missing tool should be tracked after alternate execution provider error"
         );
         let h = health.unwrap();
         assert_eq!(
             h.total_failures, 1,
-            "server fallback error should count as failure"
+            "alternate execution provider error should count as failure"
         );
         assert_eq!(h.consecutive_failures, 1);
     }

@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 
 use super::tool_execution_result::tool_result_from_output;
-use crate::server::server_tool_executor::ServerToolExecutor;
+use crate::server::runtime_tool_executor::RuntimeToolExecutor;
 use crate::server::tool_session_state_rollback::{self, SessionStateRollbackAction};
 
 fn find_json_body_start(output: &str) -> Option<usize> {
@@ -412,7 +412,7 @@ fn task_tool_result(output: String, rollback: Option<TaskMutationRollback>) -> T
 /// [`execute_task_tool`] and records rollback handles plus task-board
 /// work-surface snapshots on the executor.
 pub(super) async fn execute_with_executor(
-    executor: &ServerToolExecutor,
+    executor: &RuntimeToolExecutor,
     args: &Value,
 ) -> astra_tools::ToolResult {
     let outcome = execute_task_tool(&executor.task_manager(), args).await;

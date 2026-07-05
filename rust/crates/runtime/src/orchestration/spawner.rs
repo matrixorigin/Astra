@@ -68,9 +68,10 @@ pub fn spawn_run_status_kind(status: &str) -> SpawnRunStatusKind {
 }
 
 pub fn spawn_completion_status_from_finish_reason(finish_reason: Option<&str>) -> &'static str {
-    match finish_reason {
-        None | Some("normal") => SPAWN_STATUS_COMPLETED,
-        Some(_) => SPAWN_STATUS_INTERRUPTED,
+    if agent_completion_is_interrupted(finish_reason) {
+        SPAWN_STATUS_INTERRUPTED
+    } else {
+        SPAWN_STATUS_COMPLETED
     }
 }
 
@@ -151,80 +152,12 @@ fn spawn_run_result_to_agent_status(run_result: &SpawnRunResult) -> AgentStatus 
     }
 }
 
-fn fanout_slot_status_from_agent_status(
-    status: &AgentStatus,
-) -> (AgentFanoutSlotStatus, Option<String>) {
-    match status {
-        AgentStatus::Completed {
-            result: _,
-            finish_reason,
-        } => {
-            let reason = finish_reason
-                .as_deref()
-                .map(str::trim)
-                .filter(|reason| !reason.is_empty())
-                .unwrap_or("normal");
-            if reason == "normal" {
-                (AgentFanoutSlotStatus::Completed, None)
-            } else {
-                (AgentFanoutSlotStatus::Failed, Some(reason.to_string()))
-            }
-        }
-        AgentStatus::Interrupted { finish_reason, .. } => {
-            let reason = finish_reason.trim();
-            if is_parent_budget_finish_reason(reason) {
-                (
-                    AgentFanoutSlotStatus::CancelledByParentBudget,
-                    Some(reason.to_string()),
-                )
-            } else {
-                (AgentFanoutSlotStatus::Interrupted, Some(reason.to_string()))
-            }
-        }
-        AgentStatus::Failed {
-            error,
-            finish_reason,
-        } => (
-            AgentFanoutSlotStatus::Failed,
-            finish_reason.clone().or_else(|| Some(error.clone())),
-        ),
-        AgentStatus::Cancelled { by_user, reason } => {
-            let reason = if reason.is_empty() {
-                None
-            } else {
-                Some(reason.clone())
-            };
-            if *by_user {
-                (AgentFanoutSlotStatus::CancelledByUser, reason)
-            } else {
-                (AgentFanoutSlotStatus::CancelledByParentBudget, reason)
-            }
-        }
-        AgentStatus::Waiting { .. } => (AgentFanoutSlotStatus::Running, None),
-        AgentStatus::Initializing | AgentStatus::Running { .. } | AgentStatus::Idle => {
-            (AgentFanoutSlotStatus::Running, None)
-        }
-    }
-}
-
 fn fanout_group_title(identity: &AgentFanoutSlotIdentity, title: Option<&str>) -> String {
     title
         .map(str::trim)
         .filter(|title| !title.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("{} fanout", identity.group_id))
-}
-
-fn is_parent_budget_finish_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "budget_exhausted"
-            | "turn_budget_exhausted"
-            | "token_budget_exceeded"
-            | "context_overflow"
-            | "max_turns_exceeded"
-            | "max_turns"
-    )
 }
 
 fn spawn_run_result_to_sync_output(
@@ -308,11 +241,7 @@ pub(crate) fn agent_status_to_progress_event(
                 .elapsed()
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let reason = finish_reason
-                .as_deref()
-                .map(str::trim)
-                .filter(|reason| !reason.is_empty())
-                .unwrap_or("normal");
+            let reason = agent_finish_reason_text(finish_reason.as_deref());
             if reason == "normal" {
                 Some(ProgressEventType::Completed {
                     result_summary: result.clone(),
@@ -408,7 +337,8 @@ pub struct SpawnContext {
 
 // Re-export from turn-core (canonical definitions live there).
 pub use astra_turn_core::orchestration_types::{
-    AgentStatus, SpawnedAgentInfo, SpawnedAgentMetrics,
+    AgentStatus, SpawnedAgentInfo, SpawnedAgentMetrics, agent_completion_is_interrupted,
+    agent_finish_reason_text, project_agent_status_to_fanout_slot,
 };
 
 /// Outcome of waiting on a child agent ID.
@@ -1233,7 +1163,9 @@ impl DynamicAgentSpawner {
         let Some(identity) = state.fanout_slot.as_ref() else {
             return;
         };
-        let (status, reason) = fanout_slot_status_from_agent_status(&state.status);
+        let projection = project_agent_status_to_fanout_slot(&state.status);
+        let status = projection.status;
+        let reason = projection.terminal_reason;
         let terminal_reason_label = reason.as_deref().unwrap_or("").to_string();
         let mut groups = self.fanout_groups.write().await;
         let Some(group) = groups.get_mut(&identity.group_id) else {
@@ -3646,21 +3578,30 @@ mod tests {
             partial_result: "partial review".to_string(),
             finish_reason: "budget_exhausted".to_string(),
         };
-        let (status, reason) = fanout_slot_status_from_agent_status(&budget_interrupted);
-        assert_eq!(status, AgentFanoutSlotStatus::CancelledByParentBudget);
-        assert_eq!(reason.as_deref(), Some("budget_exhausted"));
+        let projection = project_agent_status_to_fanout_slot(&budget_interrupted);
+        assert_eq!(
+            projection.status,
+            AgentFanoutSlotStatus::CancelledByParentBudget
+        );
+        assert_eq!(
+            projection.terminal_reason.as_deref(),
+            Some("budget_exhausted")
+        );
 
         let empty_completion = AgentStatus::Interrupted {
             partial_result: String::new(),
             finish_reason: "empty_completion".to_string(),
         };
-        let (status, reason) = fanout_slot_status_from_agent_status(&empty_completion);
+        let projection = project_agent_status_to_fanout_slot(&empty_completion);
         assert_eq!(
-            status,
+            projection.status,
             AgentFanoutSlotStatus::Interrupted,
             "non-budget interrupted child runs are first-class interrupted slots, not completed or failed"
         );
-        assert_eq!(reason.as_deref(), Some("empty_completion"));
+        assert_eq!(
+            projection.terminal_reason.as_deref(),
+            Some("empty_completion")
+        );
     }
 
     #[test]

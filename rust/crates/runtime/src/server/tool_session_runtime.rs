@@ -5,7 +5,7 @@ use astra_core::SharedPool;
 use astra_tools::ToolExecutor;
 use serde_json::Value;
 
-use crate::server::server_tool_executor::ServerToolExecutor;
+use crate::server::runtime_tool_executor::RuntimeToolExecutor;
 use crate::server::tool_execution_result::tool_result_from_output;
 use crate::server::tool_session_history;
 
@@ -73,7 +73,7 @@ fn missing_action_result() -> astra_tools::ToolResult {
 /// Server-side entry point for the `session` tool. Constructs the runtime
 /// context and executor-owned closures, then delegates to [`execute_session_tool`].
 pub(super) async fn execute_with_executor(
-    executor: &ServerToolExecutor,
+    executor: &RuntimeToolExecutor,
     args: &Value,
 ) -> astra_tools::ToolResult {
     execute_session_tool(

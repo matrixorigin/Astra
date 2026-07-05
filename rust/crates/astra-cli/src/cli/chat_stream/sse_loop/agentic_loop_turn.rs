@@ -722,13 +722,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let eligible_surface_schemas = ctx
         .executor
         .runtime_bound_tool_schemas(eligible_surface_schemas);
-    let eligible_external_schemas = ctx
+    let eligible_provider_schemas = ctx
         .executor
-        .runtime_bound_external_schemas_excluding(ctx.restricted_tools);
+        .runtime_bound_provider_owned_schemas_excluding(ctx.restricted_tools);
     let tool_surface = tool_registry::surface::ToolSurface::build_excluding_visible(
         eligible_surface_schemas,
         &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
-        &eligible_external_schemas,
+        &eligible_provider_schemas,
         &final_visible_tool_names,
     );
     let mut activatable_tool_names = HashSet::new();

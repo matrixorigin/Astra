@@ -1903,7 +1903,7 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     };
     // Session 8d9e5903 regression: every outbound request ends with a
     // role=user `<system-reminder>` wrapper produced by the volatile
-    // lane (wire_assembly / bridge_inprocess / server_loop_host). This
+    // lane (wire_assembly / chat-turn adapter / server_loop_host). This
     // is runtime scaffolding, not a user query, and must not break
     // round-cadence detection — otherwise the single-tool-streak
     // counter always returns 0 on live sessions and the
@@ -3116,7 +3116,7 @@ mod tests {
     /// despite 18 consecutive single-tool rounds in T11. The fix
     /// extends scaffolding detection to any user message whose content
     /// starts with `<system-reminder>`, which is a stable runtime
-    /// marker applied by every provider path (bridge_inprocess /
+    /// marker applied by every runtime path (chat-turn adapter /
     /// server_loop_host / wire_assembly).
     #[test]
     fn trailing_single_tool_streak_skips_system_reminder_wrapper() {

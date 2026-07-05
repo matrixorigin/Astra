@@ -8,7 +8,7 @@ use super::tool_transport_metadata::{
 };
 
 pub(crate) fn edge_unavailable_message(request: &ToolExecutionRequest) -> String {
-    let fallback = "Server fallback is disabled for this workspace.";
+    let fallback = "No alternate execution provider is available for this file environment.";
     format!(
         "Error: executor '{}' is offline or unreachable for tool '{}'. {}",
         request.executor.display_name, request.tool_name, fallback
@@ -20,7 +20,7 @@ fn capability_denied_message(
     reason: &astra_runtime_env::ToolUnavailableReason,
 ) -> String {
     format!(
-        "Error: tool '{}' is not available for this run binding: {}. Select a workspace, executor, runtime, or policy that provides the required capability; no fallback was attempted.",
+        "Error: tool '{}' is not available for this run binding: {}. Select a workspace, executor, runtime, or policy that provides the required capability; no alternate execution provider was attempted.",
         request.tool_name, reason
     )
 }
@@ -80,7 +80,7 @@ fn unsupported_workspace_executor_message(request: &ToolExecutionRequest) -> Str
         .and_then(|value| value.as_str().map(ToString::to_string))
         .unwrap_or_else(|| "unknown".to_string());
     format!(
-        "Error: workspace '{}' ({workspace_kind}) is not routed to an available executor transport for tool '{}'. Bound executor is '{}' ({executor_kind}). Select Server sandbox or a connected edge workspace, then retry. No server fallback was attempted.",
+        "Error: workspace '{}' ({workspace_kind}) is not routed to an available executor transport for tool '{}'. Bound executor is '{}' ({executor_kind}). Select a workspace provider with an available executor for this tool, then retry. No alternate execution provider was attempted.",
         request.workspace.display_name, request.tool_name, request.executor.display_name
     )
 }
@@ -132,7 +132,7 @@ pub(crate) fn transport_adapter_unavailable_result(
         Value::Array(vec![Value::String(diagnostic.to_string())]),
     );
     astra_tools::ToolResult {
-        output: format!("Error: {message}. No fallback was attempted."),
+        output: format!("Error: {message}. No alternate execution provider was attempted."),
         metadata: Some(metadata),
         is_error: true,
         exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),

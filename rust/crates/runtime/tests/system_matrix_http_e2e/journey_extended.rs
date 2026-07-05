@@ -202,7 +202,9 @@ pub async fn run_chat_stream_session_info_smoke() {
     let auth = &b.auth_header;
     let session_id = ctx.session_id.clone();
 
-    // Test /chat/stream with mock LLM via bridge e2e hooks
+    // Test /chat/stream with lifecycle mock rounds. The bridge test secret is
+    // still sent by this harness, but /chat/stream must stay on the unified
+    // ServerAgenticLoopHost path.
     let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let body = json!({
         "message": "matrix e2e stream smoke",

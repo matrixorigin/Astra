@@ -104,9 +104,9 @@ export function useWorkspaceSelection(params: UseWorkspaceSelectionParams) {
   const workspaceSelectionRequestRef = useRef(0);
 
   const setWorkspaceSelection = useCallback(
-    (selection: WorkspaceSelection) => {
+    (selection: WorkspaceSelection | null) => {
       const previous = previousWorkspaceRef.current;
-      const next = { selection, explicit: true };
+      const next = { selection, explicit: Boolean(selection) };
       const requestId = workspaceSelectionRequestRef.current + 1;
       workspaceSelectionRequestRef.current = requestId;
       previousWorkspaceRef.current = next;

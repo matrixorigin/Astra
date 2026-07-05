@@ -147,6 +147,26 @@ describe("chat deferred input route workspace authority", () => {
     expect(mockQueueDeferredRunInput).not.toHaveBeenCalled();
   });
 
+  it("rejects invalid file environment selections before queueing input", async () => {
+    mockGetChatHydrated.mockResolvedValue(activeChat() as never);
+    const { POST } = await import("@/app/api/chats/[chatId]/input/route");
+
+    const response = await POST(
+      postInput({
+        content: "continue",
+        workspace: { kind: "unknown_environment" },
+      }),
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      code: "invalid_workspace_selection",
+      error: "workspace must be a valid file environment selection",
+    });
+    expect(mockQueueDeferredRunInput).not.toHaveBeenCalled();
+  });
+
   it("accepts non-code deferred input without forcing a workspace", async () => {
     mockGetChatHydrated.mockResolvedValue(activeChat() as never);
     const { POST } = await import("@/app/api/chats/[chatId]/input/route");
