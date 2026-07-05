@@ -98,21 +98,19 @@ fn scripted_round(text: &str) -> Value {
     })
 }
 
-fn value_has_cache_control(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => {
-            map.contains_key("cache_control") || map.values().any(value_has_cache_control)
-        }
-        Value::Array(values) => values.iter().any(value_has_cache_control),
-        _ => false,
-    }
+fn tool_schema_has_cache_control(tool: &Value) -> bool {
+    tool.get("cache_control").is_some()
+        || tool
+            .get("function")
+            .and_then(Value::as_object)
+            .is_some_and(|function| function.contains_key("cache_control"))
 }
 
 fn tool_cache_control_count(request: &CapturedLlmRequest) -> usize {
     request
         .tools
         .iter()
-        .filter(|tool| value_has_cache_control(tool))
+        .filter(|tool| tool_schema_has_cache_control(tool))
         .count()
 }
 
