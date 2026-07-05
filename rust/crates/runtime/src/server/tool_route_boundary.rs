@@ -309,7 +309,7 @@ pub(crate) fn projected_tool_start_event_fields(
     tool_name: &str,
     base_metadata: &Map<String, Value>,
 ) -> Option<Map<String, Value>> {
-    if tool_name.starts_with("mcp__") {
+    if metadata_is_request_scoped_mcp(base_metadata) {
         return Some(request_scoped_mcp_event_fields_from_metadata(base_metadata));
     }
     if is_server_runtime_tool(tool_name) {
@@ -323,7 +323,7 @@ pub(crate) fn projected_tool_end_event_fields(
     base_metadata: &Map<String, Value>,
 ) -> Option<Map<String, Value>> {
     if let Some(tool_name) = tool_name {
-        if tool_name.starts_with("mcp__") {
+        if metadata_is_request_scoped_mcp(base_metadata) {
             return Some(request_scoped_mcp_event_fields_from_metadata(base_metadata));
         }
         if is_server_runtime_tool(tool_name) {
@@ -382,6 +382,18 @@ fn request_scoped_mcp_event_fields_from_metadata(
     fields
 }
 
+fn metadata_is_request_scoped_mcp(base_metadata: &Map<String, Value>) -> bool {
+    base_metadata
+        .get("transport")
+        .and_then(Value::as_str)
+        .is_some_and(|transport| transport == "mcp_http")
+        || base_metadata
+            .get("executor")
+            .and_then(|executor| executor.get("kind"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "mcp")
+}
+
 fn metadata_is_edge_bound(base_metadata: &Map<String, Value>) -> bool {
     base_metadata
         .get("workspace")
@@ -417,4 +429,99 @@ fn edge_ledger_event_fields_from_metadata(
         Value::String("edge_ledger".to_string()),
     );
     fields
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edge_metadata() -> Map<String, Value> {
+        let mut metadata = Map::new();
+        metadata.insert(
+            "workspace".to_string(),
+            json!({
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "cwd": "/Users/test/project",
+                "authority": "read_write"
+            }),
+        );
+        metadata.insert(
+            "executor".to_string(),
+            json!({
+                "kind": "edge_agent",
+                "executor_id": "edge-1",
+                "display_name": "MacBook Pro",
+                "transport": "edge_ws",
+                "status": "online"
+            }),
+        );
+        metadata.insert(
+            "transport".to_string(),
+            Value::String("edge_ws".to_string()),
+        );
+        metadata
+    }
+
+    fn request_scoped_mcp_metadata() -> Map<String, Value> {
+        let mut metadata = Map::new();
+        metadata.insert(
+            "workspace".to_string(),
+            json!({
+                "kind": "none",
+                "display_name": "No file environment",
+                "authority": "none"
+            }),
+        );
+        metadata.insert(
+            "executor".to_string(),
+            json!({
+                "kind": "mcp",
+                "executor_id": "request-scoped-mcp",
+                "display_name": "Request-scoped MCP",
+                "transport": "mcp_http",
+                "status": "online"
+            }),
+        );
+        metadata.insert(
+            "transport".to_string(),
+            Value::String("mcp_http".to_string()),
+        );
+        metadata
+    }
+
+    #[test]
+    fn mcp_prefixed_start_event_does_not_project_without_mcp_route_metadata() {
+        let metadata = edge_metadata();
+
+        let projected = projected_tool_start_event_fields("mcp__demo__search", &metadata);
+
+        assert_eq!(projected, None);
+    }
+
+    #[test]
+    fn request_scoped_mcp_start_event_projects_from_route_metadata() {
+        let metadata = request_scoped_mcp_metadata();
+
+        let projected = projected_tool_start_event_fields("mcp__demo__search", &metadata)
+            .expect("mcp route metadata should project");
+
+        assert_eq!(projected["workspace"]["kind"], "none");
+        assert_eq!(projected["executor"]["kind"], "mcp");
+        assert_eq!(projected["executor"]["executor_id"], "request-scoped-mcp");
+        assert_eq!(projected["transport"], "mcp_http");
+    }
+
+    #[test]
+    fn mcp_prefixed_end_event_uses_edge_metadata_when_route_is_edge() {
+        let metadata = edge_metadata();
+
+        let projected = projected_tool_end_event_fields(Some("mcp__demo__search"), &metadata)
+            .expect("edge route metadata should project");
+
+        assert_eq!(projected["workspace"]["kind"], "edge_workspace");
+        assert_eq!(projected["executor"]["kind"], "edge_agent");
+        assert_eq!(projected["executor"]["transport"], "edge_ledger");
+        assert_eq!(projected["transport"], "edge_ledger");
+    }
 }

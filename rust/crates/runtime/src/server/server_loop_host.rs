@@ -10980,7 +10980,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_start_projects_request_scoped_mcp_metadata() {
+    fn tool_call_start_does_not_project_mcp_without_mcp_route_metadata() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -11022,6 +11022,53 @@ mod tests {
         assert_eq!(event["type"], "tool_call_start");
         assert_eq!(event["workspace"]["kind"], "edge_workspace");
         assert_eq!(event["workspace"]["cwd"], "/Users/test/project");
+        assert_eq!(event["executor"]["kind"], "edge_agent");
+        assert_eq!(event["executor"]["executor_id"], "edge-1");
+        assert_eq!(event["executor"]["display_name"], "MacBook Pro");
+        assert_eq!(event["transport"], "edge_ws");
+    }
+
+    #[test]
+    fn tool_call_start_projects_request_scoped_mcp_route_metadata() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        host.set_execution_metadata(json!({
+            "workspace": {
+                "kind": "none",
+                "display_name": "No file environment",
+                "authority": "none",
+            },
+            "executor": {
+                "kind": "mcp",
+                "executor_id": "request-scoped-mcp",
+                "display_name": "Request-scoped MCP",
+                "transport": "mcp_http",
+                "status": "online"
+            },
+            "transport": "mcp_http",
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        host.set_event_tx(tx);
+
+        host.emit_event(json!({
+            "type": "tool_call_start",
+            "tool_call": {
+                "id": "call-mcp",
+                "function": {
+                    "name": "mcp__demo__search",
+                    "arguments": "{\"query\":\"hello\"}"
+                }
+            }
+        }));
+
+        let event = rx.try_recv().expect("tool_call_start event");
+        assert_eq!(event["type"], "tool_call_start");
+        assert_eq!(event["workspace"]["kind"], "none");
         assert_eq!(event["executor"]["kind"], "mcp");
         assert_eq!(event["executor"]["executor_id"], "request-scoped-mcp");
         assert_eq!(event["executor"]["display_name"], "Request-scoped MCP");
