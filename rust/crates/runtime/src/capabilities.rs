@@ -136,14 +136,13 @@ pub fn full_server_capabilities_for_tests() -> astra_turn_core::capability::Capa
 
 /// Production-truth `CapabilitySet` for an agentic-run lifecycle.
 pub fn lifecycle_server_capabilities(
-    database_pool_present: bool,
+    _database_pool_present: bool,
     reflect_service_configured: bool,
 ) -> astra_turn_core::capability::CapabilitySet {
     use astra_turn_core::capability::{Capability, CapabilitySet};
     CapabilitySet::empty()
         .with(Capability::AgentSpawner)
         .with(Capability::MemoryService)
-        .with_if(database_pool_present, Capability::Database)
         .with(Capability::SkillsCatalog)
         .with(Capability::GitHubAuth)
         .with(Capability::PlanLifecycle)
@@ -862,11 +861,16 @@ mod tests {
             "git",
             "run_script",
             "lsp",
-            "powershell",
         ] {
             assert!(
                 tool_names.contains(visible),
                 "{visible} should be available to explicit runtime/workspace providers"
+            );
+        }
+        for hidden in ["powershell", "display_sixel"] {
+            assert!(
+                !tool_names.contains(hidden),
+                "{hidden} requires an explicit terminal/platform-local provider, not the generic server runtime provider pool"
             );
         }
         for server_owned in ["ask_user", "agent", "tool_search", "web_fetch", "memory"] {
@@ -998,9 +1002,12 @@ mod tests {
             "server lifecycle must include AgentSpawner"
         );
 
-        // Database is gated on pool availability
+        // A database pool is an internal runtime dependency, not a default
+        // model-facing SQL capability. SQL/debug tools need an explicit
+        // admin/debug provider or policy gate instead of appearing in ordinary
+        // web/server agent surfaces.
         assert!(!lifecycle_server_capabilities(false, true).has(Capability::Database));
-        assert!(caps.has(Capability::Database));
+        assert!(!caps.has(Capability::Database));
         assert!(!lifecycle_server_capabilities(true, false).has(Capability::ReflectService));
         assert!(caps.has(Capability::ReflectService));
 

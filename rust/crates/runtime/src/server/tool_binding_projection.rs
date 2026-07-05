@@ -811,10 +811,16 @@ mod tests {
             None,
         ));
 
-        for expected in ["bash", "read_file", "lsp", "powershell"] {
+        for expected in ["bash", "read_file", "lsp"] {
             assert!(
                 names.contains(expected),
                 "{expected} should be visible when the edge provider owns runtime execution"
+            );
+        }
+        for hidden in ["powershell", "display_sixel"] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} requires an explicit terminal/platform-local provider, not a generic edge workspace"
             );
         }
     }
@@ -861,6 +867,57 @@ mod tests {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must still require an explicit request-scoped provider"
+            );
+        }
+    }
+
+    #[test]
+    fn production_server_edge_surface_hides_admin_and_platform_local_tools() {
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::lifecycle_server_capabilities(true, true),
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+        ));
+
+        for expected in [
+            "task",
+            "session",
+            "introspect",
+            "reflect",
+            "tool_search",
+            "bash",
+            "read_file",
+        ] {
+            assert!(
+                names.contains(expected),
+                "{expected} must be visible in production server+edge surface: {names:?}"
+            );
+        }
+        for hidden in [
+            "mo_query",
+            "rollback_database_snapshots",
+            "powershell",
+            "display_sixel",
+            "task_output",
+            "task_stop",
+            "task_list",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must not be visible in ordinary production server+edge surface: {names:?}"
             );
         }
     }

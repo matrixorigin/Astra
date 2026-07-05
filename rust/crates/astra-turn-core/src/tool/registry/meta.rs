@@ -566,6 +566,29 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 35,
     },
     ToolMeta {
+        name: "task",
+        description: "Durable session task board: create, update, list, get, stop, adopt, or archive task-board work.",
+        triggers: &[
+            "task",
+            "task board",
+            "checklist",
+            "todo",
+            "progress",
+            "open work",
+            "work item",
+            "任务",
+            "任务板",
+            "待办",
+            "清单",
+            "进度",
+        ],
+        intents: &[IntentType::CodeEdit, IntentType::Introspect],
+        scope: Scope::Local,
+        requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 120,
+    },
+    ToolMeta {
         name: "mo_query",
         description: "Run MatrixOne SQL with pre-state rollback snapshot support",
         triggers: &[
@@ -921,7 +944,12 @@ mod tests {
 
     #[test]
     fn catalog_includes_top_level_session_state_tools() {
-        for name in ["introspect", "compress_context", "rollback_session_state"] {
+        for name in [
+            "introspect",
+            "compress_context",
+            "rollback_session_state",
+            "task",
+        ] {
             let tool = TOOL_CATALOG
                 .iter()
                 .find(|tool| tool.name == name)

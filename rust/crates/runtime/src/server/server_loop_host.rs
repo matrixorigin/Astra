@@ -6055,6 +6055,9 @@ mod tests {
             "u-compose".to_string(),
             "s-compose".to_string(),
         )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, true,
+        ))
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
@@ -6082,6 +6085,20 @@ mod tests {
             !names.contains("write_file"),
             "edge-provided runtime surfaces must not be widened with runtime tools the edge did not declare"
         );
+        for hidden in [
+            "mo_query",
+            "rollback_database_snapshots",
+            "powershell",
+            "display_sixel",
+            "task_output",
+            "task_stop",
+            "task_list",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must not leak into the ordinary server+edge surface: {names:?}"
+            );
+        }
     }
 
     #[test]

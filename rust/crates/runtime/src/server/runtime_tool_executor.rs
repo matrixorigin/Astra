@@ -4978,6 +4978,51 @@ esac
     }
 
     #[tokio::test]
+    async fn server_tool_search_uses_production_surface_not_tool_engine_inventory() {
+        let (exec, _dir) = test_executor_with_agent_context();
+        let exec = exec
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                true, true,
+            ))
+            .with_enforce_server_tool_capabilities(true);
+        let searchable = exec.capability_filtered_server_tool_schemas();
+        exec.set_current_searchable_tool_schemas(&searchable);
+
+        let task = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:task"}))
+            .await;
+        let parsed_task: Value = serde_json::from_str(&task.output).unwrap();
+        assert!(
+            parsed_task["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["name"].as_str() == Some("task")),
+            "durable task-board backbone must be searchable in production server surface; got: {}",
+            task.output
+        );
+
+        let mo_query = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mo_query"}))
+            .await;
+        let parsed_mo_query: Value = serde_json::from_str(&mo_query.output).unwrap();
+        assert!(
+            parsed_mo_query["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not surface DB debug tools merely because ToolEngine can execute them; got: {}",
+            mo_query.output
+        );
+        assert!(
+            parsed_mo_query["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("mo_query")),
+            "mo_query must be reported missing from the current production search pool; got: {}",
+            mo_query.output
+        );
+    }
+
+    #[tokio::test]
     async fn server_tool_search_hides_request_scoped_mcp_without_runtime_binding() {
         let (exec, _dir) = test_executor();
         let schema = json!({

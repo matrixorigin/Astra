@@ -243,7 +243,6 @@ pub fn server_service_capabilities() -> Vec<String> {
         CAP_REFLECT,
         CAP_INTROSPECT,
         CAP_TOOL_SEARCH,
-        CAP_MO_QUERY,
     ])
 }
 
@@ -330,6 +329,7 @@ pub fn runtime_workspace_provider(
 ) -> CapacityProviderDeclaration {
     CapacityProviderDeclaration::from_registry(provider_type, provider_id, registry, |spec| {
         matches!(spec.required.executor, RequiredExecutor::RuntimeExecutor)
+            && runtime_workspace_provider_declares_tool(provider_type, spec.name.as_str())
     })
 }
 
@@ -338,6 +338,23 @@ pub fn cli_local_provider(
     registry: &ToolRegistry,
 ) -> CapacityProviderDeclaration {
     runtime_workspace_provider(CapacityProviderType::CliLocal, provider_id, registry)
+}
+
+fn runtime_workspace_provider_declares_tool(
+    provider_type: CapacityProviderType,
+    tool_name: &str,
+) -> bool {
+    // These are access-surface/platform-local affordances, not generic
+    // workspace executor capabilities. CLI-local may expose them because the
+    // terminal/platform is the access surface; web/server+edge must wait for an
+    // explicit terminal or platform-specific provider instead of showing tools
+    // that can only fail.
+    if !matches!(provider_type, CapacityProviderType::CliLocal)
+        && matches!(tool_name, "display_sixel" | "powershell")
+    {
+        return false;
+    }
+    true
 }
 
 pub fn request_scoped_mcp_provider(
@@ -418,7 +435,31 @@ mod tests {
 
         assert!(cli.declares_tool("bash"));
         assert!(cli.declares_tool("read_file"));
+        assert!(cli.declares_tool("powershell"));
+        assert!(cli.declares_tool("display_sixel"));
         assert!(!cli.declares_tool("memory"));
+    }
+
+    #[test]
+    fn non_cli_runtime_workspace_providers_hide_terminal_and_platform_local_tools() {
+        let registry = ToolRegistry::builtins();
+        for provider_type in [
+            CapacityProviderType::EdgeCapacity,
+            CapacityProviderType::Sandbox,
+            CapacityProviderType::OrchestratorManagedRuntime,
+        ] {
+            let provider = runtime_workspace_provider(provider_type, "runtime", &registry);
+            assert!(provider.declares_tool("bash"));
+            assert!(provider.declares_tool("read_file"));
+            assert!(
+                !provider.declares_tool("powershell"),
+                "{provider_type} must not advertise powershell without platform readiness"
+            );
+            assert!(
+                !provider.declares_tool("display_sixel"),
+                "{provider_type} must not advertise terminal sixel rendering to web/server surfaces"
+            );
+        }
     }
 
     #[test]
