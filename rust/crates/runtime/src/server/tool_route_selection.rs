@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::tool_execution_binding::{
-    ToolExecutionRequest, ToolTransportKind, WorkspaceBindingKind,
+    ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolTransportKind,
+    WorkspaceBindingKind,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,7 +39,10 @@ pub(crate) enum ToolExecutionOwner {
     ServerRuntime,
     RuntimeExecutor,
     RequestScopedMcp,
-    InterceptedTurnPipeline,
+    /// Virtual turn-pipeline tools are advertised as schemas but are consumed
+    /// before route execution. They are not executable by a workspace,
+    /// executor, edge transport, or MCP provider.
+    TurnPipelineIntercept,
     Unknown,
 }
 
@@ -75,7 +79,7 @@ pub(crate) fn tool_execution_owner(
         return ToolExecutionOwner::RequestScopedMcp;
     }
     if is_intercepted_turn_pipeline_tool(tool_name) {
-        return ToolExecutionOwner::InterceptedTurnPipeline;
+        return ToolExecutionOwner::TurnPipelineIntercept;
     }
 
     let Some(spec) = registry.get(tool_name) else {
@@ -120,7 +124,7 @@ pub(crate) fn routing_decision_for_binding(
         }
         ToolExecutionOwner::ServerRuntime => return ToolExecutionRouteKind::ServerRuntime,
         ToolExecutionOwner::RequestScopedMcp => return ToolExecutionRouteKind::RequestScopedMcp,
-        ToolExecutionOwner::InterceptedTurnPipeline | ToolExecutionOwner::Unknown => {
+        ToolExecutionOwner::TurnPipelineIntercept | ToolExecutionOwner::Unknown => {
             return ToolExecutionRouteKind::Unsupported;
         }
         ToolExecutionOwner::RuntimeExecutor => {}
@@ -144,6 +148,51 @@ pub(crate) fn routing_decision_for_binding(
         WorkspaceBindingKind::ServerSandbox => {}
     }
     ToolExecutionRouteKind::Unsupported
+}
+
+pub(crate) fn runtime_tools_route_to_edge_provider(
+    workspace_kind: WorkspaceBindingKind,
+    executor_kind: ExecutorBindingKind,
+    executor_transport: ToolTransportKind,
+) -> bool {
+    matches!(workspace_kind, WorkspaceBindingKind::EdgeWorkspace)
+        || matches!(executor_kind, ExecutorBindingKind::EdgeAgent)
+        || matches!(executor_transport, ToolTransportKind::EdgeLedger)
+}
+
+pub(crate) fn edge_bound_route_is_offline_for_binding(
+    tool_name: &str,
+    workspace_kind: WorkspaceBindingKind,
+    executor_kind: ExecutorBindingKind,
+    executor_status: ExecutorStatus,
+    executor_transport: ToolTransportKind,
+    registry: &astra_runtime_env::ToolRegistry,
+) -> bool {
+    runtime_tools_route_to_edge_provider(workspace_kind, executor_kind, executor_transport)
+        && matches!(
+            routing_decision_for_binding(tool_name, workspace_kind, executor_transport, registry),
+            ToolExecutionRouteKind::EdgeBound
+        )
+        && matches!(executor_status, ExecutorStatus::Offline | ExecutorStatus::Unknown)
+}
+
+pub(crate) fn should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+    workspace_kind: WorkspaceBindingKind,
+    executor_kind: ExecutorBindingKind,
+    executor_transport: ToolTransportKind,
+    executor_status: ExecutorStatus,
+    runtime_executor_available: bool,
+    event_channel_available: bool,
+) -> bool {
+    if !event_channel_available {
+        return false;
+    }
+    if runtime_tools_route_to_edge_provider(workspace_kind, executor_kind, executor_transport)
+        && matches!(executor_status, ExecutorStatus::Offline | ExecutorStatus::Unknown)
+    {
+        return true;
+    }
+    matches!(executor_transport, ToolTransportKind::EdgeLedger) || !runtime_executor_available
 }
 
 #[cfg(test)]

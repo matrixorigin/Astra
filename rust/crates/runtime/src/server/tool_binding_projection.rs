@@ -72,7 +72,7 @@ fn tool_route_is_visible_for_binding(
         ToolExecutionOwner::ServerControlPlane
         | ToolExecutionOwner::ServerRuntime
         | ToolExecutionOwner::RequestScopedMcp
-        | ToolExecutionOwner::InterceptedTurnPipeline => return true,
+        | ToolExecutionOwner::TurnPipelineIntercept => return true,
         ToolExecutionOwner::Unknown => return false,
         ToolExecutionOwner::RuntimeExecutor => {}
     }

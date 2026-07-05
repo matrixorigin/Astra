@@ -26,7 +26,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::{AgentProgressEvent, ProgressEventType};
 use crate::server::tool_route_selection::{
-    ToolExecutionOwner, ToolExecutionRouteKind, routing_decision_for_binding, tool_execution_owner,
+    ToolExecutionOwner, ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding,
+    routing_decision_for_binding, runtime_tools_route_to_edge_provider,
+    should_deliver_edge_bound_tools_via_client_ledger_for_binding, tool_execution_owner,
 };
 use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
@@ -1489,12 +1491,10 @@ impl ServerAgenticLoopHostBuilder {
         // executor, while server-owned control-plane/runtime tools remain
         // in-process.
         let auto_server_catalog = self.server_tool_catalog_enabled && self.edge_tools.is_empty();
-        let routes_workspace_tools_to_edge = matches!(
+        let routes_workspace_tools_to_edge = runtime_tools_route_to_edge_provider(
             binding_snapshot.workspace.kind,
-            WorkspaceBindingKind::EdgeWorkspace
-        ) || matches!(
             binding_snapshot.executor.kind,
-            ExecutorBindingKind::EdgeAgent
+            binding_snapshot.executor.transport,
         );
         let server_side_tools = auto_server_catalog && !routes_workspace_tools_to_edge;
         let schema_workspace = binding_snapshot.workspace.clone();
@@ -1667,7 +1667,7 @@ fn append_server_owned_tool_schemas_unique(
         match tool_execution_owner(name, &registry) {
             ToolExecutionOwner::ServerControlPlane
             | ToolExecutionOwner::ServerRuntime
-            | ToolExecutionOwner::InterceptedTurnPipeline
+            | ToolExecutionOwner::TurnPipelineIntercept
                 if !server_builtin_tools_enabled =>
             {
                 continue;
@@ -1675,7 +1675,7 @@ fn append_server_owned_tool_schemas_unique(
             ToolExecutionOwner::ServerControlPlane
             | ToolExecutionOwner::ServerRuntime
             | ToolExecutionOwner::RequestScopedMcp
-            | ToolExecutionOwner::InterceptedTurnPipeline => {}
+            | ToolExecutionOwner::TurnPipelineIntercept => {}
             _ => continue,
         }
         if seen.insert(name.to_string()) {
@@ -2632,18 +2632,15 @@ impl ServerAgenticLoopHost {
     }
 
     fn edge_executor_offline_blocks_tool(&self, tool_name: &str) -> bool {
-        matches!(
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        edge_bound_route_is_offline_for_binding(
+            tool_name,
             self.workspace_binding.kind,
-            WorkspaceBindingKind::EdgeWorkspace
-        ) && matches!(self.executor_binding.kind, ExecutorBindingKind::EdgeAgent)
-            && matches!(
-                self.executor_binding.status,
-                ExecutorStatus::Offline | ExecutorStatus::Unknown
-            )
-            && matches!(
-                self.route_for_current_binding(tool_name),
-                ToolExecutionRouteKind::EdgeBound
-            )
+            self.executor_binding.kind,
+            self.executor_binding.status,
+            self.executor_binding.transport,
+            &registry,
+        )
     }
 
     fn edge_executor_offline_result(
@@ -2851,26 +2848,14 @@ impl ServerAgenticLoopHost {
     }
 
     fn should_deliver_edge_bound_tools_via_client_ledger(&self, state: &AgenticLoopState) -> bool {
-        if self.event_tx.is_none() {
-            return false;
-        }
-        if matches!(
-            self.executor_binding.status,
-            ExecutorStatus::Offline | ExecutorStatus::Unknown
-        ) && matches!(
+        should_deliver_edge_bound_tools_via_client_ledger_for_binding(
             self.workspace_binding.kind,
-            WorkspaceBindingKind::EdgeWorkspace
-        ) && matches!(self.executor_binding.kind, ExecutorBindingKind::EdgeAgent)
-        {
-            return true;
-        }
-        if matches!(
+            self.executor_binding.kind,
             self.executor_binding.transport,
-            ToolTransportKind::EdgeLedger
-        ) {
-            return true;
-        }
-        state.runtime_tool_executor.is_none()
+            self.executor_binding.status,
+            state.runtime_tool_executor.is_some(),
+            self.event_tx.is_some(),
+        )
     }
 
     async fn maybe_deliver_edge_bound_tools_via_ledger(

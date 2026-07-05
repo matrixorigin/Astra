@@ -874,7 +874,14 @@ impl RuntimeToolExecutor {
     fn capability_service_dependency_ready(&self, capability: Capability) -> bool {
         match capability {
             Capability::ReflectService => self.reflect_service.is_configured(),
-            _ => true,
+            Capability::AgentSpawner
+            | Capability::MemoryService
+            | Capability::Database
+            | Capability::SkillsCatalog
+            | Capability::GitHubAuth
+            | Capability::LSPServer
+            | Capability::PlanLifecycle
+            | Capability::LocalBackgroundTasks => true,
         }
     }
 
