@@ -235,6 +235,10 @@ pub fn canonical_tool_schema_digest(schema: &Value) -> String {
     canonical_sha256_digest("tool_schema", schema)
 }
 
+pub fn tool_offer_id(tool_name: &str, provider_id: &str) -> String {
+    format!("{tool_name}@{provider_id}")
+}
+
 fn canonical_tool_name_digest(tool_name: &str) -> String {
     canonical_sha256_digest("tool_name", &serde_json::json!({ "name": tool_name }))
 }
@@ -520,6 +524,22 @@ mod tests {
         let value = serde_json::to_value(CapacityProviderType::OrchestratorManagedRuntime)
             .expect("serialize provider type");
         assert_eq!(value, "orchestrator_managed_runtime");
+    }
+
+    #[test]
+    fn tool_offer_id_uses_provider_identity_without_prompt_route_metadata() {
+        assert_eq!(
+            tool_offer_id("web_fetch", "server-builtin"),
+            "web_fetch@server-builtin"
+        );
+        assert_eq!(
+            tool_offer_id("web_fetch", "edge-macpro"),
+            "web_fetch@edge-macpro"
+        );
+        assert_eq!(
+            tool_offer_id("mcp__github__search", "request-scoped-mcp"),
+            "mcp__github__search@request-scoped-mcp"
+        );
     }
 
     #[test]

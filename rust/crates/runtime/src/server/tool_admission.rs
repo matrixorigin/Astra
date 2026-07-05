@@ -387,7 +387,7 @@ fn offer_for_provider(
 ) -> ToolOffer {
     ToolOffer {
         tool_name: tool_name.to_string(),
-        offer_id: format!("{tool_name}@{}", provider.provider_id),
+        offer_id: astra_runtime_env::tool_offer_id(tool_name, &provider.provider_id),
         provider_type: provider.provider_type,
         provider_id: provider.provider_id.clone(),
         executor_id: executor_id_for_offer(provider, executor),

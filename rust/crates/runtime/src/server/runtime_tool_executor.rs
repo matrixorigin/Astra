@@ -938,7 +938,7 @@ impl RuntimeToolExecutor {
         let context = self
             .tool_execution_service
             .tool_admission_context_snapshot();
-        let offer_id = format!("{name}@request-scoped-mcp");
+        let offer_id = astra_runtime_env::tool_offer_id(name, "request-scoped-mcp");
         if context.disabled_tool_offers.contains(&offer_id) {
             return Some(astra_runtime_env::ToolUnavailableReason::PolicyDenied(
                 "tool offer disabled by policy".to_string(),

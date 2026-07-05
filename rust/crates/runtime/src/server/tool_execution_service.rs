@@ -594,7 +594,8 @@ fn disabled_offer_id_for_request(
         return admission.selected_offer_id().map(str::to_string);
     }
     if request.tool_name.starts_with("mcp__") {
-        let request_scoped_offer_id = format!("{}@request-scoped-mcp", request.tool_name);
+        let request_scoped_offer_id =
+            astra_runtime_env::tool_offer_id(&request.tool_name, "request-scoped-mcp");
         if disabled_offer_ids.contains(&request_scoped_offer_id) {
             return Some(request_scoped_offer_id);
         }
@@ -618,7 +619,7 @@ fn disallowed_offer_id_for_request(
             .is_some_and(|allowed| !allowed.contains(&request.tool_name))
         {
             return Some((
-                format!("{}@{}", request.tool_name, provider_id),
+                astra_runtime_env::tool_offer_id(&request.tool_name, provider_id),
                 provider_id.to_string(),
             ));
         }

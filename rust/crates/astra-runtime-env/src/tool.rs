@@ -970,11 +970,7 @@ fn provider_selection_rank(
 }
 
 fn offer_id(tool_name: &str, provider: &CapacityProviderDeclaration) -> String {
-    format!(
-        "{tool_name}@{}:{}",
-        provider.provider_type.as_str(),
-        provider.provider_id
-    )
+    crate::tool_offer_id(tool_name, &provider.provider_id)
 }
 
 pub use astra_core::tool_schema::tool_schema_name;
@@ -1993,7 +1989,7 @@ mod tests {
         assert_eq!(admission.selected_provider_id.as_deref(), Some("local-cli"));
         assert_eq!(
             admission.selected_offer_id.as_deref(),
-            Some("web_fetch@cli_local:local-cli")
+            Some("web_fetch@local-cli")
         );
         assert!(admission.candidates.iter().any(|candidate| {
             candidate.provider_type == crate::CapacityProviderType::ServerService
@@ -2047,7 +2043,7 @@ mod tests {
         );
         assert_eq!(
             admission.selected_offer_id.as_deref(),
-            Some("web_fetch@server_service:server-service")
+            Some("web_fetch@server-service")
         );
     }
 
@@ -2219,7 +2215,7 @@ mod tests {
         );
         assert_eq!(
             admission.selected_offer_id.as_deref(),
-            Some("mcp__weather@request_scoped_mcp:mcp")
+            Some("mcp__weather@mcp")
         );
     }
 
