@@ -205,6 +205,27 @@ impl ToolExecutionService {
         Arc::clone(&self.provider_allowed_tools)
     }
 
+    pub(crate) fn tool_admission_context_snapshot(&self) -> ToolAdmissionContext {
+        ToolAdmissionContext {
+            disabled_tool_offers: self
+                .disabled_tool_offers
+                .try_read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
+            disabled_tool_names: self
+                .disabled_tool_names
+                .try_read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
+            provider_allowed_tools: self
+                .provider_allowed_tools
+                .try_read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
+            ..ToolAdmissionContext::default()
+        }
+    }
+
     /// Check whether a tool is currently disabled.
     #[allow(dead_code)]
     pub(crate) async fn is_tool_offer_disabled(&self, name: &str) -> bool {

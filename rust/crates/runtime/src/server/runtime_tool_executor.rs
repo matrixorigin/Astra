@@ -42,6 +42,7 @@ use async_trait::async_trait;
 
 use crate::orchestration::AgentToolContext;
 use crate::server::server_bash_execution::execute_server_bash;
+use crate::server::tool_admission::{ToolAdmissionContext, ToolHiddenReason};
 use crate::server::tool_ask_user::{AskUserExecutionContext, execute_ask_user};
 use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJournal};
 use crate::server::tool_exactly_once;
@@ -68,7 +69,7 @@ use crate::server::tool_transport::{
     TOOL_ERROR_KIND_TOOL_TIMEOUT, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
     TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH, ToolExecutionRequest, ToolExecutionService,
     ToolPolicySnapshot, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
-    binding_event_fields, capability_filtered_server_tool_schemas,
+    binding_event_fields, capability_filtered_server_tool_schemas_with_context,
 };
 use crate::server::tool_work_surface_events::{
     WorkSurfaceEventEmitter, binding_snapshot_events, task_board_snapshot_event,
@@ -87,10 +88,16 @@ fn resolved_server_tool_names(
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> HashSet<String> {
-    capability_filtered_server_tool_schemas(capabilities, workspace, executor, runtime)
-        .iter()
-        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
-        .collect()
+    capability_filtered_server_tool_schemas_with_context(
+        capabilities,
+        workspace,
+        executor,
+        runtime,
+        ToolAdmissionContext::default(),
+    )
+    .iter()
+    .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+    .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -711,11 +718,12 @@ impl RuntimeToolExecutor {
         if !self.server_builtin_tools_enabled {
             return Vec::new();
         }
-        let mut schemas = capability_filtered_server_tool_schemas(
+        let mut schemas = capability_filtered_server_tool_schemas_with_context(
             &self.capabilities,
             self.execution_binding.workspace(),
             self.execution_binding.executor(),
             self.execution_binding.runtime(),
+            self.tool_admission_context(),
         );
         schemas.retain(|schema| {
             tool_schema_name(schema).is_some_and(|name| self.tool_runtime_ready(name))
@@ -757,6 +765,18 @@ impl RuntimeToolExecutor {
 
     fn executor_tool_readiness(&self, name: &str) -> ExecutorToolReadiness {
         self.executor_tool_readiness_for_call(name, &Value::Null)
+    }
+
+    fn tool_admission_context(&self) -> ToolAdmissionContext {
+        let mut context = self
+            .tool_execution_service
+            .tool_admission_context_snapshot();
+        context.server_service_provider_ready = self.server_builtin_tools_enabled;
+        context.control_plane_provider_ready = self.server_builtin_tools_enabled;
+        context.request_scoped_mcp_provider_ready = !self
+            .request_scoped_mcp_schemas_snapshot("request_scoped_mcp_admission")
+            .is_empty();
+        context
     }
 
     fn executor_tool_readiness_for_call(&self, name: &str, args: &Value) -> ExecutorToolReadiness {
@@ -808,14 +828,19 @@ impl RuntimeToolExecutor {
     ) -> Option<astra_runtime_env::ToolUnavailableReason> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         registry.get(name)?;
-        let admission = crate::server::tool_admission::resolve_tool_admission_for_binding(
-            name,
-            &[],
-            self.execution_binding.workspace(),
-            self.execution_binding.executor(),
-            self.execution_binding.runtime(),
-            &registry,
-        );
+        let admission =
+            crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
+                name,
+                &[],
+                self.execution_binding.workspace(),
+                self.execution_binding.executor(),
+                self.execution_binding.runtime(),
+                &registry,
+                self.tool_admission_context(),
+            );
+        if let Some(reason) = admission_hidden_reason_to_unavailable(admission.hidden_reason) {
+            return Some(reason);
+        }
         if matches!(
             admission.selected_route(),
             crate::server::tool_route_selection::ToolExecutionRouteKind::ServerRuntime
@@ -1523,6 +1548,38 @@ fn remove_prompt_schema_conflicts(pool: &mut Vec<Value>) {
         return;
     }
     pool.retain(|schema| tool_schema_name(schema).is_none_or(|name| !conflicts.contains(name)));
+}
+
+fn admission_hidden_reason_to_unavailable(
+    reason: Option<ToolHiddenReason>,
+) -> Option<astra_runtime_env::ToolUnavailableReason> {
+    use astra_runtime_env::ToolUnavailableReason;
+    match reason? {
+        ToolHiddenReason::UnknownTool => Some(ToolUnavailableReason::UnknownTool),
+        ToolHiddenReason::NoProvider => Some(ToolUnavailableReason::ExecutorUnavailable(
+            "no capacity provider declares this tool for the current binding".to_string(),
+        )),
+        ToolHiddenReason::ProviderRouteMismatch => {
+            Some(ToolUnavailableReason::ExecutorUnavailable(
+                "no capacity provider matches the selected execution route".to_string(),
+            ))
+        }
+        ToolHiddenReason::UnsupportedRoute => Some(ToolUnavailableReason::ExecutorUnavailable(
+            "tool has no supported execution route for the current binding".to_string(),
+        )),
+        ToolHiddenReason::SchemaConflict => Some(ToolUnavailableReason::PolicyDenied(
+            "conflicting tool schemas for this name".to_string(),
+        )),
+        ToolHiddenReason::DisabledOffer => Some(ToolUnavailableReason::PolicyDenied(
+            "tool offer disabled by policy".to_string(),
+        )),
+        ToolHiddenReason::DisabledTool => Some(ToolUnavailableReason::PolicyDenied(
+            "tool disabled by policy".to_string(),
+        )),
+        ToolHiddenReason::ProviderToolNotAllowed => Some(ToolUnavailableReason::PolicyDenied(
+            "tool not allowed for selected provider".to_string(),
+        )),
+    }
 }
 
 fn server_local_tool_arguments(request: &ToolExecutionRequest) -> Value {
@@ -5116,6 +5173,97 @@ esac
                 .any(|value| value.as_str() == Some("mo_query")),
             "mo_query must be reported missing from the current production search pool; got: {}",
             mo_query.output
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_runtime_tool_name_prunes_executor_surface_and_tool_search() {
+        let (mut exec, _dir) = test_executor();
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_disabled_tool_names(&["bash".to_string()])
+                .build(),
+        );
+
+        let names = schema_name_set(exec.tool_schemas());
+        assert!(
+            !names.contains("bash"),
+            "disabled runtime tool names must not be prompt-visible"
+        );
+        assert!(
+            !exec.tool_runtime_ready("bash"),
+            "disabled runtime tool names must not be readiness-visible"
+        );
+
+        let searchable = exec.capability_filtered_server_tool_schemas();
+        exec.set_current_searchable_tool_schemas(&searchable);
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:bash"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not rediscover a policy-disabled runtime tool: {}",
+            result.output
+        );
+        assert!(
+            parsed["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("bash")),
+            "disabled runtime tool should be reported missing from searchable surface: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_allowlist_prunes_server_service_surface_and_tool_search() {
+        let dir = TempDir::new().unwrap();
+        let mut allowed = HashMap::new();
+        allowed.insert(
+            "server-builtin".to_string(),
+            HashSet::from(["memory".to_string(), "tool_search".to_string()]),
+        );
+        let exec = RuntimeToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        )
+        .with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_provider_allowed_tools(allowed)
+                .build(),
+        );
+
+        let names = schema_name_set(exec.tool_schemas());
+        assert!(names.contains("memory"));
+        assert!(
+            !names.contains("web_search"),
+            "server service tools excluded by provider allowlist must not be visible"
+        );
+        assert!(
+            !exec.tool_runtime_ready("web_search"),
+            "provider-disallowed server service tool must not be ready"
+        );
+
+        let searchable = exec.capability_filtered_server_tool_schemas();
+        exec.set_current_searchable_tool_schemas(&searchable);
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:web_search"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap_or_else(|error| {
+            panic!(
+                "tool_search must return search JSON, parse error={error}, output={}",
+                result.output
+            )
+        });
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not rediscover a provider-disallowed server service tool: {}",
+            result.output
         );
     }
 

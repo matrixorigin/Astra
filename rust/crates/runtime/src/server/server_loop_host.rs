@@ -38,7 +38,7 @@ use crate::server::tool_transport::{
     ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind, WorkspaceAuthority,
     WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
     capability_filter_edge_provided_tool_schemas_for_binding_with_context,
-    capability_filtered_server_tool_schemas, projected_tool_end_event_fields,
+    capability_filtered_server_tool_schemas_with_context, projected_tool_end_event_fields,
     projected_tool_start_event_fields,
 };
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
@@ -1515,12 +1515,21 @@ impl ServerAgenticLoopHostBuilder {
         let schema_workspace = binding_snapshot.workspace.clone();
         let schema_executor = binding_snapshot.executor.clone();
         let schema_runtime = binding_snapshot.runtime.clone();
+        let schema_admission_context = ToolAdmissionContext {
+            server_service_provider_ready: self.server_tool_catalog_enabled,
+            control_plane_provider_ready: self.server_tool_catalog_enabled,
+            disabled_tool_offers: snapshot_builder_policy_handle(&self.disabled_tool_offers),
+            disabled_tool_names: snapshot_builder_policy_handle(&self.disabled_tool_names),
+            provider_allowed_tools: snapshot_builder_policy_handle(&self.provider_allowed_tools),
+            ..ToolAdmissionContext::default()
+        };
         let server_catalog_tools = if self.server_tool_catalog_enabled {
-            capability_filtered_server_tool_schemas(
+            capability_filtered_server_tool_schemas_with_context(
                 &self.capabilities,
                 &schema_workspace,
                 &schema_executor,
                 schema_runtime.as_ref(),
+                schema_admission_context.clone(),
             )
         } else {
             Vec::new()
@@ -1534,11 +1543,7 @@ impl ServerAgenticLoopHostBuilder {
                 &schema_workspace,
                 &schema_executor,
                 schema_runtime.as_ref(),
-                ToolAdmissionContext {
-                    server_service_provider_ready: self.server_tool_catalog_enabled,
-                    control_plane_provider_ready: self.server_tool_catalog_enabled,
-                    ..ToolAdmissionContext::default()
-                },
+                schema_admission_context,
             );
             append_server_owned_tool_schemas_unique(
                 &mut surface,
@@ -1692,6 +1697,16 @@ impl ServerAgenticLoopHostBuilder {
         self.provider_allowed_tools = Some(handle);
         self
     }
+}
+
+fn snapshot_builder_policy_handle<T>(handle: &Option<Arc<tokio::sync::RwLock<T>>>) -> T
+where
+    T: Clone + Default,
+{
+    handle
+        .as_ref()
+        .and_then(|handle| handle.try_read().ok().map(|guard| guard.clone()))
+        .unwrap_or_default()
 }
 
 fn append_server_owned_tool_schemas_unique(
@@ -7052,6 +7067,32 @@ mod tests {
     }
 
     #[test]
+    fn builder_applies_tool_policy_to_initial_prompt_surface() {
+        let disabled_names = Arc::new(tokio::sync::RwLock::new(HashSet::from([
+            "web_search".to_string()
+        ])));
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_disabled_tool_names(disabled_names)
+        .build();
+
+        let names = schema_names(&host.tool_schemas);
+        assert!(names.contains("tool_search"));
+        assert!(
+            !names.contains("web_search"),
+            "initial prompt-visible surface must not include policy-disabled tools"
+        );
+        assert!(
+            !host.valid_tool_names().contains("web_search"),
+            "valid tool set must match the policy-filtered prompt surface"
+        );
+    }
+
+    #[test]
     fn builder_runtime_surface_follows_server_sandbox_binding() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -7109,7 +7150,7 @@ mod tests {
         .build();
 
         let names = schema_names(&host.tool_schemas);
-        for visible in ["agent", "tool_search", "web_search", "memory"] {
+        for visible in ["agent", "tool_search", "memory"] {
             assert!(
                 names.contains(visible),
                 "{visible} should remain visible because it runs on the server"
@@ -7122,10 +7163,12 @@ mod tests {
             "git",
             "symbols",
             "run_script",
+            "web_fetch",
+            "web_search",
         ] {
             assert!(
                 !names.contains(hidden),
-                "{hidden} must be hidden while the edge runtime is offline"
+                "{hidden} must be hidden while the selected edge runtime is offline"
             );
             assert!(
                 !host.valid_tool_names().contains(hidden),

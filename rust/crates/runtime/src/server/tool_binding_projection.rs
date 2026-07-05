@@ -134,6 +134,22 @@ pub fn capability_filtered_server_tool_schemas(
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> Vec<Value> {
+    capability_filtered_server_tool_schemas_with_context(
+        capabilities,
+        workspace,
+        executor,
+        runtime,
+        ToolAdmissionContext::default(),
+    )
+}
+
+pub(crate) fn capability_filtered_server_tool_schemas_with_context(
+    capabilities: &astra_turn_core::capability::CapabilitySet,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    admission_context: ToolAdmissionContext,
+) -> Vec<Value> {
     let mut pool = crate::capabilities::server_builtin_tool_schemas(capabilities);
     if has_explicit_runtime_executor_provider(workspace, executor, runtime) {
         extend_tool_schema_pool_unique(
@@ -141,7 +157,13 @@ pub fn capability_filtered_server_tool_schemas(
             crate::capabilities::runtime_executor_tool_schemas(capabilities),
         );
     }
-    capability_filter_tool_schemas_for_binding(pool, workspace, executor, runtime)
+    capability_filter_tool_schemas_for_binding_with_context(
+        pool,
+        workspace,
+        executor,
+        runtime,
+        admission_context,
+    )
 }
 
 fn extend_tool_schema_pool_unique(pool: &mut Vec<Value>, extra: Vec<Value>) {
