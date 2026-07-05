@@ -18,6 +18,7 @@ LOCK_DIR="${ASTRA_EDGE_LOCK_DIR:-$REPO_ROOT/.astra_edge.lock}"
 LOCK_ACQUIRED=0
 
 if [ "${ASTRA_EDGE_LOCK_HELD:-0}" != "1" ]; then
+    mkdir -p "$(dirname "$LOCK_DIR")"
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
         echo "⚠️  astra-edge start/stop is already in progress"
         exit 1

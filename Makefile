@@ -438,7 +438,7 @@ dev-edge-stop:
 
 .PHONY: dev-edge-logs
 dev-edge-logs:
-	@LOG_FILE=$${ASTRA_EDGE_LOG_FILE:-astra_edge.log}; \
+	@LOG_FILE=$${ASTRA_EDGE_LOG_FILE:-$(CURDIR)/astra_edge.log}; \
 	if [ -f "$$LOG_FILE" ]; then \
 		tail -f "$$LOG_FILE"; \
 	else \
@@ -447,7 +447,7 @@ dev-edge-logs:
 
 .PHONY: dev-edge-status
 dev-edge-status:
-	@PID_FILE=$${ASTRA_EDGE_PID_FILE:-astra_edge.pid}; \
+	@PID_FILE=$${ASTRA_EDGE_PID_FILE:-$(CURDIR)/astra_edge.pid}; \
 	echo "Edge Provider Status:"; \
 	echo "====================="; \
 	if [ -f "$$PID_FILE" ] && kill -0 $$(cat "$$PID_FILE") 2>/dev/null; then \

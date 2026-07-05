@@ -19,7 +19,7 @@ LOCK_DIR="${ASTRA_EDGE_LOCK_DIR:-$REPO_ROOT/.astra_edge.lock}"
 BUILD_MODE="${BUILD_MODE:-debug}"
 WORKSPACE_DIR="${ASTRA_EDGE_WORKSPACE_DIR:-$PWD}"
 
-mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
+mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")" "$(dirname "$LOCK_DIR")"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     echo "⚠️  astra-edge start/stop is already in progress"
     exit 1
