@@ -3036,6 +3036,17 @@ pub(crate) mod tests {
         )])
     }
 
+    fn control_plane_runtime_environment_fields() -> serde_json::Map<String, Value> {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::cloud_control_plane(&registry),
+        );
+        serde_json::Map::from_iter([(
+            "runtime_environment_advertisement".to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )])
+    }
+
     #[test]
     fn provider_total_tokens_sums_disjoint_cache_buckets() {
         let mut state = make_test_loop_state();
@@ -3370,7 +3381,7 @@ pub(crate) mod tests {
                 }
             })
             .to_string(),
-            tool_result_fields: Some(edge_runtime_environment_fields()),
+            tool_result_fields: Some(control_plane_runtime_environment_fields()),
             status: "ok".to_string(),
             duration_ms: 10,
         }

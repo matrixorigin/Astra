@@ -3880,7 +3880,9 @@ esac
         assert!(result.is_error, "{result:?}");
         assert!(
             result.output.contains("policy denied: filesystem_write")
-                && result.output.contains("no fallback was attempted"),
+                && result
+                    .output
+                    .contains("no alternate execution provider was attempted"),
             "{}",
             result.output
         );
@@ -3927,9 +3929,9 @@ esac
         assert_eq!(blocked["call_id"], "call-unsupported-workspace");
         assert_eq!(blocked["reason"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
         assert!(
-            blocked["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("no fallback was attempted")),
+            blocked["message"].as_str().is_some_and(
+                |message| message.contains("no alternate execution provider was attempted")
+            ),
             "{blocked:?}"
         );
     }

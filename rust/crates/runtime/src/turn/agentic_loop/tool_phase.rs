@@ -1641,33 +1641,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .await;
     }
 
-    if let Some(reason) = execution_boundary_blocked_wait_reason(&new_tool_results) {
-        state.step_recorder.end_turn(false);
-        finalize_turn_trace(state).await;
-        refresh_runtime_promotion_signals_from_db(state).await;
-        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
-            reason,
-        )));
-    }
-
-    if let Some(reason) = detached_background_task_wait_reason(&edge_tool_round, &new_tool_results)
-    {
-        state.step_recorder.end_turn(false);
-        finalize_turn_trace(state).await;
-        refresh_runtime_promotion_signals_from_db(state).await;
-        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
-            reason,
-        )));
-    }
-
-    if let Some(reason) = agent_fanout_wait_reason(&edge_tool_round, &new_tool_results) {
-        state.step_recorder.end_turn(false);
-        finalize_turn_trace(state).await;
-        refresh_runtime_promotion_signals_from_db(state).await;
-        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
-            reason,
-        )));
-    }
+    let waiting_reason = execution_boundary_blocked_wait_reason(&new_tool_results)
+        .or_else(|| detached_background_task_wait_reason(&edge_tool_round, &new_tool_results))
+        .or_else(|| agent_fanout_wait_reason(&edge_tool_round, &new_tool_results));
 
     let _ = evo_records_before;
 
@@ -1747,6 +1723,15 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         state
             .turn_guard
             .record_tool_result(&edge_result.tool, &edge_result.output);
+    }
+
+    if let Some(reason) = waiting_reason {
+        state.step_recorder.end_turn(false);
+        finalize_turn_trace(state).await;
+        refresh_runtime_promotion_signals_from_db(state).await;
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
+            reason,
+        )));
     }
 
     if let Some(ref registry) = state.skills.registry_for_activation {

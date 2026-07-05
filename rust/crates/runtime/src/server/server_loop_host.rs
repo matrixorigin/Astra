@@ -6413,6 +6413,7 @@ mod tests {
             "user1".to_string(),
             "sess1".to_string(),
         )
+        .with_server_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
@@ -6430,13 +6431,16 @@ mod tests {
             "user1".to_string(),
             "sess1".to_string(),
         )
+        .with_server_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         assert!(host.valid_tool_names().contains("read_file"));
 
         let dir = tempfile::TempDir::new().unwrap();
-        let executor = Arc::new(runtime_tool_executor_with_agent_context(dir.path()));
+        let mut runtime_executor = runtime_tool_executor_with_agent_context(dir.path());
+        runtime_executor.set_execution_binding_snapshot(edge_runtime_snapshot());
+        let executor = Arc::new(runtime_executor);
         let mut state = create_test_state();
         state.runtime_tool_executor = Some(Arc::clone(&executor));
 
@@ -6482,6 +6486,7 @@ mod tests {
             "user1".to_string(),
             "sess1".to_string(),
         )
+        .with_server_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools())
         .with_edge_profile(edge_profile)
         .with_execution_binding_snapshot(edge_runtime_snapshot())
@@ -8436,6 +8441,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
+        .with_server_tool_catalog_enabled(false)
         .with_edge_tools(edge_tools)
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_disabled_tools(disabled_handle)
@@ -8465,6 +8471,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
+        .with_server_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools_with_ask_user())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
@@ -8498,6 +8505,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
+        .with_server_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools_with_ask_user())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_interactive_client(true)

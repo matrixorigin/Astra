@@ -394,7 +394,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     fn resolve_slot(&self, item: HeadlessRoundToolIdx) -> HeadlessResolvedToolSlot {
         resolve_headless_tool_slot(item, self.ctx.tool_calls, |i| {
             let edge = &self.ctx.edge_tool_round[i];
-            (edge.tool_name().to_string(), edge.tool_args().clone())
+            (
+                edge.assistant_tool_call_id(i),
+                edge.tool_name().to_string(),
+                edge.tool_args().clone(),
+            )
         })
     }
 
