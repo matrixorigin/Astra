@@ -842,6 +842,8 @@ mod tests {
 
         for expected in [
             "ask_user",
+            "task",
+            "session",
             "tool_search",
             "memory",
             "web_fetch",

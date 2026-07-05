@@ -6060,7 +6060,15 @@ mod tests {
         .build();
 
         let names = schema_names(&host.tool_schemas);
-        for expected in ["bash", "read_file", "tool_search", "web_search", "memory"] {
+        for expected in [
+            "bash",
+            "read_file",
+            "task",
+            "session",
+            "tool_search",
+            "web_search",
+            "memory",
+        ] {
             assert!(
                 names.contains(expected),
                 "{expected} should be visible in the composed server+edge surface: {names:?}"
@@ -6095,6 +6103,8 @@ mod tests {
             "edge-declared runtime tools should remain visible"
         );
         for server_owned in [
+            "task",
+            "session",
             "tool_search",
             "web_search",
             "memory",

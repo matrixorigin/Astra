@@ -54,6 +54,22 @@ impl Drop for EnvVarGuard {
     }
 }
 
+#[test]
+fn server_tool_catalog_stays_enabled_when_runtime_executor_tools_are_present() {
+    assert!(
+        AgenticRunLifecycleService::server_tool_catalog_enabled_for_request(false, false),
+        "server-only web runs must expose server backbone/control-plane tools"
+    );
+    assert!(
+        AgenticRunLifecycleService::server_tool_catalog_enabled_for_request(false, true),
+        "server+edge and managed-runtime runs must keep task/session/introspect server backbone tools"
+    );
+    assert!(
+        !AgenticRunLifecycleService::server_tool_catalog_enabled_for_request(true, true),
+        "agent-binding mode owns its own catalog and should not receive default server tools"
+    );
+}
+
 struct StaticRunControlProvider {
     status: Option<RunControlStatus>,
     calls: AtomicUsize,

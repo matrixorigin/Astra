@@ -3750,6 +3750,17 @@ impl AgenticRunLifecycleService {
         )
     }
 
+    fn server_tool_catalog_enabled_for_request(
+        agent_binding_mode: bool,
+        _has_runtime_executor_tools: bool,
+    ) -> bool {
+        // Edge, sandbox, and managed-runtime providers add workspace/process
+        // capacity. They must not replace the server-owned backbone:
+        // task/session lifecycle, introspect/reflect, planning, memory, web/API
+        // services, and policy/audit control-plane tools.
+        !agent_binding_mode
+    }
+
     /// Extract edge tools from the request context, or provide empty defaults.
     #[cfg(test)]
     fn extract_edge_tools(
@@ -4758,7 +4769,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let agent_binding_mode = request.agent_binding.is_some();
         let edge_context = Self::extract_edge_context(&request)?;
         let edge_tools = edge_context.edge_tools.clone();
-        let server_side_tool_catalog = !agent_binding_mode && edge_tools.is_empty();
+        let server_tool_catalog_enabled = Self::server_tool_catalog_enabled_for_request(
+            agent_binding_mode,
+            edge_context.has_tools(),
+        );
         let runtime_capabilities = self
             .prepare_runtime_capabilities(&request, &request_constraints)
             .await?;
@@ -4846,7 +4860,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
-        let _ = server_side_tool_catalog;
 
         if let Err(error) = self
             .persist_run_start(
@@ -4896,7 +4909,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &request,
             edge_tools,
             edge_profile.clone(),
-            server_side_tool_catalog,
+            server_tool_catalog_enabled,
             !agent_binding_mode,
             execution_bindings.as_ref(),
             plan_resume_hint,
@@ -5614,7 +5627,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let agent_binding_mode = request.agent_binding.is_some();
         let edge_context = Self::extract_edge_context(&request)?;
         let edge_tools = edge_context.edge_tools.clone();
-        let server_side_tool_catalog = !agent_binding_mode && edge_tools.is_empty();
+        let server_tool_catalog_enabled = Self::server_tool_catalog_enabled_for_request(
+            agent_binding_mode,
+            edge_context.has_tools(),
+        );
         let runtime_capabilities = self
             .prepare_runtime_capabilities(&request, &request_constraints)
             .await?;
@@ -5669,7 +5685,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
-        let _ = server_side_tool_catalog;
         let stream_agent_spawner = self
             .server_agent_spawner_for_session(&session_id)
             .await
@@ -5779,7 +5794,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &request,
             edge_tools,
             edge_profile.clone(),
-            server_side_tool_catalog,
+            server_tool_catalog_enabled,
             !agent_binding_mode,
             execution_bindings.as_ref(),
             plan_resume_hint,
