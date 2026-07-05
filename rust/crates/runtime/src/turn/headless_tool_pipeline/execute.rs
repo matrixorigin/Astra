@@ -28,9 +28,12 @@ pub(crate) async fn execute_tool_pure(
     token: &str,
     current_session_id: Option<&String>,
     session_turn: u32,
+    edge_round_present: bool,
 ) {
     if !execution.is_edge_tool && execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
-        if let Some(executor) = runtime_tool_executor {
+        if let Some(executor) = runtime_tool_executor
+            && !selected_runtime_provider_tool_missing_edge_result(execution, edge_round_present)
+        {
             executor.set_turn_index(session_turn.max(1));
             let mut server_args = execution.args.clone();
             if let Some(obj) = server_args.as_object_mut() {
@@ -68,6 +71,23 @@ pub(crate) async fn execute_tool_pure(
         std::mem::take(&mut execution.result_str),
     )
     .await;
+}
+
+fn selected_runtime_provider_tool_missing_edge_result(
+    execution: &super::HeadlessResolvedExecution,
+    edge_round_present: bool,
+) -> bool {
+    if !edge_round_present || execution.is_edge_tool {
+        return false;
+    }
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    registry.get(&execution.name).is_some_and(|spec| {
+        matches!(
+            spec.required.executor,
+            astra_runtime_env::RequiredExecutor::RuntimeExecutor
+                | astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
+        )
+    })
 }
 
 pub(super) fn execution_result_is_error(
@@ -225,6 +245,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.token,
             self.ctx.current_session_id,
             self.ctx.session_turn,
+            !self.ctx.edge_tool_round.is_empty(),
         )
         .await;
 
