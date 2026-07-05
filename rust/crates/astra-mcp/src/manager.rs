@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -145,36 +145,10 @@ impl McpClientManager {
     }
 
     /// Get all MCP tool schemas in OpenAI function-calling format.
-    /// Names follow the `mcp__{server}__{tool}` convention. Deduplicates on name collision.
+    /// Names follow the `mcp__{server}__{tool}` convention. Public-name
+    /// collisions fail closed instead of choosing an arbitrary route.
     pub fn all_tool_schemas(&self) -> Vec<Value> {
-        let mut seen: HashMap<String, &str> = HashMap::new();
-        let mut schemas = Vec::new();
-        let mut collision_count = 0usize;
-
-        for (server, tool) in self.all_tools() {
-            let schema = mcp_tool_to_schema(server, tool);
-            let name = schema["function"]["name"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            if let Some(prev_server) = seen.get(&name) {
-                tracing::warn!(
-                    public_name = %name,
-                    skipped_server = %server,
-                    kept_server = %prev_server,
-                    "MCP tool name collision; keeping first server and skipping duplicate"
-                );
-                collision_count += 1;
-                continue;
-            }
-            seen.insert(name, server);
-            schemas.push(schema);
-        }
-
-        if collision_count > 0 {
-            tracing::warn!("{collision_count} MCP tool(s) skipped due to name collisions");
-        }
-        schemas
+        build_tool_schemas(self.all_tools())
     }
 
     /// Find which server owns a sanitized MCP tool name (e.g. "mcp__moi__query_sql").
@@ -409,25 +383,68 @@ fn build_tool_route_index<'a, I>(tools: I) -> HashMap<String, McpToolRoute>
 where
     I: IntoIterator<Item = (&'a str, &'a Tool)>,
 {
+    let tools = tools.into_iter().collect::<Vec<_>>();
+    let collisions =
+        colliding_public_tool_names(tools.iter().map(|(server, tool)| (*server, *tool)));
     let mut routes: HashMap<String, McpToolRoute> = HashMap::new();
     for (server_name, tool) in tools {
-        let public_name = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool.name));
+        let public_name = public_tool_name(server_name, tool);
+        if collisions.contains(&public_name) {
+            tracing::warn!(
+                public_name = %public_name,
+                "MCP tool route collision; hiding ambiguous public name"
+            );
+            continue;
+        }
         let route = McpToolRoute {
             server_name: server_name.to_string(),
             original_tool_name: tool.name.to_string(),
         };
-        if let Some(existing) = routes.get(&public_name) {
-            tracing::warn!(
-                public_name = %public_name,
-                skipped_server = %route.server_name,
-                kept_server = %existing.server_name,
-                "MCP tool route collision; keeping first server and skipping duplicate"
-            );
-            continue;
-        }
         routes.insert(public_name, route);
     }
     routes
+}
+
+fn build_tool_schemas<'a, I>(tools: I) -> Vec<Value>
+where
+    I: IntoIterator<Item = (&'a str, &'a Tool)>,
+{
+    let tools = tools.into_iter().collect::<Vec<_>>();
+    let collisions =
+        colliding_public_tool_names(tools.iter().map(|(server, tool)| (*server, *tool)));
+    let mut schemas = Vec::new();
+    for (server, tool) in tools {
+        let public_name = public_tool_name(server, tool);
+        if collisions.contains(&public_name) {
+            tracing::warn!(
+                public_name = %public_name,
+                "MCP tool schema collision; hiding ambiguous public name"
+            );
+            continue;
+        }
+        schemas.push(mcp_tool_to_schema(server, tool));
+    }
+    schemas
+}
+
+fn colliding_public_tool_names<'a, I>(tools: I) -> HashSet<String>
+where
+    I: IntoIterator<Item = (&'a str, &'a Tool)>,
+{
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (server_name, tool) in tools {
+        *counts
+            .entry(public_tool_name(server_name, tool))
+            .or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter_map(|(name, count)| (count > 1).then_some(name))
+        .collect()
+}
+
+fn public_tool_name(server_name: &str, tool: &Tool) -> String {
+    sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool.name))
 }
 
 #[cfg(test)]
@@ -482,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_route_index_keeps_first_collision_winner() {
+    fn tool_route_index_drops_colliding_public_names() {
         let tools = [
             ("api", Tool::new("query.sql", "Query", empty_schema())),
             ("api", Tool::new("query sql", "Query", empty_schema())),
@@ -490,13 +507,31 @@ mod tests {
 
         let index = build_tool_route_index(tools.iter().map(|(server, tool)| (*server, tool)));
 
-        assert_eq!(
-            index.get("mcp__api__query_sql"),
-            Some(&McpToolRoute {
-                server_name: "api".to_string(),
-                original_tool_name: "query.sql".to_string(),
+        assert!(!index.contains_key("mcp__api__query_sql"));
+    }
+
+    #[test]
+    fn tool_schema_builder_drops_colliding_public_names() {
+        let tools = [
+            ("api", Tool::new("query.sql", "Query", empty_schema())),
+            ("api", Tool::new("query sql", "Query", empty_schema())),
+            ("api", Tool::new("status", "Status", empty_schema())),
+        ];
+
+        let schemas = build_tool_schemas(tools.iter().map(|(server, tool)| (*server, tool)));
+        let names: HashSet<String> = schemas
+            .iter()
+            .filter_map(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
             })
-        );
+            .map(str::to_string)
+            .collect();
+
+        assert!(!names.contains("mcp__api__query_sql"));
+        assert!(names.contains("mcp__api__status"));
     }
 
     #[test]
