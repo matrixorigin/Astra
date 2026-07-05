@@ -5,7 +5,10 @@ use serde_json::Map;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use super::tool_admission::resolve_tool_admission_for_binding;
+use super::tool_admission::{
+    ToolAdmissionContext, ToolHiddenReason, resolve_tool_admission_for_binding,
+    resolve_tool_admission_for_binding_with_context,
+};
 use super::tool_edge_transport::execute_edge_bound;
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolTransportKind,
@@ -306,21 +309,22 @@ impl ToolExecutionService {
         };
 
         // ── Runtime disabled-offer check (admin API / config) ──
-        let admission = resolve_tool_admission_for_binding(
+        let disabled_offer_ids = self.disabled_tool_offers.read().await.clone();
+        let admission = resolve_tool_admission_for_binding_with_context(
             &transport_request.tool_name,
             &[],
             &transport_request.workspace,
             &transport_request.executor,
             transport_request.runtime.as_ref(),
             &self.tool_registry,
+            ToolAdmissionContext {
+                disabled_tool_offers: disabled_offer_ids.clone(),
+                ..ToolAdmissionContext::default()
+            },
         );
-        let disabled_offer_id = self.disabled_tool_offers.read().await;
-        if admission.disabled_by_offer_ids(&disabled_offer_id) {
-            let offer_id = admission
-                .selected_offer_id()
-                .unwrap_or("unknown")
-                .to_string();
-            drop(disabled_offer_id);
+        if let Some(offer_id) =
+            disabled_offer_id_for_request(&transport_request, &admission, &disabled_offer_ids)
+        {
             let mut meta = serde_json::Map::new();
             meta.insert("tool_disabled".to_string(), serde_json::Value::Bool(true));
             meta.insert(
@@ -513,6 +517,23 @@ fn append_route_binding_metadata(
             metadata.entry(key).or_insert(value);
         }
     }
+}
+
+fn disabled_offer_id_for_request(
+    request: &ToolExecutionRequest,
+    admission: &super::tool_admission::ToolAdmissionDecision,
+    disabled_offer_ids: &HashSet<String>,
+) -> Option<String> {
+    if admission.hidden_reason == Some(ToolHiddenReason::DisabledOffer) {
+        return admission.selected_offer_id().map(str::to_string);
+    }
+    if request.tool_name.starts_with("mcp__") {
+        let request_scoped_offer_id = format!("{}@request-scoped-mcp", request.tool_name);
+        if disabled_offer_ids.contains(&request_scoped_offer_id) {
+            return Some(request_scoped_offer_id);
+        }
+    }
+    None
 }
 
 fn no_workspace() -> WorkspaceBinding {

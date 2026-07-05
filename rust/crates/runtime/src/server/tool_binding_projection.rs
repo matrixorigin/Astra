@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::server::tool_admission::{
     ToolAdmissionContext, active_provider_declarations_for_binding,
-    has_explicit_runtime_executor_provider, resolve_tool_admission_for_providers,
+    has_explicit_runtime_executor_provider,
 };
 
 use super::tool_execution_binding::{
@@ -46,7 +46,7 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
         executor,
         runtime,
         &registry,
-        admission_context,
+        &admission_context,
     );
     schemas
         .into_iter()
@@ -60,9 +60,15 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
             {
                 return false;
             }
-            let admission = resolve_tool_admission_for_providers(
-                tool_name, workspace, executor, &providers, &registry,
-            );
+            let admission =
+                crate::server::tool_admission::resolve_tool_admission_for_providers_with_context(
+                    tool_name,
+                    workspace,
+                    executor,
+                    &providers,
+                    &registry,
+                    &admission_context,
+                );
             if !admission.visible {
                 return false;
             }

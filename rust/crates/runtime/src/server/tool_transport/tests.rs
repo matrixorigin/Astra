@@ -3174,6 +3174,39 @@ async fn request_scoped_mcp_tools_bypass_edge_transport() {
     assert_eq!(metadata["transport"], "mcp_http");
 }
 
+#[tokio::test]
+async fn disabled_request_scoped_mcp_offer_blocks_execution_without_schema_inventory() {
+    let service = ToolExecutionService::builder()
+        .initial_disabled_tool_offers(&["mcp__demo__search@request-scoped-mcp".to_string()])
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(
+            request(
+                "mcp__demo__search",
+                WorkspaceBinding::none(),
+                ExecutorBinding {
+                    kind: ExecutorBindingKind::Mcp,
+                    executor_id: "request-scoped-mcp".to_string(),
+                    display_name: "MCP server".to_string(),
+                    transport: ToolTransportKind::McpHttp,
+                    status: ExecutorStatus::Online,
+                },
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("disabled metadata");
+    assert_eq!(metadata["tool_disabled"], true);
+    assert_eq!(
+        metadata["tool_offer_id"],
+        "mcp__demo__search@request-scoped-mcp"
+    );
+    assert_eq!(local.calls(), 0);
+}
+
 // ── Cancel token propagation ──────────────────────────────────────────
 
 #[tokio::test]

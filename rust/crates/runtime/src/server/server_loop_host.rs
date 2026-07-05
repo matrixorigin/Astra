@@ -3363,12 +3363,6 @@ impl ServerAgenticLoopHost {
         filter_tool_schemas_by_excluded_names(self.tool_schemas.clone(), restricted_tools)
     }
 
-    fn route_for_current_binding(&self, tool_name: &str) -> ToolExecutionRouteKind {
-        let registry = astra_runtime_env::ToolRegistry::builtins();
-        self.admission_for_current_binding(tool_name, &registry)
-            .selected_route()
-    }
-
     fn admission_for_current_binding(
         &self,
         tool_name: &str,
@@ -3381,12 +3375,24 @@ impl ServerAgenticLoopHost {
             &self.executor_binding,
             self.runtime_binding.as_ref(),
             registry,
-            ToolAdmissionContext {
-                server_service_provider_ready: self.server_provider_catalog_enabled,
-                control_plane_provider_ready: self.server_provider_catalog_enabled,
-                request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
-            },
+            self.tool_admission_context(),
         )
+    }
+
+    fn disabled_tool_offers_snapshot(&self) -> HashSet<String> {
+        self.disabled_tool_offers
+            .try_read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn tool_admission_context(&self) -> ToolAdmissionContext {
+        ToolAdmissionContext {
+            server_service_provider_ready: self.server_provider_catalog_enabled,
+            control_plane_provider_ready: self.server_provider_catalog_enabled,
+            request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
+            disabled_tool_offers: self.disabled_tool_offers_snapshot(),
+        }
     }
 
     fn tool_admission_snapshot_entries(
@@ -3431,13 +3437,18 @@ impl ServerAgenticLoopHost {
         let Some(executor) = state.runtime_tool_executor.as_deref() else {
             return tools;
         };
+        let registry = astra_runtime_env::ToolRegistry::builtins();
         tools
             .into_iter()
             .filter(|tool| {
                 let Some(name) = tool_schema_name(tool) else {
                     return false;
                 };
-                match self.route_for_current_binding(name) {
+                let admission = self.admission_for_current_binding(name, &registry);
+                if !admission.visible {
+                    return false;
+                }
+                match admission.selected_route() {
                     ToolExecutionRouteKind::EdgeBound
                     | ToolExecutionRouteKind::GatewayRelay
                     | ToolExecutionRouteKind::SandboxResidentAgent => true,
@@ -3460,11 +3471,6 @@ impl ServerAgenticLoopHost {
     }
 
     fn runtime_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
-        let disabled: HashSet<String> = self
-            .disabled_tool_offers
-            .try_read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
         let registry = astra_runtime_env::ToolRegistry::builtins();
         self.tool_schemas
             .iter()
@@ -3476,9 +3482,8 @@ impl ServerAgenticLoopHost {
             })
             .filter(|name| {
                 let admission = self.admission_for_current_binding(name, &registry);
-                let disabled_on_current_offer = admission.disabled_by_offer_ids(&disabled);
                 !crate::turn::agentic::tool_interception::runtime_allows_tool(state, name)
-                    || disabled_on_current_offer
+                    || !admission.visible
             })
             .collect()
     }
@@ -3554,7 +3559,7 @@ impl ServerAgenticLoopHost {
             return HashSet::new();
         }
 
-        if let Some(executor) = executor {
+        let deferred_tool_names = if let Some(executor) = executor {
             let runtime_bound = executor.runtime_bound_tool_names(deferred_tool_names.clone());
             if runtime_bound != deferred_tool_names {
                 let removed: Vec<&str> = deferred_tool_names
@@ -3572,10 +3577,18 @@ impl ServerAgenticLoopHost {
                     removed.len(),
                     deferred_tool_names.len()
                 );
-                return runtime_bound;
+                runtime_bound
+            } else {
+                deferred_tool_names
             }
-        }
+        } else {
+            deferred_tool_names
+        };
+        let registry = astra_runtime_env::ToolRegistry::builtins();
         deferred_tool_names
+            .into_iter()
+            .filter(|name| self.admission_for_current_binding(name, &registry).visible)
+            .collect()
     }
 
     fn prompt_deferred_tool_names_for_wire_tools(
@@ -6811,6 +6824,64 @@ mod tests {
             "server tool_search must resolve names advertised in the deferred manifest: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_deferred_offer_is_not_advertised_to_tool_search() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            json!(["agent_fanout"]),
+        );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            json!("<deferred-tools>\nagent_fanout\n</deferred-tools>"),
+        );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            json!(200_000),
+        );
+        let disabled = Arc::new(tokio::sync::RwLock::new(HashSet::from([
+            "agent_fanout@server-control-plane".to_string(),
+        ])));
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_profile(edge_profile)
+        .with_disabled_tool_offers(disabled)
+        .build();
+        host.resolved_model_name = Some("test-model".to_string());
+        host.resolved_context_window = Some(200_000);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(runtime_tool_executor_with_agent_context(dir.path()));
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(Arc::clone(&executor));
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        assert!(
+            !executor
+                .current_activatable_tool_names_snapshot()
+                .contains("agent_fanout"),
+            "disabled deferred offers must not be activatable"
+        );
+        let result = executor
+            .execute_with_metadata("tool_search", &json!({"query": "Select:agent_fanout"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not resolve a disabled deferred offer: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("agent_fanout"));
     }
 
     #[tokio::test]

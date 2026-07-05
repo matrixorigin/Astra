@@ -28,6 +28,7 @@ pub(crate) struct ToolOffer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolOfferCandidateReason {
     Selected,
+    Disabled,
     CurrentProviderPreferred,
     LowerPriority,
     RouteMismatch,
@@ -49,6 +50,7 @@ pub(crate) enum ToolHiddenReason {
     ProviderRouteMismatch,
     UnsupportedRoute,
     SchemaConflict,
+    DisabledOffer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,11 +63,12 @@ pub(crate) struct ToolAdmissionDecision {
     pub hidden_reason: Option<ToolHiddenReason>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolAdmissionContext {
     pub server_service_provider_ready: bool,
     pub control_plane_provider_ready: bool,
     pub request_scoped_mcp_provider_ready: bool,
+    pub disabled_tool_offers: HashSet<String>,
 }
 
 impl Default for ToolAdmissionContext {
@@ -74,6 +77,7 @@ impl Default for ToolAdmissionContext {
             server_service_provider_ready: true,
             control_plane_provider_ready: true,
             request_scoped_mcp_provider_ready: false,
+            disabled_tool_offers: HashSet::new(),
         }
     }
 }
@@ -87,11 +91,6 @@ impl ToolAdmissionDecision {
         self.selected_offer
             .as_ref()
             .map(|offer| offer.offer_id.as_str())
-    }
-
-    pub(crate) fn disabled_by_offer_ids(&self, disabled_offer_ids: &HashSet<String>) -> bool {
-        self.selected_offer_id()
-            .is_some_and(|offer_id| disabled_offer_ids.contains(offer_id))
     }
 }
 
@@ -124,17 +123,20 @@ pub(crate) fn resolve_tool_admission_for_binding_with_context(
     context: ToolAdmissionContext,
 ) -> ToolAdmissionDecision {
     let providers = active_provider_declarations_for_binding(
-        schemas, workspace, executor, runtime, registry, context,
+        schemas, workspace, executor, runtime, registry, &context,
     );
-    resolve_tool_admission_for_providers(tool_name, workspace, executor, &providers, registry)
+    resolve_tool_admission_for_providers_with_context(
+        tool_name, workspace, executor, &providers, registry, &context,
+    )
 }
 
-pub(crate) fn resolve_tool_admission_for_providers(
+pub(crate) fn resolve_tool_admission_for_providers_with_context(
     tool_name: &str,
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
     providers: &[CapacityProviderDeclaration],
     registry: &astra_runtime_env::ToolRegistry,
+    context: &ToolAdmissionContext,
 ) -> ToolAdmissionDecision {
     let class = tool_execution_class(tool_name, registry);
     let route =
@@ -146,6 +148,18 @@ pub(crate) fn resolve_tool_admission_for_providers(
         candidate_offers_for_tool(tool_name, workspace, providers)
     };
     let schema_conflict = has_schema_conflict(&raw_candidates);
+
+    let selected_offer_before_disabled =
+        if !matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
+            provider_for_route(tool_name, workspace, route, providers).map(|provider| {
+                offer_for_provider(tool_name, provider, route, CapacityProviderStatus::Ready)
+            })
+        } else {
+            None
+        };
+    let selected_offer_disabled = selected_offer_before_disabled
+        .as_ref()
+        .is_some_and(|offer| context.disabled_tool_offers.contains(&offer.offer_id));
 
     let hidden_reason = hidden_reason_for(class, route).or_else(|| {
         if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
@@ -163,24 +177,29 @@ pub(crate) fn resolve_tool_admission_for_providers(
         if provider_for_route(tool_name, workspace, route, providers).is_none() {
             return Some(ToolHiddenReason::ProviderRouteMismatch);
         }
+        if selected_offer_disabled {
+            return Some(ToolHiddenReason::DisabledOffer);
+        }
         None
     });
-    let selected_offer =
-        if hidden_reason.is_none() && !matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
-            provider_for_route(tool_name, workspace, route, providers).map(|provider| {
-                offer_for_provider(tool_name, provider, route, CapacityProviderStatus::Ready)
-            })
-        } else {
-            None
-        };
+    let selected_offer = if matches!(hidden_reason, None | Some(ToolHiddenReason::DisabledOffer))
+        && !matches!(class, ToolExecutionClass::TurnPipelineIntercept)
+    {
+        selected_offer_before_disabled
+    } else {
+        None
+    };
     let candidates = raw_candidates
         .into_iter()
         .map(|offer| {
             let selected = selected_offer
                 .as_ref()
                 .is_some_and(|selected| selected.offer_id == offer.offer_id);
+            let disabled = context.disabled_tool_offers.contains(&offer.offer_id);
             let reason = if schema_conflict {
                 ToolOfferCandidateReason::SchemaConflict
+            } else if disabled {
+                ToolOfferCandidateReason::Disabled
             } else {
                 candidate_reason(&offer, selected, route)
             };
@@ -208,7 +227,7 @@ pub(crate) fn active_provider_declarations_for_binding(
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
     registry: &astra_runtime_env::ToolRegistry,
-    context: ToolAdmissionContext,
+    context: &ToolAdmissionContext,
 ) -> Vec<CapacityProviderDeclaration> {
     let mut providers = Vec::new();
     if context.server_service_provider_ready {
@@ -676,6 +695,115 @@ mod tests {
     }
 
     #[test]
+    fn disabled_selected_offer_is_hidden_with_selected_offer_diagnostics() {
+        let decision = resolve_tool_admission_for_binding_with_context(
+            "web_fetch",
+            &[],
+            &WorkspaceBinding::none(),
+            &ExecutorBinding::server_local(),
+            None,
+            &registry(),
+            ToolAdmissionContext {
+                disabled_tool_offers: HashSet::from(["web_fetch@server-builtin".to_string()]),
+                ..ToolAdmissionContext::default()
+            },
+        );
+
+        assert!(!decision.visible);
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::DisabledOffer)
+        );
+        assert_eq!(
+            decision.selected_offer_id(),
+            Some("web_fetch@server-builtin")
+        );
+        assert_eq!(decision.candidates.len(), 1);
+        assert!(decision.candidates[0].selected);
+        assert_eq!(
+            decision.candidates[0].reason,
+            ToolOfferCandidateReason::Disabled
+        );
+    }
+
+    #[test]
+    fn disabled_server_offer_does_not_hide_selected_edge_offer() {
+        let decision = resolve_tool_admission_for_binding_with_context(
+            "web_fetch",
+            &[],
+            &WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            &ExecutorBinding::edge_agent(
+                "edge-macpro",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            None,
+            &registry(),
+            ToolAdmissionContext {
+                disabled_tool_offers: HashSet::from(["web_fetch@server-builtin".to_string()]),
+                ..ToolAdmissionContext::default()
+            },
+        );
+
+        assert!(decision.visible);
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
+        let server_candidate = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.offer.offer_id == "web_fetch@server-builtin")
+            .expect("server candidate");
+        assert!(!server_candidate.selected);
+        assert_eq!(server_candidate.reason, ToolOfferCandidateReason::Disabled);
+    }
+
+    #[test]
+    fn disabled_selected_edge_offer_hides_shared_tool_without_server_reroute() {
+        let decision = resolve_tool_admission_for_binding_with_context(
+            "web_fetch",
+            &[],
+            &WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            &ExecutorBinding::edge_agent(
+                "edge-macpro",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            None,
+            &registry(),
+            ToolAdmissionContext {
+                disabled_tool_offers: HashSet::from(["web_fetch@edge-macpro".to_string()]),
+                ..ToolAdmissionContext::default()
+            },
+        );
+
+        assert!(!decision.visible);
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::DisabledOffer)
+        );
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
+        let server_candidate = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.offer.offer_id == "web_fetch@server-builtin")
+            .expect("server candidate");
+        assert!(!server_candidate.selected);
+        assert_eq!(
+            server_candidate.reason,
+            ToolOfferCandidateReason::CurrentProviderPreferred
+        );
+    }
+
+    #[test]
     fn same_tool_name_with_different_schema_digests_fails_closed() {
         let providers = vec![
             astra_runtime_env::server_service_provider("server-builtin", &registry())
@@ -687,7 +815,7 @@ mod tests {
             )
             .with_tool_schema_digest("web_fetch", "sha256:edge"),
         ];
-        let decision = resolve_tool_admission_for_providers(
+        let decision = resolve_tool_admission_for_providers_with_context(
             "web_fetch",
             &WorkspaceBinding::edge_workspace(
                 "MacBook Pro",
@@ -702,6 +830,7 @@ mod tests {
             ),
             &providers,
             &registry(),
+            &ToolAdmissionContext::default(),
         );
 
         assert!(!decision.visible);
