@@ -293,7 +293,8 @@ pub(super) async fn admin_disable_tool_handler(
     let added = state
         .tool_execution_service
         .disable_tool_offer(&body.offer_id)
-        .await;
+        .await
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(serde_json::json!({
         "offer_id": body.offer_id,
         "was_added": added,
@@ -310,7 +311,8 @@ pub(super) async fn admin_enable_tool_handler(
     let removed = state
         .tool_execution_service
         .enable_tool_offer(&offer_id)
-        .await;
+        .await
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(serde_json::json!({
         "offer_id": offer_id,
         "was_removed": removed,

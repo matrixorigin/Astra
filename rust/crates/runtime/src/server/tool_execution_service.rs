@@ -162,16 +162,19 @@ impl Default for ToolExecutionService {
 }
 
 impl ToolExecutionService {
-    pub async fn disable_tool_offer(&self, name: &str) -> bool {
-        self.disabled_tool_offers
+    pub async fn disable_tool_offer(&self, offer_id: &str) -> Result<bool, String> {
+        validate_tool_offer_id(offer_id)?;
+        Ok(self
+            .disabled_tool_offers
             .write()
             .await
-            .insert(name.to_string())
+            .insert(offer_id.to_string()))
     }
 
     /// Enable a previously disabled tool offer at runtime (returns true if it was disabled).
-    pub async fn enable_tool_offer(&self, name: &str) -> bool {
-        self.disabled_tool_offers.write().await.remove(name)
+    pub async fn enable_tool_offer(&self, offer_id: &str) -> Result<bool, String> {
+        validate_tool_offer_id(offer_id)?;
+        Ok(self.disabled_tool_offers.write().await.remove(offer_id))
     }
 
     /// List currently disabled tool offers.
@@ -627,6 +630,16 @@ fn disallowed_offer_id_for_request(
     None
 }
 
+fn validate_tool_offer_id(offer_id: &str) -> Result<(), String> {
+    if astra_runtime_env::is_valid_tool_offer_id(offer_id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "tool offer id must be a concrete '<tool>@<provider>' id (got '{offer_id}')"
+        ))
+    }
+}
+
 fn no_workspace() -> WorkspaceBinding {
     WorkspaceBinding {
         kind: WorkspaceBindingKind::None,
@@ -650,19 +663,54 @@ mod tests {
         assert!(svc.disabled_tool_offers().await.is_empty());
         assert!(!svc.is_tool_offer_disabled("web_fetch@server-builtin").await);
 
-        svc.disable_tool_offer("web_fetch@server-builtin").await;
-        svc.disable_tool_offer("web_search@server-builtin").await;
+        svc.disable_tool_offer("web_fetch@server-builtin")
+            .await
+            .unwrap();
+        svc.disable_tool_offer("web_search@server-builtin")
+            .await
+            .unwrap();
         assert!(svc.is_tool_offer_disabled("web_fetch@server-builtin").await);
-        assert!(!svc.disable_tool_offer("web_fetch@server-builtin").await);
+        assert!(
+            !svc.disable_tool_offer("web_fetch@server-builtin")
+                .await
+                .unwrap()
+        );
 
         let list = svc.disabled_tool_offers().await;
         assert_eq!(list.len(), 2);
         assert!(list.contains(&"web_fetch@server-builtin".to_string()));
         assert!(list.contains(&"web_search@server-builtin".to_string()));
 
-        assert!(svc.enable_tool_offer("web_fetch@server-builtin").await);
+        assert!(
+            svc.enable_tool_offer("web_fetch@server-builtin")
+                .await
+                .unwrap()
+        );
         assert!(!svc.is_tool_offer_disabled("web_fetch@server-builtin").await);
-        assert!(!svc.enable_tool_offer("web_fetch@server-builtin").await);
-        assert!(!svc.enable_tool_offer("nonexistent@server-builtin").await);
+        assert!(
+            !svc.enable_tool_offer("web_fetch@server-builtin")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !svc.enable_tool_offer("nonexistent@server-builtin")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_tool_offers_reject_global_or_ambiguous_ids() {
+        let svc = ToolExecutionService::new_for_test();
+
+        for offer_id in ["web_fetch", "web_fetch@edge@macpro", "web_fetch@../edge"] {
+            let error = svc.disable_tool_offer(offer_id).await.unwrap_err();
+            assert!(
+                error.contains("tool offer id must be a concrete"),
+                "invalid offer id {offer_id:?} should fail fast: {error}"
+            );
+        }
+
+        assert!(svc.disabled_tool_offers().await.is_empty());
     }
 }

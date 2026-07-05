@@ -129,6 +129,22 @@ async fn handle_edge_connection(
         }
     };
 
+    if !astra_runtime_env::is_valid_provider_id(&edge_agent_id) {
+        tracing::warn!(
+            target: "astra_runtime::edge_ws",
+            edge_agent_id = %edge_agent_id,
+            "edge WebSocket auth failed: invalid edge_agent_id"
+        );
+        let _ = send_edge_msg(
+            &ws_sink,
+            EdgeServerMessage::AuthError {
+                message: "invalid edge_agent_id".into(),
+            },
+        )
+        .await;
+        return;
+    }
+
     // Validate token
     let mut headers = HeaderMap::new();
     if let Ok(hv) = axum::http::HeaderValue::from_str(&format!("Bearer {token}")) {
@@ -735,6 +751,16 @@ fn validate_edge_capabilities(
         return None;
     }
 
+    if advert.binding.executor.executor_id != edge_agent_id {
+        tracing::warn!(
+            target: "astra_runtime::edge_ws",
+            edge_agent_id = %edge_agent_id,
+            advertised_executor_id = %advert.binding.executor.executor_id,
+            "edge sent executor id that does not match authenticated edge id; accepting with empty capabilities"
+        );
+        return None;
+    }
+
     // Cross-reference tool names against the edge provider contract. Strip
     // registry-only, server-owned, or currently unavailable tools — edge is a
     // runtime executor provider, not a source of server/control-plane capacity.
@@ -875,6 +901,17 @@ mod tests {
             .expect("edge advertisement serializes")
     }
 
+    fn edge_advertisement_with_executor_id(
+        executor_id: &str,
+        tool_names: &[&str],
+    ) -> serde_json::Value {
+        let mut advert: RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(edge_advertisement_with_tools(tool_names))
+                .expect("edge advertisement parses");
+        advert.binding.executor.executor_id = executor_id.to_string();
+        serde_json::to_value(advert).expect("edge advertisement serializes")
+    }
+
     #[test]
     fn validate_edge_capabilities_strips_non_edge_provider_tools() {
         let capabilities = edge_advertisement_with_tools(&[
@@ -914,6 +951,19 @@ mod tests {
                 .iter()
                 .all(|denial| denial.tool_name == "write_file"),
             "edge capability denials should only describe edge-owned runtime tools"
+        );
+    }
+
+    #[test]
+    fn validate_edge_capabilities_rejects_executor_id_mismatch() {
+        let capabilities =
+            edge_advertisement_with_executor_id("edge@forged", &["read_file", "bash"]);
+
+        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1");
+
+        assert!(
+            sanitized.is_none(),
+            "edge advertisement executor id must match authenticated edge id before tools become offers"
         );
     }
 

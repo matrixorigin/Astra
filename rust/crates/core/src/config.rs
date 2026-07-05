@@ -115,6 +115,48 @@ impl DeploymentConfig {
             }
         }
     }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_tool_offer_ids(&self.disabled_tool_offers)
+    }
+}
+
+fn validate_tool_offer_ids(offer_ids: &[String]) -> Result<(), String> {
+    for offer_id in offer_ids {
+        if !is_valid_tool_offer_id(offer_id) {
+            return Err(format!(
+                "disabled_tool_offers entries must be concrete offer ids in the form '<tool>@<provider>' (got '{offer_id}')"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_tool_offer_id(value: &str) -> bool {
+    let Some((tool_name, provider_id)) = value.split_once('@') else {
+        return false;
+    };
+    !provider_id.contains('@')
+        && is_valid_tool_offer_tool_name(tool_name)
+        && is_valid_tool_offer_provider_id(provider_id)
+}
+
+fn is_valid_tool_offer_tool_name(value: &str) -> bool {
+    is_valid_tool_offer_identifier_part(value, false)
+}
+
+fn is_valid_tool_offer_provider_id(value: &str) -> bool {
+    is_valid_tool_offer_identifier_part(value, true)
+}
+
+fn is_valid_tool_offer_identifier_part(value: &str, provider: bool) -> bool {
+    !value.is_empty()
+        && value.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'-')
+                || (provider && matches!(byte, b'.' | b':'))
+        })
 }
 
 /// Database connection pool configuration.
@@ -609,6 +651,10 @@ impl ServerConfig {
             .runtime
             .validate()
             .map_err(ConfigError::InvalidValue)?;
+        config
+            .deployment
+            .validate()
+            .map_err(ConfigError::InvalidValue)?;
 
         Ok(config)
     }
@@ -624,8 +670,13 @@ impl ServerConfig {
     /// Parse configuration from a TOML string.
     pub(crate) fn parse(toml_content: &str) -> Result<Self, ConfigError> {
         reject_deprecated_auth_toml(toml_content)?;
-        toml::from_str(toml_content)
-            .map_err(|e| ConfigError::InvalidValue(format!("failed to parse TOML: {}", e)))
+        let config: Self = toml::from_str(toml_content)
+            .map_err(|e| ConfigError::InvalidValue(format!("failed to parse TOML: {}", e)))?;
+        config
+            .deployment
+            .validate()
+            .map_err(ConfigError::InvalidValue)?;
+        Ok(config)
     }
 
     /// Merge another config into this one (other takes precedence for non-None fields).
@@ -761,6 +812,7 @@ impl AppSettings {
         settings.disabled_tool_offers = sc.deployment.disabled_tool_offers.clone();
         settings.provider_allowed_tools = sc.deployment.provider_allowed_tools.clone();
         settings.external_auth_providers = sc.auth.external_providers.clone();
+        validate_tool_offer_ids(&settings.disabled_tool_offers).map_err(ConfigError::Validation)?;
         Ok(settings)
     }
 
@@ -819,7 +871,7 @@ impl AppSettings {
         };
         matrixone.validate().map_err(ConfigError::Validation)?;
 
-        Ok(Self {
+        let settings = Self {
             matrixone,
             database_bootstrap_catalog: value_or_default(
                 &lookup,
@@ -845,7 +897,9 @@ impl AppSettings {
             external_auth_providers: Vec::new(),
             disabled_tool_offers: Self::disabled_tool_offers_from_lookup(&lookup),
             provider_allowed_tools: HashMap::new(),
-        })
+        };
+        validate_tool_offer_ids(&settings.disabled_tool_offers).map_err(ConfigError::Validation)?;
+        Ok(settings)
     }
 }
 
@@ -1998,7 +2052,7 @@ auth_mode = "legacy"
     fn deployment_disabled_tool_offers_from_toml() {
         let toml_str = r#"
             [deployment]
-            disabled_tool_offers = ["tool_a@server", "tool_b@edge-1"]
+            disabled_tool_offers = ["tool_a@server", "tool_b@edge:macpro.local"]
 
             [deployment.provider_allowed_tools]
             server-builtin = ["web_fetch", "memory"]
@@ -2007,7 +2061,10 @@ auth_mode = "legacy"
         let config = ServerConfig::parse(toml_str).unwrap();
         assert_eq!(
             config.deployment.disabled_tool_offers,
-            vec!["tool_a@server".to_string(), "tool_b@edge-1".to_string()]
+            vec![
+                "tool_a@server".to_string(),
+                "tool_b@edge:macpro.local".to_string()
+            ]
         );
         assert_eq!(
             config
@@ -2069,6 +2126,75 @@ auth_mode = "legacy"
                 .to_string()
                 .contains("unknown field `disabled_tool_names`"),
             "legacy global disabled tool names must fail fast: {error}"
+        );
+    }
+
+    #[test]
+    fn deployment_rejects_global_names_in_disabled_tool_offers() {
+        let toml_str = r#"
+            [deployment]
+            disabled_tool_offers = ["web_fetch"]
+            "#;
+        let error = ServerConfig::parse(toml_str).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("disabled_tool_offers entries must be concrete offer ids"),
+            "disabled_tool_offers must reject global tool names: {error}"
+        );
+    }
+
+    #[test]
+    fn deployment_rejects_ambiguous_disabled_tool_offer_ids() {
+        for offer_id in [
+            "web_fetch@edge@macpro",
+            "web_fetch@edge macpro",
+            "web_fetch@../edge",
+            "web.fetch@server-builtin",
+            "web_fetch@...",
+        ] {
+            let toml_str = format!(
+                r#"
+                [deployment]
+                disabled_tool_offers = ["{offer_id}"]
+                "#
+            );
+            let error = ServerConfig::parse(&toml_str).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("disabled_tool_offers entries must be concrete offer ids"),
+                "disabled_tool_offers must reject ambiguous offer id {offer_id:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_settings_reject_global_names_in_disabled_tool_offers_env() {
+        let mut values = HashMap::new();
+        values.insert(
+            "MATRIXONE_PASSWORD".to_string(),
+            "test-password".to_string(),
+        );
+        values.insert(
+            "ASTRA_JWT_SECRET".to_string(),
+            "my-test-jwt-secret-key-at-least-32-chars--".to_string(),
+        );
+        values.insert(
+            "ASTRA_BRIDGE_SECRET".to_string(),
+            "bridge-secret".to_string(),
+        );
+        values.insert(
+            "ASTRA_DISABLED_TOOL_OFFERS".to_string(),
+            "web_fetch, bash@edge-1".to_string(),
+        );
+
+        let error = AppSettings::from_map(&values).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("disabled_tool_offers entries must be concrete offer ids"),
+            "ASTRA_DISABLED_TOOL_OFFERS must reject global tool names: {error}"
         );
     }
 
