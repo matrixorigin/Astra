@@ -25,7 +25,9 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::{AgentProgressEvent, ProgressEventType};
-use crate::server::tool_admission::resolve_tool_admission_for_binding;
+use crate::server::tool_admission::{
+    ToolAdmissionContext, resolve_tool_admission_for_binding_with_context,
+};
 use crate::server::tool_route_selection::{
     ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding, routing_decision_for_binding,
     runtime_tools_route_to_edge_provider,
@@ -1110,6 +1112,7 @@ pub struct ServerAgenticLoopHost {
     workspace_binding: WorkspaceBinding,
     executor_binding: ExecutorBinding,
     runtime_binding: Option<astra_runtime_env::RuntimeBinding>,
+    request_scoped_mcp_provider_ready: bool,
     /// Session-scoped cache for dedup of identical read-only tool invocations
     /// within a short window. Gated by concurrency_safety classification.
     tool_result_cache: astra_turn_core::tool_result_dedup::SharedResultCache,
@@ -1590,6 +1593,7 @@ impl ServerAgenticLoopHostBuilder {
             workspace_binding: schema_workspace.clone(),
             executor_binding: schema_executor.clone(),
             runtime_binding: schema_runtime.clone(),
+            request_scoped_mcp_provider_ready: false,
             tool_result_cache: astra_turn_core::tool_result_dedup::new_shared_cache(
                 128,
                 Some(std::time::Duration::from_secs(30)),
@@ -1876,16 +1880,21 @@ impl ServerAgenticLoopHost {
     /// Updates `tool_schemas`, `valid_tools`, and `admissible_extras`
     /// so the LLM sees MCP tools and the validator admits them.
     pub fn install_runtime_tool_schemas(&mut self, schemas: Vec<Value>) {
+        let mut installed_request_scoped_mcp_schema = false;
         for schema in &schemas {
             if let Some(name) = schema
                 .get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(|v| v.as_str())
             {
+                if name.starts_with("mcp__") {
+                    installed_request_scoped_mcp_schema = true;
+                }
                 self.valid_tools.insert(name.to_string());
                 self.admissible_extras.push(name.to_string());
             }
         }
+        self.request_scoped_mcp_provider_ready |= installed_request_scoped_mcp_schema;
         self.tool_schemas.extend(schemas);
     }
 
@@ -3358,13 +3367,16 @@ impl ServerAgenticLoopHost {
         tool_name: &str,
         registry: &astra_runtime_env::ToolRegistry,
     ) -> crate::server::tool_admission::ToolAdmissionDecision {
-        resolve_tool_admission_for_binding(
+        resolve_tool_admission_for_binding_with_context(
             tool_name,
             &self.tool_schemas,
             &self.workspace_binding,
             &self.executor_binding,
             self.runtime_binding.as_ref(),
             registry,
+            ToolAdmissionContext {
+                request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
+            },
         )
     }
 
@@ -5922,6 +5934,44 @@ mod tests {
             selected.is_empty(),
             "request-scoped MCP tools must not be delivered to the edge ledger"
         );
+    }
+
+    #[test]
+    fn runtime_mcp_install_exposes_request_scoped_mcp_offer_to_admission() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
+        .with_server_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .build();
+
+        host.install_runtime_tool_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__tools__query",
+                "description": "Binding-discovered MCP tool",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })]);
+
+        let admission = host.tool_admission_snapshot_entries();
+        let entry = admission
+            .iter()
+            .find(|entry| entry.tool_name == "mcp__tools__query")
+            .expect("request-scoped MCP admission entry");
+
+        assert!(entry.visible);
+        assert_eq!(
+            entry.selected_offer_id.as_deref(),
+            Some("mcp__tools__query@request-scoped-mcp")
+        );
+        assert_eq!(entry.selected_route, "RequestScopedMcp");
     }
 
     #[test]

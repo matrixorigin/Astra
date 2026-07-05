@@ -62,6 +62,11 @@ pub(crate) struct ToolAdmissionDecision {
     pub hidden_reason: Option<ToolHiddenReason>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ToolAdmissionContext {
+    pub request_scoped_mcp_provider_ready: bool,
+}
+
 impl ToolAdmissionDecision {
     pub(crate) fn selected_route(&self) -> ToolExecutionRouteKind {
         self.route
@@ -87,8 +92,29 @@ pub(crate) fn resolve_tool_admission_for_binding(
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
     registry: &astra_runtime_env::ToolRegistry,
 ) -> ToolAdmissionDecision {
-    let providers =
-        active_provider_declarations_for_binding(schemas, workspace, executor, runtime, registry);
+    resolve_tool_admission_for_binding_with_context(
+        tool_name,
+        schemas,
+        workspace,
+        executor,
+        runtime,
+        registry,
+        ToolAdmissionContext::default(),
+    )
+}
+
+pub(crate) fn resolve_tool_admission_for_binding_with_context(
+    tool_name: &str,
+    schemas: &[Value],
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    registry: &astra_runtime_env::ToolRegistry,
+    context: ToolAdmissionContext,
+) -> ToolAdmissionDecision {
+    let providers = active_provider_declarations_for_binding(
+        schemas, workspace, executor, runtime, registry, context,
+    );
     resolve_tool_admission_for_providers(tool_name, workspace, executor, &providers, registry)
 }
 
@@ -180,6 +206,7 @@ pub(crate) fn active_provider_declarations_for_binding(
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
     registry: &astra_runtime_env::ToolRegistry,
+    context: ToolAdmissionContext,
 ) -> Vec<CapacityProviderDeclaration> {
     let mut providers = vec![
         astra_runtime_env::server_service_provider("server-builtin", registry),
@@ -194,7 +221,8 @@ pub(crate) fn active_provider_declarations_for_binding(
         ));
     }
 
-    if matches!(executor.kind, ExecutorBindingKind::Mcp) {
+    if context.request_scoped_mcp_provider_ready || matches!(executor.kind, ExecutorBindingKind::Mcp)
+    {
         providers.push(astra_runtime_env::request_scoped_mcp_provider_from_schemas(
             "request-scoped-mcp",
             schemas,
@@ -534,6 +562,35 @@ mod tests {
         assert_eq!(decision.hidden_reason, Some(ToolHiddenReason::NoProvider));
         assert!(decision.selected_offer.is_none());
         assert!(decision.candidates.is_empty());
+    }
+
+    #[test]
+    fn request_scoped_mcp_tool_is_visible_when_discovered_provider_is_ready() {
+        let schemas = vec![json!({
+            "type": "function",
+            "function": { "name": "mcp__github__search" }
+        })];
+        let decision = resolve_tool_admission_for_binding_with_context(
+            "mcp__github__search",
+            &schemas,
+            &WorkspaceBinding::none(),
+            &ExecutorBinding::server_local(),
+            None,
+            &registry(),
+            ToolAdmissionContext {
+                request_scoped_mcp_provider_ready: true,
+            },
+        );
+
+        assert!(decision.visible);
+        assert_eq!(decision.route, ToolExecutionRouteKind::RequestScopedMcp);
+        assert_eq!(
+            decision.selected_offer_id(),
+            Some("mcp__github__search@request-scoped-mcp")
+        );
+        let offer = decision.selected_offer.expect("selected offer");
+        assert_eq!(offer.provider_type, CapacityProviderType::RequestScopedMcp);
+        assert!(offer.schema_digest.starts_with("sha256:"));
     }
 
     #[test]

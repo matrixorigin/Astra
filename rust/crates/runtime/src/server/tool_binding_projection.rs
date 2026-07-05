@@ -24,8 +24,14 @@ pub fn capability_filter_tool_schemas_for_binding(
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> Vec<Value> {
     let registry = astra_runtime_env::ToolRegistry::builtins();
-    let providers =
-        active_provider_declarations_for_binding(&schemas, workspace, executor, runtime, &registry);
+    let providers = active_provider_declarations_for_binding(
+        &schemas,
+        workspace,
+        executor,
+        runtime,
+        &registry,
+        crate::server::tool_admission::ToolAdmissionContext::default(),
+    );
     schemas
         .into_iter()
         .filter(|schema| {
