@@ -32,7 +32,7 @@ use crate::server::tool_admission::{
 use crate::server::tool_route_selection::{
     ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding, routing_decision_for_binding,
     runtime_tools_route_to_edge_provider,
-    should_deliver_edge_bound_tools_via_client_ledger_for_binding, tool_execution_class,
+    should_deliver_edge_bound_tools_via_client_ledger_for_binding,
 };
 use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
@@ -1088,8 +1088,10 @@ pub struct ServerAgenticLoopHost {
     server_side_tools: bool,
     /// `true` when the visible wire surface was populated from the server catalog.
     server_catalog_tool_surface: bool,
-    /// `true` when server-owned providers are configured to offer tools.
-    server_provider_catalog_enabled: bool,
+    /// `true` when server-service providers are configured to offer tools.
+    server_service_provider_catalog_enabled: bool,
+    /// `true` when server control-plane providers are configured to offer backbone tools.
+    control_plane_provider_catalog_enabled: bool,
     /// `true` when the connected client can answer ask_user prompts.
     interactive_client: bool,
     /// Optional request-level interaction policy override.
@@ -1235,7 +1237,8 @@ pub struct ServerAgenticLoopHostBuilder {
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     plan_resume_hint: Option<String>,
     task_board_resume_hint: Option<String>,
-    server_tool_catalog_enabled: bool,
+    server_service_tool_catalog_enabled: bool,
+    control_plane_tool_catalog_enabled: bool,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds: Vec<Value>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -1288,7 +1291,8 @@ impl ServerAgenticLoopHostBuilder {
             event_tx: None,
             plan_resume_hint: None,
             task_board_resume_hint: None,
-            server_tool_catalog_enabled: true,
+            server_service_tool_catalog_enabled: true,
+            control_plane_tool_catalog_enabled: true,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: Vec::new(),
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -1368,8 +1372,14 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    pub fn with_server_tool_catalog_enabled(mut self, enabled: bool) -> Self {
-        self.server_tool_catalog_enabled = enabled;
+    pub fn with_server_service_tool_catalog_enabled(mut self, enabled: bool) -> Self {
+        self.server_service_tool_catalog_enabled = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_control_plane_tool_catalog_enabled(mut self, enabled: bool) -> Self {
+        self.control_plane_tool_catalog_enabled = enabled;
         self
     }
 
@@ -1506,7 +1516,9 @@ impl ServerAgenticLoopHostBuilder {
         // edge binding still routes workspace/process tools to the edge
         // executor, while server-owned control-plane/runtime tools remain
         // in-process.
-        let auto_server_catalog = self.server_tool_catalog_enabled && self.edge_tools.is_empty();
+        let any_server_catalog_enabled =
+            self.server_service_tool_catalog_enabled || self.control_plane_tool_catalog_enabled;
+        let auto_server_catalog = any_server_catalog_enabled && self.edge_tools.is_empty();
         let routes_workspace_tools_to_edge = runtime_tools_route_to_edge_provider(
             binding_snapshot.workspace.kind,
             binding_snapshot.executor.kind,
@@ -1517,13 +1529,13 @@ impl ServerAgenticLoopHostBuilder {
         let schema_executor = binding_snapshot.executor.clone();
         let schema_runtime = binding_snapshot.runtime.clone();
         let schema_admission_context = ToolAdmissionContext {
-            server_service_provider_ready: self.server_tool_catalog_enabled,
-            control_plane_provider_ready: self.server_tool_catalog_enabled,
+            server_service_provider_ready: self.server_service_tool_catalog_enabled,
+            control_plane_provider_ready: self.control_plane_tool_catalog_enabled,
             disabled_tool_offers: snapshot_builder_policy_handle(&self.disabled_tool_offers),
             provider_allowed_tools: snapshot_builder_policy_handle(&self.provider_allowed_tools),
             ..ToolAdmissionContext::default()
         };
-        let server_catalog_tools = if self.server_tool_catalog_enabled {
+        let server_catalog_tools = if any_server_catalog_enabled {
             capability_filtered_server_tool_schemas_with_context(
                 &self.capabilities,
                 &schema_workspace,
@@ -1535,7 +1547,7 @@ impl ServerAgenticLoopHostBuilder {
             Vec::new()
         };
         let mut admission_tool_schemas = Vec::new();
-        if self.server_tool_catalog_enabled {
+        if any_server_catalog_enabled {
             append_tool_schemas_unique(
                 &mut admission_tool_schemas,
                 crate::capabilities::server_builtin_tool_schemas(&self.capabilities),
@@ -1561,12 +1573,15 @@ impl ServerAgenticLoopHostBuilder {
                 &schema_workspace,
                 &schema_executor,
                 schema_runtime.as_ref(),
-                schema_admission_context,
+                schema_admission_context.clone(),
             );
             append_server_owned_tool_schemas_unique(
                 &mut surface,
                 server_catalog_tools,
-                self.server_tool_catalog_enabled,
+                &schema_workspace,
+                &schema_executor,
+                schema_runtime.as_ref(),
+                schema_admission_context,
             );
             surface
         };
@@ -1620,7 +1635,8 @@ impl ServerAgenticLoopHostBuilder {
             current_deferred_tool_names: HashSet::new(),
             server_side_tools,
             server_catalog_tool_surface,
-            server_provider_catalog_enabled: self.server_tool_catalog_enabled,
+            server_service_provider_catalog_enabled: self.server_service_tool_catalog_enabled,
+            control_plane_provider_catalog_enabled: self.control_plane_tool_catalog_enabled,
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
             full_llm_capture: self.full_llm_capture,
@@ -1722,7 +1738,7 @@ fn append_tool_schemas_unique(surface: &mut Vec<Value>, candidates: Vec<Value>) 
         .iter()
         .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
         .collect();
-    for schema in candidates {
+    for schema in candidates.iter().cloned() {
         let Some(name) = tool_schema_name(&schema) else {
             continue;
         };
@@ -1735,20 +1751,33 @@ fn append_tool_schemas_unique(surface: &mut Vec<Value>, candidates: Vec<Value>) 
 fn append_server_owned_tool_schemas_unique(
     surface: &mut Vec<Value>,
     candidates: Vec<Value>,
-    server_builtin_tools_enabled: bool,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    admission_context: ToolAdmissionContext,
 ) {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let mut seen: HashSet<String> = surface
         .iter()
         .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
         .collect();
-    for schema in candidates {
+    for schema in candidates.iter().cloned() {
         let Some(name) = tool_schema_name(&schema) else {
             continue;
         };
-        if !tool_execution_class(name, &registry)
-            .include_from_server_catalog(server_builtin_tools_enabled)
-        {
+        let admission = resolve_tool_admission_for_binding_with_context(
+            name,
+            &candidates,
+            workspace,
+            executor,
+            runtime,
+            &registry,
+            admission_context.clone(),
+        );
+        if !matches!(
+            admission.selected_route(),
+            ToolExecutionRouteKind::ServerRuntime | ToolExecutionRouteKind::ServerControlPlane
+        ) {
             continue;
         }
         if seen.insert(name.to_string()) {
@@ -3491,8 +3520,8 @@ impl ServerAgenticLoopHost {
 
     fn tool_admission_context(&self) -> ToolAdmissionContext {
         ToolAdmissionContext {
-            server_service_provider_ready: self.server_provider_catalog_enabled,
-            control_plane_provider_ready: self.server_provider_catalog_enabled,
+            server_service_provider_ready: self.server_service_provider_catalog_enabled,
+            control_plane_provider_ready: self.control_plane_provider_catalog_enabled,
             request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
             selected_runtime_platform: self
                 .runtime_binding
@@ -6027,7 +6056,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_can_disable_server_tool_catalog_for_registry_runtime() {
+    fn builder_can_disable_server_service_catalog_without_losing_control_plane() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -6037,12 +6066,25 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             false, false,
         ))
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .build();
 
+        let names = schema_names(&host.tool_schemas);
+        for expected in ["ask_user", "task", "tool_search", "introspect"] {
+            assert!(
+                names.contains(expected),
+                "control-plane backbone tool {expected} must remain visible when server-service capacity is disabled: {names:?}"
+            );
+        }
+        for hidden in ["memory", "web_fetch", "web_search", "github"] {
+            assert!(
+                !names.contains(hidden),
+                "server-service tool {hidden} must not be visible when server-service capacity is disabled: {names:?}"
+            );
+        }
         assert!(
-            host.tool_schemas.is_empty(),
-            "Agent Binding mode starts with no local/request tool schemas"
+            host.valid_tool_names().contains("tool_search"),
+            "tool_search must remain callable as the deferred activation backbone"
         );
     }
 
@@ -6057,7 +6099,7 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             false, false,
         ))
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_static_tool_catalog_admissible(false)
         .build();
         let visible = vec![json!({
@@ -6073,6 +6115,9 @@ mod tests {
 
         assert!(host.valid_tool_names().contains("mcp__tools__query"));
         assert!(!host.valid_tool_names().contains("bash"));
+        assert!(host.tool_schemas.iter().any(|schema| {
+            schema.pointer("/function/name").and_then(Value::as_str) == Some("tool_search")
+        }));
         assert!(!host.valid_tool_names().contains("tool_search"));
     }
 
@@ -6087,11 +6132,13 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             false, false,
         ))
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_static_tool_catalog_admissible(false)
         .build();
 
-        assert!(host.tool_schemas.is_empty());
+        let names = schema_names(&host.tool_schemas);
+        assert!(names.contains("tool_search"));
+        assert!(!names.contains("mcp__tools__query"));
 
         host.install_runtime_tool_schemas(vec![json!({
             "type": "function",
@@ -6125,7 +6172,7 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             false, false,
         ))
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_static_tool_catalog_admissible(false)
         .build();
 
@@ -6166,7 +6213,7 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             false, false,
         ))
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_static_tool_catalog_admissible(false)
         .with_disabled_tool_offers(disabled)
         .build();
@@ -6185,7 +6232,7 @@ mod tests {
             "disabled request-scoped MCP offer must not become valid for the model"
         );
         assert!(
-            schema_names(&host.tool_schemas).is_empty(),
+            !schema_names(&host.tool_schemas).contains("mcp__tools__query"),
             "disabled request-scoped MCP offer must not enter prompt-visible schemas"
         );
     }
@@ -6205,7 +6252,7 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             false, false,
         ))
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_static_tool_catalog_admissible(false)
         .with_provider_allowed_tools(allowed)
         .build();
@@ -6465,14 +6512,14 @@ mod tests {
     }
 
     #[test]
-    fn builder_does_not_append_server_owned_tools_when_catalog_disabled_with_edge_tools() {
+    fn builder_keeps_control_plane_when_server_service_disabled_with_edge_tools() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
             "u-no-server-builtins".to_string(),
             "s-no-server-builtins".to_string(),
         )
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
@@ -6482,18 +6529,16 @@ mod tests {
             names.contains("bash"),
             "edge-declared runtime tools should remain visible"
         );
-        for server_owned in [
-            "task",
-            "session",
-            "tool_search",
-            "web_search",
-            "memory",
-            "introspect",
-            "reflect",
-        ] {
+        for expected in ["task", "session", "tool_search", "introspect"] {
             assert!(
-                !names.contains(server_owned),
-                "{server_owned} must not leak from the server catalog when server-owned tools are disabled"
+                names.contains(expected),
+                "control-plane backbone tool {expected} must remain visible with edge tools: {names:?}"
+            );
+        }
+        for hidden in ["web_search", "memory"] {
+            assert!(
+                !names.contains(hidden),
+                "server-service tool {hidden} must not leak when server-service capacity is disabled: {names:?}"
             );
         }
     }
@@ -6934,21 +6979,34 @@ mod tests {
     }
 
     #[test]
-    fn builder_extracts_valid_tool_names() {
+    fn builder_extracts_edge_and_control_plane_valid_tool_names() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
             "user1".to_string(),
             "sess1".to_string(),
         )
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         assert!(host.valid_tool_names().contains("bash"));
         assert!(host.valid_tool_names().contains("read_file"));
-        assert_eq!(host.valid_tool_names().len(), 2);
+        for expected in ["task", "session", "tool_search", "introspect"] {
+            assert!(
+                host.valid_tool_names().contains(expected),
+                "control-plane backbone tool {expected} must remain valid with server-service capacity disabled: {:?}",
+                host.valid_tool_names()
+            );
+        }
+        for hidden in ["memory", "web_fetch", "web_search", "github"] {
+            assert!(
+                !host.valid_tool_names().contains(hidden),
+                "server-service tool {hidden} must not leak through disabled server-service capacity: {:?}",
+                host.valid_tool_names()
+            );
+        }
     }
 
     #[test]
@@ -6959,7 +7017,7 @@ mod tests {
             "user1".to_string(),
             "sess1".to_string(),
         )
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
@@ -7014,7 +7072,7 @@ mod tests {
             "user1".to_string(),
             "sess1".to_string(),
         )
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools())
         .with_edge_profile(edge_profile)
         .with_execution_binding_snapshot(edge_runtime_snapshot())
@@ -9223,7 +9281,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools_with_web_fetch())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
@@ -9333,7 +9391,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools_with_ask_user())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
@@ -9367,7 +9425,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
-        .with_server_tool_catalog_enabled(false)
+        .with_server_service_tool_catalog_enabled(false)
         .with_edge_tools(sample_edge_tools_with_ask_user())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_interactive_client(true)

@@ -47,19 +47,6 @@ pub(crate) enum ToolExecutionClass {
     Unknown,
 }
 
-impl ToolExecutionClass {
-    pub(crate) fn include_from_server_catalog(self, server_catalog_enabled: bool) -> bool {
-        match self {
-            Self::ServerControlPlane
-            | Self::ServerService
-            | Self::SharedServiceOrRuntime
-            | Self::TurnPipelineIntercept => server_catalog_enabled,
-            Self::RequestScopedMcp => true,
-            Self::RuntimeExecutor | Self::Unknown => false,
-        }
-    }
-}
-
 /// Server-local adapters for workspace/runtime tools.
 ///
 /// This is adapter inventory, not fallback routing policy. A tool may be a

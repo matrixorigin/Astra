@@ -257,10 +257,14 @@ pub struct RuntimeToolExecutor {
     /// When enabled, server-local execution rejects names outside the current
     /// capability-filtered server tool surface.
     enforce_server_tool_capabilities: bool,
-    /// When false, Astra-owned built-in server tools are neither advertised nor
-    /// executable through this executor. Request-scoped MCP tools are not part of
-    /// this surface and keep their own transport path.
-    server_builtin_tools_enabled: bool,
+    /// When false, server-service tools are neither advertised nor executable
+    /// through this executor. Request-scoped MCP tools are not part of this
+    /// surface and keep their own transport path.
+    server_service_tools_enabled: bool,
+    /// Control-plane backbone tools remain separate from server-service
+    /// capacity so agent-binding/runtime modes can still plan, inspect, and
+    /// manage tasks without implying generic server execution capacity.
+    control_plane_tools_enabled: bool,
 
     // ── Gates and callbacks ───────────────────────────────────────────────────
     /// Optional approval gate for dangerous tool execution.
@@ -345,7 +349,8 @@ impl RuntimeToolExecutor {
             execution_binding: ExecutionBindingState::none(),
             capabilities,
             enforce_server_tool_capabilities: false,
-            server_builtin_tools_enabled: true,
+            server_service_tools_enabled: true,
+            control_plane_tools_enabled: true,
             exactly_once_executor: None,
         }
     }
@@ -474,7 +479,13 @@ impl RuntimeToolExecutor {
     pub fn with_server_builtin_tools_disabled(mut self) -> Self {
         self.capabilities = astra_turn_core::capability::CapabilitySet::empty();
         self.enforce_server_tool_capabilities = true;
-        self.server_builtin_tools_enabled = false;
+        self.server_service_tools_enabled = false;
+        self.control_plane_tools_enabled = false;
+        self
+    }
+
+    pub fn with_server_service_tools_disabled(mut self) -> Self {
+        self.server_service_tools_enabled = false;
         self
     }
 
@@ -721,9 +732,6 @@ impl RuntimeToolExecutor {
 
     #[cfg(test)]
     fn supports_server_tool_name(&self, tool: &str) -> bool {
-        if !self.server_builtin_tools_enabled {
-            return false;
-        }
         let supported_names = resolved_server_tool_names(
             &self.capabilities,
             self.execution_binding.workspace(),
@@ -734,7 +742,7 @@ impl RuntimeToolExecutor {
     }
 
     fn capability_filtered_server_tool_schemas(&self) -> Vec<Value> {
-        if !self.server_builtin_tools_enabled {
+        if !self.server_service_tools_enabled && !self.control_plane_tools_enabled {
             return Vec::new();
         }
         let mut schemas = capability_filtered_server_tool_schemas_with_context(
@@ -790,8 +798,8 @@ impl RuntimeToolExecutor {
         let mut context = self
             .tool_execution_service
             .tool_admission_context_snapshot();
-        context.server_service_provider_ready = self.server_builtin_tools_enabled;
-        context.control_plane_provider_ready = self.server_builtin_tools_enabled;
+        context.server_service_provider_ready = self.server_service_tools_enabled;
+        context.control_plane_provider_ready = self.control_plane_tools_enabled;
         context.request_scoped_mcp_provider_ready = !self
             .request_scoped_mcp_schemas_snapshot("request_scoped_mcp_admission")
             .is_empty();
@@ -1407,7 +1415,7 @@ impl RuntimeToolExecutor {
         self.execute_with_metadata(name, args).await.output
     }
 
-    /// Execute a tool call and preserve structured metadata for server-side fallback paths.
+    /// Execute a tool call and preserve structured metadata for route-bound execution paths.
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         let request = self.tool_execution_request(name, args);
 
@@ -5132,7 +5140,7 @@ esac
 
         assert!(
             parsed["matches"].as_array().unwrap().is_empty(),
-            "conflicting searchable schema must fail closed instead of resolving via catalog fallback; got: {}",
+            "conflicting searchable schema must fail closed instead of resolving through catalog search; got: {}",
             result.output
         );
         assert_eq!(parsed["missing"][0].as_str(), Some("github"));
@@ -5265,12 +5273,16 @@ esac
     }
 
     #[tokio::test]
-    async fn provider_allowlist_prunes_server_service_surface_and_tool_search() {
+    async fn provider_allowlist_prunes_server_service_surface_and_tool_search_results() {
         let dir = TempDir::new().unwrap();
         let mut allowed = HashMap::new();
         allowed.insert(
             "server-builtin".to_string(),
-            HashSet::from(["memory".to_string(), "tool_search".to_string()]),
+            HashSet::from(["memory".to_string()]),
+        );
+        allowed.insert(
+            "server-control-plane".to_string(),
+            HashSet::from(["tool_search".to_string()]),
         );
         let exec = RuntimeToolExecutor::new(
             dir.path().to_path_buf(),

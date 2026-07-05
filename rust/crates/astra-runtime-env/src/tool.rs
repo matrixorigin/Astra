@@ -275,7 +275,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         server_service("memory", ToolLoadPolicy::AlwaysLoad),
         server_service("mo_query", ToolLoadPolicy::Deferred),
         server_service("rollback_database_snapshots", ToolLoadPolicy::Deferred),
-        server_service("tool_search", ToolLoadPolicy::AlwaysLoad),
+        control_plane("tool_search", ToolLoadPolicy::AlwaysLoad),
         shared_network("web_search", ToolLoadPolicy::Deferred),
         shared_network("web_fetch", ToolLoadPolicy::Deferred),
         server_network_credentials("github", ToolLoadPolicy::Deferred),
@@ -1085,7 +1085,7 @@ mod tests {
     #[test]
     fn observation_control_plane_tools_are_always_load() {
         let registry = registry();
-        for name in ["introspect", "reflect"] {
+        for name in ["introspect", "reflect", "tool_search"] {
             let spec = registry
                 .get(name)
                 .unwrap_or_else(|| panic!("{name} registered"));

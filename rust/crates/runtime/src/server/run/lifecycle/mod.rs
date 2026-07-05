@@ -3181,7 +3181,7 @@ impl AgenticRunLifecycleService {
         request: &ChatRequestData,
         edge_tools: Vec<Value>,
         edge_profile: Map<String, Value>,
-        server_tool_catalog_enabled: bool,
+        server_service_tool_catalog_enabled: bool,
         static_tool_catalog_admissible: bool,
         execution_bindings: Option<&ExecutionBindingSnapshot>,
         plan_resume_hint: Option<String>,
@@ -3197,7 +3197,7 @@ impl AgenticRunLifecycleService {
         .with_llm_token_service(request.llm_token_service.clone())
         .with_full_llm_capture(request.full_llm_capture)
         .with_edge_tools(edge_tools)
-        .with_server_tool_catalog_enabled(server_tool_catalog_enabled)
+        .with_server_service_tool_catalog_enabled(server_service_tool_catalog_enabled)
         .with_static_tool_catalog_admissible(static_tool_catalog_admissible)
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
@@ -3738,7 +3738,7 @@ impl AgenticRunLifecycleService {
         )
     }
 
-    fn server_tool_catalog_enabled_for_request(
+    fn server_service_tool_catalog_enabled_for_request(
         agent_binding_mode: bool,
         _has_runtime_executor_tools: bool,
     ) -> bool {
@@ -4752,10 +4752,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let agent_binding_mode = request.agent_binding.is_some();
         let edge_context = Self::extract_edge_context(&request)?;
         let edge_tools = edge_context.edge_tools.clone();
-        let server_tool_catalog_enabled = Self::server_tool_catalog_enabled_for_request(
-            agent_binding_mode,
-            edge_context.has_tools(),
-        );
+        let server_service_tool_catalog_enabled =
+            Self::server_service_tool_catalog_enabled_for_request(
+                agent_binding_mode,
+                edge_context.has_tools(),
+            );
         let runtime_capabilities = self
             .prepare_runtime_capabilities(&request, &request_constraints)
             .await?;
@@ -4892,7 +4893,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &request,
             edge_tools,
             edge_profile.clone(),
-            server_tool_catalog_enabled,
+            server_service_tool_catalog_enabled,
             !agent_binding_mode,
             execution_bindings.as_ref(),
             plan_resume_hint,
@@ -5028,7 +5029,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .with_cancel_token(loop_state.cancellation.token.clone())
                 .with_task_store(task_store);
             if agent_binding_mode {
-                executor = executor.with_server_builtin_tools_disabled();
+                executor = executor.with_server_service_tools_disabled();
             } else {
                 executor =
                     executor.with_capabilities(crate::capabilities::lifecycle_server_capabilities(
@@ -5609,10 +5610,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let agent_binding_mode = request.agent_binding.is_some();
         let edge_context = Self::extract_edge_context(&request)?;
         let edge_tools = edge_context.edge_tools.clone();
-        let server_tool_catalog_enabled = Self::server_tool_catalog_enabled_for_request(
-            agent_binding_mode,
-            edge_context.has_tools(),
-        );
+        let server_service_tool_catalog_enabled =
+            Self::server_service_tool_catalog_enabled_for_request(
+                agent_binding_mode,
+                edge_context.has_tools(),
+            );
         let runtime_capabilities = self
             .prepare_runtime_capabilities(&request, &request_constraints)
             .await?;
@@ -5776,7 +5778,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &request,
             edge_tools,
             edge_profile.clone(),
-            server_tool_catalog_enabled,
+            server_service_tool_catalog_enabled,
             !agent_binding_mode,
             execution_bindings.as_ref(),
             plan_resume_hint,
@@ -5956,7 +5958,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .with_cancel_token(state.cancellation.token.clone())
                 .with_task_store(task_store);
             if agent_binding_mode {
-                executor = executor.with_server_builtin_tools_disabled();
+                executor = executor.with_server_service_tools_disabled();
             } else {
                 executor =
                     executor.with_capabilities(crate::capabilities::lifecycle_server_capabilities(

@@ -863,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_allowlist_filters_prompt_visible_schema_without_server_fallback() {
+    fn provider_allowlist_filters_prompt_visible_schema_without_server_reroute() {
         let names = schema_names(capability_filter_tool_schemas_for_binding_with_context(
             vec![
                 schema("ask_user"),
@@ -902,7 +902,7 @@ mod tests {
         assert!(names.contains("bash"));
         assert!(
             !names.contains("web_fetch"),
-            "web_fetch is disallowed on the selected edge offer and must not fall back to server: {names:?}"
+            "web_fetch is disallowed on the selected edge offer and must not reroute to server: {names:?}"
         );
     }
 

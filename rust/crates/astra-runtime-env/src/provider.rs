@@ -313,18 +313,20 @@ pub const CAP_SYMBOLS: &str = "symbols";
 pub const CAP_LOCAL_BACKGROUND_TASKS: &str = "local_background_tasks";
 
 pub fn server_service_capabilities() -> Vec<String> {
-    labels([
-        CAP_WEB_FETCH,
-        CAP_WEB_SEARCH,
-        CAP_MEMORY,
-        CAP_REFLECT,
-        CAP_INTROSPECT,
-        CAP_TOOL_SEARCH,
-    ])
+    labels([CAP_WEB_FETCH, CAP_WEB_SEARCH, CAP_MEMORY])
 }
 
 pub fn control_plane_capabilities(extra: impl IntoIterator<Item = &'static str>) -> Vec<String> {
-    let mut capabilities = labels([CAP_SESSION, CAP_TASK, CAP_PLAN, CAP_POLICY, CAP_AUDIT]);
+    let mut capabilities = labels([
+        CAP_SESSION,
+        CAP_TASK,
+        CAP_PLAN,
+        CAP_POLICY,
+        CAP_AUDIT,
+        CAP_REFLECT,
+        CAP_INTROSPECT,
+        CAP_TOOL_SEARCH,
+    ]);
     capabilities.extend(extra.into_iter().map(str::to_string));
     capabilities
 }

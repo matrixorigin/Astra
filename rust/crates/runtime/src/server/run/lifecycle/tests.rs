@@ -55,18 +55,18 @@ impl Drop for EnvVarGuard {
 }
 
 #[test]
-fn server_tool_catalog_stays_enabled_when_runtime_executor_tools_are_present() {
+fn server_service_catalog_is_disabled_only_for_agent_binding_mode() {
     assert!(
-        AgenticRunLifecycleService::server_tool_catalog_enabled_for_request(false, false),
-        "server-only web runs must expose server backbone/control-plane tools"
+        AgenticRunLifecycleService::server_service_tool_catalog_enabled_for_request(false, false),
+        "server-only web runs may use server-service capacity"
     );
     assert!(
-        AgenticRunLifecycleService::server_tool_catalog_enabled_for_request(false, true),
-        "server+edge and managed-runtime runs must keep task/session/introspect server backbone tools"
+        AgenticRunLifecycleService::server_service_tool_catalog_enabled_for_request(false, true),
+        "server+edge and managed-runtime runs may still use server-service offers when policy allows them"
     );
     assert!(
-        !AgenticRunLifecycleService::server_tool_catalog_enabled_for_request(true, true),
-        "agent-binding mode owns its own catalog and should not receive default server tools"
+        !AgenticRunLifecycleService::server_service_tool_catalog_enabled_for_request(true, true),
+        "agent-binding mode owns its service catalog and should not receive default server-service offers"
     );
 }
 
