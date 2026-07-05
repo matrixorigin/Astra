@@ -640,11 +640,30 @@ impl RuntimeToolExecutor {
     }
 
     pub(crate) fn ready_request_scoped_mcp_schemas(&self) -> Vec<Value> {
-        self.request_scoped_mcp_schemas_snapshot("request_scoped_mcp_schemas_ready")
-            .into_iter()
+        let schemas = self.request_scoped_mcp_schemas_snapshot("request_scoped_mcp_schemas_ready");
+        let mut context = self.tool_admission_context();
+        context.request_scoped_mcp_provider_ready = !schemas.is_empty();
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        schemas
+            .iter()
             .filter(|schema| {
-                tool_schema_name(schema).is_some_and(|name| self.mcp_tool_has_runtime_binding(name))
+                tool_schema_name(schema).is_some_and(|name| {
+                    if !self.mcp_tool_has_runtime_binding(name) {
+                        return false;
+                    }
+                    crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
+                        name,
+                        &schemas,
+                        self.execution_binding.workspace(),
+                        self.execution_binding.executor(),
+                        self.execution_binding.runtime(),
+                        &registry,
+                        context.clone(),
+                    )
+                    .visible
+                })
             })
+            .cloned()
             .collect()
     }
 
@@ -781,6 +800,9 @@ impl RuntimeToolExecutor {
 
     fn executor_tool_readiness_for_call(&self, name: &str, args: &Value) -> ExecutorToolReadiness {
         if name.starts_with("mcp__") {
+            if let Some(reason) = self.request_scoped_mcp_policy_denial(name) {
+                return ExecutorToolReadiness::RuntimeEnvironmentDenied(reason);
+            }
             return self.mcp_executor_tool_readiness(name);
         }
 
@@ -893,6 +915,36 @@ impl RuntimeToolExecutor {
             self.mcp_executor_tool_readiness(name),
             ExecutorToolReadiness::Ready | ExecutorToolReadiness::RuntimeBindingBusy(_)
         )
+    }
+
+    fn request_scoped_mcp_policy_denial(
+        &self,
+        name: &str,
+    ) -> Option<astra_runtime_env::ToolUnavailableReason> {
+        let context = self
+            .tool_execution_service
+            .tool_admission_context_snapshot();
+        if context.disabled_tool_names.contains(name) {
+            return Some(astra_runtime_env::ToolUnavailableReason::PolicyDenied(
+                "tool disabled by policy".to_string(),
+            ));
+        }
+        let offer_id = format!("{name}@request-scoped-mcp");
+        if context.disabled_tool_offers.contains(&offer_id) {
+            return Some(astra_runtime_env::ToolUnavailableReason::PolicyDenied(
+                "tool offer disabled by policy".to_string(),
+            ));
+        }
+        if context
+            .provider_allowed_tools
+            .get("request-scoped-mcp")
+            .is_some_and(|allowed| !allowed.contains(name))
+        {
+            return Some(astra_runtime_env::ToolUnavailableReason::PolicyDenied(
+                "tool not allowed for selected provider".to_string(),
+            ));
+        }
+        None
     }
 
     fn mcp_executor_tool_readiness(&self, name: &str) -> ExecutorToolReadiness {
@@ -5331,6 +5383,139 @@ esac
         assert_eq!(
             parsed["matches"][0]["name"].as_str(),
             Some("mcp__calculator")
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_hides_disabled_request_scoped_mcp_offer() {
+        let (mut exec, _dir) = test_executor();
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_request_scoped_mcp_schemas(vec![schema]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_disabled_tool_offers(&["mcp__calculator@request-scoped-mcp".to_string()])
+                .build(),
+        );
+
+        assert!(
+            !exec.tool_runtime_ready("mcp__calculator"),
+            "policy-disabled MCP offers must not be readiness-visible"
+        );
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not rediscover disabled request-scoped MCP offers: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("mcp__calculator"));
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_hides_provider_disallowed_request_scoped_mcp_tool() {
+        let (mut exec, _dir) = test_executor();
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_request_scoped_mcp_schemas(vec![schema]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_provider_allowed_tools(HashMap::from([(
+                    "request-scoped-mcp".to_string(),
+                    HashSet::from(["mcp__other__query".to_string()]),
+                )]))
+                .build(),
+        );
+
+        assert!(
+            !exec.tool_runtime_ready("mcp__calculator"),
+            "provider-disallowed MCP tools must not be readiness-visible"
+        );
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not rediscover provider-disallowed MCP tools: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("mcp__calculator"));
+    }
+
+    #[tokio::test]
+    async fn disabled_request_scoped_mcp_tool_name_blocks_execution() {
+        let (mut exec, _dir) = test_executor();
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_request_scoped_mcp_schemas(vec![schema]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_disabled_tool_names(&["mcp__calculator".to_string()])
+                .build(),
+        );
+
+        let result = exec
+            .execute_with_metadata("mcp__calculator", &json!({"expr": "1+1"}))
+            .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("disabled by the server administrator")
+                || result.output.contains("policy denied"),
+            "disabled MCP direct execution should fail closed with a policy error: {}",
+            result.output
         );
     }
 

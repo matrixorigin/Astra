@@ -1934,6 +1934,31 @@ impl ServerAgenticLoopHost {
     /// Updates `tool_schemas`, `valid_tools`, and `admissible_extras`
     /// so the LLM sees MCP tools and the validator admits them.
     pub fn install_runtime_tool_schemas(&mut self, schemas: Vec<Value>) {
+        let source_schemas = schemas;
+        let mut context = self.tool_admission_context();
+        context.request_scoped_mcp_provider_ready |= source_schemas
+            .iter()
+            .filter_map(tool_schema_name)
+            .any(|name| name.starts_with("mcp__"));
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let schemas: Vec<Value> = source_schemas
+            .iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_some_and(|name| {
+                    resolve_tool_admission_for_binding_with_context(
+                        name,
+                        &source_schemas,
+                        &self.workspace_binding,
+                        &self.executor_binding,
+                        self.runtime_binding.as_ref(),
+                        &registry,
+                        context.clone(),
+                    )
+                    .visible
+                })
+            })
+            .cloned()
+            .collect();
         let mut installed_request_scoped_mcp_schema = false;
         for schema in &schemas {
             if let Some(name) = schema
@@ -6070,6 +6095,90 @@ mod tests {
             Some("mcp__tools__query@request-scoped-mcp")
         );
         assert_eq!(entry.selected_route, "RequestScopedMcp");
+    }
+
+    #[test]
+    fn runtime_mcp_install_respects_disabled_offer_policy() {
+        let disabled = Arc::new(tokio::sync::RwLock::new(HashSet::from([
+            "mcp__tools__query@request-scoped-mcp".to_string(),
+        ])));
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
+        .with_server_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .with_disabled_tool_offers(disabled)
+        .build();
+
+        host.install_runtime_tool_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__tools__query",
+                "description": "Binding-discovered MCP tool",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })]);
+
+        assert!(
+            !host.valid_tool_names().contains("mcp__tools__query"),
+            "disabled request-scoped MCP offer must not become valid for the model"
+        );
+        assert!(
+            schema_names(&host.tool_schemas).is_empty(),
+            "disabled request-scoped MCP offer must not enter prompt-visible schemas"
+        );
+    }
+
+    #[test]
+    fn runtime_mcp_install_respects_provider_allowlist() {
+        let allowed = Arc::new(tokio::sync::RwLock::new(HashMap::from([(
+            "request-scoped-mcp".to_string(),
+            HashSet::from(["mcp__tools__status".to_string()]),
+        )])));
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
+        .with_server_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .with_provider_allowed_tools(allowed)
+        .build();
+
+        host.install_runtime_tool_schemas(vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__tools__query",
+                    "description": "Binding-discovered MCP query tool",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__tools__status",
+                    "description": "Binding-discovered MCP status tool",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }),
+        ]);
+
+        let names = schema_names(&host.tool_schemas);
+        assert!(!names.contains("mcp__tools__query"));
+        assert!(names.contains("mcp__tools__status"));
+        assert!(!host.valid_tool_names().contains("mcp__tools__query"));
+        assert!(host.valid_tool_names().contains("mcp__tools__status"));
     }
 
     #[test]

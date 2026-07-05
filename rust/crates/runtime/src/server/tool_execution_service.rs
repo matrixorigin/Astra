@@ -377,9 +377,12 @@ impl ToolExecutionService {
                 ..ToolAdmissionContext::default()
             },
         );
-        if let Some(offer_id) =
-            disabled_offer_id_for_request(&transport_request, &admission, &disabled_offer_ids)
-        {
+        if let Some(offer_id) = disabled_offer_id_for_request(
+            &transport_request,
+            &admission,
+            &disabled_offer_ids,
+            &disabled_tool_names,
+        ) {
             let mut meta = serde_json::Map::new();
             meta.insert("tool_disabled".to_string(), serde_json::Value::Bool(true));
             meta.insert(
@@ -608,6 +611,7 @@ fn disabled_offer_id_for_request(
     request: &ToolExecutionRequest,
     admission: &super::tool_admission::ToolAdmissionDecision,
     disabled_offer_ids: &HashSet<String>,
+    disabled_tool_names: &HashSet<String>,
 ) -> Option<String> {
     if matches!(
         admission.hidden_reason,
@@ -617,6 +621,9 @@ fn disabled_offer_id_for_request(
     }
     if request.tool_name.starts_with("mcp__") {
         let request_scoped_offer_id = format!("{}@request-scoped-mcp", request.tool_name);
+        if disabled_tool_names.contains(&request.tool_name) {
+            return Some(request_scoped_offer_id);
+        }
         if disabled_offer_ids.contains(&request_scoped_offer_id) {
             return Some(request_scoped_offer_id);
         }
